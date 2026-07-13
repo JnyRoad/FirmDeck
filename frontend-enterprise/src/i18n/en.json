@@ -1593,6 +1593,7 @@
   "正在按目录索引和知识图谱检索，并整理引用来源...": "Retrieving through the table of contents and knowledge graph, then organizing citation sources...",
   "正在编辑节点说明": "Edit Node Description",
   "正在测试工具接口": "Test Tool Endpoint",
+  "正在整理上下文": "Organizing Conversation Context",
   "正在抽取工具：{1}": "Extracting Tool: {1}",
   "正在处理": "Process",
   "正在处理...": "Process. . .",

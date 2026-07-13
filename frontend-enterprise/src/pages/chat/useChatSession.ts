@@ -142,6 +142,21 @@ function chatSessionPath(id: string): string {
   return `${CHAT_BASE_PATH}/${id}`;
 }
 
+function queuedTurnPreview(turn: PreparedChatTurn): ChatMessage {
+  return {
+    id: `queued_${turn.turnId}`,
+    turnId: turn.turnId,
+    role: 'user',
+    content: turn.text,
+    metadata: {
+      queued: true,
+      ...(turn.attachments.length ? { attachments: turn.attachments } : {}),
+      ...(turn.interactionMode === 'scheduled_task' ? { interaction_mode: 'scheduled_task' } : {}),
+    },
+    created_at: turn.createdAt,
+  };
+}
+
 type DraftScheduleType = 'once' | 'daily' | 'weekly' | 'monthly';
 type DraftScheduleFormatter = (schedule: Record<string, unknown>) => string;
 
@@ -838,7 +853,14 @@ export function useChatSession() {
     void streamTick;
     void traceTick;
     void queuedTurnsTick;
-    return computeMergedMessages(getSlot(activeConversationId), getStreamSlot(activeConversationId).turnId);
+    const merged = computeMergedMessages(
+      getSlot(activeConversationId),
+      getStreamSlot(activeConversationId).turnId,
+    ).filter((item) => item.metadata?.queued !== true);
+    const queued = queuedTurnsRef.current
+      .filter((turn) => turn.conversationId === activeConversationId)
+      .map(queuedTurnPreview);
+    return [...merged, ...queued];
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeConversationId, feedbackTick, getSlot, getStreamSlot, queuedTurnsTick, storeTick, streamTick, traceTick]);
 
@@ -1190,18 +1212,7 @@ export function useChatSession() {
   }, [getSlot, notifyStore]);
 
   const appendQueuedTurnPreview = useCallback((turn: PreparedChatTurn) => {
-    appendRealtime(turn.conversationId, {
-      id: `queued_${turn.turnId}`,
-      turnId: turn.turnId,
-      role: 'user',
-      content: turn.text,
-      metadata: {
-        queued: true,
-        ...(turn.attachments.length ? { attachments: turn.attachments } : {}),
-        ...(turn.interactionMode === 'scheduled_task' ? { interaction_mode: 'scheduled_task' } : {}),
-      },
-      created_at: turn.createdAt,
-    });
+    appendRealtime(turn.conversationId, queuedTurnPreview(turn));
   }, [appendRealtime]);
 
   const removeQueuedTurnPreview = useCallback((turn: PreparedChatTurn) => {
@@ -2543,7 +2554,7 @@ export function useChatSession() {
         ...(outgoingAttachments.length ? { attachments: outgoingAttachments } : {}),
         ...(resolvedInteractionMode === 'scheduled_task' ? { interaction_mode: 'scheduled_task' } : {}),
       },
-      created_at: prepared.createdAt,
+      created_at: options.queued ? new Date().toISOString() : prepared.createdAt,
     });
     upsertTraceLine(turnId, { id: 'decision_router', kind: 'decision', text: '判断意图', state: 'running', icon: 'judge', provisional: true });
     setCollapsedTraceIds((current) => current.filter((item) => item !== turnId));

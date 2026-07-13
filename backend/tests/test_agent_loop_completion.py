@@ -251,7 +251,8 @@ def test_post_read_only_tool_does_not_reuse_previous_result() -> None:
     ]
 
 
-def test_stream_emits_router_decision_before_reply_delta() -> None:
+@pytest.mark.parametrize("compacted_now", [False, True])
+def test_stream_emits_context_status_only_when_compaction_runs(compacted_now: bool) -> None:
     db = FakeDb()
     loop = object.__new__(AgentLoop)
     session = ChatSession(
@@ -274,18 +275,7 @@ def test_stream_emits_router_decision_before_reply_delta() -> None:
 
     loop.db = db
     loop.events = FakeEvents()
-    preparing_seen_before_recall: list[bool] = []
-
-    def recall_after_initial_status(*_args, **_kwargs):  # noqa: ANN002, ANN003
-        preparing_seen_before_recall.append(
-            any(
-                event_type == "stream_status" and payload.get("phase") == "preparing"
-                for _, _, event_type, payload in loop.events.records
-            )
-        )
-        return []
-
-    loop.memory = SimpleNamespace(context_memories=recall_after_initial_status)
+    loop.memory = SimpleNamespace(context_memories=lambda *_args, **_kwargs: [])
     loop.runtime = SimpleNamespace(apply_decision=lambda *_args, **_kwargs: None)
     loop.router = SimpleNamespace(
         decide=lambda *_args, **_kwargs: RouterDecision(
@@ -305,7 +295,9 @@ def test_stream_emits_router_decision_before_reply_delta() -> None:
     loop._finish_stale_completed_skill = lambda *_args, **_kwargs: None
     loop._scene_router_deferred_to_general = lambda *_args, **_kwargs: False
     loop._hydrate_router_decision_from_context = lambda *_args, **_kwargs: {}
-    loop._conversation_context = lambda *_args, **_kwargs: {}
+    loop._conversation_context = lambda *_args, **_kwargs: {
+        "metadata": {"compacted_now": compacted_now}
+    }
     loop._get_active_skill = lambda *_args, **_kwargs: None
     loop._should_record_runtime_event_after_prune = lambda *_args, **_kwargs: False
     loop._should_run_step_agent = lambda *_args, **_kwargs: False
@@ -317,16 +309,19 @@ def test_stream_emits_router_decision_before_reply_delta() -> None:
 
     events = list(loop.handle_turn_stream(_request("你好")))
     names = [event["event"] for event in events]
-    preparing_index = next(
-        index
-        for index, event in enumerate(events)
-        if event["event"] == "status" and event["data"].get("phase") == "preparing"
-    )
     router_index = names.index("router_decision")
     reply_index = names.index("stream_delta")
 
-    assert preparing_seen_before_recall == [True]
-    assert names.index("user_message_received") < preparing_index < router_index
+    preparing_indexes = [
+        index
+        for index, event in enumerate(events)
+        if event["event"] == "status" and event["data"].get("phase") == "preparing"
+    ]
+    if compacted_now:
+        assert len(preparing_indexes) == 1
+        assert names.index("user_message_received") < preparing_indexes[0] < router_index
+    else:
+        assert preparing_indexes == []
     assert router_index < reply_index
     router_payload = events[router_index]["data"]
     assert router_payload["user_intent"] == "问候"

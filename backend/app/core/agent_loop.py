@@ -1461,13 +1461,6 @@ class AgentLoop:
             self.db.commit()
             self.db.refresh(chat_session)
             self.db.refresh(user_message)
-            yield self._stream_status(
-                chat_session,
-                "preparing",
-                "正在整理上下文",
-                user_message_id=user_message_id,
-            )
-
             model_config = self._get_request_model(request, chat_session.agent_id)
             if not model_config:
                 raise AgentLoopPreconditionError("missing_model_config", "没有默认模型配置。")
@@ -1484,6 +1477,13 @@ class AgentLoop:
                 no_skill_context = self._conversation_context(
                     chat_session, model_config=model_config
                 )
+                if self._context_compacted_now(no_skill_context):
+                    yield self._stream_status(
+                        chat_session,
+                        "preparing",
+                        "正在整理上下文",
+                        user_message_id=user_message_id,
+                    )
                 yield self._stream_status(
                     chat_session, "routing", "正在判断用户意图", user_message_id=user_message_id
                 )
@@ -1595,6 +1595,13 @@ class AgentLoop:
             self.db.commit()
             self.db.refresh(chat_session)
             conversation_context = self._conversation_context(chat_session, model_config=model_config)
+            if self._context_compacted_now(conversation_context):
+                yield self._stream_status(
+                    chat_session,
+                    "preparing",
+                    "正在整理上下文",
+                    user_message_id=user_message_id,
+                )
 
             yield self._stream_status(
                 chat_session, "routing", "正在判断用户意图", user_message_id=user_message_id
@@ -2136,6 +2143,8 @@ class AgentLoop:
             no_skill_context = self._conversation_context(
                 chat_session, model_config=model_config
             )
+            if self._context_compacted_now(no_skill_context):
+                status("preparing", {"compacted_now": True})
             capability = self._select_general_capability(
                 request.message,
                 model_config,
@@ -2208,6 +2217,8 @@ class AgentLoop:
         self.db.commit()
         self.db.refresh(chat_session)
         conversation_context = self._conversation_context(chat_session, model_config=model_config)
+        if self._context_compacted_now(conversation_context):
+            status("preparing", {"compacted_now": True})
 
         status("routing")
         router_decision = self.router.decide(
@@ -5815,6 +5826,13 @@ class AgentLoop:
             chat_session.context_state_json = next_state
             self.db.add(chat_session)
         return context
+
+    @staticmethod
+    def _context_compacted_now(context: dict[str, object] | None) -> bool:
+        if not isinstance(context, dict):
+            return False
+        metadata = context.get("metadata")
+        return isinstance(metadata, dict) and metadata.get("compacted_now") is True
 
     def _context_summary_builder(
         self, model_config: ModelConfig

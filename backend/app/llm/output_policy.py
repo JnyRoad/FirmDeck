@@ -5,6 +5,10 @@ from __future__ import annotations
 # Long-form code/content generation intentionally keeps a larger allowance.
 OPERATION_MAX_OUTPUT_TOKENS: dict[str, int] = {
     "router.scene": 4096,
+    "step_agent.run": 4096,
+    "step_agent.repair": 4096,
+    "response.generate": 4096,
+    "response.generate_stream": 4096,
     "context.compact": 2048,
     "reflection.review": 2048,
     "general_skill.select": 2048,

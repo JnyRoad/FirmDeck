@@ -153,6 +153,10 @@ def render_stage_user_message(
     sections.extend(
         [
             f"当前阶段：\n{stage.get('phase') or '未指定'}",
+            (
+                "思考要求：\n保留完成当前阶段所需的简短思考；不要复述上下文、逐字段展开检查、"
+                "罗列无关备选方案或反复验证已明确的信息。得到可靠结论后立即按输出约束作答。"
+            ),
             f"阶段规则：\n{str(stage.get('instructions') or '').strip()}",
             "当前阶段独有内容：\n"
             + json.dumps(projected, ensure_ascii=False, separators=(",", ":")),

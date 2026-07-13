@@ -160,6 +160,47 @@ def test_generate_text_persists_provider_request_metrics():
     assert finished["request_text_chars"] == len("system prompt") + len(
         '{"hello": "world"}'
     )
+    assert finished["request_message_roles"] == ["system", "user"]
+    assert len(finished["request_prefix_fingerprints"]) == 2
+
+
+def test_generate_text_persists_provider_cache_usage_metrics():
+    client = object.__new__(LLMClient)
+    client.client = _FakeOpenAIClient()
+    client.model = "demo-model"
+    client.base_url = "https://example.test/v1"
+    client.temperature = 0.2
+    client.max_output_tokens = 256
+    events: list[tuple[str, dict]] = []
+    message = type("Message", (), {"content": "ok"})()
+    choice = type("Choice", (), {"message": message, "finish_reason": "stop"})()
+    prompt_details = type("PromptDetails", (), {"cached_tokens": 448})()
+    usage = type(
+        "Usage",
+        (),
+        {
+            "prompt_tokens": 3217,
+            "completion_tokens": 848,
+            "total_tokens": 4065,
+            "prompt_tokens_details": prompt_details,
+        },
+    )()
+    completion = type(
+        "Completion",
+        (),
+        {"id": "as-demo", "choices": [choice], "usage": usage},
+    )()
+    client.client.chat.completions.create = lambda **_kwargs: completion
+
+    with bind_span_sink(lambda event_type, payload: events.append((event_type, payload))):
+        assert client.generate_text("system", {"hello": "world"}) == "ok"
+
+    finished = next(
+        payload for event_type, payload in events if event_type == "llm_call_finished"
+    )
+    assert finished["input_tokens"] == 3217
+    assert finished["cached_input_tokens"] == 448
+    assert finished["uncached_input_tokens"] == 2769
 
 
 def test_generate_text_retries_empty_response():
@@ -405,6 +446,8 @@ def test_stage_input_uses_stable_history_and_puts_memory_time_and_question_first
     assert "本轮时间：\n2026-07-13T20:30:00+08:00" in current
     assert "本轮用户输入：\n我想申请报销" in current
     assert "当前阶段：\nRouter" in current
+    assert "思考要求：" in current
+    assert "保留完成当前阶段所需的简短思考" in current
     assert "available_skills" in current
     assert "memory_internal" not in current
     assert sum("我想申请报销" in str(message["content"]) for message in messages) == 1
@@ -744,7 +787,7 @@ def test_internal_output_budget_never_increases_smaller_model_config():
     assert operation_output_tokens("router.scene", 256) == 256
 
 
-def test_user_visible_response_keeps_configured_output_budget():
+def test_user_visible_response_caps_output_budget_at_4096():
     client = object.__new__(LLMClient)
     client.client = _FakeOpenAIClient()
     client.model = "demo-model"
@@ -754,13 +797,17 @@ def test_user_visible_response_keeps_configured_output_budget():
     with llm_operation("response.generate"):
         assert client.generate_text("system prompt", {}) == "ok"
 
-    assert client.client.chat.completions.calls[0]["max_tokens"] == 8192
+    assert client.client.chat.completions.calls[0]["max_tokens"] == 4096
 
 
 @pytest.mark.parametrize(
     ("operation", "expected"),
     [
         ("router.scene", 4096),
+        ("step_agent.run", 4096),
+        ("step_agent.repair", 4096),
+        ("response.generate", 4096),
+        ("response.generate_stream", 4096),
         ("reflection.review", 2048),
         ("general_skill.select", 2048),
         ("general_skill.review", 2048),
@@ -775,9 +822,9 @@ def test_control_plane_operation_output_budgets(operation, expected):  # noqa: A
     assert operation_output_tokens(operation, 8192) == expected
 
 
-def test_step_agent_uses_configured_output_budget() -> None:
-    assert operation_output_tokens("step_agent.run", 8192) == 8192
-    assert operation_output_tokens("step_agent.repair", 8192) == 8192
+def test_step_agent_caps_output_budget_at_4096() -> None:
+    assert operation_output_tokens("step_agent.run", 8192) == 4096
+    assert operation_output_tokens("step_agent.repair", 8192) == 4096
 
 
 def test_generate_json_falls_back_when_json_object_mode_is_unsupported():

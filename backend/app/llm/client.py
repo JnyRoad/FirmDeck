@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 from collections.abc import Iterator
 import copy
+import hashlib
 import json
 import math
 import re
@@ -171,6 +172,7 @@ class LLMClient:
                     max_output_tokens=max_output_tokens,
                     **request_shape,
                 )
+                stream_usage_metrics: dict[str, Any] = {}
                 pending_parts: list[str] = []
                 recorded_parts: list[str] = []
                 emitted_text = False
@@ -193,6 +195,9 @@ class LLMClient:
                     provider_setup_ms = span.elapsed_ms()
                     for chunk in stream:
                         chunk_count += 1
+                        chunk_usage_metrics = _usage_span_metrics(getattr(chunk, "usage", None))
+                        if chunk_usage_metrics:
+                            stream_usage_metrics.update(chunk_usage_metrics)
                         response_id = _safe_fragment(getattr(chunk, "id", None), 48)
                         if response_id:
                             response_ids.add(response_id)
@@ -230,6 +235,7 @@ class LLMClient:
                         output_chars=output_chars,
                         stream_chunks=chunk_count,
                         reasoning_chars=reasoning_chars,
+                        **stream_usage_metrics,
                     )
                     raise
                 if emitted_text:
@@ -243,6 +249,7 @@ class LLMClient:
                         reasoning_chars=reasoning_chars,
                         finish_reasons=sorted(finish_reasons),
                         provider_response_ids=sorted(response_ids),
+                        **stream_usage_metrics,
                     )
                     _record_stage_exchange(
                         user_payload,
@@ -262,6 +269,7 @@ class LLMClient:
                     finish_reasons=sorted(finish_reasons),
                     provider_response_ids=sorted(response_ids),
                     status="empty",
+                    **stream_usage_metrics,
                 )
                 empty_diagnostics.append(
                     _stream_empty_diagnostic(
@@ -387,7 +395,7 @@ def _request_shape_metrics(
     context_messages: list[dict[str, Any]],
     serialized_payload: str | list[dict[str, Any]],
     request_messages: list[dict[str, Any]],
-) -> dict[str, int]:
+) -> dict[str, Any]:
     context_chars = sum(
         len(_content_text(message.get("content"))) for message in context_messages
     )
@@ -400,7 +408,33 @@ def _request_shape_metrics(
         "context_text_chars": context_chars,
         "payload_chars": len(_content_text(serialized_payload)),
         "request_text_chars": request_chars,
+        "request_message_count": len(request_messages),
+        "request_message_roles": [str(message.get("role") or "") for message in request_messages],
+        "request_message_chars": [
+            len(_content_text(message.get("content"))) for message in request_messages
+        ],
+        "request_prefix_fingerprints": _request_prefix_fingerprints(request_messages),
     }
+
+
+def _request_prefix_fingerprints(messages: list[dict[str, Any]]) -> list[str]:
+    digest = hashlib.sha256()
+    fingerprints: list[str] = []
+    for message in messages:
+        serialized = json.dumps(
+            {
+                "role": str(message.get("role") or ""),
+                "content": message.get("content"),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        digest.update(serialized.encode("utf-8"))
+        digest.update(b"\n")
+        fingerprints.append(digest.hexdigest()[:16])
+    return fingerprints
 
 
 def _request_messages(
@@ -585,16 +619,65 @@ def _completion_span_metrics(completion: Any) -> dict[str, Any]:
         return {}
     choices = getattr(completion, "choices", None) or []
     finish_reason = None
+    message = None
     if choices:
         finish_reason = _safe_fragment(getattr(choices[0], "finish_reason", None), 32) or None
+        message = getattr(choices[0], "message", None)
     usage = getattr(completion, "usage", None)
     return {
         "provider_response_id": _safe_fragment(getattr(completion, "id", None), 48) or None,
         "finish_reason": finish_reason,
-        "input_tokens": getattr(usage, "prompt_tokens", None),
-        "output_tokens": getattr(usage, "completion_tokens", None),
-        "total_tokens": getattr(usage, "total_tokens", None),
+        "reasoning_chars": len(_reasoning_text(message)),
+        **_usage_span_metrics(usage),
     }
+
+
+def _usage_span_metrics(usage: Any) -> dict[str, Any]:
+    if usage is None:
+        return {}
+    input_tokens = _usage_value(usage, "prompt_tokens", "input_tokens")
+    output_tokens = _usage_value(usage, "completion_tokens", "output_tokens")
+    total_tokens = _usage_value(usage, "total_tokens")
+    prompt_details = _usage_object(usage, "prompt_tokens_details", "input_tokens_details")
+    cached_input_tokens = _usage_value(
+        prompt_details,
+        "cached_tokens",
+        "cache_read_tokens",
+        "cache_read_input_tokens",
+    )
+    if cached_input_tokens is None:
+        cached_input_tokens = _usage_value(
+            usage,
+            "cached_tokens",
+            "prompt_cache_hit_tokens",
+            "cache_read_input_tokens",
+        )
+    metrics: dict[str, Any] = {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+        "cached_input_tokens": cached_input_tokens,
+    }
+    if input_tokens is not None and cached_input_tokens is not None:
+        metrics["uncached_input_tokens"] = max(0, input_tokens - cached_input_tokens)
+    return {key: value for key, value in metrics.items() if value is not None}
+
+
+def _usage_object(source: Any, *names: str) -> Any:
+    for name in names:
+        value = source.get(name) if isinstance(source, dict) else getattr(source, name, None)
+        if value is not None:
+            return value
+    return None
+
+
+def _usage_value(source: Any, *names: str) -> int | None:
+    value = _usage_object(source, *names)
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    return None
 
 
 def _content_text(content: Any) -> str:
