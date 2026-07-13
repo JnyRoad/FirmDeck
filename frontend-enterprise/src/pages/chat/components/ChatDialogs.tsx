@@ -240,7 +240,7 @@ export default function ChatDialogs({ chat }: { chat: UseChatSession }) {
 function CitationMarkdown({ content }: { content: string }) {
   return (
     <div className={CHAT_CITATION_DETAIL_MARKDOWN_CLASS}>
-      <MarkdownMessage content={content} />
+      <MarkdownMessage content={content} preserveLineBreaks={false} />
     </div>
   );
 }

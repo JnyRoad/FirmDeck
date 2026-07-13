@@ -4,6 +4,7 @@ import ast
 from collections.abc import Iterator
 import copy
 import json
+import math
 import re
 from typing import Any
 from urllib.parse import urlsplit
@@ -12,7 +13,8 @@ from openai import OpenAI
 
 from app.config import get_settings
 from app.db.models import ModelConfig
-from app.llm.output_policy import compact_json_system_prompt, operation_output_tokens
+from app.llm.output_policy import operation_output_tokens
+from app.llm.stage_protocol import STAGE_PROTOCOL_KEY
 from app.observability.spans import current_llm_operation, llm_span_attributes, start_llm_call
 from app.security.encryption import decrypt_secret
 
@@ -25,6 +27,11 @@ JSON_REPAIR_ATTEMPTS = 3
 EMPTY_RESPONSE_RETRIES = 2
 EMPTY_RESPONSE_MESSAGE = "Model returned an empty response"
 DEFAULT_MODEL_API_TIMEOUT_SECONDS = 600.0
+DEFAULT_INPUT_TOKEN_BUDGET = 32_000
+
+
+class _CurrentStageText(str):
+    pass
 
 
 class LLMClient:
@@ -48,15 +55,15 @@ class LLMClient:
     def generate_text(
         self,
         system_prompt: str,
-        user_payload: dict[str, Any],
+        user_payload: dict[str, Any] | str,
         response_format: dict[str, str] | None = None,
     ) -> str:
         max_output_tokens = operation_output_tokens(
             current_llm_operation(), self.max_output_tokens
         )
-        context_messages, serialized_payload = _project_context_messages(user_payload)
-        serialized = json.dumps(serialized_payload, ensure_ascii=False)
+        context_messages, serialized = _prepare_user_input(user_payload)
         request_messages = _request_messages(system_prompt, context_messages, serialized)
+        request_messages = _fit_request_messages(request_messages)
         request_shape = _request_shape_metrics(
             system_prompt, context_messages, serialized, request_messages
         )
@@ -114,14 +121,14 @@ class LLMClient:
             raise LLMError(_provider_failure_detail(self, exc)) from exc
 
     def generate_text_stream(
-        self, system_prompt: str, user_payload: dict[str, Any]
+        self, system_prompt: str, user_payload: dict[str, Any] | str
     ) -> Iterator[str]:
         max_output_tokens = operation_output_tokens(
             current_llm_operation(), self.max_output_tokens
         )
-        context_messages, serialized_payload = _project_context_messages(user_payload)
-        serialized = json.dumps(serialized_payload, ensure_ascii=False)
+        context_messages, serialized = _prepare_user_input(user_payload)
         request_messages = _request_messages(system_prompt, context_messages, serialized)
+        request_messages = _fit_request_messages(request_messages)
         request_shape = _request_shape_metrics(
             system_prompt, context_messages, serialized, request_messages
         )
@@ -239,7 +246,6 @@ class LLMClient:
             raise LLMError(_provider_failure_detail(self, exc)) from exc
 
     def generate_json(self, system_prompt: str, user_payload: dict[str, Any]) -> dict[str, Any]:
-        system_prompt = compact_json_system_prompt(system_prompt)
         outputs: list[str] = []
         next_payload = user_payload
         last_error: json.JSONDecodeError | None = None
@@ -319,7 +325,7 @@ def _completion_message_content(completion: Any) -> str:
 def _request_shape_metrics(
     system_prompt: str,
     context_messages: list[dict[str, Any]],
-    serialized_payload: str,
+    serialized_payload: str | list[dict[str, Any]],
     request_messages: list[dict[str, Any]],
 ) -> dict[str, int]:
     context_chars = sum(
@@ -332,7 +338,7 @@ def _request_shape_metrics(
         "system_prompt_chars": len(system_prompt),
         "context_message_count": len(context_messages),
         "context_text_chars": context_chars,
-        "payload_chars": len(serialized_payload),
+        "payload_chars": len(_content_text(serialized_payload)),
         "request_text_chars": request_chars,
     }
 
@@ -340,17 +346,112 @@ def _request_shape_metrics(
 def _request_messages(
     system_prompt: str,
     context_messages: list[dict[str, Any]],
-    serialized_payload: str,
+    serialized_payload: str | list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    system_content = system_prompt.rstrip()
-    if context_messages and serialized_payload != "{}":
-        system_content += f"\n\n当前执行状态（JSON）：\n{serialized_payload}"
-    messages: list[dict[str, Any]] = [{"role": "system", "content": system_content}]
-    if not context_messages:
-        messages.append({"role": "user", "content": serialized_payload})
-        return messages
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": system_prompt.rstrip()}
+    ]
     messages.extend(context_messages)
+    if serialized_payload != "{}":
+        current_input = serialized_payload
+        if (
+            context_messages
+            and isinstance(serialized_payload, str)
+            and not isinstance(serialized_payload, _CurrentStageText)
+        ):
+            current_input = (
+                "本轮输入（仅用于当前调用，不写入对话历史）：\n"
+                f"{serialized_payload}"
+            )
+        messages.append(
+            {
+                "role": "user",
+                "content": current_input,
+            }
+        )
+    elif not context_messages:
+        messages.append({"role": "user", "content": "{}"})
     return messages
+
+
+def _fit_request_messages(
+    messages: list[dict[str, Any]], token_budget: int = DEFAULT_INPUT_TOKEN_BUDGET
+) -> list[dict[str, Any]]:
+    projected = copy.deepcopy(messages)
+    while len(projected) > 2 and _request_tokens(projected) > token_budget:
+        removable_index = next(
+            (
+                index
+                for index in range(1, len(projected) - 1)
+                if not _is_history_summary_message(projected[index])
+            ),
+            None,
+        )
+        if removable_index is None:
+            break
+        projected.pop(removable_index)
+
+    while len(projected) > 2 and _request_tokens(projected) > token_budget:
+        projected.pop(1)
+
+    if projected and _request_tokens(projected) > token_budget:
+        fixed_tokens = _request_tokens(projected[:-1])
+        projected[-1] = _trim_request_message(
+            projected[-1], max(1, token_budget - fixed_tokens)
+        )
+    return projected
+
+
+def _request_tokens(messages: list[dict[str, Any]]) -> int:
+    return sum(
+        max(1, math.ceil(len(_content_text(message.get("content")).encode("utf-8")) / 4))
+        + 6
+        for message in messages
+    )
+
+
+def _is_history_summary_message(message: dict[str, Any]) -> bool:
+    content = _content_text(message.get("content")).lstrip()
+    return content.startswith(
+        ("历史的信息可以被总结为：", "近期的历史信息总结为：")
+    )
+
+
+def _trim_request_message(
+    message: dict[str, Any], token_budget: int
+) -> dict[str, Any]:
+    content = message.get("content")
+    byte_budget = max(4, token_budget * 4)
+    if isinstance(content, list):
+        parts = copy.deepcopy(content)
+        text_part = next(
+            (
+                part
+                for part in parts
+                if isinstance(part, dict)
+                and part.get("type") == "text"
+                and isinstance(part.get("text"), str)
+            ),
+            None,
+        )
+        if text_part is not None:
+            text_part["text"] = _trim_request_text(text_part["text"], byte_budget)
+        return {**message, "content": parts}
+    return {**message, "content": _trim_request_text(str(content or ""), byte_budget)}
+
+
+def _trim_request_text(text: str, byte_budget: int) -> str:
+    encoded = text.encode("utf-8")
+    if len(encoded) <= byte_budget:
+        return text
+    marker = "\n...<输入超过 32k，已省略中间部分>...\n"
+    marker_bytes = len(marker.encode("utf-8"))
+    available = max(8, byte_budget - marker_bytes)
+    head_size = int(available * 0.7)
+    tail_size = available - head_size
+    head = encoded[:head_size].decode("utf-8", errors="ignore")
+    tail = encoded[-tail_size:].decode("utf-8", errors="ignore")
+    return f"{head}{marker}{tail}"
 
 
 def _completion_span_metrics(completion: Any) -> dict[str, Any]:
@@ -673,7 +774,7 @@ def _project_context_messages(
         role = str(message.get("role") or "").strip()
         content = str(message.get("content") or "").strip()
         images = _normalize_image_parts(message.get("images"))
-        if role not in {"system", "user", "assistant"} or (not content and not images):
+        if role not in {"user", "assistant"} or (not content and not images):
             continue
         if images and role == "user":
             projected.append(
@@ -699,6 +800,94 @@ def _project_context_messages(
     if current_user_message and current_user_message == latest_user_message:
         payload.pop("user_message", None)
     return projected, _drop_empty_values(payload)
+
+
+def _prepare_user_input(
+    user_payload: dict[str, Any] | str,
+) -> tuple[list[dict[str, Any]], str | list[dict[str, Any]]]:
+    if isinstance(user_payload, str):
+        return [], user_payload.strip()
+    if isinstance(user_payload.get(STAGE_PROTOCOL_KEY), dict):
+        return _prepare_stage_user_input(user_payload)
+    context_messages, projected_payload = _project_context_messages(user_payload)
+    return context_messages, json.dumps(projected_payload, ensure_ascii=False)
+
+
+def _prepare_stage_user_input(
+    user_payload: dict[str, Any],
+) -> tuple[list[dict[str, Any]], str | list[dict[str, Any]]]:
+    payload = copy.deepcopy(user_payload)
+    stage = payload.pop(STAGE_PROTOCOL_KEY, {})
+    context = payload.pop("conversation_context", None)
+    context_messages = _project_messages_from_context(context)
+    user_message = str(payload.pop("user_message", "") or "").strip()
+    current_images: list[dict[str, Any]] = []
+    for index in range(len(context_messages) - 1, -1, -1):
+        message = context_messages[index]
+        if message.get("role") != "user":
+            continue
+        if _content_text(message.get("content")).strip() != user_message:
+            break
+        content = message.get("content")
+        if isinstance(content, list):
+            current_images = [
+                item
+                for item in content
+                if isinstance(item, dict) and item.get("type") == "image_url"
+            ]
+        context_messages.pop(index)
+        break
+
+    projected = _drop_empty_values(payload)
+    output_contract = stage.get("output_contract")
+    if not isinstance(output_contract, str):
+        output_contract = json.dumps(
+            output_contract or {}, ensure_ascii=False, separators=(",", ":")
+        )
+    sections = [
+        f"用户记忆：\n{stage.get('memory') or '无'}",
+        f"本轮时间：\n{stage.get('turn_time') or '未提供'}",
+        f"本轮用户输入：\n{user_message or '（空）'}",
+        f"当前阶段：\n{stage.get('phase') or '未指定'}",
+        f"阶段规则：\n{str(stage.get('instructions') or '').strip()}",
+        "当前阶段独有内容：\n"
+        + json.dumps(projected, ensure_ascii=False, separators=(",", ":")),
+        f"输出约束：\n{output_contract}",
+    ]
+    serialized = "\n\n".join(sections)
+    if not current_images:
+        return context_messages, _CurrentStageText(serialized)
+    return context_messages, [
+        {"type": "text", "text": serialized},
+        *current_images,
+    ]
+
+
+def _project_messages_from_context(context: Any) -> list[dict[str, Any]]:
+    if not isinstance(context, dict) or not isinstance(context.get("messages"), list):
+        return []
+    projected: list[dict[str, Any]] = []
+    for message in context["messages"]:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "").strip()
+        content = str(message.get("content") or "").strip()
+        images = _normalize_image_parts(message.get("images"))
+        if role not in {"user", "assistant"} or (not content and not images):
+            continue
+        if images and role == "user":
+            projected.append(
+                {
+                    "role": role,
+                    "content": [
+                        {"type": "text", "text": content or "（用户上传了图片附件）"},
+                        *images,
+                    ],
+                }
+            )
+        else:
+            projected.append({"role": role, "content": content})
+    return projected
 
 
 def _drop_empty_values(value: Any) -> Any:

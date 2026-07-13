@@ -36,7 +36,7 @@ REVIEW_PROMPT = PROMPT_DIR / "general_skill_review_prompt.md"
 REPLY_PROMPT = PROMPT_DIR / "general_skill_reply_prompt.md"
 RUN_TIMEOUT_SECONDS = 12
 MAX_OUTPUT_CHARS = 20000
-GENERAL_SKILL_MAX_TOKENS = 16384
+GENERAL_SKILL_MAX_TOKENS = 8192
 GENERAL_SKILL_MAX_ATTEMPTS = 10
 TraceSink = Callable[[dict[str, Any]], None]
 

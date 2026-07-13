@@ -1036,7 +1036,13 @@ export function useChatSession() {
           stream.turnId = recoveredRunningTurnId;
           stream.loading = true;
           stream.phase = stream.phase || '正在思考';
-          storeChanged = upsertStreamingTracePlaceholder(slot, id, recoveredRunningTurnId) || storeChanged;
+          const recoveredTrace = turnTraceRef.current.get(recoveredRunningTurnId);
+          const hasVisibleTrace = Boolean(recoveredTrace?.lines.some((line) => (
+            !line.provisional && !line.placeholder && Boolean(normalizeMessageText(line.text))
+          )));
+          if (hasVisibleTrace) {
+            storeChanged = upsertStreamingTracePlaceholder(slot, id, recoveredRunningTurnId) || storeChanged;
+          }
           setExpandedTraceIds((expanded) => (expanded.includes(recoveredRunningTurnId) ? expanded : [...expanded, recoveredRunningTurnId]));
           setCollapsedTraceIds((collapsed) => collapsed.filter((item) => item !== recoveredRunningTurnId));
         } else if (stream.turnId && !stream.loading) {
@@ -1236,7 +1242,7 @@ export function useChatSession() {
     notifyFeedback();
   }, [getSlot, notifyFeedback]);
 
-  const updateStreaming = useCallback((id: string, text: string, turnId?: string, allowEmpty = false) => {
+  const updateStreaming = useCallback((id: string, text: string, turnId?: string) => {
     const slot = getSlot(id);
     const stream = getStreamSlot(id);
     const activeTurnId = turnId || stream.turnId || undefined;
@@ -1259,7 +1265,7 @@ export function useChatSession() {
         && canonicalMessageTurnId(item, aliasMap) === activeCanonicalTurnId
       )
     ));
-    if (!text && index < 0 && !allowEmpty) return;
+    if (!normalizeMessageText(text) && index < 0) return;
     const previousMessage = index >= 0 ? slot.realtimeMessages[index] : undefined;
     const previousCanonicalTurnId = previousMessage ? canonicalMessageTurnId(previousMessage, aliasMap) : undefined;
     const previousCreatedAt = previousMessage && previousCanonicalTurnId === activeCanonicalTurnId
@@ -1302,8 +1308,19 @@ export function useChatSession() {
     if (!turnId) return;
     const stream = getStreamSlot(id);
     if (!stream.loading) return;
-    updateStreaming(id, stream.accumulated || '', turnId, true);
-  }, [getStreamSlot, updateStreaming]);
+    const trace = turnTraceRef.current.get(turnId);
+    const hasVisibleTrace = Boolean(trace?.lines.some((line) => (
+      !line.provisional && !line.placeholder && Boolean(normalizeMessageText(line.text))
+    )));
+    if (normalizeMessageText(stream.accumulated)) {
+      updateStreaming(id, stream.accumulated, turnId);
+      return;
+    }
+    if (!hasVisibleTrace) return;
+    if (upsertStreamingTracePlaceholder(getSlot(id), id, turnId)) {
+      notifyStore();
+    }
+  }, [getSlot, getStreamSlot, notifyStore, updateStreaming]);
 
   const flushStreaming = useCallback((id: string) => {
     const stream = getStreamSlot(id);
@@ -1658,6 +1675,12 @@ export function useChatSession() {
     const ownsStreamTurn = Boolean(eventStream.turnId)
       && (eventStream.turnId === traceTurnId || eventStream.turnId === turnId);
     const shouldTouchStream = !options?.preserveExistingStreamTurn || ownsStreamTurn;
+    const upsertVisibleTraceLine = (line: TraceLine) => {
+      upsertTraceLine(traceTurnId, line);
+      if (shouldTouchStream && traceTurnId) {
+        ensureStreamingTraceMessage(eventSessionId, traceTurnId);
+      }
+    };
     if (item.event === 'session_created') return;
     if (item.event === 'heartbeat') return;
     if (item.event === 'session_title_summarized') {
@@ -1673,10 +1696,7 @@ export function useChatSession() {
         if (shouldTouchStream && eventStream.turnId !== traceTurnId) {
           eventStream.turnId = traceTurnId;
         }
-        if (shouldTouchStream) {
-          ensureStreamingTraceMessage(eventSessionId, traceTurnId);
-        }
-        scheduledTaskTraceLines(draft).forEach((line) => upsertTraceLine(traceTurnId, line));
+        scheduledTaskTraceLines(draft).forEach(upsertVisibleTraceLine);
         finishTrace(traceTurnId);
         notifyStream();
       }
@@ -1686,16 +1706,13 @@ export function useChatSession() {
       if (shouldTouchStream && eventStream.turnId !== traceTurnId) {
         eventStream.turnId = traceTurnId;
       }
-      if (shouldTouchStream) {
-        ensureStreamingTraceMessage(eventSessionId, traceTurnId);
-      }
     }
     if (item.event === 'router_decision') {
-      upsertTraceLine(traceTurnId, routerDecisionTraceLine(item.data));
+      upsertVisibleTraceLine(routerDecisionTraceLine(item.data));
       return;
     }
     if (item.event === 'step_result') {
-      upsertTraceLine(traceTurnId, stepResultTraceLine(item.data));
+      upsertVisibleTraceLine(stepResultTraceLine(item.data));
       return;
     }
     if (item.event === 'skill_state') {
@@ -1705,7 +1722,7 @@ export function useChatSession() {
         .filter((entry): entry is NonNullable<typeof entry> => Boolean(entry))
         .forEach((skill) => {
           const label = streamSkillLabel(item.data, skill);
-          upsertTraceLine(traceTurnId, {
+          upsertVisibleTraceLine({
             id: `skill_${skill.skillId}_${skill.state || 'active'}`,
             kind: 'skill',
             text: `${label} ${skill.name || skill.skillId}`,
@@ -1719,7 +1736,7 @@ export function useChatSession() {
     if (item.event === 'general_skill_state') {
       const skillName = typeof item.data.skillName === 'string' ? item.data.skillName : '';
       const skillSlug = typeof item.data.skillSlug === 'string' ? item.data.skillSlug : '';
-      upsertTraceLine(traceTurnId, {
+      upsertVisibleTraceLine({
         id: `general_skill_${skillSlug || skillName || 'selected'}`,
         kind: 'skill',
         text: `选择通用技能 ${skillName || skillSlug || ''}`.trim(),
@@ -1754,7 +1771,7 @@ export function useChatSession() {
       const outputInfo = generalSkillTraceOutput(item.data, phase, detail);
       const codePhases = new Set(['plan_created', 'plan_failed', 'attempt_started', 'running_code', 'stdout_chunk', 'stderr_chunk', 'code_finished', 'code_timeout']);
       const runningPhases = new Set(['planning', 'repair_planning', 'attempt_started', 'running_code', 'reflection_reviewing', 'replying']);
-      upsertTraceLine(traceTurnId, {
+      upsertVisibleTraceLine({
         id,
         kind: codePhases.has(phase) ? 'code' : 'decision',
         text,
@@ -1775,7 +1792,7 @@ export function useChatSession() {
       return;
     }
     if (item.event === 'knowledge_result') {
-      upsertTraceLine(traceTurnId, {
+      upsertVisibleTraceLine({
         id: 'knowledge_lookup',
         kind: 'knowledge',
         text: '读取知识库',
@@ -1788,7 +1805,7 @@ export function useChatSession() {
     if (item.event === 'tool_result') {
       const tool = normalizeTraceTool(item.data);
       if (tool) {
-        upsertTraceLine(traceTurnId, {
+        upsertVisibleTraceLine({
           id: `tool_${tool.toolCallId || tool.rawToolName || tool.toolId}`,
           kind: 'tool',
           text: `${tool.isError ? '工具调用失败' : '调用工具'} ${tool.toolName}`,
@@ -1802,7 +1819,7 @@ export function useChatSession() {
     if (item.event === 'agent_loop_continued' || item.event === 'agent_loop_completed') {
       const iteration = typeof item.data.iteration === 'number' || typeof item.data.iteration === 'string' ? String(item.data.iteration) : '1';
       const targetTool = typeof item.data.target_tool_name === 'string' ? item.data.target_tool_name : '';
-      upsertTraceLine(traceTurnId, {
+      upsertVisibleTraceLine({
         id: `decision_stepping_tool_continuation_${iteration}`,
         kind: 'decision',
         text: '重新分析',
@@ -1817,7 +1834,7 @@ export function useChatSession() {
     if (item.event === 'reflection_decision') {
       const needsRetry = item.data.needs_retry === true;
       const skipped = item.data.skipped === true;
-      upsertTraceLine(traceTurnId, {
+      upsertVisibleTraceLine({
         id: 'reflection',
         kind: 'decision',
         text: skipped ? '反思已关闭' : needsRetry ? '反思后继续尝试' : '反思通过',
@@ -1841,17 +1858,17 @@ export function useChatSession() {
       }
       const scheduledTaskLine = scheduledTaskStatusTraceLine(phase, item.data);
       if (scheduledTaskLine) {
-        upsertTraceLine(traceTurnId, scheduledTaskLine);
+        upsertVisibleTraceLine(scheduledTaskLine);
       } else if (phase === 'error') {
-        upsertTraceLine(traceTurnId, streamErrorTraceLine(item.data, 'error_occurred'));
+        upsertVisibleTraceLine(streamErrorTraceLine(item.data, 'error_occurred'));
         finishTrace(traceTurnId, true);
       } else if (phase === 'tool' && typeof item.data.tool_name === 'string') {
         const toolCallId = typeof item.data.tool_call_id === 'string' ? item.data.tool_call_id : item.data.tool_name;
-        upsertTraceLine(traceTurnId, { id: `tool_${toolCallId}`, kind: 'tool', text: `正在调用 ${item.data.tool_name}`, state: 'running', icon: 'tool' });
+        upsertVisibleTraceLine({ id: `tool_${toolCallId}`, kind: 'tool', text: `正在调用 ${item.data.tool_name}`, state: 'running', icon: 'tool' });
       } else if (phase === 'routing') {
-        upsertTraceLine(traceTurnId, { id: 'decision_router', kind: 'decision', text: '判断意图', state: 'running', icon: 'judge', provisional: true });
+        upsertVisibleTraceLine({ id: 'decision_router', kind: 'decision', text: '判断意图', state: 'running', icon: 'judge' });
       } else if (isKnowledgeTracePhase(phase)) {
-        upsertTraceLine(traceTurnId, {
+        upsertVisibleTraceLine({
           id: 'knowledge_lookup',
           kind: 'knowledge',
           text: knowledgeTraceText(item.data),
@@ -1862,7 +1879,7 @@ export function useChatSession() {
       } else if (phase === 'stepping') {
         const repairReason = typeof item.data.repair_reason === 'string' ? item.data.repair_reason : 'main';
         const iteration = typeof item.data.iteration === 'number' || typeof item.data.iteration === 'string' ? `_${item.data.iteration}` : '';
-        upsertTraceLine(traceTurnId, {
+        upsertVisibleTraceLine({
           id: `decision_stepping_${repairReason}${iteration}`,
           kind: 'decision',
           text: repairReason === 'main' ? '决定下一步' : '重新分析',
@@ -1870,9 +1887,9 @@ export function useChatSession() {
           icon: repairReason === 'main' ? 'advance' : 'loading',
         });
       } else if (phase === 'reflecting') {
-        upsertTraceLine(traceTurnId, { id: 'reflection', kind: 'decision', text: '正在反思', state: 'running', icon: 'loading' });
+        upsertVisibleTraceLine({ id: 'reflection', kind: 'decision', text: '正在反思', state: 'running', icon: 'loading' });
       } else if (phase !== 'received') {
-        upsertTraceLine(traceTurnId, {
+        upsertVisibleTraceLine({
           id: `decision_status_${phase}`,
           kind: 'decision',
           text: shouldTouchStream ? eventStream.phase : publicStreamPhase(item.data),
@@ -1908,9 +1925,10 @@ export function useChatSession() {
         }
       }
       if (next === previous) return;
-      const wasEmpty = !previous;
+      const hadVisibleText = Boolean(normalizeMessageText(previous));
       eventStream.accumulated = next;
-      if (wasEmpty) {
+      if (!normalizeMessageText(next)) return;
+      if (!hadVisibleText) {
         updateStreaming(eventSessionId, eventStream.accumulated, eventStream.turnId || traceTurnId);
         notifyStream();
         return;
@@ -1998,7 +2016,7 @@ export function useChatSession() {
       clearStreamSlot(eventSessionId, true);
       eventStream.relayRecoveryStartedAt = null;
       eventStream.relayRecoveryTurnId = null;
-      upsertTraceLine(traceTurnId, streamErrorTraceLine(item.data, item.event));
+      upsertVisibleTraceLine(streamErrorTraceLine(item.data, item.event));
       window.setTimeout(() => {
         loadMessages(eventSessionId);
         loadTraces(eventSessionId);
@@ -2022,7 +2040,7 @@ export function useChatSession() {
       const userIntent = typeof result.router_decision?.user_intent === 'string' ? result.router_decision.user_intent : '';
       const decisionReason = typeof result.router_decision?.reason === 'string' ? result.router_decision.reason : '';
       if (userIntent || decisionReason) {
-        upsertTraceLine(traceTurnId, {
+        upsertVisibleTraceLine({
           id: 'decision_router',
           kind: 'decision',
           text: userIntent ? `判断意图 ${userIntent}` : '完成SOP判断',
@@ -2191,8 +2209,8 @@ export function useChatSession() {
     stream.accumulated = text;
     stream.relayRecoveryStartedAt = stream.relayRecoveryStartedAt || Date.now();
     stream.relayRecoveryTurnId = turnId;
-    if (streamChanged) {
-      updateStreaming(id, text, turnId, true);
+    if (streamChanged && normalizeMessageText(text)) {
+      updateStreaming(id, text, turnId);
     }
     setRunningTurn((current) => (
       current?.sessionId === id && current.turnId === turnId
@@ -2260,7 +2278,7 @@ export function useChatSession() {
           });
           if (recoveredText && recoveredText !== stream.accumulated) {
             stream.accumulated = recoveredText;
-            updateStreaming(id, recoveredText, recoveringTurnId, true);
+            updateStreaming(id, recoveredText, recoveringTurnId);
             notifyStream();
           }
           const hasTerminalRecoveryEvent = recoveryEvents.some((event) => isTerminalSessionEvent(event, isTerminalEvent));
@@ -2348,7 +2366,9 @@ export function useChatSession() {
             }
             stream.loading = true;
             stream.phase = '执行中';
-            updateStreaming(id, stream.accumulated || '', eventTurnId, true);
+            if (normalizeMessageText(stream.accumulated)) {
+              updateStreaming(id, stream.accumulated, eventTurnId);
+            }
             notifyStream();
           }
           handleStreamEvent(streamEvent, id, eventTurnId, { preserveExistingStreamTurn: true });
@@ -2530,7 +2550,6 @@ export function useChatSession() {
     setExpandedTraceIds((current) => (current.includes(turnId) ? current : [...current, turnId]));
     stream.loading = true;
     stream.phase = '正在思考';
-    updateStreaming(currentConversationId, '', turnId, true);
     setRunningTurn({ sessionId: currentConversationId, turnId });
     notifyStream();
 
@@ -2691,7 +2710,9 @@ export function useChatSession() {
       activeStream.turnId = activeTurnId;
       activeStream.relayRecoveryStartedAt = activeStream.relayRecoveryStartedAt || Date.now();
       activeStream.relayRecoveryTurnId = activeTurnId;
-      updateStreaming(targetSessionId, activeStream.accumulated || '', activeTurnId, true);
+      if (normalizeMessageText(activeStream.accumulated)) {
+        updateStreaming(targetSessionId, activeStream.accumulated, activeTurnId);
+      }
       setRunningTurn((current) => (
         current?.sessionId === targetSessionId && current.turnId === activeTurnId
           ? current

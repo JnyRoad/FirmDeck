@@ -274,7 +274,18 @@ def test_stream_emits_router_decision_before_reply_delta() -> None:
 
     loop.db = db
     loop.events = FakeEvents()
-    loop.memory = SimpleNamespace(recall=lambda *_args, **_kwargs: [])
+    preparing_seen_before_recall: list[bool] = []
+
+    def recall_after_initial_status(*_args, **_kwargs):  # noqa: ANN002, ANN003
+        preparing_seen_before_recall.append(
+            any(
+                event_type == "stream_status" and payload.get("phase") == "preparing"
+                for _, _, event_type, payload in loop.events.records
+            )
+        )
+        return []
+
+    loop.memory = SimpleNamespace(recall=recall_after_initial_status)
     loop.runtime = SimpleNamespace(apply_decision=lambda *_args, **_kwargs: None)
     loop.router = SimpleNamespace(
         decide=lambda *_args, **_kwargs: RouterDecision(
@@ -307,9 +318,16 @@ def test_stream_emits_router_decision_before_reply_delta() -> None:
 
     events = list(loop.handle_turn_stream(_request("你好")))
     names = [event["event"] for event in events]
+    preparing_index = next(
+        index
+        for index, event in enumerate(events)
+        if event["event"] == "status" and event["data"].get("phase") == "preparing"
+    )
     router_index = names.index("router_decision")
     reply_index = names.index("stream_delta")
 
+    assert preparing_seen_before_recall == [True]
+    assert names.index("user_message_received") < preparing_index < router_index
     assert router_index < reply_index
     router_payload = events[router_index]["data"]
     assert router_payload["user_intent"] == "问候"
@@ -1345,17 +1363,18 @@ def test_step_agent_receives_full_conversation_context_within_budget() -> None:
         RouterDecision(decision="clarify"),
     )
 
-    args, _kwargs = loop.step_agent.call_args[0]
-    recent_messages = args[7]
-    conversation_context = args[9]
+    _args, kwargs = loop.step_agent.call_args[0]
+    recent_messages = kwargs["recent_messages"]
+    conversation_context = kwargs["conversation_context"]
     assert len(recent_messages) == 16
     assert recent_messages[0]["content"] == "message 0"
     assert recent_messages[-1]["content"] == "message 15"
     assert conversation_context["metadata"]["compacted"] is False
     assert conversation_context["metadata"]["total_messages"] == 16
+    assert kwargs["current_knowledge"] is None
 
 
-def test_router_context_uses_recent_messages_only() -> None:
+def test_all_agent_stages_share_the_same_full_conversation_context() -> None:
     rows = [
         Message(
             tenant_id="tenant_demo",
@@ -1369,12 +1388,12 @@ def test_router_context_uses_recent_messages_only() -> None:
     loop.db = FakeMessageDb(rows)
     session = ChatSession(id="session_test", tenant_id="tenant_demo")
 
-    context = loop._conversation_context(session, max_messages=8)
+    context = loop._conversation_context(session)
 
-    assert len(context["messages"]) == 8
-    assert context["messages"][0]["content"] == "message 8"
+    assert len(context["messages"]) == 16
+    assert context["messages"][0]["content"] == "message 0"
     assert context["messages"][-1]["content"] == "message 15"
-    assert context["metadata"]["total_messages"] == 8
+    assert context["metadata"]["total_messages"] == 16
 
 
 def test_model_slot_validation_retry_does_not_fill_without_model_progress() -> None:

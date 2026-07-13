@@ -67,20 +67,22 @@ def test_step_agent_uses_model_json_for_slots_and_tool(monkeypatch):
     )
 
     assert captured["payload"]["active_skill"]["skill_id"] == "repair_ticket"
-    assert "技能节点是业务目标" in captured["system_prompt"]
+    assert "统一执行引擎" in captured["system_prompt"]
+    assert "技能节点是业务目标" in captured["payload"]["_agent_stage"]["instructions"]
     assert captured["payload"]["active_skill"]["current_step"]["node_id"] == (
         "collect_issue"
     )
-    assert captured["payload"]["active_skill"]["adjacent_edges"] == [
-        {"source_node_id": "collect_issue", "next_node_id": "reply_ticket"}
-    ]
     assert [
-        step["node_id"] for step in captured["payload"]["active_skill"]["target_steps"]
+        step["node_id"] for step in captured["payload"]["active_skill"]["next_steps"]
     ] == ["reply_ticket"]
+    assert "nodes" not in captured["payload"]["active_skill"]
+    assert "edges" not in captured["payload"]["active_skill"]
+    assert "adjacent_edges" not in captured["payload"]["active_skill"]
+    assert "target_steps" not in captured["payload"]["active_skill"]
     assert "active_step" not in captured["payload"]
     assert captured["payload"]["router_decision"]["user_intent"] == "设备报修"
     assert "recent_messages" not in captured["payload"]
-    assert captured["payload"]["memory_context"] == "- 张三"
+    assert captured["payload"]["_agent_stage"]["memory"] == "- 张三"
     assert captured["payload"]["awaiting_input"]["question_summary"] == "请描述设备问题。"
     assert "repair_context" in captured["payload"]
     assert result.slot_updates["asset_id"] == "EQ-9"
@@ -119,7 +121,7 @@ def test_step_agent_compacts_knowledge_continuation_without_duplicate_results(mo
         ChatSession(
             id="session_test",
             tenant_id="tenant_demo",
-            knowledge_context_json=[knowledge_result],
+            knowledge_context_json=[{"evidence_pack": [{"content": "上一轮旧知识"}]}],
         ),
         None,
         [],
@@ -129,17 +131,20 @@ def test_step_agent_compacts_knowledge_continuation_without_duplicate_results(mo
             "knowledge_results": knowledge_result,
         },
         recent_messages=[{"role": "user", "content": "设备无法启动"}],
+        current_knowledge=[knowledge_result],
     )
 
     assert "recent_messages" not in captured["payload"]
     assert "knowledge_results" not in captured["payload"]["repair_context"]
     assert captured["payload"]["repair_context"]["knowledge_results_available_in"] == (
-        "knowledge_context"
+        "retrieved_knowledge"
     )
-    compacted = captured["payload"]["knowledge_context"][0]
+    compacted = captured["payload"]["retrieved_knowledge"][0]
     assert "chunks" not in compacted
     assert "expanded_sections" not in compacted
-    assert len(compacted["evidence_pack"][0]["content"]) <= 803
+    assert "selected_documents" not in compacted
+    assert "上一轮旧知识" not in str(captured["payload"])
+    assert len(compacted["retrieved_knowledge"][0]["content"]) <= 803
 
 
 def _repair_skill() -> Skill:

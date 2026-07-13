@@ -2,6 +2,7 @@ import pytest
 
 from app.llm.client import LLMClient, LLMError
 from app.llm.output_policy import operation_output_tokens
+from app.llm.stage_protocol import stage_payload
 from app.llm.schemas import ModelConfigCreateRequest
 from app.observability.spans import bind_span_sink, llm_operation
 
@@ -108,6 +109,22 @@ def test_generate_text_uses_chat_completions_only():
         {"role": "user", "content": '{"hello": "world"}'},
     ]
     assert call["max_tokens"] == 256
+
+
+def test_generate_text_preserves_plain_user_content_without_json_encoding():
+    client = object.__new__(LLMClient)
+    client.client = _FakeOpenAIClient()
+    client.model = "demo-model"
+    client.temperature = 0.2
+    client.max_output_tokens = 256
+
+    content = "技能标题：新SOP\n原始流程：\n收集报销事由并提交审批。"
+
+    assert client.generate_text("system prompt", content) == "ok"
+    assert client.client.chat.completions.calls[0]["messages"] == [
+        {"role": "system", "content": "system prompt"},
+        {"role": "user", "content": content},
+    ]
 
 
 def test_generate_text_persists_provider_request_metrics():
@@ -332,24 +349,106 @@ def test_generate_text_projects_conversation_context_messages():
 
     assert output == "ok"
     call = client.client.chat.completions.calls[0]
-    assert call["messages"][0]["role"] == "system"
+    assert call["messages"][0] == {"role": "system", "content": "system prompt"}
     assert sum(message["role"] == "system" for message in call["messages"]) == 1
-    assert call["messages"][0]["content"].startswith("system prompt")
-    assert "当前执行状态（JSON）" in call["messages"][0]["content"]
-    assert '"execution_state": {"active_skill_id": "purchase"}' in call["messages"][0][
-        "content"
-    ]
-    assert '"user_message"' not in call["messages"][0]["content"]
-    assert '"conversation_context"' not in call["messages"][0]["content"]
-    assert '"active_step_id"' not in call["messages"][0]["content"]
-    assert '"slots"' not in call["messages"][0]["content"]
-    assert '"pending_tasks"' not in call["messages"][0]["content"]
-    assert call["messages"][1:] == [
+    assert call["messages"][1:4] == [
         {"role": "user", "content": "我是 hx，我要买 A2"},
         {"role": "assistant", "content": "请问买几个？"},
         {"role": "user", "content": "买两个"},
     ]
-    assert call["messages"][-1] == {"role": "user", "content": "买两个"}
+    current_input = call["messages"][-1]
+    assert current_input["role"] == "user"
+    assert current_input["content"].startswith("本轮输入（仅用于当前调用，不写入对话历史）：")
+    assert '"execution_state": {"active_skill_id": "purchase"}' in current_input["content"]
+    assert '"user_message"' not in current_input["content"]
+    assert '"conversation_context"' not in current_input["content"]
+    assert '"active_step_id"' not in current_input["content"]
+    assert '"slots"' not in current_input["content"]
+    assert '"pending_tasks"' not in current_input["content"]
+
+
+def test_stage_input_uses_stable_history_and_puts_memory_time_and_question_first():
+    client = object.__new__(LLMClient)
+    client.client = _FakeOpenAIClient()
+    client.model = "demo-model"
+    client.temperature = 0.2
+    client.max_output_tokens = 256
+    payload = stage_payload(
+        phase="Router",
+        user_message="我想申请报销",
+        conversation_context={
+            "messages": [
+                {"role": "user", "content": "历史的信息可以被总结为：\n用户是研发人员"},
+                {"role": "user", "content": "近期的历史信息总结为：\n正在咨询差旅"},
+                {"role": "assistant", "content": "请说明本次需求"},
+                {"role": "user", "content": "我想申请报销"},
+            ],
+            "metadata": {"current_turn_time": "2026-07-13T20:30:00+08:00"},
+        },
+        memory_context=[{"content": "用户偏好简洁回复", "id": "memory_internal"}],
+        instructions="只根据技能摘要路由。",
+        stage_data={"available_skills": [{"skill_id": "travel", "name": "差旅报销"}]},
+        output_contract={"decision": "start_new_task | answer_only"},
+    )
+
+    assert client.generate_text("stable unified system", payload) == "ok"
+
+    messages = client.client.chat.completions.calls[0]["messages"]
+    assert messages[0] == {"role": "system", "content": "stable unified system"}
+    assert messages[1:4] == [
+        {"role": "user", "content": "历史的信息可以被总结为：\n用户是研发人员"},
+        {"role": "user", "content": "近期的历史信息总结为：\n正在咨询差旅"},
+        {"role": "assistant", "content": "请说明本次需求"},
+    ]
+    current = messages[-1]["content"]
+    assert current.startswith("用户记忆：\n- 用户偏好简洁回复\n\n本轮时间：")
+    assert "本轮时间：\n2026-07-13T20:30:00+08:00" in current
+    assert "本轮用户输入：\n我想申请报销" in current
+    assert "当前阶段：\nRouter" in current
+    assert "available_skills" in current
+    assert "memory_internal" not in current
+    assert sum("我想申请报销" in str(message["content"]) for message in messages) == 1
+
+
+def test_generate_text_keeps_append_only_history_prefix_for_kv_cache() -> None:
+    client = object.__new__(LLMClient)
+    client.client = _FakeOpenAIClient()
+    client.model = "demo-model"
+    client.temperature = 0.2
+    client.max_output_tokens = 256
+    stable_history = [
+        {"role": "user", "content": "你好"},
+        {"role": "assistant", "content": "您好"},
+        {"role": "user", "content": "查询退款规则"},
+    ]
+
+    client.generate_text(
+        "stable system",
+        {
+            "conversation_context": {"messages": stable_history},
+            "retrieved_knowledge": [{"label": "检索到的知识 1", "content": "七天内"}],
+        },
+    )
+    client.generate_text(
+        "stable system",
+        {
+            "conversation_context": {
+                "messages": [
+                    *stable_history,
+                    {"role": "assistant", "content": "七天内可申请退款。"},
+                    {"role": "user", "content": "需要什么材料？"},
+                ]
+            },
+            "slots": {"topic": "退款材料"},
+        },
+    )
+
+    first_messages = client.client.chat.completions.calls[0]["messages"]
+    second_messages = client.client.chat.completions.calls[1]["messages"]
+    assert first_messages[:4] == second_messages[:4]
+    assert first_messages[0] == {"role": "system", "content": "stable system"}
+    assert "检索到的知识 1" in first_messages[-1]["content"]
+    assert "检索到的知识 1" not in str(second_messages)
 
 
 def test_generate_text_projects_conversation_context_images_for_vision_model():
@@ -418,12 +517,13 @@ def test_generate_text_keeps_memory_capture_history_as_role_messages() -> None:
     messages = client.client.chat.completions.calls[0]["messages"]
     assert messages[0]["role"] == "system"
     assert sum(message["role"] == "system" for message in messages) == 1
-    assert messages[0]["content"].startswith("memory prompt")
-    assert '"existing_memories": "- profile/age: 32"' in messages[0]["content"]
-    assert messages[1:] == [
+    assert messages[0] == {"role": "system", "content": "memory prompt"}
+    assert messages[1:3] == [
         {"role": "user", "content": "我32岁"},
         {"role": "assistant", "content": "已记录"},
     ]
+    assert messages[-1]["role"] == "user"
+    assert '"existing_memories": "- profile/age: 32"' in messages[-1]["content"]
     assert all('"conversation_context"' not in str(message["content"]) for message in messages)
 
 
@@ -494,7 +594,7 @@ def test_generate_json_requests_json_object_mode():
     assert client.client.chat.completions.calls[0]["response_format"] == {"type": "json_object"}
 
 
-def test_internal_json_operation_caps_output_and_appends_compact_contract():
+def test_internal_json_operation_caps_output_without_mutating_system_prompt():
     client = object.__new__(LLMClient)
     client.client = _FakeOpenAIClient()
     client.model = "demo-model"
@@ -510,8 +610,7 @@ def test_internal_json_operation_caps_output_and_appends_compact_contract():
 
     call = client.client.chat.completions.calls[0]
     assert call["max_tokens"] == 1024
-    assert "不要输出思考过程" in call["messages"][0]["content"]
-    assert "只保留任务 schema 和业务执行所需字段" in call["messages"][0]["content"]
+    assert call["messages"][0]["content"] == "router prompt"
 
 
 def test_internal_output_budget_never_increases_smaller_model_config():
@@ -534,10 +633,12 @@ def test_user_visible_response_keeps_configured_output_budget():
 @pytest.mark.parametrize(
     ("operation", "expected"),
     [
-        ("router.task_scheduler", 512),
-        ("reflection.review", 512),
-        ("general_skill.select", 512),
-        ("knowledge.document_route", 512),
+        ("router.task_scheduler", 2048),
+        ("reflection.review", 2048),
+        ("general_skill.select", 2048),
+        ("general_skill.review", 2048),
+        ("general_skill.reply", 2048),
+        ("knowledge.document_route", 2048),
         ("knowledge.bucket_route", 512),
         ("memory.capture", 1024),
         ("session.title", 512),

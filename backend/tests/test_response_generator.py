@@ -561,7 +561,7 @@ def test_knowledge_result_does_not_prefer_generic_step_reply(monkeypatch):
         return None
 
     def fake_generate_text(self, system_prompt, payload):  # noqa: ANN001
-        assert payload["knowledge_results"]
+        assert payload["retrieved_knowledge"]
         assert payload["knowledge_citation_hints"]
         assert "knowledge_results" not in payload["step_summary"]
         assert "slot_updates" not in payload["step_summary"]
@@ -570,7 +570,7 @@ def test_knowledge_result_does_not_prefer_generic_step_reply(monkeypatch):
         assert "session" not in payload
         assert "content" not in payload["knowledge_citation_hints"][0]
         assert len(
-            payload["knowledge_results"][0]["evidence_pack"][0]["content"]
+            payload["retrieved_knowledge"][0]["retrieved_knowledge"][0]["content"]
         ) <= 803
         return "前端规范包括目录组织、命名规范和组件编写规范。[1]"
 

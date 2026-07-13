@@ -39,12 +39,15 @@ def test_compact_knowledge_context_keeps_evidence_without_duplicate_payloads() -
     assert len(compacted) == 1
     assert "chunks" not in compacted[0]
     assert "expanded_sections" not in compacted[0]
-    assert "outline" not in compacted[0]["selected_documents"][0]
-    evidence = compacted[0]["evidence_pack"][0]
-    assert "chunk_id" not in evidence
-    assert len(evidence["content"]) <= 803
-    assert "excerpt" not in evidence
-    assert len(compacted[0]["selected_documents"][0]["summary"]) <= 603
+    assert "selected_documents" not in compacted[0]
+    knowledge = compacted[0]["retrieved_knowledge"]
+    assert knowledge[0]["label"] == "检索到的知识 1"
+    assert knowledge[1]["label"] == "检索到的知识 2"
+    assert "chunk_id" not in knowledge[0]
+    assert len(knowledge[0]["content"]) <= 803
+    assert "excerpt" not in knowledge[0]
+    assert "outline" not in knowledge[1]
+    assert len(knowledge[1]["summary"]) <= 603
     assert result["chunks"][0]["content"].startswith("重复切片")
 
 
@@ -65,7 +68,10 @@ def test_compact_step_result_only_projects_knowledge_results() -> None:
 
     assert compacted["reply"] == "已找到规则"
     assert compacted["slot_updates"] == {"order_id": "A001"}
-    assert len(compacted["knowledge_results"][0]["evidence_pack"][0]["content"]) <= 803
+    assert "knowledge_results" not in compacted
+    assert len(
+        compacted["retrieved_knowledge"][0]["retrieved_knowledge"][0]["content"]
+    ) <= 803
 
 
 def test_compact_conversation_context_keeps_recent_history_within_control_budget() -> None:
@@ -118,11 +124,70 @@ def test_step_skill_context_keeps_only_local_graph_and_complete_instructions() -
     assert compacted["skill_id"] == "refund"
     assert compacted["response_rules"] == ["展示退款状态"]
     assert compacted["current_step"]["instruction"] == current_instruction
-    assert compacted["adjacent_edges"] == [
-        {"source_node_id": "collect_order", "next_node_id": "query_order"}
+    assert compacted["next_steps"] == [
+        {
+            "node_id": "query_order",
+            "type": "tool",
+            "instruction": target_instruction,
+        }
     ]
-    assert compacted["target_steps"][0]["instruction"] == target_instruction
+    assert "nodes" not in compacted
+    assert "edges" not in compacted
+    assert "adjacent_edges" not in compacted
+    assert "target_steps" not in compacted
     assert "unrelated" not in str(compacted)
+
+
+def test_step_skill_context_embeds_only_direct_transition_metadata() -> None:
+    compacted = compact_step_skill_context(
+        {
+            "nodes": [
+                {"node_id": "current", "instruction": "当前"},
+                {"node_id": "approved", "instruction": "通过"},
+                {"node_id": "rejected", "instruction": "拒绝"},
+                {"node_id": "after_approved", "instruction": "后续节点不得传入"},
+            ],
+            "edges": [
+                {
+                    "source_node_id": "current",
+                    "next_node_id": "approved",
+                    "condition": "amount <= limit",
+                    "label": "未超标",
+                    "priority": 1,
+                },
+                {
+                    "source_node_id": "current",
+                    "next_node_id": "rejected",
+                    "condition": "amount > limit",
+                    "label": "超标",
+                    "priority": 2,
+                },
+                {
+                    "source_node_id": "approved",
+                    "next_node_id": "after_approved",
+                    "condition": "always",
+                },
+            ],
+        },
+        "current",
+    )
+
+    assert compacted is not None
+    assert [step["node_id"] for step in compacted["next_steps"]] == [
+        "approved",
+        "rejected",
+    ]
+    assert compacted["next_steps"][0]["transition"] == {
+        "condition": "amount <= limit",
+        "label": "未超标",
+        "priority": 1,
+    }
+    assert compacted["next_steps"][1]["transition"] == {
+        "condition": "amount > limit",
+        "label": "超标",
+        "priority": 2,
+    }
+    assert "after_approved" not in str(compacted)
 
 
 def test_compact_memory_context_only_returns_deduplicated_content_text() -> None:

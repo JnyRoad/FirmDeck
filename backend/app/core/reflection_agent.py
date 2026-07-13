@@ -11,6 +11,11 @@ from app.core.context_projection import (
 )
 from app.db.models import ChatSession, ModelConfig, Skill, Tool
 from app.llm import LLMClient, LLMError
+from app.llm.stage_protocol import (
+    REFLECTION_OUTPUT_SCHEMA,
+    stage_payload,
+    unified_system_prompt,
+)
 from app.observability.spans import llm_operation
 from app.session.session_schema import RouterDecision, StepAgentResult
 from app.tools.tool_schema import ToolResult
@@ -41,13 +46,12 @@ class ReflectionAgent:
         available_tools: list[Tool],
         model_config: ModelConfig,
         conversation_context: dict[str, object] | None = None,
+        memory_context: list[dict[str, object]] | None = None,
     ) -> ReflectionDecision:
         if not action_needs_reflection(router_decision, step_result, tool_result):
             return ReflectionDecision()
 
-        payload = {
-            "user_message": message,
-            "conversation_context": compact_conversation_context(conversation_context),
+        stage_data = {
             "current_step": compact_current_step(
                 active_skill.content_json if active_skill else None,
                 session.active_step_id,
@@ -64,10 +68,19 @@ class ReflectionAgent:
             "step_result": compact_step_result(step_result.model_dump(mode="json")),
             "tool_result": tool_result.model_dump() if tool_result else None,
         }
+        payload = stage_payload(
+            phase="Reflection",
+            user_message=message,
+            conversation_context=compact_conversation_context(conversation_context),
+            memory_context=memory_context,
+            instructions=PROMPT_PATH.read_text(encoding="utf-8"),
+            stage_data=stage_data,
+            output_contract=REFLECTION_OUTPUT_SCHEMA,
+        )
         try:
             with llm_operation("reflection.review"):
                 raw = LLMClient(model_config).generate_json(
-                    PROMPT_PATH.read_text(encoding="utf-8"), payload
+                    unified_system_prompt(), payload
                 )
             return ReflectionDecision.model_validate(raw)
         except Exception as exc:

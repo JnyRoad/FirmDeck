@@ -21,8 +21,9 @@ def test_router_payload_only_exposes_skill_routing_summary(monkeypatch):
             "description": "帮助用户购买商品。",
             "trigger_intents": ["购买", "下单"],
         }
-        assert "不要让原则10吞掉复合意图" in system_prompt
-        assert "不读取 SOP 节点图" in system_prompt
+        assert "统一执行引擎" in system_prompt
+        assert "不要让原则10吞掉复合意图" in payload["_agent_stage"]["instructions"]
+        assert "不读取 SOP 节点图" in payload["_agent_stage"]["instructions"]
         return {
             "decision": "answer_only",
             "target_skill_id": "price_compare",
@@ -54,7 +55,7 @@ def test_router_payload_only_exposes_skill_routing_summary(monkeypatch):
     assert decision.target_skill_id == "price_compare"
     assert decision.target_step_id == "collect_products"
     assert captured["payload"]["current_session"]["active_skill_id"] == "purchase"
-    assert captured["payload"]["memory_context"] == "- hm"
+    assert captured["payload"]["_agent_stage"]["memory"] == "- hm"
     assert "knowledge_context" not in captured["payload"]["current_session"]
     assert "tenant_id" not in captured["payload"]["current_session"]
 
@@ -64,7 +65,7 @@ def test_router_accepts_ordered_pending_tasks(monkeypatch):
         return None
 
     def fake_generate_json(self, system_prompt, payload):  # noqa: ANN001
-        assert "pending_tasks" in system_prompt
+        assert "pending_tasks" in payload["_agent_stage"]["instructions"]
         assert payload["current_session"]["active_skill_id"] == "refund"
         return {
             "decision": "continue_active",
@@ -115,7 +116,7 @@ def test_task_scheduler_selects_multiple_existing_task_frames(monkeypatch):
         return None
 
     def fake_generate_json(self, system_prompt, payload):  # noqa: ANN001
-        assert "task scheduler" in system_prompt
+        assert "task scheduler" in payload["_agent_stage"]["instructions"]
         assert payload["candidate_task_frames"][0]["task_id"] == "task_purchase_a3"
         assert payload["candidate_task_frames"][1]["task_id"] == "task_purchase_a1"
         return {
@@ -166,7 +167,7 @@ def test_task_scheduler_can_continue_price_compare_after_purchase_completion(mon
         return None
 
     def fake_generate_json(self, system_prompt, payload):  # noqa: ANN001
-        assert "task scheduler" in system_prompt
+        assert "task scheduler" in payload["_agent_stage"]["instructions"]
         assert payload["completed_reply"] == "购买流程已完成。"
         assert len(payload["candidate_task_frames"]) == 1
         candidate = payload["candidate_task_frames"][0]
@@ -276,7 +277,7 @@ def test_router_removes_hallucinated_target_skill_from_non_matching_flow(monkeyp
         return None
 
     def fake_generate_json(self, system_prompt, payload):  # noqa: ANN001
-        assert "不要编造 target_skill_id" in system_prompt
+        assert "不要编造 target_skill_id" in payload["_agent_stage"]["instructions"]
         return {
             "decision": "clarify",
             "target_skill_id": "skill_weather_query",
@@ -306,7 +307,7 @@ def test_router_strips_generated_message_content_slots(monkeypatch):
         return None
 
     def fake_generate_json(self, system_prompt, payload):  # noqa: ANN001
-        assert "禁止填写 `message_content`" in system_prompt
+        assert "禁止填写 `message_content`" in payload["_agent_stage"]["instructions"]
         return {
             "decision": "continue_active",
             "target_skill_id": "purchase",

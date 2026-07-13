@@ -46,9 +46,6 @@ export const CHAT_BUBBLE_ASSISTANT_CLASS =
 export const CHAT_BUBBLE_USER_CLASS =
   'rounded-[14px] bg-[#f6f6f6] px-[16px] py-[11px] text-[#18181a]';
 export const CHAT_BUBBLE_ERROR_CLASS = 'border-[#f38989] bg-[#fce7e7] text-[#d20b0b]';
-export const CHAT_BUBBLE_STREAMING_PLACEHOLDER_CLASS =
-  'inline-grid h-[42px] w-[48px] max-w-[48px] place-items-center px-0 py-0';
-
 export function chatRowClass(role: 'user' | 'assistant' | 'system' | 'tool'): string {
   return cn(
     CHAT_MESSAGE_ROW_BASE_CLASS,
@@ -71,9 +68,6 @@ export const CHAT_MESSAGE_MODE_CHIP_CLASS =
 export const CHAT_QUEUED_STATUS_ROW_CLASS = 'mt-[5px] flex justify-end pr-[2px]';
 export const CHAT_QUEUED_STATUS_CLASS =
   'inline-flex items-center gap-[4px] text-[11px] font-medium leading-[1.4] text-[#858b9c]';
-export const CHAT_TYPING_CARET_CLASS =
-  'inline-block h-[15px] w-[2px] translate-y-[2px] animate-pulse bg-[#18181a]';
-
 // ---------------------------------------------------------------------------
 // Markdown answer (styled via child selectors, code delegates to CodeBlock)
 // ---------------------------------------------------------------------------
@@ -264,15 +258,15 @@ export const CHAT_HANDOFF_BLOCK_CLASS =
 export const CHAT_HANDOFF_ACTIONS_CLASS = 'flex justify-end gap-[8px]';
 export const CHAT_HANDOFF_EMPTY_CLASS = 'py-[36px] text-center text-[13px] text-[#858b9c]';
 
-export const CHAT_CITATION_DETAIL_CLASS = 'grid gap-[14px]';
+export const CHAT_CITATION_DETAIL_CLASS = 'grid w-full min-w-0 gap-[14px]';
 export const CHAT_CITATION_DETAIL_EYEBROW_CLASS = 'text-[12px] font-medium text-[#858b9c]';
 export const CHAT_CITATION_DETAIL_TITLE_CLASS = 'text-[18px] font-semibold text-[#18181a]';
 export const CHAT_CITATION_DETAIL_SECTION_CLASS =
-  'grid gap-[5px] [&>span]:text-[12px] [&>span]:font-medium [&>span]:text-[#757f9c] [&>p]:text-[13px] [&>p]:leading-[1.7] [&>p]:text-[#464c5e]';
+  'grid w-full min-w-0 gap-[5px] [&>span]:text-[12px] [&>span]:font-medium [&>span]:text-[#757f9c] [&>p]:text-[13px] [&>p]:leading-[1.7] [&>p]:text-[#464c5e]';
 export const CHAT_CITATION_DETAIL_QUOTE_CLASS =
   'm-0 max-h-[min(52vh,520px)] overflow-y-auto overscroll-contain rounded-[10px] border-l-[3px] border-[#e3e7f1] bg-[#fafbfc] px-[12px] py-[8px] text-[13px] leading-[1.7] whitespace-pre-wrap wrap-anywhere text-[#464c5e]';
 export const CHAT_CITATION_DETAIL_MARKDOWN_CLASS =
-  'max-h-[min(52vh,520px)] min-w-0 max-w-full overflow-y-auto overscroll-contain rounded-[10px] border-l-[3px] border-[#e3e7f1] bg-[#fafbfc] px-[12px] py-[8px] [&>div]:text-[13px] [&>div]:leading-[1.7] [&>div]:text-[#464c5e] [&_h1]:text-[16px] [&_h2]:text-[15px] [&_h3]:text-[14px] [&_h4]:text-[13px] [&_p]:wrap-anywhere [&_li]:wrap-anywhere [&_code]:wrap-anywhere [&_a]:wrap-anywhere';
+  'max-h-[min(52vh,520px)] w-full min-w-0 max-w-full overflow-y-auto overscroll-contain rounded-[10px] border-l-[3px] border-[#e3e7f1] bg-[#fafbfc] px-[12px] py-[8px] [&>div]:w-full [&>div]:min-w-0 [&>div]:max-w-none [&>div]:text-[13px] [&>div]:leading-[1.7] [&>div]:text-[#464c5e] [&_h1]:text-[16px] [&_h2]:text-[15px] [&_h3]:text-[14px] [&_h4]:text-[13px] [&_p]:wrap-anywhere [&_li]:wrap-anywhere [&_code]:wrap-anywhere [&_a]:wrap-anywhere';
 export const CHAT_CITATION_DETAIL_GRID_CLASS =
   'grid grid-cols-2 gap-[12px] max-[520px]:grid-cols-1 [&>div]:grid [&>div]:gap-[3px] [&_span]:text-[11px] [&_span]:text-[#858b9c] [&_strong]:text-[13px] [&_strong]:font-medium [&_strong]:text-[#18181a]';
 export const CHAT_CITATION_DETAIL_NOTE_CLASS = 'text-[12px] leading-[1.6] text-[#858b9c]';

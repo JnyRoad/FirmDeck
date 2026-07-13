@@ -1,3 +1,5 @@
+import json
+
 from app.skills.skill_distiller import SkillDistiller
 from app.skills.skill_schema import SkillDistillRequest
 
@@ -67,6 +69,50 @@ def test_fallback_card_is_not_domain_hardcoded_for_commerce_text() -> None:
         not any(action.startswith("call_tool:") for action in node.allowed_actions)
         for node in card.nodes
     )
+
+
+def test_model_input_uses_plain_text_and_compacts_available_tools() -> None:
+    request = SkillDistillRequest(
+        tenant_id="tenant_demo",
+        title="新SOP",
+        raw_content="差旅报销申请，收集事由和金额后提交审批。",
+        available_tools=[
+            {
+                "id": "tool_internal_id",
+                "name": "expense.submit",
+                "display_name": "提交报销单",
+                "description": "提交差旅报销申请。",
+                "method": "POST",
+                "url": "http://localhost:5173/api/mock/expense/submit",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "reason": {"type": "string", "description": "报销事由"},
+                        "amount": {"type": "number", "description": "报销金额"},
+                    },
+                    "required": ["reason", "amount"],
+                },
+                "output_schema": {
+                    "type": "object",
+                    "properties": {"request_id": {"type": "string"}},
+                },
+            }
+        ],
+    )
+    distiller = SkillDistiller()
+
+    payload = distiller._payload(request)  # noqa: SLF001
+    model_input = distiller._model_input(request, payload)  # noqa: SLF001
+
+    projected_tool = payload["available_tools"][0]
+    assert set(projected_tool) == {"name", "display_name", "description", "input_schema"}
+    assert "output_schema" not in json.dumps(payload, ensure_ascii=False)
+    assert "tool_internal_id" not in model_input
+    assert "localhost:5173" not in model_input
+    assert model_input.startswith("技能标题：新SOP\n原始流程：")
+    assert "expense.submit（提交报销单）" in model_input
+    assert "reason (string, 必填)" in model_input
+    assert not model_input.lstrip().startswith("{")
 
 
 def test_slot_policy_targets_model_generated_fields() -> None:

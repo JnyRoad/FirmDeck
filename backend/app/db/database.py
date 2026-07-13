@@ -99,6 +99,9 @@ def _migrate_sqlite_skill_schema() -> None:
             if "knowledge_context_json" not in session_columns:
                 conn.execute(text("ALTER TABLE sessions ADD COLUMN knowledge_context_json JSON"))
                 conn.execute(text("UPDATE sessions SET knowledge_context_json = '[]'"))
+            if "context_state_json" not in session_columns:
+                conn.execute(text("ALTER TABLE sessions ADD COLUMN context_state_json JSON"))
+                conn.execute(text("UPDATE sessions SET context_state_json = '{}'"))
 
         if "messages" in tables:
             message_columns = {column["name"] for column in inspector.get_columns("messages")}

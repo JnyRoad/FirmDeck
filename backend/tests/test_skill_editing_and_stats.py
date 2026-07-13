@@ -269,11 +269,11 @@ def test_skill_editor_applies_patch_response_without_full_draft() -> None:
 
 def test_skill_editor_stream_repairs_invalid_json_once(monkeypatch) -> None:
     def fake_stream(self, _system_prompt: str, _payload: dict):  # noqa: ANN001
-        assert self.max_output_tokens == 16384
+        assert self.max_output_tokens == 8192
         yield '{"assistant_message": "截断的输出", "patches": ['
 
     def fake_text(self, _system_prompt: str, payload: dict):  # noqa: ANN001
-        assert self.max_output_tokens == 16384
+        assert self.max_output_tokens == 8192
         if payload.get("reflection_round"):
             return _reflection_passes_json()
         assert "previous_error" in payload
@@ -1015,8 +1015,11 @@ def test_skill_read_preserves_graph_node_ids() -> None:
 
 
 def test_skill_distiller_stream_uses_generation_status(monkeypatch) -> None:
-    def fake_stream(self, _system_prompt: str, _payload: dict):  # noqa: ANN001
-        assert self.max_output_tokens == 16384
+    def fake_stream(self, _system_prompt: str, _payload: str):  # noqa: ANN001
+        assert self.max_output_tokens == 8192
+        assert isinstance(_payload, str)
+        assert _payload.startswith("技能标题：商品比价\n原始流程：")
+        assert not _payload.lstrip().startswith("{")
         yield """
         {
           "draft_skill": {
@@ -1060,7 +1063,7 @@ def test_skill_distiller_stream_uses_generation_status(monkeypatch) -> None:
         """
 
     def fake_text(self, _system_prompt: str, payload: dict):  # noqa: ANN001
-        assert self.max_output_tokens == 16384
+        assert self.max_output_tokens == 8192
         assert payload.get("reflection_round") == 1
         return _reflection_passes_json()
 
@@ -1089,7 +1092,7 @@ def test_skill_distiller_stream_uses_generation_status(monkeypatch) -> None:
 
 def test_skill_distiller_stream_reflects_and_repairs_generated_skill(monkeypatch) -> None:
     def fake_stream(self, _system_prompt: str, _payload: dict):  # noqa: ANN001
-        assert self.max_output_tokens == 16384
+        assert self.max_output_tokens == 8192
         yield json.dumps(
             {
                 "draft_skill": {
@@ -1121,7 +1124,7 @@ def test_skill_distiller_stream_reflects_and_repairs_generated_skill(monkeypatch
         )
 
     def fake_text(self, _system_prompt: str, payload: dict):  # noqa: ANN001
-        assert self.max_output_tokens == 16384
+        assert self.max_output_tokens == 8192
         if payload.get("reflection_round") == 1:
             revised = dict(payload["candidate_skill"])
             revised["nodes"] = [
@@ -1182,7 +1185,7 @@ def test_skill_distiller_stream_reflects_and_repairs_generated_skill(monkeypatch
 
 def test_skill_distiller_reflection_checks_tool_call_format_without_rule_fallback(monkeypatch) -> None:
     def fake_stream(self, _system_prompt: str, _payload: dict):  # noqa: ANN001
-        assert self.max_output_tokens == 16384
+        assert self.max_output_tokens == 8192
         yield json.dumps(
             {
                 "draft_skill": {
@@ -1222,7 +1225,7 @@ def test_skill_distiller_reflection_checks_tool_call_format_without_rule_fallbac
         )
 
     def fake_text(self, _system_prompt: str, payload: dict):  # noqa: ANN001
-        assert self.max_output_tokens == 16384
+        assert self.max_output_tokens == 8192
         if payload.get("reflection_round") == 1:
             rubric_names = {item["name"] for item in payload["rubrics"]}
             assert "tool_call_format" in rubric_names
@@ -1293,11 +1296,11 @@ def test_skill_reflection_prompt_keeps_new_candidate_tool_actions() -> None:
 
 def test_skill_distiller_stream_repairs_invalid_json_with_model(monkeypatch) -> None:
     def fake_stream(self, _system_prompt: str, _payload: dict):  # noqa: ANN001
-        assert self.max_output_tokens == 16384
+        assert self.max_output_tokens == 8192
         yield '{"draft_skill": {"name": "截断"'
 
     def fake_text(self, _system_prompt: str, payload: dict):  # noqa: ANN001
-        assert self.max_output_tokens == 16384
+        assert self.max_output_tokens == 8192
         if payload.get("reflection_round"):
             return _reflection_passes_json()
         assert payload["repair_attempt"] == 1
@@ -1367,11 +1370,11 @@ def test_skill_distiller_stream_repairs_invalid_json_with_model(monkeypatch) -> 
 
 def test_skill_distiller_stream_uses_staged_generation_after_repair_failure(monkeypatch) -> None:
     def fake_stream(self, _system_prompt: str, _payload: dict):  # noqa: ANN001
-        assert self.max_output_tokens == 16384
+        assert self.max_output_tokens == 8192
         yield '{"draft_skill": {"name": "截断"'
 
     def fake_text(self, _system_prompt: str, payload: dict):  # noqa: ANN001
-        assert self.max_output_tokens == 16384
+        assert self.max_output_tokens == 8192
         if payload.get("reflection_round"):
             return _reflection_passes_json()
         if "repair_instruction" in payload:

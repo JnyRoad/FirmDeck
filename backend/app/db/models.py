@@ -501,6 +501,7 @@ class ChatSession(SQLModel, table=True):
     resume_after_answer_json: Optional[dict[str, Any]] = Field(default=None, sa_column=Column(JSON))
     awaiting_input_json: Optional[dict[str, Any]] = Field(default=None, sa_column=Column(JSON))
     knowledge_context_json: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
+    context_state_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     summary: Optional[str] = None
     last_agent_question: Optional[str] = None
     status: str = "active"

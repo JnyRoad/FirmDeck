@@ -55,6 +55,12 @@ python weather.py -json -today <地区名称>
 """
 
 
+def _system_and_stage_instructions(system_prompt: object, payload: object) -> str:
+    stage = payload.get("_agent_stage", {}) if isinstance(payload, dict) else {}
+    instructions = stage.get("instructions", "") if isinstance(stage, dict) else ""
+    return f"{system_prompt}\n{instructions}"
+
+
 def test_capability_selector_allows_general_skill_and_knowledge_together(monkeypatch) -> None:
     monkeypatch.setattr(LLMClient, "__init__", lambda self, model_config: None)
     monkeypatch.setattr(
@@ -856,7 +862,7 @@ def test_chat_turn_uses_general_skill_after_scene_router_skips_unmatched_scene(
         return None
 
     def fake_generate_json(self, system_prompt, payload):  # noqa: ANN001
-        prompt_text = str(system_prompt)
+        prompt_text = _system_and_stage_instructions(system_prompt, payload)
         if "企业技能路由器" in prompt_text:
             calls.append("router")
             return {
@@ -959,7 +965,7 @@ def test_general_skill_response_keeps_active_scene_context(monkeypatch) -> None:
         return None
 
     def fake_generate_json(self, system_prompt, payload):  # noqa: ANN001
-        prompt_text = str(system_prompt)
+        prompt_text = _system_and_stage_instructions(system_prompt, payload)
         if "企业技能路由器" in prompt_text:
             calls.append("router")
             return {
@@ -1457,7 +1463,7 @@ def test_chat_turn_treats_unmatched_scene_as_chat_when_general_skill_not_selecte
         return None
 
     def fake_generate_json(self, system_prompt, payload):  # noqa: ANN001
-        prompt_text = str(system_prompt)
+        prompt_text = _system_and_stage_instructions(system_prompt, payload)
         if "企业技能路由器" in prompt_text:
             calls.append("router")
             return {
@@ -1540,7 +1546,7 @@ def test_general_skill_runner_repairs_failed_code(monkeypatch) -> None:
         return None
 
     def fake_generate_json(self, system_prompt, payload):  # noqa: ANN001
-        prompt_text = str(system_prompt)
+        prompt_text = _system_and_stage_instructions(system_prompt, payload)
         if "代码修复器" in prompt_text:
             calls.append("repair")
             return {
@@ -1604,7 +1610,7 @@ def test_general_skill_runner_materializes_folder_package(monkeypatch) -> None:
         return None
 
     def fake_generate_json(self, system_prompt, payload):  # noqa: ANN001
-        prompt_text = str(system_prompt)
+        prompt_text = _system_and_stage_instructions(system_prompt, payload)
         if "通用技能执行器" in prompt_text:
             calls.append("runner")
             assert payload["skill"]["package"]["file_count"] == 2
@@ -1676,7 +1682,7 @@ def test_general_skill_runner_executes_bash_package_command(monkeypatch) -> None
         return None
 
     def fake_generate_json(self, system_prompt, payload):  # noqa: ANN001
-        prompt_text = str(system_prompt)
+        prompt_text = _system_and_stage_instructions(system_prompt, payload)
         if "通用技能执行器" in prompt_text:
             calls.append("runner")
             assert payload["skill"]["package"]["file_count"] == 2
@@ -1755,7 +1761,7 @@ def test_general_skill_runner_has_requests_in_runtime(monkeypatch) -> None:
         return None
 
     def fake_generate_json(self, system_prompt, payload):  # noqa: ANN001
-        prompt_text = str(system_prompt)
+        prompt_text = _system_and_stage_instructions(system_prompt, payload)
         if "通用技能执行器" in prompt_text:
             calls.append("runner")
             return {
@@ -1833,7 +1839,7 @@ def test_general_skill_runner_reflects_failed_initial_plan(monkeypatch) -> None:
         return None
 
     def fake_generate_json(self, system_prompt, payload):  # noqa: ANN001
-        prompt_text = str(system_prompt)
+        prompt_text = _system_and_stage_instructions(system_prompt, payload)
         if "代码修复器" in prompt_text:
             calls.append("repair")
             assert (
@@ -1894,7 +1900,7 @@ def test_general_skill_runner_stops_on_non_retryable_failure(monkeypatch) -> Non
         return None
 
     def fake_generate_json(self, system_prompt, payload):  # noqa: ANN001
-        prompt_text = str(system_prompt)
+        prompt_text = _system_and_stage_instructions(system_prompt, payload)
         if "通用技能执行器" in prompt_text:
             calls.append("runner")
             return {

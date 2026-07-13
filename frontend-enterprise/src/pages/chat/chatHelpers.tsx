@@ -177,11 +177,26 @@ export function renderInlineMarkdown(text: string, keyPrefix: string): ReactNode
   return nodes;
 }
 
-function renderInlineLines(lines: string[], keyPrefix: string): ReactNode[] {
+function softLineBreakSeparator(previousLine: string, currentLine: string): string {
+  const previous = previousLine.trimEnd();
+  const current = currentLine.trimStart();
+  if (!previous || !current) return '';
+
+  const previousCharacter = previous.charAt(previous.length - 1);
+  const currentCharacter = current.charAt(0);
+  const cjkCharacter = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
+  return cjkCharacter.test(previousCharacter) || cjkCharacter.test(currentCharacter) ? '' : ' ';
+}
+
+function renderInlineLines(lines: string[], keyPrefix: string, preserveLineBreaks: boolean): ReactNode[] {
   return lines.flatMap((line, lineIndex) => {
-    const nodes = renderInlineMarkdown(line, `${keyPrefix}-line-${lineIndex}`);
+    const renderedLine = preserveLineBreaks ? line : line.trim();
+    const nodes = renderInlineMarkdown(renderedLine, `${keyPrefix}-line-${lineIndex}`);
     if (lineIndex === 0) return nodes;
-    return [<br key={`${keyPrefix}-br-${lineIndex}`} />, ...nodes];
+    const separator = preserveLineBreaks
+      ? <br key={`${keyPrefix}-br-${lineIndex}`} />
+      : softLineBreakSeparator(lines[lineIndex - 1], line);
+    return [separator, ...nodes];
   });
 }
 
@@ -299,7 +314,7 @@ function isBlockBoundary(line: string): boolean {
   );
 }
 
-export function renderMarkdownBlocks(content: string): ReactNode[] {
+export function renderMarkdownBlocks(content: string, preserveLineBreaks = true): ReactNode[] {
   const lines = content.replace(/\r\n/g, '\n').split('\n');
   const blocks: ReactNode[] = [];
   let index = 0;
@@ -353,7 +368,7 @@ export function renderMarkdownBlocks(content: string): ReactNode[] {
         quoteLines.push(lines[index].trim().replace(/^>\s?/, ''));
         index += 1;
       }
-      blocks.push(<blockquote key={key}>{renderMarkdownBlocks(quoteLines.join('\n'))}</blockquote>);
+      blocks.push(<blockquote key={key}>{renderMarkdownBlocks(quoteLines.join('\n'), preserveLineBreaks)}</blockquote>);
       blockIndex += 1;
       continue;
     }
@@ -410,15 +425,21 @@ export function renderMarkdownBlocks(content: string): ReactNode[] {
       paragraphLines.push(lines[index]);
       index += 1;
     }
-    blocks.push(<p key={key}>{renderInlineLines(paragraphLines, key)}</p>);
+    blocks.push(<p key={key}>{renderInlineLines(paragraphLines, key, preserveLineBreaks)}</p>);
     blockIndex += 1;
   }
 
   return blocks;
 }
 
-export function MarkdownMessage({ content }: { content: string }) {
-  return <div className={CHAT_MARKDOWN_CLASS}>{renderMarkdownBlocks(content)}</div>;
+export function MarkdownMessage({
+  content,
+  preserveLineBreaks = true,
+}: {
+  content: string;
+  preserveLineBreaks?: boolean;
+}) {
+  return <div className={CHAT_MARKDOWN_CLASS}>{renderMarkdownBlocks(content, preserveLineBreaks)}</div>;
 }
 
 export function traceSummaryIconName(_summary: { state: TraceLine['state'] }): CotTraceIconName {
@@ -884,6 +905,7 @@ function publicStreamPhase(data: Record<string, unknown>): string {
   const phase = typeof data.phase === 'string' ? data.phase : '';
   const text = typeof data.text === 'string' ? data.text : '';
   if (phase === 'error') return text || '请求失败';
+  if (phase === 'preparing') return text || '正在整理上下文';
   if (phase === 'scheduled_task_draft') return text || '生成定时任务草案';
   if (isKnowledgeTracePhase(phase)) return text || knowledgeTraceText(data);
   return '正在思考';

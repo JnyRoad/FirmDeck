@@ -5,11 +5,12 @@ from typing import Any
 from app.core.conversation_context import build_conversation_context
 
 
-CONTROL_CONTEXT_TOKEN_BUDGET = 12_000
+CONTROL_CONTEXT_TOKEN_BUDGET = 32_000
 KNOWLEDGE_HISTORY_LIMIT = 1
 KNOWLEDGE_EVIDENCE_LIMIT = 6
 KNOWLEDGE_CONCEPT_LIMIT = 8
 KNOWLEDGE_DOCUMENT_LIMIT = 5
+RETRIEVED_KNOWLEDGE_LIMIT = 4
 
 
 def compact_knowledge_context(
@@ -25,7 +26,8 @@ def compact_knowledge_context(
 
 def compact_step_result(payload: dict[str, Any]) -> dict[str, Any]:
     projected = dict(payload)
-    projected["knowledge_results"] = compact_knowledge_context(
+    projected.pop("knowledge_results", None)
+    projected["retrieved_knowledge"] = compact_knowledge_context(
         payload.get("knowledge_results") if isinstance(payload.get("knowledge_results"), list) else []
     )
     return projected
@@ -41,6 +43,12 @@ def compact_conversation_context(
     messages = context.get("messages")
     if not isinstance(messages, list):
         return {key: value for key, value in context.items() if key != "messages"}
+    metadata = context.get("metadata")
+    if (
+        isinstance(metadata, dict)
+        and int(metadata.get("estimated_tokens") or 0) <= token_budget
+    ):
+        return context
     return build_conversation_context(
         [message for message in messages if isinstance(message, dict)], token_budget
     )
@@ -77,22 +85,28 @@ def compact_step_skill_context(
         return None
     current_step = compact_current_step(content, step_id)
     current_step_id = _optional_text((current_step or {}).get("node_id"))
-    adjacent_edges = [
-        _project_edge(edge)
-        for edge in content.get("edges", [])
-        if isinstance(edge, dict)
-        and _optional_text(edge.get("source_node_id")) == current_step_id
-    ]
-    target_ids = {
-        _optional_text(edge.get("next_node_id") or edge.get("target_node_id"))
-        for edge in adjacent_edges
-    }
-    target_steps = [
-        _project_node(node)
+    nodes_by_id = {
+        _optional_text(node.get("node_id") or node.get("step_id")): node
         for node in _skill_nodes(content)
         if isinstance(node, dict)
-        and _optional_text(node.get("node_id") or node.get("step_id")) in target_ids
-    ]
+        and _optional_text(node.get("node_id") or node.get("step_id"))
+    }
+    edges = content.get("edges")
+    next_steps: list[dict[str, Any]] = []
+    for edge in edges if isinstance(edges, list) else []:
+        if not isinstance(edge, dict):
+            continue
+        if _optional_text(edge.get("source_node_id")) != current_step_id:
+            continue
+        target_id = _optional_text(edge.get("next_node_id") or edge.get("target_node_id"))
+        target_node = nodes_by_id.get(target_id)
+        if not target_node:
+            continue
+        projected_step = _project_node(target_node)
+        transition = _project_transition(edge)
+        if transition:
+            projected_step["transition"] = transition
+        next_steps.append(projected_step)
     return _without_empty(
         {
             "skill_id": skill_id or content.get("skill_id"),
@@ -102,8 +116,7 @@ def compact_step_skill_context(
             "slot_filling_policy": content.get("slot_filling_policy"),
             "response_rules": content.get("response_rules"),
             "current_step": current_step,
-            "adjacent_edges": adjacent_edges,
-            "target_steps": target_steps,
+            "next_steps": next_steps,
         }
     )
 
@@ -212,84 +225,88 @@ def compact_awaiting_input(value: dict[str, Any] | None) -> dict[str, Any] | Non
 
 
 def _compact_knowledge_result(item: dict[str, Any]) -> dict[str, Any]:
-    evidence = _compact_evidence(item.get("evidence_pack"))
+    query = item.get("query")
+    if isinstance(query, dict):
+        query = query.get("query")
+    return _without_empty(
+        {
+            "query": _short_text(query, 500),
+            "retrieved_knowledge": _compact_retrieved_knowledge(item),
+        }
+    )
+
+
+def _compact_retrieved_knowledge(item: dict[str, Any]) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    evidence = _dict_items(item.get("evidence_pack"), KNOWLEDGE_EVIDENCE_LIMIT)
     if not evidence:
-        evidence = _compact_evidence(item.get("chunks"))
-    return {
-        "query": item.get("query"),
-        "selected_documents": _compact_documents(item.get("selected_documents")),
-        "selected_buckets": _compact_buckets(item.get("selected_buckets")),
-        "selected_concepts": _compact_concepts(item.get("selected_concepts")),
-        "okf_citations": _compact_citations(item.get("okf_citations")),
-        "evidence_pack": evidence,
-    }
-
-
-def _compact_documents(value: object) -> list[dict[str, Any]]:
-    documents: list[dict[str, Any]] = []
-    for item in _dict_items(value, KNOWLEDGE_DOCUMENT_LIMIT):
-        documents.append(
+        evidence = _dict_items(item.get("chunks"), KNOWLEDGE_EVIDENCE_LIMIT)
+    for value in evidence:
+        candidates.append(
             {
-                "title": _short_text(item.get("title") or item.get("filename"), 180),
-                "filename": _short_text(item.get("filename"), 180),
-                "summary": _short_text(item.get("summary"), 600),
+                "title": _short_text(value.get("title") or value.get("label"), 180),
+                "source": _short_text(
+                    value.get("section_path")
+                    or value.get("source_path")
+                    or value.get("source_ref"),
+                    300,
+                ),
+                "summary": _short_text(value.get("summary"), 300),
+                "content": _short_text(value.get("content") or value.get("excerpt"), 800),
             }
         )
-    return documents
-
-
-def _compact_buckets(value: object) -> list[dict[str, Any]]:
-    buckets: list[dict[str, Any]] = []
-    for item in _dict_items(value, KNOWLEDGE_DOCUMENT_LIMIT):
-        buckets.append(
+    for value in _dict_items(item.get("selected_concepts"), KNOWLEDGE_CONCEPT_LIMIT):
+        candidates.append(
             {
-                "title": _short_text(item.get("title"), 180),
-                "summary": _short_text(item.get("summary"), 600),
+                "title": _short_text(value.get("title") or value.get("name"), 180),
+                "source": _short_text(value.get("source_path") or value.get("concept_id"), 300),
+                "summary": _short_text(value.get("summary"), 300),
+                "content": _short_text(value.get("content") or value.get("content_md"), 600),
             }
         )
-    return buckets
-
-
-def _compact_concepts(value: object) -> list[dict[str, Any]]:
-    concepts: list[dict[str, Any]] = []
-    for item in _dict_items(value, KNOWLEDGE_CONCEPT_LIMIT):
-        concepts.append(
+    for value in _dict_items(item.get("selected_documents"), KNOWLEDGE_DOCUMENT_LIMIT):
+        candidates.append(
             {
-                "title": _short_text(item.get("title") or item.get("name"), 180),
-                "summary": _short_text(item.get("summary"), 300),
-                "content": _short_text(item.get("content") or item.get("content_md"), 600),
+                "title": _short_text(value.get("title") or value.get("filename"), 180),
+                "source": _short_text(value.get("filename"), 180),
+                "summary": _short_text(value.get("summary"), 600),
             }
         )
-    return concepts
-
-
-def _compact_citations(value: object) -> list[dict[str, Any]]:
-    citations: list[dict[str, Any]] = []
-    for item in _dict_items(value, KNOWLEDGE_EVIDENCE_LIMIT):
-        citations.append(
+    for value in _dict_items(item.get("selected_buckets"), KNOWLEDGE_DOCUMENT_LIMIT):
+        candidates.append(
             {
-                "title": _short_text(item.get("title") or item.get("label"), 180),
-                "source_path": _short_text(
-                    item.get("source_path") or item.get("path") or item.get("uri"), 300
+                "title": _short_text(value.get("title"), 180),
+                "summary": _short_text(value.get("summary"), 600),
+            }
+        )
+    for value in _dict_items(item.get("okf_citations"), KNOWLEDGE_EVIDENCE_LIMIT):
+        candidates.append(
+            {
+                "title": _short_text(value.get("title") or value.get("label"), 180),
+                "source": _short_text(
+                    value.get("source_path") or value.get("path") or value.get("uri"),
+                    300,
                 ),
             }
         )
-    return citations
 
-
-def _compact_evidence(value: object) -> list[dict[str, Any]]:
-    evidence: list[dict[str, Any]] = []
-    for item in _dict_items(value, KNOWLEDGE_EVIDENCE_LIMIT):
-        evidence.append(
-            {
-                "source_path": _short_text(item.get("source_path") or item.get("source_ref"), 300),
-                "section_path": _short_text(item.get("section_path"), 300),
-                "summary": _short_text(item.get("summary"), 300),
-                "content": _short_text(item.get("content") or item.get("excerpt"), 800),
-                "relevance_score": item.get("relevance_score"),
-            }
+    compacted: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        projected = _without_empty(candidate)
+        identity = "|".join(
+            str(projected.get(key) or "")
+            for key in ("source", "title", "content", "summary")
+        ).strip("|")
+        if not identity or identity in seen:
+            continue
+        seen.add(identity)
+        compacted.append(
+            {"label": f"检索到的知识 {len(compacted) + 1}", **projected}
         )
-    return evidence
+        if len(compacted) >= RETRIEVED_KNOWLEDGE_LIMIT:
+            break
+    return compacted
 
 
 def _dict_items(value: object, limit: int) -> list[dict[str, Any]]:
@@ -326,14 +343,11 @@ def _project_node(node: dict[str, Any]) -> dict[str, Any]:
     return _without_empty(projected)
 
 
-def _project_edge(edge: dict[str, Any]) -> dict[str, Any]:
+def _project_transition(edge: dict[str, Any]) -> dict[str, Any]:
     return _without_empty(
         {
             key: edge.get(key)
             for key in (
-                "source_node_id",
-                "target_node_id",
-                "next_node_id",
                 "condition",
                 "label",
                 "priority",

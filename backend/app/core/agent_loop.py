@@ -59,7 +59,9 @@ from app.knowledge.citations import (
     knowledge_citations_from_results,
 )
 from app.knowledge.schema import KnowledgeSearchRequest, KnowledgeSearchResponse
-from app.llm import LLMError
+from app.llm import LLMClient, LLMError
+from app.llm.stage_protocol import stage_payload, unified_system_prompt
+from app.observability.spans import llm_operation
 from app.memory.jobs import enqueue_memory_capture
 from app.memory.service import MemoryService, memory_read
 from app.observability import EventLog
@@ -85,7 +87,6 @@ STREAM_CHUNK_INTERVAL_SECONDS = 0.045
 DEFAULT_REFLECTION_MAX_ROUNDS = 1
 REFLECTION_MAX_ROUNDS_LIMIT = 5
 MAX_TOOL_ACTIONS_PER_TURN = 6
-ROUTER_CONTEXT_MESSAGES = 8
 TOOL_CALL_HISTORY_SLOT = "_tool_call_history"
 TOOL_RESULTS_SLOT = "_tool_results"
 GRAPH_PENDING_STEPS_SLOT = "_graph_pending_steps"
@@ -1080,6 +1081,7 @@ class AgentLoop:
                     conversation_context,
                     reflection_stream_events,
                     completed_skill_ids_this_turn,
+                    memory_context=memory_context,
                 )
                 for event_name, payload in reflection_stream_events:
                     yield self._stream_event(event_name, chat_session, payload)
@@ -1386,7 +1388,6 @@ class AgentLoop:
                 chat_session,
                 {"newSessionId": chat_session.id, "sessionId": chat_session.id},
             )
-            yield self._stream_status(chat_session, "received", "已收到消息")
             user_message = self._append_message(
                 request.tenant_id,
                 chat_session.id,
@@ -1424,6 +1425,12 @@ class AgentLoop:
             self.db.commit()
             self.db.refresh(chat_session)
             self.db.refresh(user_message)
+            yield self._stream_status(
+                chat_session,
+                "preparing",
+                "正在整理上下文",
+                user_message_id=user_message_id,
+            )
 
             model_config = self._get_request_model(request, chat_session.agent_id)
             if not model_config:
@@ -1546,16 +1553,18 @@ class AgentLoop:
                 )
             self.db.commit()
             self.db.refresh(chat_session)
-            conversation_context = self._conversation_context(chat_session)
-            router_context = self._conversation_context(
-                chat_session, max_messages=ROUTER_CONTEXT_MESSAGES
-            )
+            conversation_context = self._conversation_context(chat_session, model_config=model_config)
 
             yield self._stream_status(
                 chat_session, "routing", "正在判断用户意图", user_message_id=user_message_id
             )
             router_decision = self.router.decide(
-                request.message, chat_session, skills, model_config, router_context, memory_context
+                request.message,
+                chat_session,
+                skills,
+                model_config,
+                conversation_context,
+                memory_context,
             )
             hydrated_slots = self._hydrate_router_decision_from_context(
                 chat_session, router_decision, skills, memory_context
@@ -1890,6 +1899,7 @@ class AgentLoop:
                 reflection_max_rounds,
                 conversation_context,
                 reflection_stream_events,
+                memory_context=memory_context,
             )
             for event_name, payload in reflection_stream_events:
                 yield self._stream_event(
@@ -2219,14 +2229,16 @@ class AgentLoop:
             )
         self.db.commit()
         self.db.refresh(chat_session)
-        conversation_context = self._conversation_context(chat_session)
-        router_context = self._conversation_context(
-            chat_session, max_messages=ROUTER_CONTEXT_MESSAGES
-        )
+        conversation_context = self._conversation_context(chat_session, model_config=model_config)
 
         status("routing")
         router_decision = self.router.decide(
-            request.message, chat_session, skills, model_config, router_context, memory_context
+            request.message,
+            chat_session,
+            skills,
+            model_config,
+            conversation_context,
+            memory_context,
         )
         hydrated_slots = self._hydrate_router_decision_from_context(
             chat_session, router_decision, skills, memory_context
@@ -2425,6 +2437,7 @@ class AgentLoop:
             tool_result,
             self._get_reflection_max_rounds(request.tenant_id),
             conversation_context,
+            memory_context=memory_context,
         )
         (
             active_skill,
@@ -2946,6 +2959,7 @@ class AgentLoop:
                     self._get_reflection_max_rounds(request.tenant_id),
                     conversation_context,
                     completed_skill_ids_this_turn=completed_skill_ids_this_turn,
+                    memory_context=memory_context,
                 )
                 (
                     active_skill,
@@ -3139,6 +3153,7 @@ class AgentLoop:
         conversation_context: dict[str, object] | None = None,
         stream_events: list[tuple[str, dict[str, object]]] | None = None,
         completed_skill_ids_this_turn: set[str] | None = None,
+        memory_context: list[dict[str, object]] | None = None,
     ) -> tuple[Skill | None, RouterDecision, StepAgentResult, ToolResult | None]:
         conversation_context = conversation_context or self._conversation_context(chat_session)
         completed_skill_ids_this_turn = completed_skill_ids_this_turn or set()
@@ -3194,6 +3209,7 @@ class AgentLoop:
                 conversation_context,
                 stream_events,
                 completed_skill_ids_this_turn,
+                memory_context,
             )
             if not retried:
                 break
@@ -3334,6 +3350,7 @@ class AgentLoop:
                 conversation_context,
                 reflection_events,
                 completed_skill_ids_this_turn,
+                memory_context,
             )
             if reflection_events:
                 stream_events.extend(reflection_events)
@@ -3364,6 +3381,7 @@ class AgentLoop:
         conversation_context: dict[str, object] | None = None,
         stream_events: list[tuple[str, dict[str, object]]] | None = None,
         completed_skill_ids_this_turn: set[str] | None = None,
+        memory_context: list[dict[str, object]] | None = None,
     ) -> tuple[Skill | None, RouterDecision, StepAgentResult, ToolResult | None, bool]:
         conversation_context = conversation_context or self._conversation_context(chat_session)
         completed_skill_ids_this_turn = completed_skill_ids_this_turn or set()
@@ -3382,6 +3400,7 @@ class AgentLoop:
                 tools,
                 model_config,
                 conversation_context,
+                memory_context,
             )
         except LLMError as exc:
             self.events.record(
@@ -3653,6 +3672,7 @@ class AgentLoop:
         status_callback: StatusCallback | None = None,
     ) -> tuple[StepAgentResult, ToolResult | None]:
         tool_result: ToolResult | None = None
+        current_knowledge = list(step_result.knowledge_results or [])
         seen_calls: set[str] = set()
         max_actions = self._get_agent_loop_max_actions(request.tenant_id)
         for iteration in range(max_actions):
@@ -3733,7 +3753,10 @@ class AgentLoop:
                     chat_session,
                     iteration + 1,
                 ),
+                current_knowledge=current_knowledge,
             )
+            if current_knowledge and not continuation_result.knowledge_results:
+                continuation_result.knowledge_results = current_knowledge
             self._apply_step_result(
                 request.tenant_id, chat_session, continuation_result, active_skill
             )
@@ -3852,7 +3875,6 @@ class AgentLoop:
             "okf_citations": search_response.okf_citations,
             "evidence_pack": search_response.evidence_pack,
         }
-        self._record_knowledge_results(chat_session, knowledge_items)
         self.events.record(
             request.tenant_id,
             chat_session.id,
@@ -3878,6 +3900,7 @@ class AgentLoop:
             },
             memory_context=memory_context,
             conversation_context=conversation_context,
+            current_knowledge=[knowledge_items],
         )
         continuation_result.knowledge_results = [knowledge_items]
         self._apply_step_result(request.tenant_id, chat_session, continuation_result, active_skill)
@@ -3935,8 +3958,6 @@ class AgentLoop:
             "okf_citations": [],
             "evidence_pack": [],
         }
-        if knowledge_items:
-            self._record_knowledge_results(chat_session, knowledge_items)
         self.events.record(
             request.tenant_id,
             chat_session.id,
@@ -4004,11 +4025,6 @@ class AgentLoop:
             "okf_citations": search_response.okf_citations,
             "evidence_pack": search_response.evidence_pack,
         }
-
-    def _record_knowledge_results(self, chat_session: ChatSession, item: dict[str, Any]) -> None:
-        history = list(chat_session.knowledge_context_json or [])
-        history.append(item)
-        chat_session.knowledge_context_json = history[-12:]
 
     def _tool_continuation_context(
         self,
@@ -4251,6 +4267,7 @@ class AgentLoop:
         repair_context: dict[str, object] | None = None,
         memory_context: list[dict[str, object]] | None = None,
         conversation_context: dict[str, object] | None = None,
+        current_knowledge: list[dict[str, object]] | None = None,
     ) -> StepAgentResult:
         conversation_context = conversation_context or self._conversation_context(chat_session)
         recent_messages = [
@@ -4259,22 +4276,23 @@ class AgentLoop:
             if isinstance(message, dict) and message.get("role") in {"user", "assistant"}
         ]
         step_result = self.step_agent.run(
-            request.message,
-            chat_session,
-            active_skill,
-            self._step_agent_tools(
+            message=request.message,
+            session=chat_session,
+            skill=active_skill,
+            tools=self._step_agent_tools(
                 active_skill,
                 tools,
                 request.message,
                 model_config,
                 chat_session.agent_id,
             ),
-            model_config,
-            router_decision,
-            repair_context,
-            recent_messages,
-            memory_context,
-            conversation_context,
+            model_config=model_config,
+            router_decision=router_decision,
+            repair_context=repair_context,
+            recent_messages=recent_messages,
+            memory_context=memory_context,
+            conversation_context=conversation_context,
+            current_knowledge=current_knowledge,
         )
         payload = step_result.model_dump()
         if repair_reason:
@@ -5867,7 +5885,9 @@ class AgentLoop:
         return [self._message_context_entry(row) for row in rows]
 
     def _conversation_context(
-        self, chat_session: ChatSession, max_messages: int | None = None
+        self,
+        chat_session: ChatSession,
+        model_config: ModelConfig | None = None,
     ) -> dict[str, object]:
         if not hasattr(self, "db") or not hasattr(self.db, "exec"):
             return build_conversation_context([])
@@ -5881,14 +5901,51 @@ class AgentLoop:
                 .order_by(Message.created_at.asc())
             ).all()
         )
-        if max_messages is not None and max_messages > 0:
-            rows = rows[-max_messages:]
-        return build_conversation_context([self._message_context_entry(row) for row in rows])
+        context = build_conversation_context(
+            [self._message_context_entry(row) for row in rows],
+            context_state=chat_session.context_state_json,
+            summary_builder=self._context_summary_builder(model_config)
+            if model_config
+            else None,
+        )
+        next_state = context.get("context_state")
+        if isinstance(next_state, dict) and next_state != (chat_session.context_state_json or {}):
+            chat_session.context_state_json = next_state
+            self.db.add(chat_session)
+        return context
+
+    def _context_summary_builder(
+        self, model_config: ModelConfig
+    ) -> Callable[[str, str, int], str]:
+        def summarize(label: str, source: str, token_budget: int) -> str:
+            payload = stage_payload(
+                phase="Context Compression",
+                user_message=f"请压缩{label}",
+                conversation_context={},
+                memory_context=None,
+                instructions=(
+                    "把输入的历史对话压缩成一段可供后续对话继续使用的中文事实摘要。"
+                    "保留用户身份与偏好、已确认事实、未完成任务、关键约束、工具或知识结论；"
+                    "删除寒暄、重复内容、内部 ID、时间戳和推理过程，不新增原文没有的信息。"
+                ),
+                stage_data={"history_to_compress": source},
+                output_contract=(
+                    f"只输出一段纯文本摘要，控制在约 {token_budget} tokens 以内。"
+                ),
+            )
+            with llm_operation("context.compact"):
+                return LLMClient(model_config).generate_text(
+                    unified_system_prompt(), payload
+                ).strip()
+
+        return summarize
 
     def _message_context_entry(self, row: Message) -> dict[str, Any]:
         entry: dict[str, Any] = {
+            "id": row.id,
             "role": row.role,
             "content": message_content_with_attachment_context(row.content, row.metadata_json),
+            "created_at": row.created_at,
         }
         images = message_images_from_metadata(row.metadata_json)
         if images and row.role == "user":

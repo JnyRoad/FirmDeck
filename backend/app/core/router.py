@@ -6,11 +6,16 @@ from app import paths
 from app.core.context_projection import (
     compact_awaiting_input,
     compact_conversation_context,
-    compact_memory_context,
     compact_pending_tasks,
 )
 from app.db.models import ChatSession, ModelConfig, Skill
 from app.llm import LLMClient, LLMError
+from app.llm.stage_protocol import (
+    ROUTER_OUTPUT_SCHEMA,
+    TASK_SCHEDULER_OUTPUT_SCHEMA,
+    stage_payload,
+    unified_system_prompt,
+)
 from app.observability.spans import llm_operation
 from app.session.session_schema import RouterDecision, TaskScheduleDecision
 from app.session.slot_policy import strip_router_generated_message_slots
@@ -30,19 +35,22 @@ class Router:
         conversation_context: dict[str, object] | None = None,
         memory_context: list[dict[str, object]] | None = None,
     ) -> RouterDecision:
-        payload = {
-            "user_message": message,
-            "conversation_context": compact_conversation_context(
-                conversation_context, token_budget=8_000
-            ),
-            "memory_context": compact_memory_context(memory_context),
-            "current_session": _router_session_payload(session),
-            "available_skills": _available_skill_payloads(available_skills),
-        }
+        payload = stage_payload(
+            phase="Router",
+            user_message=message,
+            conversation_context=compact_conversation_context(conversation_context),
+            memory_context=memory_context,
+            instructions=PROMPT_PATH.read_text(encoding="utf-8"),
+            stage_data={
+                "current_session": _router_session_payload(session),
+                "available_skills": _available_skill_payloads(available_skills),
+            },
+            output_contract=ROUTER_OUTPUT_SCHEMA,
+        )
         try:
             with llm_operation("router.scene"):
                 raw = LLMClient(model_config).generate_json(
-                    PROMPT_PATH.read_text(encoding="utf-8"), payload
+                    unified_system_prompt(), payload
                 )
             decision = RouterDecision.model_validate(raw)
         except Exception as exc:
@@ -62,21 +70,24 @@ class Router:
         completed_reply: str | None = None,
     ) -> TaskScheduleDecision:
         candidate_frames = self._candidate_task_frames(session)
-        payload = {
-            "user_message": message,
+        payload = stage_payload(
+            phase="Router / Task Scheduler",
+            user_message=message,
+            conversation_context=compact_conversation_context(conversation_context),
+            memory_context=memory_context,
+            instructions=TASK_SCHEDULER_PROMPT_PATH.read_text(encoding="utf-8"),
+            stage_data={
             "completed_reply": completed_reply or "",
-            "conversation_context": compact_conversation_context(
-                conversation_context, token_budget=8_000
-            ),
-            "memory_context": compact_memory_context(memory_context),
             "current_session": _router_session_payload(session),
             "candidate_task_frames": candidate_frames,
             "available_skills": _available_skill_payloads(available_skills),
-        }
+            },
+            output_contract=TASK_SCHEDULER_OUTPUT_SCHEMA,
+        )
         try:
             with llm_operation("router.task_scheduler"):
                 raw = LLMClient(model_config).generate_json(
-                    TASK_SCHEDULER_PROMPT_PATH.read_text(encoding="utf-8"),
+                    unified_system_prompt(),
                     payload,
                 )
             schedule = TaskScheduleDecision.model_validate(raw)

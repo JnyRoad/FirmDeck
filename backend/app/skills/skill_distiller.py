@@ -19,6 +19,10 @@ from app.skills.step_ids import ensure_unique_node_ids, skill_card_with_unique_s
 PROMPT_PATH = paths.resource_dir() / "app" / "llm" / "prompts" / "skill_distiller_prompt.md"
 STREAM_INTERVAL_SECONDS = 0.035
 MODEL_REPAIR_ATTEMPTS = 2
+MODEL_TOOL_LIMIT = 48
+MODEL_TOOL_CATALOG_CHAR_LIMIT = 12000
+MODEL_TOOL_DESCRIPTION_CHAR_LIMIT = 240
+MODEL_TOOL_PARAMETER_LIMIT = 12
 CLOSED_LOOP_RESPONSE_RULE = (
     "流程必须形成闭环：不得把“请稍候/正在处理/稍后反馈”作为最终回复；"
     "需要外部事实、外部状态或外部副作用时必须调用已配置工具或转人工，并向用户给出明确结果。"
@@ -51,12 +55,13 @@ class SkillDistiller:
 
     def stream_text(self, request: SkillDistillRequest, model_config: ModelConfig):
         payload = self._payload(request)
+        model_input = self._model_input(request, payload)
         chunks: list[str] = []
         prompt = PROMPT_PATH.read_text(encoding="utf-8")
         client = LLMClient(skill_model_config(model_config))
         try:
             yield {"event": "status", "data": {"text": "模型正在规划技能结构"}}
-            for chunk in client.generate_text_stream(prompt, payload):
+            for chunk in client.generate_text_stream(prompt, model_input):
                 chunks.append(chunk)
                 yield {"event": "chunk", "data": {"content": chunk}}
             yield {"event": "status", "data": {"text": "正在校验模型输出结构"}}
@@ -101,11 +106,12 @@ class SkillDistiller:
 
     def _generate_response(self, request: SkillDistillRequest, model_config: ModelConfig) -> SkillDistillResponse:
         payload = self._payload(request)
+        model_input = self._model_input(request, payload)
         prompt = PROMPT_PATH.read_text(encoding="utf-8")
         client = LLMClient(skill_model_config(model_config))
         output = ""
         try:
-            output = client.generate_text(prompt, payload)
+            output = client.generate_text(prompt, model_input)
             response = self._response_from_text(output, request)
         except (LLMError, json.JSONDecodeError, TypeError, ValueError) as exc:
             try:
@@ -241,8 +247,25 @@ class SkillDistiller:
             "title": request.title,
             "business_domain": request.business_domain,
             "raw_content": request.raw_content,
-            "available_tools": request.available_tools,
+            "available_tools": _compact_available_tools(
+                request.available_tools,
+                source_text=_request_text(request),
+            ),
         }
+
+    def _model_input(
+        self,
+        request: SkillDistillRequest,
+        payload: dict[str, Any] | None = None,
+    ) -> str:
+        projected = payload or self._payload(request)
+        return _distill_model_input(
+            title=request.title,
+            business_domain=request.business_domain,
+            raw_content=request.raw_content,
+            available_tools=projected.get("available_tools", []),
+            total_tool_count=len(request.available_tools),
+        )
 
     def _normalize_response(self, raw: dict[str, Any], request: SkillDistillRequest) -> SkillDistillResponse:
         draft = raw.get("draft_skill") if isinstance(raw.get("draft_skill"), dict) else raw
@@ -614,6 +637,163 @@ def _compact_warning(warning: str) -> str:
         if text == source:
             return target
     return text
+
+
+def _distill_model_input(
+    *,
+    title: str,
+    business_domain: str | None,
+    raw_content: str,
+    available_tools: Any,
+    total_tool_count: int,
+) -> str:
+    sections = [f"技能标题：{title.strip() or '新SOP'}"]
+    if business_domain and business_domain.strip():
+        sections.append(f"业务领域：{business_domain.strip()}")
+    sections.extend(("原始流程：", raw_content.strip()))
+
+    tools = [item for item in available_tools if isinstance(item, dict)] if isinstance(available_tools, list) else []
+    sections.append("可用工具（只选择与原始流程语义匹配的工具）：")
+    if not tools:
+        sections.append("无可用工具。流程需要外部接口时，请指出缺少的接口，不要臆造工具。")
+        return "\n".join(sections)
+
+    for tool in tools:
+        name = str(tool.get("name") or "").strip()
+        display_name = str(tool.get("display_name") or "").strip()
+        description = str(tool.get("description") or "").strip()
+        heading = name
+        if display_name and display_name != name:
+            heading = f"{name}（{display_name}）"
+        line = f"- {heading}"
+        if description:
+            line += f"：{description}"
+        sections.append(line)
+        parameter_text = _model_tool_parameter_text(tool.get("input_schema"))
+        if parameter_text:
+            sections.append(f"  输入参数：{parameter_text}")
+        if tool.get("requires_confirmation") is True:
+            sections.append("  调用前需要用户确认。")
+
+    omitted = max(0, total_tool_count - len(tools))
+    if omitted:
+        sections.append(f"另有 {omitted} 个与当前流程相关性较低的工具未展开；不得猜测或调用未列出的工具。")
+    return "\n".join(sections)
+
+
+def _compact_available_tools(
+    available_tools: list[dict[str, Any]],
+    *,
+    source_text: str,
+) -> list[dict[str, Any]]:
+    source_terms = _tool_relevance_terms(source_text)
+    ranked: list[tuple[int, int, dict[str, Any]]] = []
+    seen_names: set[str] = set()
+    for index, tool in enumerate(available_tools):
+        if not isinstance(tool, dict):
+            continue
+        name = str(tool.get("name") or "").strip()
+        if not name or name in seen_names:
+            continue
+        seen_names.add(name)
+        description = _limited_text(tool.get("description"), MODEL_TOOL_DESCRIPTION_CHAR_LIMIT)
+        projected: dict[str, Any] = {
+            "name": name,
+            "display_name": _limited_text(tool.get("display_name"), 120),
+            "description": description,
+            "input_schema": _compact_tool_input_schema(tool.get("input_schema")),
+        }
+        if tool.get("requires_confirmation") is True:
+            projected["requires_confirmation"] = True
+        projected = {key: value for key, value in projected.items() if value not in (None, "", [], {})}
+        candidate_text = " ".join(
+            str(tool.get(key) or "")
+            for key in ("name", "display_name", "description", "bucket")
+        )
+        score = len(source_terms & _tool_relevance_terms(candidate_text))
+        lowered_source = source_text.lower()
+        for exact in (name, str(tool.get("display_name") or "").strip()):
+            if exact and exact.lower() in lowered_source:
+                score += 20
+        ranked.append((score, index, projected))
+
+    ranked.sort(key=lambda item: (-item[0], item[1]))
+    compacted: list[dict[str, Any]] = []
+    catalog_chars = 0
+    for _score, _index, projected in ranked:
+        if len(compacted) >= MODEL_TOOL_LIMIT:
+            break
+        projected_chars = len(json.dumps(projected, ensure_ascii=False, separators=(",", ":")))
+        if compacted and catalog_chars + projected_chars > MODEL_TOOL_CATALOG_CHAR_LIMIT:
+            break
+        compacted.append(projected)
+        catalog_chars += projected_chars
+    return compacted
+
+
+def _compact_tool_input_schema(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    properties = value.get("properties") if isinstance(value.get("properties"), dict) else {}
+    required = [str(item) for item in value.get("required", []) if str(item).strip()]
+    ordered_names = [*required, *(str(name) for name in properties if str(name) not in required)]
+    selected_names = ordered_names[:MODEL_TOOL_PARAMETER_LIMIT]
+    compact_properties: dict[str, Any] = {}
+    for name in selected_names:
+        raw_property = properties.get(name)
+        if not isinstance(raw_property, dict):
+            raw_property = {}
+        item: dict[str, Any] = {
+            "type": _limited_text(raw_property.get("type"), 32),
+            "description": _limited_text(raw_property.get("description"), 100),
+        }
+        enum = raw_property.get("enum")
+        if isinstance(enum, list) and enum:
+            item["enum"] = enum[:8]
+        compact_properties[name] = {
+            key: item_value
+            for key, item_value in item.items()
+            if item_value not in (None, "", [], {})
+        }
+    result: dict[str, Any] = {"type": "object"}
+    if compact_properties:
+        result["properties"] = compact_properties
+    selected_required = [name for name in required if name in selected_names]
+    if selected_required:
+        result["required"] = selected_required
+    return result
+
+
+def _model_tool_parameter_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return ""
+    properties = value.get("properties") if isinstance(value.get("properties"), dict) else {}
+    required = {str(item) for item in value.get("required", [])}
+    parts: list[str] = []
+    for name, raw_property in properties.items():
+        property_data = raw_property if isinstance(raw_property, dict) else {}
+        kind = str(property_data.get("type") or "any")
+        marker = "必填" if name in required else "可选"
+        description = str(property_data.get("description") or "").strip()
+        part = f"{name} ({kind}, {marker})"
+        if description:
+            part += f" - {description}"
+        parts.append(part)
+    return "；".join(parts)
+
+
+def _tool_relevance_terms(value: str) -> set[str]:
+    lowered = value.lower()
+    terms = {item for item in re.findall(r"[a-z0-9_]+", lowered) if len(item) >= 2}
+    for segment in re.findall(r"[\u4e00-\u9fff]{2,}", value):
+        for size in (2, 3):
+            terms.update(segment[index : index + size] for index in range(len(segment) - size + 1))
+    return terms
+
+
+def _limited_text(value: Any, limit: int) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    return text[:limit]
 
 
 def _request_text(request: Any) -> str:

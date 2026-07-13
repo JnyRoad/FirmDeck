@@ -14,6 +14,7 @@ from app.core.context_projection import (
 from app.db.models import ChatSession, ModelConfig, Skill
 from app.knowledge.citations import knowledge_citations_from_results
 from app.llm import LLMClient
+from app.llm.stage_protocol import stage_payload, unified_system_prompt
 from app.observability.spans import llm_operation
 from app.session.session_schema import RouterDecision, StepAgentResult
 from app.tools.tool_schema import ToolResult
@@ -78,7 +79,7 @@ class ResponseGenerator:
         memory_context: list[dict[str, object]] | None = None,
         conversation_context: dict[str, object] | None = None,
     ) -> str:
-        payload = self._payload(
+        raw_payload = self._payload(
             message,
             session,
             skill,
@@ -88,12 +89,13 @@ class ResponseGenerator:
             memory_context,
             conversation_context,
         )
+        payload = self._stage_payload(raw_payload, persona_prompt)
         try:
             if tool_result and not tool_result.success:
                 return tool_failure_reply(tool_result)
             with llm_operation("response.generate"):
                 text = LLMClient(model_config).generate_text(
-                    self._system_prompt(persona_prompt), payload
+                    unified_system_prompt(), payload
                 )
             reply = text.strip() or step_result.reply or self._minimal_fallback(router_decision)
             return self._visible_reply_or_fallback(
@@ -115,7 +117,7 @@ class ResponseGenerator:
         memory_context: list[dict[str, object]] | None = None,
         conversation_context: dict[str, object] | None = None,
     ) -> Iterator[str]:
-        payload = self._payload(
+        raw_payload = self._payload(
             message,
             session,
             skill,
@@ -125,6 +127,7 @@ class ResponseGenerator:
             memory_context,
             conversation_context,
         )
+        payload = self._stage_payload(raw_payload, persona_prompt)
         try:
             if tool_result and not tool_result.success:
                 yield from self.chunk_text(tool_failure_reply(tool_result))
@@ -134,7 +137,7 @@ class ResponseGenerator:
                 return
             with llm_operation("response.generate_stream"):
                 stream = LLMClient(model_config).generate_text_stream(
-                    self._system_prompt(persona_prompt), payload
+                    unified_system_prompt(), payload
                 )
                 reply_parts: list[str] = []
                 has_streamed = False
@@ -197,7 +200,7 @@ class ResponseGenerator:
                 step_result.model_dump(mode="json")
             ),
             "tool_result": tool_result.model_dump() if tool_result else None,
-            "knowledge_results": compact_knowledge,
+            "retrieved_knowledge": compact_knowledge,
             "memory_context": compact_memory_context(memory_context),
             "knowledge_citation_hints": compact_citation_hints(
                 knowledge_citations_from_results(knowledge_context)
@@ -364,7 +367,26 @@ class ResponseGenerator:
         return FALLBACK_REPLY
 
     def _system_prompt(self, persona_prompt: str | None) -> str:
-        base_prompt = PROMPT_PATH.read_text(encoding="utf-8")
-        if not persona_prompt:
-            return base_prompt
-        return f"{persona_prompt.strip()}\n\n{base_prompt}"
+        return unified_system_prompt()
+
+    def _stage_payload(
+        self, payload: dict[str, object], persona_prompt: str | None
+    ) -> dict[str, object]:
+        stage_data = {
+            key: value
+            for key, value in payload.items()
+            if key not in {"user_message", "conversation_context", "memory_context"}
+        }
+        if persona_prompt:
+            stage_data = {"employee_identity": persona_prompt.strip(), **stage_data}
+        return stage_payload(
+            phase="Response Generator",
+            user_message=str(payload.get("user_message") or ""),
+            conversation_context=payload.get("conversation_context")
+            if isinstance(payload.get("conversation_context"), dict)
+            else {},
+            memory_context=str(payload.get("memory_context") or ""),
+            instructions=PROMPT_PATH.read_text(encoding="utf-8"),
+            stage_data=stage_data,
+            output_contract="只输出最终用户可见的纯文本，不输出 JSON、Markdown 代码围栏、分析过程或内部状态。",
+        )

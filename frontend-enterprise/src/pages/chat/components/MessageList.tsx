@@ -98,9 +98,10 @@ export default function MessageList({ chat }: { chat: UseChatSession }) {
             expandedTraceIds.includes(traceTurnId)
             || (defaultExpanded && !collapsedTraceIds.includes(traceTurnId)),
           );
-          const visibleContent = staffdeckDisplayText(
+          const rawVisibleContent = staffdeckDisplayText(
             item.role === 'assistant' ? stripTrailingCitationSummary(item.content) : item.content,
           );
+          const visibleContent = normalizeMessageText(rawVisibleContent) ? rawVisibleContent : '';
           const citations = item.role === 'assistant' ? knowledgeCitations(item, visibleContent) : [];
           const scheduledTaskPrompt = isScheduledTaskPrompt(item);
           const scheduledDraft = item.role === 'assistant' && !dismissedDraftMessageIds.includes(item.id)
@@ -126,7 +127,7 @@ export default function MessageList({ chat }: { chat: UseChatSession }) {
             && !scheduledDraft
             && !persistedCreatedTask
             && citations.length === 0
-            && !item.isStreaming
+            && attachments.length === 0
           ) {
             return null;
           }
@@ -144,7 +145,6 @@ export default function MessageList({ chat }: { chat: UseChatSession }) {
             scheduledTaskPrompt,
             attachments,
             statusOnly,
-            showTypingCaret: !statusOnly && item.role === 'assistant' && Boolean(item.isStreaming) && !summary,
           };
 
           return <MessageBubble key={`${item.id}:message`} chat={chat} item={item} render={render} />;
