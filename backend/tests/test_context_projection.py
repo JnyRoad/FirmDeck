@@ -121,8 +121,9 @@ def test_step_skill_context_keeps_only_local_graph_and_complete_instructions() -
     )
 
     assert compacted is not None
-    assert compacted["skill_id"] == "refund"
-    assert compacted["response_rules"] == ["展示退款状态"]
+    assert "skill_id" not in compacted
+    assert "response_rules" not in compacted
+    assert "required_info" not in compacted
     assert compacted["current_step"]["instruction"] == current_instruction
     assert compacted["next_steps"] == [
         {
@@ -135,6 +136,9 @@ def test_step_skill_context_keeps_only_local_graph_and_complete_instructions() -
     assert "edges" not in compacted
     assert "adjacent_edges" not in compacted
     assert "target_steps" not in compacted
+    assert "name" not in str(compacted)
+    assert "optional" not in str(compacted)
+    assert "retry_policy" not in str(compacted)
     assert "unrelated" not in str(compacted)
 
 
@@ -180,12 +184,10 @@ def test_step_skill_context_embeds_only_direct_transition_metadata() -> None:
     assert compacted["next_steps"][0]["transition"] == {
         "condition": "amount <= limit",
         "label": "未超标",
-        "priority": 1,
     }
     assert compacted["next_steps"][1]["transition"] == {
         "condition": "amount > limit",
         "label": "超标",
-        "priority": 2,
     }
     assert "after_approved" not in str(compacted)
 

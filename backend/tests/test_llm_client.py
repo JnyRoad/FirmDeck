@@ -2,7 +2,7 @@ import pytest
 
 from app.llm.client import LLMClient, LLMError
 from app.llm.output_policy import operation_output_tokens
-from app.llm.stage_protocol import stage_payload
+from app.llm.stage_protocol import TURN_STAGE_MESSAGES_KEY, stage_payload
 from app.llm.schemas import ModelConfigCreateRequest
 from app.observability.spans import bind_span_sink, llm_operation
 
@@ -410,6 +410,133 @@ def test_stage_input_uses_stable_history_and_puts_memory_time_and_question_first
     assert sum("我想申请报销" in str(message["content"]) for message in messages) == 1
 
 
+def test_stage_requests_append_each_input_and_output_to_one_turn_context() -> None:
+    client = object.__new__(LLMClient)
+    client.client = _FakeOpenAIClient()
+    client.model = "demo-model"
+    client.temperature = 0.2
+    client.max_output_tokens = 8192
+    outputs = iter(
+        [
+            '{"decision":"answer_only","confidence":0.9}',
+            '{"reply":"已处理","is_step_completed":true}',
+        ]
+    )
+
+    def fake_create(**kwargs):  # noqa: ANN003
+        client.client.chat.completions.calls.append(kwargs)
+        return _completion_with_content(next(outputs))
+
+    client.client.chat.completions.create = fake_create
+    stable_messages = [
+        {"role": "user", "content": "你好"},
+        {"role": "assistant", "content": "请说明需求"},
+        {"role": "user", "content": "查询报销规则"},
+    ]
+    context = {
+        "messages": stable_messages.copy(),
+        "metadata": {"current_turn_time": "2026-07-13T21:00:00+08:00"},
+    }
+
+    router_payload = stage_payload(
+        phase="Router",
+        user_message="查询报销规则",
+        conversation_context=context,
+        memory_context=[],
+        instructions="选择处理路径。",
+        stage_data={"available_skills": []},
+        output_contract={"decision": "answer_only"},
+    )
+    step_payload = stage_payload(
+        phase="Step Agent",
+        user_message="查询报销规则",
+        conversation_context=context,
+        memory_context=[],
+        instructions="执行当前步骤。",
+        stage_data={"current_step": {"node_id": "start"}},
+        output_contract={"reply": "string"},
+    )
+
+    assert client.generate_json("stable unified system", router_payload)["decision"] == "answer_only"
+    assert client.generate_json("stable unified system", step_payload)["reply"] == "已处理"
+
+    first_request = client.client.chat.completions.calls[0]["messages"]
+    second_request = client.client.chat.completions.calls[1]["messages"]
+    assert first_request[0] == second_request[0] == {
+        "role": "system",
+        "content": "stable unified system",
+    }
+    assert second_request[1:3] == stable_messages[:2]
+    assert second_request[3] == first_request[-1]
+    assert second_request[4] == {
+        "role": "assistant",
+        "content": '{"decision":"answer_only","confidence":0.9}',
+    }
+    assert second_request[5]["role"] == "user"
+    assert "当前阶段：\nStep Agent" in second_request[5]["content"]
+    assert "本轮用户输入：" not in second_request[5]["content"]
+    assert sum(
+        "本轮用户输入：" in str(message["content"])
+        for message in second_request
+    ) == 1
+    assert context["messages"] == stable_messages
+    assert context[TURN_STAGE_MESSAGES_KEY] == [
+        first_request[-1],
+        {"role": "assistant", "content": '{"decision":"answer_only","confidence":0.9}'},
+        second_request[-1],
+        {
+            "role": "assistant",
+            "content": '{"reply":"已处理","is_step_completed":true}',
+        },
+    ]
+
+
+def test_stage_json_repair_continues_in_the_same_turn_context() -> None:
+    client = object.__new__(LLMClient)
+    client.client = _FakeOpenAIClient()
+    client.model = "demo-model"
+    client.temperature = 0.2
+    client.max_output_tokens = 8192
+    outputs = iter(["not json", '{"decision":"answer_only"}'])
+
+    def fake_create(**kwargs):  # noqa: ANN003
+        client.client.chat.completions.calls.append(kwargs)
+        return _completion_with_content(next(outputs))
+
+    client.client.chat.completions.create = fake_create
+    context = {
+        "messages": [{"role": "user", "content": "你好"}],
+        "metadata": {"current_turn_time": "2026-07-13T21:20:00+08:00"},
+    }
+    payload = stage_payload(
+        phase="Router",
+        user_message="你好",
+        conversation_context=context,
+        memory_context=[],
+        instructions="输出路由 JSON。",
+        stage_data={"available_skills": []},
+        output_contract={"decision": "answer_only"},
+    )
+
+    assert client.generate_json("stable unified system", payload) == {
+        "decision": "answer_only"
+    }
+
+    first_request = client.client.chat.completions.calls[0]["messages"]
+    repair_request = client.client.chat.completions.calls[1]["messages"]
+    assert repair_request[1] == first_request[-1]
+    assert repair_request[2] == {"role": "assistant", "content": "not json"}
+    assert repair_request[-1]["role"] == "user"
+    assert '"_json_repair"' in repair_request[-1]["content"]
+    assert "本轮用户输入：" not in repair_request[-1]["content"]
+    assert context[TURN_STAGE_MESSAGES_KEY] == [
+        first_request[-1],
+        {"role": "assistant", "content": "not json"},
+        repair_request[-1],
+        {"role": "assistant", "content": '{"decision":"answer_only"}'},
+    ]
+
+
 def test_generate_text_keeps_append_only_history_prefix_for_kv_cache() -> None:
     client = object.__new__(LLMClient)
     client.client = _FakeOpenAIClient()
@@ -633,7 +760,6 @@ def test_user_visible_response_keeps_configured_output_budget():
 @pytest.mark.parametrize(
     ("operation", "expected"),
     [
-        ("router.task_scheduler", 2048),
         ("reflection.review", 2048),
         ("general_skill.select", 2048),
         ("general_skill.review", 2048),

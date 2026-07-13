@@ -8,7 +8,6 @@ from app.core.context_projection import (
     compact_citation_hints,
     compact_current_step,
     compact_knowledge_context,
-    compact_memory_context,
     compact_response_step_result,
 )
 from app.db.models import ChatSession, ModelConfig, Skill
@@ -79,6 +78,8 @@ class ResponseGenerator:
         memory_context: list[dict[str, object]] | None = None,
         conversation_context: dict[str, object] | None = None,
     ) -> str:
+        if self._can_use_step_reply_directly(step_result, tool_result):
+            return step_result.reply.strip()
         raw_payload = self._payload(
             message,
             session,
@@ -117,6 +118,9 @@ class ResponseGenerator:
         memory_context: list[dict[str, object]] | None = None,
         conversation_context: dict[str, object] | None = None,
     ) -> Iterator[str]:
+        if self._can_use_step_reply_directly(step_result, tool_result):
+            yield from self.chunk_text(step_result.reply or "")
+            return
         raw_payload = self._payload(
             message,
             session,
@@ -175,6 +179,20 @@ class ResponseGenerator:
         for index in range(0, len(stripped), chunk_size):
             yield stripped[index : index + chunk_size]
 
+    def _can_use_step_reply_directly(
+        self,
+        step_result: StepAgentResult,
+        tool_result: ToolResult | None,
+    ) -> bool:
+        return bool(
+            str(step_result.reply or "").strip()
+            and step_result.action in {"ask_user", "clarify"}
+            and tool_result is None
+            and step_result.tool_call is None
+            and step_result.knowledge_query is None
+            and not step_result.knowledge_results
+        )
+
     def _payload(
         self,
         message: str,
@@ -190,7 +208,9 @@ class ResponseGenerator:
         compact_knowledge = compact_knowledge_context(knowledge_context)
         return {
             "user_message": message,
-            "conversation_context": conversation_context or {},
+            "conversation_context": (
+                conversation_context if isinstance(conversation_context, dict) else {}
+            ),
             "current_step": compact_current_step(
                 skill.content_json if skill else None, session.active_step_id
             ),
@@ -201,7 +221,6 @@ class ResponseGenerator:
             ),
             "tool_result": tool_result.model_dump() if tool_result else None,
             "retrieved_knowledge": compact_knowledge,
-            "memory_context": compact_memory_context(memory_context),
             "knowledge_citation_hints": compact_citation_hints(
                 knowledge_citations_from_results(knowledge_context)
             ),
@@ -375,7 +394,7 @@ class ResponseGenerator:
         stage_data = {
             key: value
             for key, value in payload.items()
-            if key not in {"user_message", "conversation_context", "memory_context"}
+            if key not in {"user_message", "conversation_context"}
         }
         if persona_prompt:
             stage_data = {"employee_identity": persona_prompt.strip(), **stage_data}
@@ -385,7 +404,7 @@ class ResponseGenerator:
             conversation_context=payload.get("conversation_context")
             if isinstance(payload.get("conversation_context"), dict)
             else {},
-            memory_context=str(payload.get("memory_context") or ""),
+            memory_context=None,
             instructions=PROMPT_PATH.read_text(encoding="utf-8"),
             stage_data=stage_data,
             output_contract="只输出最终用户可见的纯文本，不输出 JSON、Markdown 代码围栏、分析过程或内部状态。",

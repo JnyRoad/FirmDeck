@@ -15,7 +15,7 @@
 clarification_question 是给终端用户看的澄清问题，必须像客服一样自然表达。
 禁止在 clarification_question 中要求用户提供“当前用户消息、会话状态、技能进度、可用技能列表、路由信息、JSON、decision”等内部系统信息。
 
-场景化技能和通用技能是两层能力：Router 只决定场景化技能、任务帧和调度顺序，不负责否定或执行通用技能。通用技能会在执行阶段以 `general_skill.<slug>` 的形式出现在 available_tools 中，由 StepAgent 在当前场景技能内显式调用。若用户当前消息同时推进当前场景技能，并提出实时信息、代码运行、通用计算、文件处理等临时通用能力诉求，不要因为该诉求不在 available_skills 中就降级为普通回答；应继续或保留当前场景任务，并在 reason 中说明通用能力交由执行阶段根据 available_tools 处理。
+场景化技能和通用技能是两层能力：Router 只决定场景化技能和任务执行顺序，不负责否定或执行通用技能。通用技能会在执行阶段以 `general_skill.<slug>` 的形式出现。若用户当前消息同时推进当前场景技能，并提出实时信息、代码运行、通用计算、文件处理等临时通用能力诉求，不要因为该诉求不在 available_skills 中就降级为普通回答；应继续或保留当前场景任务。
 
 Router 只根据 Skill ID、名称、描述和 trigger_intents 选择场景技能，不读取 SOP 节点图；具体节点执行和缺失字段判断交给 Step Agent。
 
@@ -57,6 +57,6 @@ slot_hints、pending_tasks/created_tasks/task_updates.slot_hints 只能填写订
 16. 每轮都要先检查 current_session.pending_tasks。如果用户当前消息是在继续其中某个任务，选择 switch_to_pending，并填写 selected_task_id。不要只根据 target_skill_id 自动合并任务。
 17. 如果 pending 为空，不能选择 switch_to_pending，但仍可继续 active 或启动新技能。
 18. 如果用户重复表达已在 pending 中的同一任务，优先输出 task_updates 更新原 task，不要新增重复 pending。
-19. 如果用户一句话包含多个独立可执行任务，必须把每个任务都显式表达出来：主 decision 表达当前应推进的任务，其他任务写入 pending_tasks / created_tasks。运行时会先把这些任务都写成 task frame，再由 scheduler 决定执行顺序；不要把多个独立任务压缩成一个 target_skill_id。
-20. 如果本轮没有一个任务天然应先执行，也可以输出 create_pending，并把所有任务写入 pending_tasks / created_tasks，让 scheduler 选择先后顺序。
-21. 当 current_session.active_skill_id 存在，而你准备选择另一个 target_skill_id 时，必须先判断当前用户消息是否同时补充、确认、推进或修改了 active skill。只要存在这种可能，就不要让 start_new_task 隐式覆盖 active skill；应把 active skill 作为一个待调度任务保留，并把新任务也显式写入 pending_tasks / created_tasks，或选择 continue_active 并把新任务写入 created_tasks。只有用户明确取消、放弃或当前任务已完成时，才可以不保留 active skill。
+19. 如果用户一句话包含多个独立可执行任务，Router 必须直接决定执行顺序：主 decision 和 target_skill_id 表达第一个执行的任务，其余任务按执行先后写入 pending_tasks / created_tasks。运行时会严格按数组顺序继续执行，不会再调用独立 scheduler；不要把多个独立任务压缩成一个 target_skill_id。
+20. 不要把多个任务全部留给 create_pending。即使多个任务优先级接近，也必须选择一个作为本轮主任务，其余任务按顺序排队。
+21. 当 current_session.active_skill_id 存在，而你准备选择另一个 target_skill_id 时，必须先判断当前用户消息是否同时补充、确认、推进或修改了 active skill。只要存在这种可能，就不要让 start_new_task 隐式覆盖 active skill；应把 active skill 放在 pending_tasks / created_tasks 的正确顺序位置，或选择 continue_active 并把新任务排到后面。只有用户明确取消、放弃或当前任务已完成时，才可以不保留 active skill。

@@ -285,7 +285,7 @@ def test_stream_emits_router_decision_before_reply_delta() -> None:
         )
         return []
 
-    loop.memory = SimpleNamespace(recall=recall_after_initial_status)
+    loop.memory = SimpleNamespace(context_memories=recall_after_initial_status)
     loop.runtime = SimpleNamespace(apply_decision=lambda *_args, **_kwargs: None)
     loop.router = SimpleNamespace(
         decide=lambda *_args, **_kwargs: RouterDecision(
@@ -305,7 +305,6 @@ def test_stream_emits_router_decision_before_reply_delta() -> None:
     loop._finish_stale_completed_skill = lambda *_args, **_kwargs: None
     loop._scene_router_deferred_to_general = lambda *_args, **_kwargs: False
     loop._hydrate_router_decision_from_context = lambda *_args, **_kwargs: {}
-    loop._initial_scheduler_queue_decision = lambda *_args, **_kwargs: None
     loop._conversation_context = lambda *_args, **_kwargs: {}
     loop._get_active_skill = lambda *_args, **_kwargs: None
     loop._should_record_runtime_event_after_prune = lambda *_args, **_kwargs: False
@@ -357,7 +356,7 @@ def test_stream_disconnect_does_not_persist_stop_event_without_cancel_flag() -> 
 
     loop.db = db
     loop.events = FakeEvents()
-    loop.memory = SimpleNamespace(recall=lambda *_args, **_kwargs: [])
+    loop.memory = SimpleNamespace(context_memories=lambda *_args, **_kwargs: [])
     loop.runtime = SimpleNamespace(apply_decision=lambda *_args, **_kwargs: None)
     loop.router = SimpleNamespace(
         decide=lambda *_args, **_kwargs: RouterDecision(
@@ -377,7 +376,6 @@ def test_stream_disconnect_does_not_persist_stop_event_without_cancel_flag() -> 
     loop._finish_stale_completed_skill = lambda *_args, **_kwargs: None
     loop._scene_router_deferred_to_general = lambda *_args, **_kwargs: False
     loop._hydrate_router_decision_from_context = lambda *_args, **_kwargs: {}
-    loop._initial_scheduler_queue_decision = lambda *_args, **_kwargs: None
     loop._conversation_context = lambda *_args, **_kwargs: {}
     loop._get_active_skill = lambda *_args, **_kwargs: None
     loop._should_record_runtime_event_after_prune = lambda *_args, **_kwargs: False
@@ -457,7 +455,7 @@ def test_stream_trace_events_require_turn_id_for_persistence() -> None:
     assert db.commits == 1
 
 
-def test_compound_turn_seeds_primary_and_created_tasks_for_scheduler() -> None:
+def test_router_order_keeps_primary_active_and_queues_followup_tasks() -> None:
     loop = object.__new__(AgentLoop)
     loop.runtime = SkillRuntime()
     session = ChatSession(
@@ -488,43 +486,19 @@ def test_compound_turn_seeds_primary_and_created_tasks_for_scheduler() -> None:
         ],
     )
 
-    queue_decision = loop._initial_scheduler_queue_decision(
-        _request("我买 A1 前跟 A3 比一下价格"),
-        session,
-        router_decision,
-    )
+    loop.runtime.apply_decision(session, router_decision)
 
-    assert queue_decision is not None
-    assert queue_decision.decision == "create_pending"
-    assert len(queue_decision.pending_tasks) == 2
-    primary, created = queue_decision.pending_tasks
-    assert primary.target_skill_id == "purchase"
-    assert primary.target_step_id == "collect_user_name"
-    assert primary.slot_hints == {"user_name": "hm", "product_id": "A1", "quantity": 1}
-    assert created.task_id == "task_price_compare_a1_a3"
-    assert created.target_skill_id == "price_compare"
-
-    loop.runtime.apply_decision(session, queue_decision)
-    loop._release_active_task_to_scheduler(session, queue_decision)
-
-    assert session.active_skill_id is None
-    assert session.active_step_id is None
-    assert [frame["skill_id"] for frame in session.pending_tasks_json] == [
-        "purchase",
-        "price_compare",
-    ]
+    assert session.active_skill_id == "purchase"
+    assert session.active_step_id == "collect_user_name"
+    assert session.slots_json == {"user_name": "hm", "product_id": "A1", "quantity": 1}
+    assert [frame["skill_id"] for frame in session.pending_tasks_json] == ["price_compare"]
     assert session.pending_tasks_json[0]["slots"] == {
-        "user_name": "hm",
-        "product_id": "A1",
-        "quantity": 1,
-    }
-    assert session.pending_tasks_json[1]["slots"] == {
         "product_name_1": "A1",
         "product_name_2": "A3",
     }
 
 
-def test_start_new_task_preserves_existing_active_frame_for_scheduler() -> None:
+def test_router_can_place_existing_active_task_after_new_primary() -> None:
     loop = object.__new__(AgentLoop)
     loop.runtime = SkillRuntime()
     session = ChatSession(
@@ -543,40 +517,25 @@ def test_start_new_task_preserves_existing_active_frame_for_scheduler() -> None:
         reason="用户提出独立比价任务。",
         source_message="我想买一个A1,然后想跟A3比下价格",
         slot_hints={"product_name_1": "A1", "product_name_2": "A3"},
+        pending_tasks=[
+            PendingTask(
+                task_id="task_purchase_a1",
+                target_skill_id="purchase",
+                target_step_id="collect_user_name",
+                user_intent="继续购买 A1",
+                source_message="我想买一个A1,然后想跟A3比下价格",
+                slot_hints={"user_name": "hm"},
+            )
+        ],
     )
 
-    queue_decision = loop._initial_scheduler_queue_decision(
-        _request("我想买一个A1,然后想跟A3比下价格"),
-        session,
-        router_decision,
-    )
+    loop.runtime.apply_decision(session, router_decision)
 
-    assert queue_decision is not None
-    assert queue_decision.decision == "create_pending"
-    assert len(queue_decision.pending_tasks) == 2
-    primary, preserved = queue_decision.pending_tasks
-    assert primary.target_skill_id == "price_compare"
-    assert primary.slot_hints == {"product_name_1": "A1", "product_name_2": "A3"}
-    assert preserved.target_skill_id == "purchase"
-    assert preserved.target_step_id == "collect_user_name"
-    assert preserved.source_message == "我想买一个A1,然后想跟A3比下价格"
-    assert preserved.slot_hints == {"user_name": "hm"}
-
-    loop.runtime.apply_decision(session, queue_decision)
-    loop._release_active_task_to_scheduler(session, queue_decision)
-
-    assert session.active_skill_id is None
-    assert session.active_step_id is None
-    assert [frame["skill_id"] for frame in session.pending_tasks_json] == [
-        "price_compare",
-        "purchase",
-    ]
-    assert session.pending_tasks_json[0]["slots"] == {
-        "product_name_1": "A1",
-        "product_name_2": "A3",
-    }
-    assert session.pending_tasks_json[1]["slots"] == {"user_name": "hm"}
-    assert session.pending_tasks_json[1]["source_message"] == "我想买一个A1,然后想跟A3比下价格"
+    assert session.active_skill_id == "price_compare"
+    assert session.active_step_id == "collect_products"
+    assert session.slots_json == {"product_name_1": "A1", "product_name_2": "A3"}
+    assert [frame["skill_id"] for frame in session.pending_tasks_json] == ["purchase"]
+    assert session.pending_tasks_json[0]["slots"] == {"user_name": "hm"}
 
 
 def test_drop_unavailable_skill_state_removes_disabled_sop_frames() -> None:
@@ -772,7 +731,7 @@ def test_finalize_turn_keeps_only_inline_knowledge_citations() -> None:
     assert [item["label"] for item in message.metadata_json["knowledge_citations"]] == ["[1]"]
 
 
-def test_merge_scheduled_reply_preserves_each_structured_execution_segment() -> None:
+def test_merge_queued_reply_preserves_each_structured_execution_segment() -> None:
     loop = object.__new__(AgentLoop)
     refund_then_purchase = (
         "好的，已为您提交订单 MOCK7A17191FC9（商品 A1）的退款申请，退款原因为“不想要了”。\n\n"
@@ -786,20 +745,20 @@ def test_merge_scheduled_reply_preserves_each_structured_execution_segment() -> 
         "好的，hm。已为您确认购买 A3 高阶商品 1 件，价格 239.0 元。请问确认下单吗？"
     )
 
-    replies, replaced = loop._merge_scheduled_reply_segment([], refund_then_purchase)
-    replies, replaced = loop._merge_scheduled_reply_segment(replies, purchase_confirmation)
+    replies, replaced = loop._merge_queued_reply_segment([], refund_then_purchase)
+    replies, replaced = loop._merge_queued_reply_segment(replies, purchase_confirmation)
 
     assert replaced is False
     assert replies == [refund_then_purchase, purchase_confirmation]
 
 
-def test_merge_scheduled_reply_keeps_distinct_followup_confirmations() -> None:
+def test_merge_queued_reply_keeps_distinct_followup_confirmations() -> None:
     loop = object.__new__(AgentLoop)
     first = "退款已处理。接下来为您购买 A1，请问确认下单吗？"
     second = "好的，hm。已为您确认购买 A3 高阶商品 1 件，价格 239.0 元。请问确认下单吗？"
 
-    replies, replaced = loop._merge_scheduled_reply_segment([], first)
-    replies, replaced = loop._merge_scheduled_reply_segment(replies, second)
+    replies, replaced = loop._merge_queued_reply_segment([], first)
+    replies, replaced = loop._merge_queued_reply_segment(replies, second)
 
     assert replaced is False
     assert replies == [first, second]
@@ -1040,7 +999,7 @@ def test_scheduled_task_followup_can_continue_after_stale_terminal_completion() 
     request = _request("自动任务唤醒：完成维修后继续处理购买任务")
     request.interaction_mode = "scheduled_task"
 
-    should_continue = loop._should_attempt_scheduled_task_followup(
+    should_continue = loop._should_attempt_queued_task_followup(
         request,
         session,
         [_repair_skill(), _purchase_skill()],
@@ -1083,7 +1042,7 @@ def test_normal_chat_does_not_auto_continue_pending_after_stale_terminal_complet
         ],
     )
 
-    should_continue = loop._should_attempt_scheduled_task_followup(
+    should_continue = loop._should_attempt_queued_task_followup(
         _request("普通聊天继续处理"),
         session,
         [_repair_skill(), _purchase_skill()],
@@ -2130,14 +2089,34 @@ def test_step_agent_tools_are_scoped_to_active_skill() -> None:
     global_tool = _order_add_tool()
 
     purchase_tool_names = {
-        tool.name for tool in loop._step_agent_tools(purchase_skill, [price_tool, global_tool])
+        tool.name
+        for tool in loop._step_agent_tools(
+            purchase_skill,
+            [price_tool, global_tool],
+            active_step_id="confirm_product",
+            slots={"product_id": "A1"},
+        )
     }
     price_tool_names = {
-        tool.name for tool in loop._step_agent_tools(price_skill, [price_tool, global_tool])
+        tool.name
+        for tool in loop._step_agent_tools(
+            price_skill,
+            [price_tool, global_tool],
+            active_step_id="query_price",
+        )
     }
 
     assert purchase_tool_names == {"order.add"}
-    assert price_tool_names == {"product.price_query", "order.add"}
+    assert price_tool_names == {"product.price_query"}
+    assert (
+        loop._step_agent_tools(
+            purchase_skill,
+            [price_tool, global_tool],
+            active_step_id="collect_user_name",
+            slots={},
+        )
+        == []
+    )
     assert loop._step_agent_tools(None, [price_tool, global_tool]) == []
 
 

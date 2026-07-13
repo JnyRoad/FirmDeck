@@ -14,7 +14,11 @@ from openai import OpenAI
 from app.config import get_settings
 from app.db.models import ModelConfig
 from app.llm.output_policy import operation_output_tokens
-from app.llm.stage_protocol import STAGE_PROTOCOL_KEY
+from app.llm.stage_protocol import (
+    STAGE_PROTOCOL_KEY,
+    TURN_STAGE_MESSAGES_KEY,
+    render_stage_user_message,
+)
 from app.observability.spans import current_llm_operation, llm_span_attributes, start_llm_call
 from app.security.encryption import decrypt_secret
 
@@ -28,6 +32,7 @@ EMPTY_RESPONSE_RETRIES = 2
 EMPTY_RESPONSE_MESSAGE = "Model returned an empty response"
 DEFAULT_MODEL_API_TIMEOUT_SECONDS = 600.0
 DEFAULT_INPUT_TOKEN_BUDGET = 32_000
+TURN_STAGE_MESSAGE_MARKER = "_agent_turn_message"
 
 
 class _CurrentStageText(str):
@@ -64,6 +69,12 @@ class LLMClient:
         context_messages, serialized = _prepare_user_input(user_payload)
         request_messages = _request_messages(system_prompt, context_messages, serialized)
         request_messages = _fit_request_messages(request_messages)
+        if isinstance(user_payload, dict) and isinstance(
+            user_payload.get(STAGE_PROTOCOL_KEY), dict
+        ):
+            self._last_stage_request_user_content = copy.deepcopy(
+                request_messages[-1].get("content")
+            )
         request_shape = _request_shape_metrics(
             system_prompt, context_messages, serialized, request_messages
         )
@@ -105,6 +116,14 @@ class LLMClient:
                         status="success",
                         **metrics,
                     )
+                    if not getattr(self, "_defer_stage_recording", False):
+                        _record_stage_exchange(
+                            user_payload,
+                            content,
+                            request_user_content=getattr(
+                                self, "_last_stage_request_user_content", None
+                            ),
+                        )
                     return content
                 span.finish(
                     ttft_ms=span.elapsed_ms(),
@@ -129,6 +148,12 @@ class LLMClient:
         context_messages, serialized = _prepare_user_input(user_payload)
         request_messages = _request_messages(system_prompt, context_messages, serialized)
         request_messages = _fit_request_messages(request_messages)
+        if isinstance(user_payload, dict) and isinstance(
+            user_payload.get(STAGE_PROTOCOL_KEY), dict
+        ):
+            self._last_stage_request_user_content = copy.deepcopy(
+                request_messages[-1].get("content")
+            )
         request_shape = _request_shape_metrics(
             system_prompt, context_messages, serialized, request_messages
         )
@@ -147,6 +172,7 @@ class LLMClient:
                     **request_shape,
                 )
                 pending_parts: list[str] = []
+                recorded_parts: list[str] = []
                 emitted_text = False
                 chunk_count = 0
                 choice_chunk_count = 0
@@ -183,6 +209,7 @@ class LLMClient:
                         content = _content_text(getattr(delta, "content", None))
                         if not content:
                             continue
+                        recorded_parts.append(content)
                         output_chars += len(content)
                         if first_content_ms is None:
                             first_content_ms = span.elapsed_ms()
@@ -216,6 +243,13 @@ class LLMClient:
                         reasoning_chars=reasoning_chars,
                         finish_reasons=sorted(finish_reasons),
                         provider_response_ids=sorted(response_ids),
+                    )
+                    _record_stage_exchange(
+                        user_payload,
+                        "".join(recorded_parts),
+                        request_user_content=getattr(
+                            self, "_last_stage_request_user_content", None
+                        ),
                     )
                     return
                 span.finish(
@@ -257,18 +291,44 @@ class LLMClient:
                 json_retry_count=attempt,
                 json_max_attempts=JSON_REPAIR_ATTEMPTS + 1,
             ):
-                text = self._generate_json_candidate(system_prompt, next_payload, json_mode_supported)
-                if json_mode_supported and _response_format_unsupported(text):
-                    json_mode_supported = False
-                    text = self.generate_text(system_prompt, next_payload)
+                previous_defer = getattr(self, "_defer_stage_recording", False)
+                self._defer_stage_recording = True
+                try:
+                    text = self._generate_json_candidate(
+                        system_prompt, next_payload, json_mode_supported
+                    )
+                    if json_mode_supported and _response_format_unsupported(text):
+                        json_mode_supported = False
+                        text = self.generate_text(system_prompt, next_payload)
+                finally:
+                    self._defer_stage_recording = previous_defer
             outputs.append(text)
             try:
-                return _loads_llm_json(text)
+                parsed = _loads_llm_json(text)
+                _record_stage_exchange(
+                    next_payload,
+                    text,
+                    request_user_content=getattr(
+                        self, "_last_stage_request_user_content", None
+                    ),
+                )
+                return parsed
             except json.JSONDecodeError as exc:
                 last_error = exc
+                _record_stage_exchange(
+                    next_payload,
+                    text,
+                    request_user_content=getattr(
+                        self, "_last_stage_request_user_content", None
+                    ),
+                )
                 if attempt >= JSON_REPAIR_ATTEMPTS:
                     break
                 next_payload = copy.deepcopy(user_payload)
+                if isinstance(user_payload.get(STAGE_PROTOCOL_KEY), dict):
+                    next_payload["conversation_context"] = user_payload.get(
+                        "conversation_context"
+                    )
                 next_payload["_json_repair"] = {
                     "attempt": attempt + 1,
                     "max_attempts": JSON_REPAIR_ATTEMPTS,
@@ -384,6 +444,7 @@ def _fit_request_messages(
                 index
                 for index in range(1, len(projected) - 1)
                 if not _is_history_summary_message(projected[index])
+                and not _is_turn_stage_message(projected[index])
             ),
             None,
         )
@@ -392,14 +453,30 @@ def _fit_request_messages(
         projected.pop(removable_index)
 
     while len(projected) > 2 and _request_tokens(projected) > token_budget:
-        projected.pop(1)
+        removable_index = next(
+            (
+                index
+                for index in range(1, len(projected) - 1)
+                if not _is_turn_stage_message(projected[index])
+            ),
+            None,
+        )
+        if removable_index is None:
+            break
+        projected.pop(removable_index)
+
+    _trim_turn_stage_messages(projected, token_budget)
+    _drop_oldest_turn_stage_exchanges(projected, token_budget)
 
     if projected and _request_tokens(projected) > token_budget:
         fixed_tokens = _request_tokens(projected[:-1])
         projected[-1] = _trim_request_message(
             projected[-1], max(1, token_budget - fixed_tokens)
         )
-    return projected
+    return [
+        {key: value for key, value in message.items() if key != TURN_STAGE_MESSAGE_MARKER}
+        for message in projected
+    ]
 
 
 def _request_tokens(messages: list[dict[str, Any]]) -> int:
@@ -415,6 +492,55 @@ def _is_history_summary_message(message: dict[str, Any]) -> bool:
     return content.startswith(
         ("历史的信息可以被总结为：", "近期的历史信息总结为：")
     )
+
+
+def _is_turn_stage_message(message: dict[str, Any]) -> bool:
+    return message.get(TURN_STAGE_MESSAGE_MARKER) is True
+
+
+def _trim_turn_stage_messages(
+    messages: list[dict[str, Any]], token_budget: int
+) -> None:
+    while _request_tokens(messages) > token_budget:
+        candidates = [
+            (len(_content_text(message.get("content"))), index)
+            for index, message in enumerate(messages[1:-1], start=1)
+            if _is_turn_stage_message(message)
+            and len(_content_text(message.get("content"))) > 512
+        ]
+        if not candidates:
+            break
+        current_length, index = max(candidates)
+        excess_tokens = _request_tokens(messages) - token_budget
+        target_tokens = max(128, math.ceil(current_length / 4) - excess_tokens)
+        trimmed = _trim_request_message(messages[index], target_tokens)
+        trimmed[TURN_STAGE_MESSAGE_MARKER] = True
+        if len(_content_text(trimmed.get("content"))) >= current_length:
+            break
+        messages[index] = trimmed
+
+
+def _drop_oldest_turn_stage_exchanges(
+    messages: list[dict[str, Any]], token_budget: int
+) -> None:
+    while _request_tokens(messages) > token_budget:
+        stage_indices = [
+            index
+            for index, message in enumerate(messages[1:-1], start=1)
+            if _is_turn_stage_message(message)
+        ]
+        if len(stage_indices) <= 2:
+            break
+        first_index = stage_indices[0]
+        remove_count = 1
+        if (
+            len(stage_indices) > 1
+            and stage_indices[1] == first_index + 1
+            and messages[first_index].get("role") == "user"
+            and messages[first_index + 1].get("role") == "assistant"
+        ):
+            remove_count = 2
+        del messages[first_index : first_index + remove_count]
 
 
 def _trim_request_message(
@@ -816,9 +942,15 @@ def _prepare_user_input(
 def _prepare_stage_user_input(
     user_payload: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], str | list[dict[str, Any]]]:
-    payload = copy.deepcopy(user_payload)
-    stage = payload.pop(STAGE_PROTOCOL_KEY, {})
-    context = payload.pop("conversation_context", None)
+    context = user_payload.get("conversation_context")
+    payload = copy.deepcopy(
+        {
+            key: value
+            for key, value in user_payload.items()
+            if key != "conversation_context"
+        }
+    )
+    payload.pop(STAGE_PROTOCOL_KEY, None)
     context_messages = _project_messages_from_context(context)
     user_message = str(payload.pop("user_message", "") or "").strip()
     current_images: list[dict[str, Any]] = []
@@ -838,23 +970,11 @@ def _prepare_stage_user_input(
         context_messages.pop(index)
         break
 
-    projected = _drop_empty_values(payload)
-    output_contract = stage.get("output_contract")
-    if not isinstance(output_contract, str):
-        output_contract = json.dumps(
-            output_contract or {}, ensure_ascii=False, separators=(",", ":")
-        )
-    sections = [
-        f"用户记忆：\n{stage.get('memory') or '无'}",
-        f"本轮时间：\n{stage.get('turn_time') or '未提供'}",
-        f"本轮用户输入：\n{user_message or '（空）'}",
-        f"当前阶段：\n{stage.get('phase') or '未指定'}",
-        f"阶段规则：\n{str(stage.get('instructions') or '').strip()}",
-        "当前阶段独有内容：\n"
-        + json.dumps(projected, ensure_ascii=False, separators=(",", ":")),
-        f"输出约束：\n{output_contract}",
-    ]
-    serialized = "\n\n".join(sections)
+    turn_stage_messages = _project_turn_stage_messages(context)
+    context_messages.extend(turn_stage_messages)
+    serialized = render_stage_user_message(
+        user_payload, include_turn_header=not turn_stage_messages
+    )
     if not current_images:
         return context_messages, _CurrentStageText(serialized)
     return context_messages, [
@@ -888,6 +1008,63 @@ def _project_messages_from_context(context: Any) -> list[dict[str, Any]]:
         else:
             projected.append({"role": role, "content": content})
     return projected
+
+
+def _project_turn_stage_messages(context: Any) -> list[dict[str, Any]]:
+    if not isinstance(context, dict):
+        return []
+    messages = context.get(TURN_STAGE_MESSAGES_KEY)
+    if not isinstance(messages, list):
+        return []
+    projected: list[dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "").strip()
+        content = message.get("content")
+        if role not in {"user", "assistant"} or not _content_text(content).strip():
+            continue
+        projected.append(
+            {
+                "role": role,
+                "content": content,
+                TURN_STAGE_MESSAGE_MARKER: True,
+            }
+        )
+    return projected
+
+
+def _record_stage_exchange(
+    context_payload: dict[str, Any] | str,
+    assistant_content: str,
+    *,
+    request_user_content: Any = None,
+) -> None:
+    if not isinstance(context_payload, dict):
+        return
+    if not isinstance(context_payload.get(STAGE_PROTOCOL_KEY), dict):
+        return
+    context = context_payload.get("conversation_context")
+    if not isinstance(context, dict):
+        return
+    turn_messages = context.setdefault(TURN_STAGE_MESSAGES_KEY, [])
+    if not isinstance(turn_messages, list):
+        return
+    content = str(assistant_content or "").strip()
+    if not content:
+        return
+    user_content = request_user_content
+    if not _content_text(user_content).strip():
+        user_content = render_stage_user_message(
+            context_payload,
+            include_turn_header=not _project_turn_stage_messages(context),
+        )
+    turn_messages.extend(
+        [
+            {"role": "user", "content": copy.deepcopy(user_content)},
+            {"role": "assistant", "content": content},
+        ]
+    )
 
 
 def _drop_empty_values(value: Any) -> Any:

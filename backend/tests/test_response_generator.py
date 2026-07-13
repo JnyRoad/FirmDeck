@@ -602,3 +602,42 @@ def test_knowledge_result_does_not_prefer_generic_step_reply(monkeypatch):
     )
 
     assert reply == "前端规范包括目录组织、命名规范和组件编写规范。[1]"
+def test_response_generator_skips_model_for_simple_step_question(monkeypatch) -> None:
+    def fail_generate_text(*_args, **_kwargs):
+        raise AssertionError("simple ask_user reply must not call the response model")
+
+    monkeypatch.setattr("app.core.response_generator.LLMClient.generate_text", fail_generate_text)
+    reply = ResponseGenerator().generate(
+        "我要报销",
+        ChatSession(id="session_test", tenant_id="tenant_demo"),
+        None,
+        RouterDecision(decision="continue_active"),
+        StepAgentResult(action="ask_user", reply="请补充报销金额。"),
+        None,
+        model_config=None,  # type: ignore[arg-type]
+    )
+
+    assert reply == "请补充报销金额。"
+
+
+def test_response_generator_stream_skips_model_for_simple_clarification(monkeypatch) -> None:
+    def fail_generate_text_stream(*_args, **_kwargs):
+        raise AssertionError("simple clarification must not call the response model")
+
+    monkeypatch.setattr(
+        "app.core.response_generator.LLMClient.generate_text_stream",
+        fail_generate_text_stream,
+    )
+    chunks = list(
+        ResponseGenerator().generate_stream(
+            "我要办理业务",
+            ChatSession(id="session_test", tenant_id="tenant_demo"),
+            None,
+            RouterDecision(decision="continue_active"),
+            StepAgentResult(action="clarify", reply="请说明具体业务类型。"),
+            None,
+            model_config=None,  # type: ignore[arg-type]
+        )
+    )
+
+    assert "".join(chunks) == "请说明具体业务类型。"

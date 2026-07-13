@@ -70,13 +70,6 @@ class AwaitingInput(BaseModel):
     turn_id: Optional[str] = None
 
 
-class TaskScheduleDecision(BaseModel):
-    action: Literal["run_tasks", "stop"] = "stop"
-    selected_task_ids: list[str] = Field(default_factory=list)
-    confidence: float = 0.0
-    reason: Optional[str] = None
-
-
 class RouterDecision(BaseModel):
     decision: RouterDecisionValue
     selected_task_id: Optional[str] = None
@@ -105,6 +98,17 @@ class KnowledgeQuery(BaseModel):
 
 
 class StepAgentResult(BaseModel):
+    action: Optional[
+        Literal[
+            "ask_user",
+            "clarify",
+            "reply",
+            "advance",
+            "call_tool",
+            "query_knowledge",
+            "handoff",
+        ]
+    ] = None
     reply: Optional[str] = None
     slot_updates: dict[str, Any] = Field(default_factory=dict)
     tool_call: Optional[ToolCall] = None

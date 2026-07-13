@@ -293,7 +293,15 @@ def test_reflection_target_skill_is_scheduled_instead_of_skipped() -> None:
     ) -> StepAgentResult:
         captured["active_skill_id"] = active_skill.skill_id if active_skill else None
         captured["router_decision"] = router_decision.model_dump(mode="json")
-        captured["tool_names"] = [tool.name for tool in loop._step_agent_tools(active_skill, tools)]
+        captured["tool_names"] = [
+            tool.name
+            for tool in loop._step_agent_tools(
+                active_skill,
+                tools,
+                active_step_id=chat_session.active_step_id,
+                slots=chat_session.slots_json,
+            )
+        ]
         return StepAgentResult(reply="已切换到比价流程。", is_step_completed=True)
 
     loop._get_active_skill = lambda tenant_id, skill_id, agent_id=None: skills_by_id.get(skill_id)  # type: ignore[method-assign]
@@ -345,7 +353,7 @@ def test_reflection_target_skill_is_scheduled_instead_of_skipped() -> None:
     assert step_result.reply == "已切换到比价流程。"
     assert tool_result is None
     assert captured["active_skill_id"] == "price_compare"
-    assert captured["tool_names"] == ["product.price_query"]
+    assert captured["tool_names"] == []
     assert not any(record[2] == "reflection_retry_skipped" for record in loop.events.records)
     assert any(
         record[2] == "reflection_retry_started" and record[3]["mode"] == "skill"

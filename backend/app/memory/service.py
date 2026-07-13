@@ -15,7 +15,6 @@ from app.tools.tool_schema import ToolResult
 
 
 PROMPT_PATH = paths.resource_dir() / "app" / "llm" / "prompts" / "memory_extractor_prompt.md"
-RERANK_PROMPT_PATH = paths.resource_dir() / "app" / "llm" / "prompts" / "memory_reranker_prompt.md"
 MEMORY_SOURCE = "model_memory_extractor"
 PROFILE_NAME_KEY = "preferred_name"
 ALLOWED_MEMORY_KINDS = {"profile", "preference", "fact"}
@@ -30,82 +29,29 @@ class MemoryService:
         tenant_id: str,
         user_id: str,
         query: str,
-        limit: int = 5,
-        model_config: ModelConfig | None = None,
+        limit: int | None = None,
         agent_id: str | None = None,
     ) -> list[MemoryRecord]:
-        rows = [
+        del query, limit
+        return self.context_memories(tenant_id, user_id, agent_id=agent_id)
+
+    def context_memories(
+        self,
+        tenant_id: str,
+        user_id: str,
+        *,
+        agent_id: str | None = None,
+    ) -> list[MemoryRecord]:
+        return [
             row
-            for row in self._list_user_memories(tenant_id, user_id, limit=80, agent_id=agent_id)
+            for row in self._list_user_memories(
+                tenant_id,
+                user_id,
+                limit=None,
+                agent_id=agent_id,
+            )
             if row.kind in ALLOWED_MEMORY_KINDS
         ]
-        profile_rows = [row for row in rows if row.kind == "profile"][:2]
-        other_rows = [row for row in rows if row.kind != "profile"]
-        if model_config and other_rows:
-            ranked = self._llm_rerank_memories(query, other_rows, model_config, limit=max(0, limit - len(profile_rows)))
-            recalled = [*profile_rows, *ranked]
-            return recalled[:limit]
-        query_terms = _terms(query)
-        scored = sorted(
-            other_rows,
-            key=lambda row: (_score(row.content, query_terms), row.importance, row.updated_at),
-            reverse=True,
-        )
-        ranked_other = [row for row in scored if _score(row.content, query_terms) > 0]
-        recalled = [*profile_rows, *ranked_other]
-        return recalled[:limit] or rows[: min(limit, len(rows))]
-
-    def _llm_rerank_memories(
-        self,
-        query: str,
-        rows: list[MemoryRecord],
-        model_config: ModelConfig,
-        limit: int,
-    ) -> list[MemoryRecord]:
-        if limit <= 0:
-            return []
-        candidates = rows[:30]
-        candidate_refs = [f"m{index}" for index in range(1, len(candidates) + 1)]
-        candidate_text = "\n".join(
-            f"{reference}: {row.content}"
-            for reference, row in zip(candidate_refs, candidates, strict=True)
-        )
-        by_id = {
-            reference: row
-            for reference, row in zip(candidate_refs, candidates, strict=True)
-        }
-        try:
-            with llm_operation("memory.rerank", candidate_count=len(candidates)):
-                raw = LLMClient(model_config).generate_json(
-                    RERANK_PROMPT_PATH.read_text(encoding="utf-8"),
-                    {
-                        "user_message": query,
-                        "candidate_memories": candidate_text,
-                        "limit": limit,
-                    },
-                )
-        except Exception:
-            return self._lexical_recall(query, rows, limit)
-        ids = raw.get("memory_ids") if isinstance(raw, dict) else []
-        ranked: list[MemoryRecord] = []
-        for memory_id in ids if isinstance(ids, list) else []:
-            row = by_id.get(str(memory_id))
-            if row and row not in ranked:
-                ranked.append(row)
-            if len(ranked) >= limit:
-                break
-        if ranked:
-            return ranked
-        return self._lexical_recall(query, rows, limit)
-
-    def _lexical_recall(self, query: str, rows: list[MemoryRecord], limit: int) -> list[MemoryRecord]:
-        query_terms = _terms(query)
-        scored = sorted(
-            rows,
-            key=lambda row: (_score(row.content, query_terms), row.importance, row.updated_at),
-            reverse=True,
-        )
-        return [row for row in scored if _score(row.content, query_terms) > 0][:limit] or scored[:limit]
 
     def capture_turn(
         self,
@@ -180,26 +126,26 @@ class MemoryService:
         self,
         tenant_id: str,
         user_id: str,
-        limit: int = 80,
+        limit: int | None = 80,
         normalize: bool = True,
         agent_id: str | None = None,
     ) -> list[MemoryRecord]:
-        fetch_limit = limit * 5 if agent_id else limit
-        rows = list(
-            self.db.exec(
-                select(MemoryRecord)
-                .where(
-                    MemoryRecord.tenant_id == tenant_id,
-                    MemoryRecord.user_id == user_id,
-                    MemoryRecord.kind != "conversation",
-                )
-                .order_by(MemoryRecord.updated_at.desc())
-                .limit(fetch_limit)
-            ).all()
+        statement = (
+            select(MemoryRecord)
+            .where(
+                MemoryRecord.tenant_id == tenant_id,
+                MemoryRecord.user_id == user_id,
+                MemoryRecord.kind != "conversation",
+            )
+            .order_by(MemoryRecord.updated_at.desc())
         )
+        if limit is not None:
+            statement = statement.limit(limit * 5 if agent_id else limit)
+        rows = list(self.db.exec(statement).all())
         if agent_id:
             rows = [row for row in rows if self._memory_matches_agent(row, agent_id)]
-        rows = rows[:limit]
+        if limit is not None:
+            rows = rows[:limit]
         return memory_rows_for_read(rows) if normalize else rows
 
     def _upsert_keyed_memory(
@@ -474,16 +420,3 @@ def _read_dedupe_key(record: MemoryRecord) -> str:
     if record.kind == "summary":
         return "summary"
     return record.id
-
-
-def _terms(text: str) -> set[str]:
-    words = set(re.findall(r"[A-Za-z0-9_]{2,}", text.lower()))
-    words.update(char for char in text if "\u4e00" <= char <= "\u9fff")
-    return words
-
-
-def _score(content: str, query_terms: set[str]) -> int:
-    if not query_terms:
-        return 1
-    lower = content.lower()
-    return sum(1 for term in query_terms if term in lower)

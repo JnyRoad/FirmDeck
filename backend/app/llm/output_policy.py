@@ -5,7 +5,6 @@ from __future__ import annotations
 # Long-form code/content generation intentionally keeps a larger allowance.
 OPERATION_MAX_OUTPUT_TOKENS: dict[str, int] = {
     "router.scene": 1024,
-    "router.task_scheduler": 2048,
     "context.compact": 2048,
     "reflection.review": 2048,
     "general_skill.select": 2048,
@@ -17,7 +16,6 @@ OPERATION_MAX_OUTPUT_TOKENS: dict[str, int] = {
     "knowledge.bucket_route": 512,
     "knowledge.discovery": 4096,
     "knowledge.ingest_bucket": 8192,
-    "memory.rerank": 512,
     "memory.capture": 1024,
     "session.title": 512,
     "scheduled_task.detect": 1024,

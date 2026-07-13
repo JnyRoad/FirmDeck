@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.core.conversation_context import build_conversation_context
+from app.llm.stage_protocol import TURN_STAGE_MESSAGES_KEY
 
 
 CONTROL_CONTEXT_TOKEN_BUDGET = 32_000
@@ -40,18 +41,22 @@ def compact_conversation_context(
 ) -> dict[str, object]:
     if not isinstance(context, dict):
         return build_conversation_context([], token_budget)
+    turn_messages = context.setdefault(TURN_STAGE_MESSAGES_KEY, [])
     messages = context.get("messages")
     if not isinstance(messages, list):
-        return {key: value for key, value in context.items() if key != "messages"}
+        context["messages"] = []
+        return context
     metadata = context.get("metadata")
     if (
         isinstance(metadata, dict)
         and int(metadata.get("estimated_tokens") or 0) <= token_budget
     ):
         return context
-    return build_conversation_context(
+    compacted = build_conversation_context(
         [message for message in messages if isinstance(message, dict)], token_budget
     )
+    compacted[TURN_STAGE_MESSAGES_KEY] = turn_messages
+    return compacted
 
 
 def compact_current_step(
@@ -102,20 +107,14 @@ def compact_step_skill_context(
         target_node = nodes_by_id.get(target_id)
         if not target_node:
             continue
-        projected_step = _project_node(target_node)
+        projected_step = _project_step_agent_node(target_node)
         transition = _project_transition(edge)
         if transition:
             projected_step["transition"] = transition
         next_steps.append(projected_step)
     return _without_empty(
         {
-            "skill_id": skill_id or content.get("skill_id"),
-            "name": name or content.get("name"),
-            "description": description or content.get("description"),
-            "required_info": content.get("required_info"),
-            "slot_filling_policy": content.get("slot_filling_policy"),
-            "response_rules": content.get("response_rules"),
-            "current_step": current_step,
+            "current_step": _project_step_agent_node(current_step or {}),
             "next_steps": next_steps,
         }
     )
@@ -138,6 +137,20 @@ def compact_router_decision(payload: dict[str, Any] | None) -> dict[str, Any] | 
                 "clarification_question",
                 "slot_hints",
             )
+        }
+    )
+    return projected or None
+
+
+def compact_step_router_decision(
+    payload: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    projected = _without_empty(
+        {
+            "decision": payload.get("decision"),
+            "user_intent": _short_text(payload.get("user_intent"), 300),
         }
     )
     return projected or None
@@ -208,6 +221,32 @@ def compact_pending_tasks(items: list[dict[str, Any]] | None) -> list[dict[str, 
         if task:
             tasks.append(task)
     return tasks
+
+
+def compact_deferred_intents(
+    items: list[dict[str, Any]] | None,
+    *,
+    selected_task_id: str | None = None,
+) -> list[str]:
+    if not isinstance(items, list):
+        return []
+    intents: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if selected_task_id and str(item.get("task_id") or "") == selected_task_id:
+            continue
+        if str(item.get("status") or "pending") != "pending":
+            continue
+        intent = _short_text(
+            item.get("intent_summary")
+            or item.get("user_intent")
+            or item.get("source_message"),
+            300,
+        )
+        if intent and intent not in intents:
+            intents.append(intent)
+    return intents
 
 
 def compact_awaiting_input(value: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -343,6 +382,21 @@ def _project_node(node: dict[str, Any]) -> dict[str, Any]:
     return _without_empty(projected)
 
 
+def _project_step_agent_node(node: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(node, dict):
+        return {}
+    return _without_empty(
+        {
+            "node_id": node.get("node_id") or node.get("step_id"),
+            "type": node.get("type"),
+            "instruction": node.get("instruction"),
+            "expected_user_info": node.get("expected_user_info"),
+            "allowed_actions": node.get("allowed_actions"),
+            "knowledge_scope": node.get("knowledge_scope"),
+        }
+    )
+
+
 def _project_transition(edge: dict[str, Any]) -> dict[str, Any]:
     return _without_empty(
         {
@@ -350,7 +404,6 @@ def _project_transition(edge: dict[str, Any]) -> dict[str, Any]:
             for key in (
                 "condition",
                 "label",
-                "priority",
             )
         }
     )

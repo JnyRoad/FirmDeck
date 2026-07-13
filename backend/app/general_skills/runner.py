@@ -25,6 +25,7 @@ from app.general_skills.schema import (
 )
 from app.general_skills.runtime_env import GeneralSkillRuntimeError, ensure_runtime_python, runtime_environment
 from app.llm import LLMClient, LLMError
+from app.llm.stage_protocol import stage_payload, unified_system_prompt
 from app.observability.spans import llm_operation
 
 
@@ -39,6 +40,28 @@ MAX_OUTPUT_CHARS = 20000
 GENERAL_SKILL_MAX_TOKENS = 8192
 GENERAL_SKILL_MAX_ATTEMPTS = 10
 TraceSink = Callable[[dict[str, Any]], None]
+GENERAL_SKILL_SELECTION_OUTPUT = {
+    "use_general_skill": "boolean",
+    "selected_slug": "string?",
+    "use_knowledge": "boolean",
+    "knowledge_query": "string?",
+    "confidence": "number",
+    "reason": "string?",
+}
+GENERAL_SKILL_PLAN_OUTPUT = {
+    "code": "string",
+    "runtime": "bash | python",
+    "rationale": "string?",
+    "expected_output": "string?",
+}
+GENERAL_SKILL_REVIEW_OUTPUT = {
+    "result_sufficient": "boolean",
+    "needs_retry": "boolean",
+    "terminal": "boolean",
+    "reason": "string",
+    "repair_hint": "string?",
+}
+GENERAL_SKILL_REPLY_OUTPUT = {"reply": "string"}
 
 
 class GeneralSkillSelector:
@@ -47,24 +70,33 @@ class GeneralSkillSelector:
         query: str,
         general_skills: list[GeneralSkill],
         model_config: ModelConfig,
+        conversation_context: dict[str, object] | None = None,
+        memory_context: list[dict[str, object]] | None = None,
     ) -> GeneralSkillSelection:
-        payload = {
-            "user_message": query,
-            "general_skills": [
-                {
-                    "slug": skill.slug,
-                    "name": skill.name,
-                    "description": skill.description,
-                    "homepage": skill.homepage,
-                    "status": skill.status,
-                }
-                for skill in general_skills
-                if skill.status == "published"
-            ],
-        }
+        payload = stage_payload(
+            phase="Router / General Skill Selector",
+            user_message=query,
+            conversation_context=conversation_context,
+            memory_context=memory_context,
+            instructions=SELECTOR_PROMPT.read_text(encoding="utf-8"),
+            stage_data={
+                "general_skills": [
+                    {
+                        "slug": skill.slug,
+                        "name": skill.name,
+                        "description": skill.description,
+                        "homepage": skill.homepage,
+                        "status": skill.status,
+                    }
+                    for skill in general_skills
+                    if skill.status == "published"
+                ],
+            },
+            output_contract=GENERAL_SKILL_SELECTION_OUTPUT,
+        )
         with llm_operation("general_skill.select"):
             raw = LLMClient(model_config).generate_json(
-                SELECTOR_PROMPT.read_text(encoding="utf-8"), payload
+                unified_system_prompt(), payload
             )
         decision = GeneralSkillSelection.model_validate(raw)
         slugs = {skill.slug for skill in general_skills if skill.status == "published"}
@@ -82,6 +114,8 @@ class GeneralSkillRunner:
         user_id: str = "",
         max_attempts: int = GENERAL_SKILL_MAX_ATTEMPTS,
         event_sink: TraceSink | None = None,
+        conversation_context: dict[str, object] | None = None,
+        memory_context: list[dict[str, object]] | None = None,
     ) -> GeneralSkillRunResponse:
         trace: list[dict[str, Any]] = []
         max_attempts = max(1, min(max_attempts, GENERAL_SKILL_MAX_ATTEMPTS))
@@ -94,6 +128,8 @@ class GeneralSkillRunner:
                 trace,
                 event_sink,
                 max_attempts,
+                conversation_context,
+                memory_context,
             )
         except LLMError as exc:
             _emit(trace, {"phase": "plan_failed", "message": "模型生成 runner 失败", "error": str(exc)}, event_sink)
@@ -138,6 +174,8 @@ class GeneralSkillRunner:
                 trace,
                 event_sink,
                 attempt,
+                conversation_context,
+                memory_context,
             )
             attempts.append(
                 {
@@ -195,7 +233,17 @@ class GeneralSkillRunner:
                 event_sink,
             )
             try:
-                plan = self._repair_plan(skill, query, model_config, trace, attempts, event_sink, attempt + 1)
+                plan = self._repair_plan(
+                    skill,
+                    query,
+                    model_config,
+                    trace,
+                    attempts,
+                    event_sink,
+                    attempt + 1,
+                    conversation_context,
+                    memory_context,
+                )
             except LLMError as exc:
                 _emit(
                     trace,
@@ -205,7 +253,18 @@ class GeneralSkillRunner:
                 break
 
         try:
-            reply = self._generate_reply(skill, query, model_config, trace, stdout, stderr, structured_result, event_sink)
+            reply = self._generate_reply(
+                skill,
+                query,
+                model_config,
+                trace,
+                stdout,
+                stderr,
+                structured_result,
+                event_sink,
+                conversation_context,
+                memory_context,
+            )
         except LLMError as exc:
             _emit(trace, {"phase": "reply_failed", "message": "模型生成最终回复失败", "error": str(exc)}, event_sink)
             reply = _fallback_reply(structured_result)
@@ -226,10 +285,11 @@ class GeneralSkillRunner:
         model_config: ModelConfig,
         trace: list[dict[str, Any]],
         event_sink: TraceSink | None = None,
+        conversation_context: dict[str, object] | None = None,
+        memory_context: list[dict[str, object]] | None = None,
     ) -> GeneralSkillExecutionPlan:
         _emit(trace, {"phase": "planning", "message": "正在根据 SKILL.md 生成 runner"}, event_sink)
-        payload = {
-            "query": query,
+        stage_data = {
             "skill": {
                 "slug": skill.slug,
                 "name": skill.name,
@@ -250,9 +310,18 @@ class GeneralSkillRunner:
                 "timeout_seconds": RUN_TIMEOUT_SECONDS,
             },
         }
+        payload = stage_payload(
+            phase="Step Agent / General Skill Plan",
+            user_message=query,
+            conversation_context=conversation_context,
+            memory_context=memory_context,
+            instructions=RUNNER_PROMPT.read_text(encoding="utf-8"),
+            stage_data=stage_data,
+            output_contract=GENERAL_SKILL_PLAN_OUTPUT,
+        )
         with llm_operation("general_skill.plan"):
             raw = LLMClient(_with_min_tokens(model_config, GENERAL_SKILL_MAX_TOKENS)).generate_json(
-                RUNNER_PROMPT.read_text(encoding="utf-8"),
+                unified_system_prompt(),
                 payload,
             )
         plan = GeneralSkillExecutionPlan.model_validate(raw)
@@ -282,13 +351,26 @@ class GeneralSkillRunner:
         trace: list[dict[str, Any]],
         event_sink: TraceSink | None,
         max_attempts: int,
+        conversation_context: dict[str, object] | None,
+        memory_context: list[dict[str, object]] | None,
     ) -> tuple[GeneralSkillExecutionPlan, list[dict[str, Any]]]:
         planning_failures: list[dict[str, Any]] = []
         last_error: LLMError | None = None
         for plan_attempt in range(1, max_attempts + 1):
             try:
                 if plan_attempt == 1:
-                    return self._generate_plan(skill, query, model_config, trace, event_sink), planning_failures
+                    return (
+                        self._generate_plan(
+                            skill,
+                            query,
+                            model_config,
+                            trace,
+                            event_sink,
+                            conversation_context,
+                            memory_context,
+                        ),
+                        planning_failures,
+                    )
                 return (
                     self._repair_plan(
                         skill,
@@ -298,6 +380,8 @@ class GeneralSkillRunner:
                         planning_failures,
                         event_sink,
                         plan_attempt,
+                        conversation_context,
+                        memory_context,
                     ),
                     planning_failures,
                 )
@@ -357,14 +441,15 @@ class GeneralSkillRunner:
         attempts: list[dict[str, Any]],
         event_sink: TraceSink | None,
         next_attempt: int,
+        conversation_context: dict[str, object] | None = None,
+        memory_context: list[dict[str, object]] | None = None,
     ) -> GeneralSkillExecutionPlan:
         _emit(
             trace,
             {"phase": "repair_planning", "message": f"正在生成第 {next_attempt} 次运行代码", "attempt": next_attempt},
             event_sink,
         )
-        payload = {
-            "query": query,
+        stage_data = {
             "skill": {
                 "slug": skill.slug,
                 "name": skill.name,
@@ -386,9 +471,18 @@ class GeneralSkillRunner:
             },
             "previous_attempts": attempts[-3:],
         }
+        payload = stage_payload(
+            phase="Step Agent / General Skill Repair",
+            user_message=query,
+            conversation_context=conversation_context,
+            memory_context=memory_context,
+            instructions=REPAIR_PROMPT.read_text(encoding="utf-8"),
+            stage_data=stage_data,
+            output_contract=GENERAL_SKILL_PLAN_OUTPUT,
+        )
         with llm_operation("general_skill.repair", attempt=next_attempt):
             raw = LLMClient(_with_min_tokens(model_config, GENERAL_SKILL_MAX_TOKENS)).generate_json(
-                REPAIR_PROMPT.read_text(encoding="utf-8"),
+                unified_system_prompt(),
                 payload,
             )
         plan = GeneralSkillExecutionPlan.model_validate(raw)
@@ -564,10 +658,11 @@ class GeneralSkillRunner:
         stderr: str,
         structured_result: dict[str, Any],
         event_sink: TraceSink | None = None,
+        conversation_context: dict[str, object] | None = None,
+        memory_context: list[dict[str, object]] | None = None,
     ) -> str:
         _emit(trace, {"phase": "replying", "message": "正在根据运行结果生成回复"}, event_sink)
-        payload = {
-            "query": query,
+        stage_data = {
             "skill": {
                 "slug": skill.slug,
                 "name": skill.name,
@@ -578,10 +673,19 @@ class GeneralSkillRunner:
             "stderr": stderr,
             "structured_result": structured_result,
         }
+        payload = stage_payload(
+            phase="Response Generator / General Skill Reply",
+            user_message=query,
+            conversation_context=conversation_context,
+            memory_context=memory_context,
+            instructions=REPLY_PROMPT.read_text(encoding="utf-8"),
+            stage_data=stage_data,
+            output_contract=GENERAL_SKILL_REPLY_OUTPUT,
+        )
         try:
             with llm_operation("general_skill.reply"):
                 raw = LLMClient(model_config).generate_json(
-                    REPLY_PROMPT.read_text(encoding="utf-8"), payload
+                    unified_system_prompt(), payload
                 )
             reply = GeneralSkillReply.model_validate(raw).reply.strip()
         except LLMError:
@@ -605,6 +709,8 @@ class GeneralSkillRunner:
         trace: list[dict[str, Any]],
         event_sink: TraceSink | None,
         attempt: int,
+        conversation_context: dict[str, object] | None = None,
+        memory_context: list[dict[str, object]] | None = None,
     ) -> dict[str, Any]:
         _emit(
             trace,
@@ -615,8 +721,7 @@ class GeneralSkillRunner:
             },
             event_sink,
         )
-        payload = {
-            "query": query,
+        stage_data = {
             "skill": {
                 "slug": skill.slug,
                 "name": skill.name,
@@ -635,10 +740,19 @@ class GeneralSkillRunner:
             "stderr": _truncate(stderr),
             "structured_result": structured_result,
         }
+        payload = stage_payload(
+            phase="Reflection / General Skill Review",
+            user_message=query,
+            conversation_context=conversation_context,
+            memory_context=memory_context,
+            instructions=REVIEW_PROMPT.read_text(encoding="utf-8"),
+            stage_data=stage_data,
+            output_contract=GENERAL_SKILL_REVIEW_OUTPUT,
+        )
         try:
             with llm_operation("general_skill.review", attempt=attempt):
                 raw = LLMClient(model_config).generate_json(
-                    REVIEW_PROMPT.read_text(encoding="utf-8"), payload
+                    unified_system_prompt(), payload
                 )
             review = GeneralSkillExecutionReview.model_validate(raw).model_dump(mode="json")
         except Exception as exc:

@@ -1063,7 +1063,17 @@ def test_general_skill_response_keeps_active_scene_context(monkeypatch) -> None:
 
 
 def test_scene_tool_call_to_general_skill_records_expandable_trace(monkeypatch) -> None:
-    def fake_decide(self, query, general_skills, model_config):  # noqa: ANN001
+    received_contexts: list[object] = []
+
+    def fake_decide(  # noqa: ANN001
+        self,
+        query,
+        general_skills,
+        model_config,
+        conversation_context=None,
+        memory_context=None,
+    ):
+        received_contexts.append(conversation_context)
         return GeneralSkillSelection(
             use_general_skill=True,
             selected_slug="weather-zh",
@@ -1071,7 +1081,18 @@ def test_scene_tool_call_to_general_skill_records_expandable_trace(monkeypatch) 
             reason="天气查询与天气技能匹配。",
         )
 
-    def fake_run(self, skill, query, model_config, user_id="", max_attempts=10, event_sink=None):  # noqa: ANN001
+    def fake_run(  # noqa: ANN001
+        self,
+        skill,
+        query,
+        model_config,
+        user_id="",
+        max_attempts=10,
+        event_sink=None,
+        conversation_context=None,
+        memory_context=None,
+    ):
+        received_contexts.append(conversation_context)
         trace = [
             {"phase": "skill_loaded", "message": "已加载通用技能 中国城市天气", "slug": skill.slug},
             {
@@ -1135,6 +1156,7 @@ def test_scene_tool_call_to_general_skill_records_expandable_trace(monkeypatch) 
         db.commit()
 
         stream_events: list[tuple[str, dict[str, object]]] = []
+        conversation_context = {"messages": [{"role": "user", "content": "北京天气怎么样"}]}
         result = AgentLoop(db)._execute_tool_call(
             ChatTurnRequest(
                 tenant_id="tenant_demo",
@@ -1146,6 +1168,7 @@ def test_scene_tool_call_to_general_skill_records_expandable_trace(monkeypatch) 
             ToolCall(name="general_skill.weather-zh", arguments={"query": "北京天气怎么样"}),
             tool_call_id="toolcall_weather",
             stream_events=stream_events,
+            conversation_context=conversation_context,
         )
 
         assert result.success is True
@@ -1170,10 +1193,18 @@ def test_scene_tool_call_to_general_skill_records_expandable_trace(monkeypatch) 
             trace_payloads
         )
         assert any(name == "general_skill_run_finished" for name, _payload in stream_events)
+        assert received_contexts == [conversation_context, conversation_context]
 
 
 def test_scene_tool_call_to_general_skill_backfills_returned_trace(monkeypatch) -> None:
-    def fake_decide(self, query, general_skills, model_config):  # noqa: ANN001
+    def fake_decide(  # noqa: ANN001
+        self,
+        query,
+        general_skills,
+        model_config,
+        conversation_context=None,
+        memory_context=None,
+    ):
         return GeneralSkillSelection(
             use_general_skill=True,
             selected_slug="weather-zh",
@@ -1181,7 +1212,17 @@ def test_scene_tool_call_to_general_skill_backfills_returned_trace(monkeypatch) 
             reason="天气查询与天气技能匹配。",
         )
 
-    def fake_run(self, skill, query, model_config, user_id="", max_attempts=10, event_sink=None):  # noqa: ANN001
+    def fake_run(  # noqa: ANN001
+        self,
+        skill,
+        query,
+        model_config,
+        user_id="",
+        max_attempts=10,
+        event_sink=None,
+        conversation_context=None,
+        memory_context=None,
+    ):
         trace = [
             {"phase": "skill_loaded", "message": "已加载通用技能 中国城市天气", "slug": skill.slug},
             {
@@ -1273,7 +1314,14 @@ def test_scene_tool_call_to_general_skill_backfills_returned_trace(monkeypatch) 
 def test_scene_tool_call_rejects_mismatched_general_skill(monkeypatch) -> None:
     runner_calls: list[str] = []
 
-    def fake_decide(self, query, general_skills, model_config):  # noqa: ANN001
+    def fake_decide(  # noqa: ANN001
+        self,
+        query,
+        general_skills,
+        model_config,
+        conversation_context=None,
+        memory_context=None,
+    ):
         return GeneralSkillSelection(
             use_general_skill=False,
             selected_slug=None,
@@ -1281,7 +1329,17 @@ def test_scene_tool_call_rejects_mismatched_general_skill(monkeypatch) -> None:
             reason="商品价格查询不属于候选通用技能能力。",
         )
 
-    def fake_run(self, skill, query, model_config, user_id="", max_attempts=10, event_sink=None):  # noqa: ANN001
+    def fake_run(  # noqa: ANN001
+        self,
+        skill,
+        query,
+        model_config,
+        user_id="",
+        max_attempts=10,
+        event_sink=None,
+        conversation_context=None,
+        memory_context=None,
+    ):
         runner_calls.append(query)
         return GeneralSkillRunResponse(
             skill_slug=skill.slug,
@@ -1354,7 +1412,14 @@ def test_scene_tool_call_rejects_mismatched_general_skill(monkeypatch) -> None:
 
 
 def test_scene_step_agent_does_not_expose_irrelevant_general_skill(monkeypatch) -> None:
-    def fake_decide(self, query, general_skills, model_config):  # noqa: ANN001
+    def fake_decide(  # noqa: ANN001
+        self,
+        query,
+        general_skills,
+        model_config,
+        conversation_context=None,
+        memory_context=None,
+    ):
         return GeneralSkillSelection(
             use_general_skill=False,
             selected_slug=None,
@@ -1402,7 +1467,7 @@ def test_scene_step_agent_does_not_expose_irrelevant_general_skill(monkeypatch) 
             model_config,
         )
 
-        assert [tool.name for tool in scoped] == ["order.query"]
+        assert scoped == []
 
 
 def test_reflection_can_retry_general_skill_with_user_query() -> None:
@@ -1446,10 +1511,12 @@ def test_scene_layer_prompt_contract_mentions_general_skill_tools() -> None:
     prompt_dir = Path(__file__).resolve().parents[1] / "app" / "llm" / "prompts"
 
     router_prompt = (prompt_dir / "router_prompt.md").read_text(encoding="utf-8")
-    step_prompt = (prompt_dir / "step_agent_prompt.md").read_text(encoding="utf-8")
+    step_prompt = (prompt_dir / "step_agent_general_skill_rules.md").read_text(
+        encoding="utf-8"
+    )
     reflection_prompt = (prompt_dir / "reflection_prompt.md").read_text(encoding="utf-8")
 
-    assert "Router 只决定场景化技能、任务帧和调度顺序" in router_prompt
+    assert "Router 只决定场景化技能和任务执行顺序" in router_prompt
     assert "通用技能是场景内第二层能力" in step_prompt
     assert "target_tool_name 指向该通用技能工具" in reflection_prompt
 

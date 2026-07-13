@@ -211,6 +211,38 @@ def test_memory_recall_excludes_summary_history() -> None:
     assert rows[0].content == "用户偏好客服回复简洁。"
 
 
+def test_context_memories_returns_all_supported_memories_without_model_selection() -> None:
+    with _test_session() as db:
+        for index, kind in enumerate(["profile", "preference", "fact"]):
+            db.add(
+                MemoryRecord(
+                    tenant_id="tenant_demo",
+                    user_id="user_demo",
+                    username="user_demo",
+                    session_id="old_session",
+                    kind=kind,
+                    content=f"memory-{index}",
+                    importance=0.5,
+                )
+            )
+        db.add(
+            MemoryRecord(
+                tenant_id="tenant_demo",
+                user_id="user_demo",
+                username="user_demo",
+                session_id="old_session",
+                kind="summary",
+                content="不进入 Router memory",
+                importance=0.9,
+            )
+        )
+        db.commit()
+
+        rows = MemoryService(db).context_memories("tenant_demo", "user_demo")
+
+    assert {row.content for row in rows} == {"memory-0", "memory-1", "memory-2"}
+
+
 def test_memory_rows_for_read_deduplicates_by_structured_key_without_text_filtering() -> None:
     rows = [
         MemoryRecord(

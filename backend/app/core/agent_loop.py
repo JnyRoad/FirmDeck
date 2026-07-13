@@ -74,7 +74,6 @@ from app.session.session_schema import (
     ChatTurnRequest,
     ChatTurnResponse,
     KnowledgeQuery,
-    PendingTask,
     RouterDecision,
     StepAgentResult,
 )
@@ -237,7 +236,7 @@ class PreparedTurn:
 
 
 @dataclass
-class TaskScheduleContinuation:
+class QueuedTaskContinuation:
     reply: str
     active_skill: Skill | None
     router_decision: RouterDecision
@@ -387,12 +386,41 @@ class AgentLoop:
                     tool_result,
                 )
                 if finalize_state == "completed":
-                    self.events.record(
-                        request.tenant_id,
-                        chat_session.id,
-                        "pending_tasks_waiting",
-                        {"pending_tasks": chat_session.pending_tasks_json or []},
+                    continuation = self._try_continue_pending_after_completion(
+                        request,
+                        chat_session,
+                        prepared.model_config,
+                        self._list_published_skills(request.tenant_id, chat_session.agent_id),
+                        self._tools_with_general_skills(
+                            request.tenant_id,
+                            self._list_enabled_tools(
+                                request.tenant_id, chat_session.agent_id
+                            ),
+                            chat_session.agent_id,
+                        ),
+                        self._get_persona_prompt(
+                            request.tenant_id, chat_session.agent_id
+                        ),
+                        memory_context,
+                        conversation_context,
+                        reply,
                     )
+                    if continuation:
+                        reply = "\n\n".join(
+                            part
+                            for part in (reply.strip(), continuation.reply.strip())
+                            if part
+                        )
+                        router_decision = continuation.router_decision
+                        step_result = continuation.step_result
+                        tool_result = continuation.tool_result
+                    else:
+                        self.events.record(
+                            request.tenant_id,
+                            chat_session.id,
+                            "pending_tasks_waiting",
+                            {"pending_tasks": chat_session.pending_tasks_json or []},
+                        )
 
         except AgentLoopPreconditionError as exc:
             chat_session = chat_session or self._get_or_create_session(request)
@@ -466,7 +494,11 @@ class AgentLoop:
         if not self._scene_router_deferred_to_general(router_decision):
             return None
         capability = capability or self._select_general_capability(
-            request.message, model_config, chat_session.agent_id
+            request.message,
+            model_config,
+            chat_session.agent_id,
+            conversation_context,
+            memory_context,
         )
         skill, selection = capability
         if skill is None:
@@ -502,7 +534,12 @@ class AgentLoop:
             ),
         )
         run_response = self.general_skill_runner.run(
-            skill, request.message, model_config, request.user_id
+            skill,
+            request.message,
+            model_config,
+            request.user_id,
+            conversation_context=conversation_context,
+            memory_context=memory_context,
         )
         self._record_general_skill_run_events(
             request.tenant_id, chat_session, run_response, user_message_id
@@ -529,7 +566,11 @@ class AgentLoop:
             model_config,
             self._get_persona_prompt(request.tenant_id, chat_session.agent_id),
             memory_context or [],
-            conversation_context or self._conversation_context(chat_session),
+            (
+                conversation_context
+                if conversation_context is not None
+                else self._conversation_context(chat_session)
+            ),
         )
         self._finalize_turn(
             chat_session,
@@ -750,6 +791,8 @@ class AgentLoop:
                     model_snapshot,
                     request.user_id,
                     event_sink=general_skill_sink,
+                    conversation_context=conversation_context,
+                    memory_context=memory_context,
                 )
                 general_skill_events.put(("complete", response))
             except Exception as exc:  # pragma: no cover - defensive stream boundary
@@ -836,7 +879,11 @@ class AgentLoop:
             if persona_prompt is not None
             else self._get_persona_prompt(request.tenant_id, chat_session.agent_id),
             memory_context or [],
-            conversation_context or self._conversation_context(chat_session),
+            (
+                conversation_context
+                if conversation_context is not None
+                else self._conversation_context(chat_session)
+            ),
         ):
             reply += chunk
             yield self._stream_event(
@@ -919,46 +966,33 @@ class AgentLoop:
         step_result = StepAgentResult()
         tool_result: ToolResult | None = None
 
-        for schedule_round in range(max_actions):
+        for queue_round in range(max_actions):
             if not chat_session.pending_tasks_json:
+                break
+            task_id = self._next_pending_task_id(chat_session)
+            if not task_id:
                 break
             yield self._stream_status(
                 chat_session,
                 "routing",
-                "正在规划后续任务",
-                {"schedule_round": schedule_round + 1},
+                "正在继续后续任务",
+                {"queue_round": queue_round + 1},
                 user_message_id=user_message_id,
-            )
-            schedule = self.router.schedule_tasks_after_completion(
-                request.message,
-                chat_session,
-                skills,
-                model_config,
-                conversation_context,
-                memory_context,
-                completed_reply="\n\n".join([completed_reply, *replies]).strip(),
             )
             self.events.record(
                 request.tenant_id,
                 chat_session.id,
-                "task_scheduler_decision_created",
-                {**schedule.model_dump(mode="json"), "round": schedule_round + 1},
+                "router_execution_order_advanced",
+                {"task_id": task_id, "queue_round": queue_round + 1},
             )
-            yield self._stream_event(
-                "task_schedule",
-                chat_session,
-                {**schedule.model_dump(mode="json"), "round": schedule_round + 1},
-            )
-            if schedule.action != "run_tasks" or not schedule.selected_task_ids:
-                break
 
-            for task_id in schedule.selected_task_ids:
+            for task_id in [task_id]:
                 if executed_actions >= max_actions:
                     break
                 router_decision = self._router_decision_from_task_frame(
                     chat_session,
                     task_id,
-                    schedule.reason,
+                    "按 Router 已确定的任务顺序继续执行。",
                 )
                 if not router_decision:
                     continue
@@ -1044,6 +1078,8 @@ class AgentLoop:
                         model_config,
                         step_result,
                         tool_stream_events,
+                        conversation_context=conversation_context,
+                        memory_context=memory_context,
                     )
                     for event_name, payload in tool_stream_events:
                         yield self._stream_event(
@@ -1159,7 +1195,7 @@ class AgentLoop:
                             self._turn_payload({"content": chunk}, user_message_id),
                         )
                         self._pace_stream()
-                replies, replaced_reply = self._merge_scheduled_reply_segment(replies, segment)
+                replies, replaced_reply = self._merge_queued_reply_segment(replies, segment)
                 if replaced_reply:
                     yield self._stream_event(
                         "stream_replace",
@@ -1180,21 +1216,21 @@ class AgentLoop:
                 if finalize_state == "completed" and active_skill:
                     completed_skill_ids_this_turn.add(active_skill.skill_id)
                 if finalize_state == "handoff":
-                    return self._scheduled_continuation(
+                    return self._queued_continuation(
                         replies, active_skill, router_decision, step_result, tool_result
                     )
                 if finalize_state == "continued":
-                    if self._should_attempt_scheduled_task_followup(
+                    if self._should_attempt_queued_task_followup(
                         request,
                         chat_session,
                         skills,
                         "\n\n".join([completed_reply, *replies]).strip(),
-                        schedule_round + 1,
+                        queue_round + 1,
                     ):
                         if active_skill:
                             completed_skill_ids_this_turn.add(active_skill.skill_id)
                         continue
-                    return self._scheduled_continuation(
+                    return self._queued_continuation(
                         replies, active_skill, router_decision, step_result, tool_result
                     )
                 self.events.record(
@@ -1203,13 +1239,13 @@ class AgentLoop:
                     "pending_tasks_waiting",
                     {
                         "pending_tasks": chat_session.pending_tasks_json or [],
-                        "round": schedule_round + 1,
+                        "round": queue_round + 1,
                     },
                 )
             if executed_actions >= max_actions:
                 break
 
-        return self._scheduled_continuation(
+        return self._queued_continuation(
             replies, active_skill, router_decision, step_result, tool_result
         )
 
@@ -1445,11 +1481,18 @@ class AgentLoop:
             persona_prompt = self._get_persona_prompt(request.tenant_id, chat_session.agent_id)
             self._drop_unavailable_skill_state(request.tenant_id, chat_session, skills)
             if not skills:
+                no_skill_context = self._conversation_context(
+                    chat_session, model_config=model_config
+                )
                 yield self._stream_status(
                     chat_session, "routing", "正在判断用户意图", user_message_id=user_message_id
                 )
                 capability = self._select_general_capability(
-                    request.message, model_config, chat_session.agent_id
+                    request.message,
+                    model_config,
+                    chat_session.agent_id,
+                    no_skill_context,
+                    [],
                 )
                 if capability[0] is not None:
                     yield from self._stream_general_skill_response(
@@ -1459,7 +1502,7 @@ class AgentLoop:
                         (capability[0], capability[1]),
                         None,
                         [],
-                        self._conversation_context(chat_session),
+                        no_skill_context,
                         persona_prompt,
                         user_message.id,
                         mark_current_turn_cancelled,
@@ -1501,7 +1544,7 @@ class AgentLoop:
                     model_config,
                     persona_prompt,
                     [],
-                    self._conversation_context(chat_session),
+                    no_skill_context,
                 ):
                     reply += chunk
                     yield self._stream_event(
@@ -1536,11 +1579,9 @@ class AgentLoop:
             self._finish_stale_completed_skill(request.tenant_id, chat_session, skills)
             memory_context = [
                 memory_read(row)
-                for row in self.memory.recall(
+                for row in self.memory.context_memories(
                     request.tenant_id,
                     request.user_id,
-                    request.message,
-                    model_config=model_config,
                     agent_id=chat_session.agent_id,
                 )
             ]
@@ -1590,7 +1631,11 @@ class AgentLoop:
             capability_selection: GeneralSkillSelection | None = None
             if self._scene_router_deferred_to_general(router_decision):
                 capability = self._select_general_capability(
-                    request.message, model_config, chat_session.agent_id
+                    request.message,
+                    model_config,
+                    chat_session.agent_id,
+                    conversation_context,
+                    memory_context,
                 )
                 capability_selection = capability[1]
                 if capability[0] is not None:
@@ -1607,111 +1652,6 @@ class AgentLoop:
                         mark_current_turn_cancelled,
                     )
                     return
-
-            initial_schedule_decision = self._initial_scheduler_queue_decision(
-                request,
-                chat_session,
-                router_decision,
-            )
-            if initial_schedule_decision:
-                self.runtime.apply_decision(chat_session, initial_schedule_decision)
-                self._release_active_task_to_scheduler(chat_session, initial_schedule_decision)
-                self._drop_unavailable_skill_state(request.tenant_id, chat_session, skills)
-                self.events.record(
-                    request.tenant_id,
-                    chat_session.id,
-                    "task_frames_seeded_for_scheduler",
-                    initial_schedule_decision.model_dump(mode="json"),
-                )
-                self.db.commit()
-                self.db.refresh(chat_session)
-                continuation = yield from self._stream_continue_pending_after_completion(
-                    request,
-                    chat_session,
-                    model_config,
-                    skills,
-                    tools,
-                    persona_prompt,
-                    memory_context,
-                    conversation_context,
-                    "",
-                    user_message_id=user_message_id,
-                )
-                if continuation:
-                    reply = continuation.reply
-                    active_skill = continuation.active_skill
-                    router_decision = continuation.router_decision
-                    step_result = continuation.step_result
-                    tool_result = continuation.tool_result
-                else:
-                    router_decision = initial_schedule_decision
-                    yield self._stream_event(
-                        "router_decision",
-                        chat_session,
-                        self._turn_payload(
-                            router_decision.model_dump(mode="json"), user_message_id
-                        ),
-                    )
-                    yield self._stream_status(
-                        chat_session, "responding", "正在生成回复", user_message_id=user_message_id
-                    )
-                    chunks: list[str] = []
-                    for chunk in self._generate_reply_stream_segment(
-                        request.message,
-                        chat_session,
-                        None,
-                        router_decision,
-                        StepAgentResult(),
-                        None,
-                        model_config,
-                        persona_prompt,
-                        memory_context,
-                        conversation_context,
-                    ):
-                        chunks.append(chunk)
-                        yield self._stream_event(
-                            "stream_delta",
-                            chat_session,
-                            self._turn_payload({"content": chunk}, user_message_id),
-                        )
-                        self._pace_stream()
-                    reply = "".join(chunks).strip() or FALLBACK_REPLY
-                    if not chunks:
-                        for chunk in self.response_generator.chunk_text(reply):
-                            yield self._stream_event(
-                                "stream_delta",
-                                chat_session,
-                                self._turn_payload({"content": chunk}, user_message_id),
-                            )
-                            self._pace_stream()
-                yield self._stream_event(
-                    "stream_end", chat_session, self._turn_payload({}, user_message_id)
-                )
-                finalize_turn_once(chat_session, reply, step_result, request.message)
-                self.db.commit()
-                self.db.refresh(chat_session)
-                if memory_model_config:
-                    self._enqueue_memory_capture(
-                        request,
-                        chat_session,
-                        step_result,
-                        tool_result,
-                        memory_model_config,
-                    )
-                result = ChatTurnResponse(
-                    reply=reply,
-                    session_id=chat_session.id,
-                    router_decision=router_decision,
-                    step_result=step_result,
-                    tool_result=tool_result,
-                    session_state=public_session(chat_session),
-                )
-                yield self._stream_event(
-                    "complete",
-                    chat_session,
-                    self._turn_payload(result.model_dump(mode="json"), user_message_id),
-                )
-                return
 
             before_skill = chat_session.active_skill_id
             before_step = chat_session.active_step_id
@@ -1863,6 +1803,8 @@ class AgentLoop:
                     model_config,
                     step_result,
                     tool_stream_events,
+                    conversation_context=conversation_context,
+                    memory_context=memory_context,
                 )
                 for event_name, payload in tool_stream_events:
                     yield self._stream_event(
@@ -1973,12 +1915,43 @@ class AgentLoop:
                 tool_result,
             )
             if finalize_state == "completed":
-                self.events.record(
-                    request.tenant_id,
-                    chat_session.id,
-                    "pending_tasks_waiting",
-                    {"pending_tasks": chat_session.pending_tasks_json or []},
-                )
+                continuation = None
+                if self._next_pending_task_id(chat_session):
+                    separator = "\n\n"
+                    yield self._stream_event(
+                        "stream_delta",
+                        chat_session,
+                        self._turn_payload({"content": separator}, user_message_id),
+                    )
+                    continuation = yield from self._stream_continue_pending_after_completion(
+                        request,
+                        chat_session,
+                        model_config,
+                        skills,
+                        tools,
+                        persona_prompt,
+                        memory_context,
+                        conversation_context,
+                        reply,
+                        user_message_id=user_message_id,
+                    )
+                if continuation:
+                    reply = "\n\n".join(
+                        part
+                        for part in (reply.strip(), continuation.reply.strip())
+                        if part
+                    )
+                    active_skill = continuation.active_skill
+                    router_decision = continuation.router_decision
+                    step_result = continuation.step_result
+                    tool_result = continuation.tool_result
+                else:
+                    self.events.record(
+                        request.tenant_id,
+                        chat_session.id,
+                        "pending_tasks_waiting",
+                        {"pending_tasks": chat_session.pending_tasks_json or []},
+                    )
             if mark_current_turn_cancelled():
                 return
             yield self._stream_event(
@@ -2160,8 +2133,15 @@ class AgentLoop:
             raise AgentLoopPreconditionError("missing_model_config", "没有默认模型配置。")
         self._drop_unavailable_skill_state(request.tenant_id, chat_session, skills)
         if not skills:
+            no_skill_context = self._conversation_context(
+                chat_session, model_config=model_config
+            )
             capability = self._select_general_capability(
-                request.message, model_config, chat_session.agent_id
+                request.message,
+                model_config,
+                chat_session.agent_id,
+                no_skill_context,
+                [],
             )
             router_decision = RouterDecision(
                 decision="answer_only",
@@ -2173,7 +2153,7 @@ class AgentLoop:
                 model_config,
                 router_decision,
                 [],
-                self._conversation_context(chat_session),
+                no_skill_context,
                 user_message.id,
                 capability,
             )
@@ -2186,7 +2166,7 @@ class AgentLoop:
                     step_result=StepAgentResult(),
                     tool_result=None,
                     memory_context=[],
-                    conversation_context=self._conversation_context(chat_session),
+                    conversation_context=no_skill_context,
                     general_response=general_response,
                     user_message_id=user_message.id,
                 )
@@ -2206,17 +2186,15 @@ class AgentLoop:
                 step_result=step_result,
                 tool_result=None,
                 memory_context=[],
-                conversation_context=self._conversation_context(chat_session),
+                conversation_context=no_skill_context,
                 user_message_id=user_message.id,
             )
         self._finish_stale_completed_skill(request.tenant_id, chat_session, skills)
         memory_context = [
             memory_read(row)
-            for row in self.memory.recall(
+            for row in self.memory.context_memories(
                 request.tenant_id,
                 request.user_id,
-                request.message,
-                model_config=model_config,
                 agent_id=chat_session.agent_id,
             )
         ]
@@ -2259,7 +2237,11 @@ class AgentLoop:
         capability: tuple[GeneralSkill | None, GeneralSkillSelection] | None = None
         if self._scene_router_deferred_to_general(router_decision):
             capability = self._select_general_capability(
-                request.message, model_config, chat_session.agent_id
+                request.message,
+                model_config,
+                chat_session.agent_id,
+                conversation_context,
+                memory_context,
             )
         general_response = self._try_handle_general_skill_after_scene_router(
             request,
@@ -2282,59 +2264,6 @@ class AgentLoop:
                 memory_context=memory_context,
                 conversation_context=conversation_context,
                 general_response=general_response,
-                user_message_id=user_message.id,
-            )
-
-        initial_schedule_decision = self._initial_scheduler_queue_decision(
-            request,
-            chat_session,
-            router_decision,
-        )
-        if initial_schedule_decision:
-            self.runtime.apply_decision(chat_session, initial_schedule_decision)
-            self._release_active_task_to_scheduler(chat_session, initial_schedule_decision)
-            self._drop_unavailable_skill_state(request.tenant_id, chat_session, skills)
-            self.events.record(
-                request.tenant_id,
-                chat_session.id,
-                "task_frames_seeded_for_scheduler",
-                initial_schedule_decision.model_dump(mode="json"),
-            )
-            self.db.commit()
-            self.db.refresh(chat_session)
-            continuation = self._try_continue_pending_after_completion(
-                request,
-                chat_session,
-                model_config,
-                skills,
-                tools,
-                self._get_persona_prompt(request.tenant_id, chat_session.agent_id),
-                memory_context,
-                conversation_context,
-                "",
-            )
-            if continuation:
-                return PreparedTurn(
-                    chat_session=chat_session,
-                    model_config=model_config,
-                    active_skill=continuation.active_skill,
-                    router_decision=continuation.router_decision,
-                    step_result=continuation.step_result,
-                    tool_result=continuation.tool_result,
-                    memory_context=memory_context,
-                    conversation_context=conversation_context,
-                    reply_override=continuation.reply,
-                    user_message_id=user_message.id,
-                )
-            return PreparedTurn(
-                chat_session=chat_session,
-                model_config=model_config,
-                active_skill=None,
-                router_decision=initial_schedule_decision,
-                step_result=StepAgentResult(),
-                tool_result=None,
-                memory_context=memory_context,
-                conversation_context=conversation_context,
                 user_message_id=user_message.id,
             )
 
@@ -2418,6 +2347,8 @@ class AgentLoop:
                 model_config,
                 step_result,
                 status_callback=status,
+                conversation_context=conversation_context,
+                memory_context=memory_context,
             )
 
         (
@@ -2709,139 +2640,6 @@ class AgentLoop:
             conversation_context,
         )
 
-    def _initial_scheduler_queue_decision(
-        self,
-        request: ChatTurnRequest,
-        chat_session: ChatSession,
-        router_decision: RouterDecision,
-    ) -> RouterDecision | None:
-        tasks: list[PendingTask] = [*router_decision.pending_tasks, *router_decision.created_tasks]
-        existing_selected_count = 0
-        if router_decision.decision == "switch_to_pending" and router_decision.selected_task_id:
-            existing_selected_count = (
-                1 if self._find_task_frame(chat_session, router_decision.selected_task_id) else 0
-            )
-        primary_task = self._primary_task_from_router_decision(
-            request, chat_session, router_decision
-        )
-        active_task = self._active_task_for_scheduler(
-            request, chat_session, router_decision, primary_task
-        )
-        if active_task:
-            tasks = [active_task, *tasks]
-        if primary_task:
-            tasks = [primary_task, *tasks]
-        if len(tasks) + existing_selected_count < 2:
-            return None
-        return RouterDecision(
-            decision="create_pending",
-            confidence=router_decision.confidence,
-            user_intent=router_decision.user_intent,
-            reason=(
-                "本轮包含多个由 Router 明确识别的任务，先写入 task frame，"
-                "再交给 scheduler 决定执行顺序。"
-            ),
-            source_message=router_decision.source_message or request.message,
-            pending_tasks=tasks,
-            task_updates=router_decision.task_updates,
-        )
-
-    def _active_task_for_scheduler(
-        self,
-        request: ChatTurnRequest,
-        chat_session: ChatSession,
-        router_decision: RouterDecision,
-        primary_task: PendingTask | None,
-    ) -> PendingTask | None:
-        if not chat_session.active_skill_id or not primary_task:
-            return None
-        if primary_task.target_skill_id == chat_session.active_skill_id:
-            return None
-        if router_decision.decision != "start_new_task":
-            return None
-        active_task_id = None
-        if isinstance(chat_session.awaiting_input_json, dict):
-            raw_task_id = chat_session.awaiting_input_json.get("task_id")
-            active_task_id = str(raw_task_id) if raw_task_id else None
-        if active_task_id:
-            for update in router_decision.task_updates:
-                if update.task_id == active_task_id and (
-                    update.remove or update.status in {"removed", "completed", "cancelled"}
-                ):
-                    return None
-        return PendingTask(
-            task_id=active_task_id or new_id("task"),
-            status="pending",
-            decision="continue_active",
-            target_skill_id=chat_session.active_skill_id,
-            target_step_id=chat_session.active_step_id,
-            confidence=router_decision.confidence,
-            user_intent="继续当前未完成任务，并从本轮用户消息中提取与该任务相关的信息。",
-            reason=(
-                "Router 在已有 active task 时选择了另一个新任务；"
-                "保留当前 active task 给 scheduler，由 scheduler 决定本轮是否以及何时继续。"
-            ),
-            source_message=request.message,
-            slot_hints=dict(chat_session.slots_json or {}),
-        )
-
-    def _release_active_task_to_scheduler(
-        self,
-        chat_session: ChatSession,
-        scheduler_queue_decision: RouterDecision,
-    ) -> None:
-        active_skill_id = chat_session.active_skill_id
-        active_step_id = chat_session.active_step_id
-        if not active_skill_id:
-            return
-        for task in scheduler_queue_decision.pending_tasks:
-            if task.target_skill_id != active_skill_id:
-                continue
-            if task.target_step_id and active_step_id and task.target_step_id != active_step_id:
-                continue
-            chat_session.active_skill_id = None
-            chat_session.active_step_id = None
-            chat_session.slots_json = {}
-            chat_session.awaiting_input_json = None
-            return
-
-    def _primary_task_from_router_decision(
-        self,
-        request: ChatTurnRequest,
-        chat_session: ChatSession,
-        router_decision: RouterDecision,
-    ) -> PendingTask | None:
-        if router_decision.decision in {
-            "answer_only",
-            "clarify",
-            "create_pending",
-            "update_pending",
-            "complete_task",
-            "handoff_human",
-            "switch_to_pending",
-        }:
-            return None
-        skill_id = router_decision.target_skill_id or chat_session.active_skill_id
-        if not skill_id:
-            return None
-        step_id = router_decision.target_step_id or chat_session.active_step_id
-        slots: dict[str, Any] = {}
-        if skill_id == chat_session.active_skill_id and isinstance(chat_session.slots_json, dict):
-            slots.update(chat_session.slots_json)
-        slots.update(dict(router_decision.slot_hints or {}))
-        return PendingTask(
-            task_id=router_decision.selected_task_id or new_id("task"),
-            status="pending",
-            decision="start_new_task",
-            target_skill_id=skill_id,
-            target_step_id=step_id,
-            confidence=router_decision.confidence,
-            user_intent=router_decision.user_intent,
-            reason=router_decision.reason,
-            source_message=router_decision.source_message or request.message,
-            slot_hints=slots,
-        )
-
     def _try_continue_pending_after_completion(
         self,
         request: ChatTurnRequest,
@@ -2854,7 +2652,7 @@ class AgentLoop:
         conversation_context: dict[str, object],
         completed_reply: str,
         completed_skill_ids_this_turn: set[str] | None = None,
-    ) -> TaskScheduleContinuation | None:
+    ) -> QueuedTaskContinuation | None:
         if not chat_session.pending_tasks_json:
             return None
         max_actions = max(1, self._get_agent_loop_max_actions(request.tenant_id))
@@ -2866,34 +2664,26 @@ class AgentLoop:
         step_result = StepAgentResult()
         tool_result: ToolResult | None = None
 
-        for schedule_round in range(max_actions):
+        for queue_round in range(max_actions):
             if not chat_session.pending_tasks_json:
                 break
-            schedule = self.router.schedule_tasks_after_completion(
-                request.message,
-                chat_session,
-                skills,
-                model_config,
-                conversation_context,
-                memory_context,
-                completed_reply="\n\n".join([completed_reply, *replies]).strip(),
-            )
+            task_id = self._next_pending_task_id(chat_session)
+            if not task_id:
+                break
             self.events.record(
                 request.tenant_id,
                 chat_session.id,
-                "task_scheduler_decision_created",
-                {**schedule.model_dump(mode="json"), "round": schedule_round + 1},
+                "router_execution_order_advanced",
+                {"task_id": task_id, "queue_round": queue_round + 1},
             )
-            if schedule.action != "run_tasks" or not schedule.selected_task_ids:
-                break
 
-            for task_id in schedule.selected_task_ids:
+            for task_id in [task_id]:
                 if executed_actions >= max_actions:
                     break
                 router_decision = self._router_decision_from_task_frame(
                     chat_session,
                     task_id,
-                    schedule.reason,
+                    "按 Router 已确定的任务顺序继续执行。",
                 )
                 if not router_decision:
                     continue
@@ -2939,6 +2729,8 @@ class AgentLoop:
                         tools,
                         model_config,
                         step_result,
+                        conversation_context=conversation_context,
+                        memory_context=memory_context,
                     )
 
                 (
@@ -2993,7 +2785,7 @@ class AgentLoop:
                     conversation_context,
                 )
                 if segment:
-                    replies, _replaced_reply = self._merge_scheduled_reply_segment(replies, segment)
+                    replies, _replaced_reply = self._merge_queued_reply_segment(replies, segment)
                 executed_actions += 1
                 finalize_state = self._finalize_execution_after_reply(
                     request.tenant_id,
@@ -3006,21 +2798,21 @@ class AgentLoop:
                 if finalize_state == "completed" and active_skill:
                     completed_skill_ids_this_turn.add(active_skill.skill_id)
                 if finalize_state == "handoff":
-                    return self._scheduled_continuation(
+                    return self._queued_continuation(
                         replies, active_skill, router_decision, step_result, tool_result
                     )
                 if finalize_state == "continued":
-                    if self._should_attempt_scheduled_task_followup(
+                    if self._should_attempt_queued_task_followup(
                         request,
                         chat_session,
                         skills,
                         "\n\n".join([completed_reply, *replies]).strip(),
-                        schedule_round + 1,
+                        queue_round + 1,
                     ):
                         if active_skill:
                             completed_skill_ids_this_turn.add(active_skill.skill_id)
                         continue
-                    return self._scheduled_continuation(
+                    return self._queued_continuation(
                         replies, active_skill, router_decision, step_result, tool_result
                     )
                 self.events.record(
@@ -3029,27 +2821,27 @@ class AgentLoop:
                     "pending_tasks_waiting",
                     {
                         "pending_tasks": chat_session.pending_tasks_json or [],
-                        "round": schedule_round + 1,
+                        "round": queue_round + 1,
                     },
                 )
             if executed_actions >= max_actions:
                 break
 
-        return self._scheduled_continuation(
+        return self._queued_continuation(
             replies, active_skill, router_decision, step_result, tool_result
         )
 
-    def _scheduled_continuation(
+    def _queued_continuation(
         self,
         replies: list[str],
         active_skill: Skill | None,
         router_decision: RouterDecision,
         step_result: StepAgentResult,
         tool_result: ToolResult | None,
-    ) -> TaskScheduleContinuation | None:
+    ) -> QueuedTaskContinuation | None:
         if not replies:
             return None
-        return TaskScheduleContinuation(
+        return QueuedTaskContinuation(
             reply="\n\n".join(replies).strip(),
             active_skill=active_skill,
             router_decision=router_decision,
@@ -3057,7 +2849,7 @@ class AgentLoop:
             tool_result=tool_result,
         )
 
-    def _should_attempt_scheduled_task_followup(
+    def _should_attempt_queued_task_followup(
         self,
         request: ChatTurnRequest,
         chat_session: ChatSession,
@@ -3095,7 +2887,7 @@ class AgentLoop:
         )
         return True
 
-    def _merge_scheduled_reply_segment(
+    def _merge_queued_reply_segment(
         self, replies: list[str], segment: str
     ) -> tuple[list[str], bool]:
         clean_segment = str(segment or "").strip()
@@ -3107,7 +2899,7 @@ class AgentLoop:
         self,
         chat_session: ChatSession,
         task_id: str,
-        scheduler_reason: str | None = None,
+        order_reason: str | None = None,
     ) -> RouterDecision | None:
         frame = self._find_task_frame(chat_session, task_id)
         if not frame:
@@ -3127,7 +2919,7 @@ class AgentLoop:
             target_step_id=frame.get("step_id") or frame.get("target_step_id"),
             confidence=float(frame.get("confidence") or 0.0),
             user_intent=frame.get("intent_summary") or frame.get("user_intent"),
-            reason=scheduler_reason or frame.get("reason"),
+            reason=order_reason or frame.get("reason"),
             source_message=frame.get("source_message"),
             slot_hints=slot_hints,
         )
@@ -3136,6 +2928,19 @@ class AgentLoop:
         for frame in chat_session.pending_tasks_json or []:
             if isinstance(frame, dict) and str(frame.get("task_id") or "") == str(task_id):
                 return frame
+        return None
+
+    def _next_pending_task_id(self, chat_session: ChatSession) -> str | None:
+        for frame in chat_session.pending_tasks_json or []:
+            if not isinstance(frame, dict):
+                continue
+            if str(frame.get("status") or "pending") != "pending":
+                continue
+            if not (frame.get("skill_id") or frame.get("target_skill_id")):
+                continue
+            task_id = str(frame.get("task_id") or "").strip()
+            if task_id:
+                return task_id
         return None
 
     def _run_reflection_rounds(
@@ -3155,7 +2960,8 @@ class AgentLoop:
         completed_skill_ids_this_turn: set[str] | None = None,
         memory_context: list[dict[str, object]] | None = None,
     ) -> tuple[Skill | None, RouterDecision, StepAgentResult, ToolResult | None]:
-        conversation_context = conversation_context or self._conversation_context(chat_session)
+        if conversation_context is None:
+            conversation_context = self._conversation_context(chat_session)
         completed_skill_ids_this_turn = completed_skill_ids_this_turn or set()
         rounds = max(0, min(max_rounds, REFLECTION_MAX_ROUNDS_LIMIT))
         if rounds <= 0:
@@ -3231,7 +3037,8 @@ class AgentLoop:
         stream_events: list[tuple[str, dict[str, object]]] | None = None,
         completed_skill_ids_this_turn: set[str] | None = None,
     ) -> tuple[Skill | None, RouterDecision, StepAgentResult, ToolResult | None]:
-        conversation_context = conversation_context or self._conversation_context(chat_session)
+        if conversation_context is None:
+            conversation_context = self._conversation_context(chat_session)
         completed_skill_ids_this_turn = completed_skill_ids_this_turn or set()
         max_actions = max(1, self._get_agent_loop_max_actions(request.tenant_id))
         for iteration in range(max_actions):
@@ -3327,6 +3134,8 @@ class AgentLoop:
                     model_config,
                     step_result,
                     tool_events,
+                    conversation_context=conversation_context,
+                    memory_context=memory_context,
                 )
                 self.db.commit()
                 self.db.refresh(chat_session)
@@ -3383,7 +3192,8 @@ class AgentLoop:
         completed_skill_ids_this_turn: set[str] | None = None,
         memory_context: list[dict[str, object]] | None = None,
     ) -> tuple[Skill | None, RouterDecision, StepAgentResult, ToolResult | None, bool]:
-        conversation_context = conversation_context or self._conversation_context(chat_session)
+        if conversation_context is None:
+            conversation_context = self._conversation_context(chat_session)
         completed_skill_ids_this_turn = completed_skill_ids_this_turn or set()
         if not self._should_try_reflection(router_decision, step_result, tool_result):
             return active_skill, router_decision, step_result, tool_result, False
@@ -3454,6 +3264,8 @@ class AgentLoop:
                 stream_events,
                 tools,
                 model_config,
+                conversation_context,
+                memory_context,
             )
             return (*retry_result, True)
 
@@ -3474,6 +3286,7 @@ class AgentLoop:
                 model_config,
                 conversation_context,
                 stream_events,
+                memory_context,
             )
             return (*retry_result, True)
 
@@ -3488,6 +3301,8 @@ class AgentLoop:
                 stream_events,
                 tools,
                 model_config,
+                conversation_context,
+                memory_context,
             )
             return (*retry_result, True)
 
@@ -3514,6 +3329,8 @@ class AgentLoop:
         stream_events: list[tuple[str, dict[str, object]]] | None = None,
         tools: list[Tool] | None = None,
         model_config: ModelConfig | None = None,
+        conversation_context: dict[str, object] | None = None,
+        memory_context: list[dict[str, object]] | None = None,
     ) -> tuple[Skill | None, RouterDecision, StepAgentResult, ToolResult | None]:
         retry_step_result = StepAgentResult(
             tool_call=retry_tool_call,
@@ -3538,6 +3355,8 @@ class AgentLoop:
             model_config,
             retry_step_result,
             stream_events,
+            conversation_context=conversation_context,
+            memory_context=memory_context,
         )
         return active_skill, router_decision, retry_step_result, retry_tool_result
 
@@ -3562,6 +3381,7 @@ class AgentLoop:
         model_config: ModelConfig,
         conversation_context: dict[str, object],
         stream_events: list[tuple[str, dict[str, object]]] | None = None,
+        memory_context: list[dict[str, object]] | None = None,
     ) -> tuple[Skill | None, RouterDecision, StepAgentResult, ToolResult | None]:
         self.events.record(
             request.tenant_id,
@@ -3629,6 +3449,7 @@ class AgentLoop:
             tools,
             model_config,
             router_decision,
+            memory_context=memory_context,
             conversation_context=conversation_context,
             stream_events=stream_events,
         )
@@ -3645,6 +3466,8 @@ class AgentLoop:
                 model_config,
                 step_result,
                 stream_events,
+                conversation_context=conversation_context,
+                memory_context=memory_context,
             )
         return active_skill, router_decision, step_result, tool_result
 
@@ -3670,6 +3493,8 @@ class AgentLoop:
         step_result: StepAgentResult,
         stream_events: list[tuple[str, dict[str, object]]] | None = None,
         status_callback: StatusCallback | None = None,
+        conversation_context: dict[str, object] | None = None,
+        memory_context: list[dict[str, object]] | None = None,
     ) -> tuple[StepAgentResult, ToolResult | None]:
         tool_result: ToolResult | None = None
         current_knowledge = list(step_result.knowledge_results or [])
@@ -3710,6 +3535,8 @@ class AgentLoop:
                 tool_call,
                 tool_call_id,
                 stream_events=stream_events,
+                conversation_context=conversation_context,
+                memory_context=memory_context,
             )
             self._record_tool_result_in_slots(chat_session, tool_call, tool_result)
             if stream_events is not None:
@@ -3753,6 +3580,8 @@ class AgentLoop:
                     chat_session,
                     iteration + 1,
                 ),
+                memory_context=memory_context,
+                conversation_context=conversation_context,
                 current_knowledge=current_knowledge,
             )
             if current_knowledge and not continuation_result.knowledge_results:
@@ -4110,7 +3939,8 @@ class AgentLoop:
         conversation_context: dict[str, object] | None = None,
         stream_events: list[tuple[str, dict[str, object]]] | None = None,
     ) -> StepAgentResult:
-        conversation_context = conversation_context or self._conversation_context(chat_session)
+        if conversation_context is None:
+            conversation_context = self._conversation_context(chat_session)
         step_result = self._run_step_agent_once(
             request,
             chat_session,
@@ -4269,7 +4099,8 @@ class AgentLoop:
         conversation_context: dict[str, object] | None = None,
         current_knowledge: list[dict[str, object]] | None = None,
     ) -> StepAgentResult:
-        conversation_context = conversation_context or self._conversation_context(chat_session)
+        if conversation_context is None:
+            conversation_context = self._conversation_context(chat_session)
         recent_messages = [
             message
             for message in conversation_context.get("messages", [])
@@ -4285,6 +4116,10 @@ class AgentLoop:
                 request.message,
                 model_config,
                 chat_session.agent_id,
+                conversation_context,
+                memory_context,
+                active_step_id=chat_session.active_step_id,
+                slots=chat_session.slots_json,
             ),
             model_config=model_config,
             router_decision=router_decision,
@@ -4312,8 +4147,29 @@ class AgentLoop:
         user_message: str | None = None,
         model_config: ModelConfig | None = None,
         agent_id: str | None = None,
+        conversation_context: dict[str, object] | None = None,
+        memory_context: list[dict[str, object]] | None = None,
+        *,
+        active_step_id: str | None = None,
+        slots: dict[str, object] | None = None,
     ) -> list[Tool]:
         if active_skill is None:
+            return []
+        current_step = self._current_skill_step(active_skill, active_step_id)
+        if not current_step:
+            return []
+        actions = {
+            str(action).strip()
+            for action in current_step.get("allowed_actions") or []
+            if str(action).strip()
+        }
+        explicit_tool_names = {
+            action.split(":", 1)[1]
+            for action in actions
+            if action.startswith("call_tool:") and ":" in action
+        }
+        allow_any_tool = "call_tool" in actions
+        if not explicit_tool_names and not allow_any_tool:
             return []
         active_skill_id = active_skill.skill_id
         scoped_tools: list[Tool] = []
@@ -4322,6 +4178,8 @@ class AgentLoop:
             if not getattr(tool, "enabled", False):
                 continue
             tool_name = str(getattr(tool, "name", "") or "")
+            if not allow_any_tool and tool_name not in explicit_tool_names:
+                continue
             if tool_name.startswith(GENERAL_SKILL_TOOL_PREFIX):
                 general_skill_tools.append(tool)
                 continue
@@ -4338,6 +4196,8 @@ class AgentLoop:
             model_config,
             agent_id,
             general_skill_tools,
+            conversation_context,
+            memory_context,
         )
         if selected_general_tool:
             scoped_tools.extend(
@@ -4353,6 +4213,8 @@ class AgentLoop:
         model_config: ModelConfig | None,
         agent_id: str | None,
         general_skill_tools: list[Tool],
+        conversation_context: dict[str, object] | None = None,
+        memory_context: list[dict[str, object]] | None = None,
     ) -> str | None:
         message = str(user_message or "").strip()
         if not message or not model_config or not general_skill_tools:
@@ -4373,7 +4235,13 @@ class AgentLoop:
         if not candidates:
             return None
         try:
-            selection = self.general_skill_selector.decide(message, candidates, model_config)
+            selection = self.general_skill_selector.decide(
+                message,
+                candidates,
+                model_config,
+                conversation_context,
+                memory_context,
+            )
         except LLMError:
             return None
         if not selection.use_general_skill or not selection.selected_slug:
@@ -4798,6 +4666,8 @@ class AgentLoop:
         tool_call: ToolCall,
         tool_call_id: str | None = None,
         stream_events: list[tuple[str, dict[str, object]]] | None = None,
+        conversation_context: dict[str, object] | None = None,
+        memory_context: list[dict[str, object]] | None = None,
     ) -> ToolResult:
         if (
             not tool_call.name.startswith(GENERAL_SKILL_TOOL_PREFIX)
@@ -4911,6 +4781,8 @@ class AgentLoop:
                 tool_call,
                 chat_session.agent_id,
                 stream_events=stream_events,
+                conversation_context=conversation_context,
+                memory_context=memory_context,
             )
         else:
             tool_result = self.tool_executor.execute(
@@ -4940,6 +4812,8 @@ class AgentLoop:
         tool_call: ToolCall,
         agent_id: str | None,
         stream_events: list[tuple[str, dict[str, object]]] | None = None,
+        conversation_context: dict[str, object] | None = None,
+        memory_context: list[dict[str, object]] | None = None,
     ) -> ToolResult:
         slug = tool_call.name.removeprefix(GENERAL_SKILL_TOOL_PREFIX).strip()
         if not slug:
@@ -4989,6 +4863,8 @@ class AgentLoop:
             query,
             model_config,
             agent_id,
+            conversation_context,
+            memory_context,
         )
         if guard_result is not None:
             return guard_result
@@ -5018,6 +4894,8 @@ class AgentLoop:
                 model_config,
                 request.user_id,
                 event_sink=trace_sink,
+                conversation_context=conversation_context,
+                memory_context=memory_context,
             )
         except Exception as exc:
             return ToolResult(
@@ -5077,6 +4955,8 @@ class AgentLoop:
         query: str,
         model_config: ModelConfig,
         agent_id: str | None,
+        conversation_context: dict[str, object] | None = None,
+        memory_context: list[dict[str, object]] | None = None,
     ) -> ToolResult | None:
         if not query:
             return ToolResult(
@@ -5106,7 +4986,13 @@ class AgentLoop:
                 ),
             )
         try:
-            selection = self.general_skill_selector.decide(query, candidates, model_config)
+            selection = self.general_skill_selector.decide(
+                query,
+                candidates,
+                model_config,
+                conversation_context,
+                memory_context,
+            )
         except LLMError:
             return None
         selected_slug = selection.selected_slug if selection.use_general_skill else None
@@ -5701,8 +5587,16 @@ class AgentLoop:
         message: str,
         model_config: ModelConfig,
         agent_id: str | None = None,
+        conversation_context: dict[str, object] | None = None,
+        memory_context: list[dict[str, object]] | None = None,
     ) -> tuple[GeneralSkill, GeneralSkillSelection] | None:
-        skill, selection = self._select_general_capability(message, model_config, agent_id)
+        skill, selection = self._select_general_capability(
+            message,
+            model_config,
+            agent_id,
+            conversation_context,
+            memory_context,
+        )
         if skill is None:
             return None
         return skill, selection
@@ -5712,10 +5606,18 @@ class AgentLoop:
         message: str,
         model_config: ModelConfig,
         agent_id: str | None = None,
+        conversation_context: dict[str, object] | None = None,
+        memory_context: list[dict[str, object]] | None = None,
     ) -> tuple[GeneralSkill | None, GeneralSkillSelection]:
         general_skills = self._list_published_general_skills(model_config.tenant_id, agent_id)
         try:
-            selection = self.general_skill_selector.decide(message, general_skills, model_config)
+            selection = self.general_skill_selector.decide(
+                message,
+                general_skills,
+                model_config,
+                conversation_context,
+                memory_context,
+            )
         except LLMError as exc:
             return None, GeneralSkillSelection(reason=f"Capability selection failed: {exc}")
         if not selection.use_general_skill or not selection.selected_slug:

@@ -111,118 +111,47 @@ def test_router_accepts_ordered_pending_tasks(monkeypatch):
     assert decision.pending_tasks[0].target_step_id == "collect_user_name"
 
 
-def test_task_scheduler_selects_multiple_existing_task_frames(monkeypatch):
+def test_router_converts_ordered_create_pending_tasks_to_primary_and_queue(monkeypatch):
     def fake_init(self, model_config):  # noqa: ANN001
         return None
 
     def fake_generate_json(self, system_prompt, payload):  # noqa: ANN001
-        assert "task scheduler" in payload["_agent_stage"]["instructions"]
-        assert payload["candidate_task_frames"][0]["task_id"] == "task_purchase_a3"
-        assert payload["candidate_task_frames"][1]["task_id"] == "task_purchase_a1"
+        assert "不会再调用独立 scheduler" in payload["_agent_stage"]["instructions"]
         return {
-            "action": "run_tasks",
-            "selected_task_ids": ["task_purchase_a3", "missing_task", "task_purchase_a1"],
-            "confidence": 0.91,
-            "reason": "当前任务完成后，用户原始消息包含后续购买 A3 和 A1。",
-        }
-
-    monkeypatch.setattr(LLMClient, "__init__", fake_init)
-    monkeypatch.setattr(LLMClient, "generate_json", fake_generate_json)
-
-    decision = Router().schedule_tasks_after_completion(
-        "退完帮我买一个 A3，再买一个 A1",
-        ChatSession(
-            id="session_test",
-            tenant_id="tenant_demo",
-            pending_tasks_json=[
+            "decision": "create_pending",
+            "confidence": 0.95,
+            "user_intent": "先购买 A3，再购买 A1",
+            "pending_tasks": [
                 {
                     "task_id": "task_purchase_a3",
-                    "skill_id": "purchase",
                     "target_skill_id": "purchase",
-                    "step_id": "collect_user_name",
-                    "target_step_id": "collect_user_name",
-                    "slots": {"product_id": "A3", "quantity": 1},
+                    "user_intent": "购买 A3",
+                    "slot_hints": {"product_id": "A3"},
                 },
                 {
                     "task_id": "task_purchase_a1",
-                    "skill_id": "purchase",
                     "target_skill_id": "purchase",
-                    "step_id": "collect_user_name",
-                    "target_step_id": "collect_user_name",
-                    "slots": {"product_id": "A1", "quantity": 1},
-                }
+                    "user_intent": "购买 A1",
+                    "slot_hints": {"product_id": "A1"},
+                },
             ],
-        ),
-        [_purchase_skill()],
-        model_config=None,  # type: ignore[arg-type]
-        completed_reply="退款已完成。",
-    )
-
-    assert decision.action == "run_tasks"
-    assert decision.selected_task_ids == ["task_purchase_a3", "task_purchase_a1"]
-
-
-def test_task_scheduler_can_continue_price_compare_after_purchase_completion(monkeypatch):
-    def fake_init(self, model_config):  # noqa: ANN001
-        return None
-
-    def fake_generate_json(self, system_prompt, payload):  # noqa: ANN001
-        assert "task scheduler" in payload["_agent_stage"]["instructions"]
-        assert payload["completed_reply"] == "购买流程已完成。"
-        assert len(payload["candidate_task_frames"]) == 1
-        candidate = payload["candidate_task_frames"][0]
-        assert candidate["source"] == "pending"
-        assert candidate["task_id"] == "task_price_compare_a1_a3"
-        assert candidate["skill_id"] == "price_compare"
-        assert candidate["step_id"] == "collect_products"
-        assert candidate["intent_summary"] == "购买前对比 A1 和 A3 的价格"
-        assert candidate["source_message"] == "买 A1 前跟 A3 比下价格"
-        assert candidate["slots"] == {"product_name_1": "A1", "product_name_2": "A3"}
-        price_compare = next(
-            item for item in payload["available_skills"] if item["skill_id"] == "price_compare"
-        )
-        assert price_compare == {
-            "skill_id": "price_compare",
-            "name": "商品比价服务",
-            "description": "比较两个商品的价格。",
-            "trigger_intents": ["比价", "价格对比"],
-        }
-        return {
-            "action": "run_tasks",
-            "selected_task_ids": ["task_price_compare_a1_a3"],
-            "confidence": 0.95,
-            "reason": "购买任务完成后继续执行用户已提出的比价任务。",
         }
 
     monkeypatch.setattr(LLMClient, "__init__", fake_init)
     monkeypatch.setattr(LLMClient, "generate_json", fake_generate_json)
 
-    decision = Router().schedule_tasks_after_completion(
-        "买 A1 前跟 A3 比下价格",
-        ChatSession(
-            id="session_test",
-            tenant_id="tenant_demo",
-            pending_tasks_json=[
-                {
-                    "task_id": "task_price_compare_a1_a3",
-                    "status": "pending",
-                    "skill_id": "price_compare",
-                    "target_skill_id": "price_compare",
-                    "step_id": "collect_products",
-                    "target_step_id": "collect_products",
-                    "intent_summary": "购买前对比 A1 和 A3 的价格",
-                    "source_message": "买 A1 前跟 A3 比下价格",
-                    "slots": {"product_name_1": "A1", "product_name_2": "A3"},
-                }
-            ],
-        ),
-        [_purchase_skill(), _price_compare_skill()],
+    decision = Router().decide(
+        "先买 A3，再买 A1",
+        ChatSession(id="session_test", tenant_id="tenant_demo"),
+        [_purchase_skill()],
         model_config=None,  # type: ignore[arg-type]
-        completed_reply="购买流程已完成。",
     )
 
-    assert decision.action == "run_tasks"
-    assert decision.selected_task_ids == ["task_price_compare_a1_a3"]
+    assert decision.decision == "start_new_task"
+    assert decision.selected_task_id == "task_purchase_a3"
+    assert decision.target_skill_id == "purchase"
+    assert decision.slot_hints == {"product_id": "A3"}
+    assert [task.task_id for task in decision.pending_tasks] == ["task_purchase_a1"]
 
 
 def test_router_rejects_noncanonical_answer_alias(monkeypatch):

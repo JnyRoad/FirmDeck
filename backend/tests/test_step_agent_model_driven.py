@@ -66,9 +66,9 @@ def test_step_agent_uses_model_json_for_slots_and_tool(monkeypatch):
         ],
     )
 
-    assert captured["payload"]["active_skill"]["skill_id"] == "repair_ticket"
+    assert "skill_id" not in captured["payload"]["active_skill"]
     assert "统一执行引擎" in captured["system_prompt"]
-    assert "技能节点是业务目标" in captured["payload"]["_agent_stage"]["instructions"]
+    assert "当前 SOP 的最小投影" in captured["payload"]["_agent_stage"]["instructions"]
     assert captured["payload"]["active_skill"]["current_step"]["node_id"] == (
         "collect_issue"
     )
@@ -80,12 +80,24 @@ def test_step_agent_uses_model_json_for_slots_and_tool(monkeypatch):
     assert "adjacent_edges" not in captured["payload"]["active_skill"]
     assert "target_steps" not in captured["payload"]["active_skill"]
     assert "active_step" not in captured["payload"]
-    assert captured["payload"]["router_decision"]["user_intent"] == "设备报修"
+    assert captured["payload"]["router_decision"] == {
+        "decision": "start_new_task",
+        "user_intent": "设备报修",
+    }
     assert "recent_messages" not in captured["payload"]
-    assert captured["payload"]["_agent_stage"]["memory"] == "- 张三"
+    assert captured["payload"]["_agent_stage"]["memory"] == ""
     assert captured["payload"]["awaiting_input"]["question_summary"] == "请描述设备问题。"
     assert "repair_context" in captured["payload"]
+    assert captured["payload"]["available_tools"] == [
+        {
+            "name": "ticket.create",
+            "description": "",
+            "input_schema": _ticket_tool().input_schema,
+        }
+    ]
+    assert "通用技能规则" not in captured["payload"]["_agent_stage"]["instructions"]
     assert result.slot_updates["asset_id"] == "EQ-9"
+    assert result.action == "call_tool"
     assert result.tool_call is not None
     assert result.tool_call.name == "ticket.create"
     assert result.next_step_id == "reply_ticket"

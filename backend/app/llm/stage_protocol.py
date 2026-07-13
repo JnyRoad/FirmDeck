@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+import json
 from typing import Any
 
 from app import paths
@@ -9,6 +11,7 @@ UNIFIED_PROMPT_PATH = (
     paths.resource_dir() / "app" / "llm" / "prompts" / "unified_agent_prompt.md"
 )
 STAGE_PROTOCOL_KEY = "_agent_stage"
+TURN_STAGE_MESSAGES_KEY = "_agent_turn_messages"
 
 
 ROUTER_OUTPUT_SCHEMA: dict[str, Any] = {
@@ -49,14 +52,8 @@ ROUTER_OUTPUT_SCHEMA: dict[str, Any] = {
     ],
 }
 
-TASK_SCHEDULER_OUTPUT_SCHEMA: dict[str, Any] = {
-    "action": "run_tasks | stop",
-    "selected_task_ids": "string[]",
-    "confidence": "number",
-    "reason": "string?",
-}
-
 STEP_AGENT_OUTPUT_SCHEMA: dict[str, Any] = {
+    "action": "ask_user | clarify | reply | advance | call_tool | query_knowledge | handoff",
     "reply": "string?",
     "slot_updates": "object",
     "tool_call": {"name": "string", "arguments": "object"},
@@ -102,11 +99,13 @@ def stage_payload(
         else {}
     )
     turn_time = metadata.get("current_turn_time") if isinstance(metadata, dict) else None
-    memory_text = (
-        _memory_text(memory_context)
-        if isinstance(memory_context, list)
-        else str(memory_context or "").strip()
-    )
+    memory_text = ""
+    if phase == "Router":
+        memory_text = (
+            _memory_text(memory_context)
+            if isinstance(memory_context, list)
+            else str(memory_context or "").strip()
+        )
     return {
         STAGE_PROTOCOL_KEY: {
             "phase": phase,
@@ -116,9 +115,51 @@ def stage_payload(
             "turn_time": str(turn_time or "未提供"),
         },
         "user_message": user_message,
-        "conversation_context": conversation_context or {},
+        "conversation_context": (
+            conversation_context if isinstance(conversation_context, dict) else {}
+        ),
         **stage_data,
     }
+
+
+def render_stage_user_message(
+    user_payload: dict[str, Any], *, include_turn_header: bool = True
+) -> str:
+    """Render the exact stage input sent as the current user message."""
+    payload = copy.deepcopy(
+        {
+            key: value
+            for key, value in user_payload.items()
+            if key != "conversation_context"
+        }
+    )
+    stage = payload.pop(STAGE_PROTOCOL_KEY, {})
+    user_message = str(payload.pop("user_message", "") or "").strip()
+    projected = _drop_empty_values(payload)
+    output_contract = stage.get("output_contract") if isinstance(stage, dict) else None
+    if not isinstance(output_contract, str):
+        output_contract = json.dumps(
+            output_contract or {}, ensure_ascii=False, separators=(",", ":")
+        )
+    sections = []
+    if include_turn_header:
+        sections.extend(
+            [
+                f"用户记忆：\n{stage.get('memory') or '无'}",
+                f"本轮时间：\n{stage.get('turn_time') or '未提供'}",
+                f"本轮用户输入：\n{user_message or '（空）'}",
+            ]
+        )
+    sections.extend(
+        [
+            f"当前阶段：\n{stage.get('phase') or '未指定'}",
+            f"阶段规则：\n{str(stage.get('instructions') or '').strip()}",
+            "当前阶段独有内容：\n"
+            + json.dumps(projected, ensure_ascii=False, separators=(",", ":")),
+            f"输出约束：\n{output_contract}",
+        ]
+    )
+    return "\n\n".join(sections)
 
 
 def _memory_text(items: list[dict[str, object]]) -> str:
@@ -129,5 +170,22 @@ def _memory_text(items: list[dict[str, object]]) -> str:
         content = " ".join(str(item.get("content") or "").split())
         if not content or content in lines:
             continue
-        lines.append(content[:1_000])
+        lines.append(content)
     return "\n".join(f"- {line}" for line in lines)
+
+
+def _drop_empty_values(value: Any) -> Any:
+    if isinstance(value, dict):
+        projected = {key: _drop_empty_values(item) for key, item in value.items()}
+        return {
+            key: item
+            for key, item in projected.items()
+            if item not in (None, "", [], {})
+        }
+    if isinstance(value, list):
+        return [
+            projected
+            for item in value
+            if (projected := _drop_empty_values(item)) not in (None, "", [], {})
+        ]
+    return value
