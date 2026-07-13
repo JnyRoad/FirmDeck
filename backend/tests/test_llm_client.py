@@ -736,7 +736,7 @@ def test_internal_json_operation_caps_output_without_mutating_system_prompt():
         assert client.generate_json("router prompt", {}) == {"decision": "answer_only"}
 
     call = client.client.chat.completions.calls[0]
-    assert call["max_tokens"] == 1024
+    assert call["max_tokens"] == 4096
     assert call["messages"][0]["content"] == "router prompt"
 
 
@@ -760,6 +760,7 @@ def test_user_visible_response_keeps_configured_output_budget():
 @pytest.mark.parametrize(
     ("operation", "expected"),
     [
+        ("router.scene", 4096),
         ("reflection.review", 2048),
         ("general_skill.select", 2048),
         ("general_skill.review", 2048),
