@@ -2879,7 +2879,10 @@ export function useChatSession() {
     setComposerAttachments([]);
     setComposerIntent(null);
     const stream = getStreamSlot(currentConversationId);
-    if (stream.loading || currentSessionRunning) {
+    const hasQueuedTurnForConversation = queuedTurnsRef.current.some(
+      (item) => item.conversationId === currentConversationId,
+    );
+    if (stream.loading || currentSessionRunning || hasQueuedTurnForConversation) {
       enqueuePreparedTurn(prepared);
       return;
     }

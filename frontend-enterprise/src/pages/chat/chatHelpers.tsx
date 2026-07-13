@@ -855,6 +855,9 @@ export function computeMergedMessages(slot: SessionSlot, activeTurnId?: string |
 
   const sorted = combined
     .sort((left, right) => {
+      const leftQueued = left.messageItem.role === 'user' && left.messageItem.metadata?.queued === true;
+      const rightQueued = right.messageItem.role === 'user' && right.messageItem.metadata?.queued === true;
+      if (leftQueued !== rightQueued) return leftQueued ? 1 : -1;
       const leftTurnId = canonicalMessageTurnId(left.messageItem, aliasMap);
       const rightTurnId = canonicalMessageTurnId(right.messageItem, aliasMap);
       const leftTurnStart = leftTurnId ? turnStarts.get(leftTurnId) : undefined;
