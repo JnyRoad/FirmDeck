@@ -1,6 +1,9 @@
-import { useMemo } from 'react';
+import { useMemo, useState } from 'react';
 import type { ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
+
+import { HoverCard, HoverCardContent, HoverCardTrigger } from '../../components/ui/hover-card';
+import { Popover, PopoverContent, PopoverTrigger } from '../../components/ui/popover';
 
 import IconGrowthArrow from '../../assets/icons/growth-arrow.svg?react';
 import IconCardArrow from '../../assets/icons/card-arrow.svg?react';
@@ -31,20 +34,15 @@ export type ReplyStats = {
   byDay: Record<string, number>;
 };
 
-const HEATMAP_ROWS = 7;
-const HEATMAP_COLUMNS = 33;
-const HEATMAP_BUCKETS = HEATMAP_ROWS * HEATMAP_COLUMNS;
-// Rolling window: from the current month one year ago (left) to the current month (right).
-const HEATMAP_MONTH_SLOTS = 13;
-// Rows are Sun→Sat (第一行周日); labels only on 周一 / 周三 / 周五.
-const HEATMAP_WEEKDAY_LABELS = ['', '周一', '', '周三', '', '周五', ''];
-const HEATMAP_CELL_LEVELS = [
-  'bg-[#f6f6f6] in-data-[theme=dark]:bg-[#363944]',
-  'bg-[#cfd5e2] in-data-[theme=dark]:bg-[#5a6274]',
-  'bg-[#9aa3ba] in-data-[theme=dark]:bg-[#7b8498]',
-  'bg-[#6a7488] in-data-[theme=dark]:bg-[#a4adbf]',
-  'bg-[#464c5e] in-data-[theme=dark]:bg-[#f0f2f6]',
-];
+const TIMELINE_MODES = [
+  { key: 'day', label: 'Day' },
+  { key: 'week', label: 'Week' },
+  { key: 'month', label: 'Month' },
+] as const;
+type TimelineMode = (typeof TIMELINE_MODES)[number]['key'];
+// Number of evenly spaced vertical grid lines behind the timeline tracks.
+const TIMELINE_GRID_LINES = 15;
+const TIMELINE_WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
 type GrowthEvent = {
   id: string;
@@ -164,13 +162,20 @@ export default function WorkRecordTab({
 
   return (
     <section className="relative flex w-full min-w-0 max-w-full mt-[-2px] flex-col gap-[24px] overflow-hidden rounded-[18px] shadow-[0_20px_42px_rgba(21,26,38,0.045)] bg-white p-[14px] *:min-w-0 min-[521px]:p-[18px] in-data-[theme=dark]:border-[#343741] in-data-[theme=dark]:bg-[#202126] in-data-[theme=dark]:text-[#f0f2f6]">
-      <div className="flex w-full items-stretch">
+      <div className="flex w-full items-stretch gap-[16px]">
         <ClickableMetric label="今日对话" value={replyStats.today} onClick={goToLogs} />
         <ClickableMetric label="累计对话" value={replyStats.total} onClick={goToLogs} />
-        <ClickableMetric label="好评率" value={positiveRate} suffix="%" onClick={goToLogs} />
-        <ClickableMetric label="差评率" value={negativeRate} suffix="%" onClick={goToLogs} />
+        <ClickableMetric label="好评率" value={positiveRate} suffix="%" tone="positive" onClick={goToLogs} />
+        <ClickableMetric label="差评率" value={negativeRate} suffix="%" tone="negative" onClick={goToLogs} />
       </div>
-      <ConversationHeatmap byDay={replyStats.byDay} />
+      <ActivityTimeline
+        employeeSessions={employeeSessions}
+        scheduledTasks={activeScheduledTasks}
+        sops={activeSkills}
+        tools={activeTools}
+        knowledge={activeKnowledge}
+        generalSkills={activeGeneralSkills}
+      />
       <div className="flex w-full min-w-0 max-w-full flex-col gap-[10px] mt-[20px]">
         <div className="inline-flex items-center gap-[6px] self-start text-[14px] capitalize leading-none text-[#757f9c] in-data-[theme=dark]:text-[#8b93a6]">
           <IconGrowthArrow className="size-[14px] shrink-0" />
@@ -238,145 +243,755 @@ export default function WorkRecordTab({
   );
 }
 
-function ClickableMetric({ label, value, suffix = '', onClick }: { label: string; value: number; suffix?: string; onClick: () => void }) {
+type MetricTone = 'default' | 'positive' | 'negative';
+
+const metricToneClass: Record<MetricTone, string> = {
+  default:
+    'border-[0.5px] border-[#e3e7f1] bg-transparent hover:bg-[#f7f8fa] in-data-[theme=dark]:border-[#343741] in-data-[theme=dark]:hover:bg-white/5',
+  positive: 'bg-[#e9f7ef] hover:bg-[#dcf1e5] in-data-[theme=dark]:bg-[#173a29] in-data-[theme=dark]:hover:bg-[#1c452f]',
+  negative: 'bg-[#fce7e7] hover:bg-[#f9dada] in-data-[theme=dark]:bg-[#3d1f1f] in-data-[theme=dark]:hover:bg-[#4a2626]',
+};
+
+const metricValueToneClass: Record<MetricTone, string> = {
+  default: 'text-[#18181a] in-data-[theme=dark]:text-[#f0f2f6]',
+  positive: 'text-[#2cb360] in-data-[theme=dark]:text-[#4fd189]',
+  negative: 'text-[#d20b0b] in-data-[theme=dark]:text-[#f26565]',
+};
+
+function ClickableMetric({
+  label,
+  value,
+  suffix = '',
+  tone = 'default',
+  onClick,
+}: {
+  label: string;
+  value: number;
+  suffix?: string;
+  tone?: MetricTone;
+  onClick: () => void;
+}) {
   return (
     <button
       type="button"
       onClick={onClick}
-      className="flex min-w-px flex-[1_0_0] cursor-pointer flex-col justify-center gap-1 border-[0.5px] border-[#e3e7f1] bg-transparent px-5 py-2.5 text-left transition-colors first:rounded-l-[14px] last:rounded-r-[14px] hover:bg-[#f7f8fa] in-data-[theme=dark]:border-[#343741] in-data-[theme=dark]:hover:bg-white/5"
+      className={`flex min-w-px flex-[1_0_0] cursor-pointer flex-col justify-center gap-[4px] rounded-[20px] px-[32px] py-[16px] text-left transition-colors ${metricToneClass[tone]}`}
     >
-      <strong className="text-[18px] font-medium leading-none text-[#18181a] in-data-[theme=dark]:text-[#f0f2f6]">{value}{suffix}</strong>
-      <span className="text-[12px] leading-none text-[#464c5e] in-data-[theme=dark]:text-[#aeb6c6]">{label}</span>
+      <strong className={`text-[18px] font-medium leading-none ${metricValueToneClass[tone]}`}>{value}{suffix}</strong>
+      <span className="text-[12px] leading-none text-[#757f9c] in-data-[theme=dark]:text-[#8b93a6]">{label}</span>
     </button>
   );
 }
 
-function ConversationHeatmap({ byDay }: { byDay: Record<string, number> }) {
-  const days = useMemo(() => heatmapDays(byDay), [byDay]);
-  const rows = useMemo(
-    () =>
-      Array.from({ length: HEATMAP_ROWS }, (_, row) =>
-        Array.from({ length: HEATMAP_COLUMNS }, (_, column) => days[column * HEATMAP_ROWS + row]),
+// Per-activity accent colors, shared by the Day/Week timeline and the Month calendar.
+const ACTIVITY_DOT: Record<string, string> = {
+  chat: 'bg-[#4f92ff]',
+  task: 'bg-[#ff9138]',
+  sop: 'bg-[#2cb360]',
+  tool: 'bg-[#9b6dff]',
+  knowledge: 'bg-[#12b5c9]',
+  skill: 'bg-[#f2589f]',
+};
+
+type TrackEvent = { time: number; name: string };
+
+type TimelineTrackConfig = {
+  key: string;
+  label: string;
+  unit: string;
+  dot: string;
+  bar: string;
+};
+
+const TIMELINE_TRACKS: TimelineTrackConfig[] = [
+  {
+    key: 'chat',
+    label: '对话数',
+    unit: '次对话',
+    dot: ACTIVITY_DOT.chat,
+    bar: 'bg-[#e8f0ff] in-data-[theme=dark]:bg-[#1d2c47]',
+  },
+  {
+    key: 'task',
+    label: '定时任务',
+    unit: '个任务',
+    dot: ACTIVITY_DOT.task,
+    bar: 'bg-[#fff1e3] in-data-[theme=dark]:bg-[#3a2c1a]',
+  },
+  {
+    key: 'sop',
+    label: '新增SOP',
+    unit: '个 SOP',
+    dot: ACTIVITY_DOT.sop,
+    bar: 'bg-[#e9f7ef] in-data-[theme=dark]:bg-[#173a29]',
+  },
+  {
+    key: 'tool',
+    label: '新增工具',
+    unit: '个工具',
+    dot: ACTIVITY_DOT.tool,
+    bar: 'bg-[#f1ecff] in-data-[theme=dark]:bg-[#2c2544]',
+  },
+  {
+    key: 'knowledge',
+    label: '新增知识',
+    unit: '个知识',
+    dot: ACTIVITY_DOT.knowledge,
+    bar: 'bg-[#e2f6f9] in-data-[theme=dark]:bg-[#123037]',
+  },
+  {
+    key: 'skill',
+    label: '新增技能',
+    unit: '个技能',
+    dot: ACTIVITY_DOT.skill,
+    bar: 'bg-[#fde8f1] in-data-[theme=dark]:bg-[#3d1e2e]',
+  },
+];
+
+type DayActivity = { label: string; dot: string; time?: string };
+
+type ActivityTimelineProps = {
+  employeeSessions: EnterpriseChatSessionRead[];
+  scheduledTasks: ScheduledTaskRead[];
+  sops: SkillRead[];
+  tools: ToolRead[];
+  knowledge: KnowledgeBaseRead[];
+  generalSkills: GeneralSkillRead[];
+};
+
+function ActivityTimeline(props: ActivityTimelineProps) {
+  const { employeeSessions, scheduledTasks, sops, tools, knowledge, generalSkills } = props;
+  const [mode, setMode] = useState<TimelineMode>('day');
+  const [anchor, setAnchor] = useState<number>(() => startOfDay(new Date()).getTime());
+
+  const eventsByTrack = useMemo(() => {
+    const collect = (entries: Array<{ value?: string; name?: string }>) =>
+      entries
+        .map((entry) => ({ time: entry.value ? new Date(entry.value).getTime() : Number.NaN, name: entry.name || '' }))
+        .filter((entry) => Number.isFinite(entry.time));
+    return {
+      chat: collect(employeeSessions.map((item) => ({ value: item.created_at }))),
+      task: collect(
+        scheduledTasks.flatMap((item) =>
+          [item.last_run_at, item.next_run_at].map((value) => ({ value, name: staffdeckDisplayText(item.title) })),
+        ),
       ),
-    [days],
+      sop: collect(sops.map((item) => ({ value: item.created_at, name: staffdeckDisplayText(item.name) }))),
+      tool: collect(
+        tools.map((item) => ({ value: item.created_at, name: staffdeckDisplayText(item.display_name || item.name) })),
+      ),
+      knowledge: collect(knowledge.map((item) => ({ value: item.created_at, name: staffdeckDisplayText(item.name) }))),
+      skill: collect(generalSkills.map((item) => ({ value: item.created_at, name: staffdeckDisplayText(item.name) }))),
+    } as Record<string, TrackEvent[]>;
+  }, [employeeSessions, scheduledTasks, sops, tools, knowledge, generalSkills]);
+
+  const itemsByDay = useMemo(
+    () => (mode === 'month' ? buildDayActivities(props) : {}),
+    [mode, props],
   );
+
+  const range = useMemo(() => timelineRange(mode, anchor), [mode, anchor]);
+  const ticks = useMemo(() => timelineTicks(mode, range), [mode, range]);
+  const activeTracks = useMemo(
+    () =>
+      TIMELINE_TRACKS.map((track) => ({ track, bar: timelineBar(eventsByTrack[track.key] || [], range) })).filter(
+        (item): item is { track: TimelineTrackConfig; bar: NonNullable<ReturnType<typeof timelineBar>> } =>
+          item.bar !== null,
+      ),
+    [eventsByTrack, range],
+  );
+
+  const shift = (direction: number) => setAnchor((prev) => shiftAnchor(mode, prev, direction));
+  const changeMode = (next: TimelineMode) => {
+    setMode(next);
+    setAnchor(normalizeAnchor(next, anchor));
+  };
+
   return (
-    <div className="w-full overflow-x-auto overflow-y-hidden">
-      <div className="mx-auto flex w-max flex-col gap-[6px]">
-        <div className="ml-[52px] grid w-[714px] grid-cols-[repeat(33,10px)] gap-x-[12px] text-[10px] capitalize leading-none text-[#757f9c] in-data-[theme=dark]:text-[#8b93a6]">
-          {monthLabels().map((item) => (
-            <span
-              key={`${item.label}-${item.offset}`}
-              className="whitespace-nowrap"
-              style={{ gridColumn: `${item.offset + 1} / span ${item.span}` }}
+    <div className="flex w-full min-w-0 flex-col gap-[16px]">
+      <div className="flex h-[36px] flex-wrap items-center justify-between gap-[12px]">
+        <div className="flex items-center gap-[6px] text-[14px] text-[#858b9c] in-data-[theme=dark]:text-[#8b93a6]">
+          <IconProfileCalendar className="size-[14px] shrink-0" />
+          {formatAnchorLabel(mode, range)}
+        </div>
+        <div className="flex items-center gap-[24px] rounded-[8px] border border-[#e3e7f1] px-[12px] py-[8px] in-data-[theme=dark]:border-[#343741]">
+          <button
+            type="button"
+            onClick={() => shift(-1)}
+            className="flex size-[14px] items-center justify-center text-[#464c5e] transition-colors hover:text-[#18181a] in-data-[theme=dark]:text-[#c9cede]"
+            aria-label="上一个周期"
+          >
+            <TimelineChevron direction="left" />
+          </button>
+          <TimelineDatePicker
+            mode={mode}
+            anchor={anchor}
+            label={formatTimelineRange(mode, range)}
+            onPick={setAnchor}
+          />
+          <button
+            type="button"
+            onClick={() => shift(1)}
+            className="flex size-[14px] items-center justify-center text-[#464c5e] transition-colors hover:text-[#18181a] in-data-[theme=dark]:text-[#c9cede]"
+            aria-label="下一个周期"
+          >
+            <TimelineChevron direction="right" />
+          </button>
+        </div>
+        <div className="flex items-center gap-[12px]">
+          {TIMELINE_MODES.map((item) => (
+            <button
+              type="button"
+              key={item.key}
+              onClick={() => changeMode(item.key)}
+              className={`flex w-[50px] items-center justify-center px-[8px] text-[12px] transition-colors ${
+                mode === item.key
+                  ? 'font-medium text-[#464c5e] in-data-[theme=dark]:text-[#f0f2f6]'
+                  : 'text-[#757f9c] hover:text-[#464c5e] in-data-[theme=dark]:text-[#8b93a6]'
+              }`}
             >
               {item.label}
-            </span>
+            </button>
           ))}
-        </div>
-        {rows.map((cells, row) => (
-          <div className="flex items-center gap-[32px]" key={`row-${row}`}>
-            <span className="w-[20px] shrink-0 text-[10px] capitalize leading-none text-[#757f9c] in-data-[theme=dark]:text-[#8b93a6]">
-              {HEATMAP_WEEKDAY_LABELS[row]}
-            </span>
-            <div className="flex gap-[12px]">
-              {cells.map((day) => (
-                <span
-                  key={day.key}
-                  className={`group relative size-[10px] shrink-0 rounded-[2.5px] border-[0.625px] border-solid border-[#e3e7f1] in-data-[theme=dark]:border-[#363a45] ${HEATMAP_CELL_LEVELS[Math.min(4, day.count)]}`}
-                >
-                  {day.count > 0 && (
-                    <span className={`pointer-events-none absolute left-1/2 z-20 hidden -translate-x-1/2 whitespace-nowrap rounded-[6px] bg-[#303645] px-[8px] py-[5px] text-[11px] font-medium leading-none text-white shadow-[0_6px_16px_rgba(21,26,38,0.18)] group-hover:block in-data-[theme=dark]:bg-[#f0f2f6] in-data-[theme=dark]:text-[#202126] ${row < 2 ? 'top-full mt-[7px]' : 'bottom-full mb-[7px]'}`}>
-                      {day.label} · {day.count} 轮对话
-                      <span className={`absolute left-1/2 size-0 -translate-x-1/2 border-x-4 border-x-transparent ${row < 2 ? 'bottom-full border-b-4 border-b-[#303645] in-data-[theme=dark]:border-b-[#f0f2f6]' : 'top-full border-t-4 border-t-[#303645] in-data-[theme=dark]:border-t-[#f0f2f6]'}`} />
-                    </span>
-                  )}
-                </span>
-              ))}
-            </div>
-          </div>
-        ))}
-        <div className="mt-[4px] flex items-center justify-center gap-[6px] text-[12px] leading-none text-[#757f9c] in-data-[theme=dark]:text-[#8b93a6]">
-          <span>少</span>
-          {[1, 2, 3, 4].map((level) => (
-            <span
-              key={`legend-${level}`}
-              className={`size-[12px] shrink-0 rounded-[3px] border-[0.625px] border-solid border-[#e3e7f1] in-data-[theme=dark]:border-[#363a45] ${HEATMAP_CELL_LEVELS[level]}`}
-            />
-          ))}
-          <span>多</span>
         </div>
       </div>
+
+      {mode === 'month' ? (
+        <MonthCalendar anchor={anchor} itemsByDay={itemsByDay} />
+      ) : (
+        <>
+          <div className="relative w-full overflow-hidden rounded-[20px] px-[12px] py-[16px]">
+            <div className="pointer-events-none absolute inset-x-[12px] inset-y-[8px] flex justify-between">
+              {Array.from({ length: TIMELINE_GRID_LINES }, (_, index) => (
+                <span key={`grid-${index}`} className="w-px bg-[#eef1f7] in-data-[theme=dark]:bg-[#2c2f38]" />
+              ))}
+            </div>
+            <div className="relative z-10 flex min-h-[94px] flex-col gap-[8px]">
+              {activeTracks.map(({ track, bar }) => {
+                const label = trackBarLabel(track, bar);
+                return (
+                  <div key={track.key} className="relative h-[26px] w-full">
+                    <HoverCard openDelay={120} closeDelay={80}>
+                      <HoverCardTrigger asChild>
+                        <div
+                          className={`absolute top-0 flex h-[26px] cursor-default items-center gap-[6px] rounded-[8px] px-[8px] py-[4px] ${track.bar}`}
+                          style={{ left: `${bar.left}%`, width: `${bar.width}%` }}
+                        >
+                          <span className={`size-[6px] shrink-0 rounded-full ${track.dot}`} />
+                          <span className="truncate text-[10px] leading-none capitalize text-[#464c5e] in-data-[theme=dark]:text-[#f0f2f6]">
+                            {label}
+                          </span>
+                        </div>
+                      </HoverCardTrigger>
+                      <HoverCardContent align="start" sideOffset={6} className="w-auto max-w-[300px] p-[10px]">
+                        <div className="mb-[8px] flex items-center gap-[6px]">
+                          <span className={`size-[6px] shrink-0 rounded-full ${track.dot}`} />
+                          <span className="text-[12px] font-medium text-[#18181a] in-data-[theme=dark]:text-[#f0f2f6]">
+                            {track.label}
+                          </span>
+                          <span className="text-[11px] text-[#858b9c]">
+                            共{bar.count}
+                            {track.unit}
+                          </span>
+                        </div>
+                        <div className="flex flex-col gap-[4px]">
+                          {bar.events.slice(0, 12).map((event, index) => (
+                            <div
+                              key={`${track.key}-${event.time}-${index}`}
+                              className="flex items-start gap-[8px] text-[11px] leading-[15px]"
+                            >
+                              <span className="shrink-0 tabular-nums text-[#858b9c]">
+                                {mode === 'week'
+                                  ? `${new Date(event.time).getMonth() + 1}/${new Date(event.time).getDate()} ${formatHm(new Date(event.time))}`
+                                  : formatHm(new Date(event.time))}
+                              </span>
+                              <span className="flex-1 break-words text-[#464c5e] in-data-[theme=dark]:text-[#c9cede]">
+                                {event.name || track.label}
+                              </span>
+                            </div>
+                          ))}
+                          {bar.events.length > 12 && (
+                            <div className="text-[11px] text-[#858b9c]">…等{bar.events.length}项</div>
+                          )}
+                        </div>
+                      </HoverCardContent>
+                    </HoverCard>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          <div className="flex w-full items-center justify-between text-[12px] text-[#858b9c] in-data-[theme=dark]:text-[#8b93a6]">
+            {ticks.map((tick, index) => (
+              <span key={`tick-${index}`} className="whitespace-nowrap">
+                {tick}
+              </span>
+            ))}
+          </div>
+        </>
+      )}
     </div>
   );
 }
 
-// Ascending rolling months ending at the current month, e.g. [去年7月 … 今年7月].
-function heatmapMonthSequence() {
-  const now = new Date();
-  return Array.from({ length: HEATMAP_MONTH_SLOTS }, (_, index) => {
-    const offsetFromNow = HEATMAP_MONTH_SLOTS - 1 - index;
-    const date = new Date(now.getFullYear(), now.getMonth() - offsetFromNow, 1);
-    return { year: date.getFullYear(), month: date.getMonth() };
-  });
+function MonthCalendar({
+  anchor,
+  itemsByDay,
+}: {
+  anchor: number;
+  itemsByDay: Record<string, DayActivity[]>;
+}) {
+  const weeks = monthCalendarWeeks(anchor);
+  const month = new Date(anchor).getMonth();
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  const toggle = (key: string) => setExpanded((prev) => ({ ...prev, [key]: !prev[key] }));
+  return (
+    <div className="w-full overflow-hidden rounded-[20px] border border-[#eef1f7] in-data-[theme=dark]:border-[#2c2f38]">
+      <div className="grid grid-cols-7">
+        {['周日', '周一', '周二', '周三', '周四', '周五', '周六'].map((day) => (
+          <div
+            key={day}
+            className="px-[12px] py-[8px] text-[12px] leading-none text-[#757f9c] in-data-[theme=dark]:text-[#8b93a6]"
+          >
+            {day}
+          </div>
+        ))}
+      </div>
+      {weeks.map((week) => (
+        <div
+          key={dateKey(week[0])}
+          className="grid grid-cols-7 border-t border-[#eef1f7] in-data-[theme=dark]:border-[#2c2f38]"
+        >
+          {week.map((date) => {
+            const key = dateKey(date);
+            const items = itemsByDay[key] || [];
+            const isExpanded = Boolean(expanded[key]);
+            const visible = isExpanded || items.length <= 4 ? items : items.slice(0, 3);
+            const overflow = items.length - visible.length;
+            const inMonth = date.getMonth() === month;
+            const dayLabel = date.getDate() === 1 ? `${date.getMonth() + 1}月1日` : `${date.getDate()}`;
+            return (
+              <div
+                key={key}
+                className={`flex min-h-[136px] flex-col gap-[8px] px-[12px] py-[10px] ${inMonth ? '' : 'opacity-45'}`}
+              >
+                <span className="text-[14px] leading-none text-[#858b9c] in-data-[theme=dark]:text-[#8b93a6]">
+                  {dayLabel}
+                </span>
+                <div className="flex flex-col gap-[2px]">
+                  {visible.map((item, index) => (
+                    <HoverCard key={`${key}-${index}`} openDelay={120} closeDelay={80}>
+                      <HoverCardTrigger asChild>
+                        <div className="flex cursor-default items-center gap-[6px] rounded-[8px] p-[4px] transition-colors hover:bg-[#f6f6f6] in-data-[theme=dark]:hover:bg-[#2b2d33]">
+                          <span className={`size-[6px] shrink-0 rounded-full ${item.dot}`} />
+                          <span className="truncate text-[10px] leading-none capitalize text-[#757f9c] in-data-[theme=dark]:text-[#8b93a6]">
+                            {item.label}
+                          </span>
+                        </div>
+                      </HoverCardTrigger>
+                      <HoverCardContent align="start" sideOffset={6} className="w-auto max-w-[300px] p-[10px]">
+                        <div className="flex items-start gap-[8px]">
+                          <span className={`mt-[4px] size-[6px] shrink-0 rounded-full ${item.dot}`} />
+                          <span className="flex-1 break-words text-[12px] leading-[17px] text-[#464c5e] in-data-[theme=dark]:text-[#c9cede]">
+                            {item.time ? (
+                              <span className="mr-[6px] tabular-nums text-[#858b9c]">{item.time}</span>
+                            ) : null}
+                            {item.label}
+                          </span>
+                        </div>
+                      </HoverCardContent>
+                    </HoverCard>
+                  ))}
+                  {overflow > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => toggle(key)}
+                      className="flex items-center gap-[6px] rounded-[8px] p-[4px] text-left transition-colors hover:bg-[#f6f6f6] in-data-[theme=dark]:hover:bg-[#2b2d33]"
+                    >
+                      <span className="truncate text-[10px] leading-none text-[#757f9c] in-data-[theme=dark]:text-[#8b93a6]">
+                        还有{overflow}项
+                      </span>
+                    </button>
+                  )}
+                  {isExpanded && items.length > 4 && (
+                    <button
+                      type="button"
+                      onClick={() => toggle(key)}
+                      className="flex items-center gap-[6px] rounded-[8px] p-[4px] text-left transition-colors hover:bg-[#f6f6f6] in-data-[theme=dark]:hover:bg-[#2b2d33]"
+                    >
+                      <span className="truncate text-[10px] leading-none text-[#757f9c] in-data-[theme=dark]:text-[#8b93a6]">
+                        收起
+                      </span>
+                    </button>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      ))}
+    </div>
+  );
 }
 
-// Canonical partition of the columns into month slots, shared by the data grid
-// and the month labels so they always line up.
-function heatmapMonthColumnStart(slot: number) {
-  return Math.floor((slot * HEATMAP_COLUMNS) / HEATMAP_MONTH_SLOTS);
+function TimelineChevron({ direction }: { direction: 'left' | 'right' }) {
+  return (
+    <svg viewBox="0 0 14 14" fill="none" className="size-[14px]" aria-hidden>
+      <path
+        d={direction === 'left' ? 'M9 3L5 7l4 4' : 'M5 3l4 4-4 4'}
+        stroke="currentColor"
+        strokeWidth="1.5"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
 }
 
-function heatmapSlotForColumn(column: number) {
-  for (let slot = HEATMAP_MONTH_SLOTS - 1; slot >= 0; slot -= 1) {
-    if (column >= heatmapMonthColumnStart(slot)) return slot;
+function startOfDay(date: Date): Date {
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate());
+}
+
+function startOfWeek(date: Date): Date {
+  const start = startOfDay(date);
+  start.setDate(start.getDate() - start.getDay());
+  return start;
+}
+
+function timelineRange(mode: TimelineMode, anchor: number): { start: number; end: number } {
+  const base = new Date(anchor);
+  if (mode === 'day') {
+    const start = startOfDay(base);
+    return { start: start.getTime(), end: start.getTime() + 24 * 60 * 60 * 1000 };
   }
-  return 0;
+  if (mode === 'week') {
+    const start = startOfWeek(base);
+    return { start: start.getTime(), end: start.getTime() + 7 * 24 * 60 * 60 * 1000 };
+  }
+  const start = new Date(base.getFullYear(), base.getMonth(), 1);
+  const end = new Date(base.getFullYear(), base.getMonth() + 1, 1);
+  return { start: start.getTime(), end: end.getTime() };
 }
 
-function heatmapDays(byDay: Record<string, number>) {
-  const months = heatmapMonthSequence();
-  return Array.from({ length: HEATMAP_BUCKETS }, (_, index) => {
-    const column = Math.floor(index / HEATMAP_ROWS);
-    const row = index % HEATMAP_ROWS;
-    const monthSlot = heatmapSlotForColumn(column);
-    const { year, month } = months[monthSlot];
-    const monthStartColumn = heatmapMonthColumnStart(monthSlot);
-    const monthEndColumn = heatmapMonthColumnStart(monthSlot + 1);
-    const columnsInMonth = Math.max(1, monthEndColumn - monthStartColumn);
-    const cellsInMonth = columnsInMonth * HEATMAP_ROWS;
-    const cellInMonth = (column - monthStartColumn) * HEATMAP_ROWS + row;
-    const daysInMonth = new Date(year, month + 1, 0).getDate();
-    const startDay = Math.min(daysInMonth, Math.floor((cellInMonth * daysInMonth) / cellsInMonth) + 1);
-    const endDay = Math.max(startDay, Math.min(daysInMonth, Math.floor(((cellInMonth + 1) * daysInMonth) / cellsInMonth)));
-    const bucketStart = new Date(year, month, startDay);
-    const bucketEnd = new Date(year, month, endDay);
-    let count = 0;
-    for (let dayOfMonth = startDay; dayOfMonth <= endDay; dayOfMonth += 1) {
-      count += byDay[dateKey(new Date(year, month, dayOfMonth))] || 0;
+function normalizeAnchor(mode: TimelineMode, anchor: number): number {
+  return timelineRange(mode, anchor).start;
+}
+
+function shiftAnchor(mode: TimelineMode, anchor: number, direction: number): number {
+  const base = new Date(anchor);
+  if (mode === 'day') base.setDate(base.getDate() + direction);
+  else if (mode === 'week') base.setDate(base.getDate() + direction * 7);
+  else base.setMonth(base.getMonth() + direction);
+  return normalizeAnchor(mode, base.getTime());
+}
+
+function trackBarLabel(
+  track: TimelineTrackConfig,
+  bar: { count: number; names: string[] },
+): string {
+  if (track.key === 'chat') return `对话数${bar.count}条`;
+  if (!bar.names.length) return track.label;
+  const suffix = bar.names.length > 1 ? ` 等${bar.names.length}项` : '';
+  return `${track.label} ${bar.names[0]}${suffix}`;
+}
+
+function timelineBar(
+  events: TrackEvent[],
+  range: { start: number; end: number },
+): { left: number; width: number; count: number; names: string[]; events: TrackEvent[] } | null {
+  const inRange = events
+    .filter((event) => event.time >= range.start && event.time < range.end)
+    .sort((a, b) => a.time - b.time);
+  if (!inRange.length) return null;
+  const span = range.end - range.start;
+  const times = inRange.map((event) => event.time);
+  const min = Math.min(...times);
+  const max = Math.max(...times);
+  const left = ((min - range.start) / span) * 100;
+  const rawWidth = ((max - min) / span) * 100;
+  // Guarantee the pill stays wide enough to show its label, and never overflows.
+  const width = Math.min(100 - left, Math.max(rawWidth, 22));
+  const names = Array.from(new Set(inRange.map((event) => event.name).filter(Boolean)));
+  return { left, width, count: inRange.length, names, events: inRange };
+}
+
+function timelineTicks(mode: TimelineMode, range: { start: number; end: number }): string[] {
+  if (mode === 'day') {
+    return Array.from({ length: 13 }, (_, index) => formatHour(index * 2));
+  }
+  if (mode === 'week') {
+    return Array.from({ length: 7 }, (_, index) => {
+      const date = new Date(range.start + index * 24 * 60 * 60 * 1000);
+      return `${TIMELINE_WEEKDAYS[date.getDay()]} ${date.getDate()}`;
+    });
+  }
+  const start = new Date(range.start);
+  const daysInMonth = new Date(start.getFullYear(), start.getMonth() + 1, 0).getDate();
+  const step = Math.max(2, Math.round(daysInMonth / 8));
+  const ticks: string[] = [];
+  for (let day = 1; day <= daysInMonth; day += step) {
+    ticks.push(`${start.getMonth() + 1}/${day}`);
+  }
+  return ticks;
+}
+
+function formatHour(hour: number): string {
+  if (hour === 0 || hour === 24) return '12AM';
+  if (hour === 12) return '12PM';
+  return hour < 12 ? `${hour}AM` : `${hour - 12}PM`;
+}
+
+function formatTimelineDate(date: Date): string {
+  const month = `${date.getMonth() + 1}`.padStart(2, '0');
+  const day = `${date.getDate()}`.padStart(2, '0');
+  return `${date.getFullYear()}/${month}/${day}`;
+}
+
+function formatTimelineRange(mode: TimelineMode, range: { start: number; end: number }): string {
+  const start = new Date(range.start);
+  if (mode === 'day') return formatTimelineDate(start);
+  const last = new Date(range.end - 24 * 60 * 60 * 1000);
+  const short = (date: Date) => `${date.getMonth() + 1}/${date.getDate()}`;
+  if (mode === 'week') return `${short(start)} - ${short(last)}`;
+  return `${start.getFullYear()}/${`${start.getMonth() + 1}`.padStart(2, '0')}`;
+}
+
+function TimelineDatePicker({
+  mode,
+  anchor,
+  label,
+  onPick,
+}: {
+  mode: TimelineMode;
+  anchor: number;
+  label: string;
+  onPick: (ms: number) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [viewDate, setViewDate] = useState(() => new Date(anchor));
+
+  const handleOpenChange = (next: boolean) => {
+    if (next) setViewDate(new Date(anchor));
+    setOpen(next);
+  };
+  const commit = (date: Date) => {
+    onPick(normalizeAnchor(mode, date.getTime()));
+    setOpen(false);
+  };
+
+  const selected = new Date(anchor);
+  const selectedWeekStart = startOfWeek(selected).getTime();
+  const shiftView = (deltaMonth: number, deltaYear: number) =>
+    setViewDate((prev) => new Date(prev.getFullYear() + deltaYear, prev.getMonth() + deltaMonth, 1));
+
+  const now = new Date();
+  const shortcuts: { label: string; date: Date }[] =
+    mode === 'day'
+      ? [
+          { label: '今天', date: now },
+          { label: '昨天', date: new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1) },
+        ]
+      : mode === 'week'
+        ? [
+            { label: '本周', date: now },
+            { label: '上周', date: new Date(now.getFullYear(), now.getMonth(), now.getDate() - 7) },
+          ]
+        : [
+            { label: '本月', date: now },
+            { label: '上月', date: new Date(now.getFullYear(), now.getMonth() - 1, 1) },
+          ];
+
+  return (
+    <Popover open={open} onOpenChange={handleOpenChange}>
+      <PopoverTrigger asChild>
+        <button
+          type="button"
+          className="text-[12px] whitespace-nowrap text-[#464c5e] transition-colors hover:text-[#18181a] in-data-[theme=dark]:text-[#c9cede]"
+        >
+          {label}
+        </button>
+      </PopoverTrigger>
+      <PopoverContent align="center" className="w-auto p-[12px]">
+        <div className="mb-[8px] flex items-center justify-between">
+          <button
+            type="button"
+            onClick={() => shiftView(mode === 'month' ? 0 : -1, mode === 'month' ? -1 : 0)}
+            className="flex size-[24px] items-center justify-center rounded-[6px] text-[#464c5e] transition-colors hover:bg-[#f6f6f6] in-data-[theme=dark]:text-[#c9cede] in-data-[theme=dark]:hover:bg-[#2b2d33]"
+            aria-label="上一页"
+          >
+            <TimelineChevron direction="left" />
+          </button>
+          <span className="text-[13px] font-medium text-[#18181a] in-data-[theme=dark]:text-[#f0f2f6]">
+            {mode === 'month'
+              ? `${viewDate.getFullYear()}年`
+              : `${viewDate.getFullYear()}年${viewDate.getMonth() + 1}月`}
+          </span>
+          <button
+            type="button"
+            onClick={() => shiftView(mode === 'month' ? 0 : 1, mode === 'month' ? 1 : 0)}
+            className="flex size-[24px] items-center justify-center rounded-[6px] text-[#464c5e] transition-colors hover:bg-[#f6f6f6] in-data-[theme=dark]:text-[#c9cede] in-data-[theme=dark]:hover:bg-[#2b2d33]"
+            aria-label="下一页"
+          >
+            <TimelineChevron direction="right" />
+          </button>
+        </div>
+
+        {mode === 'month' ? (
+          <div className="grid grid-cols-3 gap-[6px]">
+            {Array.from({ length: 12 }, (_, index) => {
+              const isSelected = selected.getFullYear() === viewDate.getFullYear() && selected.getMonth() === index;
+              return (
+                <button
+                  key={index}
+                  type="button"
+                  onClick={() => commit(new Date(viewDate.getFullYear(), index, 1))}
+                  className={`flex h-[36px] w-[64px] items-center justify-center rounded-[8px] text-[12px] transition-colors ${
+                    isSelected
+                      ? 'bg-[#4f92ff] text-white'
+                      : 'text-[#464c5e] hover:bg-[#f6f6f6] in-data-[theme=dark]:text-[#c9cede] in-data-[theme=dark]:hover:bg-[#2b2d33]'
+                  }`}
+                >
+                  {index + 1}月
+                </button>
+              );
+            })}
+          </div>
+        ) : (
+          <>
+            <div className="grid grid-cols-7">
+              {['日', '一', '二', '三', '四', '五', '六'].map((day) => (
+                <span
+                  key={day}
+                  className="flex size-[32px] items-center justify-center text-[11px] text-[#a7adbd] in-data-[theme=dark]:text-[#6b7080]"
+                >
+                  {day}
+                </span>
+              ))}
+            </div>
+            {monthCalendarWeeks(viewDate.getTime()).map((week) => (
+              <div key={dateKey(week[0])} className="grid grid-cols-7">
+                {week.map((date, dayIndex) => {
+                  const inMonth = date.getMonth() === viewDate.getMonth();
+                  const isSelected = mode === 'day' && isSameDay(date, selected);
+                  const inWeek = mode === 'week' && startOfWeek(date).getTime() === selectedWeekStart;
+                  const bandRounding =
+                    dayIndex === 0 ? 'rounded-l-[8px]' : dayIndex === 6 ? 'rounded-r-[8px]' : '';
+                  const tone = isSelected
+                    ? 'rounded-[8px] bg-[#4f92ff] font-medium text-white'
+                    : inWeek
+                      ? `${bandRounding} bg-[#e8f0ff] text-[#18181a] in-data-[theme=dark]:bg-[#1d2c47] in-data-[theme=dark]:text-[#f0f2f6]`
+                      : inMonth
+                        ? 'rounded-[8px] text-[#464c5e] hover:bg-[#f6f6f6] in-data-[theme=dark]:text-[#c9cede] in-data-[theme=dark]:hover:bg-[#2b2d33]'
+                        : 'rounded-[8px] text-[#c0c5d2] hover:bg-[#f6f6f6] in-data-[theme=dark]:text-[#5b606d]';
+                  return (
+                    <button
+                      key={dateKey(date)}
+                      type="button"
+                      onClick={() => commit(date)}
+                      className={`flex size-[32px] items-center justify-center text-[12px] transition-colors ${tone}`}
+                    >
+                      {date.getDate()}
+                    </button>
+                  );
+                })}
+              </div>
+            ))}
+          </>
+        )}
+
+        <div className="mt-[8px] flex items-center gap-[6px] border-t border-[#eef1f7] pt-[8px] in-data-[theme=dark]:border-[#2c2f38]">
+          {shortcuts.map((shortcut) => (
+            <button
+              key={shortcut.label}
+              type="button"
+              onClick={() => commit(shortcut.date)}
+              className="rounded-[6px] px-[10px] py-[4px] text-[12px] text-[#464c5e] transition-colors hover:bg-[#f6f6f6] in-data-[theme=dark]:text-[#c9cede] in-data-[theme=dark]:hover:bg-[#2b2d33]"
+            >
+              {shortcut.label}
+            </button>
+          ))}
+        </div>
+      </PopoverContent>
+    </Popover>
+  );
+}
+
+function isSameDay(a: Date, b: Date): boolean {
+  return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
+}
+
+function formatAnchorLabel(mode: TimelineMode, range: { start: number; end: number }): string {
+  const start = new Date(range.start);
+  if (mode === 'month') return `${start.getFullYear()}/${`${start.getMonth() + 1}`.padStart(2, '0')}`;
+  return formatTimelineDate(start);
+}
+
+function formatHm(date: Date): string {
+  return `${`${date.getHours()}`.padStart(2, '0')}:${`${date.getMinutes()}`.padStart(2, '0')}`;
+}
+
+// Sun→Sat weeks covering the full month of the anchor (leading/trailing days included).
+function monthCalendarWeeks(anchor: number): Date[][] {
+  const base = new Date(anchor);
+  const monthStart = new Date(base.getFullYear(), base.getMonth(), 1);
+  const monthEnd = new Date(base.getFullYear(), base.getMonth() + 1, 0);
+  const gridStart = startOfWeek(monthStart);
+  const weeks: Date[][] = [];
+  const cursor = new Date(gridStart);
+  while (cursor <= monthEnd || cursor.getDay() !== 0) {
+    const week: Date[] = [];
+    for (let day = 0; day < 7; day += 1) {
+      week.push(new Date(cursor));
+      cursor.setDate(cursor.getDate() + 1);
     }
-    const startKey = dateKey(bucketStart);
-    const endKey = dateKey(bucketEnd);
-    return {
-      key: `${index}-${startKey}`,
-      label: startKey === endKey ? startKey : `${startKey} 至 ${endKey}`,
-      date: bucketStart,
-      count,
-    };
-  });
+    weeks.push(week);
+    if (weeks.length > 6) break;
+  }
+  return weeks;
 }
 
-function monthLabels() {
-  const months = heatmapMonthSequence();
-  return months.map((item, index) => {
-    const offset = heatmapMonthColumnStart(index);
-    const nextOffset = heatmapMonthColumnStart(index + 1);
-    return {
-      label: `${item.month + 1}月`,
-      offset,
-      span: Math.max(1, nextOffset - offset),
-    };
+function buildDayActivities(props: ActivityTimelineProps): Record<string, DayActivity[]> {
+  const { employeeSessions, scheduledTasks, sops, tools, knowledge, generalSkills } = props;
+  const map: Record<string, DayActivity[]> = {};
+  const push = (value: string | undefined, label: string, dot: string) => {
+    if (!value) return;
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return;
+    const key = dateKey(date);
+    (map[key] ||= []).push({ label, dot, time: formatHm(date) });
+  };
+
+  const chatByDay: Record<string, number> = {};
+  employeeSessions.forEach((item) => {
+    if (!item.created_at) return;
+    const date = new Date(item.created_at);
+    if (Number.isNaN(date.getTime())) return;
+    const key = dateKey(date);
+    chatByDay[key] = (chatByDay[key] || 0) + 1;
   });
+  Object.entries(chatByDay).forEach(([key, count]) => {
+    (map[key] ||= []).unshift({ label: `对话数${count}条`, dot: ACTIVITY_DOT.chat });
+  });
+
+  scheduledTasks.forEach((task) => {
+    const title = staffdeckDisplayText(task.title);
+    [task.last_run_at, task.next_run_at].forEach((value) => {
+      if (!value) return;
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return;
+      push(value, title, ACTIVITY_DOT.task);
+    });
+  });
+
+  sops.forEach((item) => push(item.created_at, `新增SOP ${staffdeckDisplayText(item.name)}`, ACTIVITY_DOT.sop));
+  tools.forEach((item) =>
+    push(item.created_at, `新增工具 ${staffdeckDisplayText(item.display_name || item.name)}`, ACTIVITY_DOT.tool),
+  );
+  knowledge.forEach((item) => push(item.created_at, `新增知识 ${staffdeckDisplayText(item.name)}`, ACTIVITY_DOT.knowledge));
+  generalSkills.forEach((item) => push(item.created_at, `新增技能 ${staffdeckDisplayText(item.name)}`, ACTIVITY_DOT.skill));
+
+  return map;
 }
 
 export function dateKey(date: Date): string {

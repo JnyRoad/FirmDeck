@@ -1,4 +1,6 @@
 import StaffdeckIcon from '@/components/StaffdeckIcon';
+import IconThumbUp from '@/assets/icons/thumb-up.svg?react';
+import IconThumbDown from '@/assets/icons/thumb-down.svg?react';
 import { cn } from '@/lib/utils';
 import type {
   ChatAttachmentRead,
@@ -183,7 +185,7 @@ export default function MessageBubble({ chat, item, render }: MessageBubbleProps
                 aria-label="点赞"
                 onClick={() => rateMessage(item, 'up')}
               >
-                <StaffdeckIcon name="thumb-up" size={15} />
+                <IconThumbUp width={15} height={15} />
               </button>
               <button
                 type="button"
@@ -194,7 +196,7 @@ export default function MessageBubble({ chat, item, render }: MessageBubbleProps
                 aria-label="点踩"
                 onClick={() => rateMessage(item, 'down')}
               >
-                <StaffdeckIcon name="thumb-down" size={15} />
+                <IconThumbDown width={15} height={15} />
               </button>
             </div>
           )}
