@@ -262,7 +262,18 @@ function scheduledTaskStatusTraceLine(phase: string, data: Record<string, unknow
 
 export type UseChatSession = ReturnType<typeof useChatSession>;
 
-export function useChatSession() {
+export type UseChatSessionOptions = {
+  /**
+   * Anonymous mode for the public site embed: never redirect to login on a
+   * missing/expired session (auth-only data simply stays empty). Without this
+   * the hook bounces unauthenticated visitors off the page via
+   * `window.location.href = '/'`.
+   */
+  anonymous?: boolean;
+};
+
+export function useChatSession(options: UseChatSessionOptions = {}) {
+  const { anonymous = false } = options;
   const { sessionId, draftAgentId } = useParams<{ sessionId?: string; draftAgentId?: string }>();
   const navigate = useNavigate();
   const [auth] = useState(() => getEnterpriseAuthSession());
@@ -363,9 +374,10 @@ export function useChatSession() {
   ), [queueStorageKey]);
 
   const redirectToLogin = useCallback(() => {
+    if (anonymous) return;
     clearEnterpriseAuthSession();
     window.location.href = '/';
-  }, []);
+  }, [anonymous]);
 
   useEffect(() => () => {
     uploadControllersRef.current.forEach((controller) => controller.abort());
@@ -1391,11 +1403,11 @@ export function useChatSession() {
 
   useEffect(() => {
     if (!auth) {
-      redirectToLogin();
+      if (!anonymous) redirectToLogin();
       return;
     }
     loadSessions();
-  }, [auth, loadSessions, redirectToLogin]);
+  }, [anonymous, auth, loadSessions, redirectToLogin]);
 
   useEffect(() => {
     if (!auth) return;

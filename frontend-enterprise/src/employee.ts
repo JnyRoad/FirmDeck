@@ -8,6 +8,7 @@ import {
 
 import avatarAfterSales from './assets/staffdeck/staffdeck-avatar-after-sales.png';
 import avatarCommerce from './assets/staffdeck/staffdeck-avatar-commerce.png';
+import avatarDefault from './assets/staffdeck/staffdeck-avatar-default.png';
 import avatarKnowledge from './assets/staffdeck/staffdeck-avatar-knowledge.png';
 import avatarOps from './assets/staffdeck/staffdeck-avatar-ops.png';
 import avatarOverall from './assets/staffdeck/staffdeck-avatar-overall.png';
@@ -84,7 +85,7 @@ export function isUploadedAvatar(profile: AvatarSource): boolean {
 /** Resolve the image URL for an employee avatar (uploaded image or preset illustration). */
 export function employeeAvatarImage(profile: AvatarSource): string {
   if (isUploadedAvatar(profile)) return profile.avatarImage;
-  return PRESET_AVATAR_IMAGES[profile.avatarPreset || DEFAULT_AVATAR_PRESET] || avatarService;
+  return PRESET_AVATAR_IMAGES[profile.avatarPreset || DEFAULT_AVATAR_PRESET] || avatarDefault;
 }
 
 export const EMPLOYEE_TEMPLATES: EmployeeTemplate[] = [

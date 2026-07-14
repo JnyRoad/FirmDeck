@@ -1,5 +1,13 @@
 import { CheckOutlined, UploadOutlined } from '../icons';
-import { Button as UIButton, Dialog, DialogContent, DialogTitle, notify } from '@/components/ui';
+import {
+  Button,
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  notify,
+} from '@/components/ui';
 import { useEffect, useRef, useState } from 'react';
 import { api, TENANT_ID } from '../api/client';
 import {
@@ -105,92 +113,101 @@ export default function EmployeeAvatarEditor({
     <Dialog open={open} onOpenChange={(next) => { if (!next && !saving) onClose(); }}>
       <DialogContent
         aria-describedby={undefined}
-        className="employee-avatar-modal flex max-h-[calc(100dvh-4rem)] w-[calc(100%-2rem)] flex-col gap-[16px] overflow-hidden rounded-[14px] px-[20px] py-[16px] sm:max-w-[680px]"
+        className="flex max-h-[calc(100dvh-4rem)] w-[calc(100%-2rem)] flex-col gap-4 overflow-hidden rounded-[14px] px-5 py-4 sm:max-w-[680px]"
       >
-        <DialogTitle className="px-[12px] text-[14px] font-normal leading-none text-[#757f9c]">
-          {agent ? `设置头像：${employeeDisplayName(agent)}` : '设置头像'}
-        </DialogTitle>
-        <div className="min-h-0 flex-1 overflow-y-auto px-[12px]">
-          <div className="employee-avatar-editor">
-            <div className="employee-avatar-preview">
-              <EmployeeAvatar profile={profile} size={104} />
-              <div>
-                <strong className="m-0 block text-[14px] text-[#18181a]">{mode === 'upload' ? '自定义头像' : selected.label}</strong>
-                <p className="m-0 mt-[4px] text-[12px] text-muted-foreground">
-                  头像会显示在我的数字员工、数字员工档案页和对话端的员工选择中。
-                </p>
-              </div>
-            </div>
+        <DialogHeader className="px-3">
+          <DialogTitle className="text-sm font-normal leading-none text-[#757f9c]">
+            {agent ? `设置头像：${employeeDisplayName(agent)}` : '设置头像'}
+          </DialogTitle>
+        </DialogHeader>
 
-            <div className="employee-avatar-section">
-              <div className="employee-avatar-section-head">
-                <strong className="text-[13px] text-[#18181a]">默认头像</strong>
-                <span className="text-[12px] text-muted-foreground">选择一个适合岗位的默认头像。</span>
-              </div>
-          <div className="employee-avatar-preset-grid">
-            {EMPLOYEE_AVATAR_PRESETS.map((preset) => {
-              const active = mode === 'preset' && selectedPreset === preset.key;
-              return (
-                <button
-                  key={preset.key}
-                  type="button"
-                  className={`employee-avatar-preset-card ${active ? 'active' : ''}`}
-                  onClick={() => {
-                    setSelectedPreset(preset.key);
-                    setMode('preset');
-                  }}
-                >
-                  <EmployeeAvatar
-                    profile={{
-                      avatarKind: 'preset',
-                      avatarImage: '',
-                      avatarPreset: preset.key,
-                      avatarText: preset.text,
-                      avatarTone: preset.tone,
+        <div className="min-h-0 flex-1 space-y-[18px] overflow-y-auto px-3">
+          <div className="grid grid-cols-[auto_minmax(0,1fr)] items-center gap-[18px] rounded-2xl border border-border bg-[linear-gradient(135deg,color-mix(in_srgb,var(--accent-soft)_34%,transparent),transparent_58%),var(--surface-subtle)] p-[18px]">
+            <EmployeeAvatar profile={profile} width={104} height={122} />
+            <div>
+              <strong className="block text-sm text-foreground">{mode === 'upload' ? '自定义头像' : selected.label}</strong>
+              <p className="mt-1 text-xs text-muted-foreground">
+                头像会显示在我的数字员工、数字员工档案页和对话端的员工选择中。
+              </p>
+            </div>
+          </div>
+
+          <section className="space-y-3">
+            <div className="flex items-baseline justify-between gap-3">
+              <strong className="text-[13px] text-foreground">默认头像</strong>
+              <span className="text-xs text-muted-foreground">选择一个适合岗位的默认头像。</span>
+            </div>
+            <div className="grid grid-cols-3 gap-2.5">
+              {EMPLOYEE_AVATAR_PRESETS.map((preset) => {
+                const active = mode === 'preset' && selectedPreset === preset.key;
+                return (
+                  <button
+                    key={preset.key}
+                    type="button"
+                    data-active={active}
+                    onClick={() => {
+                      setSelectedPreset(preset.key);
+                      setMode('preset');
                     }}
-                    size={52}
-                  />
-                  <span>{preset.label}</span>
-                  {active && <CheckOutlined />}
-                </button>
-              );
-            })}
-          </div>
-        </div>
-
-            <div className="employee-avatar-upload">
-              <input
-                ref={inputRef}
-                type="file"
-                accept="image/*"
-                onChange={(event) => void handleUpload(event.target.files?.[0])}
-              />
-              <UIButton variant="outline" onClick={() => inputRef.current?.click()}>
-                <UploadOutlined />
-                上传自定义头像
-              </UIButton>
-              <span className="text-[12px] text-muted-foreground">支持常见图片格式，会自动裁剪为方形头像。</span>
+                    className="grid min-h-[88px] min-w-0 grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-2.5 rounded-[14px] border border-border bg-(--surface) p-3 text-left text-foreground transition-all hover:-translate-y-px hover:border-[color-mix(in_srgb,var(--accent)_45%,var(--border))] hover:shadow-[0_14px_30px_rgba(30,24,16,0.08)] data-[active=true]:-translate-y-px data-[active=true]:border-[color-mix(in_srgb,var(--accent)_45%,var(--border))] data-[active=true]:shadow-[0_14px_30px_rgba(30,24,16,0.08)]"
+                  >
+                    <EmployeeAvatar
+                      profile={{
+                        avatarKind: 'preset',
+                        avatarImage: '',
+                        avatarPreset: preset.key,
+                        avatarText: preset.text,
+                        avatarTone: preset.tone,
+                      }}
+                      size={52}
+                    />
+                    <span className="min-w-0 truncate text-left font-[760]">{preset.label}</span>
+                    {active && <CheckOutlined className="text-accent" />}
+                  </button>
+                );
+              })}
             </div>
-          </div>
+          </section>
+
+          <button
+            type="button"
+            onClick={() => inputRef.current?.click()}
+            className="flex w-full items-center gap-3.5 rounded-2xl border border-dashed border-[color-mix(in_srgb,var(--accent)_30%,var(--border))] bg-[linear-gradient(135deg,color-mix(in_srgb,var(--accent-soft)_26%,transparent),transparent_62%),var(--surface-subtle)] px-4 py-3.5 text-left transition-all hover:border-[color-mix(in_srgb,var(--accent)_52%,var(--border))] hover:shadow-[0_12px_28px_rgba(30,24,16,0.07)] focus-visible:border-[color-mix(in_srgb,var(--accent)_60%,var(--border))] focus-visible:shadow-[0_0_0_3px_color-mix(in_srgb,var(--accent)_20%,transparent)] focus-visible:outline-none"
+          >
+            <input
+              ref={inputRef}
+              type="file"
+              accept="image/*"
+              className="hidden"
+              onChange={(event) => void handleUpload(event.target.files?.[0])}
+            />
+            <span className="inline-flex size-10 shrink-0 items-center justify-center rounded-xl bg-[color-mix(in_srgb,var(--accent)_12%,var(--surface))] text-lg text-accent">
+              <UploadOutlined />
+            </span>
+            <span className="grid min-w-0 gap-0.5">
+              <span className="text-sm font-semibold text-foreground">上传自定义头像</span>
+              <span className="text-xs text-muted-foreground">支持常见图片格式，会自动裁剪为方形头像。</span>
+            </span>
+          </button>
         </div>
 
-        <div className="flex items-center justify-end gap-[8px] px-[12px]">
-          <UIButton
+        <DialogFooter className="gap-2 px-3 py-0 sm:justify-end">
+          <Button
             variant="outline"
             disabled={saving}
             onClick={onClose}
-            className="h-[32px] w-[92px] rounded-[10px] border-[#e3e7f1] bg-white px-[12px] text-[14px] font-normal text-[#464c5e] hover:border-[#e3e7f1] hover:bg-[#f6f6f6] hover:text-[#18181a]"
+            className="h-8 w-[92px] rounded-[10px] border-[#e3e7f1] bg-white px-3 text-sm font-normal text-[#464c5e] hover:border-[#e3e7f1] hover:bg-[#f6f6f6] hover:text-[#18181a]"
           >
             取消
-          </UIButton>
-          <UIButton
+          </Button>
+          <Button
             disabled={saving}
             onClick={() => void save()}
-            className="h-[32px] w-[92px] rounded-[10px] bg-[#18181a] px-[12px] text-[14px] font-normal text-white hover:bg-[#303030]"
+            className="h-8 w-[92px] rounded-[10px] bg-[#18181a] px-3 text-sm font-normal text-white hover:bg-[#303030]"
           >
             保存头像
-          </UIButton>
-        </div>
+          </Button>
+        </DialogFooter>
       </DialogContent>
     </Dialog>
   );

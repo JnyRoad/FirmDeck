@@ -15,6 +15,8 @@ exports/
 dist/
 build/
 node_modules/
+.pnpm-store/
+/frontend-site/
 # 打包产物（PyInstaller 输出、附带 python、下载缓存）—— 不进 git
 packaging/out/
 packaging/build/

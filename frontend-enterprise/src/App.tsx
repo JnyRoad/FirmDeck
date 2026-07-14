@@ -35,7 +35,7 @@ import AccountsPage from "./pages/AccountsPage";
 import AgentsPage from "./pages/AgentsPage";
 import ChatPage from "./pages/chat/ChatPage";
 import ChatGalleryPage from "./pages/chat/ChatGalleryPage";
-import DashboardPage from "./pages/Dashboard/DashboardPage";
+import DashboardPage from "./pages/dashboard/DashboardPage";
 import EmptyEmployeeState from "./components/EmptyEmployeeState";
 import DistillPage from "./pages/DistillPage";
 import GeneralSkillsPage, {
@@ -50,7 +50,7 @@ import SkillsPage from "./pages/SkillsPage";
 import {
   ScheduledTaskEditPage,
   ScheduledTaskNewPage,
-} from "./pages/Dashboard/ScheduledTasksTab";
+} from "./pages/dashboard/ScheduledTasksTab";
 import ToolsPage, {
   McpServerEditPage,
   McpServerNewPage,
@@ -903,11 +903,18 @@ export default function App() {
   return (
     <TooltipProvider>
       <BrowserRouter>
-        {auth && !authChecked ? null : auth ? (
-          <AuthedApp auth={auth} onLogout={logout} />
-        ) : (
-          <LoginPage onLogin={setAuth} />
-        )}
+        <Routes>
+          <Route
+            path="/*"
+            element={
+              auth && !authChecked ? null : auth ? (
+                <AuthedApp auth={auth} onLogout={logout} />
+              ) : (
+                <LoginPage onLogin={setAuth} />
+              )
+            }
+          />
+        </Routes>
       </BrowserRouter>
       <Toaster richColors closeButton position="top-center" />
     </TooltipProvider>
