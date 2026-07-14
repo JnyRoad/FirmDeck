@@ -57,6 +57,12 @@ class LLMClient:
         self.model = model_config.model
         self.temperature = model_config.temperature
         self.max_output_tokens = model_config.max_output_tokens
+        settings = get_settings()
+        self.thinking_mode = _thinking_mode_for_model(
+            getattr(settings, "model_thinking_mode", ""),
+            getattr(settings, "model_thinking_models", ""),
+            self.model,
+        )
 
     def generate_text(
         self,
@@ -88,6 +94,7 @@ class LLMClient:
             }
             if response_format:
                 request["response_format"] = response_format
+            request.update(_thinking_request_kwargs(getattr(self, "thinking_mode", "")))
             empty_diagnostics: list[str] = []
             for attempt in range(EMPTY_RESPONSE_RETRIES + 1):
                 span = start_llm_call(
@@ -99,6 +106,7 @@ class LLMClient:
                     retry_count=attempt,
                     max_attempts=EMPTY_RESPONSE_RETRIES + 1,
                     max_output_tokens=max_output_tokens,
+                    thinking_mode=getattr(self, "thinking_mode", "") or "provider_default",
                     **request_shape,
                 )
                 try:
@@ -170,6 +178,7 @@ class LLMClient:
                     retry_count=attempt,
                     max_attempts=EMPTY_RESPONSE_RETRIES + 1,
                     max_output_tokens=max_output_tokens,
+                    thinking_mode=getattr(self, "thinking_mode", "") or "provider_default",
                     **request_shape,
                 )
                 stream_usage_metrics: dict[str, Any] = {}
@@ -191,6 +200,7 @@ class LLMClient:
                         temperature=self.temperature,
                         max_tokens=max_output_tokens,
                         stream=True,
+                        **_thinking_request_kwargs(getattr(self, "thinking_mode", "")),
                     )
                     provider_setup_ms = span.elapsed_ms()
                     for chunk in stream:
@@ -435,6 +445,32 @@ def _request_prefix_fingerprints(messages: list[dict[str, Any]]) -> list[str]:
         digest.update(b"\n")
         fingerprints.append(digest.hexdigest()[:16])
     return fingerprints
+
+
+def _normalize_thinking_mode(value: Any) -> str:
+    mode = str(value or "").strip().lower()
+    return mode if mode in {"enabled", "disabled"} else ""
+
+
+def _thinking_mode_for_model(mode: Any, configured_models: Any, model: Any) -> str:
+    normalized_mode = _normalize_thinking_mode(mode)
+    if not normalized_mode:
+        return ""
+    allowed_models = {
+        item.strip().lower()
+        for item in str(configured_models or "").split(",")
+        if item.strip()
+    }
+    if allowed_models and str(model or "").strip().lower() not in allowed_models:
+        return ""
+    return normalized_mode
+
+
+def _thinking_request_kwargs(mode: Any) -> dict[str, Any]:
+    normalized = _normalize_thinking_mode(mode)
+    if not normalized:
+        return {}
+    return {"extra_body": {"thinking": {"type": normalized}}}
 
 
 def _request_messages(

@@ -1,6 +1,6 @@
 import pytest
 
-from app.llm.client import LLMClient, LLMError
+from app.llm.client import LLMClient, LLMError, _thinking_mode_for_model
 from app.llm.output_policy import operation_output_tokens
 from app.llm.stage_protocol import TURN_STAGE_MESSAGES_KEY, stage_payload
 from app.llm.schemas import ModelConfigCreateRequest
@@ -109,6 +109,25 @@ def test_generate_text_uses_chat_completions_only():
         {"role": "user", "content": '{"hello": "world"}'},
     ]
     assert call["max_tokens"] == 256
+
+
+def test_generate_text_can_disable_provider_thinking():
+    client = object.__new__(LLMClient)
+    client.client = _FakeOpenAIClient()
+    client.model = "demo-model"
+    client.temperature = 0.2
+    client.max_output_tokens = 256
+    client.thinking_mode = "disabled"
+
+    assert client.generate_text("system prompt", "hello") == "ok"
+
+    call = client.client.chat.completions.calls[0]
+    assert call["extra_body"] == {"thinking": {"type": "disabled"}}
+
+
+def test_thinking_mode_can_be_scoped_to_specific_models():
+    assert _thinking_mode_for_model("disabled", "glm-5.2", "glm-5.2") == "disabled"
+    assert _thinking_mode_for_model("disabled", "glm-5.2", "deepseek-v4-pro") == ""
 
 
 def test_generate_text_preserves_plain_user_content_without_json_encoding():
