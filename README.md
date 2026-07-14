@@ -1,8 +1,7 @@
 <div align="center">
 
-<img src="packaging/assets/staffdeck_banner_en.png" alt="StaffDeck logo" width="150" />
+<img src="packaging/assets/staffdeck_banner_en.png" alt="StaffDeck logo" />
 
-# StaffDeck: Build, Manage, and Continuously Evolve Enterprise Digital Employees
 
 
 **English** | [简体中文](./README.zh.md)
@@ -15,10 +14,6 @@
 
 </div>
 
-StaffDeck accelerates the enterprise transition from digitalization to intelligence.
-
-NEU-ModelBest Data Intelligence Joint Lab
-
 
 ## News
 
@@ -28,7 +23,7 @@ NEU-ModelBest Data Intelligence Joint Lab
 
 StaffDeck is an enterprise platform for building and managing digital employees. It helps professionals turn their work experience, business processes, and decision criteria into digital employees that can operate continuously, take over repetitive tasks, and preserve individual expertise as reusable, evolvable, and traceable organizational assets. StaffDeck is jointly developed by the [ModelBest](https://modelbest.cn/), [NEU-ModelBest Data Intelligence Joint Lab](https://neuir.github.io/), [THUNLP](https://nlp.csai.tsinghua.edu.cn/), [OpenBMB](https://www.openbmb.cn/home), and [AI9Stars](https://github.com/AI9Stars) for enterprises and institutions seeking to advance AI from a personal productivity tool to an organizational capability.
 
-## Highlights
+## Core Features
 
 - 🧑‍💼 **Build and manage digital employees**: Turn professional experience, processes, and decision criteria into digital employees with positions, employee IDs, capability profiles, and work records. Support capability growth, permission isolation, publishing, and reuse.
 - 🧩 **State-machine-driven procedural skills**: Generate structured SOPs from natural language and use state machines to execute complex processes accurately. Support real-time switching across multiple flows, context preservation, visual editing, version management, and branch evolution.
@@ -51,10 +46,8 @@ verify /api/health plus /workspace/gallery before reporting success.
 
 ## Table of Contents
 
-- [StaffDeck: Build, Manage, and Continuously Evolve Enterprise Digital Employees](#staffdeck-build-manage-and-continuously-evolve-enterprise-digital-employees)
-  - [News](#news)
 - [💡 About StaffDeck](#-about-staffdeck)
-  - [Highlights](#highlights)
+  - [Core Features](#core-features)
   - [Agent-Friendly Quick Deploy](#agent-friendly-quick-deploy)
   - [Table of Contents](#table-of-contents)
   - [Quick Start](#quick-start)

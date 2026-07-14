@@ -1,8 +1,7 @@
 <div align="center">
 
-<img src="packaging/assets/staffdeck_banner_cn.png" alt="StaffDeck 标志" width="150" />
+<img src="packaging/assets/staffdeck_banner_cn.png" alt="StaffDeck 标志"  />
 
-# StaffDeck：构建、管理并持续进化企业数字员工
 
 
 [English](./README.md) | **简体中文**
@@ -14,10 +13,6 @@
 </p>
 
 </div>
-
-StaffDeck 为企业加速从数字化向智能化转型。
-
-NEU-ModelBest Data Intelligence Joint Lab
 
 
 ## 更新日志
@@ -50,8 +45,6 @@ DETACH=1 scripts/dev_up.sh，并验证 /api/health 和 /workspace/gallery 后再
 
 ## 目录
 
-- [StaffDeck：构建、管理并持续进化企业数字员工](#staffdeck构建管理并持续进化企业数字员工)
-  - [更新日志](#更新日志)
 - [💡 关于StaffDeck](#-关于staffdeck)
   - [核心亮点](#核心亮点)
   - [Agent 一键部署](#agent-一键部署)
