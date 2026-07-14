@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="packaging/assets/staffdeck.png" alt="StaffDeck 标志" width="150" />
+<img src="packaging/assets/staffdeck_banner_cn.png" alt="StaffDeck 标志" width="150" />
 
 # StaffDeck：构建、管理并持续进化企业数字员工
 
@@ -26,22 +26,18 @@ NEU-ModelBest Data Intelligence Joint Lab
 
 # 💡 关于StaffDeck
 
-StaffDeck是一套面向企业的数字员工构建与管理平台，帮助专业员工将工作经验、业务流程和判断标准固化为可以持续工作的数字员工，接手重复性任务，并将个人能力沉淀为可复用、可迭代、可追溯的组织资产。StaffDeck由[东北大学-面壁智能数据智能联合实验室](https://neuir.github.io/)，[清华大学THUNLP实验室](https://nlp.csai.tsinghua.edu.cn/)，[面壁智能](https://modelbest.cn/)，[OpenBMB](https://www.openbmb.cn/home)与[AI9Stars](https://github.com/AI9Stars)联合研发，面向希望将 AI 从个人效率工具升级为组织生产力的企业与机构。
+StaffDeck是一套面向企业的数字员工构建与管理平台，帮助专业员工将工作经验、业务流程和判断标准固化为可以持续工作的数字员工，接手重复性任务，并将个人能力沉淀为可复用、可迭代、可追溯的组织资产。StaffDeck由[面壁智能](https://modelbest.cn/)，[东北大学-面壁智能数据智能联合实验室](https://neuir.github.io/)，[清华大学THUNLP实验室](https://nlp.csai.tsinghua.edu.cn/)，[OpenBMB](https://www.openbmb.cn/home)与[AI9Stars](https://github.com/AI9Stars)联合研发，面向希望将 AI 从个人效率工具升级为组织生产力的企业与机构。
 
 ## 核心亮点
 
-- 🧑‍💼 **数字员工，而非通用机器人**：按员工隔离岗位描述、能力资源、会话、记忆与运营记录。
-- 📚 **有依据的企业知识**：解析文档、检索相关上下文，并在回答中保留可追溯的引用来源。
-- 🧩 **知识 + 通用技能 + SOP**：一次请求可以组合需要的能力，而非被限制为单一执行模式。
-- 🔌 **真实工具执行**：通过 HTTP、MCP、内置工具和动态生成的技能 Runner 连接企业服务。
-- ⏰ **定时与排队任务**：支持一次性或周期任务，并在刷新后保留聊天 Buffer 中的排队请求。
-- 🔎 **全过程可观测**：将意图、路由、技能、工具、校验与回答事件流式写入每轮执行记录。
-- 🤝 **Human-in-the-loop**：支持暂停、取消、转人工、待回答和人工审核，避免高风险动作完全自动决策。
-- 🔐 **基于角色的治理**：区分广场资源、创建者归属、员工访问范围与仅管理员可用的操作。
+- 🧑‍💼 **数字员工构建与管理**：将专业员工的经验、流程和判断标准固化为拥有岗位、工号、能力档案和工作记录的数字员工；支持能力成长、权限隔离及发布复用。
+- 🧩 **状态机驱动的流程型技能**：通过自然语言生成结构化 SOP，以状态机保证复杂流程准确执行；支持多个流程实时切换、上下文保留、可视化编辑、版本管理和分支演化。
+- 📚 **文档结构感知的知识检索**：基于文档、章节、页面和摘要等层级构建可导航索引，让数字员工先判断信息可能位于哪里，再逐层定位原文；支持知识分桶、定向检索、来源引用和检索调试。
+- 🔌 **自主执行与持续迭代**：通过 HTTP API、MCP 和定时任务执行真实业务操作，并结合长期记忆、完整 Trace、真人接管、用户反馈和反馈分析形成持续迭代闭环。
 
 ## Agent 一键部署
 
-将下面的 Prompt 粘贴给有仓库权限的 Cursor、Claude Code 或 Codex：
+将下面的 Prompt 粘贴给 Cursor、Claude Code 或 Codex：
 
 ```text
 阅读 https://raw.githubusercontent.com/OpenBMB/StaffDeck/main/README.zh.md。
@@ -51,7 +47,6 @@ backend/.env；缺少 OpenAI 兼容模型地址或 API Key 时向我询问；运
 DETACH=1 scripts/dev_up.sh，并验证 /api/health 和 /workspace/gallery 后再报告完成。
 ```
 
-由于仓库为私有仓库，以上 Raw URL 同样需要 GitHub 身份验证。
 
 ## 目录
 
@@ -68,10 +63,8 @@ DETACH=1 scripts/dev_up.sh，并验证 /api/health 和 /workspace/gallery 后再
     - [3. 启动 Web Demo](#3-启动-web-demo)
     - [4. 验证安装](#4-验证安装)
     - [常用命令](#常用命令)
-  - [配置说明](#配置说明)
   - [核心流程](#核心流程)
   - [项目结构](#项目结构)
-  - [开发与验证](#开发与验证)
   - [常见问题](#常见问题)
   - [路线图](#路线图)
   - [参与贡献](#参与贡献)
@@ -147,21 +140,6 @@ scripts/dev_up.sh           # 前台运行
 
 > 完整说明 → [StaffDeck 使用教程](docs/tutorial.md)
 
-## 配置说明
-
-主要环境变量见 [`backend/.env.example`](backend/.env.example)。
-
-| 变量 | 作用 | 默认值 |
-| --- | --- | --- |
-| `APP_SECRET` | 加密模型凭据，非本地环境必须替换 | `change-me-in-development` |
-| `DEMO_MODEL_BASE_URL` | 首次启动时创建模型配置所用的 OpenAI 兼容接口 | Demo 地址 |
-| `DEMO_MODEL_NAME` | 初始模型标识 | `qwen3.6-27b` |
-| `DEMO_MODEL_API_KEY` | 可选的初始模型 API Key | 空 |
-| `TOOL_TIMEOUT_SECONDS` | HTTP 工具超时 | `8` |
-| `GENERAL_SKILL_RUNTIME_PYTHON` | 通用技能 Runner 使用的 Python | 自动探测 |
-| `GENERAL_SKILL_RUNTIME_PACKAGES` | 独立技能运行时校验或安装的依赖 | `requests,httpx` |
-
-StaffDeck 支持可配置的 OpenAI 兼容模型服务，不在仓库中捆绑模型权重。上下文长度、多模态能力、输出限制和硬件需求取决于所选模型服务。
 
 
 
@@ -187,20 +165,6 @@ StaffDeck/
 └── README.zh.md              # 简体中文
 ```
 
-## 开发与验证
-
-```bash
-# 后端测试
-cd backend
-.venv/bin/python -m pytest tests
-
-# 前端 i18n 检查与生产构建
-cd ../frontend-enterprise
-npm run i18n:check
-npm run build
-```
-
-修改 UI 后必须验证 `/workspace/*` 与 `/enterprise/*` 下的真实挂载路由，不能只测试孤立组件。
 
 ## 常见问题
 
@@ -208,12 +172,6 @@ npm run build
 <summary><strong>页面可以打开，但数字员工不回答。</strong></summary>
 
 检查所选模型配置、API Key、模型名和模型服务网络。随后查看执行记录与 `.dev/logs/app.log`，定位模型服务返回的具体错误。
-</details>
-
-<details>
-<summary><strong>5173 端口已被占用。</strong></summary>
-
-先运行 `scripts/dev_down.sh`。若监听进程不属于 StaffDeck，应先确认其用途；只有确定可以终止时才使用 `FORCE_PORTS=1 scripts/dev_up.sh`。
 </details>
 
 <details>
