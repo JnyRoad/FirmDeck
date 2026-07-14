@@ -11,6 +11,7 @@ import { MOBILE_CARD_CLASS, formatDateTime } from '@/lib/enterprise-ui';
 
 import { api, TENANT_ID } from '../../api/client';
 import IconListBulleted from '../../assets/icons/list-bulleted.svg?react';
+import IconHistory from '../../assets/icons/profile-history.svg?react';
 import IconRefresh from '../../assets/icons/refresh.svg?react';
 import IconSearch from '../../assets/icons/search.svg?react';
 import { useClientPagination } from '../../hooks/useClientPagination';
@@ -208,7 +209,7 @@ export default function MemoriesTab() {
       >
         <div className="flex flex-col gap-[18px]">
           <div className="flex items-center gap-[6px] px-[12px] text-[#757f9c]">
-            <IconListBulleted className="size-[14px] shrink-0" />
+            <IconHistory className="size-[14px] shrink-0" />
             <span className="text-[14px] font-normal leading-none">记忆查询</span>
           </div>
 

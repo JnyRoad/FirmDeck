@@ -64,6 +64,7 @@ import {
 import IconAdd from '../assets/icons/add.svg?react';
 import IconChevronDown from '../assets/icons/chevron-down.svg?react';
 import IconClear from '../assets/icons/field-clear.svg?react';
+import IconFolder from '../assets/icons/cap-folder.svg?react';
 import IconRefresh from '../assets/icons/refresh.svg?react';
 import IconSearch from '../assets/icons/search.svg?react';
 import {
@@ -1103,7 +1104,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
 
         <div className="flex flex-col gap-[18px]">
           <div className="flex items-center gap-[6px] px-[12px] text-[#757f9c]">
-            <DatabaseOutlined className="text-[14px]" />
+            <IconFolder className="size-[14px] shrink-0" />
             <span className="text-[14px] font-normal leading-none">{listLabel}</span>
           </div>
 

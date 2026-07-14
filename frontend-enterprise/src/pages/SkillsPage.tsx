@@ -38,6 +38,7 @@ import { api, TENANT_ID } from '../api/client';
 import IconAdd from '../assets/icons/add.svg?react';
 import IconChevronDown from '../assets/icons/chevron-down.svg?react';
 import IconClear from '../assets/icons/field-clear.svg?react';
+import IconClipboard from '../assets/icons/cap-clipboard.svg?react';
 import IconEdit from '../assets/icons/edit.svg?react';
 import IconHistory from '../assets/icons/profile-history.svg?react';
 import IconMore from '../assets/icons/more.svg?react';
@@ -651,7 +652,7 @@ export default function SkillsPage({
       <div className="flex flex-col gap-[24px] rounded-[20px_20px_0_0] bg-white p-[18px_18px_24px_18px] shadow-[0_-4px_16px_0_rgba(0,0,0,0.05)]">
         <div className="flex flex-col gap-[18px]">
           <div className="flex items-center gap-[6px] px-[12px] text-[#757f9c]">
-            <IconSkill className="size-[14px] shrink-0" />
+            <IconClipboard className="size-[14px] shrink-0" />
             <span className="text-[14px] font-normal leading-none">{isOverallAgent ? 'SOP 广场列表' : '本地 SOP'}</span>
           </div>
 

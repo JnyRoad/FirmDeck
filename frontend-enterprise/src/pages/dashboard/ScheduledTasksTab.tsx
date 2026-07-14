@@ -13,8 +13,8 @@ import { MOBILE_CARD_CLASS } from '@/lib/enterprise-ui';
 import { api, TENANT_ID } from '../../api/client';
 import IconAdd from '../../assets/icons/add.svg?react';
 import IconAlignJustify from '../../assets/icons/align-justify.svg?react';
+import IconAlarm from '../../assets/icons/profile-alarm.svg?react';
 import IconSearch from '../../assets/icons/search.svg?react';
-import IconTable from '../../assets/icons/table.svg?react';
 import { useClientPagination } from '../../hooks/useClientPagination';
 import type { AgentProfileRead, ScheduledTaskRead, ScheduledTaskRunRead } from '../../types';
 import { StatusBadge, TaskRunResultBadge, TaskStatusBadge } from '../scheduled-tasks/StatusBadge';
@@ -428,7 +428,7 @@ export default function ScheduledTasksTab() {
 
       <div className="flex flex-col gap-[24px]">
         <TaskSection
-          icon={<IconTable className="size-[14px] shrink-0" />}
+          icon={<IconAlarm className="size-[14px] shrink-0" />}
           title="任务列表"
           filterTabs={TASK_FILTER_TABS}
           filter={taskFilter}

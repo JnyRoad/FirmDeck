@@ -55,6 +55,7 @@ import CodeBlock, { renderCodeTokens } from '../components/CodeBlock';
 import IconAdd from '../assets/icons/add.svg?react';
 import IconArrowRight from '../assets/icons/arrow-right.svg?react';
 import IconFolder from '../assets/icons/cap-folder.svg?react';
+import IconMagicWand from '../assets/icons/cap-magicwand.svg?react';
 import IconChevronDown from '../assets/icons/chevron-down.svg?react';
 import IconPlay from '../assets/icons/play.svg?react';
 import IconClear from '../assets/icons/field-clear.svg?react';
@@ -773,7 +774,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
 
         <div className="flex flex-col gap-[18px]">
           <div className="flex items-center gap-[6px] px-[12px] text-[#757f9c]">
-            <IconSkill className="size-[14px] shrink-0" />
+            <IconMagicWand className="size-[14px] shrink-0" />
             <span className="text-[14px] font-normal leading-none">{listLabel}</span>
           </div>
 

@@ -20,6 +20,7 @@ import { cn } from '@/lib/utils';
 import { formatDateTime } from '@/lib/enterprise-ui';
 
 import { api, TENANT_ID } from '../../api/client';
+import IconCalendar from '../../assets/icons/profile-calendar.svg?react';
 import { employeeDisplayNameWithCreator } from '../../employee';
 import { useClientPagination } from '../../hooks/useClientPagination';
 import { StatusBadge } from '../scheduled-tasks/StatusBadge';
@@ -343,7 +344,7 @@ export default function ConversationLogsTab() {
         className="relative mt-[-2px] flex w-full min-w-0 max-w-full flex-col gap-[24px] overflow-hidden rounded-[18px] bg-white p-[14px] shadow-[0_20px_42px_rgba(21,26,38,0.045)] min-[521px]:p-[18px]"
       >
         <div className="flex items-center gap-[6px] px-[12px] text-[#757f9c]">
-          <Clock className="size-[14px] shrink-0" />
+          <IconCalendar className="size-[14px] shrink-0" />
           <span className="text-[14px] font-normal leading-none">对话记录</span>
         </div>
 

@@ -43,6 +43,7 @@ import {
 import CodeBlock from '../components/CodeBlock';
 import IconAdd from '../assets/icons/add.svg?react';
 import IconArrowRight from '../assets/icons/arrow-right.svg?react';
+import IconBriefcase from '../assets/icons/cap-briefcase.svg?react';
 import IconChevronDown from '../assets/icons/chevron-down.svg?react';
 import IconClear from '../assets/icons/field-clear.svg?react';
 import IconEdit from '../assets/icons/edit.svg?react';
@@ -741,7 +742,7 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
 
         <div className="flex flex-col gap-[18px]">
           <div className="flex items-center gap-[6px] px-[12px] text-[#757f9c]">
-            <IconTool className="size-[14px] shrink-0" />
+            <IconBriefcase className="size-[14px] shrink-0" />
             <span className="text-[14px] font-normal leading-none">{listLabel}</span>
           </div>
 
