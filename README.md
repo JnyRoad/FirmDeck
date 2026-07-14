@@ -26,7 +26,7 @@ NEU-ModelBest Data Intelligence Joint Lab
 
 # 💡 About StaffDeck
 
-StaffDeck is an enterprise platform for building and managing digital employees. It helps professionals turn their work experience, business processes, and decision criteria into digital employees that can operate continuously, take over repetitive tasks, and preserve individual expertise as reusable, evolvable, and traceable organizational assets. StaffDeck is jointly developed by the [NEU-ModelBest Data Intelligence Joint Lab](https://neuir.github.io/), [ModelBest](https://modelbest.cn/), [OpenBMB](https://www.openbmb.cn/home), and [AI9Stars](https://github.com/AI9Stars) for enterprises and institutions seeking to advance AI from a personal productivity tool to an organizational capability.
+StaffDeck is an enterprise platform for building and managing digital employees. It helps professionals turn their work experience, business processes, and decision criteria into digital employees that can operate continuously, take over repetitive tasks, and preserve individual expertise as reusable, evolvable, and traceable organizational assets. StaffDeck is jointly developed by the [ModelBest](https://modelbest.cn/), [NEU-ModelBest Data Intelligence Joint Lab](https://neuir.github.io/), [THUNLP](https://nlp.csai.tsinghua.edu.cn/), [OpenBMB](https://www.openbmb.cn/home), and [AI9Stars](https://github.com/AI9Stars) for enterprises and institutions seeking to advance AI from a personal productivity tool to an organizational capability.
 
 ## Highlights
 
