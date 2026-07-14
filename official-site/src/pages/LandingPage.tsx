@@ -47,8 +47,6 @@ function d(ms: number): RevealStyle {
 
 const SCENE_COUNT = 3;
 const REPOSITORY_URL = "https://github.com/OpenBMB/URStaff";
-const TUTORIAL_URL = import.meta.env.VITE_STAFFDECK_DOCS_URL
-  || "https://github.com/OpenBMB/URStaff/blob/main/README_zh.md";
 const DOWNLOAD_URL = "https://github.com/OpenBMB/URStaff/releases/latest";
 
 function GitHubIcon() {
@@ -557,7 +555,7 @@ export default function LandingPage() {
                 <GitHubIcon />
                 <span>{copy.hero.repository}</span>
               </a>
-              <a className="lp-hero-action" href={TUTORIAL_URL} target="_blank" rel="noreferrer">
+              <a className="lp-hero-action" href={`/docs/introduce?lang=${locale.startsWith("en") ? "en" : "zh"}`}>
                 <BookOpen aria-hidden />
                 <span>{copy.hero.tutorial}</span>
               </a>

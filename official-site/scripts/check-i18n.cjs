@@ -7,8 +7,10 @@ const sourceRoot = path.join(projectRoot, 'src');
 const catalog = require(path.join(sourceRoot, 'i18n', 'en.json'));
 const ignoredFiles = new Set([
   path.join(sourceRoot, 'components', 'LanguageSwitcher.tsx'),
+  // The tutorial catalog intentionally stores paired Chinese and English content.
+  path.join(sourceRoot, 'pages', 'tutorialDocs.ts'),
 ]);
-const ignoredFragments = ["after:content-['展开']"];
+const ignoredFragments = ["after:content-['展开']", '中文'];
 const missing = new Map();
 
 function sourceFiles(directory) {
