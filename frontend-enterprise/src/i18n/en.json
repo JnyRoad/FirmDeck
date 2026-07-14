@@ -1785,5 +1785,10 @@
   "UltraRAG4 的对话不是单轮问答。它会在路由、知识、技能、SOP、工具和回复生成之间形成可追踪执行链路。": "UltraRAG4 conversations are not single-turn Q&A. They form a traceable execution chain across routing, knowledge, skills, SOPs, tools, and response generation.",
   "UltraRAG4 的核心不是“能聊天”，而是让一个真实岗位拥有自己的配置、资源、执行规则和运营记录。 每个员工都可以有独立知识、SOP、工具和记忆；每次对话都能回看路由、工具调用、回复和反馈。": "UltraRAG4 is not just chat. It gives a real role its own configuration, resources, execution rules, and operations history. Each employee has independent knowledge, SOPs, tools, and memory, and every conversation can be reviewed end to end.",
   "由文档 {1} 创建": "Created from Document {1}",
-  "URL 已包含查询参数时请把 HTTP Method 切换为 GET；POST 会把测试参数作为 JSON Body 发送。": "If the URL already contains query parameters, switch HTTP Method to GET. POST sends test parameters as a JSON body."
+  "URL 已包含查询参数时请把 HTTP Method 切换为 GET；POST 会把测试参数作为 JSON Body 发送。": "If the URL already contains query parameters, switch HTTP Method to GET. POST sends test parameters as a JSON body.",
+  "加入发送队列": "Add to Send Queue",
+  "待回答会话仅支持发送人工回复": "Awaiting-reply conversations only accept human replies",
+  "待回答暂不支持附件，请发送文字回复": "Attachments are not supported for awaiting replies; send a text reply instead",
+  "当前账号不能直接向该会话发送消息，请从待回答列表回复": "This account cannot message the conversation directly; reply from the Awaiting Reply list",
+  "任务信息还在加载，请稍后再发送": "Task details are still loading; try sending again shortly"
 }

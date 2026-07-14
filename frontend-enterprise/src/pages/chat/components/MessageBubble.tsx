@@ -29,6 +29,7 @@ import {
   CHAT_MESSAGE_ITEM_CLASS,
   CHAT_MESSAGE_MODE_CHIP_CLASS,
   CHAT_PLAIN_ANSWER_CLASS,
+  CHAT_QUEUED_MESSAGE_ITEM_CLASS,
   CHAT_QUEUED_STATUS_CLASS,
   CHAT_QUEUED_STATUS_ROW_CLASS,
   chatBubbleClass,
@@ -85,7 +86,7 @@ export default function MessageBubble({ chat, item, render }: MessageBubbleProps
   const queuedMessage = item.role === 'user' && item.metadata?.queued === true;
 
   return (
-    <div className={CHAT_MESSAGE_ITEM_CLASS}>
+    <div className={cn(CHAT_MESSAGE_ITEM_CLASS, queuedMessage && CHAT_QUEUED_MESSAGE_ITEM_CLASS)}>
       <div className={chatRowClass(item.role)}>
         <div
           className={chatBubbleClass(item.role, item.isError)}

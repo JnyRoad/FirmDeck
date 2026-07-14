@@ -1,4 +1,4 @@
-import type { FormEvent, MouseEvent } from 'react';
+import type { FormEvent } from 'react';
 import { useEffect, useRef, useState } from 'react';
 
 import EmployeeAvatar from '@/components/EmployeeAvatar';
@@ -88,7 +88,6 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
   } = chat;
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const stopClickArmedRef = useRef(false);
   const [scheduleIntentHovered, setScheduleIntentHovered] = useState(false);
 
   useEffect(() => {
@@ -104,35 +103,11 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
     }
   }, [composerIntent]);
 
-  const sendDisabled = !currentSessionRunning
-    && ((!input.trim() && readyComposerAttachments.length === 0) || uploadingComposerAttachment);
+  const hasSendContent = Boolean(input.trim() || readyComposerAttachments.length > 0);
+  const sendDisabled = !hasSendContent || uploadingComposerAttachment;
 
   const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (stopClickArmedRef.current) {
-      stopClickArmedRef.current = false;
-      return;
-    }
-    void send();
-  };
-
-  const handleSendButtonMouseDown = (event: MouseEvent<HTMLButtonElement>) => {
-    if (!currentSessionRunning) return;
-    event.preventDefault();
-    event.stopPropagation();
-    stopClickArmedRef.current = true;
-    abortStream();
-  };
-
-  const handleSendButtonClick = (event: MouseEvent<HTMLButtonElement>) => {
-    if (currentSessionRunning || stopClickArmedRef.current) {
-      event.preventDefault();
-      event.stopPropagation();
-      const shouldAbort = currentSessionRunning;
-      stopClickArmedRef.current = false;
-      if (shouldAbort) abortStream();
-      return;
-    }
     void send();
   };
 
@@ -387,15 +362,25 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
                   )}
                 </DropdownMenuContent>
               </DropdownMenu>
+              {currentSessionRunning && (
+                <button
+                  type="button"
+                  className={cn(CHAT_COMPOSER_SEND_BTN_CLASS, CHAT_COMPOSER_STOP_BTN_CLASS)}
+                  onClick={abortStream}
+                  aria-label="停止生成"
+                  title="停止生成"
+                >
+                  <StaffdeckIcon name="stop" size={18} />
+                </button>
+              )}
               <button
-                type="button"
-                className={cn(CHAT_COMPOSER_SEND_BTN_CLASS, currentSessionRunning && CHAT_COMPOSER_STOP_BTN_CLASS)}
-                onMouseDown={handleSendButtonMouseDown}
-                onClick={handleSendButtonClick}
+                type="submit"
+                className={CHAT_COMPOSER_SEND_BTN_CLASS}
                 disabled={sendDisabled}
-                aria-label={currentSessionRunning ? '停止生成' : '发送'}
+                aria-label={currentSessionRunning ? '加入发送队列' : '发送'}
+                title={currentSessionRunning ? '加入发送队列' : '发送'}
               >
-                <StaffdeckIcon name={currentSessionRunning ? 'stop' : 'send'} size={18} />
+                <StaffdeckIcon name="send" size={18} />
               </button>
             </div>
           </div>

@@ -121,6 +121,33 @@ export function normalizeMessageText(value?: string): string {
   return typeof value === 'string' ? value.replace(/\s+/g, ' ').trim() : '';
 }
 
+export function hasRenderableStreamingText(value?: string): boolean {
+  return Array.from(normalizeMessageText(value)).length >= 2;
+}
+
+export function isQueuedChatMessage(messageItem: ChatMessage): boolean {
+  return messageItem.role === 'user' && messageItem.metadata?.queued === true;
+}
+
+export function placeQueuedMessagesLast(messages: ChatMessage[]): ChatMessage[] {
+  const timeline: ChatMessage[] = [];
+  const queued: ChatMessage[] = [];
+  const queuedTurnIds = new Set<string>();
+
+  messages.forEach((messageItem) => {
+    if (!isQueuedChatMessage(messageItem)) {
+      timeline.push(messageItem);
+      return;
+    }
+    const identity = messageItem.turnId || messageItem.id;
+    if (queuedTurnIds.has(identity)) return;
+    queuedTurnIds.add(identity);
+    queued.push(messageItem);
+  });
+
+  return [...timeline, ...queued];
+}
+
 export function renderInlineMarkdown(text: string, keyPrefix: string): ReactNode[] {
   const nodes: ReactNode[] = [];
   const pattern = /(`[^`]*`|\*\*[^*]+?\*\*|!?\[[^\]\n]*\]\([^\)\n]+\))/g;

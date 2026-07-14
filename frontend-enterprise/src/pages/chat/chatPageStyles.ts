@@ -35,6 +35,7 @@ export const CHAT_MESSAGES_CLASS = 'min-h-0 flex-1 overflow-y-auto px-[24px] pt-
 export const CHAT_MESSAGE_STACK_CLASS = 'mx-auto flex w-full max-w-[820px] flex-col gap-[20px]';
 
 export const CHAT_MESSAGE_ITEM_CLASS = 'flex min-w-0 flex-col';
+export const CHAT_QUEUED_MESSAGE_ITEM_CLASS = 'order-last';
 export const CHAT_MESSAGE_ROW_BASE_CLASS = 'flex min-w-0';
 export const CHAT_MESSAGE_ROW_USER_CLASS = 'justify-end';
 export const CHAT_MESSAGE_ROW_ASSISTANT_CLASS = 'justify-start';

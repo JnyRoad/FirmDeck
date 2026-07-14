@@ -10,6 +10,7 @@ import {
   knowledgeCitations,
   messageAttachments,
   normalizeMessageText,
+  placeQueuedMessagesLast,
   scheduledDraftForMessage,
   stripTrailingCitationSummary,
   traceDetails,
@@ -44,13 +45,14 @@ export default function MessageList({ chat }: { chat: UseChatSession }) {
     SHOW_DEBUG,
     lastTurn,
   } = chat;
+  const renderMessages = placeQueuedMessagesLast(displayedMessages);
 
   return (
     <div className={CHAT_MESSAGES_CLASS} ref={chatMessagesRef} onScroll={handleChatMessagesScroll}>
-      {displayedMessages.length === 0 && <ChatEmptyState chat={chat} />}
+      {renderMessages.length === 0 && <ChatEmptyState chat={chat} />}
 
       <div className={CHAT_MESSAGE_STACK_CLASS}>
-        {displayedMessages.map((item, itemIndex) => {
+        {renderMessages.map((item, itemIndex) => {
           const turnId = item.turnId || item.id;
           const fallbackTraceId = item.role === 'assistant' && item.isStreaming
             ? (currentStream.turnId || runningTurn?.turnId || '')
@@ -80,7 +82,7 @@ export default function MessageList({ chat }: { chat: UseChatSession }) {
           const latestAssistantTrace = Boolean(
             item.role === 'assistant'
             && details.length > 0
-            && !displayedMessages.slice(itemIndex + 1).some((later) => (
+            && !renderMessages.slice(itemIndex + 1).some((later) => (
               later.role === 'assistant'
               && Boolean(turnTraceRef.current.get(later.turnId || later.id)?.lines.length)
             )),

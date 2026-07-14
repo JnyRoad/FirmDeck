@@ -71,6 +71,7 @@ import {
   generalSkillTraceOutput,
   hasAssistantCarrierForTurn,
   hasAssistantMessageForTurn,
+  hasRenderableStreamingText,
   hasRecoverableEventProgress,
   hasServerMessageForTurn,
   isDraftConversationKey,
@@ -884,6 +885,13 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     currentStream.loading
     || (activeConversationId && runningTurn?.sessionId === activeConversationId),
   );
+  const activeSessionReportsRunning = Boolean(
+    activeConversationId
+    && sessions.some((item) => (
+      item.id === activeConversationId
+      && (item.status === 'running' || item.status === 'executing')
+    )),
+  );
   const activeRunningTraceId = currentTraceRunning
     ? (currentStream.turnId || (runningTurn?.sessionId === activeConversationId ? runningTurn.turnId : '') || '')
     : '';
@@ -898,7 +906,8 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
   const currentSessionRunning = Boolean(
     currentStream.loading
     || (activeConversationId && runningTurn?.sessionId === activeConversationId)
-    || hasRunningDisplayedTrace,
+    || hasRunningDisplayedTrace
+    || activeSessionReportsRunning,
   );
   const readyComposerAttachments = useMemo(
     () => composerAttachments.filter((item) => item.uploadStatus === 'ready'),
@@ -1168,35 +1177,39 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       .finally(() => setHandoffsLoading(false));
   }, [auth, notifyRequestError, tenantId]);
 
+  const replyToHandoff = useCallback(async (handoff: HumanHandoffRead, reply: string): Promise<boolean> => {
+    try {
+      await api.post<HumanHandoffRead>(`/api/chat/handoffs/${handoff.id}/reply`, { tenant_id: tenantId, reply });
+      notify.success('已回复，原会话会继续执行');
+      setHandoffs((rows) => rows.filter((item) => item.id !== handoff.id));
+      setHandoffReplies((prev) => {
+        const next = { ...prev };
+        delete next[handoff.id];
+        return next;
+      });
+      loadSessions();
+      getSlot(handoff.session_id);
+      void loadMessages(handoff.session_id);
+      void loadTraces(handoff.session_id);
+      return true;
+    } catch (error) {
+      if (isAuthError(error)) {
+        redirectToLogin();
+        return false;
+      }
+      notify.error(error instanceof Error ? error.message : '回复失败');
+      return false;
+    }
+  }, [getSlot, loadMessages, loadSessions, loadTraces, redirectToLogin, tenantId]);
+
   const submitHandoffReply = useCallback((handoff: HumanHandoffRead) => {
     const reply = (handoffReplies[handoff.id] || '').trim();
     if (!reply) {
       notify.warning('请输入回复内容');
       return;
     }
-    api
-      .post<HumanHandoffRead>(`/api/chat/handoffs/${handoff.id}/reply`, { tenant_id: tenantId, reply })
-      .then(() => {
-        notify.success('已回复，原会话会继续执行');
-        setHandoffs((rows) => rows.filter((item) => item.id !== handoff.id));
-        setHandoffReplies((prev) => {
-          const next = { ...prev };
-          delete next[handoff.id];
-          return next;
-        });
-        loadSessions();
-        getSlot(handoff.session_id);
-        void loadMessages(handoff.session_id);
-        void loadTraces(handoff.session_id);
-      })
-      .catch((error) => {
-        if (isAuthError(error)) {
-          redirectToLogin();
-          return;
-        }
-        notify.error(error instanceof Error ? error.message : '回复失败');
-      });
-  }, [getSlot, handoffReplies, loadMessages, loadSessions, loadTraces, redirectToLogin, tenantId]);
+    void replyToHandoff(handoff, reply);
+  }, [handoffReplies, replyToHandoff]);
 
   const openHandoffInbox = useCallback(() => {
     setShowHandoffInbox(true);
@@ -1265,7 +1278,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     notifyFeedback();
   }, [getSlot, notifyFeedback]);
 
-  const updateStreaming = useCallback((id: string, text: string, turnId?: string) => {
+  const updateStreaming = useCallback((id: string, text: string, turnId?: string, force = false) => {
     const slot = getSlot(id);
     const stream = getStreamSlot(id);
     const activeTurnId = turnId || stream.turnId || undefined;
@@ -1288,7 +1301,19 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
         && canonicalMessageTurnId(item, aliasMap) === activeCanonicalTurnId
       )
     ));
-    if (!normalizeMessageText(text) && index < 0) return;
+    const hasVisibleText = Boolean(normalizeMessageText(text));
+    if (!hasVisibleText || (!force && !hasRenderableStreamingText(text))) {
+      if (index >= 0 && normalizeMessageText(slot.realtimeMessages[index].content)) {
+        slot.realtimeMessages = [...slot.realtimeMessages];
+        slot.realtimeMessages[index] = {
+          ...slot.realtimeMessages[index],
+          content: '',
+          isStreaming: true,
+        };
+        notifyStore();
+      }
+      return;
+    }
     const previousMessage = index >= 0 ? slot.realtimeMessages[index] : undefined;
     const previousCanonicalTurnId = previousMessage ? canonicalMessageTurnId(previousMessage, aliasMap) : undefined;
     const previousCreatedAt = previousMessage && previousCanonicalTurnId === activeCanonicalTurnId
@@ -1335,7 +1360,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     const hasVisibleTrace = Boolean(trace?.lines.some((line) => (
       !line.provisional && !line.placeholder && Boolean(normalizeMessageText(line.text))
     )));
-    if (normalizeMessageText(stream.accumulated)) {
+    if (hasRenderableStreamingText(stream.accumulated)) {
       updateStreaming(id, stream.accumulated, turnId);
       return;
     }
@@ -1352,7 +1377,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       stream.timer = null;
     }
     if (stream.accumulated) {
-      updateStreaming(id, stream.accumulated, stream.turnId || undefined);
+      updateStreaming(id, stream.accumulated, stream.turnId || undefined, true);
     }
   }, [getStreamSlot, updateStreaming]);
 
@@ -2389,7 +2414,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
             }
             stream.loading = true;
             stream.phase = '执行中';
-            if (normalizeMessageText(stream.accumulated)) {
+            if (hasRenderableStreamingText(stream.accumulated)) {
               updateStreaming(id, stream.accumulated, eventTurnId);
             }
             notifyStream();
@@ -2877,9 +2902,37 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       return;
     }
     const currentConversationId = activeConversationId;
+    const pendingHandoff = handoffs.find((handoff) => (
+      handoff.session_id === currentConversationId && handoff.status === 'pending'
+    ));
+    if (pendingHandoff) {
+      if (resolvedInteractionMode !== 'normal') {
+        notify.warning('待回答会话仅支持发送人工回复');
+        return;
+      }
+      if (readyComposerAttachments.length > 0) {
+        notify.warning('待回答暂不支持附件，请发送文字回复');
+        return;
+      }
+      const reply = input.trim();
+      if (!reply) {
+        notify.warning('请输入回复内容');
+        return;
+      }
+      if (await replyToHandoff(pendingHandoff, reply)) {
+        setInput('');
+        setComposerAttachments([]);
+        setComposerIntent(null);
+      }
+      return;
+    }
     const activeSession = sessionId ? sessions.find((item) => item.id === sessionId) || null : null;
     if (!isDraftConversation && !activeSession && !optimisticSessionIdsRef.current.has(currentConversationId)) {
-      notify.warning('任务信息还在加载，请稍后再发送');
+      if (sessionsLoading || handoffsLoading) {
+        notify.warning('任务信息还在加载，请稍后再发送');
+      } else {
+        notify.warning('当前账号不能直接向该会话发送消息，请从待回答列表回复');
+      }
       return;
     }
     const sessionAgentId = activeSession?.agent_id || activeDraftAgentId || selectedAgentId || displayedAgent?.id || '';
@@ -2905,7 +2958,11 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     const hasQueuedTurnForConversation = queuedTurnsRef.current.some(
       (item) => item.conversationId === currentConversationId,
     );
-    if (stream.loading || currentSessionRunning || hasQueuedTurnForConversation) {
+    const sessionReportsRunning = Boolean(
+      activeSession
+      && (activeSession.status === 'running' || activeSession.status === 'executing'),
+    );
+    if (stream.loading || currentSessionRunning || sessionReportsRunning || hasQueuedTurnForConversation) {
       enqueuePreparedTurn(prepared);
       return;
     }
@@ -2919,13 +2976,17 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     enqueuePreparedTurn,
     executePreparedTurn,
     getStreamSlot,
+    handoffs,
+    handoffsLoading,
     input,
     isDraftConversation,
     readyComposerAttachments,
+    replyToHandoff,
     selectedAgentId,
     selectedModelConfig?.id,
     sessionId,
     sessions,
+    sessionsLoading,
     uploadingComposerAttachment,
   ]);
 
