@@ -626,13 +626,13 @@ export default function SiteChat() {
             return (
               <article className={`site-chat-message is-${message.role}`} key={message.id}>
                 {message.role === "assistant" && <ExecutionRecord message={message} copy={copy} />}
-                {normalized.content && (
+                {normalized.content && (message.role === "assistant" ? (
                   <div className="site-chat-content">
-                    {message.role === "assistant"
-                      ? <MarkdownMessage content={normalized.content} />
-                      : normalized.content}
+                    <MarkdownMessage content={normalized.content} />
                   </div>
-                )}
+                ) : (
+                  <div className="site-chat-user-content">{normalized.content}</div>
+                ))}
                 {message.status === "stopped" && <div className="site-chat-stopped">{copy.stopped}</div>}
                 {message.error && (
                   <div className="site-chat-error">
@@ -641,7 +641,7 @@ export default function SiteChat() {
                   </div>
                 )}
                 {normalized.sources.length > 0 && (
-                  <div className="site-chat-sources">
+                  <div className={`site-chat-sources${message.status !== "streaming" ? " has-feedback" : ""}`}>
                     <span><img src={referenceIcon} alt="" />{copy.sources}</span>
                     <div>
                       {normalized.sources.map((source) => (

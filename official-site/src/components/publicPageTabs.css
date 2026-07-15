@@ -1,0 +1,66 @@
+.public-page-tabs {
+  box-sizing: border-box;
+  display: inline-grid;
+  grid-template-columns: auto auto;
+  align-items: center;
+  gap: 3px;
+  padding: 3px;
+  border: 1px solid rgba(213, 218, 229, 0.86);
+  border-radius: 13px;
+  background: rgba(239, 241, 246, 0.76);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.8);
+  backdrop-filter: blur(12px);
+}
+
+.public-page-tabs a {
+  min-width: 76px;
+  height: 32px;
+  padding: 0 13px;
+  border-radius: 9px;
+  color: #6c7486;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  font-size: 12px;
+  font-weight: 580;
+  line-height: 1;
+  text-decoration: none;
+  white-space: nowrap;
+  transition: color 160ms ease, background 160ms ease, box-shadow 160ms ease, transform 160ms ease;
+}
+
+.public-page-tabs a:hover {
+  color: #20232c;
+  background: rgba(255, 255, 255, 0.62);
+}
+
+.public-page-tabs a:focus-visible {
+  outline: 2px solid rgba(59, 108, 255, 0.38);
+  outline-offset: 2px;
+}
+
+.public-page-tabs a.is-active {
+  color: #fff;
+  background: #202228;
+  box-shadow: 0 5px 14px -8px rgba(20, 23, 31, 0.8), inset 0 1px 0 rgba(255, 255, 255, 0.16);
+}
+
+.public-page-tabs a.is-active:hover {
+  background: #111216;
+}
+
+.public-page-tabs svg {
+  width: 14px;
+  height: 14px;
+  stroke-width: 1.8;
+}
+
+@media (max-width: 520px) {
+  .public-page-tabs a {
+    min-width: 0;
+    padding: 0 9px;
+    gap: 5px;
+    font-size: 11px;
+  }
+}

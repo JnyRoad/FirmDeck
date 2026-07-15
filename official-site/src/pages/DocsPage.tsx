@@ -3,6 +3,7 @@ import { Link, Navigate, useNavigate, useParams, useSearchParams } from 'react-r
 
 import BrandLogo from '@/components/BrandLogo';
 import GitHubMark from '@/components/GitHubMark';
+import PublicPageTabs from '@/components/PublicPageTabs';
 import { cn } from '@/lib/utils';
 
 import { tutorialNavGroups, tutorialPages, tutorialShared } from './tutorialDocs';
@@ -73,12 +74,9 @@ export default function DocsPage() {
     <div className="docs-root" data-i18n-ignore>
       <header className="docs-topbar">
         <Link className="docs-brand" to="/">
-          <BrandLogo markSize={28} />
+          <BrandLogo markSize={28} wordmarkClassName="docs-brand-wordmark" />
         </Link>
-        <nav className="docs-topnav" aria-label="StaffDeck">
-          <Link to="/">{labels.home}</Link>
-          <Link className="is-active" to={`/docs/${page.id}?lang=${lang}`}>{labels.docs}</Link>
-        </nav>
+        <PublicPageTabs active="docs" language={lang} />
         <div className="docs-top-actions">
           <a
             className="docs-icon-link"

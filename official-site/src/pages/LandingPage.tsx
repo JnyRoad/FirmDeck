@@ -15,10 +15,11 @@ import {
   Monitor,
   Terminal,
 } from "lucide-react";
+import { Link } from "react-router-dom";
 
-import AppHeader from "../components/AppHeader";
 import BrandLogo from "../components/BrandLogo";
 import LanguageSwitcher from "../components/LanguageSwitcher";
+import PublicPageTabs from "../components/PublicPageTabs";
 import { useI18n } from "../i18n";
 import copyByLocale from "../i18n/site.json";
 import logoMark from "../assets/LOGO.svg";
@@ -500,13 +501,15 @@ export default function LandingPage() {
         </div>
       )}
 
-      {/* header — shared global AppHeader inside the fixed scroll-blur wrapper */}
+      {/* Public navigation shared with the tutorial documentation. */}
       <div className="lp-header" data-solid={scrolled}>
-        <AppHeader
-          className="h-[60px] items-center px-[32px]"
-          left={<BrandLogo markSize={28} />}
-          right={<LanguageSwitcher />}
-        />
+        <header className="lp-public-topbar">
+          <Link className="lp-public-brand" to="/" aria-label="StaffDeck">
+            <BrandLogo markSize={28} wordmarkClassName="lp-public-brand-wordmark" />
+          </Link>
+          <PublicPageTabs active="home" language={locale === "en-US" ? "en" : "zh"} />
+          <div className="lp-public-actions"><LanguageSwitcher /></div>
+        </header>
       </div>
 
       {/* ============================================= SCENE 1 · HERO ==== */}
