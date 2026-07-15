@@ -98,6 +98,7 @@ def list_agents(
         .where(AgentProfile.tenant_id == tenant_id)
         .order_by(AgentProfile.is_overall.desc(), AgentProfile.updated_at.desc())
     ).all()
+    rows = [row for row in rows if not _agent_hidden_from_staffdeck(row)]
     if not _is_admin_user(user):
         # Non-admin users still need the overall agent as a read-only open-gallery
         # source for copy/use flows. Mutations remain guarded by manage/update
@@ -611,6 +612,7 @@ def list_chat_agents(
         )
         .order_by(AgentProfile.updated_at.desc())
     ).all()
+    rows = [row for row in rows if not _agent_hidden_from_staffdeck(row)]
     used_agent_ids = _used_agent_ids_for_user(db, tenant_id, current_user)
     rows = [
         row for row in rows if _chat_agent_selectable_to_user(row, current_user, used_agent_ids)
@@ -831,12 +833,18 @@ def _ensure_request_tenant(tenant_id: str, user: User) -> None:
 
 
 def _agent_visible_to_user(row: AgentProfile, user: User) -> bool:
+    if _agent_hidden_from_staffdeck(row):
+        return False
     if _is_admin_user(user):
         return True
     if row.is_overall:
         return True
     metadata = row.metadata_json or {}
     return _agent_owned_by_user(row, user) or metadata.get("published_to_gallery") is True
+
+
+def _agent_hidden_from_staffdeck(row: AgentProfile) -> bool:
+    return (row.metadata_json or {}).get("hidden_from_staffdeck") is True
 
 
 def _agent_published_to_gallery(row: AgentProfile) -> bool:

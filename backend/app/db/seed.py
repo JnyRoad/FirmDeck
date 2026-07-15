@@ -6,11 +6,7 @@ from pathlib import Path
 from sqlmodel import Session, select
 
 from app import paths
-from app.agents.branching import (
-    copy_open_gallery_tools_to_agent,
-    copy_overall_scope_to_agent,
-    ensure_open_gallery_binding,
-)
+from app.agents.branching import ensure_open_gallery_binding
 from app.config import get_settings
 from app.db.models import (
     AgentProfile,
@@ -983,17 +979,12 @@ def _publish_seeded_system_resources(session: Session) -> None:
     tenant_id = "tenant_demo"
     creator_metadata = _system_seed_metadata()
 
-    for agent_id, is_default in (
-        (f"agent_{tenant_id}_overall", False),
-        (f"agent_{tenant_id}_default", True),
-    ):
-        agent = session.get(AgentProfile, agent_id)
-        if not agent:
-            continue
-        agent.metadata_json = _system_seed_metadata(
-            {**(agent.metadata_json or {}), **({"is_default_employee": True} if is_default else {})}
-        )
-        session.add(agent)
+    overall = session.get(AgentProfile, f"agent_{tenant_id}_overall")
+    if overall:
+        overall.metadata_json = _system_seed_metadata(overall.metadata_json or {})
+        session.add(overall)
+
+    _archive_seed_default_agent(session, tenant_id)
 
     seeded_skill_ids = {
         str(content["skill_id"])
@@ -1047,17 +1038,11 @@ def _publish_seeded_system_resources(session: Session) -> None:
             metadata_json=creator_metadata,
         )
 
-    default_agent = session.get(AgentProfile, f"agent_{tenant_id}_default")
-    if default_agent:
-        copy_overall_scope_to_agent(session, tenant_id, default_agent)
-        copy_open_gallery_tools_to_agent(session, tenant_id, default_agent)
-
 
 def _ensure_seed_agents(session: Session) -> None:
     tenant_id = "tenant_demo"
     for agent_id, name, description, is_overall in (
         (f"agent_{tenant_id}_overall", "整体智能体", "全局资源池", True),
-        (f"agent_{tenant_id}_default", "默认智能体", "默认对话可见域", False),
     ):
         existing = session.get(AgentProfile, agent_id)
         if existing:
@@ -1072,6 +1057,30 @@ def _ensure_seed_agents(session: Session) -> None:
                 status="active",
             )
         )
+
+
+def _archive_seed_default_agent(session: Session, tenant_id: str) -> None:
+    default_agent = session.get(AgentProfile, f"agent_{tenant_id}_default")
+    if not default_agent:
+        return
+    metadata = dict(default_agent.metadata_json or {})
+    if metadata and not (
+        metadata.get("is_default_employee") is True
+        or metadata.get("created_by") == "admin"
+        or metadata.get("owner_user_id") == "admin"
+    ):
+        return
+    metadata.update(
+        {
+            "is_default_employee": True,
+            "hidden_from_staffdeck": True,
+            "archived_by_seed": True,
+        }
+    )
+    default_agent.metadata_json = _system_seed_metadata(metadata)
+    default_agent.status = "archived"
+    default_agent.updated_at = utc_now()
+    session.add(default_agent)
 
 
 def _system_seed_metadata(extra: dict[str, object] | None = None) -> dict[str, object]:

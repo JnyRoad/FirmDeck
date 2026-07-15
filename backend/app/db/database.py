@@ -918,7 +918,6 @@ def _seed_default_agents(conn, tables: set[str]) -> None:
     for tenant_id in tenant_ids:
         for agent_id, name, is_overall in (
             (_overall_agent_id(tenant_id), "整体智能体", True),
-            (_default_agent_id(tenant_id), "默认智能体", False),
         ):
             existing = conn.execute(text("SELECT id FROM agent_profiles WHERE id = :id"), {"id": agent_id}).first()
             if existing:
@@ -944,17 +943,24 @@ def _seed_default_agents(conn, tables: set[str]) -> None:
                     "is_overall": 1 if is_overall else 0,
                 },
             )
-        if "sessions" in tables:
-            conn.execute(
-                text("UPDATE sessions SET agent_id = :agent_id WHERE tenant_id = :tenant_id AND (agent_id IS NULL OR agent_id = '')"),
-                {"tenant_id": tenant_id, "agent_id": _default_agent_id(tenant_id)},
-            )
+        _archive_default_agent(conn, tenant_id)
         if "agent_resource_bindings" in tables:
             _seed_default_agent_bindings(conn, tenant_id)
 
 
 def _seed_default_agent_bindings(conn, tenant_id: str) -> None:
     default_agent = _default_agent_id(tenant_id)
+    active_default = conn.execute(
+        text(
+            """
+            SELECT id FROM agent_profiles
+            WHERE id = :id AND tenant_id = :tenant_id AND status != 'archived'
+            """
+        ),
+        {"id": default_agent, "tenant_id": tenant_id},
+    ).first()
+    if not active_default:
+        return
     resource_queries = (
         ("skill", "SELECT id, status FROM skills WHERE tenant_id = :tenant_id AND status != 'deleted'"),
         ("general_skill", "SELECT id, status FROM general_skills WHERE tenant_id = :tenant_id AND status != 'deleted'"),
@@ -1006,6 +1012,62 @@ def _seed_default_agent_bindings(conn, tenant_id: str) -> None:
                     "status": binding_status,
                 },
             )
+
+
+def _archive_default_agent(conn, tenant_id: str) -> None:
+    default_agent = _default_agent_id(tenant_id)
+    row = conn.execute(
+        text(
+            """
+            SELECT metadata_json FROM agent_profiles
+            WHERE id = :id AND tenant_id = :tenant_id AND is_overall = 0
+            """
+        ),
+        {"id": default_agent, "tenant_id": tenant_id},
+    ).first()
+    if not row:
+        return
+    try:
+        metadata = json.loads(row[0] or "{}")
+    except json.JSONDecodeError:
+        metadata = {}
+    if metadata and not (
+        metadata.get("is_default_employee") is True
+        or metadata.get("created_by") == "admin"
+        or metadata.get("owner_user_id") == "admin"
+    ):
+        return
+    metadata.update(
+        {
+            "is_default_employee": True,
+            "hidden_from_staffdeck": True,
+            "archived_by_seed": True,
+            "owner_user_id": "admin",
+            "owner_username": "admin",
+            "owner_display_name": "Administrator",
+            "created_by_user_id": "admin",
+            "created_by_username": "admin",
+            "created_by": "admin",
+            "created_by_display_name": "Administrator",
+            "creator_name": "admin",
+        }
+    )
+    conn.execute(
+        text(
+            """
+            UPDATE agent_profiles
+            SET status = 'archived',
+                metadata_json = :metadata_json,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = :id AND tenant_id = :tenant_id
+            """
+        ),
+        {
+            "id": default_agent,
+            "tenant_id": tenant_id,
+            "metadata_json": json.dumps(metadata, ensure_ascii=False, sort_keys=True),
+        },
+    )
 
 
 def _seed_agent_branch_state(conn, inspector, tables: set[str]) -> None:

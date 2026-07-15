@@ -38,6 +38,13 @@ def test_staffdeck_seed_exposes_selected_agents_with_knowledge_bases() -> None:
         }
 
         assert set(agents) == set(EXPECTED_KNOWLEDGE_COUNTS)
+        assert not db.exec(
+            select(AgentProfile).where(
+                AgentProfile.tenant_id == "tenant_demo",
+                AgentProfile.name == "默认智能体",
+                AgentProfile.status == "active",
+            )
+        ).first()
         for name, expected_count in EXPECTED_KNOWLEDGE_COUNTS.items():
             agent = agents[name]
             bound_count = sum(
@@ -126,3 +133,35 @@ def test_staffdeck_seed_does_not_overwrite_non_seed_employee_name_conflict() -> 
         assert row.description == "用户原有的 IT 员工"
         assert row.metadata_json.get("owner_user_id") == "user_custom"
         assert row.metadata_json.get("seed_source") is None
+
+
+def test_staffdeck_seed_archives_legacy_default_agent() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as db:
+        db.add(Tenant(id="tenant_demo", name="Demo Enterprise"))
+        db.add(
+            AgentProfile(
+                id="agent_tenant_demo_default",
+                tenant_id="tenant_demo",
+                name="默认智能体",
+                description="默认对话可见域",
+                status="active",
+            )
+        )
+        db.commit()
+
+        seed_demo_data(db)
+        db.commit()
+
+        row = db.get(AgentProfile, "agent_tenant_demo_default")
+        admin = db.exec(
+            select(User).where(User.tenant_id == "tenant_demo", User.username == "admin")
+        ).one()
+        listed_ids = {agent.id for agent in list_agents("tenant_demo", db=db, current_user=admin)}
+
+        assert row is not None
+        assert row.status == "archived"
+        assert row.metadata_json.get("hidden_from_staffdeck") is True
+        assert row.metadata_json.get("is_default_employee") is True
+        assert "agent_tenant_demo_default" not in listed_ids

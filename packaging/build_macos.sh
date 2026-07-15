@@ -81,12 +81,12 @@ python3 packaging/make_dmg_background.py "$DMG_BACKGROUND"
 
 if command -v create-dmg >/dev/null 2>&1; then
   LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8 create-dmg --volname "StaffDeck" \
-    --window-pos 120 100 --window-size 640 360 \
+    --window-pos 120 100 --window-size 840 360 \
     --background "$DMG_BACKGROUND" \
     --icon-size 96 --text-size 13 \
-    --icon "StaffDeck.app" 180 180 \
+    --icon "StaffDeck.app" 230 180 \
     --hide-extension "StaffDeck.app" \
-    --app-drop-link 460 175 \
+    --app-drop-link 610 175 \
     --app-drop-link-name "Applications" \
     --volicon "packaging/assets/staffdeck.icns" \
     --no-internet-enable --overwrite \
