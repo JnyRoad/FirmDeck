@@ -65,6 +65,49 @@ def test_response_payload_has_single_source_for_each_business_fact() -> None:
     assert "awaiting_input" not in str(payload)
 
 
+def test_multi_task_payload_projects_all_results_for_one_final_reply() -> None:
+    generator = ResponseGenerator()
+    payload = generator._payload(
+        "先查询额度，再提交报销",
+        ChatSession(id="session_test", tenant_id="tenant_demo"),
+        None,
+        RouterDecision(decision="start_new_task", user_intent="处理两个任务"),
+        StepAgentResult(),
+        None,
+        task_results=[
+            {
+                "task": "查询额度",
+                "slots": {"employee_id": "E-1"},
+                "step_result": {
+                    "action": "reply",
+                    "reply": "剩余额度 1000 元",
+                    "knowledge_results": [],
+                    "is_step_completed": True,
+                    "handoff": False,
+                },
+                "tool_result": {"tool_name": "quota.query", "success": True},
+            },
+            {
+                "task": "提交报销",
+                "slots": {"amount": 500},
+                "step_result": {
+                    "action": "ask_user",
+                    "reply": "请补充发票",
+                    "knowledge_results": [],
+                    "is_step_completed": False,
+                    "handoff": False,
+                },
+                "tool_result": None,
+            },
+        ],
+    )
+
+    assert set(payload) == {"user_message", "conversation_context", "task_results"}
+    assert [item["task"] for item in payload["task_results"]] == ["查询额度", "提交报销"]
+    assert payload["task_results"][0]["step_summary"]["reply"] == "剩余额度 1000 元"
+    assert payload["task_results"][1]["step_summary"]["reply"] == "请补充发票"
+
+
 def test_clarify_does_not_leak_internal_router_prompt(monkeypatch):
     def fake_init(self, model_config):  # noqa: ANN001
         return None
