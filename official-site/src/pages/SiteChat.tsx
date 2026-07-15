@@ -342,7 +342,9 @@ function SourceDialog({
             <X aria-hidden="true" />
           </button>
         </header>
-        <p>{source.text?.trim() || copy.sourceUnavailable}</p>
+        <div className="site-chat-source-dialog-content">
+          <MarkdownMessage content={source.text?.trim() || copy.sourceUnavailable} />
+        </div>
       </section>
     </div>,
     document.body,
@@ -602,7 +604,7 @@ export default function SiteChat() {
   return (
     <div className="site-chat-shell">
       <div
-        className="site-chat-transcript"
+        className={`site-chat-transcript${messages.length > 0 ? " has-messages" : ""}`}
         ref={transcriptRef}
         aria-live="polite"
         onScroll={(event) => {
