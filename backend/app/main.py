@@ -64,7 +64,7 @@ def on_shutdown() -> None:
 
 @app.get("/api/health", tags=["health"])
 def health() -> dict[str, str]:
-    return {"status": "ok"}
+    return {"status": "ok", "app": "StaffDeck"}
 
 
 app.include_router(chat.router)

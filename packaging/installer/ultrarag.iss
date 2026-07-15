@@ -1,20 +1,20 @@
-; packaging/installer/ultrarag.iss — Inno Setup 脚本（产物为 URStaff）
+; packaging/installer/ultrarag.iss — Inno Setup 脚本（产物为 StaffDeck）
 ; 由 build_windows.ps1 调用：ISCC.exe packaging\installer\ultrarag.iss
 ; VERSION 通过环境变量传入（GetEnv）
 
 [Setup]
-AppId=URStaff
-AppName=URStaff
+AppId=StaffDeck
+AppName=StaffDeck
 AppVersion={#GetEnv('VERSION')}
-AppVerName=URStaff {#GetEnv('VERSION')}
-AppPublisher=URStaff
-DefaultDirName={autopf}\URStaff
-DefaultGroupName=URStaff
+AppVerName=StaffDeck {#GetEnv('VERSION')}
+AppPublisher=StaffDeck
+DefaultDirName={autopf}\StaffDeck
+DefaultGroupName=StaffDeck
 OutputDir=..\out
-OutputBaseFilename=URStaff-setup
+OutputBaseFilename=StaffDeck-setup
 SetupIconFile=..\assets\staffdeck.ico
 UninstallDisplayIcon={app}\staffdeck.exe
-UninstallDisplayName=URStaff
+UninstallDisplayName=StaffDeck
 Compression=lzma2
 SolidCompression=yes
 ArchitecturesInstallIn64BitMode=x64
@@ -25,12 +25,12 @@ DisableDirPage=no
 DisableProgramGroupPage=no
 DisableReadyPage=no
 VersionInfoVersion={#GetEnv('VERSION')}
-VersionInfoProductName=URStaff
+VersionInfoProductName=StaffDeck
 VersionInfoProductVersion={#GetEnv('VERSION')}
-VersionInfoCompany=URStaff
-VersionInfoDescription=URStaff Installer
+VersionInfoCompany=StaffDeck
+VersionInfoDescription=StaffDeck Installer
 #if GetEnv('WINDOWS_SIGN_ENABLED') == '1'
-SignTool=urstaff
+SignTool=staffdeck
 SignedUninstaller=yes
 #endif
 
@@ -39,8 +39,8 @@ SignedUninstaller=yes
 Source: "..\out\staffdeck\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{group}\URStaff"; Filename: "{app}\staffdeck.exe"; AppUserModelID: "ai.urstaff.desktop"
-Name: "{autodesktop}\URStaff"; Filename: "{app}\staffdeck.exe"; AppUserModelID: "ai.urstaff.desktop"
+Name: "{group}\StaffDeck"; Filename: "{app}\staffdeck.exe"; AppUserModelID: "ai.staffdeck.desktop"
+Name: "{autodesktop}\StaffDeck"; Filename: "{app}\staffdeck.exe"; AppUserModelID: "ai.staffdeck.desktop"
 
 [Run]
-Filename: "{app}\staffdeck.exe"; Description: "启动 URStaff"; Flags: postinstall nowait skipifsilent
+Filename: "{app}\staffdeck.exe"; Description: "启动 StaffDeck"; Flags: postinstall nowait skipifsilent

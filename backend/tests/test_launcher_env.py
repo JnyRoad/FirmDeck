@@ -7,7 +7,14 @@ import desktop_launcher
 
 @pytest.fixture(autouse=True)
 def _clean_runtime_env():
-    keys = ("TOOL_BASE_URL", "CORS_ORIGINS", "ULTRARAG_PORT", "ULTRARAG_DOTENV")
+    keys = (
+        "TOOL_BASE_URL",
+        "CORS_ORIGINS",
+        "ULTRARAG_PORT",
+        "ULTRARAG_PORT_RANGE_START",
+        "ULTRARAG_PORT_RANGE_END",
+        "ULTRARAG_DOTENV",
+    )
     saved = {k: os.environ.get(k) for k in keys}
     for k in keys:
         os.environ.pop(k, None)
@@ -22,16 +29,14 @@ def _clean_runtime_env():
 def test_launcher_sets_tool_base_url_to_actual_port(monkeypatch) -> None:
     monkeypatch.delenv("TOOL_BASE_URL", raising=False)
     monkeypatch.delenv("CORS_ORIGINS", raising=False)
-    monkeypatch.setenv("ULTRARAG_PORT", "6123")
-    desktop_launcher.apply_runtime_env()
+    desktop_launcher.apply_runtime_env({"app": "single_port_app:app", "host": "127.0.0.1", "port": 6123})
     assert os.environ["TOOL_BASE_URL"] == "http://127.0.0.1:6123"
     assert "http://127.0.0.1:6123" in os.environ["CORS_ORIGINS"]
 
 
 def test_launcher_respects_user_tool_base_url(monkeypatch) -> None:
     monkeypatch.setenv("TOOL_BASE_URL", "http://example.com")
-    monkeypatch.setenv("ULTRARAG_PORT", "6123")
-    desktop_launcher.apply_runtime_env()
+    desktop_launcher.apply_runtime_env({"app": "single_port_app:app", "host": "127.0.0.1", "port": 6123})
     assert os.environ["TOOL_BASE_URL"] == "http://example.com"
 
 
@@ -39,8 +44,7 @@ def test_config_reads_new_port_after_apply(monkeypatch) -> None:
     from app.config import get_settings
     monkeypatch.delenv("TOOL_BASE_URL", raising=False)
     monkeypatch.delenv("CORS_ORIGINS", raising=False)
-    monkeypatch.setenv("ULTRARAG_PORT", "6123")
-    desktop_launcher.apply_runtime_env()
+    desktop_launcher.apply_runtime_env({"app": "single_port_app:app", "host": "127.0.0.1", "port": 6123})
     get_settings.cache_clear()
     try:
         assert get_settings().normalized_tool_base_url.endswith(":6123")
@@ -51,8 +55,7 @@ def test_config_reads_new_port_after_apply(monkeypatch) -> None:
 def test_cors_includes_new_port_origin(monkeypatch) -> None:
     from app.config import get_settings
     monkeypatch.delenv("CORS_ORIGINS", raising=False)
-    monkeypatch.setenv("ULTRARAG_PORT", "6123")
-    desktop_launcher.apply_runtime_env()
+    desktop_launcher.apply_runtime_env({"app": "single_port_app:app", "host": "127.0.0.1", "port": 6123})
     get_settings.cache_clear()
     try:
         assert "http://127.0.0.1:6123" in get_settings().cors_origin_list

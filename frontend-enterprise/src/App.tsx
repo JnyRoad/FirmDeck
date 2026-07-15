@@ -18,6 +18,7 @@ import {
   type EnterpriseAuthUser,
 } from "./auth";
 import AppSidebar from "./components/AppSidebar";
+import OnboardingGuide from "./components/OnboardingGuide";
 import StaffdeckIcon from "./components/StaffdeckIcon";
 import { SidebarProvider } from "@/components/ui/sidebar";
 import { EnterpriseRoute } from "./enums/routes";
@@ -915,6 +916,7 @@ export default function App() {
             }
           />
         </Routes>
+        {auth && authChecked ? <OnboardingGuide /> : null}
       </BrowserRouter>
       <Toaster richColors closeButton position="top-center" />
     </TooltipProvider>

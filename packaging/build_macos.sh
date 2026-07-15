@@ -38,11 +38,11 @@ if ! .venv/bin/python -c "import AppKit" >/dev/null 2>&1; then
   fi
 fi
 
-echo "==> [3/5] PyInstaller 打包（spec 在 macOS 下同时产出 URStaff.app）"
+echo "==> [3/5] PyInstaller 打包（spec 在 macOS 下同时产出 StaffDeck.app）"
 .venv/bin/pyinstaller ../packaging/ultrarag.spec --noconfirm \
   --distpath ../packaging/out --workpath ../packaging/build
 cd "$REPO"
-APP="packaging/out/URStaff.app"
+APP="packaging/out/StaffDeck.app"
 test -d "$APP" || { echo "PyInstaller 未产出 $APP"; exit 1; }
 
 echo "==> [4/5] 附带 python 运行时（放 .app/Contents/Resources/runtime）"
@@ -69,16 +69,34 @@ else
   echo "警告：密封校验未过，双击可能无法打开"
 fi
 
-DMG="packaging/out/URStaff-${VERSION}-macos-${ARCH}.dmg"
+DMG="packaging/out/StaffDeck-${VERSION}-macos-${ARCH}.dmg"
+DMG_ROOT="packaging/out/dmg-root"
+DMG_BACKGROUND="packaging/build/staffdeck-dmg-background.png"
 rm -f "$DMG"
+rm -f "packaging/out/rw."*"StaffDeck-${VERSION}-macos-${ARCH}.dmg" 2>/dev/null || true
+rm -rf "$DMG_ROOT"
+mkdir -p "$DMG_ROOT"
+ditto "$APP" "$DMG_ROOT/StaffDeck.app"
+python3 packaging/make_dmg_background.py "$DMG_BACKGROUND"
+
 if command -v create-dmg >/dev/null 2>&1; then
-  create-dmg --volname "URStaff" --window-size 520 320 \
-    --app-drop-link 380 170 --icon "URStaff.app" 140 170 \
+  LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8 create-dmg --volname "StaffDeck" \
+    --window-pos 120 100 --window-size 640 360 \
+    --background "$DMG_BACKGROUND" \
+    --icon-size 96 --text-size 13 \
+    --icon "StaffDeck.app" 180 180 \
+    --hide-extension "StaffDeck.app" \
+    --app-drop-link 460 175 \
+    --app-drop-link-name "Applications" \
     --volicon "packaging/assets/staffdeck.icns" \
-    "$DMG" "$APP" \
-    || hdiutil create -volname URStaff -srcfolder "$APP" -ov -format UDZO "$DMG"
+    --no-internet-enable --overwrite \
+    "$DMG" "$DMG_ROOT" \
+    || { ln -s /Applications "$DMG_ROOT/Applications"; hdiutil create -volname StaffDeck -srcfolder "$DMG_ROOT" -ov -format UDZO "$DMG"; }
 else
-  hdiutil create -volname URStaff -srcfolder "$APP" -ov -format UDZO "$DMG"
+  ln -s /Applications "$DMG_ROOT/Applications"
+  hdiutil create -volname StaffDeck -srcfolder "$DMG_ROOT" -ov -format UDZO "$DMG"
 fi
+rm -rf "$DMG_ROOT"
+rm -f "packaging/out/rw."*"StaffDeck-${VERSION}-macos-${ARCH}.dmg" 2>/dev/null || true
 echo "built $DMG"
 ls -lh "$DMG"

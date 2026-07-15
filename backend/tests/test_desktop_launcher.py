@@ -1,9 +1,16 @@
 import desktop_launcher
 
 
+def _clear_port_env(monkeypatch) -> None:
+    monkeypatch.delenv("ULTRARAG_PORT", raising=False)
+    monkeypatch.delenv("ULTRARAG_PORT_RANGE_START", raising=False)
+    monkeypatch.delenv("ULTRARAG_PORT_RANGE_END", raising=False)
+
+
 def test_build_server_config_defaults(monkeypatch) -> None:
     monkeypatch.delenv("ULTRARAG_HOST", raising=False)
-    monkeypatch.delenv("ULTRARAG_PORT", raising=False)
+    _clear_port_env(monkeypatch)
+    monkeypatch.setattr(desktop_launcher, "port_in_use", lambda _host, _port: False)
     cfg = desktop_launcher.build_server_config()
     assert cfg["host"] == "127.0.0.1"
     assert cfg["port"] == 5173
@@ -11,13 +18,86 @@ def test_build_server_config_defaults(monkeypatch) -> None:
 
 
 def test_build_server_config_env_override(monkeypatch) -> None:
+    _clear_port_env(monkeypatch)
     monkeypatch.setenv("ULTRARAG_PORT", "6000")
+    monkeypatch.setattr(desktop_launcher, "port_in_use", lambda _host, _port: False)
     cfg = desktop_launcher.build_server_config()
     assert cfg["port"] == 6000
 
 
+def test_build_server_config_uses_next_port_in_range(monkeypatch) -> None:
+    _clear_port_env(monkeypatch)
+    monkeypatch.setattr(desktop_launcher, "port_in_use", lambda _host, port: port == 5173)
+    cfg = desktop_launcher.build_server_config()
+    assert cfg["port"] == 5174
+
+
+def test_build_server_config_honors_custom_port_range(monkeypatch) -> None:
+    _clear_port_env(monkeypatch)
+    monkeypatch.setenv("ULTRARAG_PORT_RANGE_START", "6200")
+    monkeypatch.setenv("ULTRARAG_PORT_RANGE_END", "6202")
+    monkeypatch.setattr(desktop_launcher, "port_in_use", lambda _host, port: port in {6200, 6201})
+    cfg = desktop_launcher.build_server_config()
+    assert cfg["port"] == 6202
+
+
+def test_explicit_port_is_tried_before_range(monkeypatch) -> None:
+    _clear_port_env(monkeypatch)
+    monkeypatch.setenv("ULTRARAG_PORT", "7000")
+    monkeypatch.setenv("ULTRARAG_PORT_RANGE_START", "5173")
+    monkeypatch.setenv("ULTRARAG_PORT_RANGE_END", "5174")
+    checked_ports = []
+
+    def fake_port_in_use(_host, port):
+        checked_ports.append(port)
+        return port == 7000
+
+    monkeypatch.setattr(desktop_launcher, "port_in_use", fake_port_in_use)
+    cfg = desktop_launcher.build_server_config()
+    assert checked_ports == [7000, 5173]
+    assert cfg["port"] == 5173
+
+
 def test_port_in_use_false_for_unused_port() -> None:
     assert desktop_launcher.port_in_use("127.0.0.1", 59999) is False
+
+
+def test_health_requires_staffdeck_marker(monkeypatch) -> None:
+    class FakeResponse:
+        def __init__(self, payload: bytes):
+            self.payload = payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self) -> bytes:
+            return self.payload
+
+    def fake_urlopen(url, timeout):
+        assert url == "http://127.0.0.1:5173/api/health"
+        assert timeout == 1
+        return FakeResponse(b'{"status":"ok","app":"StaffDeck"}')
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    assert desktop_launcher._health_ok("http://127.0.0.1:5173") is True
+
+
+def test_health_rejects_other_local_service(monkeypatch) -> None:
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self) -> bytes:
+            return b'{"status":"ok"}'
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda *_args, **_kwargs: FakeResponse())
+    assert desktop_launcher._health_ok("http://127.0.0.1:5175") is False
 
 
 def test_windows_taskbar_app_only_used_for_frozen_windows(monkeypatch) -> None:

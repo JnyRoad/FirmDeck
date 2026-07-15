@@ -1,18 +1,27 @@
 from __future__ import annotations
 
 import os
+import json
 import socket
 import sys
 import threading
 import time
 import webbrowser
 
+APP_NAME = "StaffDeck"
+APP_ID = "ai.staffdeck.desktop"
+APP_VERSION = "0.1.0"
+DEFAULT_PORT_RANGE_START = 5173
+DEFAULT_PORT_RANGE_END = 5199
+_MACOS_DELEGATE_REF = None
+
 
 def build_server_config() -> dict:
+    host = os.environ.get("ULTRARAG_HOST", "127.0.0.1")
     return {
         "app": "single_port_app:app",
-        "host": os.environ.get("ULTRARAG_HOST", "127.0.0.1"),
-        "port": int(os.environ.get("ULTRARAG_PORT", "5173")),
+        "host": host,
+        "port": find_available_port(host),
     }
 
 
@@ -32,18 +41,18 @@ def _redirect_logs_when_frozen() -> None:
         log_file = open(log_path, "w", buffering=1, encoding="utf-8")
         sys.stdout = log_file
         sys.stderr = log_file
-        print(f"URStaff session started: pid={os.getpid()}")
+        print(f"{APP_NAME} session started: pid={os.getpid()}")
     except Exception:
         pass
 
 
-def apply_runtime_env() -> None:
+def apply_runtime_env(cfg: dict | None = None) -> None:
     # 时序契约：必须在任何 app.config 被 import 之前调用；仅 frozen 态断言，
     # 开发/测试进程通常已 import 过 app.config，无条件断言会误炸。
     if getattr(sys, "frozen", False):
         assert "app.config" not in sys.modules, "apply_runtime_env 必须在 import app.* 之前调用"
 
-    cfg = build_server_config()
+    cfg = cfg or build_server_config()
     origin = f"http://{cfg['host']}:{cfg['port']}"
     os.environ.setdefault("TOOL_BASE_URL", origin)
     existing_cors = os.environ.get("CORS_ORIGINS", "")
@@ -62,16 +71,65 @@ def port_in_use(host: str, port: int) -> bool:
         return sock.connect_ex((host, port)) == 0
 
 
-def _open_browser_when_ready(url: str) -> None:
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} 必须是整数，当前值：{raw!r}") from exc
+
+
+def _port_candidates() -> list[int]:
+    start = _env_int("ULTRARAG_PORT_RANGE_START", DEFAULT_PORT_RANGE_START)
+    end = _env_int("ULTRARAG_PORT_RANGE_END", DEFAULT_PORT_RANGE_END)
+    if start > end:
+        start, end = end, start
+
+    candidates = list(range(start, end + 1))
+    explicit = os.environ.get("ULTRARAG_PORT")
+    if explicit:
+        port = _env_int("ULTRARAG_PORT", DEFAULT_PORT_RANGE_START)
+        candidates = [port] + [candidate for candidate in candidates if candidate != port]
+    return candidates
+
+
+def find_available_port(host: str) -> int:
+    for port in _port_candidates():
+        if not port_in_use(host, port):
+            return port
+    first, last = _port_candidates()[0], _port_candidates()[-1]
+    raise RuntimeError(f"{APP_NAME} 可用端口耗尽：{first}-{last} 都已被占用")
+
+
+def _health_ok(url: str) -> bool:
     import urllib.request
 
+    try:
+        with urllib.request.urlopen(url + "/api/health", timeout=1) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        return payload.get("status") == "ok" and payload.get("app") == APP_NAME
+    except Exception:
+        return False
+
+
+def _find_existing_app_url(host: str) -> str | None:
+    for port in _port_candidates():
+        if not port_in_use(host, port):
+            continue
+        url = f"http://{host}:{port}"
+        if _health_ok(url):
+            return url
+    return None
+
+
+def _open_browser_when_ready(url: str) -> None:
     for _ in range(120):
-        try:
-            with urllib.request.urlopen(url + "/api/health", timeout=1):
-                _open_browser(url + "/chat/")
-                return
-        except Exception:
-            time.sleep(0.5)
+        if _health_ok(url):
+            _open_browser(url + "/chat/")
+            return
+        time.sleep(0.5)
 
 
 def _open_browser(target: str) -> None:
@@ -104,18 +162,19 @@ def _serve(cfg: dict) -> None:
 
 
 def _run_macos_dock_app(cfg: dict, url: str) -> int:
-    """macOS：NSApplication 主循环。进 Dock、点 Dock 图标重新打开浏览器、退出时停服务。"""
+    """macOS：NSApplication 主循环。进 Dock/菜单栏，点入口重新打开浏览器。"""
     import AppKit
     from PyObjCTools import AppHelper
 
-    # uvicorn 在后台线程跑（主线程要留给 Cocoa 事件循环）
-    server_thread = threading.Thread(target=_serve, args=(cfg,), daemon=True)
-    server_thread.start()
-    threading.Thread(target=_open_browser_when_ready, args=(url,), daemon=True).start()
+    global _MACOS_DELEGATE_REF
 
     class AppDelegate(AppKit.NSObject):
         def applicationDidFinishLaunching_(self, _notification):  # noqa: N802
-            print(f"URStaff 启动中，就绪后将打开：{url}/chat/")
+            self.dock_visible = True
+            self.server_started = False
+            self._install_status_menu()
+            self._start_server()
+            print(f"{APP_NAME} 启动中，就绪后将打开：{url}/chat/")
 
         def applicationShouldHandleReopen_hasVisibleWindows_(self, _app, _flag):  # noqa: N802
             # 点 Dock 图标（app 已在运行）→ 打开浏览器页面（新标签）
@@ -125,10 +184,94 @@ def _run_macos_dock_app(cfg: dict, url: str) -> int:
         def applicationShouldTerminate_(self, _app):  # noqa: N802
             return AppKit.NSTerminateNow
 
+        def applicationDockMenu_(self, _sender):  # noqa: N802
+            # 右键 Dock 图标时展示同一套控制入口。
+            self.dock_context_menu, self.dock_context_dock_item = self._build_control_menu()
+            return self.dock_context_menu
+
+        def openStaffDeck_(self, _sender):  # noqa: N802
+            _open_browser(url + "/chat/")
+
+        def restartStaffDeck_(self, _sender):  # noqa: N802
+            os.execv(sys.executable, [sys.executable] + sys.argv[1:])
+
+        def toggleDockIcon_(self, _sender):  # noqa: N802
+            app = AppKit.NSApplication.sharedApplication()
+            if self.dock_visible:
+                app.setActivationPolicy_(AppKit.NSApplicationActivationPolicyAccessory)
+                self.dock_visible = False
+                if hasattr(self, "status_dock_item"):
+                    self.status_dock_item.setTitle_("显示 Dock 图标")
+            else:
+                app.setActivationPolicy_(AppKit.NSApplicationActivationPolicyRegular)
+                app.activateIgnoringOtherApps_(True)
+                self.dock_visible = True
+                if hasattr(self, "status_dock_item"):
+                    self.status_dock_item.setTitle_("隐藏 Dock 图标")
+
+        def showAbout_(self, _sender):  # noqa: N802
+            alert = AppKit.NSAlert.alloc().init()
+            alert.setMessageText_(APP_NAME)
+            alert.setInformativeText_(f"版本：{APP_VERSION}\n本地服务：{url}")
+            alert.addButtonWithTitle_("好")
+            alert.runModal()
+
+        def quitStaffDeck_(self, _sender):  # noqa: N802
+            AppKit.NSApplication.sharedApplication().terminate_(self)
+
+        def _start_server(self) -> None:
+            if self.server_started:
+                return
+            self.server_started = True
+            # uvicorn 在后台线程跑（主线程要留给 Cocoa 事件循环）。这里必须等
+            # NSApplication 完成注册后再启动，避免 LaunchServices 初始化竞态导致 abort。
+            threading.Thread(target=_serve, args=(cfg,), daemon=True).start()
+            threading.Thread(target=_open_browser_when_ready, args=(url,), daemon=True).start()
+
+        def _menu_item(self, title: str, action: str | None = None, enabled: bool = True):
+            item = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, None, "")
+            item.setEnabled_(enabled)
+            if action:
+                item.setTarget_(self)
+                item.setAction_(action)
+            return item
+
+        def _dock_toggle_title(self) -> str:
+            return "隐藏 Dock 图标" if self.dock_visible else "显示 Dock 图标"
+
+        def _build_control_menu(self):
+            menu = AppKit.NSMenu.alloc().initWithTitle_(APP_NAME)
+            menu.addItem_(self._menu_item("状态：运行中", enabled=False))
+            menu.addItem_(self._menu_item(f"版本：{APP_VERSION}", enabled=False))
+            menu.addItem_(self._menu_item(f"端口：{cfg['port']}", enabled=False))
+            menu.addItem_(AppKit.NSMenuItem.separatorItem())
+            menu.addItem_(self._menu_item(f"打开 {APP_NAME}", "openStaffDeck:"))
+            menu.addItem_(self._menu_item("重启服务", "restartStaffDeck:"))
+            dock_item = self._menu_item(self._dock_toggle_title(), "toggleDockIcon:")
+            menu.addItem_(dock_item)
+            menu.addItem_(AppKit.NSMenuItem.separatorItem())
+            menu.addItem_(self._menu_item(f"关于 {APP_NAME}", "showAbout:"))
+            menu.addItem_(self._menu_item(f"退出 {APP_NAME}", "quitStaffDeck:"))
+            return menu, dock_item
+
+        def _install_status_menu(self) -> None:
+            self.status_item = AppKit.NSStatusBar.systemStatusBar().statusItemWithLength_(
+                AppKit.NSVariableStatusItemLength
+            )
+            button = self.status_item.button()
+            button.setTitle_(APP_NAME)
+            button.setToolTip_(APP_NAME)
+
+            menu, self.status_dock_item = self._build_control_menu()
+            self.status_item.setMenu_(menu)
+            self.status_menu = menu
+
     app = AppKit.NSApplication.sharedApplication()
     # Regular：常规 GUI app，进 Dock、可激活
     app.setActivationPolicy_(AppKit.NSApplicationActivationPolicyRegular)
     delegate = AppDelegate.alloc().init()
+    # PyObjC 不总是按 Python 预期保留 delegate，模块级引用保证菜单和事件代理常驻。
+    _MACOS_DELEGATE_REF = delegate
     app.setDelegate_(delegate)
     app.activateIgnoringOtherApps_(True)
     AppHelper.runEventLoop()
@@ -136,7 +279,7 @@ def _run_macos_dock_app(cfg: dict, url: str) -> int:
 
 
 def _run_windows_taskbar_app(cfg: dict, url: str) -> int:
-    """Run the server behind a native window so URStaff owns a taskbar icon."""
+    """Run the server behind a native window so StaffDeck owns a taskbar icon."""
     import ctypes
     from ctypes import wintypes
 
@@ -223,7 +366,7 @@ def _run_windows_taskbar_app(cfg: dict, url: str) -> int:
     user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT]
     user32.GetMessageW.restype = wintypes.BOOL
 
-    shell32.SetCurrentProcessExplicitAppUserModelID("ai.urstaff.desktop")
+    shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)
     large_icon = wintypes.HICON()
     small_icon = wintypes.HICON()
     shell32.ExtractIconExW(sys.executable, 0, ctypes.byref(large_icon), ctypes.byref(small_icon), 1)
@@ -231,7 +374,7 @@ def _run_windows_taskbar_app(cfg: dict, url: str) -> int:
     @WNDPROC
     def window_proc(hwnd, message, wparam, lparam):
         if _is_windows_restore_command(message, wparam):
-            print("Taskbar activated; opening URStaff in the system default browser.")
+            print(f"Taskbar activated; opening {APP_NAME} in the system default browser.")
             _open_browser(url + "/chat/")
             user32.ShowWindow(hwnd, SW_SHOWMINNOACTIVE)
             return 0
@@ -241,7 +384,7 @@ def _run_windows_taskbar_app(cfg: dict, url: str) -> int:
         return user32.DefWindowProcW(hwnd, message, wparam, lparam)
 
     instance = kernel32.GetModuleHandleW(None)
-    class_name = "URStaffDesktopWindow"
+    class_name = "StaffDeckDesktopWindow"
     window_class = WNDCLASSW()
     window_class.lpfnWndProc = window_proc
     window_class.hInstance = instance
@@ -257,7 +400,7 @@ def _run_windows_taskbar_app(cfg: dict, url: str) -> int:
     hwnd = user32.CreateWindowExW(
         WS_EX_APPWINDOW,
         class_name,
-        "URStaff",
+        APP_NAME,
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT,
         CW_USEDEFAULT,
@@ -300,25 +443,20 @@ def _run_windows_taskbar_app(cfg: dict, url: str) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    # 时序：先设 env（apply_runtime_env），再 import uvicorn / 触发 app.* import。
-    apply_runtime_env()
-
-    cfg = build_server_config()
-    url = f"http://{cfg['host']}:{cfg['port']}"
-
-    # 已在运行：直接开浏览器并退出（双击重复启动的兜底）
-    if port_in_use(cfg["host"], cfg["port"]):
-        try:
-            import urllib.request
-            with urllib.request.urlopen(url + "/api/health", timeout=1):
-                print(f"URStaff 已在运行：{url}/chat/")
-                _open_browser(url + "/chat/")
-                return 0
-        except Exception:
-            print(f"端口 {cfg['port']} 已被其它程序占用。请设置 ULTRARAG_PORT 换端口后重试。", file=sys.stderr)
-            return 2
-
     _redirect_logs_when_frozen()
+
+    host = os.environ.get("ULTRARAG_HOST", "127.0.0.1")
+    if not _use_macos_dock_app():
+        existing_url = _find_existing_app_url(host)
+        if existing_url:
+            print(f"{APP_NAME} 已在运行：{existing_url}/chat/")
+            _open_browser(existing_url + "/chat/")
+            return 0
+
+    # 时序：先选定端口并设 env，再 import uvicorn / 触发 app.* import。
+    cfg = build_server_config()
+    apply_runtime_env(cfg)
+    url = f"http://{cfg['host']}:{cfg['port']}"
 
     if _use_macos_dock_app():
         return _run_macos_dock_app(cfg, url)
@@ -327,7 +465,7 @@ def main(argv: list[str] | None = None) -> int:
         return _run_windows_taskbar_app(cfg, url)
 
     # 其它平台 / 开发态：主线程跑 uvicorn，后台线程开浏览器
-    print(f"URStaff 启动中，就绪后将打开：{url}/chat/")
+    print(f"{APP_NAME} 启动中，就绪后将打开：{url}/chat/")
     threading.Thread(target=_open_browser_when_ready, args=(url,), daemon=True).start()
     _serve(cfg)
     return 0

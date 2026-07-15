@@ -1,6 +1,6 @@
 # Windows code signing
 
-URStaff uses Authenticode signing for the packaged application, the Inno Setup
+StaffDeck uses Authenticode signing for the packaged application, the Inno Setup
 uninstaller, and the final installer. Signing is optional for local builds but
 should be enabled for public releases.
 
@@ -23,7 +23,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File packaging\build_windows.
 ## PFX file
 
 ```powershell
-$env:WINDOWS_PFX_PATH = "C:\secure\urstaff-code-signing.pfx"
+$env:WINDOWS_PFX_PATH = "C:\secure\staffdeck-code-signing.pfx"
 $env:WINDOWS_PFX_PASSWORD = "<secret>"
 $env:VERSION = "0.1.0"
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File packaging\build_windows.ps1

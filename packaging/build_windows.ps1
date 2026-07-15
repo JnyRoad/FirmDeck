@@ -107,14 +107,14 @@ if (-not $iscc) {
   throw "Inno Setup 6 was not found. Install it or set ISCC to the full path of ISCC.exe."
 }
 Write-Host "Using Inno Setup: $iscc"
-$unsignedInstaller = "packaging\out\URStaff-setup.exe"
+$unsignedInstaller = "packaging\out\StaffDeck-setup.exe"
 if (Test-Path $unsignedInstaller) {
   Remove-Item -Force $unsignedInstaller
 }
 if ($signingConfigured) {
   $signScript = (Resolve-Path packaging\sign_windows.ps1).Path
   $signCommand = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$signScript`" -FilePath `$f"
-  & "$iscc" "/Surstaff=$signCommand" packaging\installer\ultrarag.iss
+  & "$iscc" "/Sstaffdeck=$signCommand" packaging\installer\ultrarag.iss
 } else {
   & "$iscc" packaging\installer\ultrarag.iss
 }
@@ -124,7 +124,7 @@ if (-not (Test-Path $unsignedInstaller)) {
 }
 
 Write-Host "==> [6/6] Name the release artifact"
-$out = "packaging\out\URStaff-$($env:VERSION)-windows-x64-setup.exe"
+$out = "packaging\out\StaffDeck-$($env:VERSION)-windows-x64-setup.exe"
 if (Test-Path $out) { Remove-Item -Force $out }
 Rename-Item $unsignedInstaller $out
 if ($signingConfigured) {
@@ -135,4 +135,4 @@ if ($signingConfigured) {
   Write-Host "Authenticode signature valid: $($signature.SignerCertificate.Subject)"
 }
 Write-Host "built $out"
-Get-ChildItem packaging\out\URStaff-*-windows-x64-setup.exe
+Get-ChildItem packaging\out\StaffDeck-*-windows-x64-setup.exe

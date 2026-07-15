@@ -20,6 +20,7 @@ if sys.platform == "win32" and ICO.exists():
 datas = [
     (str(DIST), "frontend-enterprise/dist"),
     (str(BACKEND / "app" / "llm" / "prompts"), "app/llm/prompts"),
+    (str(BACKEND / "app" / "db" / "seed_fixtures"), "app/db/seed_fixtures"),
     (str(BACKEND / "mock_servers"), "mock_servers"),
 ]
 
@@ -37,7 +38,7 @@ hiddenimports = (
     ]
 )
 
-# macOS：Dock 壳需要 pyobjc（AppKit + PyObjCTools）
+# macOS：Dock/菜单栏壳需要 pyobjc（AppKit + PyObjCTools）
 if sys.platform == "darwin":
     hiddenimports = hiddenimports + collect_submodules("objc") + [
         "AppKit", "Foundation", "PyObjCTools", "PyObjCTools.AppHelper",
@@ -66,12 +67,12 @@ coll = COLLECT(exe, a.binaries, a.datas, strip=False, upx=False, name="staffdeck
 if sys.platform == "darwin":
     app = BUNDLE(
         coll,
-        name="URStaff.app",
+        name="StaffDeck.app",
         icon=str(ICNS) if ICNS.exists() else None,
-        bundle_identifier="ai.urstaff.desktop",
+        bundle_identifier="ai.staffdeck.desktop",
         info_plist={
-            "CFBundleName": "URStaff",
-            "CFBundleDisplayName": "URStaff",
+            "CFBundleName": "StaffDeck",
+            "CFBundleDisplayName": "StaffDeck",
             # 可执行名保持 staffdeck（COLLECT/EXE 名 + build 脚本按此路径拷 runtime）
             "CFBundleExecutable": "staffdeck",
             "CFBundleShortVersionString": "0.1.0",
