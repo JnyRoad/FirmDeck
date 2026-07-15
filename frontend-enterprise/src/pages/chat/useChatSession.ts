@@ -1865,10 +1865,10 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       skills
         .map((entry) => normalizeTraceSkill(entry))
         .filter((entry): entry is NonNullable<typeof entry> => Boolean(entry))
-        .forEach((skill) => {
+        .forEach((skill, index) => {
           const label = streamSkillLabel(item.data, skill);
           upsertVisibleTraceLine({
-            id: `skill_${skill.skillId}_${skill.state || 'active'}`,
+            id: `skill_state_${skill.skillId}_${skill.state || 'active'}_${index}`,
             kind: 'skill',
             text: `${label} ${skill.name || skill.skillId}`,
             detail: skill.stepId ? `当前步骤 ${skill.stepId}` : undefined,
@@ -2482,9 +2482,11 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
           unseenEventsByTurn.set(eventTurnId, bucket);
         });
         unseenEvents.forEach((event) => {
-          scheduledEventIdsRef.current.add(event.id);
           const eventTurnId = eventTraceTurnId(event);
           if (!eventTurnId) return;
+          const liveSseOwnsTurn = Boolean(stream.abortController && stream.turnId === eventTurnId);
+          if (liveSseOwnsTurn) return;
+          scheduledEventIdsRef.current.add(event.id);
           const terminalEvent = isTerminalSessionEvent(event, isTerminalEvent);
           const hasFinalAssistant = hasAssistantMessageForTurn(slot, eventTurnId);
           if (event.event === 'assistant_message_created') {
@@ -2499,16 +2501,12 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
             syncTurnUntilAssistant(id, eventTurnId);
           }
           const streamEvent = normalizeSessionEventForStream(event);
-          const liveSseOwnsTurn = Boolean(stream.abortController && stream.turnId === eventTurnId);
-          if (liveSseOwnsTurn && STREAM_TEXT_EVENTS.has(streamEvent.event)) {
-            return;
-          }
-          if (!liveSseOwnsTurn && recoveringTurnId && eventTurnId === recoveringTurnId && STREAM_TEXT_EVENTS.has(streamEvent.event)) {
+          if (recoveringTurnId && eventTurnId === recoveringTurnId && STREAM_TEXT_EVENTS.has(streamEvent.event)) {
             return;
           }
           const turnEvents = unseenEventsByTurn.get(eventTurnId) || [event];
           const hasTurnProgress = hasRecoverableEventProgress(turnEvents);
-          if (hasAssistantCarrierForTurn(slot, eventTurnId) && !liveSseOwnsTurn) return;
+          if (hasAssistantCarrierForTurn(slot, eventTurnId)) return;
           if (!stream.turnId && !terminalEvent && hasTurnProgress) {
             stream.turnId = eventTurnId;
           }

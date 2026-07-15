@@ -2868,6 +2868,9 @@ def _event_trace_line(
         }
     if event.event_type == "skill_state":
         lines = []
+        runtime_decision = str(payload.get("runtimeDecision") or "").strip()
+        from_skill_id = str(payload.get("fromSkillId") or "").strip()
+        to_skill_id = str(payload.get("toSkillId") or "").strip()
         for index, entry in enumerate(payload.get("currentSkills") or []):
             if not isinstance(entry, dict):
                 continue
@@ -2876,7 +2879,26 @@ def _event_trace_line(
                 continue
             name = str(entry.get("name") or skill_id).strip()
             state = str(entry.get("state") or "active").strip()
-            label = "挂起SOP" if state == "suspended" else "等待SOP" if state == "pending" else "执行SOP"
+            if state == "suspended":
+                label = "挂起SOP"
+            elif state == "pending":
+                label = "等待SOP"
+            elif runtime_decision in {"start_skill", "start_new_task"}:
+                label = "选择SOP"
+            elif runtime_decision == "suspend_current_and_start_new_skill":
+                label = "切换SOP"
+            elif (
+                runtime_decision
+                in {"answer_related_question_then_resume", "answer_chitchat_then_resume"}
+                and from_skill_id
+                and to_skill_id
+                and from_skill_id != to_skill_id
+            ):
+                label = "切换SOP"
+            elif runtime_decision == "exit_current_skill":
+                label = "恢复SOP"
+            else:
+                label = "推进SOP"
             step_id = str(entry.get("stepId") or "").strip()
             lines.append(
                 {
@@ -2944,6 +2966,13 @@ def _event_trace_line(
     if event.event_type in {"skill_started", "skill_resumed", "skill_step_changed"}:
         to_skill_id = str(payload.get("to_skill_id") or "")
         from_skill_id = str(payload.get("from_skill_id") or "")
+        if (
+            event.event_type == "skill_step_changed"
+            and from_skill_id == to_skill_id
+            and str(payload.get("from_step_id") or "")
+            == str(payload.get("to_step_id") or "")
+        ):
+            return None
         skill_id = to_skill_id or from_skill_id or (skill_hint or "")
         if not skill_id:
             return None

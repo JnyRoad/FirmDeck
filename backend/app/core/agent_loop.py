@@ -6426,15 +6426,6 @@ class AgentLoop:
         before_step: str | None,
         decision: RouterDecision,
     ) -> None:
-        payload = {
-            "decision": decision.decision,
-            "from_skill_id": before_skill,
-            "to_skill_id": chat_session.active_skill_id,
-            "from_skill_version": self._skill_version(tenant_id, before_skill),
-            "to_skill_version": self._skill_version(tenant_id, chat_session.active_skill_id),
-            "from_step_id": before_step,
-            "to_step_id": chat_session.active_step_id,
-        }
         event_type = "skill_step_changed"
         if decision.decision == "start_new_task":
             event_type = "skill_started"
@@ -6444,6 +6435,23 @@ class AgentLoop:
             event_type = "skill_exited"
         elif decision.decision == "handoff_human":
             event_type = "handoff_triggered"
+
+        if (
+            event_type == "skill_step_changed"
+            and before_skill == chat_session.active_skill_id
+            and before_step == chat_session.active_step_id
+        ):
+            return
+
+        payload = {
+            "decision": decision.decision,
+            "from_skill_id": before_skill,
+            "to_skill_id": chat_session.active_skill_id,
+            "from_skill_version": self._skill_version(tenant_id, before_skill),
+            "to_skill_version": self._skill_version(tenant_id, chat_session.active_skill_id),
+            "from_step_id": before_step,
+            "to_step_id": chat_session.active_step_id,
+        }
         self.events.record(tenant_id, chat_session.id, event_type, payload)
 
     def _skill_version(self, tenant_id: str, skill_id: str | None) -> str | None:

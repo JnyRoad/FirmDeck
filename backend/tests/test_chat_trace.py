@@ -201,7 +201,13 @@ def test_turn_trace_recovers_persisted_skill_state_for_current_turn() -> None:
                         "name": "购买商品流程",
                         "stepId": "collect_user_name",
                         "state": "active",
-                    }
+                    },
+                    {
+                        "skillId": "skill_weather_001",
+                        "name": "天气查询流程",
+                        "stepId": "collect_city",
+                        "state": "pending",
+                    },
                 ],
                 "runtimeDecision": "start_new_task",
                 "user_message_id": "msg_user",
@@ -213,9 +219,57 @@ def test_turn_trace_recovers_persisted_skill_state_for_current_turn() -> None:
 
     traces = _build_turn_traces(messages, events, {"skill_purchase_001": "购买商品流程"})
 
-    skill_line = next(line for line in traces[0]["lines"] if line["kind"] == "skill")
-    assert skill_line["text"] == "执行SOP 购买商品流程"
-    assert skill_line["detail"] == "当前步骤 collect_user_name"
+    skill_lines = [line for line in traces[0]["lines"] if line["kind"] == "skill"]
+    assert skill_lines[0]["id"] == "skill_state_skill_purchase_001_active_0"
+    assert skill_lines[0]["text"] == "选择SOP 购买商品流程"
+    assert skill_lines[0]["detail"] == "当前步骤 collect_user_name"
+    assert skill_lines[1]["id"] == "skill_state_skill_weather_001_pending_1"
+    assert skill_lines[1]["text"] == "等待SOP 天气查询流程"
+
+
+def test_turn_trace_ignores_noop_skill_step_change() -> None:
+    started_at = datetime(2026, 7, 15, 12, 40, 14)
+    messages = [
+        Message(
+            id="msg_user",
+            tenant_id="tenant_demo",
+            session_id="session_test",
+            role="user",
+            content="我的工号是2472063",
+            created_at=started_at,
+        )
+    ]
+    events = [
+        AgentEvent(
+            tenant_id="tenant_demo",
+            session_id="session_test",
+            event_type="user_message_received",
+            payload_json={"message_id": "msg_user", "message": "我的工号是2472063"},
+            created_at=started_at,
+        ),
+        AgentEvent(
+            tenant_id="tenant_demo",
+            session_id="session_test",
+            event_type="skill_step_changed",
+            payload_json={
+                "decision": "continue_active",
+                "from_skill_id": "expense_travel_reimbursement",
+                "to_skill_id": "expense_travel_reimbursement",
+                "from_step_id": "collect_reimbursement_info",
+                "to_step_id": "collect_reimbursement_info",
+                "turn_id": "msg_user",
+            },
+            created_at=started_at + timedelta(seconds=1),
+        ),
+    ]
+
+    traces = _build_turn_traces(
+        messages,
+        events,
+        {"expense_travel_reimbursement": "差旅报销申请"},
+    )
+
+    assert not any(line["kind"] == "skill" for line in traces[0]["lines"])
 
 
 def test_message_read_hydrates_knowledge_citation_content_from_concept() -> None:
