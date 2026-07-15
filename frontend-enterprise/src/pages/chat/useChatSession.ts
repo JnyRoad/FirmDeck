@@ -711,7 +711,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     }
     setCollapsedTraceIds((current) => current.filter((item) => item !== turnId));
     setExpandedTraceIds((current) => (
-      current.includes(turnId) ? current.filter((item) => item !== turnId) : [...current, turnId]
+      current.includes(turnId) ? current : [...current, turnId]
     ));
   }, []);
 
@@ -1152,7 +1152,6 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
             storeChanged = upsertTraceStatusPlaceholder(slot, id, row.turn_id) || storeChanged;
             if (staleOpenTrace) {
               setExpandedTraceIds((expanded) => (expanded.includes(row.turn_id) ? expanded : [...expanded, row.turn_id]));
-              setCollapsedTraceIds((collapsed) => collapsed.filter((item) => item !== row.turn_id));
             }
           }
         });
@@ -1185,7 +1184,6 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
             storeChanged = upsertStreamingTracePlaceholder(slot, id, recoveredRunningTurnId) || storeChanged;
           }
           setExpandedTraceIds((expanded) => (expanded.includes(recoveredRunningTurnId) ? expanded : [...expanded, recoveredRunningTurnId]));
-          setCollapsedTraceIds((collapsed) => collapsed.filter((item) => item !== recoveredRunningTurnId));
         } else if (stream.turnId && !stream.loading) {
           streamChanged = true;
           stream.turnId = null;
