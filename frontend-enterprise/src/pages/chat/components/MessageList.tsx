@@ -96,9 +96,10 @@ export default function MessageList({ chat }: { chat: UseChatSession }) {
             || traceOnlyMessage
             || (latestAssistantTrace && recentlyStartedTrace),
           );
+          const manuallyCollapsed = collapsedTraceIds.includes(traceTurnId);
           const expanded = Boolean(
-            expandedTraceIds.includes(traceTurnId)
-            || (defaultExpanded && !collapsedTraceIds.includes(traceTurnId)),
+            !manuallyCollapsed
+            && (expandedTraceIds.includes(traceTurnId) || defaultExpanded),
           );
           const rawVisibleContent = staffdeckDisplayText(
             item.role === 'assistant' ? stripTrailingCitationSummary(item.content) : item.content,
