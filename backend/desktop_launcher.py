@@ -199,6 +199,12 @@ def _open_browser(target: str) -> None:
     webbrowser.open(target)
 
 
+def _four_char_code(value: str) -> int:
+    result = 0
+    for byte in value.encode("macroman"):
+        result = (result << 8) | byte
+    return result
+
 
 def _use_macos_dock_app() -> bool:
     # 仅 macOS 打包态用 Cocoa 壳（进 Dock + 点图标开页面）。
@@ -248,9 +254,16 @@ def _run_macos_dock_app(cfg: dict, url: str) -> int:
         def applicationDidFinishLaunching_(self, _notification):  # noqa: N802
             self.dock_visible = True
             self.server_started = False
+            self._install_url_scheme_handler()
             self._install_status_menu()
             self._start_server()
             print(f"{APP_NAME} 启动中，就绪后将打开：{url}/chat/")
+
+        def handleGetURLEvent_withReplyEvent_(self, event, _reply_event):  # noqa: N802
+            direct_object = event.descriptorForKeyword_(_four_char_code("----"))
+            deep_link = direct_object.stringValue() if direct_object is not None else ""
+            print(f"收到 {APP_NAME} URL Scheme 唤起：{deep_link or '<empty>'}")
+            threading.Thread(target=_open_browser_when_ready, args=(url,), daemon=True).start()
 
         def applicationShouldHandleReopen_hasVisibleWindows_(self, _app, _flag):  # noqa: N802
             # 点 Dock 图标（app 已在运行）→ 打开浏览器页面（新标签）
@@ -303,6 +316,15 @@ def _run_macos_dock_app(cfg: dict, url: str) -> int:
             # NSApplication 完成注册后再启动，避免 LaunchServices 初始化竞态导致 abort。
             threading.Thread(target=_serve, args=(cfg,), daemon=True).start()
             threading.Thread(target=_open_browser_when_ready, args=(url,), daemon=True).start()
+
+        def _install_url_scheme_handler(self) -> None:
+            manager = AppKit.NSAppleEventManager.sharedAppleEventManager()
+            manager.setEventHandler_andSelector_forEventClass_andEventID_(
+                self,
+                "handleGetURLEvent:withReplyEvent:",
+                _four_char_code("GURL"),
+                _four_char_code("GURL"),
+            )
 
         def _menu_item(self, title: str, action: str | None = None, enabled: bool = True):
             item = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, None, "")

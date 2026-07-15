@@ -38,6 +38,12 @@ SignedUninstaller=yes
 ; PyInstaller onedir 产物整体安装
 Source: "..\out\staffdeck\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs
 
+[Registry]
+Root: HKCU; Subkey: "Software\Classes\staffdeck"; ValueType: string; ValueData: "URL:StaffDeck Protocol"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\staffdeck"; ValueType: string; ValueName: "URL Protocol"; ValueData: ""
+Root: HKCU; Subkey: "Software\Classes\staffdeck\DefaultIcon"; ValueType: string; ValueData: "{app}\staffdeck.exe,0"
+Root: HKCU; Subkey: "Software\Classes\staffdeck\shell\open\command"; ValueType: string; ValueData: """{app}\staffdeck.exe"" ""%1"""
+
 [Icons]
 Name: "{group}\StaffDeck"; Filename: "{app}\staffdeck.exe"; AppUserModelID: "ai.staffdeck.desktop"
 Name: "{autodesktop}\StaffDeck"; Filename: "{app}\staffdeck.exe"; AppUserModelID: "ai.staffdeck.desktop"
