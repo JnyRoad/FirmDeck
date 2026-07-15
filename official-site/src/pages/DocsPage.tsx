@@ -4,6 +4,7 @@ import { Link, Navigate, useNavigate, useParams, useSearchParams } from 'react-r
 import BrandLogo from '@/components/BrandLogo';
 import GitHubMark from '@/components/GitHubMark';
 import PublicPageTabs from '@/components/PublicPageTabs';
+import { useI18n, type AppLocale } from '@/i18n';
 import { cn } from '@/lib/utils';
 
 import { tutorialNavGroups, tutorialPages, tutorialShared } from './tutorialDocs';
@@ -33,9 +34,11 @@ function renderPageHtml(html: string, lang: DocLang) {
 
 export default function DocsPage() {
   const navigate = useNavigate();
+  const { locale, setLocale } = useI18n();
   const { pageId = 'introduce' } = useParams();
   const [searchParams] = useSearchParams();
   const lang: DocLang = searchParams.get('lang')?.toLowerCase().startsWith('en') ? 'en' : 'zh';
+  const appLocale: AppLocale = lang === 'en' ? 'en-US' : 'zh-CN';
   const page = pageById[pageId];
 
   if (!page) return <Navigate to={`/docs/introduce?lang=${lang}`} replace />;
@@ -50,8 +53,13 @@ export default function DocsPage() {
   const pageHtml = renderPageHtml(page.content[lang], lang);
 
   const setLang = (nextLang: DocLang) => {
+    setLocale(nextLang === 'en' ? 'en-US' : 'zh-CN');
     navigate(`/docs/${page.id}?lang=${nextLang}`, { replace: true });
   };
+
+  useEffect(() => {
+    if (locale !== appLocale) setLocale(appLocale);
+  }, [appLocale, locale, setLocale]);
 
   useEffect(() => {
     if (!('scrollRestoration' in window.history)) return;
