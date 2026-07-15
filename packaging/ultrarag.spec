@@ -78,6 +78,12 @@ if sys.platform == "darwin":
             "CFBundleExecutable": "staffdeck",
             "CFBundleShortVersionString": "0.1.0",
             "CFBundleVersion": "0.1.0",
+            "CFBundleURLTypes": [
+                {
+                    "CFBundleURLName": "StaffDeck URL",
+                    "CFBundleURLSchemes": ["staffdeck"],
+                },
+            ],
             "NSHighResolutionCapable": True,
             # 显式声明为常规 GUI app：进 Dock、可激活（非后台/非 agent）
             "LSBackgroundOnly": False,

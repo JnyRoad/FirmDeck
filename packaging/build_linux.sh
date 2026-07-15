@@ -128,11 +128,12 @@ cat > "$STAGE/usr/share/applications/staffdeck.desktop" <<'DESK'
 [Desktop Entry]
 Name=StaffDeck
 Comment=StaffDeck desktop service
-Exec=staffdeck
+Exec=staffdeck %u
 Icon=staffdeck
 Terminal=false
 Type=Application
 Categories=Utility;
+MimeType=x-scheme-handler/staffdeck;
 StartupNotify=true
 DESK
 INSTALLED_SIZE="$(du -sk "$STAGE/opt/staffdeck" | cut -f1)"
