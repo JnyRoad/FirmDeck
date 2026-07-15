@@ -226,6 +226,8 @@ def test_seed_publishing_writes_explicit_admin_owner_without_backfilling_user_re
         assert deleted_binding.status == "deleted"
         assert custom_binding is None
         assert overall.metadata_json["owner_user_id"] == "admin"
+        assert default_agent.status == "archived"
+        assert default_agent.metadata_json["hidden_from_staffdeck"] is True
         assert default_agent.metadata_json["owner_user_id"] == "admin"
         assert user_agent.metadata_json == {"owner_user_id": "user_member"}
 
