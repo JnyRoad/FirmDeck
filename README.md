@@ -113,6 +113,8 @@ DETACH=1 scripts/dev_up.sh
 
 The script builds the StaffDeck frontend and serves the UI, API, and Swagger documentation from one FastAPI process on port `5173`.
 
+Initial administrator credentials: username `admin`, password `admin`. Please change the password after first login.
+
 ### 4. Verify the Installation
 
 ```bash

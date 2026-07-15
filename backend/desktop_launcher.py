@@ -4,9 +4,11 @@ import os
 import json
 import socket
 import sys
+import tempfile
 import threading
 import time
 import webbrowser
+from pathlib import Path
 
 APP_NAME = "StaffDeck"
 APP_ID = "ai.staffdeck.desktop"
@@ -14,6 +16,8 @@ APP_VERSION = "0.1.0"
 DEFAULT_PORT_RANGE_START = 5173
 DEFAULT_PORT_RANGE_END = 5199
 _MACOS_DELEGATE_REF = None
+_MACOS_INSTANCE_LOCK_HANDLE = None
+STAFFDECK_ICON_PNG = ("packaging", "assets", "staffdeck.png")
 
 
 def build_server_config() -> dict:
@@ -103,6 +107,29 @@ def find_available_port(host: str) -> int:
     raise RuntimeError(f"{APP_NAME} 可用端口耗尽：{first}-{last} 都已被占用")
 
 
+def _resource_path(*parts: str) -> str | None:
+    candidates: list[Path] = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        candidates.append(Path(meipass, *parts))
+
+    if getattr(sys, "frozen", False):
+        executable = Path(sys.executable).resolve()
+        candidates.append(executable.parent.joinpath(*parts))
+        if sys.platform == "darwin" and len(executable.parents) >= 2:
+            candidates.append(executable.parents[1] / "Resources" / Path(*parts))
+
+    candidates.append(Path(__file__).resolve().parent.parent.joinpath(*parts))
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
+def _staffdeck_icon_png_path() -> str | None:
+    return _resource_path(*STAFFDECK_ICON_PNG)
+
+
 def _health_ok(url: str) -> bool:
     import urllib.request
 
@@ -122,6 +149,40 @@ def _find_existing_app_url(host: str) -> str | None:
         if _health_ok(url):
             return url
     return None
+
+
+def _wait_for_existing_app_url(host: str, attempts: int = 20, delay: float = 0.3) -> str | None:
+    for _ in range(attempts):
+        url = _find_existing_app_url(host)
+        if url:
+            return url
+        time.sleep(delay)
+    return None
+
+
+def _acquire_macos_instance_lock() -> bool:
+    if not _use_macos_dock_app():
+        return True
+
+    try:
+        import fcntl
+    except Exception:
+        return True
+
+    global _MACOS_INSTANCE_LOCK_HANDLE
+    lock_path = Path(tempfile.gettempdir()) / f"{APP_ID}.lock"
+    lock_file = open(lock_path, "w", encoding="utf-8")
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock_file.close()
+        return False
+    lock_file.seek(0)
+    lock_file.write(str(os.getpid()))
+    lock_file.truncate()
+    lock_file.flush()
+    _MACOS_INSTANCE_LOCK_HANDLE = lock_file
+    return True
 
 
 def _open_browser_when_ready(url: str) -> None:
@@ -167,6 +228,15 @@ def _run_macos_dock_app(cfg: dict, url: str) -> int:
     from PyObjCTools import AppHelper
 
     global _MACOS_DELEGATE_REF
+
+    def load_app_icon(point_size: float | None = None):
+        icon_path = _staffdeck_icon_png_path()
+        if not icon_path:
+            return None
+        image = AppKit.NSImage.alloc().initWithContentsOfFile_(icon_path)
+        if image is not None and point_size is not None:
+            image.setSize_((point_size, point_size))
+        return image
 
     class AppDelegate(AppKit.NSObject):
         def applicationDidFinishLaunching_(self, _notification):  # noqa: N802
@@ -256,11 +326,18 @@ def _run_macos_dock_app(cfg: dict, url: str) -> int:
 
         def _install_status_menu(self) -> None:
             self.status_item = AppKit.NSStatusBar.systemStatusBar().statusItemWithLength_(
-                AppKit.NSVariableStatusItemLength
+                AppKit.NSSquareStatusItemLength
             )
             button = self.status_item.button()
-            button.setTitle_(APP_NAME)
-            button.setToolTip_(APP_NAME)
+            if button is not None:
+                status_icon = load_app_icon(18)
+                if status_icon is not None:
+                    status_icon.setTemplate_(False)
+                    button.setImage_(status_icon)
+                    button.setImagePosition_(AppKit.NSImageOnly)
+                else:
+                    button.setTitle_(APP_NAME)
+                button.setToolTip_(APP_NAME)
 
             menu, self.status_dock_item = self._build_control_menu()
             self.status_item.setMenu_(menu)
@@ -269,6 +346,9 @@ def _run_macos_dock_app(cfg: dict, url: str) -> int:
     app = AppKit.NSApplication.sharedApplication()
     # Regular：常规 GUI app，进 Dock、可激活
     app.setActivationPolicy_(AppKit.NSApplicationActivationPolicyRegular)
+    dock_icon = load_app_icon()
+    if dock_icon is not None:
+        app.setApplicationIconImage_(dock_icon)
     delegate = AppDelegate.alloc().init()
     # PyObjC 不总是按 Python 预期保留 delegate，模块级引用保证菜单和事件代理常驻。
     _MACOS_DELEGATE_REF = delegate
@@ -446,12 +526,20 @@ def main(argv: list[str] | None = None) -> int:
     _redirect_logs_when_frozen()
 
     host = os.environ.get("ULTRARAG_HOST", "127.0.0.1")
-    if not _use_macos_dock_app():
-        existing_url = _find_existing_app_url(host)
+    existing_url = _find_existing_app_url(host)
+    if existing_url:
+        print(f"{APP_NAME} 已在运行：{existing_url}/chat/")
+        _open_browser(existing_url + "/chat/")
+        return 0
+
+    if _use_macos_dock_app() and not _acquire_macos_instance_lock():
+        existing_url = _wait_for_existing_app_url(host)
         if existing_url:
-            print(f"{APP_NAME} 已在运行：{existing_url}/chat/")
+            print(f"{APP_NAME} 正在运行：{existing_url}/chat/")
             _open_browser(existing_url + "/chat/")
-            return 0
+        else:
+            print(f"{APP_NAME} 已有实例正在启动，当前实例退出。")
+        return 0
 
     # 时序：先选定端口并设 env，再 import uvicorn / 触发 app.* import。
     cfg = build_server_config()
