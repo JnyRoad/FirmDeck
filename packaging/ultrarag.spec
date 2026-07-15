@@ -19,6 +19,7 @@ if sys.platform == "win32" and ICO.exists():
 
 datas = [
     (str(DIST), "frontend-enterprise/dist"),
+    (str(ASSETS / "staffdeck.png"), "packaging/assets"),
     (str(BACKEND / "app" / "llm" / "prompts"), "app/llm/prompts"),
     (str(BACKEND / "app" / "db" / "seed_fixtures"), "app/db/seed_fixtures"),
     (str(BACKEND / "mock_servers"), "mock_servers"),
