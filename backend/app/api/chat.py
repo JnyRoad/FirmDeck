@@ -94,6 +94,21 @@ SPAN_EVENT_TYPES = {
     "knowledge_span_finished",
     "knowledge_span_failed",
 }
+KNOWLEDGE_TRACE_PHASES = {
+    "knowledge",
+    "okf_route",
+    "okf_only",
+    "document_route",
+    "document_route_lexical",
+    "bucket_route",
+    "bucket_route_lexical",
+    "section_expand",
+    "read_chunks",
+    "evidence_pack",
+    "no_visible_knowledge",
+    "no_documents",
+    "no_buckets",
+}
 SESSION_TITLE_PROMPT = """你是任务派发台的会话标题编辑器。
 
 根据首轮用户需求和员工回复，生成一个简短、可读、具体的中文标题。
@@ -2782,6 +2797,63 @@ def _event_trace_line(
             }
         if phase == "responding":
             return None
+        if phase == "stepping":
+            repair_reason = str(payload.get("repair_reason") or "main").strip()
+            iteration = payload.get("iteration")
+            iteration_suffix = (
+                f"_{iteration}" if isinstance(iteration, (int, float, str)) else ""
+            )
+            return {
+                "id": f"decision_stepping_{repair_reason}{iteration_suffix}",
+                "kind": "decision",
+                "text": "决定下一步" if repair_reason == "main" else "重新分析",
+                "detail": None,
+                "state": "running",
+            }
+        if phase == "reflecting":
+            return {
+                "id": "reflection",
+                "kind": "decision",
+                "text": "正在反思",
+                "detail": None,
+                "state": "running",
+            }
+        if phase in KNOWLEDGE_TRACE_PHASES:
+            query = payload.get("query") if isinstance(payload.get("query"), dict) else {}
+            detail_parts = [
+                f"查询：{query['query']}" if query.get("query") else "",
+                f"命中知识图谱 {payload['selected_count']} 个"
+                if isinstance(payload.get("selected_count"), int)
+                else "",
+                f"候选 {payload['candidate_count']} 个"
+                if isinstance(payload.get("candidate_count"), int)
+                else "",
+                f"读取 {payload['chunk_count']} 个片段"
+                if isinstance(payload.get("chunk_count"), int)
+                else "",
+                f"整理 {payload['evidence_count']} 条证据"
+                if isinstance(payload.get("evidence_count"), int)
+                else "",
+            ]
+            return {
+                "id": "knowledge_lookup",
+                "kind": "knowledge",
+                "text": text or "检索知识库",
+                "detail": " · ".join(part for part in detail_parts if part) or None,
+                "state": "completed"
+                if phase == "evidence_pack" or phase.startswith("no_") or phase == "okf_only"
+                else "running",
+            }
+        if phase == "tool" and payload.get("tool_name"):
+            tool_name = str(payload["tool_name"])
+            tool_call_id = str(payload.get("tool_call_id") or tool_name)
+            return {
+                "id": f"tool_{tool_call_id}",
+                "kind": "tool",
+                "text": f"正在调用 {tool_name}",
+                "detail": None,
+                "state": "running",
+            }
         if phase and phase != "received":
             return {
                 "id": f"decision_status_{phase}",
@@ -2900,9 +2972,10 @@ def _event_trace_line(
             else:
                 label = "推进SOP"
             step_id = str(entry.get("stepId") or "").strip()
+            state_key = step_id or str(index)
             lines.append(
                 {
-                    "id": f"skill_state_{skill_id}_{state}_{index}",
+                    "id": f"skill_state_{skill_id}_{state}_{state_key}",
                     "kind": "skill",
                     "text": f"{label} {name}",
                     "detail": f"当前步骤 {step_id}" if step_id else None,
@@ -2986,8 +3059,10 @@ def _event_trace_line(
             detail_parts.append(f"from {skill_names.get(from_skill_id, from_skill_id)}")
         if payload.get("to_step_id"):
             detail_parts.append(f"step {payload['to_step_id']}")
+        step_id = str(payload.get("to_step_id") or payload.get("from_step_id") or "").strip()
+        state_key = step_id or "0"
         return {
-            "id": f"skill_{event.id}",
+            "id": f"skill_state_{skill_id}_active_{state_key}",
             "kind": "skill",
             "text": f"{label} {skill_names.get(skill_id, skill_id)}",
             "detail": " · ".join(detail_parts) or None,
