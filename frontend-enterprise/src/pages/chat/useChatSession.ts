@@ -1867,8 +1867,9 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
         .filter((entry): entry is NonNullable<typeof entry> => Boolean(entry))
         .forEach((skill, index) => {
           const label = streamSkillLabel(item.data, skill);
+          const stateKey = skill.stepId || String(index);
           upsertVisibleTraceLine({
-            id: `skill_state_${skill.skillId}_${skill.state || 'active'}_${index}`,
+            id: `skill_state_${skill.skillId}_${skill.state || 'active'}_${stateKey}`,
             kind: 'skill',
             text: `${label} ${skill.name || skill.skillId}`,
             detail: skill.stepId ? `当前步骤 ${skill.stepId}` : undefined,
