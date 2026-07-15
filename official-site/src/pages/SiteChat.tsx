@@ -6,6 +6,7 @@ import {
   Square,
   ThumbsDown,
   ThumbsUp,
+  X,
 } from "lucide-react";
 import {
   useCallback,
@@ -29,6 +30,7 @@ import selectIcon from "../assets/staffdeck/cot-icons/select.svg";
 import employeeAvatar from "../assets/staffdeck/staffdeck-avatar-default.png";
 import { useI18n } from "../i18n";
 import copyByLocale from "../i18n/site.json";
+import productCorpus from "../../server/data/product-corpus.json";
 import { MarkdownMessage } from "./chat/chatHelpers";
 import {
   normalizeSiteChatCitations,
@@ -73,6 +75,10 @@ const STAGE_ICONS: Record<string, string> = {
   retrieval: advanceIcon,
   answer: generatedIcon,
 };
+
+const SOURCE_TEXT_BY_ID = new Map(
+  productCorpus.chunks.map((source) => [source.id, source.text]),
+);
 
 function newId() {
   return `${Date.now()}_${Math.random().toString(36).slice(2)}`;
@@ -146,6 +152,14 @@ function ExecutionRecord({ message, copy }: { message: ChatMessage; copy: ChatCo
   );
 }
 
+function StaffAvatar({ placement }: { placement: "empty" | "composer" }) {
+  return (
+    <div className={`site-chat-avatar-anchor is-${placement}`} aria-hidden="true">
+      <img src={employeeAvatar} alt="" />
+    </div>
+  );
+}
+
 function StaffProfile({
   copy,
   onPointerEnter,
@@ -187,7 +201,7 @@ function StaffProfile({
   );
 }
 
-function StaffAvatar({ copy, placement }: { copy: ChatCopy; placement: "empty" | "composer" }) {
+function ComposerStaffAvatar({ copy }: { copy: ChatCopy }) {
   const anchorRef = useRef<HTMLDivElement>(null);
   const hideTimerRef = useRef<number | null>(null);
   const [profileNode, setProfileNode] = useState<HTMLDivElement | null>(null);
@@ -203,24 +217,21 @@ function StaffAvatar({ copy, placement }: { copy: ChatCopy; placement: "empty" |
     const profileHeight = profileRect?.height || 164;
     const viewportPadding = 12;
     const gap = 12;
-
-    let left = placement === "empty" ? anchorRect.right + gap : anchorRect.left;
-    let top = placement === "empty"
-      ? anchorRect.top + (anchorRect.height - profileHeight) / 2
-      : anchorRect.top - profileHeight - gap;
+    let left = anchorRect.left;
+    let top = anchorRect.top - profileHeight - gap;
 
     if (left + profileWidth > window.innerWidth - viewportPadding) {
-      left = anchorRect.left - profileWidth - gap;
+      left = window.innerWidth - profileWidth - viewportPadding;
     }
     if (top < viewportPadding) {
       top = Math.min(anchorRect.bottom + gap, window.innerHeight - profileHeight - viewportPadding);
     }
 
     setProfileStyle({
-      left: Math.max(viewportPadding, Math.min(left, window.innerWidth - profileWidth - viewportPadding)),
-      top: Math.max(viewportPadding, Math.min(top, window.innerHeight - profileHeight - viewportPadding)),
+      left: Math.max(viewportPadding, left),
+      top: Math.max(viewportPadding, top),
     });
-  }, [placement, profileNode]);
+  }, [profileNode]);
 
   useLayoutEffect(() => {
     if (!profileOpen) return undefined;
@@ -263,7 +274,7 @@ function StaffAvatar({ copy, placement }: { copy: ChatCopy; placement: "empty" |
   return (
     <>
       <div
-        className={`site-chat-avatar-anchor is-${placement}`}
+        className="site-chat-avatar-anchor is-composer"
         ref={anchorRef}
         tabIndex={0}
         aria-label={`${copy.emptyGreeting} ${copy.emptyRole}`}
@@ -271,7 +282,6 @@ function StaffAvatar({ copy, placement }: { copy: ChatCopy; placement: "empty" |
         onPointerLeave={scheduleHide}
         onFocus={showProfile}
         onBlur={scheduleHide}
-        onClick={showProfile}
       >
         <img src={employeeAvatar} alt="" />
       </div>
@@ -290,6 +300,55 @@ function StaffAvatar({ copy, placement }: { copy: ChatCopy; placement: "empty" |
   );
 }
 
+function SourceDialog({
+  copy,
+  source,
+  onClose,
+}: {
+  copy: ChatCopy;
+  source: SiteChatSource;
+  onClose: () => void;
+}) {
+  useEffect(() => {
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [onClose]);
+
+  if (typeof document === "undefined") return null;
+  const titleId = `site-chat-source-${source.id.replace(/[^a-zA-Z0-9_-]/g, "-")}`;
+
+  return createPortal(
+    <div
+      className="site-chat-source-dialog-backdrop"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
+      <section
+        className="site-chat-source-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+      >
+        <header>
+          <div>
+            <span>{copy.sourceExcerpt}</span>
+            <h2 id={titleId}>[{source.index}] {source.title}</h2>
+          </div>
+          <button type="button" onClick={onClose} aria-label={copy.closeSource} title={copy.closeSource}>
+            <X aria-hidden="true" />
+          </button>
+        </header>
+        <p>{source.text?.trim() || copy.sourceUnavailable}</p>
+      </section>
+    </div>,
+    document.body,
+  );
+}
+
 function EmptyState({
   copy,
   disabled,
@@ -302,7 +361,7 @@ function EmptyState({
   return (
     <div className="site-chat-empty">
       <div className="site-chat-empty-greeting">
-        <StaffAvatar copy={copy} placement="empty" />
+        <StaffAvatar placement="empty" />
         <div>
           <h2>{copy.emptyGreeting}</h2>
           <p>{copy.emptySubtitle}</p>
@@ -343,6 +402,7 @@ export default function SiteChat() {
   const [busy, setBusy] = useState(false);
   const [csrfToken, setCsrfToken] = useState("");
   const [sessionToken, setSessionToken] = useState("");
+  const [activeSource, setActiveSource] = useState<SiteChatSource | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const transcriptRef = useRef<HTMLDivElement>(null);
   const stickToBottomRef = useRef(true);
@@ -583,7 +643,17 @@ export default function SiteChat() {
                     <span><img src={referenceIcon} alt="" />{copy.sources}</span>
                     <div>
                       {normalized.sources.map((source) => (
-                        <button type="button" key={source.id} title={source.title}>[{source.index}] {source.title}</button>
+                        <button
+                          type="button"
+                          key={source.id}
+                          title={source.title}
+                          onClick={() => setActiveSource({
+                            ...source,
+                            text: source.text || SOURCE_TEXT_BY_ID.get(source.id),
+                          })}
+                        >
+                          [{source.index}] {source.title}
+                        </button>
                       ))}
                     </div>
                   </div>
@@ -601,7 +671,7 @@ export default function SiteChat() {
       </div>
 
       <div className="site-chat-composer-stage">
-        <StaffAvatar copy={copy} placement="composer" />
+        <ComposerStaffAvatar copy={copy} />
         <div className="site-chat-composer">
           <textarea
             value={input}
@@ -629,6 +699,9 @@ export default function SiteChat() {
           </div>
         </div>
       </div>
+      {activeSource && (
+        <SourceDialog copy={copy} source={activeSource} onClose={() => setActiveSource(null)} />
+      )}
     </div>
   );
 }

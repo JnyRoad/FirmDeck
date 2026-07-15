@@ -1991,7 +1991,7 @@ html[lang="en-US"] .lp-title .lp-line2 {
 }
 
 .site-chat-shell {
-  --site-chat-track-width: 940px;
+  --site-chat-track-width: 860px;
   box-sizing: border-box;
   width: 100%;
   max-width: calc(var(--site-chat-track-width) + 48px);
@@ -2024,18 +2024,19 @@ html[lang="en-US"] .lp-title .lp-line2 {
 }
 
 .site-chat-empty {
-  width: min(640px, 100%);
+  width: min(620px, 100%);
   height: 100%;
   margin: 0 auto;
   display: flex;
   flex-direction: column;
   justify-content: center;
   padding: 3vh 0 20px;
+  transform: translateY(40px);
 }
 
 .site-chat-empty-greeting {
   position: relative;
-  min-height: 122px;
+  min-height: 138px;
   padding: 24px 26px 20px 220px;
   border-radius: 20px;
   background: #f6f6f6;
@@ -2046,6 +2047,7 @@ html[lang="en-US"] .lp-title .lp-line2 {
 .site-chat-avatar-anchor {
   position: absolute;
   z-index: 4;
+  user-select: none;
   outline: none;
 }
 
@@ -2059,9 +2061,10 @@ html[lang="en-US"] .lp-title .lp-line2 {
 
 .site-chat-avatar-anchor.is-empty {
   left: 24px;
-  bottom: 0;
+  bottom: 8px;
   width: 180px;
   height: 212px;
+  pointer-events: none;
 }
 
 .site-chat-profile-card {
@@ -2521,6 +2524,104 @@ html[lang="en-US"] .lp-title .lp-line2 {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  cursor: pointer;
+  transition: border-color 160ms ease, background 160ms ease, color 160ms ease;
+}
+
+.site-chat-sources button:hover,
+.site-chat-sources button:focus-visible {
+  border-color: #aeb6c7;
+  background: #f7f8fa;
+  color: #242731;
+  outline: none;
+}
+
+.site-chat-source-dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1100;
+  padding: 24px;
+  background: rgba(19, 22, 31, 0.28);
+  backdrop-filter: blur(6px);
+  display: grid;
+  place-items: center;
+}
+
+.site-chat-source-dialog {
+  box-sizing: border-box;
+  width: min(620px, 100%);
+  max-height: min(72vh, 680px);
+  padding: 22px;
+  border: 1px solid #e1e5ee;
+  border-radius: 16px;
+  background: #fff;
+  box-shadow: 0 28px 80px -30px rgba(20, 24, 38, 0.45);
+  color: #242731;
+  overflow: hidden;
+}
+
+.site-chat-source-dialog header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.site-chat-source-dialog header span {
+  display: block;
+  color: #858da0;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.site-chat-source-dialog h2 {
+  margin: 7px 0 0;
+  color: #18181a;
+  font-size: 18px;
+  font-weight: 620;
+  line-height: 1.45;
+}
+
+.site-chat-source-dialog header button {
+  width: 34px;
+  height: 34px;
+  flex: 0 0 auto;
+  padding: 0;
+  border: 1px solid #e3e7f1;
+  border-radius: 9px;
+  background: #fff;
+  color: #687187;
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+}
+
+.site-chat-source-dialog header button:hover,
+.site-chat-source-dialog header button:focus-visible {
+  border-color: #aeb6c7;
+  color: #18181a;
+  outline: none;
+}
+
+.site-chat-source-dialog header svg {
+  width: 17px;
+  height: 17px;
+}
+
+.site-chat-source-dialog > p {
+  max-height: calc(min(72vh, 680px) - 102px);
+  margin: 18px 0 0;
+  padding: 16px 18px;
+  border-left: 3px solid #dfe4ee;
+  border-radius: 0 10px 10px 0;
+  background: #f7f8fa;
+  color: #4f586b;
+  font-size: 13px;
+  line-height: 1.75;
+  white-space: pre-wrap;
+  overflow-y: auto;
 }
 
 .site-chat-feedback {
@@ -2565,9 +2666,10 @@ html[lang="en-US"] .lp-title .lp-line2 {
   position: absolute;
   z-index: 2;
   left: 22px;
-  top: -54px;
+  top: -72px;
   width: 72px;
   height: 84px;
+  cursor: pointer;
 }
 
 .site-chat-composer {
@@ -2677,6 +2779,7 @@ html[lang="en-US"] .lp-title .lp-line2 {
   }
   .site-chat-empty {
     padding-top: 16px;
+    transform: translateY(10px);
   }
   .site-chat-empty-greeting {
     min-height: 106px;
@@ -2753,6 +2856,7 @@ html[lang="en-US"] .lp-title .lp-line2 {
   .site-chat-empty {
     width: 100%;
     padding: 20px 0 12px;
+    transform: none;
   }
   .site-chat-empty-greeting {
     min-height: 104px;
@@ -2761,6 +2865,7 @@ html[lang="en-US"] .lp-title .lp-line2 {
   }
   .site-chat-avatar-anchor.is-empty {
     left: 10px;
+    bottom: 4px;
     width: 112px;
     height: 132px;
   }
@@ -2808,13 +2913,15 @@ html[lang="en-US"] .lp-title .lp-line2 {
   }
   .site-chat-avatar-anchor.is-composer {
     left: 14px;
-    top: -45px;
+    top: -60px;
     width: 62px;
     height: 72px;
   }
   .site-chat-profile-card {
     width: min(252px, calc(100vw - 52px));
   }
+  .site-chat-source-dialog-backdrop { padding: 14px; }
+  .site-chat-source-dialog { padding: 18px; border-radius: 14px; }
   .site-chat-suggestions {
     display: grid;
     grid-template-columns: 1fr;
