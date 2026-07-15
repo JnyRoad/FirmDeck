@@ -1,5 +1,8 @@
 # packaging/build_windows.ps1
 $ErrorActionPreference = "Stop"
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
+$env:PYTHONUTF8 = "1"
+$env:PYTHONIOENCODING = "utf-8"
 $Repo = Split-Path -Parent $PSScriptRoot
 Set-Location $Repo
 if (-not $env:VERSION) { $env:VERSION = "0.1.0" }
