@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { Fragment, useMemo, useState } from 'react';
 import type { ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
 
@@ -41,8 +41,6 @@ const TIMELINE_MODES = [
   { key: 'month', label: 'Month' },
 ] as const;
 type TimelineMode = (typeof TIMELINE_MODES)[number]['key'];
-// Number of evenly spaced vertical grid lines behind the timeline tracks.
-const TIMELINE_GRID_LINES = 15;
 const TIMELINE_WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
 type GrowthEvent = {
@@ -302,7 +300,7 @@ type TimelineTrackConfig = {
 const TIMELINE_TRACKS: TimelineTrackConfig[] = [
   {
     key: 'chat',
-    label: '对话数',
+    label: '对话',
     unit: '次对话',
     dot: ACTIVITY_DOT.chat,
     bar: 'bg-[#e8f0ff] in-data-[theme=dark]:bg-[#1d2c47]',
@@ -370,7 +368,7 @@ function ActivityTimeline({ events }: ActivityTimelineProps) {
   }, [events]);
 
   const itemsByDay = useMemo(
-    () => (mode === 'month' ? buildDayActivities(events) : {}),
+    () => (mode === 'month' || mode === 'week' ? buildDayActivities(events) : {}),
     [events, mode],
   );
 
@@ -378,10 +376,10 @@ function ActivityTimeline({ events }: ActivityTimelineProps) {
   const ticks = useMemo(() => timelineTicks(mode, range), [mode, range]);
   const activeTracks = useMemo(
     () =>
-      TIMELINE_TRACKS.map((track) => ({ track, bar: timelineBar(eventsByTrack[track.key] || [], range) })).filter(
-        (item): item is { track: TimelineTrackConfig; bar: NonNullable<ReturnType<typeof timelineBar>> } =>
-          item.bar !== null,
-      ),
+      TIMELINE_TRACKS.map((track) => ({
+        track,
+        segments: daySegments(eventsByTrack[track.key] || [], range),
+      })).filter((item) => item.segments.length > 0),
     [eventsByTrack, range],
   );
 
@@ -442,79 +440,196 @@ function ActivityTimeline({ events }: ActivityTimelineProps) {
 
       {mode === 'month' ? (
         <MonthCalendar anchor={anchor} itemsByDay={itemsByDay} />
+      ) : mode === 'week' ? (
+        <WeekCalendar anchor={anchor} itemsByDay={itemsByDay} />
+      ) : activeTracks.length === 0 ? (
+        <TimelineEmptyState text="当日暂无活动记录" />
       ) : (
-        <>
-          <div className="relative w-full overflow-hidden rounded-[20px] px-[12px] py-[16px]">
+        <div className="flex min-h-[178px] w-full flex-col gap-[16px]">
+          <div className="relative flex flex-1 w-full flex-col justify-center overflow-hidden rounded-[20px] px-[12px] py-[16px]">
             <div className="pointer-events-none absolute inset-x-[12px] inset-y-[8px] flex justify-between">
-              {Array.from({ length: TIMELINE_GRID_LINES }, (_, index) => (
+              {ticks.map((_, index) => (
                 <span key={`grid-${index}`} className="w-px bg-[#eef1f7] in-data-[theme=dark]:bg-[#2c2f38]" />
               ))}
             </div>
             <div className="relative z-10 flex min-h-[94px] flex-col gap-[8px]">
-              {activeTracks.map(({ track, bar }) => {
-                const label = trackBarLabel(track, bar);
-                return (
-                  <div key={track.key} className="relative h-[26px] w-full">
-                    <HoverCard openDelay={120} closeDelay={80}>
-                      <HoverCardTrigger asChild>
-                        <div
-                          className={`absolute top-0 flex h-[26px] cursor-default items-center gap-[6px] rounded-[8px] px-[8px] py-[4px] ${track.bar}`}
-                          style={{ left: `${bar.left}%`, width: `${bar.width}%` }}
-                        >
-                          <span className={`size-[6px] shrink-0 rounded-full ${track.dot}`} />
-                          <span className="truncate text-[10px] leading-none capitalize text-[#464c5e] in-data-[theme=dark]:text-[#f0f2f6]">
-                            {label}
-                          </span>
-                        </div>
-                      </HoverCardTrigger>
-                      <HoverCardContent align="start" sideOffset={6} className="w-auto max-w-[300px] p-[10px]">
-                        <div className="mb-[8px] flex items-center gap-[6px]">
-                          <span className={`size-[6px] shrink-0 rounded-full ${track.dot}`} />
-                          <span className="text-[12px] font-medium text-[#18181a] in-data-[theme=dark]:text-[#f0f2f6]">
-                            {track.label}
-                          </span>
-                          <span className="text-[11px] text-[#858b9c]">
-                            共{bar.count}
-                            {track.unit}
-                          </span>
-                        </div>
-                        <div className="flex flex-col gap-[4px]">
-                          {bar.events.slice(0, 12).map((event, index) => (
-                            <div
-                              key={`${track.key}-${event.time}-${index}`}
-                              className="flex items-start gap-[8px] text-[11px] leading-[15px]"
-                            >
-                              <span className="shrink-0 tabular-nums text-[#858b9c]">
-                                {mode === 'week'
-                                  ? `${new Date(event.time).getMonth() + 1}/${new Date(event.time).getDate()} ${formatHm(new Date(event.time))}`
-                                  : formatHm(new Date(event.time))}
-                              </span>
-                              <span className="flex-1 break-words text-[#464c5e] in-data-[theme=dark]:text-[#c9cede]">
-                                {event.name || track.label}
-                              </span>
-                            </div>
-                          ))}
-                          {bar.events.length > 12 && (
-                            <div className="text-[11px] text-[#858b9c]">…等{bar.events.length}项</div>
-                          )}
-                        </div>
-                      </HoverCardContent>
-                    </HoverCard>
-                  </div>
-                );
-              })}
+              {activeTracks.map(({ track, segments }) => (
+                <div key={track.key} className="relative h-[26px] w-full">
+                  {segments.map((segment, segmentIndex) => {
+                    const label = trackBarLabel(track, segment);
+                    return (
+                      <HoverCard key={segmentIndex} openDelay={120} closeDelay={80}>
+                        <HoverCardTrigger asChild>
+                          <div
+                            className={`absolute top-0 flex h-[26px] min-w-0 cursor-default items-center gap-[6px] overflow-hidden rounded-[8px] px-[8px] py-[4px] ${track.bar}`}
+                            style={{ left: `${segment.left}%`, width: `${segment.width}%` }}
+                          >
+                            <span className={`size-[6px] shrink-0 rounded-full ${track.dot}`} />
+                            <span className="truncate text-[10px] leading-none capitalize text-[#464c5e] in-data-[theme=dark]:text-[#f0f2f6]">
+                              {label}
+                            </span>
+                          </div>
+                        </HoverCardTrigger>
+                        <HoverCardContent align="start" sideOffset={6} className="w-auto max-w-[300px] p-[10px]">
+                          <div className="mb-[8px] flex items-center gap-[6px]">
+                            <span className={`size-[6px] shrink-0 rounded-full ${track.dot}`} />
+                            <span className="text-[12px] font-medium text-[#18181a] in-data-[theme=dark]:text-[#f0f2f6]">
+                              {track.label}
+                            </span>
+                            <span className="text-[11px] text-[#858b9c]">
+                              共{segment.count}
+                              {track.unit}
+                            </span>
+                          </div>
+                          <div className="flex flex-col gap-[4px]">
+                            {segment.events.slice(0, 12).map((event, eventIndex) => (
+                              <div
+                                key={`${track.key}-${event.time}-${eventIndex}`}
+                                className="flex items-start gap-[8px] text-[11px] leading-[15px]"
+                              >
+                                <span className="shrink-0 tabular-nums text-[#858b9c]">
+                                  {formatHm(new Date(event.time))}
+                                </span>
+                                <span className="flex-1 break-words text-[#464c5e] in-data-[theme=dark]:text-[#c9cede]">
+                                  {event.name || track.label}
+                                </span>
+                              </div>
+                            ))}
+                            {segment.events.length > 12 && (
+                              <div className="text-[11px] text-[#858b9c]">…等{segment.events.length}项</div>
+                            )}
+                          </div>
+                        </HoverCardContent>
+                      </HoverCard>
+                    );
+                  })}
+                </div>
+              ))}
             </div>
           </div>
 
-          <div className="flex w-full items-center justify-between text-[12px] text-[#858b9c] in-data-[theme=dark]:text-[#8b93a6]">
+          <div className="flex h-[16px] w-full items-center justify-between px-[12px] text-[12px] leading-none text-[#858b9c] in-data-[theme=dark]:text-[#8b93a6]">
             {ticks.map((tick, index) => (
-              <span key={`tick-${index}`} className="whitespace-nowrap">
-                {tick}
+              <span key={`tick-${index}`} className="relative w-0">
+                <span className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 whitespace-nowrap">
+                  {tick}
+                </span>
               </span>
             ))}
           </div>
-        </>
+        </div>
       )}
+    </div>
+  );
+}
+
+function TimelineEmptyState({ text }: { text: string }) {
+  return (
+    <div className="flex min-h-[178px] w-full flex-col items-center justify-center gap-[10px] rounded-[20px] border border-dashed border-[#e3e7f1] in-data-[theme=dark]:border-[#343741]">
+      <IconProfileCalendar className="size-[24px] text-[#c0c5d2] in-data-[theme=dark]:text-[#5b606d]" />
+      <span className="text-[13px] leading-none text-[#858b9c] in-data-[theme=dark]:text-[#8b93a6]">
+        {text}
+      </span>
+    </div>
+  );
+}
+
+function WeekCalendar({
+  anchor,
+  itemsByDay,
+}: {
+  anchor: number;
+  itemsByDay: Record<string, DayActivity[]>;
+}) {
+  const weekStart = startOfWeek(new Date(anchor));
+  const days = Array.from({ length: 7 }, (_, index) => {
+    const date = new Date(weekStart);
+    date.setDate(date.getDate() + index);
+    return date;
+  });
+  const todayKey = dateKey(new Date());
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  const toggle = (key: string) => setExpanded((prev) => ({ ...prev, [key]: !prev[key] }));
+
+  const hasActivity = days.some((date) => (itemsByDay[dateKey(date)] || []).length > 0);
+  if (!hasActivity) {
+    return <TimelineEmptyState text="本周暂无活动记录" />;
+  }
+
+  return (
+    <div className="flex min-h-[178px] w-full min-w-0 items-stretch rounded-[20px]">
+      {days.map((date, index) => {
+        const key = dateKey(date);
+        const isToday = key === todayKey;
+        const items = itemsByDay[key] || [];
+        const isExpanded = Boolean(expanded[key]);
+        const visible = isExpanded || items.length <= 4 ? items : items.slice(0, 3);
+        const overflow = items.length - visible.length;
+
+        return (
+          <Fragment key={key}>
+            {index > 0 && (
+              <span className="my-[12px] w-px shrink-0 self-stretch bg-[#eef1f7] in-data-[theme=dark]:bg-[#2c2f38]" />
+            )}
+            <div
+              className={`flex min-w-px flex-1 flex-col gap-[12px] rounded-[18px] px-[12px] py-[10px] ${
+                isToday ? 'bg-[#e8f0ff] in-data-[theme=dark]:bg-[#1d2c47]' : ''
+              }`}
+            >
+              <span className="text-[14px] leading-none text-[#858b9c] in-data-[theme=dark]:text-[#8b93a6]">
+                {date.getDate()}
+              </span>
+              <div className="flex w-full flex-col gap-[2px]">
+                {visible.map((item, itemIndex) => (
+                  <HoverCard key={`${key}-${itemIndex}`} openDelay={120} closeDelay={80}>
+                    <HoverCardTrigger asChild>
+                      <div className="flex cursor-default items-center gap-[6px] rounded-[8px] p-[4px] transition-colors hover:bg-[#f6f6f6] in-data-[theme=dark]:hover:bg-[#2b2d33]">
+                        <span className={`size-[6px] shrink-0 rounded-full ${item.dot}`} />
+                        <span className="truncate text-[10px] leading-none capitalize text-[#757f9c] in-data-[theme=dark]:text-[#8b93a6]">
+                          {item.label}
+                        </span>
+                      </div>
+                    </HoverCardTrigger>
+                    <HoverCardContent align="start" sideOffset={6} className="w-auto max-w-[300px] p-[10px]">
+                      <div className="flex items-start gap-[8px]">
+                        <span className={`mt-[4px] size-[6px] shrink-0 rounded-full ${item.dot}`} />
+                        <span className="flex-1 break-words text-[12px] leading-[17px] text-[#464c5e] in-data-[theme=dark]:text-[#c9cede]">
+                          {item.time ? (
+                            <span className="mr-[6px] tabular-nums text-[#858b9c]">{item.time}</span>
+                          ) : null}
+                          {item.label}
+                        </span>
+                      </div>
+                    </HoverCardContent>
+                  </HoverCard>
+                ))}
+                {overflow > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => toggle(key)}
+                    className="flex items-center gap-[6px] rounded-[8px] p-[4px] text-left transition-colors hover:bg-[#f6f6f6] in-data-[theme=dark]:hover:bg-[#2b2d33]"
+                  >
+                    <span className="truncate text-[10px] leading-none text-[#757f9c] in-data-[theme=dark]:text-[#8b93a6]">
+                      还有{overflow}项
+                    </span>
+                  </button>
+                )}
+                {isExpanded && items.length > 4 && (
+                  <button
+                    type="button"
+                    onClick={() => toggle(key)}
+                    className="flex items-center gap-[6px] rounded-[8px] p-[4px] text-left transition-colors hover:bg-[#f6f6f6] in-data-[theme=dark]:hover:bg-[#2b2d33]"
+                  >
+                    <span className="truncate text-[10px] leading-none text-[#757f9c] in-data-[theme=dark]:text-[#8b93a6]">
+                      收起
+                    </span>
+                  </button>
+                )}
+              </div>
+            </div>
+          </Fragment>
+        );
+      })}
     </div>
   );
 }
@@ -674,30 +789,48 @@ function trackBarLabel(
   track: TimelineTrackConfig,
   bar: { count: number; names: string[] },
 ): string {
-  if (track.key === 'chat') return `对话数${bar.count}条`;
+  if (track.key === 'chat') return `对话${bar.count}条`;
   if (!bar.names.length) return track.label;
   const suffix = bar.names.length > 1 ? ` 等${bar.names.length}项` : '';
   return `${track.label} ${bar.names[0]}${suffix}`;
 }
 
-function timelineBar(
-  events: TrackEvent[],
-  range: { start: number; end: number },
-): { left: number; width: number; count: number; names: string[]; events: TrackEvent[] } | null {
+type DaySegment = { left: number; width: number; count: number; names: string[]; events: TrackEvent[] };
+
+// Day view: each event fills the 2-hour cell that contains it — start snaps down
+// to the 2-hour tick line at or before it, end snaps up to the next 2-hour tick
+// line (so 6:26 → 6-8, 9:40 → 8-10). Consecutive/touching cells of the same
+// track merge into one bar (e.g. a chat at 9:xx + an event at 11:xx → 8-12).
+const DAY_HOURS = 24;
+const HOUR_MS = 60 * 60 * 1000;
+
+function daySegments(events: TrackEvent[], range: { start: number; end: number }): DaySegment[] {
   const inRange = events
     .filter((event) => event.time >= range.start && event.time < range.end)
     .sort((a, b) => a.time - b.time);
-  if (!inRange.length) return null;
-  const span = range.end - range.start;
-  const times = inRange.map((event) => event.time);
-  const min = Math.min(...times);
-  const max = Math.max(...times);
-  const left = ((min - range.start) / span) * 100;
-  const rawWidth = ((max - min) / span) * 100;
-  // Guarantee the pill stays wide enough to show its label, and never overflows.
-  const width = Math.min(100 - left, Math.max(rawWidth, 22));
-  const names = Array.from(new Set(inRange.map((event) => event.name).filter(Boolean)));
-  return { left, width, count: inRange.length, names, events: inRange };
+  if (!inRange.length) return [];
+
+  const merged: Array<{ start: number; end: number; events: TrackEvent[] }> = [];
+  for (const event of inRange) {
+    const hour = (event.time - range.start) / HOUR_MS;
+    const start = Math.max(0, Math.floor(hour / 2) * 2);
+    const end = Math.min(DAY_HOURS, start + 2);
+    const last = merged[merged.length - 1];
+    if (last && start <= last.end) {
+      last.end = Math.max(last.end, end);
+      last.events.push(event);
+    } else {
+      merged.push({ start, end, events: [event] });
+    }
+  }
+
+  return merged.map((block) => ({
+    left: (block.start / DAY_HOURS) * 100,
+    width: ((block.end - block.start) / DAY_HOURS) * 100,
+    count: block.events.length,
+    names: Array.from(new Set(block.events.map((event) => event.name).filter(Boolean))),
+    events: block.events,
+  }));
 }
 
 function timelineTicks(mode: TimelineMode, range: { start: number; end: number }): string[] {
@@ -951,8 +1084,8 @@ function buildDayActivities(events: AgentWorkRecordEventRead[]): Record<string, 
     const key = dateKey(date);
     chatByDay[key] = (chatByDay[key] || 0) + 1;
   });
-  Object.entries(chatByDay).forEach(([key, count]) => {
-    (map[key] ||= []).unshift({ label: `对话数${count}条`, dot: ACTIVITY_DOT.chat });
+  Object.entries(chatByDay).forEach(([dayKey, count]) => {
+    (map[dayKey] ||= []).unshift({ label: `对话${count}条`, dot: ACTIVITY_DOT.chat });
   });
 
   events.filter((item) => item.kind !== 'chat').forEach((item) => {
