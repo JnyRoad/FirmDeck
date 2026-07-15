@@ -2836,7 +2836,7 @@ def _event_trace_line(
                 else "",
             ]
             return {
-                "id": "knowledge_lookup",
+                "id": _knowledge_trace_line_id(payload),
                 "kind": "knowledge",
                 "text": text or "检索知识库",
                 "detail": " · ".join(part for part in detail_parts if part) or None,
@@ -3093,7 +3093,7 @@ def _event_trace_line(
         query = payload.get("query") if isinstance(payload.get("query"), dict) else {}
         text = str(query.get("query") if isinstance(query, dict) else payload.get("text") or "").strip()
         return {
-            "id": f"knowledge_{event.id}_started",
+            "id": _knowledge_trace_line_id(payload),
             "kind": "knowledge",
             "phase": "query",
             "text": "查询业务资料",
@@ -3112,7 +3112,7 @@ def _event_trace_line(
             f"生成 {len(evidence)} 条引用候选" if evidence else "",
         ]
         return {
-            "id": f"knowledge_{event.id}_finished",
+            "id": _knowledge_trace_line_id(payload),
             "kind": "knowledge",
             "phase": "result",
             "text": "读取业务资料",
@@ -3172,7 +3172,7 @@ def _event_trace_line(
     if event.event_type in {"reflection_decision_created", "reflection_decision"}:
         needs_retry = bool(payload.get("needs_retry"))
         return {
-            "id": f"decision_{event.id}",
+            "id": "reflection",
             "kind": "decision",
             "text": "反思后继续尝试" if needs_retry else "反思通过",
             "detail": _reflection_trace_detail(payload),
@@ -3180,7 +3180,7 @@ def _event_trace_line(
         }
     if event.event_type == "reflection_skipped":
         return {
-            "id": f"decision_{event.id}",
+            "id": "reflection",
             "kind": "decision",
             "text": "反思已关闭",
             "detail": str(payload.get("reason") or "") or None,
@@ -3192,7 +3192,7 @@ def _event_trace_line(
         target_skill = str(payload.get("target_skill_id") or "").strip()
         target = target_tool or skill_names.get(target_skill, target_skill)
         return {
-            "id": f"decision_{event.id}",
+            "id": "reflection",
             "kind": "decision",
             "text": f"重试{ '工具' if mode == 'tool' else 'SOP' } {target}".strip(),
             "detail": str(payload.get("reason") or "") or None,
@@ -3233,6 +3233,14 @@ def _reflection_trace_detail(payload: dict) -> str | None:
     ]
     text = " · ".join(part for part in parts if part)
     return text or None
+
+
+def _knowledge_trace_line_id(payload: dict) -> str:
+    raw_query = payload.get("query")
+    if isinstance(raw_query, dict):
+        raw_query = raw_query.get("query")
+    query = " ".join(str(raw_query or "").split())
+    return f"knowledge_lookup_{query}" if query else "knowledge_lookup"
 
 
 def _upsert_trace_line(lines: list[dict], line: dict) -> None:

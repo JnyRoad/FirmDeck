@@ -364,6 +364,110 @@ def test_turn_trace_uses_live_stream_ids_for_persisted_status_events() -> None:
     ]
 
 
+def test_turn_trace_merges_knowledge_lifecycle_events_for_same_query() -> None:
+    started_at = datetime(2026, 7, 15, 14, 33, 9)
+    query = "招待客户的餐费是否计入差旅费报销范围"
+    messages = [
+        Message(
+            id="msg_user",
+            tenant_id="tenant_demo",
+            session_id="session_test",
+            role="user",
+            content=query,
+            created_at=started_at,
+        )
+    ]
+    common_payload = {"query": {"query": query}, "turn_id": "msg_user"}
+    events = [
+        AgentEvent(
+            tenant_id="tenant_demo",
+            session_id="session_test",
+            event_type="user_message_received",
+            payload_json={"message_id": "msg_user", "message": query},
+            created_at=started_at,
+        ),
+        AgentEvent(
+            tenant_id="tenant_demo",
+            session_id="session_test",
+            event_type="knowledge_query_started",
+            payload_json=common_payload,
+            created_at=started_at + timedelta(seconds=1),
+        ),
+        AgentEvent(
+            tenant_id="tenant_demo",
+            session_id="session_test",
+            event_type="knowledge_query_finished",
+            payload_json={**common_payload, "selected_concepts": [{"id": "concept_1"}]},
+            created_at=started_at + timedelta(seconds=2),
+        ),
+        AgentEvent(
+            tenant_id="tenant_demo",
+            session_id="session_test",
+            event_type="knowledge_result",
+            payload_json={**common_payload, "selected_concepts": [{"id": "concept_1"}]},
+            created_at=started_at + timedelta(seconds=3),
+        ),
+    ]
+
+    traces = _build_turn_traces(messages, events, {})
+
+    knowledge_lines = [line for line in traces[0]["lines"] if line["kind"] == "knowledge"]
+    assert knowledge_lines == [
+        {
+            "id": f"knowledge_lookup_{query}",
+            "kind": "knowledge",
+            "phase": "result",
+            "text": "读取业务资料",
+            "detail": "命中 Wiki 1 个",
+            "state": "completed",
+            "icon": "advance",
+        }
+    ]
+
+
+def test_turn_trace_merges_created_and_relayed_reflection_decisions() -> None:
+    started_at = datetime(2026, 7, 15, 14, 37, 5)
+    messages = [
+        Message(
+            id="msg_user",
+            tenant_id="tenant_demo",
+            session_id="session_test",
+            role="user",
+            content="继续处理",
+            created_at=started_at,
+        )
+    ]
+    events = [
+        AgentEvent(
+            tenant_id="tenant_demo",
+            session_id="session_test",
+            event_type="user_message_received",
+            payload_json={"message_id": "msg_user", "message": "继续处理"},
+            created_at=started_at,
+        ),
+        AgentEvent(
+            tenant_id="tenant_demo",
+            session_id="session_test",
+            event_type="reflection_decision_created",
+            payload_json={"needs_retry": False, "turn_id": "msg_user"},
+            created_at=started_at + timedelta(seconds=1),
+        ),
+        AgentEvent(
+            tenant_id="tenant_demo",
+            session_id="session_test",
+            event_type="reflection_decision",
+            payload_json={"needs_retry": False, "turn_id": "msg_user"},
+            created_at=started_at + timedelta(seconds=2),
+        ),
+    ]
+
+    traces = _build_turn_traces(messages, events, {})
+
+    reflection_lines = [line for line in traces[0]["lines"] if line["id"] == "reflection"]
+    assert len(reflection_lines) == 1
+    assert reflection_lines[0]["text"] == "反思通过"
+
+
 def test_turn_trace_ignores_noop_skill_step_change() -> None:
     started_at = datetime(2026, 7, 15, 12, 40, 14)
     messages = [

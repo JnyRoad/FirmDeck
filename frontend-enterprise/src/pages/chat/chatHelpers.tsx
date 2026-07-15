@@ -1017,6 +1017,16 @@ export function knowledgeTraceText(data: Record<string, unknown>): string {
   return raw;
 }
 
+export function knowledgeTraceLineId(data: Record<string, unknown>): string {
+  const rawQuery = isPlainRecord(data.query) && typeof data.query.query === 'string'
+    ? data.query.query
+    : typeof data.query === 'string'
+      ? data.query
+      : '';
+  const query = rawQuery.trim().replace(/\s+/g, ' ');
+  return query ? `knowledge_lookup_${query}` : 'knowledge_lookup';
+}
+
 export function knowledgeTraceDetail(data: Record<string, unknown>): string | undefined {
   const query = isPlainRecord(data.query) && typeof data.query.query === 'string' ? data.query.query : '';
   const parts = [
