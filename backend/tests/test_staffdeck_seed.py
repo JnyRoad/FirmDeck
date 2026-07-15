@@ -6,6 +6,7 @@ from app.api.agents import list_agents
 from app.api.knowledge_bases import list_knowledge_bases
 from app.db.models import AgentProfile, Tenant, User
 from app.db.seed import seed_demo_data
+from app.db import staffdeck_seed
 
 
 EXPECTED_KNOWLEDGE_COUNTS = {
@@ -17,6 +18,11 @@ EXPECTED_KNOWLEDGE_COUNTS = {
 }
 
 
+class _FlushOnlySession:
+    def flush(self) -> None:
+        pass
+
+
 def _seeded_session() -> Session:
     engine = create_engine("sqlite:///:memory:")
     SQLModel.metadata.create_all(engine)
@@ -24,6 +30,30 @@ def _seeded_session() -> Session:
     seed_demo_data(session)
     session.commit()
     return session
+
+
+def test_staffdeck_seed_reads_fixture_as_utf8(monkeypatch) -> None:
+    class FakeFixturePath:
+        def exists(self) -> bool:
+            return True
+
+        def read_text(self, *, encoding=None) -> str:
+            assert encoding == "utf-8"
+            return "{}"
+
+    monkeypatch.setattr(staffdeck_seed, "FIXTURE_PATH", FakeFixturePath())
+    monkeypatch.setattr(staffdeck_seed, "_seed_agents", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(staffdeck_seed, "_seed_skills", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(staffdeck_seed, "_seed_general_skills", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(staffdeck_seed, "_seed_tools", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(staffdeck_seed, "_seed_knowledge", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(staffdeck_seed, "_seed_agent_resource_bindings", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(staffdeck_seed, "_seed_skill_branches", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(staffdeck_seed, "_seed_knowledge_branches", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(staffdeck_seed, "_publish_gallery_resources", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(staffdeck_seed, "_sync_seed_agents_to_current_admin", lambda *_args, **_kwargs: None)
+
+    staffdeck_seed.seed_staffdeck_admin_gallery(_FlushOnlySession())
 
 
 def test_staffdeck_seed_exposes_selected_agents_with_knowledge_bases() -> None:

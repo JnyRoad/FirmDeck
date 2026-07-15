@@ -101,12 +101,20 @@ def test_health_rejects_other_local_service(monkeypatch) -> None:
 
 
 def test_windows_taskbar_app_only_used_for_frozen_windows(monkeypatch) -> None:
+    monkeypatch.delenv("STAFFDECK_HEADLESS", raising=False)
     monkeypatch.setattr(desktop_launcher.sys, "platform", "win32")
     monkeypatch.delattr(desktop_launcher.sys, "frozen", raising=False)
     assert desktop_launcher._use_windows_taskbar_app() is False
 
     monkeypatch.setattr(desktop_launcher.sys, "frozen", True, raising=False)
     assert desktop_launcher._use_windows_taskbar_app() is True
+
+
+def test_windows_taskbar_app_disabled_in_headless_mode(monkeypatch) -> None:
+    monkeypatch.setattr(desktop_launcher.sys, "platform", "win32")
+    monkeypatch.setattr(desktop_launcher.sys, "frozen", True, raising=False)
+    monkeypatch.setenv("STAFFDECK_HEADLESS", "1")
+    assert desktop_launcher._use_windows_taskbar_app() is False
 
 
 def test_windows_restore_command_detection() -> None:

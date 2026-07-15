@@ -1,5 +1,8 @@
 # packaging/build_windows.ps1
 $ErrorActionPreference = "Stop"
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
+$env:PYTHONUTF8 = "1"
+$env:PYTHONIOENCODING = "utf-8"
 $Repo = Split-Path -Parent $PSScriptRoot
 Set-Location $Repo
 if (-not $env:VERSION) { $env:VERSION = "0.1.0" }
@@ -18,6 +21,32 @@ function Assert-NativeCommandSucceeded {
     throw "$Step failed with exit code $LASTEXITCODE."
   }
 }
+
+function ConvertTo-WindowsVersionInfoVersion {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Version
+  )
+
+  $match = [regex]::Match($Version, '^[vV]?([0-9]+(?:\.[0-9]+){0,3})')
+  if (-not $match.Success) {
+    throw "VERSION must start with a numeric version for Windows VersionInfoVersion. Current value: $Version"
+  }
+
+  $parts = @($match.Groups[1].Value.Split('.') | ForEach-Object { [int]$_ })
+  foreach ($part in $parts) {
+    if ($part -lt 0 -or $part -gt 65535) {
+      throw "Windows version component out of range 0..65535 in VERSION: $Version"
+    }
+  }
+  while ($parts.Count -lt 4) {
+    $parts += 0
+  }
+  return ($parts[0..3] -join ".")
+}
+
+$env:WINDOWS_VERSION_INFO_VERSION = ConvertTo-WindowsVersionInfoVersion $env:VERSION
+Write-Host "Windows VersionInfoVersion: $env:WINDOWS_VERSION_INFO_VERSION"
 
 # A py.exe launcher can exist without an installed Python runtime. Probe each
 # candidate instead of only checking whether the launcher is on PATH.
@@ -125,8 +154,8 @@ if (-not (Test-Path $unsignedInstaller)) {
 
 Write-Host "==> [6/6] Name the release artifact"
 $out = "packaging\out\StaffDeck-$($env:VERSION)-windows-x64-setup.exe"
-if (Test-Path $out) { Remove-Item -Force $out }
-Rename-Item $unsignedInstaller $out
+if (Test-Path -LiteralPath $out) { Remove-Item -LiteralPath $out -Force }
+Move-Item -LiteralPath $unsignedInstaller -Destination $out
 if ($signingConfigured) {
   $signature = Get-AuthenticodeSignature $out
   if ($signature.Status -ne "Valid") {

@@ -11,6 +11,10 @@ import tarfile
 import urllib.request
 from pathlib import Path
 
+for stream in (sys.stdout, sys.stderr):
+    if hasattr(stream, "reconfigure"):
+        stream.reconfigure(encoding="utf-8", errors="replace")
+
 # 已知稳定 release（执行前用 curl -sI 核实资产可达；失效则更新此处并同步 docs）
 BASE = "https://github.com/astral-sh/python-build-standalone/releases/download/20240415"
 ASSETS = {

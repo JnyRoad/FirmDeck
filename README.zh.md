@@ -114,7 +114,9 @@ API Key 用于创建初始模型配置，存入数据库前会被加密。请勿
 DETACH=1 scripts/dev_up.sh
 ```
 
-脚本会构建 StaffDeck 前端，并由一个 FastAPI 进程在 `5173` 端口同时提供 UI、API 与 Swagger 文档。
+脚本会构建 StaffDeck 前端，并由一个 FastAPI 进程在 `5173` 端口同时提供 UI、API 与 Swagger 文档，默认管理员的账号密码是admin/admin，请在首次登陆后再账号配置中修改密码。
+
+初始管理员账号：用户名 `admin`，密码 `admin`。首次登录后请及时修改密码。
 
 ### 4. 验证安装
 
@@ -138,7 +140,7 @@ scripts/dev_down.sh         # 停止本地服务
 scripts/dev_up.sh           # 前台运行
 ```
 
-> 完整说明 → [StaffDeck 使用教程]()
+> 完整说明 → [StaffDeck 使用教程](https://staffdeck.openbmb.cn/docs/introduce?lang=zh)
 
 
 
@@ -207,7 +209,7 @@ StaffDeck/
 <tr>
 <td align="center"><img src="packaging/assets/qr-wechat.jpg" width="200" alt="微信二维码"/></td>
 <td align="center"><img src="packaging/assets/qr-feishu.jpg" width="200" alt="飞书二维码"/></td>
-<td align="center"><img src="packaging/assets/qr-discord.jpg" width="200" alt="Discord 二维码"/></td>
+<td align="center"><img src="packaging/assets/qr-discord.png" width="200" alt="Discord 二维码"/></td>
 </tr>
 </table>
 
