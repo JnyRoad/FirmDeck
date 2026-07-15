@@ -83,6 +83,7 @@ import {
   isTerminalSessionEvent,
   knowledgeResultTraceDetail,
   knowledgeTraceDetail,
+  knowledgeTraceLineId,
   knowledgeTraceText,
   latestUserMessageForTurn,
   loadSessionReadTimes,
@@ -1939,7 +1940,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     }
     if (item.event === 'knowledge_result') {
       upsertVisibleTraceLine({
-        id: 'knowledge_lookup',
+        id: knowledgeTraceLineId(item.data),
         kind: 'knowledge',
         text: '读取知识库',
         detail: knowledgeResultTraceDetail(item.data),
@@ -2015,7 +2016,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
         upsertVisibleTraceLine({ id: 'decision_router', kind: 'decision', text: '判断意图', state: 'running', icon: 'judge' });
       } else if (isKnowledgeTracePhase(phase)) {
         upsertVisibleTraceLine({
-          id: 'knowledge_lookup',
+          id: knowledgeTraceLineId(item.data),
           kind: 'knowledge',
           text: knowledgeTraceText(item.data),
           detail: knowledgeTraceDetail(item.data),
