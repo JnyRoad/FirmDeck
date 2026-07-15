@@ -77,8 +77,9 @@ class ResponseGenerator:
         persona_prompt: str | None = None,
         memory_context: list[dict[str, object]] | None = None,
         conversation_context: dict[str, object] | None = None,
+        task_results: list[dict[str, object]] | None = None,
     ) -> str:
-        if self._can_use_step_reply_directly(step_result, tool_result):
+        if self._can_use_step_reply_directly(step_result, tool_result, task_results):
             return step_result.reply.strip()
         raw_payload = self._payload(
             message,
@@ -89,10 +90,11 @@ class ResponseGenerator:
             tool_result,
             memory_context,
             conversation_context,
+            task_results,
         )
         payload = self._stage_payload(raw_payload, persona_prompt)
         try:
-            if tool_result and not tool_result.success:
+            if tool_result and not tool_result.success and not task_results:
                 return tool_failure_reply(tool_result)
             with llm_operation("response.generate"):
                 text = LLMClient(model_config).generate_text(
@@ -117,8 +119,9 @@ class ResponseGenerator:
         persona_prompt: str | None = None,
         memory_context: list[dict[str, object]] | None = None,
         conversation_context: dict[str, object] | None = None,
+        task_results: list[dict[str, object]] | None = None,
     ) -> Iterator[str]:
-        if self._can_use_step_reply_directly(step_result, tool_result):
+        if self._can_use_step_reply_directly(step_result, tool_result, task_results):
             yield from self.chunk_text(step_result.reply or "")
             return
         raw_payload = self._payload(
@@ -130,10 +133,11 @@ class ResponseGenerator:
             tool_result,
             memory_context,
             conversation_context,
+            task_results,
         )
         payload = self._stage_payload(raw_payload, persona_prompt)
         try:
-            if tool_result and not tool_result.success:
+            if tool_result and not tool_result.success and not task_results:
                 yield from self.chunk_text(tool_failure_reply(tool_result))
                 return
             if router_decision.decision == "clarify" and step_result.reply:
@@ -183,9 +187,11 @@ class ResponseGenerator:
         self,
         step_result: StepAgentResult,
         tool_result: ToolResult | None,
+        task_results: list[dict[str, object]] | None = None,
     ) -> bool:
         return bool(
-            str(step_result.reply or "").strip()
+            not task_results
+            and str(step_result.reply or "").strip()
             and step_result.action in {"ask_user", "clarify"}
             and tool_result is None
             and step_result.tool_call is None
@@ -203,7 +209,17 @@ class ResponseGenerator:
         tool_result: ToolResult | None,
         memory_context: list[dict[str, object]] | None = None,
         conversation_context: dict[str, object] | None = None,
+        task_results: list[dict[str, object]] | None = None,
     ) -> dict[str, object]:
+        projected_task_results = self._project_task_results(task_results)
+        if projected_task_results:
+            return {
+                "user_message": message,
+                "conversation_context": (
+                    conversation_context if isinstance(conversation_context, dict) else {}
+                ),
+                "task_results": projected_task_results,
+            }
         knowledge_context = self._current_knowledge_context(message, session, step_result)
         compact_knowledge = compact_knowledge_context(knowledge_context)
         return {
@@ -226,6 +242,43 @@ class ResponseGenerator:
             ),
             "response_rules": skill.content_json.get("response_rules", []) if skill else [],
         }
+
+    def _project_task_results(
+        self, task_results: list[dict[str, object]] | None
+    ) -> list[dict[str, object]]:
+        if not isinstance(task_results, list):
+            return []
+        projected: list[dict[str, object]] = []
+        for item in task_results:
+            if not isinstance(item, dict):
+                continue
+            skill_content = item.get("skill_content")
+            content = skill_content if isinstance(skill_content, dict) else {}
+            raw_step_result = item.get("step_result")
+            step_result = raw_step_result if isinstance(raw_step_result, dict) else {}
+            knowledge_context = (
+                step_result.get("knowledge_results")
+                if isinstance(step_result.get("knowledge_results"), list)
+                else []
+            )
+            compact_knowledge = compact_knowledge_context(knowledge_context)
+            projected.append(
+                {
+                    "task": item.get("task") or "当前任务",
+                    "current_step": compact_current_step(
+                        content, str(item.get("current_step_id") or "") or None
+                    ),
+                    "slots": item.get("slots") if isinstance(item.get("slots"), dict) else {},
+                    "step_summary": compact_response_step_result(step_result),
+                    "tool_result": item.get("tool_result"),
+                    "retrieved_knowledge": compact_knowledge,
+                    "knowledge_citation_hints": compact_citation_hints(
+                        knowledge_citations_from_results(knowledge_context)
+                    ),
+                    "response_rules": content.get("response_rules", []),
+                }
+            )
+        return projected
 
     def _current_knowledge_context(
         self,

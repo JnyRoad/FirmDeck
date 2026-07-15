@@ -239,6 +239,7 @@ class PreparedTurn:
 @dataclass
 class QueuedTaskContinuation:
     reply: str
+    task_results: list[dict[str, object]]
     active_skill: Skill | None
     router_decision: RouterDecision
     step_result: StepAgentResult
@@ -372,30 +373,27 @@ class AgentLoop:
             if prepared.reply_override is not None:
                 reply = prepared.reply_override
             else:
-                reply = self._generate_reply_segment(
-                    request.message,
-                    chat_session,
-                    prepared.active_skill,
-                    router_decision,
-                    step_result,
-                    tool_result,
-                    prepared.model_config,
-                    self._get_persona_prompt(request.tenant_id, chat_session.agent_id),
-                    memory_context,
-                    conversation_context,
-                )
-                finalize_state = self._finalize_execution_after_reply(
-                    request.tenant_id,
-                    chat_session,
-                    prepared.active_skill,
-                    router_decision,
-                    step_result,
-                    tool_result,
-                )
                 if turn_followup_frames:
+                    task_results = [
+                        self._task_response_context(
+                            chat_session,
+                            prepared.active_skill,
+                            router_decision,
+                            step_result,
+                            tool_result,
+                        )
+                    ]
                     primary_router_decision = router_decision
                     primary_step_result = step_result
                     primary_tool_result = tool_result
+                    finalize_state = self._finalize_execution_after_reply(
+                        request.tenant_id,
+                        chat_session,
+                        prepared.active_skill,
+                        router_decision,
+                        step_result,
+                        tool_result,
+                    )
                     paused_primary = None
                     if finalize_state == "continued" and prepared.active_skill:
                         paused_primary = self.runtime.suspend_current_skill(chat_session)
@@ -416,34 +414,68 @@ class AgentLoop:
                         ),
                         memory_context,
                         conversation_context,
-                        reply,
+                        "",
                         turn_task_frames=turn_followup_frames,
                     )
+                    if continuation:
+                        task_results.extend(continuation.task_results)
                     if paused_primary:
                         if chat_session.active_skill_id:
                             self.runtime.suspend_current_skill(chat_session, enqueue=True)
                         self.runtime.restore_task_frame(chat_session, paused_primary)
                         self.db.commit()
                         self.db.refresh(chat_session)
-                        if continuation:
-                            reply = "\n\n".join(
-                                part
-                                for part in (continuation.reply.strip(), reply.strip())
-                                if part
-                            )
                         router_decision = primary_router_decision
                         step_result = primary_step_result
                         tool_result = primary_tool_result
                     elif continuation:
-                        reply = "\n\n".join(
-                            part
-                            for part in (reply.strip(), continuation.reply.strip())
-                            if part
-                        )
                         router_decision = continuation.router_decision
                         step_result = continuation.step_result
                         tool_result = continuation.tool_result
-                elif finalize_state == "completed" and request.interaction_mode == "scheduled_task":
+                    response_active_skill = (
+                        prepared.active_skill
+                        if paused_primary or not continuation
+                        else continuation.active_skill
+                    )
+                    reply = self._generate_reply_segment(
+                        request.message,
+                        chat_session,
+                        response_active_skill,
+                        router_decision,
+                        step_result,
+                        tool_result,
+                        prepared.model_config,
+                        self._get_persona_prompt(request.tenant_id, chat_session.agent_id),
+                        memory_context,
+                        conversation_context,
+                        task_results,
+                    )
+                else:
+                    reply = self._generate_reply_segment(
+                        request.message,
+                        chat_session,
+                        prepared.active_skill,
+                        router_decision,
+                        step_result,
+                        tool_result,
+                        prepared.model_config,
+                        self._get_persona_prompt(request.tenant_id, chat_session.agent_id),
+                        memory_context,
+                        conversation_context,
+                    )
+                    finalize_state = self._finalize_execution_after_reply(
+                        request.tenant_id,
+                        chat_session,
+                        prepared.active_skill,
+                        router_decision,
+                        step_result,
+                        tool_result,
+                    )
+                if (
+                    not turn_followup_frames
+                    and finalize_state == "completed"
+                    and request.interaction_mode == "scheduled_task"
+                ):
                     continuation = self._try_continue_pending_after_completion(
                         request,
                         chat_session,
@@ -1007,7 +1039,6 @@ class AgentLoop:
         conversation_context: dict[str, object],
         completed_reply: str,
         completed_skill_ids_this_turn: set[str] | None = None,
-        replace_existing_reply: bool = False,
         user_message_id: str | None = None,
         turn_task_frames: list[PendingTask] | None = None,
     ) -> Iterator[dict[str, object]]:
@@ -1020,8 +1051,8 @@ class AgentLoop:
         max_actions = max(1, self._get_agent_loop_max_actions(request.tenant_id))
         executed_actions = 0
         replies: list[str] = []
+        task_results: list[dict[str, object]] = []
         completed_skill_ids_this_turn = completed_skill_ids_this_turn or set()
-        replaced_current_reply = False
         active_skill: Skill | None = None
         router_decision = RouterDecision(decision="answer_only", reason="No pending task selected")
         step_result = StepAgentResult()
@@ -1220,62 +1251,18 @@ class AgentLoop:
                         event_name, chat_session, self._turn_payload(payload, user_message_id)
                     )
 
-                yield self._stream_status(
-                    chat_session, "responding", "正在生成回复", user_message_id=user_message_id
+                task_results.append(
+                    self._task_response_context(
+                        chat_session,
+                        active_skill,
+                        router_decision,
+                        step_result,
+                        tool_result,
+                    )
                 )
-                chunks: list[str] = []
-                for chunk in self._generate_reply_stream_segment(
-                    request.message,
-                    chat_session,
-                    active_skill,
-                    router_decision,
-                    step_result,
-                    tool_result,
-                    model_config,
-                    persona_prompt,
-                    memory_context,
-                    conversation_context,
-                ):
-                    chunks.append(chunk)
-                    if replace_existing_reply and not replaced_current_reply:
-                        yield self._stream_event(
-                            "stream_replace",
-                            chat_session,
-                            self._turn_payload({"content": ""}, user_message_id),
-                        )
-                        replaced_current_reply = True
-                    yield self._stream_event(
-                        "stream_delta",
-                        chat_session,
-                        self._turn_payload({"content": chunk}, user_message_id),
-                    )
-                    self._pace_stream()
-                segment = "".join(chunks).strip() or FALLBACK_REPLY
-                if not chunks:
-                    for chunk in self.response_generator.chunk_text(segment):
-                        chunks.append(chunk)
-                        if replace_existing_reply and not replaced_current_reply:
-                            yield self._stream_event(
-                                "stream_replace",
-                                chat_session,
-                                self._turn_payload({"content": ""}, user_message_id),
-                            )
-                            replaced_current_reply = True
-                        yield self._stream_event(
-                            "stream_delta",
-                            chat_session,
-                            self._turn_payload({"content": chunk}, user_message_id),
-                        )
-                        self._pace_stream()
-                replies, replaced_reply = self._merge_queued_reply_segment(replies, segment)
-                if replaced_reply:
-                    yield self._stream_event(
-                        "stream_replace",
-                        chat_session,
-                        self._turn_payload(
-                            {"content": "\n\n".join(replies).strip()}, user_message_id
-                        ),
-                    )
+                draft = self._task_response_draft(step_result)
+                if draft:
+                    replies, _ = self._merge_queued_reply_segment(replies, draft)
                 executed_actions += 1
                 finalize_state = self._finalize_execution_after_reply(
                     request.tenant_id,
@@ -1289,7 +1276,12 @@ class AgentLoop:
                     completed_skill_ids_this_turn.add(active_skill.skill_id)
                 if finalize_state == "handoff":
                     return self._queued_continuation(
-                        replies, active_skill, router_decision, step_result, tool_result
+                        replies,
+                        task_results,
+                        active_skill,
+                        router_decision,
+                        step_result,
+                        tool_result,
                     )
                 if finalize_state == "continued":
                     if uses_turn_frames and remaining_turn_frames:
@@ -1309,7 +1301,12 @@ class AgentLoop:
                             completed_skill_ids_this_turn.add(active_skill.skill_id)
                         continue
                     return self._queued_continuation(
-                        replies, active_skill, router_decision, step_result, tool_result
+                        replies,
+                        task_results,
+                        active_skill,
+                        router_decision,
+                        step_result,
+                        tool_result,
                     )
                 self.events.record(
                     request.tenant_id,
@@ -1324,7 +1321,12 @@ class AgentLoop:
                 break
 
         return self._queued_continuation(
-            replies, active_skill, router_decision, step_result, tool_result
+            replies,
+            task_results,
+            active_skill,
+            router_decision,
+            step_result,
+            tool_result,
         )
 
     def handle_turn_stream(self, request: ChatTurnRequest) -> Iterator[dict[str, object]]:
@@ -1963,6 +1965,101 @@ class AgentLoop:
                     event_name, chat_session, self._turn_payload(payload, user_message_id)
                 )
 
+            response_task_results: list[dict[str, object]] | None = None
+            finalize_before_reply = bool(turn_followup_frames) or (
+                request.interaction_mode == "scheduled_task"
+            )
+            if finalize_before_reply:
+                response_task_results = [
+                    self._task_response_context(
+                        chat_session,
+                        active_skill,
+                        router_decision,
+                        step_result,
+                        tool_result,
+                    )
+                ]
+                finalize_state = self._finalize_execution_after_reply(
+                    request.tenant_id,
+                    chat_session,
+                    active_skill,
+                    router_decision,
+                    step_result,
+                    tool_result,
+                )
+            else:
+                finalize_state = "continued"
+
+            if turn_followup_frames and finalize_state != "handoff":
+                primary_active_skill = active_skill
+                primary_router_decision = router_decision
+                primary_step_result = step_result
+                primary_tool_result = tool_result
+                paused_primary = None
+                if finalize_state == "continued" and active_skill:
+                    paused_primary = self.runtime.suspend_current_skill(chat_session)
+                continuation = None
+                if turn_followup_frames:
+                    continuation = yield from self._stream_continue_pending_after_completion(
+                        request,
+                        chat_session,
+                        model_config,
+                        skills,
+                        tools,
+                        persona_prompt,
+                        memory_context,
+                        conversation_context,
+                        "",
+                        user_message_id=user_message_id,
+                        turn_task_frames=turn_followup_frames,
+                    )
+                if continuation and response_task_results is not None:
+                    response_task_results.extend(continuation.task_results)
+                if paused_primary:
+                    if chat_session.active_skill_id:
+                        self.runtime.suspend_current_skill(chat_session, enqueue=True)
+                    self.runtime.restore_task_frame(chat_session, paused_primary)
+                    self.db.commit()
+                    self.db.refresh(chat_session)
+                    active_skill = primary_active_skill
+                    router_decision = primary_router_decision
+                    step_result = primary_step_result
+                    tool_result = primary_tool_result
+                elif continuation:
+                    active_skill = continuation.active_skill
+                    router_decision = continuation.router_decision
+                    step_result = continuation.step_result
+                    tool_result = continuation.tool_result
+            elif finalize_state == "completed" and request.interaction_mode == "scheduled_task":
+                continuation = None
+                if self._next_pending_task_id(chat_session):
+                    continuation = yield from self._stream_continue_pending_after_completion(
+                        request,
+                        chat_session,
+                        model_config,
+                        skills,
+                        tools,
+                        persona_prompt,
+                        memory_context,
+                        conversation_context,
+                        "",
+                        user_message_id=user_message_id,
+                    )
+                if continuation:
+                    if response_task_results is not None:
+                        response_task_results.extend(continuation.task_results)
+                    active_skill = continuation.active_skill
+                    router_decision = continuation.router_decision
+                    step_result = continuation.step_result
+                    tool_result = continuation.tool_result
+                elif chat_session.pending_tasks_json:
+                    self.events.record(
+                        request.tenant_id,
+                        chat_session.id,
+                        "pending_tasks_waiting",
+                        {"pending_tasks": chat_session.pending_tasks_json or []},
+                    )
+
             yield self._stream_status(
                 chat_session, "responding", "正在生成回复", user_message_id=user_message_id
             )
@@ -1978,6 +2075,7 @@ class AgentLoop:
                 persona_prompt,
                 memory_context,
                 conversation_context,
+                response_task_results,
             ):
                 chunks.append(chunk)
                 yield self._stream_event(
@@ -1996,115 +2094,15 @@ class AgentLoop:
                         self._turn_payload({"content": chunk}, user_message_id),
                     )
                     self._pace_stream()
-            finalize_state = self._finalize_execution_after_reply(
-                request.tenant_id,
-                chat_session,
-                active_skill,
-                router_decision,
-                step_result,
-                tool_result,
-            )
-            if turn_followup_frames and finalize_state != "handoff":
-                primary_active_skill = active_skill
-                primary_router_decision = router_decision
-                primary_step_result = step_result
-                primary_tool_result = tool_result
-                paused_primary = None
-                if finalize_state == "continued" and active_skill:
-                    paused_primary = self.runtime.suspend_current_skill(chat_session)
-                continuation = None
-                if turn_followup_frames:
-                    separator = "\n\n"
-                    if not paused_primary:
-                        yield self._stream_event(
-                            "stream_delta",
-                            chat_session,
-                            self._turn_payload({"content": separator}, user_message_id),
-                        )
-                    continuation = yield from self._stream_continue_pending_after_completion(
-                        request,
-                        chat_session,
-                        model_config,
-                        skills,
-                        tools,
-                        persona_prompt,
-                        memory_context,
-                        conversation_context,
-                        reply,
-                        replace_existing_reply=bool(paused_primary),
-                        user_message_id=user_message_id,
-                        turn_task_frames=turn_followup_frames,
-                    )
-                if paused_primary:
-                    if chat_session.active_skill_id:
-                        self.runtime.suspend_current_skill(chat_session, enqueue=True)
-                    self.runtime.restore_task_frame(chat_session, paused_primary)
-                    self.db.commit()
-                    self.db.refresh(chat_session)
-                    if continuation:
-                        suffix = f"\n\n{reply.strip()}" if reply.strip() else ""
-                        if suffix:
-                            yield self._stream_event(
-                                "stream_delta",
-                                chat_session,
-                                self._turn_payload({"content": suffix}, user_message_id),
-                            )
-                        reply = "\n\n".join(
-                            part
-                            for part in (continuation.reply.strip(), reply.strip())
-                            if part
-                        )
-                    active_skill = primary_active_skill
-                    router_decision = primary_router_decision
-                    step_result = primary_step_result
-                    tool_result = primary_tool_result
-                elif continuation:
-                    reply = "\n\n".join(
-                        part
-                        for part in (reply.strip(), continuation.reply.strip())
-                        if part
-                    )
-                    active_skill = continuation.active_skill
-                    router_decision = continuation.router_decision
-                    step_result = continuation.step_result
-                    tool_result = continuation.tool_result
-            elif finalize_state == "completed" and request.interaction_mode == "scheduled_task":
-                continuation = None
-                if self._next_pending_task_id(chat_session):
-                    yield self._stream_event(
-                        "stream_delta",
-                        chat_session,
-                        self._turn_payload({"content": "\n\n"}, user_message_id),
-                    )
-                    continuation = yield from self._stream_continue_pending_after_completion(
-                        request,
-                        chat_session,
-                        model_config,
-                        skills,
-                        tools,
-                        persona_prompt,
-                        memory_context,
-                        conversation_context,
-                        reply,
-                        user_message_id=user_message_id,
-                    )
-                if continuation:
-                    reply = "\n\n".join(
-                        part
-                        for part in (reply.strip(), continuation.reply.strip())
-                        if part
-                    )
-                    active_skill = continuation.active_skill
-                    router_decision = continuation.router_decision
-                    step_result = continuation.step_result
-                    tool_result = continuation.tool_result
-                elif chat_session.pending_tasks_json:
-                    self.events.record(
-                        request.tenant_id,
-                        chat_session.id,
-                        "pending_tasks_waiting",
-                        {"pending_tasks": chat_session.pending_tasks_json or []},
-                    )
+            if not finalize_before_reply:
+                self._finalize_execution_after_reply(
+                    request.tenant_id,
+                    chat_session,
+                    active_skill,
+                    router_decision,
+                    step_result,
+                    tool_result,
+                )
             if mark_current_turn_cancelled():
                 return
             yield self._stream_event(
@@ -2760,6 +2758,7 @@ class AgentLoop:
         persona_prompt: str | None,
         memory_context: list[dict[str, object]],
         conversation_context: dict[str, object],
+        task_results: list[dict[str, object]] | None = None,
     ) -> str:
         return self.response_generator.generate(
             message,
@@ -2772,6 +2771,7 @@ class AgentLoop:
             persona_prompt,
             memory_context,
             conversation_context,
+            task_results,
         )
 
     def _generate_reply_stream_segment(
@@ -2786,6 +2786,7 @@ class AgentLoop:
         persona_prompt: str | None,
         memory_context: list[dict[str, object]],
         conversation_context: dict[str, object],
+        task_results: list[dict[str, object]] | None = None,
     ) -> Iterator[str]:
         yield from self.response_generator.generate_stream(
             message,
@@ -2798,7 +2799,29 @@ class AgentLoop:
             persona_prompt,
             memory_context,
             conversation_context,
+            task_results,
         )
+
+    def _task_response_context(
+        self,
+        chat_session: ChatSession,
+        active_skill: Skill | None,
+        router_decision: RouterDecision,
+        step_result: StepAgentResult,
+        tool_result: ToolResult | None,
+    ) -> dict[str, object]:
+        return {
+            "task": router_decision.user_intent
+            or (active_skill.name if active_skill else "当前任务"),
+            "current_step_id": chat_session.active_step_id,
+            "skill_content": dict(active_skill.content_json or {}) if active_skill else None,
+            "slots": dict(chat_session.slots_json or {}),
+            "step_result": step_result.model_dump(mode="json"),
+            "tool_result": tool_result.model_dump(mode="json") if tool_result else None,
+        }
+
+    def _task_response_draft(self, step_result: StepAgentResult) -> str:
+        return str(step_result.reply or "").strip()
 
     def _try_continue_pending_after_completion(
         self,
@@ -2823,6 +2846,7 @@ class AgentLoop:
         max_actions = max(1, self._get_agent_loop_max_actions(request.tenant_id))
         executed_actions = 0
         replies: list[str] = []
+        task_results: list[dict[str, object]] = []
         completed_skill_ids_this_turn = completed_skill_ids_this_turn or set()
         active_skill: Skill | None = None
         router_decision = RouterDecision(decision="answer_only", reason="No pending task selected")
@@ -2947,20 +2971,18 @@ class AgentLoop:
                     conversation_context,
                     completed_skill_ids_this_turn=completed_skill_ids_this_turn,
                 )
-                segment = self._generate_reply_segment(
-                    request.message,
-                    chat_session,
-                    active_skill,
-                    router_decision,
-                    step_result,
-                    tool_result,
-                    model_config,
-                    persona_prompt,
-                    memory_context,
-                    conversation_context,
+                task_results.append(
+                    self._task_response_context(
+                        chat_session,
+                        active_skill,
+                        router_decision,
+                        step_result,
+                        tool_result,
+                    )
                 )
-                if segment:
-                    replies, _replaced_reply = self._merge_queued_reply_segment(replies, segment)
+                draft = self._task_response_draft(step_result)
+                if draft:
+                    replies, _ = self._merge_queued_reply_segment(replies, draft)
                 executed_actions += 1
                 finalize_state = self._finalize_execution_after_reply(
                     request.tenant_id,
@@ -2974,7 +2996,12 @@ class AgentLoop:
                     completed_skill_ids_this_turn.add(active_skill.skill_id)
                 if finalize_state == "handoff":
                     return self._queued_continuation(
-                        replies, active_skill, router_decision, step_result, tool_result
+                        replies,
+                        task_results,
+                        active_skill,
+                        router_decision,
+                        step_result,
+                        tool_result,
                     )
                 if finalize_state == "continued":
                     if uses_turn_frames and remaining_turn_frames:
@@ -2994,7 +3021,12 @@ class AgentLoop:
                             completed_skill_ids_this_turn.add(active_skill.skill_id)
                         continue
                     return self._queued_continuation(
-                        replies, active_skill, router_decision, step_result, tool_result
+                        replies,
+                        task_results,
+                        active_skill,
+                        router_decision,
+                        step_result,
+                        tool_result,
                     )
                 self.events.record(
                     request.tenant_id,
@@ -3009,21 +3041,28 @@ class AgentLoop:
                 break
 
         return self._queued_continuation(
-            replies, active_skill, router_decision, step_result, tool_result
+            replies,
+            task_results,
+            active_skill,
+            router_decision,
+            step_result,
+            tool_result,
         )
 
     def _queued_continuation(
         self,
         replies: list[str],
+        task_results: list[dict[str, object]],
         active_skill: Skill | None,
         router_decision: RouterDecision,
         step_result: StepAgentResult,
         tool_result: ToolResult | None,
     ) -> QueuedTaskContinuation | None:
-        if not replies:
+        if not replies and not task_results:
             return None
         return QueuedTaskContinuation(
             reply="\n\n".join(replies).strip(),
+            task_results=task_results,
             active_skill=active_skill,
             router_decision=router_decision,
             step_result=step_result,

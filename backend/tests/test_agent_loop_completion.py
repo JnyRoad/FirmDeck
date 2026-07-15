@@ -636,10 +636,6 @@ def test_only_started_waiting_task_becomes_pending_while_later_turn_frame_still_
     loop._get_reflection_max_rounds = lambda _tenant_id: 0
     loop._run_reflection_rounds = lambda *args, **_kwargs: tuple(args[5:9])
     loop._auto_progress_skill_graph = lambda *args, **_kwargs: tuple(args[5:9])
-    loop._generate_reply_segment = (
-        lambda _message, _session, active_skill, *_args, **_kwargs: active_skill.skill_id
-    )
-
     skills = [_price_compare_skill(), _purchase_skill()]
     skills_by_id = {skill.skill_id: skill for skill in skills}
     executed: list[str] = []
@@ -697,7 +693,79 @@ def test_only_started_waiting_task_becomes_pending_while_later_turn_frame_still_
         "expected_fields": ["product_name_2"]
     }
     assert result is not None
-    assert result.reply == "price_compare\n\npurchase"
+    assert result.reply == "请补充第二个商品\n\n购买完成"
+
+
+def test_streamed_followup_tasks_collect_results_without_emitting_replies() -> None:
+    loop = object.__new__(AgentLoop)
+    loop.runtime = SkillRuntime()
+    loop.events = FakeEvents()
+    loop.db = FakeDb()
+    loop._get_agent_loop_max_actions = lambda _tenant_id: 4
+    loop._drop_unavailable_skill_state = lambda *_args, **_kwargs: False
+    loop._should_record_runtime_event_after_prune = lambda *_args, **_kwargs: False
+    loop._should_run_step_agent = lambda *_args, **_kwargs: True
+    loop._get_reflection_max_rounds = lambda _tenant_id: 0
+    loop._run_reflection_rounds = lambda *args, **_kwargs: tuple(args[5:9])
+    loop._auto_progress_skill_graph = lambda *args, **_kwargs: tuple(args[5:9])
+    loop._skill_state_payload = lambda *_args, **_kwargs: {}
+    loop._runtime_stream_context = lambda *_args, **_kwargs: {}
+
+    skills = [_price_compare_skill(), _purchase_skill()]
+    skills_by_id = {skill.skill_id: skill for skill in skills}
+    loop._get_active_skill = (
+        lambda _tenant_id, skill_id, _agent_id: skills_by_id.get(skill_id or "")
+    )
+
+    def run_step(_request, _session, active_skill, *_args, **_kwargs):
+        return StepAgentResult(
+            action="ask_user",
+            reply=f"{active_skill.name}需要补充信息",
+        )
+
+    loop._run_step_agent_with_context_repair = run_step
+    loop._finalize_execution_after_reply = lambda *_args, **_kwargs: "continued"
+    session = ChatSession(id="session_test", tenant_id="tenant_demo", pending_tasks_json=[])
+    frames = [
+        PendingTask(
+            decision="start_new_task",
+            target_skill_id="price_compare",
+            target_step_id="collect_products",
+        ),
+        PendingTask(
+            decision="start_new_task",
+            target_skill_id="purchase",
+            target_step_id="collect_user_name",
+        ),
+    ]
+
+    iterator = loop._stream_continue_pending_after_completion(
+        _request("先比价，再购买"),
+        session,
+        _model_config(),
+        skills,
+        [],
+        None,
+        [],
+        {},
+        "",
+        user_message_id="msg_user",
+        turn_task_frames=frames,
+    )
+    events: list[dict[str, object]] = []
+    while True:
+        try:
+            events.append(next(iterator))
+        except StopIteration as stop:
+            result = stop.value
+            break
+
+    assert result is not None
+    assert len(result.task_results) == 2
+    assert [event["event"] for event in events].count("step_result") == 2
+    assert not {"stream_delta", "stream_replace"}.intersection(
+        event["event"] for event in events
+    )
 
 
 def test_drop_unavailable_skill_state_removes_disabled_sop_frames() -> None:
