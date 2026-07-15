@@ -146,7 +146,13 @@ def _use_macos_dock_app() -> bool:
 
 
 def _use_windows_taskbar_app() -> bool:
+    if _env_flag("STAFFDECK_HEADLESS"):
+        return False
     return sys.platform == "win32" and getattr(sys, "frozen", False)
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _is_windows_restore_command(message: int, wparam: int) -> bool:
@@ -464,9 +470,11 @@ def main(argv: list[str] | None = None) -> int:
     if _use_windows_taskbar_app():
         return _run_windows_taskbar_app(cfg, url)
 
-    # 其它平台 / 开发态：主线程跑 uvicorn，后台线程开浏览器
-    print(f"{APP_NAME} 启动中，就绪后将打开：{url}/chat/")
-    threading.Thread(target=_open_browser_when_ready, args=(url,), daemon=True).start()
+    if not _env_flag("STAFFDECK_HEADLESS"):
+        print(f"{APP_NAME} 启动中，就绪后将打开：{url}/chat/")
+        threading.Thread(target=_open_browser_when_ready, args=(url,), daemon=True).start()
+    else:
+        print(f"{APP_NAME} headless 启动中：{url}")
     _serve(cfg)
     return 0
 

@@ -53,7 +53,7 @@ def seed_staffdeck_admin_gallery(session: Session) -> None:
 
     if not FIXTURE_PATH.exists():
         return
-    data = json.loads(FIXTURE_PATH.read_text())
+    data = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
     id_maps: dict[str, dict[str, str]] = {
         "agent": {},
         "skill": {},
