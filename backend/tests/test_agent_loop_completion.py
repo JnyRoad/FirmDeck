@@ -450,7 +450,7 @@ def test_stream_trace_events_require_turn_id_for_persistence() -> None:
     assert db.commits == 1
 
 
-def test_router_order_keeps_primary_active_and_queues_followup_tasks() -> None:
+def test_router_order_keeps_current_turn_followup_out_of_pending_tasks() -> None:
     loop = object.__new__(AgentLoop)
     loop.runtime = SkillRuntime()
     session = ChatSession(
@@ -469,9 +469,18 @@ def test_router_order_keeps_primary_active_and_queues_followup_tasks() -> None:
         reason="用户补充购买目标，同时提出独立比价任务。",
         source_message="我买 A1 前跟 A3 比一下价格",
         slot_hints={"product_id": "A1", "quantity": 1},
-        created_tasks=[
+        task_frames=[
+            PendingTask(
+                decision="continue_active",
+                target_skill_id="purchase",
+                target_step_id="collect_user_name",
+                user_intent="继续购买 A1",
+                source_message="我买 A1 前跟 A3 比一下价格",
+                slot_hints={"product_id": "A1", "quantity": 1},
+            ),
             PendingTask(
                 task_id="task_price_compare_a1_a3",
+                decision="start_new_task",
                 target_skill_id="price_compare",
                 target_step_id="collect_products",
                 user_intent="比较 A1 和 A3 的价格",
@@ -486,14 +495,14 @@ def test_router_order_keeps_primary_active_and_queues_followup_tasks() -> None:
     assert session.active_skill_id == "purchase"
     assert session.active_step_id == "collect_user_name"
     assert session.slots_json == {"user_name": "hm", "product_id": "A1", "quantity": 1}
-    assert [frame["skill_id"] for frame in session.pending_tasks_json] == ["price_compare"]
-    assert session.pending_tasks_json[0]["slots"] == {
-        "product_name_1": "A1",
-        "product_name_2": "A3",
-    }
+    assert session.pending_tasks_json == []
+    assert [task.target_skill_id for task in router_decision.task_frames] == [
+        "purchase",
+        "price_compare",
+    ]
 
 
-def test_router_can_place_existing_active_task_after_new_primary() -> None:
+def test_router_keeps_existing_active_task_in_current_turn_plan_after_new_primary() -> None:
     loop = object.__new__(AgentLoop)
     loop.runtime = SkillRuntime()
     session = ChatSession(
@@ -512,9 +521,18 @@ def test_router_can_place_existing_active_task_after_new_primary() -> None:
         reason="用户提出独立比价任务。",
         source_message="我想买一个A1,然后想跟A3比下价格",
         slot_hints={"product_name_1": "A1", "product_name_2": "A3"},
-        pending_tasks=[
+        task_frames=[
+            PendingTask(
+                decision="start_new_task",
+                target_skill_id="price_compare",
+                target_step_id="collect_products",
+                user_intent="比较 A1 和 A3 的价格",
+                source_message="我想买一个A1,然后想跟A3比下价格",
+                slot_hints={"product_name_1": "A1", "product_name_2": "A3"},
+            ),
             PendingTask(
                 task_id="task_purchase_a1",
+                decision="continue_active",
                 target_skill_id="purchase",
                 target_step_id="collect_user_name",
                 user_intent="继续购买 A1",
@@ -529,8 +547,157 @@ def test_router_can_place_existing_active_task_after_new_primary() -> None:
     assert session.active_skill_id == "price_compare"
     assert session.active_step_id == "collect_products"
     assert session.slots_json == {"product_name_1": "A1", "product_name_2": "A3"}
-    assert [frame["skill_id"] for frame in session.pending_tasks_json] == ["purchase"]
-    assert session.pending_tasks_json[0]["slots"] == {"user_name": "hm"}
+    assert session.pending_tasks_json == []
+    assert [task.target_skill_id for task in router_decision.task_frames] == [
+        "price_compare",
+        "purchase",
+    ]
+
+
+def test_current_turn_task_frames_execute_in_order_without_pending_queue() -> None:
+    loop = object.__new__(AgentLoop)
+    loop.runtime = SkillRuntime()
+    loop.events = FakeEvents()
+    loop.db = FakeDb()
+    loop._get_agent_loop_max_actions = lambda _tenant_id: 4
+    loop._drop_unavailable_skill_state = lambda *_args, **_kwargs: False
+    loop._should_record_runtime_event_after_prune = lambda *_args, **_kwargs: False
+    loop._should_run_step_agent = lambda *_args, **_kwargs: True
+    loop._get_reflection_max_rounds = lambda _tenant_id: 0
+    loop._run_reflection_rounds = lambda *args, **_kwargs: tuple(args[5:9])
+    loop._auto_progress_skill_graph = lambda *args, **_kwargs: tuple(args[5:9])
+    loop._generate_reply_segment = lambda *_args, **_kwargs: "已完成"
+
+    skills = [_price_compare_skill(), _purchase_skill()]
+    skills_by_id = {skill.skill_id: skill for skill in skills}
+    executed: list[str] = []
+    loop._get_active_skill = (
+        lambda _tenant_id, skill_id, _agent_id: skills_by_id.get(skill_id or "")
+    )
+
+    def run_step(_request, session, active_skill, *_args, **_kwargs):
+        executed.append(active_skill.skill_id)
+        return StepAgentResult(reply="已完成", is_step_completed=True)
+
+    def finalize(_tenant_id, session, active_skill, *_args, **_kwargs):
+        loop.runtime.complete_current_skill(session)
+        return "completed"
+
+    loop._run_step_agent_with_context_repair = run_step
+    loop._finalize_execution_after_reply = finalize
+    session = ChatSession(
+        id="session_test",
+        tenant_id="tenant_demo",
+        pending_tasks_json=[],
+    )
+    frames = [
+        PendingTask(
+            decision="start_new_task",
+            target_skill_id="price_compare",
+            target_step_id="collect_products",
+            slot_hints={"product_name_1": "A1", "product_name_2": "A3"},
+        ),
+        PendingTask(
+            decision="start_new_task",
+            target_skill_id="purchase",
+            target_step_id="collect_user_name",
+            slot_hints={"product_id": "A3", "quantity": 1},
+        ),
+    ]
+
+    result = loop._try_continue_pending_after_completion(
+        _request("先比较 A1 和 A3，再购买 A3"),
+        session,
+        _model_config(),
+        skills,
+        [],
+        None,
+        [],
+        {},
+        "",
+        turn_task_frames=frames,
+    )
+
+    assert executed == ["price_compare", "purchase"]
+    assert session.pending_tasks_json == []
+    assert result is not None
+    assert result.reply == "已完成\n\n已完成"
+
+
+def test_only_started_waiting_task_becomes_pending_while_later_turn_frame_still_runs() -> None:
+    loop = object.__new__(AgentLoop)
+    loop.runtime = SkillRuntime()
+    loop.events = FakeEvents()
+    loop.db = FakeDb()
+    loop._get_agent_loop_max_actions = lambda _tenant_id: 4
+    loop._drop_unavailable_skill_state = lambda *_args, **_kwargs: False
+    loop._should_record_runtime_event_after_prune = lambda *_args, **_kwargs: False
+    loop._should_run_step_agent = lambda *_args, **_kwargs: True
+    loop._get_reflection_max_rounds = lambda _tenant_id: 0
+    loop._run_reflection_rounds = lambda *args, **_kwargs: tuple(args[5:9])
+    loop._auto_progress_skill_graph = lambda *args, **_kwargs: tuple(args[5:9])
+    loop._generate_reply_segment = (
+        lambda _message, _session, active_skill, *_args, **_kwargs: active_skill.skill_id
+    )
+
+    skills = [_price_compare_skill(), _purchase_skill()]
+    skills_by_id = {skill.skill_id: skill for skill in skills}
+    executed: list[str] = []
+    loop._get_active_skill = (
+        lambda _tenant_id, skill_id, _agent_id: skills_by_id.get(skill_id or "")
+    )
+
+    def run_step(_request, session, active_skill, *_args, **_kwargs):
+        executed.append(active_skill.skill_id)
+        if active_skill.skill_id == "price_compare":
+            session.awaiting_input_json = {"expected_fields": ["product_name_2"]}
+            return StepAgentResult(reply="请补充第二个商品")
+        return StepAgentResult(reply="购买完成", is_step_completed=True)
+
+    def finalize(_tenant_id, session, active_skill, *_args, **_kwargs):
+        if active_skill.skill_id == "price_compare":
+            return "continued"
+        loop.runtime.complete_current_skill(session)
+        return "completed"
+
+    loop._run_step_agent_with_context_repair = run_step
+    loop._finalize_execution_after_reply = finalize
+    session = ChatSession(id="session_test", tenant_id="tenant_demo", pending_tasks_json=[])
+    frames = [
+        PendingTask(
+            decision="start_new_task",
+            target_skill_id="price_compare",
+            target_step_id="collect_products",
+            slot_hints={"product_name_1": "A1"},
+        ),
+        PendingTask(
+            decision="start_new_task",
+            target_skill_id="purchase",
+            target_step_id="collect_user_name",
+            slot_hints={"product_id": "A3", "quantity": 1},
+        ),
+    ]
+
+    result = loop._try_continue_pending_after_completion(
+        _request("先比较 A1 和另一个商品，再购买 A3"),
+        session,
+        _model_config(),
+        skills,
+        [],
+        None,
+        [],
+        {},
+        "",
+        turn_task_frames=frames,
+    )
+
+    assert executed == ["price_compare", "purchase"]
+    assert [frame["skill_id"] for frame in session.pending_tasks_json] == ["price_compare"]
+    assert session.pending_tasks_json[0]["awaiting_input"] == {
+        "expected_fields": ["product_name_2"]
+    }
+    assert result is not None
+    assert result.reply == "price_compare\n\npurchase"
 
 
 def test_drop_unavailable_skill_state_removes_disabled_sop_frames() -> None:
@@ -593,10 +760,16 @@ def test_skill_state_payload_filters_disabled_sop_frames() -> None:
         ],
     )
 
-    payload = loop._skill_state_payload(session, [_purchase_skill()])
+    payload = loop._skill_state_payload(
+        session,
+        [_purchase_skill()],
+        user_message_id="msg_current_turn",
+    )
 
     assert payload["activeSkillId"] is None
     assert payload["activeStepId"] is None
+    assert payload["user_message_id"] == "msg_current_turn"
+    assert payload["turn_id"] == "msg_current_turn"
     assert payload["currentSkills"] == [
         {
             "skillId": "purchase",

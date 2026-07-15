@@ -20,7 +20,7 @@ import StaffdeckIcon from '../../components/StaffdeckIcon';
 import ScheduledTasksTab from './ScheduledTasksTab';
 import MemoriesTab from './MemoriesTab';
 import ConversationLogsTab from './ConversationLogsTab';
-import WorkRecordTab, { dateKey } from './WorkRecordTab';
+import WorkRecordTab from './WorkRecordTab';
 import type { ReplyStats } from './WorkRecordTab';
 import {
   agentResourceCount,
@@ -34,8 +34,9 @@ import {
 } from '../../employee';
 import type {
   AgentProfileRead,
+  AgentWorkRecordEventRead,
+  AgentWorkRecordRead,
   EnterpriseChatSessionRead,
-  EnterpriseSessionDetailRead,
   FeedbackSummaryRead,
   GeneralSkillRead,
   KnowledgeBaseRead,
@@ -71,6 +72,7 @@ export default function DashboardPage({
   const [feedbackSummary, setFeedbackSummary] = useState<FeedbackSummaryRead | null>(null);
   const [scheduledTasks, setScheduledTasks] = useState<ScheduledTaskRead[]>([]);
   const [replyStats, setReplyStats] = useState<ReplyStats>({ total: 0, today: 0, byDay: {} });
+  const [activityEvents, setActivityEvents] = useState<AgentWorkRecordEventRead[]>([]);
   const [agentId, setAgentId] = useState(() => window.localStorage.getItem(ENTERPRISE_AGENT_STORAGE_KEY) || '');
   const [avatarEditorOpen, setAvatarEditorOpen] = useState(false);
   const [profileEditorOpen, setProfileEditorOpen] = useState(false);
@@ -145,39 +147,36 @@ export default function DashboardPage({
 
   useEffect(() => {
     let cancelled = false;
-    async function loadReplyStats() {
-      if (!selectedAgent || selectedAgent.is_overall || employeeSessions.length === 0) {
+    async function loadWorkRecord() {
+      if (!selectedAgent || selectedAgent.is_overall) {
         setReplyStats({ total: 0, today: 0, byDay: {} });
+        setActivityEvents([]);
         return;
       }
       try {
-        const details = await Promise.all(
-          employeeSessions.map((item) => api.get<EnterpriseSessionDetailRead>(
-            `/api/enterprise/sessions/${item.id}?tenant_id=${TENANT_ID}`,
-          )),
+        const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'Asia/Shanghai';
+        const workRecord = await api.get<AgentWorkRecordRead>(
+          `/api/enterprise/agents/${encodeURIComponent(selectedAgent.id)}/work-record?tenant_id=${TENANT_ID}&timezone=${encodeURIComponent(timezone)}`,
         );
         if (cancelled) return;
-        const byDay: Record<string, number> = {};
-        let total = 0;
-        details.forEach((detail) => {
-          detail.messages
-            .filter((item) => item.role === 'assistant')
-            .forEach((item) => {
-              const key = dateKey(new Date(item.created_at));
-              byDay[key] = (byDay[key] || 0) + 1;
-              total += 1;
-            });
+        setReplyStats({
+          total: workRecord.reply_stats.total,
+          today: workRecord.reply_stats.today,
+          byDay: workRecord.reply_stats.by_day,
         });
-        setReplyStats({ total, today: byDay[dateKey(new Date())] || 0, byDay });
-      } catch {
-        if (!cancelled) setReplyStats({ total: 0, today: 0, byDay: {} });
+        setActivityEvents(workRecord.events);
+      } catch (error) {
+        if (cancelled) return;
+        setReplyStats({ total: 0, today: 0, byDay: {} });
+        setActivityEvents([]);
+        notify.error(error instanceof Error ? error.message : '加载员工工作记录失败');
       }
     }
-    void loadReplyStats();
+    void loadWorkRecord();
     return () => {
       cancelled = true;
     };
-  }, [selectedAgent?.id, selectedAgent?.is_overall, sessions]);
+  }, [selectedAgent?.id, selectedAgent?.is_overall]);
   const defaultModel = models.find((item) => item.is_default);
   const totalCalls = skills.reduce((sum, item) => sum + (item.total_call_count || item.call_count || 0), 0);
   const positiveFeedback = skills.reduce((sum, item) => sum + (item.total_positive_feedback_count || 0), 0);
@@ -387,6 +386,7 @@ export default function DashboardPage({
           activeScheduledTasks={activeScheduledTasks}
           employeeSessions={employeeSessions}
           replyStats={replyStats}
+          activityEvents={activityEvents}
           positiveRate={positiveRate}
           negativeRate={negativeRate}
         />

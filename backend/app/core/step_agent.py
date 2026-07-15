@@ -219,14 +219,16 @@ def _available_tools_for_step(
         if action.startswith("call_tool:") and ":" in action
     }
     allow_any = "call_tool" in actions
-    if not explicit_names and not allow_any:
-        return []
     projected: list[dict[str, object]] = []
     for tool in tools:
         if not getattr(tool, "enabled", False):
             continue
         name = str(getattr(tool, "name", "") or "").strip()
-        if not name or (not allow_any and name not in explicit_names):
+        if not name:
+            continue
+        if not name.startswith(GENERAL_SKILL_TOOL_PREFIX) and (
+            not allow_any and name not in explicit_names
+        ):
             continue
         projected.append(
             {

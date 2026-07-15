@@ -77,10 +77,12 @@ class RouterDecision(BaseModel):
     target_step_id: Optional[str] = None
     confidence: float = 0.0
     user_intent: Optional[str] = None
+    general_intent: Optional[str] = None
     reason: Optional[str] = None
     source_message: Optional[str] = None
     clarification_question: Optional[str] = None
     slot_hints: dict[str, Any] = Field(default_factory=dict)
+    task_frames: list[PendingTask] = Field(default_factory=list)
     pending_tasks: list[PendingTask] = Field(default_factory=list)
     task_updates: list[TaskUpdate] = Field(default_factory=list)
     created_tasks: list[PendingTask] = Field(default_factory=list)

@@ -1991,12 +1991,14 @@ html[lang="en-US"] .lp-title .lp-line2 {
 }
 
 .site-chat-shell {
+  --site-chat-track-width: 940px;
   box-sizing: border-box;
-  width: min(1180px, calc(100% - 48px));
+  width: 100%;
+  max-width: calc(var(--site-chat-track-width) + 48px);
   height: 100%;
   min-height: 0;
   margin: 0 auto;
-  padding: 22px 0 28px;
+  padding: 22px 24px 28px;
   display: grid;
   grid-template-rows: minmax(0, 1fr) auto;
   gap: 14px;
@@ -2006,9 +2008,19 @@ html[lang="en-US"] .lp-title .lp-line2 {
   min-height: 0;
   overflow-y: auto;
   overscroll-behavior: contain;
-  padding: 12px clamp(8px, 2vw, 22px) 26px;
+  padding: 12px 0 26px;
   scrollbar-width: thin;
   scrollbar-color: #ccd1dc transparent;
+}
+
+.site-chat-transcript-track {
+  box-sizing: border-box;
+  width: 100%;
+  max-width: var(--site-chat-track-width);
+  min-height: 100%;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
 }
 
 .site-chat-empty {
@@ -2054,8 +2066,8 @@ html[lang="en-US"] .lp-title .lp-line2 {
 
 .site-chat-profile-card {
   box-sizing: border-box;
-  position: absolute;
-  z-index: 20;
+  position: fixed;
+  z-index: 1000;
   width: 258px;
   padding: 14px;
   border: 1px solid #e1e5ee;
@@ -2070,20 +2082,10 @@ html[lang="en-US"] .lp-title .lp-line2 {
   transition: opacity 160ms ease, transform 160ms ease, visibility 160ms ease;
 }
 
-.site-chat-avatar-anchor.is-empty .site-chat-profile-card {
-  left: 78%;
-  bottom: 18%;
-}
-
-.site-chat-avatar-anchor.is-composer .site-chat-profile-card {
-  left: 0;
-  bottom: calc(100% + 10px);
-}
-
-.site-chat-avatar-anchor:hover .site-chat-profile-card,
-.site-chat-avatar-anchor:focus-visible .site-chat-profile-card {
+.site-chat-profile-card.is-visible {
   opacity: 1;
   visibility: visible;
+  pointer-events: auto;
   transform: translateY(0);
 }
 
@@ -2294,6 +2296,7 @@ html[lang="en-US"] .lp-title .lp-line2 {
 .site-chat-message.is-user {
   width: fit-content;
   max-width: min(72%, 720px);
+  align-self: flex-end;
   margin-left: auto;
   padding: 13px 17px;
   border-radius: 18px 18px 2px 18px;
@@ -2305,7 +2308,7 @@ html[lang="en-US"] .lp-title .lp-line2 {
 }
 
 .site-chat-message.is-assistant {
-  width: min(940px, 100%);
+  width: 100%;
   margin-left: auto;
   margin-right: auto;
   border: 1px solid #e1e5ee;
@@ -2552,7 +2555,8 @@ html[lang="en-US"] .lp-title .lp-line2 {
 .site-chat-composer-stage {
   position: relative;
   z-index: 3;
-  width: min(940px, calc(100% - 32px));
+  width: 100%;
+  max-width: var(--site-chat-track-width);
   margin: 0 auto;
   padding-top: 12px;
 }
@@ -2739,11 +2743,12 @@ html[lang="en-US"] .lp-title .lp-line2 {
     padding: 62px 0 0;
   }
   .site-chat-shell {
-    width: calc(100% - 24px);
-    padding: 14px 0 16px;
+    width: 100%;
+    max-width: none;
+    padding: 14px 12px 16px;
   }
   .site-chat-transcript {
-    padding: 12px 4px 22px;
+    padding: 12px 0 22px;
   }
   .site-chat-empty {
     width: 100%;
@@ -2799,21 +2804,13 @@ html[lang="en-US"] .lp-title .lp-line2 {
     padding-right: 16px;
   }
   .site-chat-composer-stage {
-    width: calc(100% - 12px);
+    width: 100%;
   }
   .site-chat-avatar-anchor.is-composer {
     left: 14px;
     top: -45px;
     width: 62px;
     height: 72px;
-  }
-  .site-chat-avatar-anchor.is-empty .site-chat-profile-card {
-    left: 18%;
-    bottom: 74%;
-  }
-  .site-chat-avatar-anchor.is-composer .site-chat-profile-card {
-    left: 0;
-    bottom: calc(100% + 8px);
   }
   .site-chat-profile-card {
     width: min(252px, calc(100vw - 52px));

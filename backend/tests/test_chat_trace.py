@@ -15,6 +15,27 @@ from app.api.chat import (
     message_read,
 )
 from app.db.models import AgentEvent, ChatSession, KnowledgeConcept, Message, Tenant, User
+from app.observability.event_log import EventLog
+
+
+def test_event_log_binds_all_execution_events_to_current_turn() -> None:
+    with _test_db() as db:
+        events = EventLog(db)
+        events.bind_turn("msg_user", "client_turn")
+
+        event = events.record(
+            "tenant_demo",
+            "session_test",
+            "step_agent_result_created",
+            {"reply": "请补充退款原因"},
+        )
+
+        assert event.payload_json == {
+            "reply": "请补充退款原因",
+            "turn_id": "msg_user",
+            "user_message_id": "msg_user",
+            "client_turn_id": "client_turn",
+        }
 
 
 def test_session_spans_endpoint_returns_internal_spans_without_relaying_them() -> None:
@@ -145,6 +166,56 @@ def test_turn_trace_uses_router_skill_hint_when_events_have_turn_id() -> None:
     router_line = next(line for line in traces[0]["lines"] if line["id"] == "decision_router")
     assert router_line["icon"] == "judge"
     assert skill_lines[0]["icon"] == "advance"
+
+
+def test_turn_trace_recovers_persisted_skill_state_for_current_turn() -> None:
+    started_at = datetime(2026, 7, 14, 9, 57, 4)
+    messages = [
+        Message(
+            id="msg_user",
+            tenant_id="tenant_demo",
+            session_id="session_test",
+            role="user",
+            content="先查询天气，再购买 a1",
+            created_at=started_at,
+        )
+    ]
+    events = [
+        AgentEvent(
+            tenant_id="tenant_demo",
+            session_id="session_test",
+            event_type="user_message_received",
+            payload_json={"message_id": "msg_user", "message": "先查询天气，再购买 a1"},
+            created_at=started_at,
+        ),
+        AgentEvent(
+            tenant_id="tenant_demo",
+            session_id="session_test",
+            event_type="skill_state",
+            payload_json={
+                "activeSkillId": "skill_purchase_001",
+                "activeStepId": "collect_user_name",
+                "currentSkills": [
+                    {
+                        "skillId": "skill_purchase_001",
+                        "name": "购买商品流程",
+                        "stepId": "collect_user_name",
+                        "state": "active",
+                    }
+                ],
+                "runtimeDecision": "start_new_task",
+                "user_message_id": "msg_user",
+                "turn_id": "msg_user",
+            },
+            created_at=started_at + timedelta(seconds=1),
+        ),
+    ]
+
+    traces = _build_turn_traces(messages, events, {"skill_purchase_001": "购买商品流程"})
+
+    skill_line = next(line for line in traces[0]["lines"] if line["kind"] == "skill")
+    assert skill_line["text"] == "执行SOP 购买商品流程"
+    assert skill_line["detail"] == "当前步骤 collect_user_name"
 
 
 def test_message_read_hydrates_knowledge_citation_content_from_concept() -> None:

@@ -246,6 +246,7 @@ def _migrate_sqlite_skill_schema() -> None:
                 _seed_skill_versions(conn)
             _normalize_agent_branch_rows(conn, tables)
             _seed_agent_branch_state(conn, inspector, tables)
+            _sync_explicit_skill_tool_bindings(conn, tables)
 
 
 def _migrate_default_model_output_limit(conn, tables: set[str]) -> None:
@@ -351,6 +352,76 @@ def _normalize_existing_skill_version_rows(conn, legacy_id_prefix: str) -> None:
                 "content_json": json.dumps(content, ensure_ascii=False),
             },
         )
+
+
+def _sync_explicit_skill_tool_bindings(conn, tables: set[str]) -> None:
+    if "skills" not in tables or "tools" not in tables:
+        return
+    skill_rows = conn.execute(
+        text(
+            "SELECT tenant_id, skill_id, content_json FROM skills "
+            "WHERE status IS NULL OR status != 'deleted'"
+        )
+    ).mappings().all()
+    for skill_row in skill_rows:
+        content = _json_object(skill_row.get("content_json"))
+        tool_names = _explicit_skill_tool_names(content)
+        if not tool_names:
+            continue
+        tool_rows = conn.execute(
+            text("SELECT id, name, allowed_skills_json FROM tools WHERE tenant_id = :tenant_id"),
+            {"tenant_id": skill_row["tenant_id"]},
+        ).mappings().all()
+        for tool_row in tool_rows:
+            if str(tool_row.get("name") or "") not in tool_names:
+                continue
+            allowed_skills = _json_string_list(tool_row.get("allowed_skills_json"))
+            skill_id = str(skill_row.get("skill_id") or "").strip()
+            if not skill_id or skill_id in allowed_skills:
+                continue
+            allowed_skills.append(skill_id)
+            conn.execute(
+                text(
+                    "UPDATE tools SET allowed_skills_json = :allowed_skills, "
+                    "updated_at = CURRENT_TIMESTAMP WHERE id = :id"
+                ),
+                {
+                    "id": tool_row["id"],
+                    "allowed_skills": json.dumps(allowed_skills, ensure_ascii=False),
+                },
+            )
+
+
+def _explicit_skill_tool_names(content: dict[str, object]) -> set[str]:
+    names: set[str] = set()
+    for key in ("nodes", "steps"):
+        items = content.get(key)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            actions = item.get("allowed_actions")
+            if not isinstance(actions, list):
+                continue
+            for action in actions:
+                value = str(action or "").strip()
+                if value.startswith("call_tool:"):
+                    name = value.split(":", 1)[1].strip()
+                    if name:
+                        names.add(name)
+    return names
+
+
+def _json_string_list(value: object) -> list[str]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return []
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value if str(item).strip()]
 
 
 def _ensure_skill_graph(content: dict[str, object]) -> dict[str, object]:

@@ -28,7 +28,7 @@ class SkillRuntime:
         session.pending_tasks_json = _sanitize_task_frames(session.pending_tasks_json)
         session.skill_stack_json = []
         self._apply_task_updates(session, decision.task_updates)
-        self._append_pending_tasks(session, [*decision.pending_tasks, *decision.created_tasks])
+        self._append_pending_tasks(session, decision.pending_tasks)
         session.resume_after_answer_json = None
 
         selected_frame = self._take_task_frame(session, decision.selected_task_id)
@@ -80,6 +80,49 @@ class SkillRuntime:
         session.resume_after_answer_json = None
         session.updated_at = utc_now()
         return session
+
+    def suspend_current_skill(
+        self, session: ChatSession, *, enqueue: bool = False
+    ) -> dict[str, Any] | None:
+        frame = _current_frame(session, status="pending", resume_policy="resume_after_turn_tasks")
+        if not frame:
+            return None
+        frame["awaiting_input"] = dict(session.awaiting_input_json or {})
+        if enqueue:
+            self.enqueue_task_frame(session, frame)
+        session.active_skill_id = None
+        session.active_step_id = None
+        session.slots_json = {}
+        session.awaiting_input_json = None
+        session.summary = None
+        session.last_agent_question = None
+        session.resume_after_answer_json = None
+        session.updated_at = utc_now()
+        return frame
+
+    def restore_task_frame(self, session: ChatSession, frame: dict[str, Any]) -> ChatSession:
+        _activate_frame(session, frame)
+        awaiting_input = frame.get("awaiting_input")
+        if isinstance(awaiting_input, dict):
+            session.awaiting_input_json = dict(awaiting_input)
+        session.updated_at = utc_now()
+        return session
+
+    def enqueue_task_frame(self, session: ChatSession, frame: dict[str, Any]) -> None:
+        next_frame = dict(frame)
+        next_frame["status"] = "pending"
+        frames = list(session.pending_tasks_json or [])
+        task_id = str(next_frame.get("task_id") or "").strip()
+        if task_id and any(
+            isinstance(item, dict) and str(item.get("task_id") or "") == task_id
+            for item in frames
+        ):
+            return
+        frames.append(next_frame)
+        session.pending_tasks_json = frames
+
+    def enqueue_pending_task(self, session: ChatSession, task: PendingTask) -> None:
+        self._append_pending_tasks(session, [task])
 
     def _activate_decision_target(
         self,
@@ -180,7 +223,7 @@ class SkillRuntime:
 
 def _sanitize_decision_slots(decision: RouterDecision) -> None:
     decision.slot_hints = strip_router_generated_message_slots(decision.slot_hints)
-    for task in [*decision.pending_tasks, *decision.created_tasks]:
+    for task in [*decision.task_frames, *decision.pending_tasks, *decision.created_tasks]:
         task.slot_hints = strip_router_generated_message_slots(task.slot_hints)
     for update in decision.task_updates:
         update.slot_hints = strip_router_generated_message_slots(update.slot_hints)
@@ -288,6 +331,9 @@ def _activate_frame(session: ChatSession, frame: dict[str, Any]) -> None:
     session.slots_json = strip_router_generated_message_slots(slots)
     session.summary = frame.get("summary")
     session.last_agent_question = frame.get("last_agent_question")
+    awaiting_input = frame.get("awaiting_input")
+    if isinstance(awaiting_input, dict):
+        session.awaiting_input_json = dict(awaiting_input)
     _set_active_task_id(session, str(frame.get("task_id") or ""))
 
 

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from time import sleep
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.exc import IntegrityError, OperationalError
@@ -17,6 +19,9 @@ from app.agents.schema import (
     AgentResourcesUpdateRequest,
     AgentScopeRead,
     AgentSkillRollbackRequest,
+    AgentWorkRecordEventRead,
+    AgentWorkRecordRead,
+    AgentWorkRecordReplyStatsRead,
 )
 from app.agents.branching import (
     agent_private_metadata,
@@ -48,6 +53,8 @@ from app.db.models import (
     KnowledgeBucket,
     KnowledgeChunk,
     KnowledgeDocument,
+    Message,
+    ScheduledTask,
     Skill,
     Tool,
     utc_now,
@@ -165,6 +172,66 @@ def get_agent(
     row = _get_agent(db, tenant_id, agent_id)
     _ensure_can_access_agent(row, current_user)
     return agent_read(row, _bindings_by_agent(db, tenant_id).get(row.id, []))
+
+
+@enterprise_router.get("/{agent_id}/work-record", response_model=AgentWorkRecordRead)
+def get_agent_work_record(
+    agent_id: str,
+    tenant_id: str = Query(...),
+    timezone: str = Query("Asia/Shanghai"),
+    db: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+) -> AgentWorkRecordRead:
+    agent = _get_agent(db, tenant_id, agent_id)
+    _ensure_can_access_agent(agent, current_user)
+    try:
+        local_timezone = ZoneInfo(timezone)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="Invalid timezone") from exc
+
+    now = utc_now()
+    reply_rows = db.exec(
+        select(Message)
+        .join(ChatSession, Message.session_id == ChatSession.id)
+        .where(
+            Message.tenant_id == tenant_id,
+            Message.role == "assistant",
+            ChatSession.tenant_id == tenant_id,
+            ChatSession.agent_id == agent_id,
+            ChatSession.user_id == current_user.id,
+        )
+        .order_by(Message.created_at.asc())
+    ).all()
+    by_day: dict[str, int] = {}
+    events = [
+        AgentWorkRecordEventRead(
+            id=f"{message.id}:reply",
+            kind="chat",
+            phase="reply",
+            timestamp=_iso_utc(message.created_at),
+            label="对话回复",
+        )
+        for message in reply_rows
+    ]
+    for message in reply_rows:
+        day = _as_utc(message.created_at).astimezone(local_timezone).date().isoformat()
+        by_day[day] = by_day.get(day, 0) + 1
+
+    events.extend(_agent_resource_timeline_events(db, tenant_id, agent_id))
+    events.extend(_agent_scheduled_task_timeline_events(db, tenant_id, agent_id, current_user))
+    events.sort(key=lambda item: (item.timestamp, item.id))
+    today = _as_utc(now).astimezone(local_timezone).date().isoformat()
+    return AgentWorkRecordRead(
+        agent_id=agent_id,
+        timezone=timezone,
+        generated_at=_iso_utc(now),
+        reply_stats=AgentWorkRecordReplyStatsRead(
+            total=len(reply_rows),
+            today=by_day.get(today, 0),
+            by_day=dict(sorted(by_day.items())),
+        ),
+        events=events,
+    )
 
 
 @enterprise_router.put("/{agent_id}", response_model=AgentProfileRead)
@@ -572,6 +639,162 @@ def use_chat_agent(
     _mark_agent_used(db, tenant_id, current_user, row.id)
     bindings = _bindings_by_agent(db, tenant_id)
     return agent_read(row, bindings.get(row.id, []), True)
+
+
+def _agent_resource_timeline_events(
+    db: Session,
+    tenant_id: str,
+    agent_id: str,
+) -> list[AgentWorkRecordEventRead]:
+    bindings = db.exec(
+        select(AgentResourceBinding).where(
+            AgentResourceBinding.tenant_id == tenant_id,
+            AgentResourceBinding.agent_id == agent_id,
+            AgentResourceBinding.status == "active",
+        )
+    ).all()
+    ids_by_type = {
+        resource_type: {
+            binding.resource_id
+            for binding in bindings
+            if binding.resource_type == resource_type
+        }
+        for resource_type in ("skill", "general_skill", "knowledge_base", "tool")
+    }
+    skills = {
+        row.id: row
+        for row in db.exec(
+            select(Skill).where(
+                Skill.tenant_id == tenant_id,
+                Skill.id.in_(ids_by_type["skill"]),
+            )
+        ).all()
+    } if ids_by_type["skill"] else {}
+    general_skills = {
+        row.id: row
+        for row in db.exec(
+            select(GeneralSkill).where(
+                GeneralSkill.tenant_id == tenant_id,
+                GeneralSkill.id.in_(ids_by_type["general_skill"]),
+            )
+        ).all()
+    } if ids_by_type["general_skill"] else {}
+    knowledge_bases = {
+        row.id: row
+        for row in db.exec(
+            select(KnowledgeBase).where(
+                KnowledgeBase.tenant_id == tenant_id,
+                KnowledgeBase.id.in_(ids_by_type["knowledge_base"]),
+            )
+        ).all()
+    } if ids_by_type["knowledge_base"] else {}
+    tools = {
+        row.id: row
+        for row in db.exec(
+            select(Tool).where(
+                Tool.tenant_id == tenant_id,
+                Tool.id.in_(ids_by_type["tool"]),
+            )
+        ).all()
+    } if ids_by_type["tool"] else {}
+    skill_branches = {
+        row.skill_id: row
+        for row in db.exec(
+            select(AgentSkillBranch).where(
+                AgentSkillBranch.tenant_id == tenant_id,
+                AgentSkillBranch.agent_id == agent_id,
+            )
+        ).all()
+    }
+    knowledge_branches = {
+        row.knowledge_base_id: row
+        for row in db.exec(
+            select(AgentKnowledgeBranch).where(
+                AgentKnowledgeBranch.tenant_id == tenant_id,
+                AgentKnowledgeBranch.agent_id == agent_id,
+            )
+        ).all()
+    }
+
+    events: list[AgentWorkRecordEventRead] = []
+    for binding in bindings:
+        kind: str
+        label: str
+        if binding.resource_type == "skill":
+            resource = skills.get(binding.resource_id)
+            branch = skill_branches.get(resource.skill_id) if resource else None
+            if not resource or resource.status != "published" or (branch and branch.status != "active"):
+                continue
+            kind, label = "sop", resource.name
+        elif binding.resource_type == "general_skill":
+            resource = general_skills.get(binding.resource_id)
+            if not resource or resource.status != "published":
+                continue
+            kind, label = "skill", resource.name
+        elif binding.resource_type == "knowledge_base":
+            resource = knowledge_bases.get(binding.resource_id)
+            branch = knowledge_branches.get(binding.resource_id)
+            if not resource or resource.status != "active" or (branch and branch.status != "active"):
+                continue
+            kind, label = "knowledge", resource.name
+        elif binding.resource_type == "tool":
+            resource = tools.get(binding.resource_id)
+            if not resource or not resource.enabled:
+                continue
+            kind, label = "tool", resource.display_name or resource.name
+        else:
+            continue
+        events.append(
+            AgentWorkRecordEventRead(
+                id=f"{binding.id}:assigned",
+                kind=kind,  # type: ignore[arg-type]
+                phase="assigned",
+                timestamp=_iso_utc(binding.created_at),
+                label=label,
+            )
+        )
+    return events
+
+
+def _agent_scheduled_task_timeline_events(
+    db: Session,
+    tenant_id: str,
+    agent_id: str,
+    current_user: User,
+) -> list[AgentWorkRecordEventRead]:
+    conditions = [
+        ScheduledTask.tenant_id == tenant_id,
+        ScheduledTask.agent_id == agent_id,
+        ScheduledTask.status != "archived",
+    ]
+    if not _is_admin_user(current_user):
+        conditions.append(ScheduledTask.created_by_user_id == current_user.id)
+    tasks = db.exec(select(ScheduledTask).where(*conditions)).all()
+    events: list[AgentWorkRecordEventRead] = []
+    for task in tasks:
+        for phase, timestamp in (("last_run", task.last_run_at), ("next_run", task.next_run_at)):
+            if not timestamp:
+                continue
+            events.append(
+                AgentWorkRecordEventRead(
+                    id=f"{task.id}:{phase}",
+                    kind="task",
+                    phase=phase,  # type: ignore[arg-type]
+                    timestamp=_iso_utc(timestamp),
+                    label=task.title,
+                )
+            )
+    return events
+
+
+def _as_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
+def _iso_utc(value: datetime) -> str:
+    return _as_utc(value).isoformat().replace("+00:00", "Z")
 
 
 def agent_read(

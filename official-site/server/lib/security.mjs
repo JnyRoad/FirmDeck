@@ -55,8 +55,24 @@ export function sessionCookie(token, { secure = false, maxAge = 7_200 } = {}) {
 }
 
 export function sessionFromRequest(request, secret) {
-  const token = parseCookies(request.headers.cookie || '')[COOKIE_NAME];
+  const sessionHeader = request.headers['x-site-session'];
+  const headerToken = Array.isArray(sessionHeader) ? sessionHeader[0] : sessionHeader;
+  const token = typeof headerToken === 'string' && headerToken
+    ? headerToken
+    : parseCookies(request.headers.cookie || '')[COOKIE_NAME];
   return verifySessionToken(token, secret);
+}
+
+export function corsHeaders(request, configuredOrigins = []) {
+  const origin = request.headers.origin;
+  if (!origin || !isAllowedOrigin(request, configuredOrigins)) return {};
+  return {
+    'Access-Control-Allow-Credentials': 'true',
+    'Access-Control-Allow-Headers': 'Content-Type, X-Site-CSRF, X-Site-Session',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Origin': origin,
+    Vary: 'Origin',
+  };
 }
 
 export function isAllowedOrigin(request, configuredOrigins = []) {

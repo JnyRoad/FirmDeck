@@ -20,6 +20,7 @@ import StaffdeckIcon from '../../components/StaffdeckIcon';
 import { staffdeckDisplayText } from '../../employee';
 import type {
   AgentProfileRead,
+  AgentWorkRecordEventRead,
   EnterpriseChatSessionRead,
   GeneralSkillRead,
   KnowledgeBaseRead,
@@ -69,6 +70,7 @@ export type WorkRecordTabProps = {
   activeScheduledTasks: ScheduledTaskRead[];
   employeeSessions: EnterpriseChatSessionRead[];
   replyStats: ReplyStats;
+  activityEvents: AgentWorkRecordEventRead[];
   positiveRate: number;
   negativeRate: number;
 };
@@ -92,6 +94,7 @@ export default function WorkRecordTab({
   activeScheduledTasks,
   employeeSessions,
   replyStats,
+  activityEvents,
   positiveRate,
   negativeRate,
 }: WorkRecordTabProps) {
@@ -168,14 +171,7 @@ export default function WorkRecordTab({
         <ClickableMetric label="好评率" value={positiveRate} suffix="%" tone="positive" onClick={goToLogs} />
         <ClickableMetric label="差评率" value={negativeRate} suffix="%" tone="negative" onClick={goToLogs} />
       </div>
-      <ActivityTimeline
-        employeeSessions={employeeSessions}
-        scheduledTasks={activeScheduledTasks}
-        sops={activeSkills}
-        tools={activeTools}
-        knowledge={activeKnowledge}
-        generalSkills={activeGeneralSkills}
-      />
+      <ActivityTimeline events={activityEvents} />
       <div className="flex w-full min-w-0 max-w-full flex-col gap-[10px] mt-[20px]">
         <div className="inline-flex items-center gap-[6px] self-start text-[14px] capitalize leading-none text-[#757f9c] in-data-[theme=dark]:text-[#8b93a6]">
           <IconGrowthArrow className="size-[14px] shrink-0" />
@@ -351,16 +347,10 @@ const TIMELINE_TRACKS: TimelineTrackConfig[] = [
 type DayActivity = { label: string; dot: string; time?: string };
 
 type ActivityTimelineProps = {
-  employeeSessions: EnterpriseChatSessionRead[];
-  scheduledTasks: ScheduledTaskRead[];
-  sops: SkillRead[];
-  tools: ToolRead[];
-  knowledge: KnowledgeBaseRead[];
-  generalSkills: GeneralSkillRead[];
+  events: AgentWorkRecordEventRead[];
 };
 
-function ActivityTimeline(props: ActivityTimelineProps) {
-  const { employeeSessions, scheduledTasks, sops, tools, knowledge, generalSkills } = props;
+function ActivityTimeline({ events }: ActivityTimelineProps) {
   const [mode, setMode] = useState<TimelineMode>('day');
   const [anchor, setAnchor] = useState<number>(() => startOfDay(new Date()).getTime());
 
@@ -369,25 +359,19 @@ function ActivityTimeline(props: ActivityTimelineProps) {
       entries
         .map((entry) => ({ time: entry.value ? new Date(entry.value).getTime() : Number.NaN, name: entry.name || '' }))
         .filter((entry) => Number.isFinite(entry.time));
-    return {
-      chat: collect(employeeSessions.map((item) => ({ value: item.created_at }))),
-      task: collect(
-        scheduledTasks.flatMap((item) =>
-          [item.last_run_at, item.next_run_at].map((value) => ({ value, name: staffdeckDisplayText(item.title) })),
-        ),
-      ),
-      sop: collect(sops.map((item) => ({ value: item.created_at, name: staffdeckDisplayText(item.name) }))),
-      tool: collect(
-        tools.map((item) => ({ value: item.created_at, name: staffdeckDisplayText(item.display_name || item.name) })),
-      ),
-      knowledge: collect(knowledge.map((item) => ({ value: item.created_at, name: staffdeckDisplayText(item.name) }))),
-      skill: collect(generalSkills.map((item) => ({ value: item.created_at, name: staffdeckDisplayText(item.name) }))),
-    } as Record<string, TrackEvent[]>;
-  }, [employeeSessions, scheduledTasks, sops, tools, knowledge, generalSkills]);
+    return TIMELINE_TRACKS.reduce<Record<string, TrackEvent[]>>((grouped, track) => {
+      grouped[track.key] = collect(
+        events
+          .filter((item) => item.kind === track.key)
+          .map((item) => ({ value: item.timestamp, name: staffdeckDisplayText(item.label) })),
+      );
+      return grouped;
+    }, {});
+  }, [events]);
 
   const itemsByDay = useMemo(
-    () => (mode === 'month' ? buildDayActivities(props) : {}),
-    [mode, props],
+    () => (mode === 'month' ? buildDayActivities(events) : {}),
+    [events, mode],
   );
 
   const range = useMemo(() => timelineRange(mode, anchor), [mode, anchor]);
@@ -951,21 +935,18 @@ function monthCalendarWeeks(anchor: number): Date[][] {
   return weeks;
 }
 
-function buildDayActivities(props: ActivityTimelineProps): Record<string, DayActivity[]> {
-  const { employeeSessions, scheduledTasks, sops, tools, knowledge, generalSkills } = props;
+function buildDayActivities(events: AgentWorkRecordEventRead[]): Record<string, DayActivity[]> {
   const map: Record<string, DayActivity[]> = {};
-  const push = (value: string | undefined, label: string, dot: string) => {
-    if (!value) return;
-    const date = new Date(value);
+  const push = (event: AgentWorkRecordEventRead, label: string) => {
+    const date = new Date(event.timestamp);
     if (Number.isNaN(date.getTime())) return;
     const key = dateKey(date);
-    (map[key] ||= []).push({ label, dot, time: formatHm(date) });
+    (map[key] ||= []).push({ label, dot: ACTIVITY_DOT[event.kind], time: formatHm(date) });
   };
 
   const chatByDay: Record<string, number> = {};
-  employeeSessions.forEach((item) => {
-    if (!item.created_at) return;
-    const date = new Date(item.created_at);
+  events.filter((item) => item.kind === 'chat').forEach((item) => {
+    const date = new Date(item.timestamp);
     if (Number.isNaN(date.getTime())) return;
     const key = dateKey(date);
     chatByDay[key] = (chatByDay[key] || 0) + 1;
@@ -974,22 +955,18 @@ function buildDayActivities(props: ActivityTimelineProps): Record<string, DayAct
     (map[key] ||= []).unshift({ label: `对话数${count}条`, dot: ACTIVITY_DOT.chat });
   });
 
-  scheduledTasks.forEach((task) => {
-    const title = staffdeckDisplayText(task.title);
-    [task.last_run_at, task.next_run_at].forEach((value) => {
-      if (!value) return;
-      const date = new Date(value);
-      if (Number.isNaN(date.getTime())) return;
-      push(value, title, ACTIVITY_DOT.task);
-    });
+  events.filter((item) => item.kind !== 'chat').forEach((item) => {
+    const prefix = item.kind === 'sop'
+      ? '新增SOP '
+      : item.kind === 'tool'
+        ? '新增工具 '
+        : item.kind === 'knowledge'
+          ? '新增知识 '
+          : item.kind === 'skill'
+            ? '新增技能 '
+            : '';
+    push(item, `${prefix}${staffdeckDisplayText(item.label)}`);
   });
-
-  sops.forEach((item) => push(item.created_at, `新增SOP ${staffdeckDisplayText(item.name)}`, ACTIVITY_DOT.sop));
-  tools.forEach((item) =>
-    push(item.created_at, `新增工具 ${staffdeckDisplayText(item.display_name || item.name)}`, ACTIVITY_DOT.tool),
-  );
-  knowledge.forEach((item) => push(item.created_at, `新增知识 ${staffdeckDisplayText(item.name)}`, ACTIVITY_DOT.knowledge));
-  generalSkills.forEach((item) => push(item.created_at, `新增技能 ${staffdeckDisplayText(item.name)}`, ACTIVITY_DOT.skill));
 
   return map;
 }

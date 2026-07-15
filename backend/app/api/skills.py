@@ -216,6 +216,7 @@ def create_skill(
     )
     db.add(row)
     db.flush()
+    _sync_skill_tool_bindings(db, request.tenant_id, row.skill_id, row.content_json)
     branch = None
     binding_status = "active" if request.status == "published" else "inactive"
     creator_metadata = user_creator_metadata(current_user)
@@ -303,6 +304,12 @@ def update_skill(
             normalized_content.model_dump(),
             "技能分支改写",
         )
+        _sync_skill_tool_bindings(
+            db,
+            request.tenant_id,
+            row.skill_id,
+            normalized_content.model_dump(),
+        )
         db.commit()
         projected = project_skill_with_branch(row, branch, binding.status)
         stats = _skill_stats(db, request.tenant_id)
@@ -313,6 +320,7 @@ def update_skill(
     row.business_domain = normalized_content.business_domain
     row.description = normalized_content.description
     row.content_json = normalized_content.model_dump()
+    _sync_skill_tool_bindings(db, request.tenant_id, row.skill_id, row.content_json)
     if request.status:
         row.status = request.status
     row.updated_at = utc_now()
@@ -339,6 +347,7 @@ def publish_skill(
         branch.status = "active"
         branch.updated_at = utc_now()
         db.add(branch)
+        _sync_skill_tool_bindings(db, tenant_id, row.skill_id, branch.content_json)
         ensure_private_resource_binding(db, tenant_id, agent.id, "skill", row.id, "active")
         db.commit()
         projected = project_skill_with_branch(row, branch, "active")
@@ -346,6 +355,7 @@ def publish_skill(
         return skill_read(projected, stats, _recent_skill_stats(db, tenant_id, stats))
     ensure_open_gallery_admin(tenant_id, current_user)
     row.status = "published"
+    _sync_skill_tool_bindings(db, tenant_id, row.skill_id, row.content_json)
     mark_resource_open_gallery(row)
     row.updated_at = utc_now()
     db.add(row)
@@ -876,6 +886,52 @@ def _get_request_model(
     if not model_config or model_config.tenant_id != tenant_id or not model_config.enabled:
         raise HTTPException(status_code=404, detail="Model config not found")
     return model_config
+
+
+def _sync_skill_tool_bindings(
+    db: Session,
+    tenant_id: str,
+    skill_id: str,
+    content: dict[str, object],
+) -> None:
+    tool_names: set[str] = set()
+    for key in ("nodes", "steps"):
+        items = content.get(key)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            actions = item.get("allowed_actions")
+            if not isinstance(actions, list):
+                continue
+            for action in actions:
+                value = str(action or "").strip()
+                if not value.startswith("call_tool:"):
+                    continue
+                tool_name = value.split(":", 1)[1].strip()
+                if tool_name:
+                    tool_names.add(tool_name)
+    if not tool_names:
+        return
+
+    rows = db.exec(
+        select(Tool).where(
+            Tool.tenant_id == tenant_id,
+            Tool.name.in_(sorted(tool_names)),
+        )
+    ).all()
+    for row in rows:
+        allowed_skills = [
+            str(item)
+            for item in (row.allowed_skills_json or [])
+            if str(item).strip()
+        ]
+        if skill_id in allowed_skills:
+            continue
+        row.allowed_skills_json = [*allowed_skills, skill_id]
+        row.updated_at = utc_now()
+        db.add(row)
 
 
 def _with_available_tools(db: Session, request: SkillDistillRequest) -> SkillDistillRequest:

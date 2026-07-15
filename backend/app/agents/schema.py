@@ -5,6 +5,8 @@ from typing import Any, Literal, Optional
 from pydantic import BaseModel, ConfigDict, Field
 
 AgentResourceType = Literal["skill", "general_skill", "knowledge_base", "tool"]
+AgentWorkRecordEventKind = Literal["chat", "task", "sop", "tool", "knowledge", "skill"]
+AgentWorkRecordEventPhase = Literal["reply", "last_run", "next_run", "assigned"]
 
 
 class AgentProfileCreateRequest(BaseModel):
@@ -60,6 +62,28 @@ class AgentProfileRead(BaseModel):
 class AgentScopeRead(BaseModel):
     tenant_id: str
     agents: list[AgentProfileRead] = Field(default_factory=list)
+
+
+class AgentWorkRecordReplyStatsRead(BaseModel):
+    total: int = 0
+    today: int = 0
+    by_day: dict[str, int] = Field(default_factory=dict)
+
+
+class AgentWorkRecordEventRead(BaseModel):
+    id: str
+    kind: AgentWorkRecordEventKind
+    phase: AgentWorkRecordEventPhase
+    timestamp: str
+    label: str = ""
+
+
+class AgentWorkRecordRead(BaseModel):
+    agent_id: str
+    timezone: str
+    generated_at: str
+    reply_stats: AgentWorkRecordReplyStatsRead
+    events: list[AgentWorkRecordEventRead] = Field(default_factory=list)
 
 
 class AgentResourceBindingInput(BaseModel):

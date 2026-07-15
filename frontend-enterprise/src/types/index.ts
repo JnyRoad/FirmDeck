@@ -608,6 +608,26 @@ export type EnterpriseSessionDetailRead = {
   }>;
 };
 
+export type AgentWorkRecordEventRead = {
+  id: string;
+  kind: 'chat' | 'task' | 'sop' | 'tool' | 'knowledge' | 'skill';
+  phase: 'reply' | 'last_run' | 'next_run' | 'assigned';
+  timestamp: string;
+  label: string;
+};
+
+export type AgentWorkRecordRead = {
+  agent_id: string;
+  timezone: string;
+  generated_at: string;
+  reply_stats: {
+    total: number;
+    today: number;
+    by_day: Record<string, number>;
+  };
+  events: AgentWorkRecordEventRead[];
+};
+
 export type TraceLineRead = {
   id: string;
   kind: 'thinking' | 'decision' | 'skill' | 'tool' | 'code' | 'knowledge';

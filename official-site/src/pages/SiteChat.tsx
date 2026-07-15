@@ -7,7 +7,17 @@ import {
   ThumbsDown,
   ThumbsUp,
 } from "lucide-react";
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type KeyboardEvent,
+} from "react";
+import { createPortal } from "react-dom";
 
 import advanceIcon from "../assets/staffdeck/cot-icons/advance.svg";
 import executeIcon from "../assets/staffdeck/cot-icons/execute.svg";
@@ -50,6 +60,11 @@ type ServerEvent = {
 };
 
 type ChatCopy = (typeof copyByLocale)["en-US"]["chat"];
+
+const SITE_CHAT_API_BASE = (
+  import.meta.env.VITE_SITE_CHAT_API_BASE_URL?.trim()
+  || (import.meta.env.PROD ? "http://39.102.210.77:10086/api/site-chat" : "/api/site-chat")
+).replace(/\/+$/, "");
 
 const STAGE_ICONS: Record<string, string> = {
   waiting: loadingIcon,
@@ -131,9 +146,30 @@ function ExecutionRecord({ message, copy }: { message: ChatMessage; copy: ChatCo
   );
 }
 
-function StaffProfile({ copy }: { copy: ChatCopy }) {
+function StaffProfile({
+  copy,
+  onPointerEnter,
+  onPointerLeave,
+  open,
+  setProfileRef,
+  style,
+}: {
+  copy: ChatCopy;
+  onPointerEnter: () => void;
+  onPointerLeave: () => void;
+  open: boolean;
+  setProfileRef: (node: HTMLDivElement | null) => void;
+  style: CSSProperties;
+}) {
   return (
-    <div className="site-chat-profile-card" role="tooltip">
+    <div
+      className={`site-chat-profile-card${open ? " is-visible" : ""}`}
+      ref={setProfileRef}
+      role="tooltip"
+      style={style}
+      onPointerEnter={onPointerEnter}
+      onPointerLeave={onPointerLeave}
+    >
       <strong>{copy.emptyGreeting}</strong>
       <p>{copy.emptyRole}</p>
       <div className="site-chat-profile-tags">
@@ -152,15 +188,105 @@ function StaffProfile({ copy }: { copy: ChatCopy }) {
 }
 
 function StaffAvatar({ copy, placement }: { copy: ChatCopy; placement: "empty" | "composer" }) {
+  const anchorRef = useRef<HTMLDivElement>(null);
+  const hideTimerRef = useRef<number | null>(null);
+  const [profileNode, setProfileNode] = useState<HTMLDivElement | null>(null);
+  const [profileOpen, setProfileOpen] = useState(false);
+  const [profileStyle, setProfileStyle] = useState<CSSProperties>({ left: -9999, top: -9999 });
+
+  const updateProfilePosition = useCallback(() => {
+    const anchor = anchorRef.current;
+    if (!anchor) return;
+    const anchorRect = anchor.getBoundingClientRect();
+    const profileRect = profileNode?.getBoundingClientRect();
+    const profileWidth = profileRect?.width || 258;
+    const profileHeight = profileRect?.height || 164;
+    const viewportPadding = 12;
+    const gap = 12;
+
+    let left = placement === "empty" ? anchorRect.right + gap : anchorRect.left;
+    let top = placement === "empty"
+      ? anchorRect.top + (anchorRect.height - profileHeight) / 2
+      : anchorRect.top - profileHeight - gap;
+
+    if (left + profileWidth > window.innerWidth - viewportPadding) {
+      left = anchorRect.left - profileWidth - gap;
+    }
+    if (top < viewportPadding) {
+      top = Math.min(anchorRect.bottom + gap, window.innerHeight - profileHeight - viewportPadding);
+    }
+
+    setProfileStyle({
+      left: Math.max(viewportPadding, Math.min(left, window.innerWidth - profileWidth - viewportPadding)),
+      top: Math.max(viewportPadding, Math.min(top, window.innerHeight - profileHeight - viewportPadding)),
+    });
+  }, [placement, profileNode]);
+
+  useLayoutEffect(() => {
+    if (!profileOpen) return undefined;
+    updateProfilePosition();
+    const frame = window.requestAnimationFrame(updateProfilePosition);
+    window.addEventListener("resize", updateProfilePosition);
+    window.addEventListener("scroll", updateProfilePosition, true);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.removeEventListener("resize", updateProfilePosition);
+      window.removeEventListener("scroll", updateProfilePosition, true);
+    };
+  }, [profileOpen, updateProfilePosition]);
+
+  useEffect(() => () => {
+    if (hideTimerRef.current !== null) window.clearTimeout(hideTimerRef.current);
+  }, []);
+
+  const cancelHide = () => {
+    if (hideTimerRef.current !== null) {
+      window.clearTimeout(hideTimerRef.current);
+      hideTimerRef.current = null;
+    }
+  };
+
+  const showProfile = () => {
+    cancelHide();
+    updateProfilePosition();
+    setProfileOpen(true);
+  };
+
+  const scheduleHide = () => {
+    cancelHide();
+    hideTimerRef.current = window.setTimeout(() => {
+      setProfileOpen(false);
+      hideTimerRef.current = null;
+    }, 140);
+  };
+
   return (
-    <div
-      className={`site-chat-avatar-anchor is-${placement}`}
-      tabIndex={0}
-      aria-label={`${copy.emptyGreeting} ${copy.emptyRole}`}
-    >
-      <img src={employeeAvatar} alt="" />
-      <StaffProfile copy={copy} />
-    </div>
+    <>
+      <div
+        className={`site-chat-avatar-anchor is-${placement}`}
+        ref={anchorRef}
+        tabIndex={0}
+        aria-label={`${copy.emptyGreeting} ${copy.emptyRole}`}
+        onPointerEnter={showProfile}
+        onPointerLeave={scheduleHide}
+        onFocus={showProfile}
+        onBlur={scheduleHide}
+        onClick={showProfile}
+      >
+        <img src={employeeAvatar} alt="" />
+      </div>
+      {typeof document !== "undefined" && createPortal(
+        <StaffProfile
+          copy={copy}
+          onPointerEnter={showProfile}
+          onPointerLeave={scheduleHide}
+          open={profileOpen}
+          setProfileRef={setProfileNode}
+          style={profileStyle}
+        />,
+        document.body,
+      )}
+    </>
   );
 }
 
@@ -216,6 +342,7 @@ export default function SiteChat() {
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [csrfToken, setCsrfToken] = useState("");
+  const [sessionToken, setSessionToken] = useState("");
   const abortRef = useRef<AbortController | null>(null);
   const transcriptRef = useRef<HTMLDivElement>(null);
   const stickToBottomRef = useRef(true);
@@ -223,13 +350,17 @@ export default function SiteChat() {
 
   useEffect(() => {
     let active = true;
-    fetch("/api/site-chat/session", { credentials: "same-origin" })
+    fetch(`${SITE_CHAT_API_BASE}/session`, { credentials: "include" })
       .then((response) => response.ok ? response.json() : Promise.reject(new Error(String(response.status))))
       .then((data) => {
-        if (active && typeof data.csrfToken === "string") setCsrfToken(data.csrfToken);
+        if (active && typeof data.csrfToken === "string" && typeof data.sessionToken === "string") {
+          setCsrfToken(data.csrfToken);
+          setSessionToken(data.sessionToken);
+        }
       })
       .catch(() => {
         if (active) setCsrfToken("");
+        if (active) setSessionToken("");
       });
     return () => {
       active = false;
@@ -329,7 +460,7 @@ export default function SiteChat() {
 
   const send = async (contentOverride?: string) => {
     const content = (contentOverride ?? input).trim();
-    if (!content || busy || !csrfToken) return;
+    if (!content || busy || !csrfToken || !sessionToken) return;
     const userMessage: ChatMessage = { id: newId(), role: "user", content, status: "done" };
     const assistantMessage: ChatMessage = {
       id: newId(),
@@ -345,10 +476,14 @@ export default function SiteChat() {
     const controller = new AbortController();
     abortRef.current = controller;
     try {
-      const response = await fetch("/api/site-chat/stream", {
+      const response = await fetch(`${SITE_CHAT_API_BASE}/stream`, {
         method: "POST",
-        credentials: "same-origin",
-        headers: { "Content-Type": "application/json", "X-Site-CSRF": csrfToken },
+        credentials: "include",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Site-CSRF": csrfToken,
+          "X-Site-Session": sessionToken,
+        },
         body: JSON.stringify({ message: content, history, locale }),
         signal: controller.signal,
       });
@@ -415,52 +550,54 @@ export default function SiteChat() {
           stickToBottomRef.current = target.scrollHeight - target.scrollTop - target.clientHeight < 120;
         }}
       >
-        {messages.length === 0 ? (
-          <EmptyState
-            copy={copy}
-            disabled={busy || !csrfToken}
-            onPrompt={(prompt) => { void send(prompt); }}
-          />
-        ) : messages.map((message) => {
-          const normalized = message.role === "assistant"
-            ? normalizeSiteChatCitations(message.content, message.sources || [])
-            : { content: message.content, sources: [] as SiteChatSource[] };
-          return (
-          <article className={`site-chat-message is-${message.role}`} key={message.id}>
-            {message.role === "assistant" && <ExecutionRecord message={message} copy={copy} />}
-            {normalized.content && (
-              <div className="site-chat-content">
-                {message.role === "assistant"
-                  ? <MarkdownMessage content={normalized.content} />
-                  : normalized.content}
-              </div>
-            )}
-            {message.status === "stopped" && <div className="site-chat-stopped">{copy.stopped}</div>}
-            {message.error && (
-              <div className="site-chat-error">
-                <AlertCircle aria-hidden />
-                <div><strong>{copy.errorTitle}</strong><p>{message.error}</p></div>
-              </div>
-            )}
-            {normalized.sources.length > 0 && (
-              <div className="site-chat-sources">
-                <span><img src={referenceIcon} alt="" />{copy.sources}</span>
-                <div>
-                  {normalized.sources.map((source) => (
-                    <button type="button" key={source.id} title={source.title}>[{source.index}] {source.title}</button>
-                  ))}
-                </div>
-              </div>
-            )}
-            {message.role === "assistant" && message.status !== "streaming" && (
-              <div className="site-chat-feedback">
-                <button type="button" aria-label={copy.feedbackUp} title={copy.feedbackUp}><ThumbsUp aria-hidden /></button>
-                <button type="button" aria-label={copy.feedbackDown} title={copy.feedbackDown}><ThumbsDown aria-hidden /></button>
-              </div>
-            )}
-          </article>
-          );
-        })}
+        <div className="site-chat-transcript-track">
+          {messages.length === 0 ? (
+            <EmptyState
+              copy={copy}
+              disabled={busy || !csrfToken || !sessionToken}
+              onPrompt={(prompt) => { void send(prompt); }}
+            />
+          ) : messages.map((message) => {
+            const normalized = message.role === "assistant"
+              ? normalizeSiteChatCitations(message.content, message.sources || [])
+              : { content: message.content, sources: [] as SiteChatSource[] };
+            return (
+              <article className={`site-chat-message is-${message.role}`} key={message.id}>
+                {message.role === "assistant" && <ExecutionRecord message={message} copy={copy} />}
+                {normalized.content && (
+                  <div className="site-chat-content">
+                    {message.role === "assistant"
+                      ? <MarkdownMessage content={normalized.content} />
+                      : normalized.content}
+                  </div>
+                )}
+                {message.status === "stopped" && <div className="site-chat-stopped">{copy.stopped}</div>}
+                {message.error && (
+                  <div className="site-chat-error">
+                    <AlertCircle aria-hidden />
+                    <div><strong>{copy.errorTitle}</strong><p>{message.error}</p></div>
+                  </div>
+                )}
+                {normalized.sources.length > 0 && (
+                  <div className="site-chat-sources">
+                    <span><img src={referenceIcon} alt="" />{copy.sources}</span>
+                    <div>
+                      {normalized.sources.map((source) => (
+                        <button type="button" key={source.id} title={source.title}>[{source.index}] {source.title}</button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+                {message.role === "assistant" && message.status !== "streaming" && (
+                  <div className="site-chat-feedback">
+                    <button type="button" aria-label={copy.feedbackUp} title={copy.feedbackUp}><ThumbsUp aria-hidden /></button>
+                    <button type="button" aria-label={copy.feedbackDown} title={copy.feedbackDown}><ThumbsDown aria-hidden /></button>
+                  </div>
+                )}
+              </article>
+            );
+          })}
+        </div>
       </div>
 
       <div className="site-chat-composer-stage">
@@ -484,7 +621,7 @@ export default function SiteChat() {
                   <Square aria-hidden />
                 </button>
               ) : (
-                <button type="button" className="site-chat-send" onClick={() => void send()} disabled={!input.trim() || !csrfToken} aria-label={copy.send} title={copy.send}>
+                <button type="button" className="site-chat-send" onClick={() => void send()} disabled={!input.trim() || !csrfToken || !sessionToken} aria-label={copy.send} title={copy.send}>
                   <Send aria-hidden />
                 </button>
               )}

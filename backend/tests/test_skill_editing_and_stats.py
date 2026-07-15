@@ -22,7 +22,7 @@ from app.api.skills import (
     update_skill,
 )
 from app.agents.branching import ensure_open_gallery_binding, visible_published_skills
-from app.db.models import AgentEvent, AgentProfile, Message, Skill, SkillFeedback, SkillVersion, Tenant, User
+from app.db.models import AgentEvent, AgentProfile, Message, Skill, SkillFeedback, SkillVersion, Tenant, Tool, User
 from app.db.models import ModelConfig
 from app.skills.skill_distiller import SkillDistiller
 from app.skills.skill_editor import SkillEditor
@@ -551,6 +551,52 @@ def test_personal_created_skill_uses_agent_owner_as_creator() -> None:
         assert created.metadata["created_by_username"] == "owner"
         assert listed[0].metadata["creator_name"] == "owner"
         assert listed[0].metadata["created_by_username"] == "owner"
+
+
+def test_personal_created_skill_binds_explicit_tools_to_its_skill_id() -> None:
+    with _test_session() as db:
+        db.add(Tenant(id="tenant_demo", name="Demo"))
+        agent = AgentProfile(
+            id="agent_tool_owner",
+            tenant_id="tenant_demo",
+            name="个人员工",
+            is_overall=False,
+            metadata_json={
+                "owner_user_id": "user_owner",
+                "owner_username": "owner",
+            },
+        )
+        tool = Tool(
+            tenant_id="tenant_demo",
+            name="product.price_query",
+            method="POST",
+            url="http://localhost/api/mock/product/price-query",
+            allowed_skills_json=["skill_price_compare_001"],
+            enabled=True,
+        )
+        db.add(agent)
+        db.add(tool)
+        db.commit()
+
+        content = _skill_card().model_copy(deep=True)
+        content.skill_id = "price_compare_copy"
+        content.nodes[0].allowed_actions = ["call_tool:product.price_query"]
+        create_skill(
+            SkillCreateRequest(
+                tenant_id="tenant_demo",
+                content=content,
+                status="published",
+            ),
+            agent_id=agent.id,
+            db=db,
+            current_user=_owner_user(),
+        )
+
+        db.refresh(tool)
+        assert tool.allowed_skills_json == [
+            "skill_price_compare_001",
+            "price_compare_copy",
+        ]
 
 
 def test_personal_created_skill_uses_current_admin_when_owner_missing() -> None:

@@ -9,6 +9,7 @@ import corpus from './data/product-corpus.json' with { type: 'json' };
 import { SiteLlmError, routeQuestion, streamAnswer } from './lib/llm.mjs';
 import { createRetriever } from './lib/retrieval.mjs';
 import {
+  corsHeaders,
   createRateLimiter,
   createSessionToken,
   isAllowedOrigin,
@@ -89,28 +90,29 @@ function emit(response, event, data = {}) {
 }
 
 async function handleChat(request, response) {
-  if (!llmConfig.apiKey) return sendJson(response, 503, { error: 'Website assistant is not configured.' });
+  const responseCorsHeaders = corsHeaders(request, allowedOrigins);
+  if (!llmConfig.apiKey) return sendJson(response, 503, { error: 'Website assistant is not configured.' }, responseCorsHeaders);
   if (!isAllowedOrigin(request, allowedOrigins)) return sendJson(response, 403, { error: 'Origin is not allowed.' });
   const session = sessionFromRequest(request, sessionSecret);
   if (!session || request.headers['x-site-csrf'] !== session.csrf) {
-    return sendJson(response, 401, { error: 'Website chat session is invalid or expired.' });
+    return sendJson(response, 401, { error: 'Website chat session is invalid or expired.' }, responseCorsHeaders);
   }
 
   const ipLimit = consumeIp(requestIp(request));
   const sessionLimit = consumeSession(session.sid);
   if (!ipLimit.allowed || !sessionLimit.allowed) {
     const retryAfter = Math.max(ipLimit.retryAfterSeconds, sessionLimit.retryAfterSeconds);
-    return sendJson(response, 429, { error: 'Too many requests. Please try again later.' }, { 'Retry-After': retryAfter });
+    return sendJson(response, 429, { error: 'Too many requests. Please try again later.' }, { ...responseCorsHeaders, 'Retry-After': retryAfter });
   }
   if (activeSessions.has(session.sid)) {
-    return sendJson(response, 409, { error: 'A response is already being generated for this session.' });
+    return sendJson(response, 409, { error: 'A response is already being generated for this session.' }, responseCorsHeaders);
   }
 
   let input;
   try {
     input = validatePayload(await readJson(request));
   } catch (error) {
-    return sendJson(response, error.status || 400, { error: error.message });
+    return sendJson(response, error.status || 400, { error: error.message }, responseCorsHeaders);
   }
 
   const controller = new AbortController();
@@ -121,6 +123,7 @@ async function handleChat(request, response) {
   response.on('close', onClose);
   activeSessions.add(session.sid);
   response.writeHead(200, {
+    ...responseCorsHeaders,
     'Content-Type': 'text/event-stream; charset=utf-8',
     'Cache-Control': 'no-cache, no-transform',
     Connection: 'keep-alive',
@@ -194,13 +197,23 @@ async function serveStatic(request, response) {
 
 const server = http.createServer(async (request, response) => {
   const pathname = new URL(request.url, 'http://localhost').pathname;
+  const responseCorsHeaders = corsHeaders(request, allowedOrigins);
+  if (request.method === 'OPTIONS' && pathname.startsWith('/api/site-chat/')) {
+    if (!isAllowedOrigin(request, allowedOrigins)) return sendJson(response, 403, { error: 'Origin is not allowed.' });
+    response.writeHead(204, responseCorsHeaders);
+    return response.end();
+  }
   if (request.method === 'GET' && pathname === '/api/site-chat/health') {
-    return sendJson(response, 200, { status: 'ok', assistantConfigured: Boolean(llmConfig.apiKey) });
+    return sendJson(response, 200, { status: 'ok', assistantConfigured: Boolean(llmConfig.apiKey) }, responseCorsHeaders);
   }
   if (request.method === 'GET' && pathname === '/api/site-chat/session') {
+    if (request.headers.origin && !isAllowedOrigin(request, allowedOrigins)) {
+      return sendJson(response, 403, { error: 'Origin is not allowed.' });
+    }
     const { session, token } = createSessionToken(sessionSecret);
     const secure = request.headers['x-forwarded-proto'] === 'https';
-    return sendJson(response, 200, { csrfToken: session.csrf, expiresAt: session.exp }, {
+    return sendJson(response, 200, { csrfToken: session.csrf, sessionToken: token, expiresAt: session.exp }, {
+      ...responseCorsHeaders,
       'Set-Cookie': sessionCookie(token, { secure }),
     });
   }

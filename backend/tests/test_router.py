@@ -60,12 +60,12 @@ def test_router_payload_only_exposes_skill_routing_summary(monkeypatch):
     assert "tenant_id" not in captured["payload"]["current_session"]
 
 
-def test_router_accepts_ordered_pending_tasks(monkeypatch):
+def test_router_accepts_ordered_current_turn_task_frames(monkeypatch):
     def fake_init(self, model_config):  # noqa: ANN001
         return None
 
     def fake_generate_json(self, system_prompt, payload):  # noqa: ANN001
-        assert "pending_tasks" in payload["_agent_stage"]["instructions"]
+        assert "task_frames" in payload["_agent_stage"]["instructions"]
         assert payload["current_session"]["active_skill_id"] == "refund"
         return {
             "decision": "continue_active",
@@ -75,7 +75,14 @@ def test_router_accepts_ordered_pending_tasks(monkeypatch):
             "user_intent": "确认当前退货，并在完成后购买 A3",
             "reason": "用户先确认当前退货，再提出后续购买任务。",
             "clarification_question": "",
-            "pending_tasks": [
+            "task_frames": [
+                {
+                    "decision": "continue_active",
+                    "target_skill_id": "refund",
+                    "target_step_id": "confirm_refund_order",
+                    "user_intent": "确认当前退货",
+                    "slot_hints": {"order_id": "O1", "refund_type": "退货"},
+                },
                 {
                     "decision": "start_new_task",
                     "target_skill_id": "purchase",
@@ -107,11 +114,49 @@ def test_router_accepts_ordered_pending_tasks(monkeypatch):
 
     assert decision.decision == "continue_active"
     assert decision.target_skill_id == "refund"
-    assert decision.pending_tasks[0].target_skill_id == "purchase"
-    assert decision.pending_tasks[0].target_step_id == "collect_user_name"
+    assert decision.pending_tasks == []
+    assert [task.target_skill_id for task in decision.task_frames] == ["refund", "purchase"]
+    assert decision.task_frames[1].target_step_id == "collect_user_name"
 
 
-def test_router_converts_ordered_create_pending_tasks_to_primary_and_queue(monkeypatch):
+def test_router_keeps_general_subtask_with_active_scene(monkeypatch):
+    def fake_init(self, model_config):  # noqa: ANN001
+        return None
+
+    def fake_generate_json(self, system_prompt, payload):  # noqa: ANN001
+        assert "general_intent" in payload["_agent_stage"]["instructions"]
+        return {
+            "decision": "continue_active",
+            "target_skill_id": "purchase",
+            "confidence": 0.96,
+            "user_intent": "购买 A1 并查询北京天气",
+            "general_intent": "查询北京当前天气",
+            "reason": "购买由当前流程处理，天气交给执行阶段的通用 Skill。",
+            "slot_hints": {"product_id": "A1"},
+        }
+
+    monkeypatch.setattr(LLMClient, "__init__", fake_init)
+    monkeypatch.setattr(LLMClient, "generate_json", fake_generate_json)
+
+    decision = Router().decide(
+        "我想买 A1，同时看下北京天气",
+        ChatSession(
+            id="session_test",
+            tenant_id="tenant_demo",
+            active_skill_id="purchase",
+            active_step_id="collect_user_name",
+        ),
+        [_purchase_skill()],
+        model_config=None,  # type: ignore[arg-type]
+    )
+
+    assert decision.decision == "continue_active"
+    assert decision.target_skill_id == "purchase"
+    assert decision.general_intent == "查询北京当前天气"
+    assert decision.slot_hints == {"product_id": "A1"}
+
+
+def test_router_converts_legacy_create_pending_tasks_to_current_turn_frames(monkeypatch):
     def fake_init(self, model_config):  # noqa: ANN001
         return None
 
@@ -151,7 +196,11 @@ def test_router_converts_ordered_create_pending_tasks_to_primary_and_queue(monke
     assert decision.selected_task_id == "task_purchase_a3"
     assert decision.target_skill_id == "purchase"
     assert decision.slot_hints == {"product_id": "A3"}
-    assert [task.task_id for task in decision.pending_tasks] == ["task_purchase_a1"]
+    assert decision.pending_tasks == []
+    assert [task.task_id for task in decision.task_frames] == [
+        "task_purchase_a3",
+        "task_purchase_a1",
+    ]
 
 
 def test_router_rejects_noncanonical_answer_alias(monkeypatch):
@@ -280,7 +329,8 @@ def test_router_strips_generated_message_content_slots(monkeypatch):
 
     assert decision.slot_hints == {"product_id": "A1"}
     assert decision.pending_tasks[0].slot_hints == {"quantity": 1}
-    assert decision.created_tasks[0].slot_hints == {"user_name": "hm"}
+    assert decision.created_tasks == []
+    assert decision.task_frames[0].slot_hints == {"product_id": "A1", "user_name": "hm"}
     assert decision.task_updates[0].slot_hints == {"product_id": "A3"}
 
 

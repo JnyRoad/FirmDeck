@@ -16,7 +16,7 @@ from app.llm.stage_protocol import (
     unified_system_prompt,
 )
 from app.observability.spans import llm_operation
-from app.session.session_schema import RouterDecision
+from app.session.session_schema import PendingTask, RouterDecision
 from app.session.slot_policy import strip_router_generated_message_slots
 
 
@@ -61,6 +61,9 @@ class Router:
         self, decision: RouterDecision, session: ChatSession, available_skills: list[Skill]
     ) -> RouterDecision:
         self._strip_generated_message_slots(decision)
+        decision.general_intent = " ".join(
+            str(decision.general_intent or "").split()
+        ) or None
         skills = {skill.skill_id: skill for skill in available_skills}
         if decision.target_skill_id and decision.target_skill_id not in skills:
             decision.target_skill_id = None
@@ -85,7 +88,11 @@ class Router:
                 decision.clarification_question = "请问您想继续哪一项待处理任务？"
                 return decision
         if decision.decision == "create_pending":
-            ordered_tasks = [*decision.pending_tasks, *decision.created_tasks]
+            ordered_tasks = [
+                *decision.task_frames,
+                *decision.pending_tasks,
+                *decision.created_tasks,
+            ]
             if ordered_tasks:
                 primary = ordered_tasks[0]
                 decision.decision = "start_new_task"
@@ -97,7 +104,8 @@ class Router:
                     **dict(primary.slot_hints or {}),
                     **dict(decision.slot_hints or {}),
                 }
-                decision.pending_tasks = ordered_tasks[1:]
+                decision.task_frames = ordered_tasks
+                decision.pending_tasks = []
                 decision.created_tasks = []
                 if not decision.target_skill_id or decision.target_skill_id not in skills:
                     decision.decision = "clarify"
@@ -114,12 +122,18 @@ class Router:
                 decision.target_step_id = _first_node_id(target_skill)
         normalized_tasks = self._normalize_tasks(decision.pending_tasks, skills)
         decision.pending_tasks = normalized_tasks
-        decision.created_tasks = self._normalize_tasks(decision.created_tasks, skills)
+        legacy_created_tasks = self._normalize_tasks(decision.created_tasks, skills)
+        decision.task_frames = self._normalize_turn_task_frames(
+            decision,
+            self._normalize_tasks(decision.task_frames, skills),
+            legacy_created_tasks,
+        )
+        decision.created_tasks = []
         return decision
 
     def _strip_generated_message_slots(self, decision: RouterDecision) -> None:
         decision.slot_hints = strip_router_generated_message_slots(decision.slot_hints)
-        for task in [*decision.pending_tasks, *decision.created_tasks]:
+        for task in [*decision.task_frames, *decision.pending_tasks, *decision.created_tasks]:
             task.slot_hints = strip_router_generated_message_slots(task.slot_hints)
         for update in decision.task_updates:
             update.slot_hints = strip_router_generated_message_slots(update.slot_hints)
@@ -135,6 +149,38 @@ class Router:
                     task.target_step_id = _first_node_id(target_skill)
             normalized_tasks.append(task)
         return normalized_tasks
+
+    def _normalize_turn_task_frames(
+        self,
+        decision: RouterDecision,
+        task_frames: list[PendingTask],
+        legacy_created_tasks: list[PendingTask],
+    ) -> list[PendingTask]:
+        if decision.decision not in {"continue_active", "start_new_task", "switch_to_pending"}:
+            return []
+        primary = PendingTask(
+            task_id=decision.selected_task_id,
+            decision=decision.decision,
+            target_skill_id=decision.target_skill_id,
+            target_step_id=decision.target_step_id,
+            confidence=decision.confidence,
+            user_intent=decision.user_intent,
+            reason=decision.reason,
+            slot_hints=dict(decision.slot_hints or {}),
+        )
+        ordered = [*task_frames, *legacy_created_tasks]
+        first = ordered[0] if ordered else None
+        if not first or first.target_skill_id != primary.target_skill_id:
+            ordered.insert(0, primary)
+        else:
+            first.decision = decision.decision
+            first.task_id = first.task_id or decision.selected_task_id
+            first.target_step_id = first.target_step_id or decision.target_step_id
+            first.slot_hints = {
+                **dict(decision.slot_hints or {}),
+                **dict(first.slot_hints or {}),
+            }
+        return ordered
 
 
 def _first_node_id(skill: Skill) -> str | None:

@@ -928,8 +928,18 @@ def seed_demo_data(session: Session) -> None:
             tool.config_json = tool_config.get("config_json") or tool.config_json
             tool.input_schema = tool_config.get("input_schema") or tool.input_schema
             tool.output_schema = tool_config.get("output_schema") or tool.output_schema
-            tool.allowed_skills_json = (
-                tool_config.get("allowed_skills_json") or tool.allowed_skills_json
+            configured_skills = [
+                str(skill_id)
+                for skill_id in (tool_config.get("allowed_skills_json") or [])
+                if str(skill_id).strip()
+            ]
+            existing_skills = [
+                str(skill_id)
+                for skill_id in (tool.allowed_skills_json or [])
+                if str(skill_id).strip()
+            ]
+            tool.allowed_skills_json = list(
+                dict.fromkeys([*configured_skills, *existing_skills])
             )
             tool.enabled = bool(tool_config.get("enabled", tool.enabled))
             tool.updated_at = utc_now()

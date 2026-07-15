@@ -21,9 +21,21 @@ ROUTER_OUTPUT_SCHEMA: dict[str, Any] = {
     "target_step_id": "string?",
     "confidence": "number",
     "user_intent": "string?",
+    "general_intent": "string?",
     "reason": "string?",
     "clarification_question": "string?",
     "slot_hints": "object?",
+    "task_frames": [
+        {
+            "task_id": "string?",
+            "status": "pending?",
+            "decision": "start_new_task | continue_active?",
+            "target_skill_id": "string",
+            "target_step_id": "string?",
+            "user_intent": "string?",
+            "slot_hints": "object?",
+        }
+    ],
     "pending_tasks": [
         {
             "task_id": "string?",
@@ -37,7 +49,6 @@ ROUTER_OUTPUT_SCHEMA: dict[str, Any] = {
             "slot_hints": "object?",
         }
     ],
-    "created_tasks": "与 pending_tasks 相同的 object[]?",
     "task_updates": [
         {
             "task_id": "string",

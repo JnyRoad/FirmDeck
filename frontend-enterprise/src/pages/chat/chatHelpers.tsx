@@ -1244,8 +1244,14 @@ export function mergeTurnTraceSnapshot(existing: TurnTrace | undefined, incoming
     return previous ? mergeTraceLine(previous, line) : line;
   });
 
+  const incomingStillRunning = !incoming.completedAt;
   existing.lines.forEach((line) => {
-    if (!incomingIds.has(line.id) && !line.provisional && !line.placeholder) {
+    const preserveRunningLocalLine = incomingStillRunning && !line.placeholder;
+    if (
+      !incomingIds.has(line.id)
+      && !line.placeholder
+      && (!line.provisional || preserveRunningLocalLine)
+    ) {
       mergedLines.push(line);
     }
   });
