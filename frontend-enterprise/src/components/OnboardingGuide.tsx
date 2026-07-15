@@ -242,7 +242,7 @@ export default function OnboardingGuide() {
                 onClick={goNext}
                 className="flex w-[134px] items-center justify-center rounded-[10px] bg-[#18181a] px-[32px] py-[8px] text-[14px] text-white transition-colors hover:bg-[#303030]"
               >
-                下一步
+                {isLast ? "开始使用" : "下一步"}
               </button>
             </div>
           </div>
