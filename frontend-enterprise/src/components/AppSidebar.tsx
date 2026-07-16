@@ -200,11 +200,11 @@ function AgentSwitcher({
   selectedAgentId,
   onSelectAgent,
 }: Pick<AppSidebarManagementProps, 'sidebarAgent' | 'scopeAgents' | 'selectedAgentId' | 'onSelectAgent'>) {
-  const caption = sidebarAgent ? '当前员工' : '未选择';
-  const nameLabel = sidebarAgent
-    ? sidebarAgent.is_overall
-      ? '开放广场'
-      : employeeDisplayNameWithCreator(sidebarAgent)
+  const employeeAgents = scopeAgents.filter((agent) => !agent.is_overall);
+  const currentAgent = sidebarAgent && !sidebarAgent.is_overall ? sidebarAgent : undefined;
+  const caption = currentAgent ? '当前员工' : '未选择';
+  const nameLabel = currentAgent
+    ? employeeDisplayNameWithCreator(currentAgent)
     : '-';
 
   return (
@@ -217,10 +217,10 @@ function AgentSwitcher({
             'group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:px-0 group-data-[collapsible=icon]:py-0',
           )}
         >
-          {sidebarAgent ? (
+          {currentAgent ? (
             <div className="w-[60px] h-[30px] relative">
               <div className="absolute inset-0 flex items-end justify-center">
-                <EmployeeAvatar agent={sidebarAgent} width={60} height={71} />
+                <EmployeeAvatar agent={currentAgent} width={60} height={71} />
               </div>
             </div>
           ) : (
@@ -245,7 +245,7 @@ function AgentSwitcher({
         align="start"
         className="flex max-h-[320px] w-(--radix-dropdown-menu-trigger-width) flex-col gap-[4px] overflow-y-auto"
       >
-        {scopeAgents.map((agent) => (
+        {employeeAgents.map((agent) => (
           <DropdownMenuItem
             key={agent.id}
             data-active={agent.id === selectedAgentId}
@@ -255,10 +255,10 @@ function AgentSwitcher({
             <EmployeeAvatar agent={agent} size={28} />
             <span className="flex min-w-0 flex-col">
               <strong className="truncate text-[12px] font-medium">
-                {agent.is_overall ? '开放广场' : employeeDisplayNameWithCreator(agent)}
+                {employeeDisplayNameWithCreator(agent)}
               </strong>
               <small className="truncate text-[10px] text-muted-foreground">
-                {agent.is_overall ? '平台' : employeeProfile(agent).roleName}
+                {employeeProfile(agent).roleName}
               </small>
             </span>
           </DropdownMenuItem>
@@ -356,6 +356,8 @@ function CollapsedAgentSwitcher({
 }: Pick<AppSidebarManagementProps, 'sidebarAgent' | 'scopeAgents' | 'selectedAgentId' | 'onSelectAgent'> & {
   nameLabel: string;
 }) {
+  const employeeAgents = scopeAgents.filter((agent) => !agent.is_overall);
+  const currentAgent = sidebarAgent && !sidebarAgent.is_overall ? sidebarAgent : undefined;
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
@@ -364,8 +366,8 @@ function CollapsedAgentSwitcher({
           aria-label="切换当前员工"
           className="flex flex-col items-center gap-[2px] pt-[8px]"
         >
-          {sidebarAgent ? (
-            <EmployeeAvatar agent={sidebarAgent} width={32} height={38} radius={8} />
+          {currentAgent ? (
+            <EmployeeAvatar agent={currentAgent} width={32} height={38} radius={8} />
           ) : (
             <span className="flex h-[38px] w-[32px] items-center justify-center rounded-[8px] border-[0.5px] border-[#e3e7f1] bg-white text-sidebar-foreground">
               <IconAdd className="size-[16px]" />
@@ -377,7 +379,7 @@ function CollapsedAgentSwitcher({
         </button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="start" className="flex max-h-[320px] min-w-[180px] flex-col gap-[4px] overflow-y-auto">
-        {scopeAgents.map((agent) => (
+        {employeeAgents.map((agent) => (
           <DropdownMenuItem
             key={agent.id}
             data-active={agent.id === selectedAgentId}
@@ -387,10 +389,10 @@ function CollapsedAgentSwitcher({
             <EmployeeAvatar agent={agent} size={28} />
             <span className="flex min-w-0 flex-col">
               <strong className="truncate text-[12px] font-medium">
-                {agent.is_overall ? '开放广场' : employeeDisplayNameWithCreator(agent)}
+                {employeeDisplayNameWithCreator(agent)}
               </strong>
               <small className="truncate text-[10px] text-muted-foreground">
-                {agent.is_overall ? '平台' : employeeProfile(agent).roleName}
+                {employeeProfile(agent).roleName}
               </small>
             </span>
           </DropdownMenuItem>
@@ -416,7 +418,7 @@ function CollapsedSidebar({
 > & { onToggle: () => void }) {
   const nameLabel = sidebarAgent
     ? sidebarAgent.is_overall
-      ? '开放广场'
+      ? '未选择'
       : employeeDisplayNameWithCreator(sidebarAgent)
     : '未选择';
   const primaryItems = primaryNavItems(isAdmin);

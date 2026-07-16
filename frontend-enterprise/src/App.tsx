@@ -241,9 +241,7 @@ function Shell({
             canManageEmployeeAgent(item, auth.user),
           );
           const next = isAdmin
-            ? selectableRows.find((item) => item.is_overall)?.id ||
-              preferredEmployeeAgent(selectableRows)?.id ||
-              ""
+            ? preferredEmployeeAgent(selectableRows)?.id || ""
             : preferredEmployeeAgent(manageableRows)?.id ||
               preferredEmployeeAgent(selectableRows)?.id ||
               "";
@@ -261,7 +259,7 @@ function Shell({
   }
 
   function canUseAgentScope(agent: AgentProfileRead): boolean {
-    return canSelectCurrentEmployeeAgent(agent, auth.user, { activeOnly: true, includeOverall: isAdmin });
+    return canSelectCurrentEmployeeAgent(agent, auth.user, { activeOnly: true });
   }
 
   function changeAgentScope(agentId: string) {

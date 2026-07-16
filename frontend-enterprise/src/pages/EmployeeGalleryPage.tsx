@@ -66,7 +66,6 @@ export default function EmployeeGalleryPage({
     void load();
   }, []);
 
-  const overallAgent = agents.find((item) => item.is_overall);
   // Keep these tabs aligned with the rest of the app:
   // - 所有员工: employees the current user can access and chat with
   // - 我的数字员工: employees the current user can manage/edit
@@ -161,9 +160,16 @@ export default function EmployeeGalleryPage({
     setDeleting(true);
     try {
       await api.delete(`/api/enterprise/agents/${row.id}?tenant_id=${TENANT_ID}`);
-      if (window.localStorage.getItem(ENTERPRISE_AGENT_STORAGE_KEY) === row.id && overallAgent) {
-        window.localStorage.setItem(ENTERPRISE_AGENT_STORAGE_KEY, overallAgent.id);
-        window.dispatchEvent(new CustomEvent('ultrarag-enterprise-agent-scope-change', { detail: { agentId: overallAgent.id } }));
+      if (window.localStorage.getItem(ENTERPRISE_AGENT_STORAGE_KEY) === row.id) {
+        const nextAgent = availableAgents.find((item) => item.id !== row.id && item.status === 'active')
+          || availableAgents.find((item) => item.id !== row.id);
+        if (nextAgent) {
+          window.localStorage.setItem(ENTERPRISE_AGENT_STORAGE_KEY, nextAgent.id);
+          window.dispatchEvent(new CustomEvent('ultrarag-enterprise-agent-scope-change', { detail: { agentId: nextAgent.id } }));
+        } else {
+          window.localStorage.removeItem(ENTERPRISE_AGENT_STORAGE_KEY);
+          window.dispatchEvent(new CustomEvent('ultrarag-enterprise-agent-scope-change', { detail: { agentId: '' } }));
+        }
       }
       notify.success('员工已删除');
       setDeleteTarget(null);

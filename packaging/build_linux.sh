@@ -163,7 +163,7 @@ command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -q /us
 exit 0
 SH
 chmod 0755 "$STAGE/DEBIAN/postinst" "$STAGE/DEBIAN/postrm"
-DEB_OUT="packaging/out/StaffDeck-${VERSION}-linux-x86_64.deb"
+DEB_OUT="packaging/out/StaffDeck-linux-x86_64.deb"
 dpkg-deb --root-owner-group --build "$STAGE" "$DEB_OUT"
 
 echo "==> [7/8] Building AppImage"
@@ -197,7 +197,7 @@ urllib.request.urlretrieve(url, sys.argv[1])
 PY
   chmod 0755 "$APPIMAGETOOL"
 fi
-APPIMAGE_OUT="packaging/out/StaffDeck-${VERSION}-linux-x86_64.AppImage"
+APPIMAGE_OUT="packaging/out/StaffDeck-linux-x86_64.AppImage"
 ARCH=x86_64 "$APPIMAGETOOL" --appimage-extract-and-run "$APPDIR" "$APPIMAGE_OUT"
 
 echo "==> [8/8] Verifying package metadata"

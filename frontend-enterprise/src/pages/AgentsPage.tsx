@@ -70,7 +70,6 @@ export default function AgentsPage({
     return () => window.removeEventListener('ultrarag-enterprise-agent-scope-change', handler);
   }, []);
 
-  const overallAgent = agents.find((item) => item.is_overall);
   const employees = useMemo(
     () => agents.filter((item) => !item.is_overall && canManageEmployeeAgent(item, currentUser)),
     [agents, currentUser],
@@ -154,9 +153,16 @@ export default function AgentsPage({
     setDeleting(true);
     try {
       await api.delete(`/api/enterprise/agents/${row.id}?tenant_id=${TENANT_ID}`);
-      if (window.localStorage.getItem(ENTERPRISE_AGENT_STORAGE_KEY) === row.id && overallAgent) {
-        window.localStorage.setItem(ENTERPRISE_AGENT_STORAGE_KEY, overallAgent.id);
-        window.dispatchEvent(new CustomEvent('ultrarag-enterprise-agent-scope-change', { detail: { agentId: overallAgent.id } }));
+      if (window.localStorage.getItem(ENTERPRISE_AGENT_STORAGE_KEY) === row.id) {
+        const nextAgent = employees.find((item) => item.id !== row.id && item.status === 'active')
+          || employees.find((item) => item.id !== row.id);
+        if (nextAgent) {
+          window.localStorage.setItem(ENTERPRISE_AGENT_STORAGE_KEY, nextAgent.id);
+          window.dispatchEvent(new CustomEvent('ultrarag-enterprise-agent-scope-change', { detail: { agentId: nextAgent.id } }));
+        } else {
+          window.localStorage.removeItem(ENTERPRISE_AGENT_STORAGE_KEY);
+          window.dispatchEvent(new CustomEvent('ultrarag-enterprise-agent-scope-change', { detail: { agentId: '' } }));
+        }
       }
       notify.success('员工已删除');
       setDeleteTarget(null);

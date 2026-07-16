@@ -51,13 +51,11 @@ const ENTERPRISE_AGENT_STORAGE_KEY = 'ultrarag_enterprise_agent_scope';
 export default function DashboardPage({
   currentUser,
   isAdmin = false,
-  forceOverall = false,
   profileTab = 'work',
   onLogout,
 }: {
   currentUser?: EnterpriseAuthUser;
   isAdmin?: boolean;
-  forceOverall?: boolean;
   profileTab?: ProfileTabKey;
   onLogout?: () => void;
 }) {
@@ -101,7 +99,6 @@ export default function DashboardPage({
       .then(([agentRows, skillRows, generalSkillRows, kbRows, modelRows, toolRows, sessionRows, feedbackRows, taskRows]) => {
         const visibleAgents = agentRows.filter((item) => canSelectCurrentEmployeeAgent(item, currentUser, {
           activeOnly: true,
-          includeOverall: isAdmin,
         }));
         setAgents(visibleAgents);
         setSkills(skillRows);
@@ -112,19 +109,10 @@ export default function DashboardPage({
         setSessions(sessionRows);
         setFeedbackSummary(feedbackRows);
         setScheduledTasks(taskRows.filter((item) => item.status !== 'archived'));
-        if (forceOverall) {
-          const overallAgent = visibleAgents.find((item) => item.is_overall);
-          if (overallAgent && overallAgent.id !== agentId) {
-            window.localStorage.setItem(ENTERPRISE_AGENT_STORAGE_KEY, overallAgent.id);
-            window.dispatchEvent(new CustomEvent('ultrarag-enterprise-agent-scope-change', { detail: { agentId: overallAgent.id } }));
-            setAgentId(overallAgent.id);
-          }
-          return;
-        }
         if (!agentId || !visibleAgents.some((item) => item.id === agentId)) {
           const manageableAgents = visibleAgents.filter((item) => canManageEmployeeAgent(item, currentUser));
           const next = isAdmin
-            ? visibleAgents.find((item) => item.is_overall)?.id || preferredEmployeeAgent(visibleAgents)?.id || ''
+            ? preferredEmployeeAgent(visibleAgents)?.id || ''
             : preferredEmployeeAgent(manageableAgents)?.id
               || preferredEmployeeAgent(visibleAgents)?.id
               || '';
@@ -137,10 +125,11 @@ export default function DashboardPage({
       })
       .catch((error) => notify.error(error instanceof Error ? error.message : '加载数字员工档案失败'))
       .finally(() => setLoaded(true));
-  }, [agentId, currentUser, forceOverall, isAdmin]);
+  }, [agentId, currentUser, isAdmin]);
 
-  const selectedAgent = (forceOverall ? agents.find((item) => item.is_overall) : agents.find((item) => item.id === agentId))
-    || (isAdmin ? agents.find((item) => item.is_overall) || null : agents.find((item) => !item.is_overall) || null);
+  const selectedAgent = agents.find((item) => item.id === agentId)
+    || agents.find((item) => !item.is_overall)
+    || null;
   const employeeSessions = selectedAgent?.is_overall
     ? sessions
     : sessions.filter((item) => item.agent_id === selectedAgent?.id);

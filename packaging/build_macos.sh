@@ -69,11 +69,11 @@ else
   echo "警告：密封校验未过，双击可能无法打开"
 fi
 
-DMG="packaging/out/StaffDeck-${VERSION}-macos-${ARCH}.dmg"
+DMG="packaging/out/StaffDeck-macos-${ARCH}.dmg"
 DMG_ROOT="packaging/out/dmg-root"
 DMG_BACKGROUND="packaging/build/staffdeck-dmg-background.png"
 rm -f "$DMG"
-rm -f "packaging/out/rw."*"StaffDeck-${VERSION}-macos-${ARCH}.dmg" 2>/dev/null || true
+rm -f "packaging/out/rw."*"StaffDeck-macos-${ARCH}.dmg" 2>/dev/null || true
 rm -rf "$DMG_ROOT"
 mkdir -p "$DMG_ROOT"
 ditto "$APP" "$DMG_ROOT/StaffDeck.app"
@@ -97,6 +97,6 @@ else
   hdiutil create -volname StaffDeck -srcfolder "$DMG_ROOT" -ov -format UDZO "$DMG"
 fi
 rm -rf "$DMG_ROOT"
-rm -f "packaging/out/rw."*"StaffDeck-${VERSION}-macos-${ARCH}.dmg" 2>/dev/null || true
+rm -f "packaging/out/rw."*"StaffDeck-macos-${ARCH}.dmg" 2>/dev/null || true
 echo "built $DMG"
 ls -lh "$DMG"

@@ -153,7 +153,7 @@ if (-not (Test-Path $unsignedInstaller)) {
 }
 
 Write-Host "==> [6/6] Name the release artifact"
-$out = "packaging\out\StaffDeck-$($env:VERSION)-windows-x64-setup.exe"
+$out = "packaging\out\StaffDeck-windows-x64-setup.exe"
 if (Test-Path -LiteralPath $out) { Remove-Item -LiteralPath $out -Force }
 Move-Item -LiteralPath $unsignedInstaller -Destination $out
 if ($signingConfigured) {
@@ -164,4 +164,4 @@ if ($signingConfigured) {
   Write-Host "Authenticode signature valid: $($signature.SignerCertificate.Subject)"
 }
 Write-Host "built $out"
-Get-ChildItem packaging\out\StaffDeck-*-windows-x64-setup.exe
+Get-ChildItem packaging\out\StaffDeck-windows-x64-setup.exe

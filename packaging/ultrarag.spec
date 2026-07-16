@@ -1,5 +1,6 @@
 # packaging/ultrarag.spec
 # 运行：cd backend && pyinstaller ../packaging/ultrarag.spec --noconfirm
+import os
 import sys
 from pathlib import Path
 from PyInstaller.utils.hooks import collect_submodules
@@ -11,6 +12,9 @@ ASSETS = REPO / "packaging" / "assets"
 ICNS = ASSETS / "staffdeck.icns"
 ICO = ASSETS / "staffdeck.ico"
 assert DIST.exists(), "先构建前端：npm --prefix frontend-enterprise run build"
+
+RAW_VERSION = os.environ.get("VERSION", "0.1.0").strip() or "0.1.0"
+BUNDLE_VERSION = RAW_VERSION[1:] if RAW_VERSION.startswith("v") else RAW_VERSION
 
 # 平台图标：macOS 用 .icns，Windows 用 .ico，Linux(EXE) 不用
 _exe_icon = None
@@ -76,8 +80,8 @@ if sys.platform == "darwin":
             "CFBundleDisplayName": "StaffDeck",
             # 可执行名保持 staffdeck（COLLECT/EXE 名 + build 脚本按此路径拷 runtime）
             "CFBundleExecutable": "staffdeck",
-            "CFBundleShortVersionString": "0.1.0",
-            "CFBundleVersion": "0.1.0",
+            "CFBundleShortVersionString": BUNDLE_VERSION,
+            "CFBundleVersion": BUNDLE_VERSION,
             "CFBundleURLTypes": [
                 {
                     "CFBundleURLName": "StaffDeck URL",
