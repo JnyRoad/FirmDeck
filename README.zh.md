@@ -205,7 +205,7 @@ StaffDeck/
 <td width="33%" align="center"><b>Discord 社区</b></td>
 </tr>
 <tr>
-<td align="center"><img src="packaging/assets/qr-wechat.jpg" width="200" alt="微信二维码"/></td>
+<td align="center"><img src="packaging/assets/qr-wechat.png" width="200" alt="微信二维码"/></td>
 <td align="center"><img src="packaging/assets/qr-feishu.jpg" width="200" alt="飞书二维码"/></td>
 <td align="center"><img src="packaging/assets/qr-discord.png" width="200" alt="Discord 二维码"/></td>
 </tr>
