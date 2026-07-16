@@ -3,7 +3,7 @@
 <img src="packaging/assets/staffdeck_banner_en.png" alt="StaffDeck logo" />
 
 <p align="center">
-  <a href="https://staffdeck.openbmb.cn"><img src="https://img.shields.io/badge/Website-staffdeck.openbmb.cn-FF6B35?style=flat-square&logo=googlechrome&logoColor=white" alt="Official Website"/></a>
+  <a href="https://staffdeck.openbmb.cn/"><img src="https://img.shields.io/badge/Website-staffdeck.openbmb.cn-FF6B35?style=flat-square&logo=googlechrome&logoColor=white" alt="Official Website"/></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-AGPL_3.0-blue.svg?style=flat-square" alt="License"/></a>
   <a href="https://github.com/OpenBMB/StaffDeck/stargazers"><img src="https://img.shields.io/github/stars/OpenBMB/StaffDeck?style=flat-square" alt="Stars"/></a>
   <br/>
@@ -33,6 +33,16 @@ StaffDeck is an enterprise platform for building and managing digital employees.
 - 📚 **Document-structure-aware knowledge retrieval**: Build navigable indexes across documents, chapters, pages, summaries, and other levels, allowing digital employees to first estimate where information may reside and then locate the original text step by step. Support knowledge buckets, targeted retrieval, source citations, and retrieval debugging.
 - 🔌 **Autonomous execution and continuous improvement**: Perform real business operations through HTTP APIs, MCP, and scheduled tasks, then close the improvement loop with long-term memory, complete traces, human takeover, user feedback, and feedback analysis.
 
+## Desktop Downloads
+
+Visit the [StaffDeck official website](https://staffdeck.openbmb.cn/) or download the latest desktop release directly:
+
+| Platform | Architecture | Download |
+| --- | --- | --- |
+| macOS | Apple Silicon (arm64) | [Download `.dmg`](https://github.com/OpenBMB/StaffDeck/releases/latest/download/StaffDeck-macos-arm64.dmg) |
+| Windows | x64 | [Download installer `.exe`](https://github.com/OpenBMB/StaffDeck/releases/latest/download/StaffDeck-windows-x64-setup.exe) |
+| Linux | x86_64 (Debian/Ubuntu) | [Download `.deb`](https://github.com/OpenBMB/StaffDeck/releases/latest/download/StaffDeck-linux-x86_64.deb) |
+
 ## Agent-Friendly Quick Deploy
 
 Paste the prompt below into Cursor, Claude Code, or Codex:
@@ -51,6 +61,7 @@ verify /api/health plus /workspace/gallery before reporting success.
 
 - [💡 About StaffDeck](#-about-staffdeck)
   - [Core Features](#core-features)
+  - [Desktop Downloads](#desktop-downloads)
   - [Agent-Friendly Quick Deploy](#agent-friendly-quick-deploy)
   - [Table of Contents](#table-of-contents)
   - [Quick Start](#quick-start)
