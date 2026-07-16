@@ -13,6 +13,7 @@ import {
 } from '@/components/ui';
 import { Button } from '@/components/ui/button';
 import { notify } from '@/components/ui/app-toast';
+import { useI18n } from '@/i18n';
 import type { ModelConfigRead } from '@/types';
 
 type ModelSetupDialogProps = {
@@ -59,6 +60,7 @@ export default function ModelSetupDialog({
   const [savedModelId, setSavedModelId] = useState('');
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<TestResult>(null);
+  const { t } = useI18n();
 
   useEffect(() => {
     if (!open) return;
@@ -78,13 +80,13 @@ export default function ModelSetupDialog({
     const provider = form.provider.trim();
     const model = form.model.trim();
     if (!name || !provider || !model) {
-      notify.error('请填写配置名称、Provider 和 Model');
+      notify.error(t('请填写配置名称、Provider 和 Model'));
       return;
     }
     const temperature = Number(form.temperature);
     const maxOutputTokens = Number(form.maxOutputTokens);
     if (!Number.isFinite(temperature) || !Number.isFinite(maxOutputTokens)) {
-      notify.error('Temperature 与 Max Tokens 必须是数字');
+      notify.error(t('Temperature 与 Max Tokens 必须是数字'));
       return;
     }
 
@@ -112,7 +114,7 @@ export default function ModelSetupDialog({
         `/api/enterprise/model-configs/${saved.id}/test?tenant_id=${encodeURIComponent(tenantId)}`,
       );
       if (!result.success) {
-        setTestResult({ success: false, message: result.message || '模型连接失败，请检查配置后重试。' });
+        setTestResult({ success: false, message: result.message ? t(result.message) : t('模型连接失败，请检查配置后重试。') });
         return;
       }
 
@@ -122,12 +124,12 @@ export default function ModelSetupDialog({
         is_default: true,
         enabled: true,
       });
-      setTestResult({ success: true, message: result.output || result.message || '模型连接成功。' });
+      setTestResult({ success: true, message: result.output || (result.message ? t(result.message) : t('模型连接成功。')) });
       onConfigured(activated);
     } catch (error) {
       setTestResult({
         success: false,
-        message: error instanceof Error ? error.message : '模型保存或连接测试失败，请检查配置后重试。',
+        message: error instanceof Error ? error.message : t('模型保存或连接测试失败，请检查配置后重试。'),
       });
     } finally {
       setTesting(false);

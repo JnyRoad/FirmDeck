@@ -61,6 +61,7 @@ const BLANK_MODEL_FORM: ModelForm = {
   is_default: false,
   enabled: true,
 };
+const MODEL_CONFIGS_UPDATED_EVENT = 'ultrarag-enterprise-model-configs-updated';
 
 export default function ModelsPage({
   currentUser,
@@ -84,7 +85,10 @@ export default function ModelsPage({
     setLoading(true);
     return api
       .get<ModelConfigRead[]>(`/api/enterprise/model-configs?tenant_id=${TENANT_ID}`)
-      .then(setRows)
+      .then((items) => {
+        setRows(items);
+        window.dispatchEvent(new CustomEvent(MODEL_CONFIGS_UPDATED_EVENT, { detail: { models: items } }));
+      })
       .catch((error) => notify.error(error instanceof Error ? error.message : '加载模型失败'))
       .finally(() => setLoading(false));
   };

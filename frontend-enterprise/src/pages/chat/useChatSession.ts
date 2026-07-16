@@ -32,6 +32,7 @@ import {
   visibleChatEmployees,
 } from '@/employee';
 import { notify } from '@/components/ui/app-toast';
+import { useI18n } from '@/i18n';
 import type {
   AgentProfileRead,
   ChatAttachmentRead,
@@ -141,6 +142,7 @@ const SCHEDULE_WEEKDAY_LABELS = ['周一', '周二', '周三', '周四', '周五
 // Stored as '1' (expanded) / '0' (collapsed); unset defaults to expanded.
 const ENTERPRISE_SIDEBAR_STORAGE_KEY = 'ultrarag_enterprise_sidebar_expanded';
 const MISSING_MODEL_CONFIG_PATTERN = /missing_model_config|missing model config|没有默认模型配置|没有可用模型|模型配置不存在|模型未配置/i;
+const MODEL_CONFIGS_UPDATED_EVENT = 'ultrarag-enterprise-model-configs-updated';
 
 function isMissingModelConfigurationError(value: unknown): boolean {
   if (value instanceof ApiError) {
@@ -293,6 +295,7 @@ export type UseChatSessionOptions = {
 
 export function useChatSession(options: UseChatSessionOptions = {}) {
   const { anonymous = false } = options;
+  const { t } = useI18n();
   const { sessionId, draftAgentId } = useParams<{ sessionId?: string; draftAgentId?: string }>();
   const navigate = useNavigate();
   const [auth] = useState(() => getEnterpriseAuthSession());
@@ -560,6 +563,11 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     || enabledModelConfigs[0]
     || null
   );
+  const canConfigureModels = auth?.user.role === 'admin';
+  const showModelSetupNotice = !modelConfigsLoading && !modelConfigsLoadError && !selectedModelConfig;
+  const modelSetupNoticeText = canConfigureModels
+    ? t('还没有可用模型配置，发送消息前请先完成模型配置。')
+    : t('系统管理员尚未配置可用模型，暂时无法发送消息。请联系管理员完成模型配置。');
 
   const changeModelConfig = useCallback((value: string) => {
     setSelectedModelConfigId(value);
@@ -571,10 +579,12 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
   }, [tenantId]);
 
   const completeModelSetup = useCallback((model: ModelConfigRead) => {
-    setModelConfigs((current) => [...current.filter((item) => item.id !== model.id), model]);
+    const next = [...modelConfigs.filter((item) => item.id !== model.id), model];
+    setModelConfigs(next);
+    window.dispatchEvent(new CustomEvent(MODEL_CONFIGS_UPDATED_EVENT, { detail: { models: next } }));
     setModelConfigsLoadError('');
     changeModelConfig(model.id);
-  }, [changeModelConfig]);
+  }, [changeModelConfig, modelConfigs]);
 
   const invalidateModelSelection = useCallback((modelId?: string) => {
     if (modelId) {
@@ -588,19 +598,23 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
 
   const ensureModelAvailable = useCallback(() => {
     if (modelConfigsLoading) {
-      notify.warning('模型配置正在加载，请稍后再发送');
+      notify.warning(t('模型配置正在加载，请稍后再发送'));
       return false;
     }
     if (modelConfigsLoadError) {
-      notify.error('无法读取模型配置，请刷新页面后重试');
+      notify.error(t('无法读取模型配置，请刷新页面后重试'));
       return false;
     }
     if (!selectedModelConfig) {
-      setModelSetupOpen(true);
+      if (canConfigureModels) {
+        setModelSetupOpen(true);
+      } else {
+        notify.warning(t('系统管理员尚未配置可用模型，请联系管理员完成模型配置'));
+      }
       return false;
     }
     return true;
-  }, [modelConfigsLoadError, modelConfigsLoading, selectedModelConfig]);
+  }, [canConfigureModels, modelConfigsLoadError, modelConfigsLoading, selectedModelConfig, t]);
 
   const loadAgents = useCallback(async (preferredAgentId?: string) => {
     setAgentsLoaded(false);
@@ -703,6 +717,29 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       })
       .finally(() => setModelConfigsLoading(false));
   }, [auth, redirectToLogin, tenantId]);
+
+  useEffect(() => {
+    const onModelConfigsUpdated = (event: Event) => {
+      const rows = (event as CustomEvent<{ models?: ModelConfigRead[] }>).detail?.models;
+      if (!rows) return;
+      setModelConfigs(rows);
+      setModelConfigsLoadError('');
+      setModelConfigsLoading(false);
+      setSelectedModelConfigId((current) => {
+        const enabledRows = rows.filter((item) => item.enabled);
+        if (current && enabledRows.some((item) => item.id === current)) return current;
+        const next = enabledRows.find((item) => item.is_default)?.id || enabledRows[0]?.id || '';
+        if (next) {
+          window.localStorage.setItem(modelStorageKey(tenantId), next);
+        } else {
+          window.localStorage.removeItem(modelStorageKey(tenantId));
+        }
+        return next;
+      });
+    };
+    window.addEventListener(MODEL_CONFIGS_UPDATED_EVENT, onModelConfigsUpdated);
+    return () => window.removeEventListener(MODEL_CONFIGS_UPDATED_EVENT, onModelConfigsUpdated);
+  }, [tenantId]);
 
   const toggleTrace = useCallback((turnId: string, isExpanded = false) => {
     if (isExpanded) {
@@ -3113,7 +3150,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     if (sessionsLoading) return;
     if (modelConfigsLoading || modelConfigsLoadError) return;
     if (!selectedModelConfig) {
-      setModelSetupOpen(true);
+      if (canConfigureModels) setModelSetupOpen(true);
       return;
     }
     const queuedSession = sessions.find((item) => item.id === nextTurn.conversationId);
@@ -3143,6 +3180,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
   }, [
     executePreparedTurn,
     getStreamSlot,
+    canConfigureModels,
     modelConfigsLoadError,
     modelConfigsLoading,
     notifyQueue,
@@ -3262,8 +3300,10 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     enabledModelConfigs,
     selectedModelConfig,
     changeModelConfig,
+    showModelSetupNotice,
+    modelSetupNoticeText,
     tenantId,
-    canConfigureModels: auth?.user.role === 'admin',
+    canConfigureModels,
     modelConfigsLoading,
     modelSetupOpen,
     setModelSetupOpen,

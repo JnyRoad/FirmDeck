@@ -72,6 +72,10 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
     enabledModelConfigs,
     selectedModelConfig,
     changeModelConfig,
+    showModelSetupNotice,
+    modelSetupNoticeText,
+    canConfigureModels,
+    setModelSetupOpen,
     isComposing,
     setIsComposing,
     fileInputRef,
@@ -114,6 +118,25 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
   return (
     <div className={CHAT_INPUT_SHELL_CLASS}>
       <div className={CHAT_COMPOSER_STAGE_CLASS}>
+        {showModelSetupNotice && (
+          <div className="mb-[10px] flex flex-col items-start justify-between gap-[10px] rounded-[12px] border border-[#f3d28b] bg-[#fff8e8] px-[14px] py-[10px] text-[#6f4500] shadow-[0_8px_24px_rgba(92,62,0,0.08)] sm:flex-row sm:items-center">
+            <div className="flex min-w-0 items-center gap-[9px]">
+              <span className="flex size-[26px] shrink-0 items-center justify-center rounded-[8px] bg-[#ffe7ad] text-[#8a4b00]">
+                <StaffdeckIcon name="model" size={14} />
+              </span>
+              <span className="min-w-0 text-[12px] leading-[18px]">{modelSetupNoticeText}</span>
+            </div>
+            {canConfigureModels && (
+              <button
+                type="button"
+                onClick={() => setModelSetupOpen(true)}
+                className="h-[30px] shrink-0 rounded-[8px] bg-[#18181a] px-[12px] text-[12px] text-white transition-colors hover:bg-[#303030]"
+              >
+                {t('配置模型')}
+              </button>
+            )}
+          </div>
+        )}
         {showComposerAvatar && displayedProfile && (
           <HoverCard openDelay={80} closeDelay={80}>
             <HoverCardTrigger asChild>

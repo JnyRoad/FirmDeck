@@ -94,6 +94,7 @@ export type AppSidebarManagementProps = {
   selectedAgentId: string;
   onSelectAgent: (agentId: string) => void;
   onOpenChat: () => void;
+  modelSetupAttention?: boolean;
 };
 
 export type ChatSessionFilterOption = { value: string; label: string };
@@ -132,10 +133,12 @@ function PrimaryNavButton({
   item,
   selected,
   onNavigate,
+  attention,
 }: {
   item: NavItem;
   selected: string;
   onNavigate: (route: string) => void;
+  attention?: boolean;
 }) {
   return (
     <SidebarMenuItem>
@@ -147,11 +150,15 @@ function PrimaryNavButton({
           'h-[40px] gap-[10px] rounded-[14px] px-[20px] py-[10px] text-[14px] text-sidebar-foreground',
           'hover:bg-sidebar-accent hover:text-sidebar-accent-foreground',
           'data-active:bg-sidebar-accent data-active:text-sidebar-accent-foreground data-active:font-normal',
+          attention && selected !== item.route && 'bg-[#fff7e8] text-[#8a4b00] ring-1 ring-[#ffd58a]',
           'group-data-[collapsible=icon]:px-0!',
         )}
       >
         <item.Icon className="size-[16px]!" />
         <span className="text-[14px]">{item.label}</span>
+        {attention && (
+          <span className="ml-auto size-[6px] rounded-full bg-[#f59e0b] group-data-[collapsible=icon]:hidden" />
+        )}
       </SidebarMenuButton>
     </SidebarMenuItem>
   );
@@ -315,12 +322,14 @@ function CollapsedNavButton({
   onNavigate,
   radius,
   iconSize,
+  attention,
 }: {
   item: NavItem;
   selected: string;
   onNavigate: (route: string) => void;
   radius: number;
   iconSize: number;
+  attention?: boolean;
 }) {
   const active = selected === item.route;
   return (
@@ -331,13 +340,17 @@ function CollapsedNavButton({
           aria-label={item.label}
           onClick={() => onNavigate(item.route)}
           className={cn(
-            'flex size-[32px] shrink-0 items-center justify-center text-sidebar-foreground transition-colors',
+            'relative flex size-[32px] shrink-0 items-center justify-center text-sidebar-foreground transition-colors',
             'hover:bg-sidebar-accent hover:text-sidebar-accent-foreground',
             active && 'bg-sidebar-accent text-sidebar-accent-foreground',
+            attention && !active && 'bg-[#fff7e8] text-[#8a4b00] ring-1 ring-[#ffd58a]',
           )}
           style={{ borderRadius: radius }}
         >
           <item.Icon style={{ width: iconSize, height: iconSize }} />
+          {attention && (
+            <span className="absolute mt-[-22px] ml-[22px] size-[6px] rounded-full bg-[#f59e0b]" />
+          )}
         </button>
       </TooltipTrigger>
       <TooltipContent side="right" align="center">
@@ -412,9 +425,10 @@ function CollapsedSidebar({
   onSelectAgent,
   onOpenChat,
   onToggle,
+  modelSetupAttention,
 }: Pick<
   AppSidebarManagementProps,
-  'selected' | 'onNavigate' | 'isAdmin' | 'sidebarAgent' | 'scopeAgents' | 'selectedAgentId' | 'onSelectAgent' | 'onOpenChat'
+  'selected' | 'onNavigate' | 'isAdmin' | 'sidebarAgent' | 'scopeAgents' | 'selectedAgentId' | 'onSelectAgent' | 'onOpenChat' | 'modelSetupAttention'
 > & { onToggle: () => void }) {
   const nameLabel = sidebarAgent
     ? sidebarAgent.is_overall
@@ -455,6 +469,7 @@ function CollapsedSidebar({
             onNavigate={onNavigate}
             radius={10}
             iconSize={16}
+            attention={modelSetupAttention && item.route === EnterpriseRoute.Models}
           />
         ))}
         <div className="h-px w-full bg-sidebar-border" />
@@ -530,6 +545,7 @@ function ManagementSidebar({
   selectedAgentId,
   onSelectAgent,
   onOpenChat,
+  modelSetupAttention,
 }: AppSidebarManagementProps) {
   const { toggleSidebar, state } = useSidebar();
   const brandCollapsed = useMemo(() => state === 'collapsed', [state]);
@@ -548,6 +564,7 @@ function ManagementSidebar({
           onSelectAgent={onSelectAgent}
           onOpenChat={onOpenChat}
           onToggle={toggleSidebar}
+          modelSetupAttention={modelSetupAttention}
         />
       </Sidebar>
     );
@@ -577,7 +594,13 @@ function ManagementSidebar({
         <div className="flex flex-col gap-[18px]">
           <SidebarMenu className="gap-[10px]">
             {primaryItems.map((item) => (
-              <PrimaryNavButton key={item.route} item={item} selected={selected} onNavigate={onNavigate} />
+              <PrimaryNavButton
+                key={item.route}
+                item={item}
+                selected={selected}
+                onNavigate={onNavigate}
+                attention={modelSetupAttention && item.route === EnterpriseRoute.Models}
+              />
             ))}
           </SidebarMenu>
           <div className="h-px w-full bg-sidebar-border group-data-[collapsible=icon]:hidden" />

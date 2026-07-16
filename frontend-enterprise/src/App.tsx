@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type CSSProperties } from "react";
+import { useCallback, useEffect, useMemo, useState, type CSSProperties } from "react";
 import {
   BrowserRouter,
   Navigate,
@@ -88,10 +88,11 @@ import {
   DIALOG_FOOTER_CLASS,
   DIALOG_PRIMARY_BUTTON_CLASS,
 } from "@/lib/enterprise-ui";
-import type { AgentProfileRead } from "./types";
+import type { AgentProfileRead, ModelConfigRead } from "./types";
 import { useI18n } from "./i18n";
 
 const ENTERPRISE_SIDEBAR_STORAGE_KEY = "ultrarag_enterprise_sidebar_expanded";
+const MODEL_CONFIGS_UPDATED_EVENT = "ultrarag-enterprise-model-configs-updated";
 type AgentCreateMode = "copy" | "blank";
 
 type AgentCreateFormState = {
@@ -119,6 +120,7 @@ function Shell({
 }) {
   const navigate = useNavigate();
   const location = useLocation();
+  const { t } = useI18n();
   const [agents, setAgents] = useState<AgentProfileRead[]>([]);
   const [agentsLoaded, setAgentsLoaded] = useState(false);
   const [selectedAgentId, setSelectedAgentId] = useState(
@@ -131,6 +133,8 @@ function Shell({
   const [agentCreateOpen, setAgentCreateOpen] = useState(false);
   const [agentForm, setAgentForm] =
     useState<AgentCreateFormState>(EMPTY_AGENT_FORM);
+  const [modelConfigs, setModelConfigs] = useState<ModelConfigRead[]>([]);
+  const [modelConfigsLoaded, setModelConfigsLoaded] = useState(false);
   const isMobile = useIsMobile();
   const isAdmin = isEnterpriseAdmin(auth.user);
   const accountRoleLabel = isAdmin ? "管理员" : "";
@@ -170,6 +174,37 @@ function Shell({
   useEffect(() => {
     loadAgents();
   }, []);
+
+  const loadModelConfigs = useCallback(() => {
+    return api
+      .get<ModelConfigRead[]>(`/api/enterprise/model-configs?tenant_id=${TENANT_ID}`)
+      .then((items) => {
+        setModelConfigs(items);
+        setModelConfigsLoaded(true);
+      })
+      .catch(() => {
+        setModelConfigs([]);
+        setModelConfigsLoaded(false);
+      });
+  }, []);
+
+  useEffect(() => {
+    void loadModelConfigs();
+  }, [loadModelConfigs]);
+
+  useEffect(() => {
+    const onModelConfigsUpdated = (event: Event) => {
+      const rows = (event as CustomEvent<{ models?: ModelConfigRead[] }>).detail?.models;
+      if (rows) {
+        setModelConfigs(rows);
+        setModelConfigsLoaded(true);
+      } else {
+        void loadModelConfigs();
+      }
+    };
+    window.addEventListener(MODEL_CONFIGS_UPDATED_EVENT, onModelConfigsUpdated);
+    return () => window.removeEventListener(MODEL_CONFIGS_UPDATED_EVENT, onModelConfigsUpdated);
+  }, [loadModelConfigs]);
 
   // Auto-collapse the sidebar on small screens; restore the saved preference on desktop.
   useEffect(() => {
@@ -277,6 +312,11 @@ function Shell({
   }
 
   const scopeAgents = agents.filter(canUseAgentScope);
+  const hasUsableModelConfig = modelConfigs.some((item) => item.enabled);
+  const showModelSetupNotice = modelConfigsLoaded && !hasUsableModelConfig;
+  const modelSetupNoticeText = isAdmin
+    ? t("还没有可用模型配置，数字员工暂不能调用模型。请先完成模型配置。")
+    : t("系统管理员尚未配置可用模型，数字员工暂不能调用模型。请联系管理员完成模型配置。");
   const selectedAgent = scopeAgents.find((item) => item.id === selectedAgentId);
   const sidebarAgent = selectedAgent;
   // Routes that operate on a specific employee; show the empty guide when none exist.
@@ -413,11 +453,32 @@ function Shell({
         onOpenChat={() => {
           navigate(EnterpriseRoute.Gallery);
         }}
+        modelSetupAttention={isAdmin && showModelSetupNotice}
       />
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
         <div
           className={`content flex-1 ${isDistillRoute ? "flex min-h-0 flex-col overflow-hidden p-0!" : ""} ${selected === "/enterprise/dashboard" ? "sd1-dashboard-content" : ""} ${selected !== "/enterprise/dashboard" && !isDistillRoute ? "sd1-management-content" : ""}`}
         >
+          {showModelSetupNotice && (
+            <div className="mx-[24px] mt-[18px] mb-[10px] flex shrink-0 flex-col items-start justify-between gap-[12px] rounded-[12px] border border-[#f3d28b] bg-[#fff8e8] px-[18px] py-[12px] text-[#6f4500] shadow-[0_8px_24px_rgba(92,62,0,0.08)] sm:flex-row sm:items-center">
+              <div className="flex min-w-0 items-center gap-[10px]">
+                <span className="flex size-[28px] shrink-0 items-center justify-center rounded-[8px] bg-[#ffe7ad] text-[#8a4b00]">
+                  <StaffdeckIcon name="model" className="size-[15px]" />
+                </span>
+                <span className="min-w-0 text-[13px] leading-[20px]">{modelSetupNoticeText}</span>
+              </div>
+              {isAdmin && (
+                <UIButton
+                  type="button"
+                  size="sm"
+                  onClick={() => navigate(EnterpriseRoute.Models)}
+                  className="h-[32px] shrink-0 rounded-[8px] bg-[#1a71ff] px-[12px] text-[12px] text-white hover:bg-[#0f5ed7]"
+                >
+                  {t("去配置")}
+                </UIButton>
+              )}
+            </div>
+          )}
           <div
             className={
               isDistillRoute
