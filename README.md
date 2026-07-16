@@ -138,7 +138,7 @@ scripts/dev_down.sh         # stop the local service
 scripts/dev_up.sh           # run in the foreground
 ```
 
-> Full guide → [StaffDeck Tutorial](docs/tutorial.md)
+> Full guide → [StaffDeck Tutorial](https://staffdeck.openbmb.cn/docs/introduce?lang=en)
 
 
 
