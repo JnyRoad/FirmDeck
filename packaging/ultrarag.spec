@@ -3,7 +3,7 @@
 import os
 import sys
 from pathlib import Path
-from PyInstaller.utils.hooks import collect_submodules
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 BACKEND = Path.cwd()                      # 约定在 backend/ 下执行
 REPO = BACKEND.parent
@@ -27,7 +27,7 @@ datas = [
     (str(BACKEND / "app" / "llm" / "prompts"), "app/llm/prompts"),
     (str(BACKEND / "app" / "db" / "seed_fixtures"), "app/db/seed_fixtures"),
     (str(BACKEND / "mock_servers"), "mock_servers"),
-]
+] + collect_data_files("tzdata")
 
 hiddenimports = (
     collect_submodules("uvicorn")

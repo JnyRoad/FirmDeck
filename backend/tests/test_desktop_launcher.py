@@ -100,6 +100,22 @@ def test_health_rejects_other_local_service(monkeypatch) -> None:
     assert desktop_launcher._health_ok("http://127.0.0.1:5175") is False
 
 
+def test_preload_server_app_imports_reference_on_calling_thread(monkeypatch) -> None:
+    app = object()
+
+    class FakeModule:
+        pass
+
+    module = FakeModule()
+    module.app = app
+    monkeypatch.setattr(desktop_launcher.importlib, "import_module", lambda name: module)
+    cfg = {"app": "single_port_app:app"}
+
+    desktop_launcher.preload_server_app(cfg)
+
+    assert cfg["app"] is app
+
+
 def test_windows_taskbar_app_only_used_for_frozen_windows(monkeypatch) -> None:
     monkeypatch.delenv("STAFFDECK_HEADLESS", raising=False)
     monkeypatch.setattr(desktop_launcher.sys, "platform", "win32")

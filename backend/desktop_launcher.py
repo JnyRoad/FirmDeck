@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import os
+import importlib
 import json
+import os
 import socket
 import sys
 import tempfile
@@ -232,6 +233,17 @@ def _serve(cfg: dict) -> None:
     import uvicorn
 
     uvicorn.run(cfg["app"], host=cfg["host"], port=cfg["port"], log_level="info")
+
+
+def preload_server_app(cfg: dict) -> None:
+    app_ref = cfg.get("app")
+    if not isinstance(app_ref, str):
+        return
+    module_name, separator, attribute_name = app_ref.partition(":")
+    if not separator or not module_name or not attribute_name:
+        raise RuntimeError(f"Invalid ASGI application reference: {app_ref!r}")
+    module = importlib.import_module(module_name)
+    cfg["app"] = getattr(module, attribute_name)
 
 
 def _run_macos_dock_app(cfg: dict, url: str) -> int:
@@ -573,6 +585,7 @@ def main(argv: list[str] | None = None) -> int:
     cfg = build_server_config()
     apply_runtime_env(cfg)
     url = f"http://{cfg['host']}:{cfg['port']}"
+    preload_server_app(cfg)
 
     if _use_macos_dock_app():
         return _run_macos_dock_app(cfg, url)
