@@ -196,7 +196,7 @@ Roadmap priorities are driven by real deployment needs. Please open an [Issue](h
 
 # 💬 Community
 - For bugs and feature requests, please open a [GitHub Issues](https://github.com/OpenBMB/StaffDeck/issues)。
-- 欢迎加入我们的社区与我们交流：
+- Join our community channels:
 
 <table width="100%">
 <tr>
