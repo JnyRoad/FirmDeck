@@ -1025,6 +1025,31 @@ def test_apply_step_result_records_skill_context_for_step_change() -> None:
     assert payload["to_step_id"] == "confirm_purchase"
 
 
+def test_record_runtime_event_skips_noop_step_change() -> None:
+    loop = object.__new__(AgentLoop)
+    loop.events = FakeEvents()
+    session = ChatSession(
+        id="session_test",
+        tenant_id="tenant_demo",
+        active_skill_id="skill_purchase_001",
+        active_step_id="collect_user_name",
+    )
+
+    loop._record_runtime_event(
+        "tenant_demo",
+        session,
+        "skill_purchase_001",
+        "collect_user_name",
+        RouterDecision(
+            decision="continue_active",
+            target_skill_id="skill_purchase_001",
+            target_step_id="collect_user_name",
+        ),
+    )
+
+    assert loop.events.records == []
+
+
 def test_apply_step_result_ignores_next_step_outside_active_skill() -> None:
     loop = object.__new__(AgentLoop)
     loop.events = FakeEvents()

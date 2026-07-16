@@ -2,6 +2,7 @@ export type SiteChatSource = {
   index: number;
   id: string;
   title: string;
+  text?: string;
 };
 
 export type NormalizedSiteChatCitations = {

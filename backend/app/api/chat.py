@@ -94,6 +94,21 @@ SPAN_EVENT_TYPES = {
     "knowledge_span_finished",
     "knowledge_span_failed",
 }
+KNOWLEDGE_TRACE_PHASES = {
+    "knowledge",
+    "okf_route",
+    "okf_only",
+    "document_route",
+    "document_route_lexical",
+    "bucket_route",
+    "bucket_route_lexical",
+    "section_expand",
+    "read_chunks",
+    "evidence_pack",
+    "no_visible_knowledge",
+    "no_documents",
+    "no_buckets",
+}
 SESSION_TITLE_PROMPT = """你是任务派发台的会话标题编辑器。
 
 根据首轮用户需求和员工回复，生成一个简短、可读、具体的中文标题。
@@ -2782,6 +2797,63 @@ def _event_trace_line(
             }
         if phase == "responding":
             return None
+        if phase == "stepping":
+            repair_reason = str(payload.get("repair_reason") or "main").strip()
+            iteration = payload.get("iteration")
+            iteration_suffix = (
+                f"_{iteration}" if isinstance(iteration, (int, float, str)) else ""
+            )
+            return {
+                "id": f"decision_stepping_{repair_reason}{iteration_suffix}",
+                "kind": "decision",
+                "text": "决定下一步" if repair_reason == "main" else "重新分析",
+                "detail": None,
+                "state": "running",
+            }
+        if phase == "reflecting":
+            return {
+                "id": "reflection",
+                "kind": "decision",
+                "text": "正在反思",
+                "detail": None,
+                "state": "running",
+            }
+        if phase in KNOWLEDGE_TRACE_PHASES:
+            query = payload.get("query") if isinstance(payload.get("query"), dict) else {}
+            detail_parts = [
+                f"查询：{query['query']}" if query.get("query") else "",
+                f"命中知识图谱 {payload['selected_count']} 个"
+                if isinstance(payload.get("selected_count"), int)
+                else "",
+                f"候选 {payload['candidate_count']} 个"
+                if isinstance(payload.get("candidate_count"), int)
+                else "",
+                f"读取 {payload['chunk_count']} 个片段"
+                if isinstance(payload.get("chunk_count"), int)
+                else "",
+                f"整理 {payload['evidence_count']} 条证据"
+                if isinstance(payload.get("evidence_count"), int)
+                else "",
+            ]
+            return {
+                "id": _knowledge_trace_line_id(payload),
+                "kind": "knowledge",
+                "text": text or "检索知识库",
+                "detail": " · ".join(part for part in detail_parts if part) or None,
+                "state": "completed"
+                if phase == "evidence_pack" or phase.startswith("no_") or phase == "okf_only"
+                else "running",
+            }
+        if phase == "tool" and payload.get("tool_name"):
+            tool_name = str(payload["tool_name"])
+            tool_call_id = str(payload.get("tool_call_id") or tool_name)
+            return {
+                "id": f"tool_{tool_call_id}",
+                "kind": "tool",
+                "text": f"正在调用 {tool_name}",
+                "detail": None,
+                "state": "running",
+            }
         if phase and phase != "received":
             return {
                 "id": f"decision_status_{phase}",
@@ -2868,6 +2940,9 @@ def _event_trace_line(
         }
     if event.event_type == "skill_state":
         lines = []
+        runtime_decision = str(payload.get("runtimeDecision") or "").strip()
+        from_skill_id = str(payload.get("fromSkillId") or "").strip()
+        to_skill_id = str(payload.get("toSkillId") or "").strip()
         for index, entry in enumerate(payload.get("currentSkills") or []):
             if not isinstance(entry, dict):
                 continue
@@ -2876,11 +2951,31 @@ def _event_trace_line(
                 continue
             name = str(entry.get("name") or skill_id).strip()
             state = str(entry.get("state") or "active").strip()
-            label = "挂起SOP" if state == "suspended" else "等待SOP" if state == "pending" else "执行SOP"
+            if state == "suspended":
+                label = "挂起SOP"
+            elif state == "pending":
+                label = "等待SOP"
+            elif runtime_decision in {"start_skill", "start_new_task"}:
+                label = "选择SOP"
+            elif runtime_decision == "suspend_current_and_start_new_skill":
+                label = "切换SOP"
+            elif (
+                runtime_decision
+                in {"answer_related_question_then_resume", "answer_chitchat_then_resume"}
+                and from_skill_id
+                and to_skill_id
+                and from_skill_id != to_skill_id
+            ):
+                label = "切换SOP"
+            elif runtime_decision == "exit_current_skill":
+                label = "恢复SOP"
+            else:
+                label = "推进SOP"
             step_id = str(entry.get("stepId") or "").strip()
+            state_key = step_id or str(index)
             lines.append(
                 {
-                    "id": f"skill_state_{skill_id}_{state}_{index}",
+                    "id": f"skill_state_{skill_id}_{state}_{state_key}",
                     "kind": "skill",
                     "text": f"{label} {name}",
                     "detail": f"当前步骤 {step_id}" if step_id else None,
@@ -2944,6 +3039,13 @@ def _event_trace_line(
     if event.event_type in {"skill_started", "skill_resumed", "skill_step_changed"}:
         to_skill_id = str(payload.get("to_skill_id") or "")
         from_skill_id = str(payload.get("from_skill_id") or "")
+        if (
+            event.event_type == "skill_step_changed"
+            and from_skill_id == to_skill_id
+            and str(payload.get("from_step_id") or "")
+            == str(payload.get("to_step_id") or "")
+        ):
+            return None
         skill_id = to_skill_id or from_skill_id or (skill_hint or "")
         if not skill_id:
             return None
@@ -2957,8 +3059,10 @@ def _event_trace_line(
             detail_parts.append(f"from {skill_names.get(from_skill_id, from_skill_id)}")
         if payload.get("to_step_id"):
             detail_parts.append(f"step {payload['to_step_id']}")
+        step_id = str(payload.get("to_step_id") or payload.get("from_step_id") or "").strip()
+        state_key = step_id or "0"
         return {
-            "id": f"skill_{event.id}",
+            "id": f"skill_state_{skill_id}_active_{state_key}",
             "kind": "skill",
             "text": f"{label} {skill_names.get(skill_id, skill_id)}",
             "detail": " · ".join(detail_parts) or None,
@@ -2989,7 +3093,7 @@ def _event_trace_line(
         query = payload.get("query") if isinstance(payload.get("query"), dict) else {}
         text = str(query.get("query") if isinstance(query, dict) else payload.get("text") or "").strip()
         return {
-            "id": f"knowledge_{event.id}_started",
+            "id": _knowledge_trace_line_id(payload),
             "kind": "knowledge",
             "phase": "query",
             "text": "查询业务资料",
@@ -3008,7 +3112,7 @@ def _event_trace_line(
             f"生成 {len(evidence)} 条引用候选" if evidence else "",
         ]
         return {
-            "id": f"knowledge_{event.id}_finished",
+            "id": _knowledge_trace_line_id(payload),
             "kind": "knowledge",
             "phase": "result",
             "text": "读取业务资料",
@@ -3068,7 +3172,7 @@ def _event_trace_line(
     if event.event_type in {"reflection_decision_created", "reflection_decision"}:
         needs_retry = bool(payload.get("needs_retry"))
         return {
-            "id": f"decision_{event.id}",
+            "id": "reflection",
             "kind": "decision",
             "text": "反思后继续尝试" if needs_retry else "反思通过",
             "detail": _reflection_trace_detail(payload),
@@ -3076,7 +3180,7 @@ def _event_trace_line(
         }
     if event.event_type == "reflection_skipped":
         return {
-            "id": f"decision_{event.id}",
+            "id": "reflection",
             "kind": "decision",
             "text": "反思已关闭",
             "detail": str(payload.get("reason") or "") or None,
@@ -3088,7 +3192,7 @@ def _event_trace_line(
         target_skill = str(payload.get("target_skill_id") or "").strip()
         target = target_tool or skill_names.get(target_skill, target_skill)
         return {
-            "id": f"decision_{event.id}",
+            "id": "reflection",
             "kind": "decision",
             "text": f"重试{ '工具' if mode == 'tool' else 'SOP' } {target}".strip(),
             "detail": str(payload.get("reason") or "") or None,
@@ -3129,6 +3233,14 @@ def _reflection_trace_detail(payload: dict) -> str | None:
     ]
     text = " · ".join(part for part in parts if part)
     return text or None
+
+
+def _knowledge_trace_line_id(payload: dict) -> str:
+    raw_query = payload.get("query")
+    if isinstance(raw_query, dict):
+        raw_query = raw_query.get("query")
+    query = " ".join(str(raw_query or "").split())
+    return f"knowledge_lookup_{query}" if query else "knowledge_lookup"
 
 
 def _upsert_trace_line(lines: list[dict], line: dict) -> None:

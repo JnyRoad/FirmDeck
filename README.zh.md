@@ -3,7 +3,7 @@
 <img src="packaging/assets/staffdeck_banner_cn.png" alt="StaffDeck 标志"  />
 
 <p align="center">
-  <a href="https://"><img src="https://img.shields.io/badge/Website-staffdeck.openbmb.cn-FF6B35?style=flat-square&logo=googlechrome&logoColor=white" alt="Official Website"/></a>
+  <a href="https://staffdeck.openbmb.cn"><img src="https://img.shields.io/badge/Website-staffdeck.openbmb.cn-FF6B35?style=flat-square&logo=googlechrome&logoColor=white" alt="Official Website"/></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-AGPL_3.0-blue.svg?style=flat-square" alt="License"/></a>
   <a href="https://github.com/OpenBMB/StaffDeck/stargazers"><img src="https://img.shields.io/github/stars/OpenBMB/StaffDeck?style=flat-square" alt="Stars"/></a>
   <br/>
@@ -114,9 +114,7 @@ API Key 用于创建初始模型配置，存入数据库前会被加密。请勿
 DETACH=1 scripts/dev_up.sh
 ```
 
-脚本会构建 StaffDeck 前端，并由一个 FastAPI 进程在 `5173` 端口同时提供 UI、API 与 Swagger 文档，默认管理员的账号密码是admin/admin，请在首次登陆后再账号配置中修改密码。
-
-初始管理员账号：用户名 `admin`，密码 `admin`。首次登录后请及时修改密码。
+脚本会构建 StaffDeck 前端，并由一个 FastAPI 进程在 `5173` 端口同时提供 UI、API 与 Swagger 文档。默认管理员账号为 `admin` / `admin`，请在首次登录后通过账号配置修改密码。
 
 ### 4. 验证安装
 

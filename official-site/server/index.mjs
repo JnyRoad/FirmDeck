@@ -142,7 +142,12 @@ async function handleChat(request, response) {
       emit(response, 'retrieval.started');
       sources = retrieve(`${route.retrievalQuery}\n${input.message}`, 4).map(({ score, ...source }) => source);
       emit(response, 'retrieval.completed', {
-        sources: sources.map((source, index) => ({ index: index + 1, id: source.id, title: source.title })),
+        sources: sources.map((source, index) => ({
+          index: index + 1,
+          id: source.id,
+          title: source.title,
+          text: source.text,
+        })),
       });
     }
 

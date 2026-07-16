@@ -1017,6 +1017,16 @@ export function knowledgeTraceText(data: Record<string, unknown>): string {
   return raw;
 }
 
+export function knowledgeTraceLineId(data: Record<string, unknown>): string {
+  const rawQuery = isPlainRecord(data.query) && typeof data.query.query === 'string'
+    ? data.query.query
+    : typeof data.query === 'string'
+      ? data.query
+      : '';
+  const query = rawQuery.trim().replace(/\s+/g, ' ');
+  return query ? `knowledge_lookup_${query}` : 'knowledge_lookup';
+}
+
 export function knowledgeTraceDetail(data: Record<string, unknown>): string | undefined {
   const query = isPlainRecord(data.query) && typeof data.query.query === 'string' ? data.query.query : '';
   const parts = [
@@ -1056,10 +1066,11 @@ export function normalizeTraceSkill(value: unknown): TraceSkill | null {
 
 export function streamSkillLabel(data: Record<string, unknown>, skill: TraceSkill): string {
   if (skill.state === 'suspended') return '挂起SOP';
+  if (skill.state === 'pending') return '等待SOP';
   const decision = typeof data.runtimeDecision === 'string' ? data.runtimeDecision : '';
   const fromSkillId = typeof data.fromSkillId === 'string' ? data.fromSkillId : '';
   const toSkillId = typeof data.toSkillId === 'string' ? data.toSkillId : '';
-  if (decision === 'start_skill') return '选择SOP';
+  if (decision === 'start_skill' || decision === 'start_new_task') return '选择SOP';
   if (decision === 'suspend_current_and_start_new_skill') return '切换SOP';
   if (
     (decision === 'answer_related_question_then_resume' || decision === 'answer_chitchat_then_resume')
@@ -1245,16 +1256,13 @@ export function mergeTurnTraceSnapshot(existing: TurnTrace | undefined, incoming
   });
 
   const incomingStillRunning = !incoming.completedAt;
-  existing.lines.forEach((line) => {
-    const preserveRunningLocalLine = incomingStillRunning && !line.placeholder;
-    if (
-      !incomingIds.has(line.id)
-      && !line.placeholder
-      && (!line.provisional || preserveRunningLocalLine)
-    ) {
-      mergedLines.push(line);
-    }
-  });
+  if (incomingStillRunning) {
+    existing.lines.forEach((line) => {
+      if (!incomingIds.has(line.id) && !line.placeholder) {
+        mergedLines.push(line);
+      }
+    });
+  }
 
   const startedAt = existing.startedAt > 0 && incoming.startedAt > 0
     ? Math.min(existing.startedAt, incoming.startedAt)

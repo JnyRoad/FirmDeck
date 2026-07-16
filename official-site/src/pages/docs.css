@@ -15,9 +15,9 @@
   gap: 22px;
   height: 60px;
   padding: 0 28px;
-  border-bottom: 1px solid #d8dee4;
-  background: rgba(255, 255, 255, 0.96);
-  backdrop-filter: blur(12px);
+  border-bottom: 1px solid rgba(20, 22, 40, 0.07);
+  background: rgba(247, 248, 252, 0.88);
+  backdrop-filter: saturate(1.35) blur(14px);
 }
 
 .docs-brand {
@@ -25,29 +25,6 @@
   justify-self: start;
   color: inherit;
   text-decoration: none;
-}
-
-.docs-topnav {
-  display: flex;
-  align-items: center;
-  justify-self: center;
-  gap: 32px;
-}
-
-.docs-topnav a {
-  border: 0;
-  background: transparent;
-  color: #303646;
-  font: inherit;
-  font-size: 13px;
-  font-weight: 600;
-  padding: 0;
-  text-decoration: none;
-}
-
-.docs-topnav a:hover,
-.docs-topnav a.is-active {
-  color: #2563eb;
 }
 
 .docs-top-actions {
@@ -651,15 +628,14 @@
 
 @media (max-width: 720px) {
   .docs-topbar {
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    gap: 8px;
     padding: 0 14px;
   }
 
-  .docs-topnav {
+  .docs-brand-wordmark,
+  .docs-icon-link {
     display: none;
-  }
-
-  .docs-topbar {
-    grid-template-columns: minmax(0, 1fr) auto;
   }
 
   .docs-layout {

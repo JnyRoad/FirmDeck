@@ -201,7 +201,13 @@ def test_turn_trace_recovers_persisted_skill_state_for_current_turn() -> None:
                         "name": "购买商品流程",
                         "stepId": "collect_user_name",
                         "state": "active",
-                    }
+                    },
+                    {
+                        "skillId": "skill_weather_001",
+                        "name": "天气查询流程",
+                        "stepId": "collect_city",
+                        "state": "pending",
+                    },
                 ],
                 "runtimeDecision": "start_new_task",
                 "user_message_id": "msg_user",
@@ -213,9 +219,298 @@ def test_turn_trace_recovers_persisted_skill_state_for_current_turn() -> None:
 
     traces = _build_turn_traces(messages, events, {"skill_purchase_001": "购买商品流程"})
 
-    skill_line = next(line for line in traces[0]["lines"] if line["kind"] == "skill")
-    assert skill_line["text"] == "执行SOP 购买商品流程"
-    assert skill_line["detail"] == "当前步骤 collect_user_name"
+    skill_lines = [line for line in traces[0]["lines"] if line["kind"] == "skill"]
+    assert skill_lines[0]["id"] == "skill_state_skill_purchase_001_active_collect_user_name"
+    assert skill_lines[0]["text"] == "选择SOP 购买商品流程"
+    assert skill_lines[0]["detail"] == "当前步骤 collect_user_name"
+    assert skill_lines[1]["id"] == "skill_state_skill_weather_001_pending_collect_city"
+    assert skill_lines[1]["text"] == "等待SOP 天气查询流程"
+
+
+def test_turn_trace_merges_skill_started_with_matching_state_snapshot() -> None:
+    started_at = datetime(2026, 7, 15, 13, 44, 11)
+    messages = [
+        Message(
+            id="msg_user",
+            tenant_id="tenant_demo",
+            session_id="session_test",
+            role="user",
+            content="帮我查询本月报销额度",
+            created_at=started_at,
+        )
+    ]
+    events = [
+        AgentEvent(
+            tenant_id="tenant_demo",
+            session_id="session_test",
+            event_type="user_message_received",
+            payload_json={"message_id": "msg_user", "message": "帮我查询本月报销额度"},
+            created_at=started_at,
+        ),
+        AgentEvent(
+            tenant_id="tenant_demo",
+            session_id="session_test",
+            event_type="skill_started",
+            payload_json={
+                "decision": "start_new_task",
+                "to_skill_id": "skill_expense_quota_query",
+                "to_step_id": "node_collect_info",
+                "turn_id": "msg_user",
+            },
+            created_at=started_at + timedelta(seconds=1),
+        ),
+        AgentEvent(
+            tenant_id="tenant_demo",
+            session_id="session_test",
+            event_type="skill_state",
+            payload_json={
+                "runtimeDecision": "start_new_task",
+                "currentSkills": [
+                    {
+                        "skillId": "skill_expense_quota_query",
+                        "name": "报销额度查询",
+                        "stepId": "node_collect_info",
+                        "state": "active",
+                    }
+                ],
+                "turn_id": "msg_user",
+            },
+            created_at=started_at + timedelta(seconds=2),
+        ),
+    ]
+
+    traces = _build_turn_traces(
+        messages,
+        events,
+        {"skill_expense_quota_query": "报销额度查询"},
+    )
+
+    skill_lines = [line for line in traces[0]["lines"] if line["kind"] == "skill"]
+    assert skill_lines == [
+        {
+            "id": "skill_state_skill_expense_quota_query_active_node_collect_info",
+            "kind": "skill",
+            "text": "选择SOP 报销额度查询",
+            "detail": "当前步骤 node_collect_info",
+            "state": "running",
+            "icon": "advance",
+        }
+    ]
+
+
+def test_turn_trace_uses_live_stream_ids_for_persisted_status_events() -> None:
+    started_at = datetime(2026, 7, 15, 14, 10, 0)
+    messages = [
+        Message(
+            id="msg_user",
+            tenant_id="tenant_demo",
+            session_id="session_test",
+            role="user",
+            content="查询报销额度",
+            created_at=started_at,
+        )
+    ]
+    events = [
+        AgentEvent(
+            tenant_id="tenant_demo",
+            session_id="session_test",
+            event_type="user_message_received",
+            payload_json={"message_id": "msg_user", "message": "查询报销额度"},
+            created_at=started_at,
+        ),
+        AgentEvent(
+            tenant_id="tenant_demo",
+            session_id="session_test",
+            event_type="stream_status",
+            payload_json={"phase": "stepping", "text": "正在思考", "turn_id": "msg_user"},
+            created_at=started_at + timedelta(seconds=1),
+        ),
+        AgentEvent(
+            tenant_id="tenant_demo",
+            session_id="session_test",
+            event_type="stream_status",
+            payload_json={"phase": "reflecting", "text": "正在反思", "turn_id": "msg_user"},
+            created_at=started_at + timedelta(seconds=2),
+        ),
+        AgentEvent(
+            tenant_id="tenant_demo",
+            session_id="session_test",
+            event_type="stream_status",
+            payload_json={"phase": "knowledge", "text": "查询业务资料", "turn_id": "msg_user"},
+            created_at=started_at + timedelta(seconds=3),
+        ),
+        AgentEvent(
+            tenant_id="tenant_demo",
+            session_id="session_test",
+            event_type="stream_status",
+            payload_json={
+                "phase": "tool",
+                "text": "正在调用工具",
+                "tool_name": "expense.quota_query",
+                "tool_call_id": "call_1",
+                "turn_id": "msg_user",
+            },
+            created_at=started_at + timedelta(seconds=4),
+        ),
+    ]
+
+    traces = _build_turn_traces(messages, events, {})
+
+    assert [line["id"] for line in traces[0]["lines"]] == [
+        "decision_stepping_main",
+        "reflection",
+        "knowledge_lookup",
+        "tool_call_1",
+    ]
+
+
+def test_turn_trace_merges_knowledge_lifecycle_events_for_same_query() -> None:
+    started_at = datetime(2026, 7, 15, 14, 33, 9)
+    query = "招待客户的餐费是否计入差旅费报销范围"
+    messages = [
+        Message(
+            id="msg_user",
+            tenant_id="tenant_demo",
+            session_id="session_test",
+            role="user",
+            content=query,
+            created_at=started_at,
+        )
+    ]
+    common_payload = {"query": {"query": query}, "turn_id": "msg_user"}
+    events = [
+        AgentEvent(
+            tenant_id="tenant_demo",
+            session_id="session_test",
+            event_type="user_message_received",
+            payload_json={"message_id": "msg_user", "message": query},
+            created_at=started_at,
+        ),
+        AgentEvent(
+            tenant_id="tenant_demo",
+            session_id="session_test",
+            event_type="knowledge_query_started",
+            payload_json=common_payload,
+            created_at=started_at + timedelta(seconds=1),
+        ),
+        AgentEvent(
+            tenant_id="tenant_demo",
+            session_id="session_test",
+            event_type="knowledge_query_finished",
+            payload_json={**common_payload, "selected_concepts": [{"id": "concept_1"}]},
+            created_at=started_at + timedelta(seconds=2),
+        ),
+        AgentEvent(
+            tenant_id="tenant_demo",
+            session_id="session_test",
+            event_type="knowledge_result",
+            payload_json={**common_payload, "selected_concepts": [{"id": "concept_1"}]},
+            created_at=started_at + timedelta(seconds=3),
+        ),
+    ]
+
+    traces = _build_turn_traces(messages, events, {})
+
+    knowledge_lines = [line for line in traces[0]["lines"] if line["kind"] == "knowledge"]
+    assert knowledge_lines == [
+        {
+            "id": f"knowledge_lookup_{query}",
+            "kind": "knowledge",
+            "phase": "result",
+            "text": "读取业务资料",
+            "detail": "命中 Wiki 1 个",
+            "state": "completed",
+            "icon": "advance",
+        }
+    ]
+
+
+def test_turn_trace_merges_created_and_relayed_reflection_decisions() -> None:
+    started_at = datetime(2026, 7, 15, 14, 37, 5)
+    messages = [
+        Message(
+            id="msg_user",
+            tenant_id="tenant_demo",
+            session_id="session_test",
+            role="user",
+            content="继续处理",
+            created_at=started_at,
+        )
+    ]
+    events = [
+        AgentEvent(
+            tenant_id="tenant_demo",
+            session_id="session_test",
+            event_type="user_message_received",
+            payload_json={"message_id": "msg_user", "message": "继续处理"},
+            created_at=started_at,
+        ),
+        AgentEvent(
+            tenant_id="tenant_demo",
+            session_id="session_test",
+            event_type="reflection_decision_created",
+            payload_json={"needs_retry": False, "turn_id": "msg_user"},
+            created_at=started_at + timedelta(seconds=1),
+        ),
+        AgentEvent(
+            tenant_id="tenant_demo",
+            session_id="session_test",
+            event_type="reflection_decision",
+            payload_json={"needs_retry": False, "turn_id": "msg_user"},
+            created_at=started_at + timedelta(seconds=2),
+        ),
+    ]
+
+    traces = _build_turn_traces(messages, events, {})
+
+    reflection_lines = [line for line in traces[0]["lines"] if line["id"] == "reflection"]
+    assert len(reflection_lines) == 1
+    assert reflection_lines[0]["text"] == "反思通过"
+
+
+def test_turn_trace_ignores_noop_skill_step_change() -> None:
+    started_at = datetime(2026, 7, 15, 12, 40, 14)
+    messages = [
+        Message(
+            id="msg_user",
+            tenant_id="tenant_demo",
+            session_id="session_test",
+            role="user",
+            content="我的工号是2472063",
+            created_at=started_at,
+        )
+    ]
+    events = [
+        AgentEvent(
+            tenant_id="tenant_demo",
+            session_id="session_test",
+            event_type="user_message_received",
+            payload_json={"message_id": "msg_user", "message": "我的工号是2472063"},
+            created_at=started_at,
+        ),
+        AgentEvent(
+            tenant_id="tenant_demo",
+            session_id="session_test",
+            event_type="skill_step_changed",
+            payload_json={
+                "decision": "continue_active",
+                "from_skill_id": "expense_travel_reimbursement",
+                "to_skill_id": "expense_travel_reimbursement",
+                "from_step_id": "collect_reimbursement_info",
+                "to_step_id": "collect_reimbursement_info",
+                "turn_id": "msg_user",
+            },
+            created_at=started_at + timedelta(seconds=1),
+        ),
+    ]
+
+    traces = _build_turn_traces(
+        messages,
+        events,
+        {"expense_travel_reimbursement": "差旅报销申请"},
+    )
+
+    assert not any(line["kind"] == "skill" for line in traces[0]["lines"])
 
 
 def test_message_read_hydrates_knowledge_citation_content_from_concept() -> None:
