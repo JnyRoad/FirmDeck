@@ -138,7 +138,7 @@ scripts/dev_down.sh         # 停止本地服务
 scripts/dev_up.sh           # 前台运行
 ```
 
-> 完整说明 → [StaffDeck 使用教程](https://staffdeck.openbmb.cn/docs/introduce?lang=zh)
+> 完整说明 → [StaffDeck 使用教程](https://staffdeck.openbmb.cn/#/docs/introduce?lang=zh)
 
 
 
