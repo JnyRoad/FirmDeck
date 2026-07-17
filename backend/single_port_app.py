@@ -1,15 +1,18 @@
+import logging
 import os
 from pathlib import Path
 
 import httpx
-from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import FileResponse, RedirectResponse, Response, StreamingResponse
 from starlette.requests import Request
 from starlette.staticfiles import StaticFiles
+from starlette.types import Scope
 
 from app import paths
 from app.main import app
 
 
+logger = logging.getLogger("staffdeck.static")
 ROOT_DIR = paths.resource_dir()
 # frozen: dist 被收集到 _MEIPASS/frontend-enterprise/dist
 # dev:    resource_dir()==backend/，需回到仓库根找 frontend-enterprise
@@ -38,6 +41,44 @@ HOP_BY_HOP_HEADERS = {
     "transfer-encoding",
     "upgrade",
 }
+FRONTEND_CONTENT_TYPES = {
+    ".css": "text/css; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".json": "application/json",
+    ".mjs": "text/javascript; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".wasm": "application/wasm",
+}
+
+
+class FrontendStaticFiles(StaticFiles):
+    """Serve Vite assets with stable MIME types across Windows machines."""
+
+    def file_response(
+        self,
+        full_path: os.PathLike[str],
+        stat_result: os.stat_result,
+        scope: Scope,
+        status_code: int = 200,
+    ) -> Response:
+        response = super().file_response(full_path, stat_result, scope, status_code)
+        suffix = Path(full_path).suffix.lower()
+        media_type = FRONTEND_CONTENT_TYPES.get(suffix)
+        if media_type:
+            detected_media_type = response.headers.get("Content-Type")
+            response.headers["Content-Type"] = media_type
+            detected_base_type = (detected_media_type or "").partition(";")[0].strip().lower()
+            allowed_base_types = {media_type.partition(";")[0].lower()}
+            if suffix in {".js", ".mjs"}:
+                allowed_base_types.add("application/javascript")
+            if detected_base_type not in allowed_base_types:
+                logger.warning(
+                    "Corrected frontend MIME suffix=%s detected=%s forced=%s",
+                    suffix,
+                    detected_media_type,
+                    media_type,
+                )
+        return response
 
 
 def spa_index_response(index_path: Path) -> FileResponse:
@@ -100,22 +141,22 @@ async def site_chat_proxy(site_path: str, request: Request) -> StreamingResponse
 
 app.mount(
     "/assets",
-    StaticFiles(directory=ENTERPRISE_DIST / "assets", check_dir=False),
+    FrontendStaticFiles(directory=ENTERPRISE_DIST / "assets", check_dir=False),
     name="assets",
 )
 app.mount(
     "/enterprise/assets",
-    StaticFiles(directory=ENTERPRISE_DIST / "assets", check_dir=False),
+    FrontendStaticFiles(directory=ENTERPRISE_DIST / "assets", check_dir=False),
     name="enterprise-assets",
 )
 app.mount(
     "/chat/assets",
-    StaticFiles(directory=ENTERPRISE_DIST / "assets", check_dir=False),
+    FrontendStaticFiles(directory=ENTERPRISE_DIST / "assets", check_dir=False),
     name="chat-assets",
 )
 app.mount(
     "/workspace/assets",
-    StaticFiles(directory=ENTERPRISE_DIST / "assets", check_dir=False),
+    FrontendStaticFiles(directory=ENTERPRISE_DIST / "assets", check_dir=False),
     name="workspace-assets",
 )
 

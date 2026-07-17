@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import logging
 import os
 import socket
 import sys
@@ -31,22 +32,12 @@ def build_server_config() -> dict:
 
 
 def _redirect_logs_when_frozen() -> None:
-    # console=False 的 GUI app 没有终端，stdout/stderr 会丢失。
-    # 打包态把日志重定向到用户数据目录，启动/运行问题可查文件。
     if not getattr(sys, "frozen", False):
         return
     try:
-        from app import paths
-        log_dir = paths.user_data_dir() / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = log_dir / "staffdeck.log"
-        previous_log_path = log_dir / "staffdeck.previous.log"
-        if log_path.exists():
-            log_path.replace(previous_log_path)
-        log_file = open(log_path, "w", buffering=1, encoding="utf-8")
-        sys.stdout = log_file
-        sys.stderr = log_file
-        print(f"{APP_NAME} session started: pid={os.getpid()}")
+        from app.runtime_logging import configure_runtime_logging
+
+        configure_runtime_logging()
     except Exception:
         pass
 
@@ -232,6 +223,21 @@ def _is_windows_restore_command(message: int, wparam: int) -> bool:
 def _serve(cfg: dict) -> None:
     import uvicorn
 
+    if getattr(sys, "frozen", False):
+        logging.getLogger("staffdeck.runtime").info(
+            "Server starting host=%s port=%s",
+            cfg["host"],
+            cfg["port"],
+        )
+        uvicorn.run(
+            cfg["app"],
+            host=cfg["host"],
+            port=cfg["port"],
+            log_level="info",
+            log_config=None,
+            access_log=False,
+        )
+        return
     uvicorn.run(cfg["app"], host=cfg["host"], port=cfg["port"], log_level="info")
 
 

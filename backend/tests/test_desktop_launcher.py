@@ -138,3 +138,16 @@ def test_windows_restore_command_detection() -> None:
     assert desktop_launcher._is_windows_restore_command(0x0112, 0xF122) is True
     assert desktop_launcher._is_windows_restore_command(0x0112, 0xF020) is False
     assert desktop_launcher._is_windows_restore_command(0x0002, 0xF120) is False
+
+
+def test_frozen_server_disables_api_access_logging(monkeypatch) -> None:
+    import uvicorn
+
+    calls = []
+    monkeypatch.setattr(desktop_launcher.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(uvicorn, "run", lambda *args, **kwargs: calls.append((args, kwargs)))
+
+    desktop_launcher._serve({"app": "single_port_app:app", "host": "127.0.0.1", "port": 5173})
+
+    assert calls[0][1]["access_log"] is False
+    assert calls[0][1]["log_config"] is None
