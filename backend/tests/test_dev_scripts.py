@@ -76,6 +76,7 @@ def test_supervisor_does_not_restart_during_startup_grace(monkeypatch) -> None:
 def test_shell_wrappers_delegate_to_cross_platform_cli() -> None:
     for command in ("up", "down", "status"):
         script = (SCRIPTS_DIR / f"dev_{command}.sh").read_text(encoding="utf-8")
+        assert '$ROOT_DIR/backend/.venv/bin/python' in script
         assert 'scripts/dev.py" ' + command in script
 
 
