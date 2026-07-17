@@ -2,6 +2,13 @@
 .env
 .env.*
 !.env.example
+*.cer
+*.certSigningRequest
+*.csr
+*.key
+*.p12
+*.mobileprovision
+*.provisionprofile
 __pycache__/
 *.py[cod]
 .pytest_cache/

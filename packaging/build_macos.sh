@@ -4,6 +4,54 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
 VERSION="${VERSION:-0.1.0}"
 ARCH="$(uname -m)"
+MAC_SIGN_ID="${MAC_SIGN_ID:-}"
+NOTARY_PROFILE="${NOTARY_PROFILE:-}"
+NOTARY_KEYCHAIN="${NOTARY_KEYCHAIN:-}"
+
+sign_code() {
+  local target="$1"
+  if [ -n "$MAC_SIGN_ID" ]; then
+    codesign --force --timestamp --options runtime --sign "$MAC_SIGN_ID" "$target"
+  else
+    codesign --force --timestamp=none --sign - "$target" 2>/dev/null || true
+  fi
+}
+
+sign_app_bundle() {
+  local app="$1"
+  xattr -cr "$app" 2>/dev/null || true
+  if [ -n "$MAC_SIGN_ID" ]; then
+    echo "使用 Developer ID 签名"
+    python3 - "$app" <<'PY' | while IFS= read -r item; do
+import subprocess
+import sys
+from pathlib import Path
+
+app = Path(sys.argv[1])
+items = []
+for path in app.rglob("*"):
+    if not path.is_file() or path.is_symlink():
+        continue
+    try:
+        desc = subprocess.check_output(["file", str(path)], text=True, stderr=subprocess.DEVNULL)
+    except Exception:
+        continue
+    if "Mach-O" in desc:
+        items.append(path)
+
+for path in sorted(items, key=lambda p: len(p.parts), reverse=True):
+    print(path)
+PY
+      sign_code "$item"
+    done
+  else
+    echo "未配置 MAC_SIGN_ID，使用 ad-hoc 签名"
+    find "$app/Contents/Frameworks" -type f -name "*.dylib" 2>/dev/null \
+      -exec codesign --force --timestamp=none --sign - {} \; 2>/dev/null || true
+    codesign --force --timestamp=none --sign - "$app/Contents/MacOS/staffdeck" 2>/dev/null || true
+  fi
+  sign_code "$app"
+}
 
 echo "==> [1/5] 构建前端"
 npm --prefix frontend-enterprise run build
@@ -55,16 +103,10 @@ rm -rf "$APP/Contents/Resources/runtime" "$APP/Contents/MacOS/runtime"
 cp -R packaging/runtime_dl/python "$APP/Contents/Resources/runtime"
 
 echo "==> [5/5] 签名 + 打 dmg"
-# arm64 要求 app 至少有 ad-hoc 签名才能启动。runtime 在 Resources，顶层签名可一次通过。
-xattr -cr "$APP" 2>/dev/null || true
-find "$APP/Contents/Frameworks" -type f -name "*.dylib" 2>/dev/null \
-  -exec codesign --force --timestamp=none --sign - {} \; 2>/dev/null || true
-codesign --force --timestamp=none --sign - "$APP/Contents/MacOS/staffdeck" 2>/dev/null || true
-codesign --force --timestamp=none --sign - "$APP" 2>/dev/null || echo "顶层签名跳过"
+sign_app_bundle "$APP"
 
-# 验证密封（ad-hoc 未被 Gatekeeper 信任属正常，用户首次右键打开即可；但密封必须有效）
-if codesign --verify --strict "$APP" 2>/dev/null; then
-  echo "✓ 签名密封验证通过（可正常双击打开；未公证故首次可能需右键→打开）"
+if codesign --verify --deep --strict "$APP" 2>/dev/null; then
+  echo "✓ 签名密封验证通过"
 else
   echo "警告：密封校验未过，双击可能无法打开"
 fi
@@ -98,5 +140,26 @@ else
 fi
 rm -rf "$DMG_ROOT"
 rm -f "packaging/out/rw."*"StaffDeck-macos-${ARCH}.dmg" 2>/dev/null || true
+
+if [ -n "$MAC_SIGN_ID" ]; then
+  codesign --force --timestamp --sign "$MAC_SIGN_ID" "$DMG"
+  codesign --verify --strict "$DMG"
+fi
+
+if [ -n "$NOTARY_PROFILE" ]; then
+  if [ -z "$MAC_SIGN_ID" ]; then
+    echo "配置 NOTARY_PROFILE 时也必须配置 MAC_SIGN_ID" >&2
+    exit 1
+  fi
+  NOTARY_ARGS=(--keychain-profile "$NOTARY_PROFILE")
+  if [ -n "$NOTARY_KEYCHAIN" ]; then
+    NOTARY_ARGS+=(--keychain "$NOTARY_KEYCHAIN")
+  fi
+  xcrun notarytool submit "$DMG" "${NOTARY_ARGS[@]}" --wait
+  xcrun stapler staple "$DMG"
+  xcrun stapler validate "$DMG"
+  spctl -a -vvv -t open --context context:primary-signature "$DMG"
+fi
+
 echo "built $DMG"
 ls -lh "$DMG"
