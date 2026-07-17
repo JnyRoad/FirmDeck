@@ -263,9 +263,9 @@ When using StaffDeck in internal research or authorized public materials, cite:
 
 <a href="https://www.star-history.com/?repos=openbmb%2Fstaffdeck&type=date&legend=top-left">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=openbmb/staffdeck&type=date&theme=dark&legend=top-left&sealed_token=ZMOmXTRtoNvTixQwNuQuduhd4KwN-e6aV0PavHUTxUELV8qKulCQBCFkxRqvjnBQLbaflu4id0jiCfglF4Sud7UXT8wV7mtzYDpzjZN8lwHbfDPOjDNwiA" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=openbmb/staffdeck&type=date&legend=top-left&sealed_token=ZMOmXTRtoNvTixQwNuQuduhd4KwN-e6aV0PavHUTxUELV8qKulCQBCFkxRqvjnBQLbaflu4id0jiCfglF4Sud7UXT8wV7mtzYDpzjZN8lwHbfDPOjDNwiA" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=openbmb/staffdeck&type=date&legend=top-left&sealed_token=ZMOmXTRtoNvTixQwNuQuduhd4KwN-e6aV0PavHUTxUELV8qKulCQBCFkxRqvjnBQLbaflu4id0jiCfglF4Sud7UXT8wV7mtzYDpzjZN8lwHbfDPOjDNwiA" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=openbmb/staffdeck&type=date&theme=dark&legend=top-left&sealed_token=lLohLC57bGAPh4lrzSYu2xW6Fmkavbj5r-T25GGt-jA10veIrv9OBPs0wiE5A98VIxP0NyxjbloW1t5OnPdVn6RT_L6Dmsp5EnfiWsGirs6G3Bv5_l_zUw" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=openbmb/staffdeck&type=date&legend=top-left&sealed_token=lLohLC57bGAPh4lrzSYu2xW6Fmkavbj5r-T25GGt-jA10veIrv9OBPs0wiE5A98VIxP0NyxjbloW1t5OnPdVn6RT_L6Dmsp5EnfiWsGirs6G3Bv5_l_zUw" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=openbmb/staffdeck&type=date&legend=top-left&sealed_token=lLohLC57bGAPh4lrzSYu2xW6Fmkavbj5r-T25GGt-jA10veIrv9OBPs0wiE5A98VIxP0NyxjbloW1t5OnPdVn6RT_L6Dmsp5EnfiWsGirs6G3Bv5_l_zUw" />
  </picture>
 </a>
 
