@@ -259,6 +259,15 @@ When using StaffDeck in internal research or authorized public materials, cite:
   url    = {https://github.com/OpenBMB/StaffDeck}
 }
 ```
+## Star History
+
+<a href="https://www.star-history.com/?repos=openbmb%2Fstaffdeck&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=openbmb/staffdeck&type=date&theme=dark&legend=top-left&sealed_token=ZMOmXTRtoNvTixQwNuQuduhd4KwN-e6aV0PavHUTxUELV8qKulCQBCFkxRqvjnBQLbaflu4id0jiCfglF4Sud7UXT8wV7mtzYDpzjZN8lwHbfDPOjDNwiA" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=openbmb/staffdeck&type=date&legend=top-left&sealed_token=ZMOmXTRtoNvTixQwNuQuduhd4KwN-e6aV0PavHUTxUELV8qKulCQBCFkxRqvjnBQLbaflu4id0jiCfglF4Sud7UXT8wV7mtzYDpzjZN8lwHbfDPOjDNwiA" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=openbmb/staffdeck&type=date&legend=top-left&sealed_token=ZMOmXTRtoNvTixQwNuQuduhd4KwN-e6aV0PavHUTxUELV8qKulCQBCFkxRqvjnBQLbaflu4id0jiCfglF4Sud7UXT8wV7mtzYDpzjZN8lwHbfDPOjDNwiA" />
+ </picture>
+</a>
 
 ## License
 
