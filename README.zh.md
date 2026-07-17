@@ -207,6 +207,10 @@ StaffDeck/
 
 # 💬 联系我们
 - 关于技术问题及功能请求，请提交 [GitHub Issues](https://github.com/OpenBMB/StaffDeck/issues)。
+- 商业合作，请联系：
+  ```
+  business@modelbest.cn
+  ```
 - 欢迎加入我们的社区与我们交流：
 
 <table width="100%">
