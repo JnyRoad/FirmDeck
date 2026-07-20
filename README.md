@@ -73,6 +73,7 @@ plus /workspace/gallery before reporting success.
     - [3. Launch the Web Demo](#3-launch-the-web-demo)
     - [4. Verify the Installation](#4-verify-the-installation)
     - [Useful Commands](#useful-commands)
+      - [Unified Python Entry](#unified-python-entry)
   - [Core Workflows](#core-workflows)
   - [Project Structure](#project-structure)
   - [FAQ](#faq)
@@ -136,19 +137,12 @@ The API key is used to create the initial model configuration and is encrypted b
 
 ### 3. Launch the Web Demo
 
-On macOS, Linux, or WSL:
+| Platform | Recommended command |
+| --- | --- |
+| macOS, Linux, or WSL | `scripts/dev_up.sh --detach` |
+| Windows PowerShell | `.\scripts\dev_up.ps1 --detach` |
 
-```bash
-scripts/dev_up.sh --detach
-```
-
-On Windows PowerShell:
-
-```powershell
-.\scripts\dev_up.ps1 --detach
-```
-
-The script builds the StaffDeck frontend and serves the UI, API, and Swagger documentation from one FastAPI process on port `5173`.
+Both wrappers call the same cross-platform Python lifecycle entry, `scripts/dev.py`. The startup process builds the StaffDeck frontend and serves the UI, API, and Swagger documentation from one FastAPI process on port `5173`.
 
 Initial administrator credentials: username `admin`, password `admin`. Please change the password after first login.
 
@@ -176,21 +170,30 @@ Open [http://127.0.0.1:5173/workspace/gallery](http://127.0.0.1:5173/workspace/g
 
 ### Useful Commands
 
-On macOS, Linux, or WSL:
+| Action | macOS, Linux, or WSL | Windows PowerShell |
+| --- | --- | --- |
+| Start in the background | `scripts/dev_up.sh --detach` | `.\scripts\dev_up.ps1 --detach` |
+| Start in the foreground | `scripts/dev_up.sh` | `.\scripts\dev_up.ps1` |
+| Inspect service status | `scripts/dev_status.sh` | `.\scripts\dev_status.ps1` |
+| Stop the local service | `scripts/dev_down.sh` | `.\scripts\dev_down.ps1` |
 
-```bash
-scripts/dev_status.sh       # inspect service status
-scripts/dev_down.sh         # stop the local service
-scripts/dev_up.sh           # run in the foreground
-```
+#### Unified Python Entry
 
-On Windows PowerShell:
+The wrapper scripts above delegate to `scripts/dev.py`. It can also be called directly with the project virtual environment created in step 1, avoiding any dependency on shell script execution or a system Python launcher:
 
-```powershell
-.\scripts\dev_status.ps1    # inspect service status
-.\scripts\dev_down.ps1      # stop the local service
-.\scripts\dev_up.ps1        # run in the foreground
-```
+| Platform | Direct background start |
+| --- | --- |
+| macOS, Linux, or WSL | `backend/.venv/bin/python scripts/dev.py up --detach` |
+| Windows PowerShell | `.\backend\.venv\Scripts\python.exe scripts\dev.py up --detach` |
+
+Replace `up --detach` with another lifecycle argument when needed:
+
+| Action | Arguments |
+| --- | --- |
+| Start in the background | `up --detach` |
+| Start in the foreground | `up` |
+| Inspect service status | `status` |
+| Stop the local service | `down` |
 
 > Full guide → [StaffDeck Tutorial](https://staffdeck.openbmb.cn/#/docs/introduce?lang=en)
 

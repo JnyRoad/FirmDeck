@@ -75,6 +75,7 @@ PowerShell 运行 .\scripts\dev_up.ps1 --detach；验证 /api/health 和
     - [3. 启动 Web Demo](#3-启动-web-demo)
     - [4. 验证安装](#4-验证安装)
     - [常用命令](#常用命令)
+      - [统一 Python 入口](#统一-python-入口)
   - [核心流程](#核心流程)
   - [项目结构](#项目结构)
   - [常见问题](#常见问题)
@@ -138,19 +139,12 @@ API Key 用于创建初始模型配置，存入数据库前会被加密。请勿
 
 ### 3. 启动 Web Demo
 
-macOS、Linux 或 WSL：
+| 平台 | 推荐命令 |
+| --- | --- |
+| macOS、Linux 或 WSL | `scripts/dev_up.sh --detach` |
+| Windows PowerShell | `.\scripts\dev_up.ps1 --detach` |
 
-```bash
-scripts/dev_up.sh --detach
-```
-
-Windows PowerShell：
-
-```powershell
-.\scripts\dev_up.ps1 --detach
-```
-
-脚本会构建 StaffDeck 前端，并由一个 FastAPI 进程在 `5173` 端口同时提供 UI、API 与 Swagger 文档。默认管理员账号为 `admin` / `admin`，请在首次登录后通过账号配置修改密码。
+两套包装脚本最终都会调用同一个跨平台 Python 生命周期入口 `scripts/dev.py`。启动过程会构建 StaffDeck 前端，并由一个 FastAPI 进程在 `5173` 端口同时提供 UI、API 与 Swagger 文档。默认管理员账号为 `admin` / `admin`，请在首次登录后通过账号配置修改密码。
 
 ### 4. 验证安装
 
@@ -176,21 +170,30 @@ curl.exe http://127.0.0.1:5173/api/health
 
 ### 常用命令
 
-macOS、Linux 或 WSL：
+| 操作 | macOS、Linux 或 WSL | Windows PowerShell |
+| --- | --- | --- |
+| 后台启动 | `scripts/dev_up.sh --detach` | `.\scripts\dev_up.ps1 --detach` |
+| 前台启动 | `scripts/dev_up.sh` | `.\scripts\dev_up.ps1` |
+| 查看服务状态 | `scripts/dev_status.sh` | `.\scripts\dev_status.ps1` |
+| 停止本地服务 | `scripts/dev_down.sh` | `.\scripts\dev_down.ps1` |
 
-```bash
-scripts/dev_status.sh       # 查看服务状态
-scripts/dev_down.sh         # 停止本地服务
-scripts/dev_up.sh           # 前台运行
-```
+#### 统一 Python 入口
 
-Windows PowerShell：
+上述包装脚本最终都会调用 `scripts/dev.py`。也可以直接使用第 1 步创建的项目虚拟环境，避免依赖 Shell 脚本执行能力或系统 Python Launcher：
 
-```powershell
-.\scripts\dev_status.ps1    # 查看服务状态
-.\scripts\dev_down.ps1      # 停止本地服务
-.\scripts\dev_up.ps1        # 前台运行
-```
+| 平台 | 直接后台启动 |
+| --- | --- |
+| macOS、Linux 或 WSL | `backend/.venv/bin/python scripts/dev.py up --detach` |
+| Windows PowerShell | `.\backend\.venv\Scripts\python.exe scripts\dev.py up --detach` |
+
+需要执行其他操作时，将 `up --detach` 替换为对应的生命周期参数：
+
+| 操作 | 参数 |
+| --- | --- |
+| 后台启动 | `up --detach` |
+| 前台启动 | `up` |
+| 查看服务状态 | `status` |
+| 停止本地服务 | `down` |
 
 > 完整说明 → [StaffDeck 使用教程](https://staffdeck.openbmb.cn/#/docs/introduce?lang=zh)
 
