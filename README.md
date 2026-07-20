@@ -49,11 +49,13 @@ Paste the prompt below into Cursor, Claude Code, or Codex:
 
 ```text
 Read https://raw.githubusercontent.com/OpenBMB/StaffDeck/main/README.md.
-Clone the OpenBMB/StaffDeck repository, prepare Python 3.11 and Node.js 20,
+Clone the OpenBMB/StaffDeck repository, prepare Python 3.11 or newer and Node.js 20,
 create backend/.venv, install the backend and frontend dependencies, copy
 backend/.env.example to backend/.env, ask me for the OpenAI-compatible model
-endpoint and API key if they are missing, run DETACH=1 scripts/dev_up.sh, and
-verify /api/health plus /workspace/gallery before reporting success.
+endpoint and API key if they are missing, and use the commands documented for
+the current OS. Start with scripts/dev_up.sh --detach on macOS/Linux/WSL or
+.\scripts\dev_up.ps1 --detach on Windows PowerShell, then verify /api/health
+plus /workspace/gallery before reporting success.
 ```
 
 
@@ -86,7 +88,7 @@ verify /api/health plus /workspace/gallery before reporting success.
 
 ### Requirements
 
-- macOS, Linux, or WSL when using the development scripts
+- macOS, Linux, WSL, or Windows PowerShell
 - Python **3.11+**
 - Node.js **20+** and npm
 - An OpenAI-compatible Chat Completions endpoint and API key
@@ -94,14 +96,29 @@ verify /api/health plus /workspace/gallery before reporting success.
 
 ### 1. Clone and Install
 
+Clone the repository first:
+
 ```bash
 git clone https://github.com/OpenBMB/StaffDeck.git
 cd StaffDeck
+```
 
+On macOS, Linux, or WSL:
+
+```bash
 python3 -m venv backend/.venv
 backend/.venv/bin/python -m pip install -e "backend[dev]"
 npm --prefix frontend-enterprise ci
 cp backend/.env.example backend/.env
+```
+
+On Windows PowerShell:
+
+```powershell
+py -3 -m venv backend\.venv
+.\backend\.venv\Scripts\python.exe -m pip install -e "backend[dev]"
+npm --prefix frontend-enterprise ci
+Copy-Item backend\.env.example backend\.env
 ```
 
 ### 2. Configure a Model
@@ -119,8 +136,16 @@ The API key is used to create the initial model configuration and is encrypted b
 
 ### 3. Launch the Web Demo
 
+On macOS, Linux, or WSL:
+
 ```bash
-DETACH=1 scripts/dev_up.sh
+scripts/dev_up.sh --detach
+```
+
+On Windows PowerShell:
+
+```powershell
+.\scripts\dev_up.ps1 --detach
 ```
 
 The script builds the StaffDeck frontend and serves the UI, API, and Swagger documentation from one FastAPI process on port `5173`.
@@ -129,8 +154,16 @@ Initial administrator credentials: username `admin`, password `admin`. Please ch
 
 ### 4. Verify the Installation
 
+On macOS, Linux, or WSL:
+
 ```bash
 curl http://127.0.0.1:5173/api/health
+```
+
+On Windows PowerShell:
+
+```powershell
+curl.exe http://127.0.0.1:5173/api/health
 ```
 
 Expected output:
@@ -143,10 +176,20 @@ Open [http://127.0.0.1:5173/workspace/gallery](http://127.0.0.1:5173/workspace/g
 
 ### Useful Commands
 
+On macOS, Linux, or WSL:
+
 ```bash
 scripts/dev_status.sh       # inspect service status
 scripts/dev_down.sh         # stop the local service
 scripts/dev_up.sh           # run in the foreground
+```
+
+On Windows PowerShell:
+
+```powershell
+.\scripts\dev_status.ps1    # inspect service status
+.\scripts\dev_down.ps1      # stop the local service
+.\scripts\dev_up.ps1        # run in the foreground
 ```
 
 > Full guide → [StaffDeck Tutorial](https://staffdeck.openbmb.cn/#/docs/introduce?lang=en)
