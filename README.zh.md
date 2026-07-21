@@ -304,7 +304,15 @@ StaffDeck/
   url    = {https://github.com/OpenBMB/StaffDeck}
 }
 ```
+## Star 历史
 
+<a href="https://www.star-history.com/?repos=openbmb%2Fstaffdeck&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=openbmb/staffdeck&type=date&theme=dark&legend=top-left&sealed_token=QE_nMUxB1irVnqSzqIsS94ZLhKVY799RbVOxNAIiaQr5IAxYu3aV1E0vCiPAwABFpWGKUiYCdICE22aUXZz7s3Cgpti91juQicTd7JOWtEn2tVy2Z1AGHg" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=openbmb/staffdeck&type=date&legend=top-left&sealed_token=QE_nMUxB1irVnqSzqIsS94ZLhKVY799RbVOxNAIiaQr5IAxYu3aV1E0vCiPAwABFpWGKUiYCdICE22aUXZz7s3Cgpti91juQicTd7JOWtEn2tVy2Z1AGHg" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=openbmb/staffdeck&type=date&legend=top-left&sealed_token=QE_nMUxB1irVnqSzqIsS94ZLhKVY799RbVOxNAIiaQr5IAxYu3aV1E0vCiPAwABFpWGKUiYCdICE22aUXZz7s3Cgpti91juQicTd7JOWtEn2tVy2Z1AGHg" />
+ </picture>
+</a>
 
 ## 许可证
 
