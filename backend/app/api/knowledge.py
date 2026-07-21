@@ -58,7 +58,15 @@ from app.knowledge.okf import (
     parse_okf_bundle,
     upsert_concepts,
 )
-from app.knowledge.service import IngestPayload, KnowledgeService, bucket_read, chunk_read
+from app.knowledge.service import (
+    IngestPayload,
+    KnowledgeDiscoveryConflictError,
+    KnowledgeDiscoveryValidationError,
+    KnowledgeService,
+    bucket_read,
+    chunk_read,
+    validate_discovered_skill,
+)
 from app.security.auth import ensure_current_user_tenant, get_current_user
 from app.security.permissions import (
     ensure_agent_scope_manager,
@@ -667,7 +675,17 @@ def list_discoveries(
     if status:
         stmt = stmt.where(KnowledgeDiscoverySuggestion.status == status)
     rows = db.exec(stmt.order_by(KnowledgeDiscoverySuggestion.created_at.desc())).all()
-    return [discovery_read(row) for row in rows]
+    visible_rows: list[KnowledgeDiscoverySuggestion] = []
+    for row in rows:
+        if row.status == "pending" and row.suggestion_type == "skill":
+            payload = row.payload_json or {}
+            skill_payload = payload.get("draft_skill") if isinstance(payload.get("draft_skill"), dict) else payload
+            try:
+                validate_discovered_skill(skill_payload)
+            except KnowledgeDiscoveryValidationError:
+                continue
+        visible_rows.append(row)
+    return [discovery_read(row) for row in visible_rows]
 
 
 @router.post("/discoveries/{suggestion_id}/confirm")
@@ -679,7 +697,12 @@ def confirm_discovery(
 ) -> dict[str, object]:
     row = _get_discovery(db, tenant_id, suggestion_id)
     _ensure_open_gallery_knowledge_admin(db, tenant_id, row.knowledge_base_id, current_user)
-    result = KnowledgeService(db).confirm_discovery(row)
+    try:
+        result = KnowledgeService(db).confirm_discovery(row)
+    except KnowledgeDiscoveryValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except KnowledgeDiscoveryConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return {"status": "confirmed", "result": result}
 
 
@@ -692,7 +715,10 @@ def reject_discovery(
 ) -> dict[str, str]:
     row = _get_discovery(db, tenant_id, suggestion_id)
     _ensure_open_gallery_knowledge_admin(db, tenant_id, row.knowledge_base_id, current_user)
-    KnowledgeService(db).reject_discovery(row)
+    try:
+        KnowledgeService(db).reject_discovery(row)
+    except KnowledgeDiscoveryConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return {"status": "rejected"}
 
 
