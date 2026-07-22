@@ -279,6 +279,9 @@ def _seed_tools(
             select(Tool).where(Tool.tenant_id == TENANT_ID, Tool.name == name)
         ).first()
         existing = _seed_update_target(existing_by_id, existing_by_name, source_id)
+        config = _json_object(row.get("config_json"))
+        if name == "contract.archive_query":
+            config = {**config, "execution": {"timeout_seconds": 20}}
         payload = {
             "tenant_id": TENANT_ID,
             "name": name,
@@ -290,7 +293,7 @@ def _seed_tools(
             "url": row.get("url") or "",
             "headers_json": _json_object(row.get("headers_json")),
             "auth_json": _json_object(row.get("auth_json")),
-            "config_json": _json_object(row.get("config_json")),
+            "config_json": config,
             "input_schema": _json_object(row.get("input_schema")),
             "output_schema": _json_object(row.get("output_schema")),
             "allowed_skills_json": _json_list(row.get("allowed_skills_json")),
