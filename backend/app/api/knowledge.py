@@ -38,6 +38,7 @@ from app.db.models import (
     User,
     utc_now,
 )
+from app.llm.model_config_resolver import resolve_model_config_for_runtime
 from app.knowledge.schema import (
     KnowledgeBucketRead,
     KnowledgeChunkRead,
@@ -623,13 +624,14 @@ def search_knowledge(
 
 
 def _get_default_model(db: Session, tenant_id: str) -> ModelConfig | None:
-    return db.exec(
+    row = db.exec(
         select(ModelConfig).where(
             ModelConfig.tenant_id == tenant_id,
             ModelConfig.is_default == True,  # noqa: E712
             ModelConfig.enabled == True,  # noqa: E712
         )
     ).first()
+    return _runtime_model(db, tenant_id, row) if row else None
 
 
 def _get_request_model(
@@ -640,7 +642,11 @@ def _get_request_model(
     model_config = db.get(ModelConfig, model_config_id)
     if not model_config or model_config.tenant_id != tenant_id or not model_config.enabled:
         raise HTTPException(status_code=404, detail="Model config not found")
-    return model_config
+    return _runtime_model(db, tenant_id, model_config)
+
+
+def _runtime_model(db: Session, tenant_id: str, row: ModelConfig):
+    return resolve_model_config_for_runtime(db, tenant_id, row.id)
 
 
 @router.get(

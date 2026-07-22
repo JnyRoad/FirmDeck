@@ -30,6 +30,7 @@ from app.db.models import (
     utc_now,
 )
 from app.knowledge.parser import KnowledgeParseError, extract_text
+from app.llm.model_config_resolver import resolve_model_config_for_runtime
 from app.knowledge.schema import (
     KnowledgeBucketRead,
     KnowledgeChunkRead,
@@ -1123,13 +1124,16 @@ class KnowledgeService:
         return {"status": "created", "skill_id": row.id}
 
     def _default_model_config(self, tenant_id: str) -> ModelConfig | None:
-        return self.db.exec(
+        row = self.db.exec(
             select(ModelConfig).where(
                 ModelConfig.tenant_id == tenant_id,
                 ModelConfig.is_default == True,  # noqa: E712 - SQLModel expression.
                 ModelConfig.enabled == True,  # noqa: E712
             )
         ).first()
+        if row is None:
+            return None
+        return resolve_model_config_for_runtime(self.db, tenant_id, row.id)
 
     def ensure_default_knowledge_base(self, tenant_id: str) -> KnowledgeBase:
         existing = self.db.exec(
