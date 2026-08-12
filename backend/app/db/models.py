@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from typing import Any, Optional
 from uuid import uuid4
 
-from sqlalchemy import JSON, Column, Index, Integer, UniqueConstraint
+from sqlalchemy import JSON, Column, Index, Integer, Text, UniqueConstraint
 from sqlmodel import Field, SQLModel
 
 
@@ -50,7 +50,7 @@ class UserAvatar(SQLModel, table=True):
     __tablename__ = "user_avatars"
 
     user_id: str = Field(primary_key=True)
-    data_url: str
+    data_url: str = Field(sa_column=Column(Text, nullable=False))
     updated_at: datetime = Field(default_factory=utc_now)
 
 
@@ -65,7 +65,7 @@ class APIClient(SQLModel, table=True):
     id: str = Field(default_factory=lambda: new_id("apiclient"), primary_key=True)
     tenant_id: str = Field(index=True)
     name: str
-    description: Optional[str] = None
+    description: Optional[str] = Field(default=None, sa_column=Column(Text))
     scopes_json: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     status: str = Field(default="active", index=True)
     created_by_user_id: Optional[str] = Field(default=None, index=True)
@@ -266,7 +266,7 @@ class Skill(SQLModel, table=True):
     version: str = "1.0.0"
     name: str
     business_domain: Optional[str] = None
-    description: Optional[str] = None
+    description: Optional[str] = Field(default=None, sa_column=Column(Text))
     content_json: dict[str, Any] = Field(sa_column=Column(JSON, nullable=False))
     status: str = Field(default="draft", index=True)
     created_at: datetime = Field(default_factory=utc_now)
@@ -283,7 +283,7 @@ class SkillVersion(SQLModel, table=True):
     version: str = Field(index=True)
     name: str
     business_domain: Optional[str] = None
-    description: Optional[str] = None
+    description: Optional[str] = Field(default=None, sa_column=Column(Text))
     content_json: dict[str, Any] = Field(sa_column=Column(JSON, nullable=False))
     status: str = Field(default="draft", index=True)
     created_at: datetime = Field(default_factory=utc_now)
@@ -327,7 +327,7 @@ class AgentSkillBranchVersion(SQLModel, table=True):
     content_json: dict[str, Any] = Field(sa_column=Column(JSON, nullable=False))
     status: str = Field(default="active", index=True)
     sync_state: str = Field(default="diverged", index=True)
-    change_summary: Optional[str] = None
+    change_summary: Optional[str] = Field(default=None, sa_column=Column(Text))
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 
@@ -340,9 +340,9 @@ class GeneralSkill(SQLModel, table=True):
     tenant_id: str = Field(index=True)
     slug: str = Field(index=True)
     name: str
-    description: Optional[str] = None
+    description: Optional[str] = Field(default=None, sa_column=Column(Text))
     homepage: Optional[str] = None
-    skill_markdown: str
+    skill_markdown: str = Field(sa_column=Column(Text, nullable=False))
     skill_files_json: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
     metadata_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     status: str = Field(default="draft", index=True)
@@ -360,7 +360,7 @@ class KnowledgeBase(SQLModel, table=True):
     id: str = Field(default_factory=lambda: new_id("kb"), primary_key=True)
     tenant_id: str = Field(index=True)
     name: str
-    description: Optional[str] = None
+    description: Optional[str] = Field(default=None, sa_column=Column(Text))
     status: str = Field(default="active", index=True)
     capability_scope: str = Field(default="general", index=True)
     metadata_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
@@ -379,7 +379,7 @@ class KnowledgeBaseVersion(SQLModel, table=True):
     knowledge_base_id: str = Field(index=True)
     version: str = Field(default="1.0.0", index=True)
     name: str
-    description: Optional[str] = None
+    description: Optional[str] = Field(default=None, sa_column=Column(Text))
     status: str = Field(default="active", index=True)
     capability_scope: str = Field(default="general", index=True)
     metadata_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
@@ -420,7 +420,7 @@ class KnowledgeDocument(SQLModel, table=True):
     bucket_count: int = 0
     chunk_count: int = 0
     metadata_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
-    error: Optional[str] = None
+    error: Optional[str] = Field(default=None, sa_column=Column(Text))
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 
@@ -435,7 +435,7 @@ class KnowledgeBucket(SQLModel, table=True):
     document_id: str = Field(index=True)
     bucket_key: str = Field(index=True)
     title: str
-    summary: str
+    summary: str = Field(sa_column=Column(Text, nullable=False))
     token_estimate: int = 0
     metadata_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     created_at: datetime = Field(default_factory=utc_now)
@@ -452,8 +452,8 @@ class KnowledgeChunk(SQLModel, table=True):
     document_id: str = Field(index=True)
     bucket_id: str = Field(index=True)
     chunk_index: int = Field(index=True)
-    content: str
-    summary: Optional[str] = None
+    content: str = Field(sa_column=Column(Text, nullable=False))
+    summary: Optional[str] = Field(default=None, sa_column=Column(Text))
     source_ref: Optional[str] = None
     metadata_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     created_at: datetime = Field(default_factory=utc_now)
@@ -479,8 +479,8 @@ class KnowledgeConcept(SQLModel, table=True):
     concept_id: str = Field(index=True)
     concept_type: str = Field(index=True)
     title: str
-    description: Optional[str] = None
-    content_md: str
+    description: Optional[str] = Field(default=None, sa_column=Column(Text))
+    content_md: str = Field(sa_column=Column(Text, nullable=False))
     frontmatter_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     links_json: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
     citations_json: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
@@ -504,7 +504,7 @@ class KnowledgeDiscoverySuggestion(SQLModel, table=True):
     status: str = Field(default="pending", index=True)
     payload_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     source_refs_json: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
-    reason: Optional[str] = None
+    reason: Optional[str] = Field(default=None, sa_column=Column(Text))
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 
@@ -521,7 +521,7 @@ class KnowledgeIngestJob(SQLModel, table=True):
     status: str = Field(default="queued", index=True)
     stage: str = "queued"
     progress: float = 0.0
-    error: Optional[str] = None
+    error: Optional[str] = Field(default=None, sa_column=Column(Text))
     metadata_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     created_at: datetime = Field(default_factory=utc_now)
     started_at: Optional[datetime] = None
@@ -567,7 +567,7 @@ class PersonaConfig(SQLModel, table=True):
     __tablename__ = "persona_configs"
 
     tenant_id: str = Field(primary_key=True)
-    system_prompt: str
+    system_prompt: str = Field(sa_column=Column(Text, nullable=False))
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 
@@ -594,8 +594,8 @@ class AgentProfile(SQLModel, table=True):
     id: str = Field(default_factory=lambda: new_id("agent"), primary_key=True)
     tenant_id: str = Field(index=True)
     name: str
-    description: Optional[str] = None
-    persona_prompt: Optional[str] = None
+    description: Optional[str] = Field(default=None, sa_column=Column(Text))
+    persona_prompt: Optional[str] = Field(default=None, sa_column=Column(Text))
     is_overall: bool = Field(default=False, index=True)
     status: str = Field(default="active", index=True)
     harness_max_actions: int = Field(default=32)
@@ -659,7 +659,7 @@ class Tool(SQLModel, table=True):
     tenant_id: str = Field(index=True)
     name: str = Field(index=True)
     display_name: Optional[str] = None
-    description: Optional[str] = None
+    description: Optional[str] = Field(default=None, sa_column=Column(Text))
     bucket: str = Field(default="未分桶", index=True)
     tool_type: str = Field(default="http", index=True)
     method: str
@@ -686,7 +686,7 @@ class MCPServer(SQLModel, table=True):
     tenant_id: str = Field(index=True)
     name: str = Field(index=True)
     display_name: Optional[str] = None
-    description: Optional[str] = None
+    description: Optional[str] = Field(default=None, sa_column=Column(Text))
     bucket: str = Field(default="MCP 工具", index=True)
     # 连接方式：stdio / streamable_http / sse / builtin
     transport: str = Field(default="streamable_http", index=True)
@@ -744,7 +744,7 @@ class ChatSession(SQLModel, table=True):
     awaiting_input_json: Optional[dict[str, Any]] = Field(default=None, sa_column=Column(JSON))
     knowledge_context_json: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
     context_state_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
-    summary: Optional[str] = None
+    summary: Optional[str] = Field(default=None, sa_column=Column(Text))
     last_agent_question: Optional[str] = None
     status: str = "active"
     channel: Optional[str] = None
@@ -892,7 +892,7 @@ class ChannelInboundEvent(SQLModel, table=True):
     # 每条事件不可变的回复目标；异步处理不得读取会话上的可变 target
     target_json: dict[str, Any] = Field(
         default_factory=dict,
-        sa_column=Column(JSON, nullable=False, server_default="{}"),
+        sa_column=Column(JSON, nullable=False),
     )
     # 收到确认标记的句柄；最终回复送达后据此异步撤回。飞书存远端 reaction_id；
     # 钉钉 emotion 接口不返回 ID，存本地哨兵值表示"已挂上待撤回"。
@@ -901,7 +901,7 @@ class ChannelInboundEvent(SQLModel, table=True):
     status: str = Field(default="received", index=True)
     # 创建/接管该事件的进程启动代次；当前代次仍在运行时禁止按墙钟误接管。
     processor_run_id: Optional[str] = Field(default=None, index=True)
-    error: Optional[str] = None
+    error: Optional[str] = Field(default=None, sa_column=Column(Text))
     processed_at: Optional[datetime] = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
@@ -919,14 +919,14 @@ class ChannelDelivery(SQLModel, table=True):
     target_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     # reply/error_notice
     kind: str = Field(default="reply", index=True)
-    text: str
+    text: str = Field(sa_column=Column(Text, nullable=False))
     # pending/sending/delivered/failed
     status: str = Field(default="pending", index=True)
     attempts: int = 0
     next_attempt_at: Optional[datetime] = Field(default=None, index=True)
     # 原子 claim 的抢占时间(守护据此重置卡死投递)
     sending_since: Optional[datetime] = None
-    last_error: Optional[str] = None
+    last_error: Optional[str] = Field(default=None, sa_column=Column(Text))
     # 回复类投递 = message_id，天然幂等
     idempotency_key: str = Field(unique=True, index=True)
     # 第一次真正尝试远端发送的时间，用于飞书 UUID 一小时去重窗口
@@ -947,10 +947,10 @@ class HumanHandoffRequest(SQLModel, table=True):
     assignee_user_id: Optional[str] = Field(default=None, index=True)
     trigger_skill_id: Optional[str] = Field(default=None, index=True)
     trigger_step_id: Optional[str] = Field(default=None, index=True)
-    context_summary: Optional[str] = None
-    pending_question: Optional[str] = None
+    context_summary: Optional[str] = Field(default=None, sa_column=Column(Text))
+    pending_question: Optional[str] = Field(default=None, sa_column=Column(Text))
     status: str = Field(default="pending", index=True)
-    human_reply: Optional[str] = None
+    human_reply: Optional[str] = Field(default=None, sa_column=Column(Text))
     resume_payload_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     metadata_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     created_at: datetime = Field(default_factory=utc_now)
@@ -966,8 +966,8 @@ class ScheduledTask(SQLModel, table=True):
     agent_id: str = Field(index=True)
     created_by_user_id: str = Field(index=True)
     title: str
-    prompt: str
-    description: Optional[str] = None
+    prompt: str = Field(sa_column=Column(Text, nullable=False))
+    description: Optional[str] = Field(default=None, sa_column=Column(Text))
     schedule_type: str = Field(default="daily", index=True)
     schedule_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     timezone: str = Field(default="Asia/Shanghai", index=True)
@@ -1005,8 +1005,8 @@ class ScheduledTaskRun(SQLModel, table=True):
     status: str = Field(default="queued", index=True)
     started_at: Optional[datetime] = Field(default=None, index=True)
     finished_at: Optional[datetime] = Field(default=None, index=True)
-    result_summary: Optional[str] = None
-    error: Optional[str] = None
+    result_summary: Optional[str] = Field(default=None, sa_column=Column(Text))
+    error: Optional[str] = Field(default=None, sa_column=Column(Text))
     trace_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
@@ -1177,7 +1177,7 @@ class Message(SQLModel, table=True):
     tenant_id: str = Field(index=True)
     session_id: str = Field(index=True)
     role: str
-    content: str
+    content: str = Field(sa_column=Column(Text, nullable=False))
     metadata_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     created_at: datetime = Field(default_factory=utc_now)
 
@@ -1194,8 +1194,8 @@ class MessageFeedback(SQLModel, table=True):
     rating: str = Field(index=True)
     analysis_status: str = Field(default="pending", index=True)
     analysis_bucket: Optional[str] = Field(default=None, index=True)
-    analysis_reason: Optional[str] = None
-    analysis_summary: Optional[str] = None
+    analysis_reason: Optional[str] = Field(default=None, sa_column=Column(Text))
+    analysis_summary: Optional[str] = Field(default=None, sa_column=Column(Text))
     analysis_confidence: Optional[float] = None
     analysis_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     analyzed_at: Optional[datetime] = None
@@ -1240,7 +1240,7 @@ class MemoryRecord(SQLModel, table=True):
     username: Optional[str] = Field(default=None, index=True)
     session_id: Optional[str] = Field(default=None, index=True)
     kind: str = Field(default="conversation", index=True)
-    content: str
+    content: str = Field(sa_column=Column(Text, nullable=False))
     importance: float = 0.5
     metadata_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     created_at: datetime = Field(default_factory=utc_now)

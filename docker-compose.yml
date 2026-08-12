@@ -1,0 +1,27 @@
+services:
+  staffdeck:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: staffdeck:local
+    restart: unless-stopped
+    ports:
+      - "${STAFFDECK_PORT:-5173}:5173"
+    env_file:
+      - path: backend/.env
+        required: false
+    environment:
+      ULTRARAG_DATA_DIR: /data
+      DATABASE_URL: ${DATABASE_URL:-sqlite:////data/skill_agent_loop.db}
+      TOOL_BASE_URL: http://localhost:5173
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173}
+    # SRT creates an unprivileged user namespace for each skill execution.
+    # Docker Desktop generally permits this; on hardened Linux hosts, the
+    # equivalent user-namespace/seccomp policy must be enabled by the operator.
+    security_opt:
+      - seccomp:unconfined
+    volumes:
+      - staffdeck-data:/data
+
+volumes:
+  staffdeck-data:

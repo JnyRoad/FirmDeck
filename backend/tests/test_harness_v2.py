@@ -605,6 +605,64 @@ def test_task_requirement_only_marks_explicitly_required_node_capabilities() -> 
     assert any("ocr_parse" in item for item in requirement.completion_criteria)
 
 
+def test_conversation_requirement_ignores_stale_active_sop_capabilities() -> None:
+    skill = Skill(
+        id="skill-http-chain",
+        tenant_id="tenant-demo",
+        skill_id="http-chain",
+        name="HTTP 串行流程",
+        status="published",
+        content_json={
+            "goal": ["完成 OCR 流程"],
+            "start_node_id": "ocr",
+            "nodes": [
+                {
+                    "node_id": "ocr",
+                    "type": "tool_call",
+                    "name": "调用 OCR",
+                    "instruction": "必须调用 OCR。",
+                    "capability_refs": {
+                        "tool_ids": ["tool-ocr"],
+                        "required_tool_ids": ["tool-ocr"],
+                    },
+                }
+            ],
+        },
+    )
+    frame = PlannedTaskFrame(
+        task_id="task-greeting",
+        kind="conversation",
+        decision="answer_only",
+        target_skill_id="http-chain",
+        target_step_id="ocr",
+        user_intent="用户问候",
+        requirements=["礼貌回应用户"],
+    )
+    manifest = CapabilityManifest(
+        available=[
+            CapabilityDescriptor(
+                capability_id="tool-ocr",
+                name="ocr_parse",
+                kind="tool",
+            )
+        ]
+    )
+
+    requirement = TaskRequestCompiler().compile(
+        frame,
+        _chat_session(active_skill_id="http-chain", active_step_id="ocr"),
+        skill,
+        manifest,
+    )
+
+    assert requirement.required_capability_names == []
+    assert requirement.required_knowledge_base_ids == []
+    assert requirement.sop_context == {}
+    assert requirement.allowed_transitions == []
+    assert requirement.requirements == ["礼貌回应用户"]
+    assert all("ocr" not in item.lower() for item in requirement.completion_criteria)
+
+
 def test_required_capability_refs_must_also_be_selected() -> None:
     with pytest.raises(ValueError, match="required_tool_ids"):
         SkillCapabilityRefs(required_tool_ids=["tool-ocr"])

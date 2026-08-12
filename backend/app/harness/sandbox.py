@@ -77,6 +77,17 @@ def _environment_diagnostics(backend: str) -> SandboxDiagnostics:
                 "请启用 kernel.unprivileged_userns_clone=1，"
                 "并将 user.max_user_namespaces 设置为大于 0。",
             )
+        if backend == "srt":
+            resolved = resolve_srt()
+            if resolved is None or not _linux_srt_ready(*resolved):
+                return SandboxDiagnostics(
+                    "unavailable",
+                    "SANDBOX_RUNTIME_PROBE_FAILED",
+                    "SRT 运行时文件存在，但当前 Linux/Docker 环境无法启动沙盒。",
+                    "请确认 Docker runtime 允许嵌套 user/network namespace；原生 Linux Docker 通常支持，"
+                    "受限的 Docker Desktop 或 Colima 可能需要调整安全策略。",
+                    backend=backend,
+                )
     if sys.platform == "win32" and backend == "srt":
         resolved = resolve_srt()
         if resolved is None or not _windows_srt_ready(*resolved):
@@ -125,6 +136,42 @@ def _windows_srt_ready(node: Path, cli: Path) -> bool:
                 ],
                 # The sandbox account cannot enter the real user's private temp
                 # directory. The installed bundle is readable by local Users.
+                cwd=node.parent,
+                capture_output=True,
+                timeout=20,
+                check=False,
+            )
+            return completed.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+@lru_cache(maxsize=4)
+def _linux_srt_ready(node: Path, cli: Path) -> bool:
+    """Verify that SRT can create its nested sandbox in this runtime."""
+    try:
+        with tempfile.TemporaryDirectory(prefix="staffdeck-srt-probe-") as raw_dir:
+            settings = Path(raw_dir) / "settings.json"
+            settings.write_text(
+                json.dumps(
+                    {
+                        "filesystem": {
+                            "denyRead": [],
+                            "allowRead": [raw_dir],
+                            "allowWrite": ["."],
+                            "denyWrite": [],
+                        },
+                        "network": {
+                            "allowedDomains": [],
+                            "deniedDomains": ["*"],
+                            "strictAllowlist": True,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            completed = subprocess.run(
+                [str(node), str(cli), "--settings", str(settings), "-c", "exit 0"],
                 cwd=node.parent,
                 capture_output=True,
                 timeout=20,

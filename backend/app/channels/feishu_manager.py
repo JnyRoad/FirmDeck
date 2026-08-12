@@ -3,8 +3,8 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 from sqlalchemy import update
 from sqlmodel import Session, select
@@ -28,9 +28,13 @@ class FeishuProcessManager:
     ):
         self._engine = db_engine or engine
         database = self._engine.url.database
-        if self._engine.url.get_backend_name() != "sqlite" or not database or database == ":memory:":
-            raise RuntimeError("飞书长连接首版仅支持文件 SQLite")
-        self._database_path = Path(database).expanduser().resolve()
+        self._database_path = (
+            Path(database).expanduser().resolve()
+            if self._engine.url.get_backend_name() == "sqlite"
+            and database
+            and database != ":memory:"
+            else None
+        )
         self._supervisor_factory = supervisor_factory
         self._supervisor: FeishuProcessSupervisor | None = None
         self._reconcile_seconds = reconcile_seconds
@@ -42,13 +46,35 @@ class FeishuProcessManager:
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
 
+    @property
+    def supported(self) -> bool:
+        return self._database_path is not None
+
+    def _disable_unsupported_bindings(self) -> None:
+        with Session(self._engine) as db:
+            db.exec(
+                update(ChannelBinding)
+                .where(
+                    ChannelBinding.channel == "feishu",
+                    ChannelBinding.connected.is_(True),
+                )
+                .values(connected=False, updated_at=utc_now())
+            )
+            db.commit()
+
     def _get_supervisor(self) -> FeishuProcessSupervisor:
         with self._lock:
             if self._supervisor is None:
+                if self._database_path is None:
+                    raise RuntimeError("飞书长连接首版仅支持文件 SQLite")
                 self._supervisor = self._supervisor_factory(database_path=self._database_path)
             return self._supervisor
 
     def start(self) -> None:
+        if not self.supported:
+            self._disable_unsupported_bindings()
+            logger.warning("飞书长连接已停用：当前数据库不是文件 SQLite")
+            return
         with self._lock:
             if self._thread and self._thread.is_alive():
                 return
@@ -71,6 +97,9 @@ class FeishuProcessManager:
             self._wake.clear()
 
     def reconcile_once(self) -> None:
+        if not self.supported:
+            self._disable_unsupported_bindings()
+            return
         with Session(self._engine) as db:
             rows = db.exec(
                 select(ChannelBinding).where(ChannelBinding.channel == "feishu")
@@ -86,18 +115,24 @@ class FeishuProcessManager:
             should_run = status == "active" and binding_id not in paused
             if should_run:
                 try:
-                    if binding_id in known and known[binding_id] != revision:
-                        if not supervisor.stop_binding(binding_id, timeout=2.0):
-                            continue
+                    if (
+                        binding_id in known
+                        and known[binding_id] != revision
+                        and not supervisor.stop_binding(binding_id, timeout=2.0)
+                    ):
+                        continue
                     supervisor.start_binding(binding_id, revision)
                     with self._lock:
                         self._known[binding_id] = revision
                 except Exception:
                     logger.warning("飞书 binding 启动失败 binding=%s", binding_id, exc_info=True)
-            elif supervisor and binding_id in known:
-                if supervisor.stop_binding(binding_id, timeout=2.0):
-                    with self._lock:
-                        self._known.pop(binding_id, None)
+            elif (
+                supervisor
+                and binding_id in known
+                and supervisor.stop_binding(binding_id, timeout=2.0)
+            ):
+                with self._lock:
+                    self._known.pop(binding_id, None)
             actual_connected = bool(
                 supervisor
                 and supervisor.connected(binding_id)
@@ -122,6 +157,9 @@ class FeishuProcessManager:
                     self._known.pop(binding_id, None)
 
     def ensure_binding(self, binding_id: str) -> None:
+        if not self.supported:
+            self._disable_unsupported_bindings()
+            return
         with Session(self._engine) as db:
             binding = db.get(ChannelBinding, binding_id)
             if not binding or binding.channel != "feishu" or binding.status != "active":

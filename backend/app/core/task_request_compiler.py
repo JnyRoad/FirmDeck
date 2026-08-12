@@ -7,7 +7,6 @@ from pydantic import BaseModel, Field
 from app.db.models import ChatSession, Skill
 from app.session.session_schema import PlannedTaskFrame
 
-
 CapabilityKind = Literal[
     "general_skill",
     "knowledge",
@@ -107,7 +106,14 @@ class TaskRequestCompiler:
         attachments: list[dict[str, Any]] | None = None,
         source_user_message: str | None = None,
     ) -> TaskRequirement:
-        current_node = _current_node(skill, frame.target_step_id or session.active_step_id)
+        # Conversation frames must remain independent from any stale or suspended SOP state.
+        # Otherwise a normal reply can inherit the SOP node's mandatory capabilities and keep
+        # rejecting the model's finish action until the action budget is exhausted.
+        effective_skill = skill if frame.kind == "sop" else None
+        current_node = _current_node(
+            effective_skill,
+            frame.target_step_id or session.active_step_id,
+        )
         expected_fields = _text_list((current_node or {}).get("expected_user_info"))
         known_slots = (
             {
@@ -128,7 +134,7 @@ class TaskRequestCompiler:
                 *frame.requirements,
             ]
         )
-        goal = _goal(frame, skill, current_node, requirements)
+        goal = _goal(frame, effective_skill, current_node, requirements)
         completion_criteria = _unique(
             [
                 (
@@ -136,7 +142,11 @@ class TaskRequestCompiler:
                     if expected_fields
                     else ""
                 ),
-                *(_text_list((skill.content_json or {}).get("goal")) if skill is not None else []),
+                *(
+                    _text_list((effective_skill.content_json or {}).get("goal"))
+                    if effective_skill is not None
+                    else []
+                ),
                 "完整处理 TaskRequirement 中的全部子需求。",
             ]
         )
@@ -165,13 +175,13 @@ class TaskRequestCompiler:
             goal=goal,
             source_user_message=str(source_user_message or "").strip()[:4_000],
             requirements=requirements or [goal],
-            sop_context=_sop_context(skill, current_node),
+            sop_context=_sop_context(effective_skill, current_node),
             required_slots=required_slots,
             known_slots=known_slots,
             completion_criteria=completion_criteria,
             required_capability_names=required_capability_names,
             required_knowledge_base_ids=required_knowledge_base_ids,
-            allowed_transitions=_transitions(skill, current_node),
+            allowed_transitions=_transitions(effective_skill, current_node),
             memory_projection=_memory_projection(memory_context),
             prior_task_results=list(prior_task_results or []),
             attachments=list(attachments or []),

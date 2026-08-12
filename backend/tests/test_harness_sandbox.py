@@ -161,6 +161,42 @@ def test_diagnostics_rejects_disabled_user_namespaces(monkeypatch, tmp_path: Pat
     assert report.code == "SANDBOX_USERNS_DISABLED"
 
 
+def test_linux_diagnostics_reports_runtime_probe_failure(monkeypatch, tmp_path: Path) -> None:
+    _make_bundle(tmp_path)
+    monkeypatch.setenv("STAFFDECK_SRT_RUNTIME", str(tmp_path))
+    monkeypatch.setattr(sandbox.sys, "platform", "linux")
+    monkeypatch.setattr(sandbox.os, "geteuid", lambda: 1001, raising=False)
+    monkeypatch.setattr(sandbox, "available_backend", lambda: "srt")
+    monkeypatch.setattr(sandbox, "_read_int", lambda _path: 100)
+    monkeypatch.setattr(sandbox, "_linux_srt_ready", lambda *_args: False)
+
+    report = sandbox.diagnostics()
+
+    assert report.status == "unavailable"
+    assert report.code == "SANDBOX_RUNTIME_PROBE_FAILED"
+    assert report.backend == "srt"
+    assert "Docker runtime" in (report.remediation or "")
+
+
+def test_linux_srt_probe_runs_bundled_cli(monkeypatch, tmp_path: Path) -> None:
+    _make_bundle(tmp_path)
+    node = (tmp_path / "bin" / sandbox._node_name()).resolve()
+    cli = (tmp_path / "node_modules/@anthropic-ai/sandbox-runtime/dist/cli.js").resolve()
+    observed: dict[str, object] = {}
+
+    def fake_run(argv, **kwargs):
+        observed["argv"] = argv
+        observed["cwd"] = kwargs["cwd"]
+        return sandbox.subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(sandbox.subprocess, "run", fake_run)
+    sandbox._linux_srt_ready.cache_clear()
+
+    assert sandbox._linux_srt_ready(node, cli) is True
+    assert observed["cwd"] == node.parent
+    assert observed["argv"][-2:] == ["-c", "exit 0"]
+
+
 def test_windows_diagnostics_requires_successful_srt_initialization(
     monkeypatch, tmp_path: Path
 ) -> None:

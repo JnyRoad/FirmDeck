@@ -99,6 +99,42 @@ def test_manager_reconciles_pause_resume_revision_and_shutdown(tmp_path) -> None
     assert supervisor.closed is True
 
 
+def test_manager_disables_connected_state_when_database_is_unsupported(tmp_path) -> None:
+    db_path = tmp_path / "manager-unsupported.db"
+    engine = create_engine(f"sqlite:///{db_path}")
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as db:
+        db.add(Tenant(id="tenant_a", name="A"))
+        db.add(
+            ChannelBinding(
+                id="chan_feishu",
+                tenant_id="tenant_a",
+                agent_id="agent_a",
+                channel="feishu",
+                status="active",
+                connected=True,
+                config_revision=1,
+            )
+        )
+        db.commit()
+
+    created = []
+    manager = FeishuProcessManager(
+        db_engine=engine,
+        supervisor_factory=lambda **kwargs: created.append(FakeSupervisor(**kwargs)),
+    )
+    manager._database_path = None
+
+    manager.start()
+    manager.reconcile_once()
+    manager.ensure_binding("chan_feishu")
+
+    with Session(engine) as db:
+        assert db.get(ChannelBinding, "chan_feishu").connected is False
+    assert created == []
+    assert manager.stop(timeout_seconds=1.0) is True
+
+
 def test_manager_keeps_tracking_binding_when_stop_times_out(tmp_path) -> None:
     db_path = tmp_path / "manager-stop-timeout.db"
     engine = create_engine(f"sqlite:///{db_path}")
@@ -259,9 +295,9 @@ def test_connected_writeback_is_revision_fenced_in_single_update(tmp_path) -> No
 
 
 def test_channel_service_lifecycle_starts_and_stops_feishu_manager(monkeypatch) -> None:
-    import app.channels as channels
     import app.channels.service_intake as intake
     import app.channels.service_outbox as outbox
+    from app import channels
 
     class Manager:
         def __init__(self):
@@ -297,7 +333,7 @@ def test_channel_service_lifecycle_starts_and_stops_feishu_manager(monkeypatch) 
 
 
 def test_feishu_adapter_is_registered() -> None:
-    import app.channels as channels
+    from app import channels
     from app.channels.adapters.base import get_channel_adapter
 
     channels._ensure_adapters_registered()

@@ -61,6 +61,39 @@ infer a public URL first; if it cannot, or when running headless, pass
 and set the same public URL as `OIDC_REDIRECT_URI` when SSO is enabled. The
 setup is saved per user and applied on the next launch.
 
+### Docker Deployment
+
+The repository includes a multi-stage image that builds the frontend, installs
+the FastAPI service, and generates a platform-matched Node/SRT sandbox bundle:
+
+```bash
+cp backend/.env.example backend/.env   # set APP_SECRET and model credentials
+docker compose up -d --build
+curl http://127.0.0.1:5173/api/health
+```
+
+The service is available at `http://127.0.0.1:5173`. SQLite data, uploaded
+attachments, and logs are stored in the named `staffdeck-data` volume. SRT
+requires Linux user and network namespaces; on hardened Linux hosts, enable
+unprivileged user namespaces and keep the Compose `seccomp:unconfined`
+setting. The container runtime must also allow nested network namespaces for
+SRT (native Linux Docker generally does; some restricted Docker Desktop or
+Colima profiles may require an adjusted security policy).
+
+To run with OceanBase MySQL mode, provide credentials at runtime rather than
+storing them in Compose files:
+
+```bash
+export OB_TENANT_PASSWORD='<strong-password>'
+export OCEANBASE_DATABASE_URL='mysql+pymysql://root%40test:<url-encoded-password>@oceanbase:2881/staffdeck?charset=utf8mb4'
+docker compose -f docker-compose.yml -f docker-compose.oceanbase.yml up -d --build
+```
+
+Use `scripts/migrate_sqlite_to_oceanbase.py` to copy an existing StaffDeck
+SQLite database after the OceanBase schema has been initialized. Local `.env`
+files and database files are excluded from both Git and the Docker build
+context.
+
 ## Agent-Friendly Quick Deploy
 
 Paste the prompt below into Cursor, Claude Code, or Codex. For code-based

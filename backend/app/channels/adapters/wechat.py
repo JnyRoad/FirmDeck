@@ -89,9 +89,15 @@ def _patch_runtime_config(
     for index, (key, value) in enumerate((expected_values or {}).items()):
         params[f"expected_path_{index}"] = f"$.{key}"
         params[f"expected_value_{index}"] = value
-        predicates.append(
-            f"json_extract(config_json, :expected_path_{index}) = :expected_value_{index}"
-        )
+        if db_engine.url.get_backend_name() in {"mysql", "mariadb"}:
+            predicates.append(
+                "JSON_UNQUOTE(JSON_EXTRACT(config_json, "
+                f":expected_path_{index})) = :expected_value_{index}"
+            )
+        else:
+            predicates.append(
+                f"json_extract(config_json, :expected_path_{index}) = :expected_value_{index}"
+            )
 
     with Session(db_engine) as db:
         result = db.exec(

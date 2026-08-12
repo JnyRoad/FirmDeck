@@ -1,0 +1,49 @@
+services:
+  oceanbase:
+    image: ${OCEANBASE_IMAGE:-oceanbase/oceanbase-ce:4.2.5-lts}
+    container_name: staffdeck-oceanbase
+    restart: unless-stopped
+    environment:
+      MODE: mini
+      OB_TENANT_PASSWORD: ${OB_TENANT_PASSWORD:?Set OB_TENANT_PASSWORD}
+    ports:
+      - "${OCEANBASE_SQL_PORT:-2881}:2881"
+      - "${OCEANBASE_CONSOLE_PORT:-2886}:2886"
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+      stack: -1
+    volumes:
+      - staffdeck-oceanbase:/root/ob
+    healthcheck:
+      test: ["CMD-SHELL", "obclient -h127.0.0.1 -P2881 -uroot@test -p$${OB_TENANT_PASSWORD} -e 'SELECT 1' >/dev/null 2>&1"]
+      interval: 15s
+      timeout: 10s
+      retries: 30
+      start_period: 60s
+
+  staffdeck:
+    depends_on:
+      oceanbase:
+        condition: service_healthy
+      oceanbase-init:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: ${OCEANBASE_DATABASE_URL:?Set OCEANBASE_DATABASE_URL}
+
+  oceanbase-init:
+    image: ${OCEANBASE_IMAGE:-oceanbase/oceanbase-ce:4.2.5-lts}
+    depends_on:
+      oceanbase:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        obclient -h oceanbase -P 2881 -u root@test -p"$${OB_TENANT_PASSWORD}"
+        -e "CREATE DATABASE IF NOT EXISTS staffdeck DEFAULT CHARACTER SET utf8mb4"
+    environment:
+      OB_TENANT_PASSWORD: ${OB_TENANT_PASSWORD:?Set OB_TENANT_PASSWORD}
+
+volumes:
+  staffdeck-oceanbase:

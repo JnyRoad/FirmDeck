@@ -8,6 +8,9 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import IO
 
+from sqlalchemy import text
+from sqlalchemy.engine import Connection
+
 from app.config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -20,25 +23,50 @@ _dingtalk_stream_manager = None
 _binding_lifecycle_locks: dict[str, threading.RLock] = {}
 _binding_lifecycle_locks_guard = threading.Lock()
 _connector_lock_file: IO[bytes] | None = None
+_connector_lock_connection: Connection | None = None
 _connector_lock_pid: int | None = None
 _intake_sweep_thread: threading.Thread | None = None
 
 
 def _acquire_connector_process_lock() -> bool:
-    global _connector_lock_file, _connector_lock_pid
+    global _connector_lock_connection, _connector_lock_file, _connector_lock_pid
     current_pid = os.getpid()
-    if _connector_lock_file is not None and _connector_lock_pid == current_pid:
+    if (
+        (_connector_lock_file is not None or _connector_lock_connection is not None)
+        and _connector_lock_pid == current_pid
+    ):
         return True
     if _connector_lock_file is not None:
         # preload 后 fork 的子进程不能把继承句柄当作自己已持有锁。
         _connector_lock_file.close()
         _connector_lock_file = None
         _connector_lock_pid = None
+    if _connector_lock_connection is not None:
+        _connector_lock_connection.close()
+        _connector_lock_connection = None
+        _connector_lock_pid = None
     from app.db import engine
 
     database_path = engine.url.database
-    if engine.url.get_backend_name() != "sqlite" or not database_path or database_path == ":memory:":
-        logger.error("渠道服务要求文件 SQLite 进程锁；当前数据库不支持可靠的单实例 Outbox")
+    if engine.url.get_backend_name() != "sqlite":
+        connection = engine.connect()
+        try:
+            acquired = connection.execute(
+                text("SELECT GET_LOCK(:name, 0)"),
+                {"name": "staffdeck:connector"},
+            ).scalar_one()
+        except Exception:
+            connection.close()
+            logger.exception("数据库不支持渠道服务命名锁")
+            return False
+        if acquired != 1:
+            connection.close()
+            return False
+        _connector_lock_connection = connection
+        _connector_lock_pid = current_pid
+        return True
+    if not database_path or database_path == ":memory:":
+        logger.error("内存 SQLite 不支持可靠的单实例 Outbox")
         return False
     lock_path = Path(database_path).resolve().with_name(f"{Path(database_path).name}.connector.lock")
     handle = lock_path.open("a+b")
@@ -65,7 +93,20 @@ def _acquire_connector_process_lock() -> bool:
 
 
 def _release_connector_process_lock() -> None:
-    global _connector_lock_file, _connector_lock_pid
+    global _connector_lock_connection, _connector_lock_file, _connector_lock_pid
+    connection = _connector_lock_connection
+    if connection is not None:
+        try:
+            if _connector_lock_pid == os.getpid():
+                connection.execute(
+                    text("SELECT RELEASE_LOCK(:name)"),
+                    {"name": "staffdeck:connector"},
+                )
+        finally:
+            connection.close()
+            _connector_lock_connection = None
+            _connector_lock_pid = None
+        return
     handle = _connector_lock_file
     if handle is None:
         return
