@@ -175,6 +175,7 @@ def test_manager_can_invite_internal_user_to_bind_identity() -> None:
     with Session(engine) as db:
         binding = db.get(ChannelBinding, binding_id)
         binding.identity_scope_key = "cli_feishu:tenant_a"
+        binding.credentials_enc = "encrypted-secret"
         db.add(binding)
         db.commit()
 
@@ -199,6 +200,31 @@ def test_manager_can_invite_internal_user_to_bind_identity() -> None:
         headers=_auth(users["outsider"]),
     )
     assert forbidden.status_code == 403
+
+
+def test_manager_can_invite_when_connected_feishu_scope_is_not_backfilled() -> None:
+    engine = _engine()
+    users = _seed(engine)
+    client = _client(engine)
+    binding_id = _seed_binding(engine)
+    with Session(engine) as db:
+        binding = db.get(ChannelBinding, binding_id)
+        binding.channel = "feishu"
+        binding.status = "active"
+        binding.credentials_enc = "encrypted-secret"
+        binding.config_json = {"app_id": "cli_test"}
+        binding.provider_tenant_key = "tenant_a"
+        binding.identity_scope_key = None
+        db.add(binding)
+        db.commit()
+
+    response = client.post(
+        f"/api/enterprise/channels/{binding_id}/identity-bind-code",
+        params={"tenant_id": "tenant_demo"},
+        json={"user_id": "user_other"},
+        headers=_auth(users["owner"]),
+    )
+    assert response.status_code == 200, response.text
 
 
 def test_collaborator_cannot_delete(monkeypatch) -> None:
