@@ -272,7 +272,12 @@ export default function ChannelsPage({
 
   const binding = bindings.find((item) => item.id === selectedId) || null;
   const navigate = useNavigate();
-  const channelIdentities = identityBindings.filter((item) => item.channel === binding?.channel);
+  // 身份绑定属于具体渠道账号 scope；同一用户可以分别绑定多个飞书应用。
+  const channelIdentities = identityBindings.filter(
+    (item) =>
+      item.channel === binding?.channel &&
+      (item.external_account_scope || '') === (binding?.identity_scope_key || ''),
+  );
   const bindCodeChannelName = binding
     ? channelName(binding.channel)
     : getChannelPresentation(createChannel).name;
@@ -984,6 +989,7 @@ export default function ChannelsPage({
                   const matchingIdentity = user.channel_identities?.find(
                     (ci) => ci.channel === binding.channel && (ci.external_account_scope || '') === scope,
                   );
+                  if (binding.channel === 'feishu' && !matchingIdentity) return null;
                   const channelLabel = matchingIdentity
                     ? ` (${_CHANNEL_LABELS[matchingIdentity.channel] || matchingIdentity.channel} 可达)`
                     : user.channel_identities?.[0]

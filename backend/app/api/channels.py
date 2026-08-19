@@ -575,6 +575,21 @@ def update_channel_binding_agents(
                 status_code=400,
                 detail="默认人工处理人必须是当前租户的内部成员",
             )
+        if binding.channel == "feishu":
+            reachable = db.exec(
+                select(ChannelIdentity).where(
+                    ChannelIdentity.tenant_id == tenant_id,
+                    ChannelIdentity.channel == "feishu",
+                    ChannelIdentity.external_account_scope == binding.identity_scope_key,
+                    ChannelIdentity.staffdeck_user_id == handoff_assignee,
+                    ~ChannelIdentity.external_user_id.startswith("group:"),
+                )
+            ).first()
+            if not reachable:
+                raise HTTPException(
+                    status_code=400,
+                    detail="默认人工处理人必须已绑定当前飞书账号",
+                )
     default_agent_id: str | None = None
     if request.agents is not None:
         if not request.agents:
