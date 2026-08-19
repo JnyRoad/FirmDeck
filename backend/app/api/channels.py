@@ -602,11 +602,20 @@ def update_channel_binding_agents(
                 detail="默认人工处理人必须是当前租户的内部成员",
             )
         if binding.channel == "feishu":
+            identity_scope = binding.identity_scope_key
+            if not identity_scope:
+                config = dict(binding.config_json or {})
+                app_id = str(config.get("app_id") or "").strip()
+                tenant_key = str(binding.provider_tenant_key or "").strip()
+                if app_id and tenant_key:
+                    from app.channels.service_feishu_inbox import feishu_identity_scope
+
+                    identity_scope = feishu_identity_scope(app_id, tenant_key)
             reachable = db.exec(
                 select(ChannelIdentity).where(
                     ChannelIdentity.tenant_id == tenant_id,
                     ChannelIdentity.channel == "feishu",
-                    ChannelIdentity.external_account_scope == binding.identity_scope_key,
+                    ChannelIdentity.external_account_scope == (identity_scope or ""),
                     ChannelIdentity.staffdeck_user_id == handoff_assignee,
                     ~ChannelIdentity.external_user_id.startswith("group:"),
                 )
