@@ -55,7 +55,13 @@ import WechatSetup from './channels/WechatSetup';
 import WecomSetup from './channels/WecomSetup';
 import FeishuSetup from './channels/FeishuSetup';
 import DingTalkSetup from './channels/DingTalkSetup';
-import { getChannelPresentation } from './channelPresentation';
+import BindingManagers from './channels/BindingManagers';
+import {
+  canDeleteBinding,
+  canManageBinding,
+  getChannelPresentation,
+  ROLE_LABEL,
+} from './channelPresentation';
 import { StatusBadge } from './scheduled-tasks/StatusBadge';
 import { formatTime, type BadgeTone } from './scheduled-tasks/shared';
 
@@ -245,6 +251,7 @@ export default function ChannelsPage({
   const [creating, setCreating] = useState(false);
   const [unbindOpen, setUnbindOpen] = useState(false);
   const [unbinding, setUnbinding] = useState(false);
+  const [togglingStatus, setTogglingStatus] = useState(false);
   const [agentEditing, setAgentEditing] = useState(false);
   const [agentCandidates, setAgentCandidates] = useState<AgentProfileRead[]>([]);
   const [candidatesLoading, setCandidatesLoading] = useState(false);
@@ -573,6 +580,22 @@ export default function ChannelsPage({
     }
   }
 
+  async function toggleStatus() {
+    if (!binding) return;
+    setTogglingStatus(true);
+    try {
+      const updated = await api.post<ChannelBindingRead>(
+        `/api/enterprise/channels/${binding.id}/toggle-status?tenant_id=${TENANT_ID}`,
+      );
+      setBindings((current) => current.map((item) => (item.id === updated.id ? updated : item)));
+      notify.success(updated.status === 'active' ? '已启用渠道' : '已停用渠道');
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '切换状态失败');
+    } finally {
+      setTogglingStatus(false);
+    }
+  }
+
   function openAgentEdit() {
     const mounted = binding?.agents || [];
     setSelectedAgentIds(new Set(mounted.map((item) => item.agent_id)));
@@ -857,15 +880,32 @@ export default function ChannelsPage({
             <span className="truncate text-[12px] text-[#858b9c]">
               创建者：{binding.created_by_name || '-'}
             </span>
+            {binding.my_role && (
+              <span className="rounded-[6px] bg-[#f0f1f5] px-[6px] py-[2px] text-[11px] text-[#858b9c]">
+                {ROLE_LABEL[binding.my_role] || binding.my_role}
+              </span>
+            )}
           </div>
           <div className="flex items-center gap-[8px]">
-            <UIButton
-              variant="outline"
-              onClick={() => setUnbindOpen(true)}
-              className={OUTLINE_BUTTON_CLASS}
-            >
-              断开接入
-            </UIButton>
+            {canManageBinding(binding) && (
+              <UIButton
+                variant="outline"
+                onClick={() => void toggleStatus()}
+                disabled={togglingStatus}
+                className={OUTLINE_BUTTON_CLASS}
+              >
+                {binding.status === 'active' ? '停用' : '启用'}
+              </UIButton>
+            )}
+            {canDeleteBinding(binding) && (
+              <UIButton
+                variant="outline"
+                onClick={() => setUnbindOpen(true)}
+                className={OUTLINE_BUTTON_CLASS}
+              >
+                断开接入
+              </UIButton>
+            )}
           </div>
         </div>
         {binding.status === 'expired' && setupKindFor(binding.channel) !== 'qrcode' && (
@@ -960,6 +1000,13 @@ export default function ChannelsPage({
             </Select>
           </div>
         </div>
+        {canDeleteBinding(binding) && (
+          <BindingManagers
+            bindingId={binding.id}
+            users={tenantUsers}
+            creatorUserId={binding.created_by_user_id}
+          />
+        )}
       </div>
 
       <section aria-label={activeChannel ? `${activeChannel.name}身份绑定` : '身份绑定'}>
