@@ -40,6 +40,7 @@ from app.channels.schema import (
     ChannelBindingManagerCreate,
     ChannelBindingManagerRead,
     ChannelBindingRead,
+    ChannelIdentityBindCodeCreate,
     ChannelConversationAttachmentRead,
     ChannelConversationMessageRead,
     ChannelConversationPage,
@@ -419,17 +420,7 @@ def _generate_bind_code() -> str:
     return f"{secrets.randbelow(900000) + 100000}"
 
 
-@router.post("/bind-code", response_model=ChannelBindCodeRead)
-def create_bind_code(
-    tenant_id: str = Query(...),
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_session),
-) -> ChannelBindCodeRead:
-    """为当前用户生成渠道身份绑定码(6 位数字,10 分钟有效,旧码作废)。"""
-    ensure_current_user_tenant(tenant_id, current_user)
-    if not _check_bind_code_rate(current_user.id):
-        raise HTTPException(status_code=429, detail="绑定码生成过于频繁，请稍后再试")
-    user_id = current_user.id
+def _issue_bind_code(db: Session, tenant_id: str, user_id: str) -> ChannelBindCodeRead:
     for _attempt in range(10):
         now = utc_now()
         record = db.exec(
@@ -458,6 +449,41 @@ def create_bind_code(
             continue
         return ChannelBindCodeRead(code=record.code, expires_at=record.expires_at.isoformat())
     raise HTTPException(status_code=409, detail="绑定码生成冲突，请重试")
+
+
+@router.post("/bind-code", response_model=ChannelBindCodeRead)
+def create_bind_code(
+    tenant_id: str = Query(...),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_session),
+) -> ChannelBindCodeRead:
+    """为当前用户生成渠道身份绑定码(6 位数字,10 分钟有效,旧码作废)。"""
+    ensure_current_user_tenant(tenant_id, current_user)
+    if not _check_bind_code_rate(current_user.id):
+        raise HTTPException(status_code=429, detail="绑定码生成过于频繁，请稍后再试")
+    return _issue_bind_code(db, tenant_id, current_user.id)
+
+
+@router.post("/{binding_id}/identity-bind-code", response_model=ChannelBindCodeRead)
+def create_identity_bind_code(
+    binding_id: str,
+    request: ChannelIdentityBindCodeCreate,
+    tenant_id: str = Query(...),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_session),
+) -> ChannelBindCodeRead:
+    """为内部成员生成身份绑定邀请；成员仍须用自己的渠道账号发送绑定指令。"""
+    ensure_current_user_tenant(tenant_id, current_user)
+    binding = _get_binding(db, tenant_id, binding_id)
+    _ensure_binding_manager(db, tenant_id, binding, current_user, action=_MANAGER_ACTION_AGENTS)
+    target = db.get(User, request.user_id)
+    if not target or target.tenant_id != tenant_id or target.source != "web":
+        raise HTTPException(status_code=400, detail="身份绑定对象必须是当前租户的内部成员")
+    if binding.channel == "feishu" and not binding.identity_scope_key:
+        raise HTTPException(status_code=409, detail="请先完成飞书应用接入，再邀请成员绑定身份")
+    if not _check_bind_code_rate(current_user.id):
+        raise HTTPException(status_code=429, detail="绑定码生成过于频繁，请稍后再试")
+    return _issue_bind_code(db, tenant_id, target.id)
 
 
 @router.get("/my-identity-bindings", response_model=list[MyIdentityBindingRead])

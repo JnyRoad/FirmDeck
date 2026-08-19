@@ -90,6 +90,10 @@ class ChannelBindCodeRead(BaseModel):
     expires_at: str
 
 
+class ChannelIdentityBindCodeCreate(BaseModel):
+    user_id: str
+
+
 class ChannelBindingManagerCreate(BaseModel):
     user_id: str
 

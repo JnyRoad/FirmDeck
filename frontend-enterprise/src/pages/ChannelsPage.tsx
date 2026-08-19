@@ -265,6 +265,9 @@ export default function ChannelsPage({
   const [bindCodeOpen, setBindCodeOpen] = useState(false);
   const [bindCodeLoading, setBindCodeLoading] = useState(false);
   const [bindCodeRemain, setBindCodeRemain] = useState(0);
+  const [bindCodeTargetName, setBindCodeTargetName] = useState('');
+  const [bindCodeTargetUserId, setBindCodeTargetUserId] = useState<string | undefined>();
+  const [identityInviteUserId, setIdentityInviteUserId] = useState('');
   const [identityBindings, setIdentityBindings] = useState<ChannelIdentityBindingRead[]>([]);
   const [unbindIdentityTarget, setUnbindIdentityTarget] =
     useState<ChannelIdentityBindingRead | null>(null);
@@ -277,6 +280,19 @@ export default function ChannelsPage({
     (item) =>
       item.channel === binding?.channel &&
       (item.external_account_scope || '') === (binding?.identity_scope_key || ''),
+  );
+  const bindingScope = binding?.identity_scope_key || '';
+  const identityBoundUsers = tenantUsers.filter((user) =>
+    user.channel_identities?.some(
+      (identity) =>
+        identity.channel === binding?.channel &&
+        (identity.external_account_scope || '') === bindingScope,
+    ),
+  );
+  const identityUnboundUsers = tenantUsers.filter(
+    (user) =>
+      (!user.source || user.source === 'web') &&
+      !identityBoundUsers.some((bound) => bound.id === user.id),
   );
   const bindCodeChannelName = binding
     ? channelName(binding.channel)
@@ -542,14 +558,24 @@ export default function ChannelsPage({
     }
   }
 
-  async function openBindCode() {
+  async function openBindCode(targetUserId?: string) {
     if (bindCodeLoading) return;
     setBindCodeLoading(true);
     try {
-      const result = await api.post<ChannelBindCodeRead>(
-        `/api/enterprise/channels/bind-code?tenant_id=${TENANT_ID}`,
-      );
+      const target = targetUserId
+        ? tenantUsers.find((user) => user.id === targetUserId)
+        : currentUser;
+      const result = targetUserId && binding
+        ? await api.post<ChannelBindCodeRead>(
+            `/api/enterprise/channels/${binding.id}/identity-bind-code?tenant_id=${TENANT_ID}`,
+            { user_id: targetUserId },
+          )
+        : await api.post<ChannelBindCodeRead>(
+            `/api/enterprise/channels/bind-code?tenant_id=${TENANT_ID}`,
+          );
       setBindCode(result);
+      setBindCodeTargetName(target?.display_name || target?.username || '当前用户');
+      setBindCodeTargetUserId(targetUserId);
       setBindCodeOpen(true);
     } catch (error) {
       notify.error(error instanceof Error ? error.message : '生成绑定码失败');
@@ -1054,6 +1080,52 @@ export default function ChannelsPage({
               >
                 {`绑定我的${channelName(binding.channel)}`}
               </UIButton>
+            </div>
+          )}
+          {canManageBinding(binding) && binding.channel === 'feishu' && (
+            <div className="mt-[4px] flex flex-col gap-[10px] border-t border-[#eef0f4] pt-[12px]">
+              <div className="flex flex-col gap-[3px]">
+                <span className="text-[12px] font-medium text-[#18181a]">邀请成员绑定飞书身份</span>
+                <span className="text-[11px] leading-[1.6] text-[#858b9c]">
+                  每位成员需用自己的飞书账号向当前机器人发送一次性绑定指令。
+                </span>
+              </div>
+              {identityBoundUsers.length > 0 && (
+                <div className="flex flex-wrap gap-[6px]">
+                  {identityBoundUsers.map((user) => (
+                    <StatusBadge key={user.id} tone="green">
+                      {`${user.display_name || user.username} 已绑定`}
+                    </StatusBadge>
+                  ))}
+                </div>
+              )}
+              {identityUnboundUsers.length > 0 ? (
+                <div className="flex flex-wrap items-center gap-[8px]">
+                  <Select value={identityInviteUserId || '__none__'} onValueChange={(value) => setIdentityInviteUserId(value === '__none__' ? '' : value)}>
+                    <SelectTrigger className="h-[32px] w-[180px] text-[12px]">
+                      <SelectValue placeholder="选择内部成员" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="__none__">选择内部成员</SelectItem>
+                      {identityUnboundUsers.map((user) => (
+                        <SelectItem key={user.id} value={user.id}>
+                          {user.display_name || user.username || user.id}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  <UIButton
+                    variant="outline"
+                    disabled={!identityInviteUserId || bindCodeLoading}
+                    onClick={() => void openBindCode(identityInviteUserId)}
+                    className={OUTLINE_BUTTON_CLASS}
+                  >
+                    生成绑定指令
+                  </UIButton>
+                </div>
+              ) : (
+                <span className="text-[11px] text-[#858b9c]">所有内部成员均已绑定当前飞书应用</span>
+              )}
             </div>
           )}
         </div>
@@ -1561,7 +1633,7 @@ export default function ChannelsPage({
           className="flex w-[calc(100%-2rem)] flex-col gap-[16px] overflow-hidden rounded-[14px] px-[20px] py-[16px] sm:max-w-[420px]"
         >
           <DialogTitle className="text-[14px] font-normal leading-none text-[#757f9c]">
-            {`绑定我的${bindCodeChannelName}`}
+            {`绑定${bindCodeTargetName ? ` ${bindCodeTargetName} 的` : ''}${bindCodeChannelName}身份`}
           </DialogTitle>
           {bindCode && (
             <div className="flex flex-col items-center gap-[12px]">
@@ -1584,11 +1656,11 @@ export default function ChannelsPage({
                 </UIButton>
               </div>
               <span className="text-center text-[12px] leading-[1.6] text-[#858b9c]">
-                {`请在${bindCodeChannelName}中向你的数字员工发送以上指令，完成身份绑定。`}
+                {`请让${bindCodeTargetName || '该成员'}使用自己的${bindCodeChannelName}账号向当前机器人发送以上指令。`}
               </span>
               {bindCodeRemain === 0 && (
                 <UIButton
-                  onClick={() => void openBindCode()}
+                  onClick={() => void openBindCode(bindCodeTargetUserId)}
                   disabled={bindCodeLoading}
                   className={PRIMARY_BUTTON_CLASS}
                 >

@@ -3,13 +3,14 @@ from __future__ import annotations
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy.pool import StaticPool
-from sqlmodel import Session, SQLModel, create_engine
+from sqlmodel import Session, SQLModel, create_engine, select
 
 import app.api.channels as channels_api
 from app.db import get_session
 from app.db.models import (
     AgentProfile,
     ChannelBinding,
+    ChannelBindCode,
     ChannelBindingManager,
     Tenant,
     User,
@@ -164,6 +165,40 @@ def test_collaborator_can_toggle_status(monkeypatch) -> None:
     )
     assert enable.status_code == 200, enable.text
     assert enable.json()["status"] == "active"
+
+
+def test_manager_can_invite_internal_user_to_bind_identity() -> None:
+    engine = _engine()
+    users = _seed(engine)
+    client = _client(engine)
+    binding_id = _seed_binding(engine)
+    with Session(engine) as db:
+        binding = db.get(ChannelBinding, binding_id)
+        binding.identity_scope_key = "cli_feishu:tenant_a"
+        db.add(binding)
+        db.commit()
+
+    invited = client.post(
+        f"/api/enterprise/channels/{binding_id}/identity-bind-code",
+        params={"tenant_id": "tenant_demo"},
+        json={"user_id": "user_other"},
+        headers=_auth(users["owner"]),
+    )
+    assert invited.status_code == 200, invited.text
+    assert len(invited.json()["code"]) == 6
+    with Session(engine) as db:
+        record = db.exec(
+            select(ChannelBindCode).where(ChannelBindCode.user_id == "user_other")
+        ).one()
+        assert record.code == invited.json()["code"]
+
+    forbidden = client.post(
+        f"/api/enterprise/channels/{binding_id}/identity-bind-code",
+        params={"tenant_id": "tenant_demo"},
+        json={"user_id": "user_owner"},
+        headers=_auth(users["outsider"]),
+    )
+    assert forbidden.status_code == 403
 
 
 def test_collaborator_cannot_delete(monkeypatch) -> None:
