@@ -106,6 +106,33 @@ const agents: AgentProfileRead[] = [
   },
 ];
 
+const teamLog = {
+  schema_version: 'staffdeck.team-log.v1',
+  exported_at: '2026-08-03T00:00:00Z',
+  team: { id: 'team-1', name: '增长团队' },
+  summary: {
+    task_count: 3,
+    wake_event_count: 2,
+    blackboard_entry_count: 1,
+    session_count: 1,
+  },
+  tasks: [],
+  wake_events: [],
+  blackboard_entries: [],
+  sessions: [
+    {
+      session: { id: 'session-log-1', title: '成员调研', agent_id: 'agent-2', status: 'completed' },
+      messages: [
+        { id: 'message-log-1', role: 'user', content: '调研用户反馈' },
+        { id: 'message-log-2', role: 'assistant', content: '已完成用户反馈调研' },
+      ],
+      traces: [],
+      events: [{ id: 'event-log-1', event_type: 'model_exchange_completed' }],
+      tool_invocations: [{ id: 'tool-log-1', tool_name: 'knowledge_search', status: 'completed' }],
+    },
+  ],
+};
+
 function jsonResponse(body: unknown): Response {
   return {
     ok: true,
@@ -177,6 +204,7 @@ function stubDetailFetch(overrides?: {
     if (url.includes('/tl/session')) {
       return jsonResponse(overrides?.onTlSession?.() ?? { session_id: 'session-1' });
     }
+    if (url.includes('/export')) return jsonResponse(teamLog);
     if (url.includes('/award-override')) {
       return jsonResponse(makeTask({ status: 'pending', assignee_agent_id: 'agent-1' }));
     }
@@ -268,7 +296,7 @@ beforeAll(() => {
 });
 
 describe('TeamDetailPage', () => {
-  it('downloads the complete team execution log', async () => {
+  it('opens the complete team execution log online and keeps JSON download available', async () => {
     const user = userEvent.setup();
     const fetchMock = stubDetailFetch();
     const createObjectURL = vi.fn(() => 'blob:team-log');
@@ -278,7 +306,15 @@ describe('TeamDetailPage', () => {
     Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: revokeObjectURL });
     renderDetail();
 
-    await user.click(await screen.findByRole('button', { name: '下载完整日志' }));
+    await user.click(await screen.findByRole('button', { name: '查看完整日志' }));
+
+    const dialog = await screen.findByRole('dialog');
+    expect(within(dialog).getByText('团队完整日志')).toBeTruthy();
+    expect(within(dialog).getByText('成员调研')).toBeTruthy();
+    expect(within(dialog).getByText('任务数')).toBeTruthy();
+    await user.click(within(dialog).getByText('成员调研'));
+    expect(await within(dialog).findByText('已完成用户反馈调研')).toBeTruthy();
+    await user.click(within(dialog).getByRole('button', { name: '下载 JSON' }));
 
     await waitFor(() => {
       expect(fetchMock.mock.calls.some(([input]) =>
