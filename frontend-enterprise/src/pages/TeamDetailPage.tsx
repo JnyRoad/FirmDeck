@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Crown, Download, Eye, FileJson, LoaderCircle, MessageCircle } from 'lucide-react';
+import { ChevronLeft, ChevronRight, Crown, Download, Eye, FileJson, LoaderCircle, MessageCircle } from 'lucide-react';
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
 
 import {
@@ -215,6 +215,58 @@ export default function TeamDetailPage({
   const [loadingTeamLog, setLoadingTeamLog] = useState(false);
   const [promotingEntryId, setPromotingEntryId] = useState<string | null>(null);
   const openedTaskParamRef = useRef<string | null>(null);
+  const memberScrollRef = useRef<HTMLDivElement | null>(null);
+  const [memberScrollEdges, setMemberScrollEdges] = useState({
+    overflow: false,
+    left: false,
+    right: false,
+  });
+
+  const teamMemberKey = useMemo(
+    () => (team?.members || []).map((member) => `${member.id}:${member.role}`).join('|'),
+    [team?.members],
+  );
+
+  const updateMemberScrollEdges = useCallback(() => {
+    const node = memberScrollRef.current;
+    if (!node) return;
+    const maxScrollLeft = Math.max(0, node.scrollWidth - node.clientWidth);
+    const overflow = maxScrollLeft > 1;
+    const nextEdges = {
+      overflow,
+      left: overflow && node.scrollLeft > 1,
+      right: overflow && node.scrollLeft < maxScrollLeft - 1,
+    };
+    setMemberScrollEdges((current) => (
+      current.overflow === nextEdges.overflow
+      && current.left === nextEdges.left
+      && current.right === nextEdges.right
+        ? current
+        : nextEdges
+    ));
+  }, []);
+
+  useEffect(() => {
+    const node = memberScrollRef.current;
+    if (!node) return;
+    node.scrollLeft = 0;
+    updateMemberScrollEdges();
+
+    node.addEventListener('scroll', updateMemberScrollEdges, { passive: true });
+    window.addEventListener('resize', updateMemberScrollEdges);
+    const resizeObserver = typeof ResizeObserver === 'undefined'
+      ? null
+      : new ResizeObserver(updateMemberScrollEdges);
+    resizeObserver?.observe(node);
+    if (node.firstElementChild instanceof HTMLElement) {
+      resizeObserver?.observe(node.firstElementChild);
+    }
+    return () => {
+      node.removeEventListener('scroll', updateMemberScrollEdges);
+      window.removeEventListener('resize', updateMemberScrollEdges);
+      resizeObserver?.disconnect();
+    };
+  }, [teamMemberKey, updateMemberScrollEdges]);
 
   const loadTeam = useCallback(async () => {
     try {
@@ -850,31 +902,66 @@ export default function TeamDetailPage({
                   {leader && memberNode(leader, true)}
                   {leader && others.length > 0 && <div className="h-[14px] w-px bg-[#dbe1ec]" />}
                   {others.length > 0 && (
-                    <div className="flex max-w-full justify-center gap-[12px] overflow-x-auto">
-                      {others.map((member, index) => (
-                        <div key={member.id} className="flex flex-col items-center">
-                          {leader && (
-                            <>
-                              <div className="flex w-full">
-                                <div
-                                  className={cn(
-                                    '-mr-[6px] h-px w-[calc(50%+6px)]',
-                                    index > 0 && 'bg-[#dbe1ec]',
-                                  )}
-                                />
-                                <div
-                                  className={cn(
-                                    '-ml-[6px] h-px w-[calc(50%+6px)]',
-                                    index < others.length - 1 && 'bg-[#dbe1ec]',
-                                  )}
-                                />
-                              </div>
-                              <div className="h-[12px] w-px bg-[#dbe1ec]" />
-                            </>
-                          )}
-                          {memberNode(member, false)}
+                    <div className="relative w-full">
+                      {memberScrollEdges.left && (
+                        <div
+                          aria-hidden="true"
+                          data-scroll-edge="left"
+                          className="pointer-events-none absolute inset-y-0 left-0 z-10 w-[44px] bg-gradient-to-r from-white via-white/85 to-transparent"
+                        />
+                      )}
+                      {memberScrollEdges.right && (
+                        <div
+                          aria-hidden="true"
+                          data-scroll-edge="right"
+                          className="pointer-events-none absolute inset-y-0 right-0 z-10 w-[44px] bg-gradient-to-l from-white via-white/85 to-transparent"
+                        />
+                      )}
+                      <div
+                        ref={memberScrollRef}
+                        role="region"
+                        aria-label="团队成员列表"
+                        aria-describedby={memberScrollEdges.overflow ? 'team-member-scroll-hint' : undefined}
+                        tabIndex={0}
+                        className="max-w-full overflow-x-auto overscroll-x-contain pb-[8px] outline-none [scrollbar-color:#cfd5e2_transparent] [scrollbar-width:thin] focus-visible:ring-2 focus-visible:ring-[#a9c7ff] focus-visible:ring-offset-2 [&::-webkit-scrollbar]:h-[6px] [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-[#cfd5e2] [&::-webkit-scrollbar-track]:bg-transparent"
+                      >
+                        <div className="flex w-max min-w-full justify-center gap-[12px] px-[4px]">
+                          {others.map((member, index) => (
+                            <div key={member.id} className="flex flex-col items-center">
+                              {leader && (
+                                <>
+                                  <div className="flex w-full">
+                                    <div
+                                      className={cn(
+                                        '-mr-[6px] h-px w-[calc(50%+6px)]',
+                                        index > 0 && 'bg-[#dbe1ec]',
+                                      )}
+                                    />
+                                    <div
+                                      className={cn(
+                                        '-ml-[6px] h-px w-[calc(50%+6px)]',
+                                        index < others.length - 1 && 'bg-[#dbe1ec]',
+                                      )}
+                                    />
+                                  </div>
+                                  <div className="h-[12px] w-px bg-[#dbe1ec]" />
+                                </>
+                              )}
+                              {memberNode(member, false)}
+                            </div>
+                          ))}
                         </div>
-                      ))}
+                      </div>
+                      {memberScrollEdges.overflow && (
+                        <p
+                          id="team-member-scroll-hint"
+                          className="mt-[5px] flex items-center justify-center gap-[5px] text-[11px] text-[#858b9c]"
+                        >
+                          <ChevronLeft className="size-[12px]" aria-hidden="true" />
+                          横向滑动查看更多成员
+                          <ChevronRight className="size-[12px]" aria-hidden="true" />
+                        </p>
+                      )}
                     </div>
                   )}
                   {team && members.length === 0 && (

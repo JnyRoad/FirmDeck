@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
@@ -38,6 +38,21 @@ const team: TeamRead = {
   ],
   created_at: '2026-08-01T00:00:00Z',
   updated_at: '2026-08-01T00:00:00Z',
+};
+
+const crowdedTeam: TeamRead = {
+  ...team,
+  members: [
+    team.members[0],
+    ...Array.from({ length: 9 }, (_, index) => ({
+      id: `member-crowded-${index + 1}`,
+      team_id: 'team-1',
+      agent_id: `agent-crowded-${index + 1}`,
+      role: 'member' as const,
+      agent_name: index === 0 ? '产品经理' : `成员${index + 2}`,
+      created_at: '2026-08-01T00:00:00Z',
+    })),
+  ],
 };
 
 function makeTask(overrides: Partial<TeamTaskRead>): TeamTaskRead {
@@ -346,6 +361,32 @@ describe('TeamDetailPage', () => {
     expect(within(pendingColumn).getByText('未分配')).toBeTruthy();
     const progressColumn = within(board).getByText('进行中').closest('div')?.parentElement as HTMLElement;
     expect(within(progressColumn).getByText('投放分析')).toBeTruthy();
+  });
+
+  it('starts an overflowed member list from the left and shows a horizontal scroll hint', async () => {
+    vi.spyOn(Element.prototype, 'scrollWidth', 'get').mockReturnValue(1000);
+    vi.spyOn(Element.prototype, 'clientWidth', 'get').mockReturnValue(500);
+    stubDetailFetch({ teamOverride: crowdedTeam });
+    renderDetail();
+
+    const memberList = await screen.findByRole('region', { name: '团队成员列表' });
+    const memberSection = screen.getByRole('region', { name: '成员管理' });
+    await waitFor(() => {
+      expect(within(memberSection).getByText('横向滑动查看更多成员')).toBeTruthy();
+    });
+    expect(memberList.scrollLeft).toBe(0);
+    expect(memberList.firstElementChild?.className).toContain('w-max');
+    expect(memberList.firstElementChild?.className).toContain('min-w-full');
+    expect(memberSection.querySelector('[data-scroll-edge="right"]')).toBeTruthy();
+    expect(within(memberSection).getByText('产品经理')).toBeTruthy();
+    expect(within(memberSection).getAllByText('成员', { exact: true })).toHaveLength(9);
+
+    memberList.scrollLeft = 500;
+    fireEvent.scroll(memberList);
+    await waitFor(() => {
+      expect(memberSection.querySelector('[data-scroll-edge="left"]')).toBeTruthy();
+      expect(memberSection.querySelector('[data-scroll-edge="right"]')).toBeFalsy();
+    });
   });
 
   it('submits an override verdict from the task detail dialog', async () => {
