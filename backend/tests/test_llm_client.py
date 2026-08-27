@@ -238,7 +238,29 @@ def test_generate_text_passes_model_extra_body_and_preserves_thinking_options():
     call = client.client.chat.completions.calls[0]
     assert call["extra_body"] == {
         "thinking": {"type": "disabled", "clear_thinking": True},
+        "chat_template_kwargs": {"enable_thinking": False},
         "do_sample": False,
+    }
+
+
+def test_generate_text_adds_glm_compatible_hard_thinking_switch():
+    client = object.__new__(LLMClient)
+    client.client = _FakeOpenAIClient()
+    client.model = "zai-org/GLM-5.2"
+    client.temperature = 0.2
+    client.max_output_tokens = 256
+    client.thinking_mode = "disabled"
+    client.extra_body = {
+        "thinking": {"type": "disabled"},
+        "chat_template_kwargs": {"enable_thinking": True, "custom": "kept"},
+    }
+
+    assert client.generate_text("system prompt", "hello") == "ok"
+
+    call = client.client.chat.completions.calls[0]
+    assert call["extra_body"] == {
+        "thinking": {"type": "disabled"},
+        "chat_template_kwargs": {"enable_thinking": False, "custom": "kept"},
     }
 
 

@@ -212,6 +212,7 @@ class LLMClient:
                 _thinking_request_kwargs(
                     getattr(self, "thinking_mode", ""),
                     getattr(self, "extra_body", {}),
+                    model=getattr(self, "model", ""),
                 )
             )
             empty_diagnostics: list[str] = []
@@ -335,6 +336,7 @@ class LLMClient:
                     **_thinking_request_kwargs(
                         getattr(self, "thinking_mode", ""),
                         getattr(self, "extra_body", {}),
+                        model=getattr(self, "model", ""),
                     ),
                 }
                 if cancellation is not None:
@@ -957,7 +959,12 @@ def _thinking_mode_from_extra_body(extra_body: Any) -> str:
     return _normalize_thinking_mode(thinking.get("type"))
 
 
-def _thinking_request_kwargs(mode: Any, extra_body: Any = None) -> dict[str, Any]:
+def _thinking_request_kwargs(
+    mode: Any,
+    extra_body: Any = None,
+    *,
+    model: Any = None,
+) -> dict[str, Any]:
     body = _normalize_extra_body(extra_body)
     normalized = _normalize_thinking_mode(mode)
     if normalized:
@@ -965,6 +972,22 @@ def _thinking_request_kwargs(mode: Any, extra_body: Any = None) -> dict[str, Any
         body["thinking"] = {
             **(thinking if isinstance(thinking, dict) else {}),
             "type": normalized,
+        }
+    # GLM's official API accepts ``thinking.type=disabled``, while common
+    # OpenAI-compatible GLM gateways (notably vLLM deployments) control the
+    # chat template with ``enable_thinking`` instead. Send both compatible
+    # switches for GLM so an intermediary cannot silently leave reasoning on.
+    # Other model families keep their existing request shape.
+    model_name = str(model or "").strip().lower().split("/")[-1]
+    if normalized == "disabled" and model_name.startswith("glm-"):
+        chat_template_kwargs = body.get("chat_template_kwargs")
+        body["chat_template_kwargs"] = {
+            **(
+                chat_template_kwargs
+                if isinstance(chat_template_kwargs, dict)
+                else {}
+            ),
+            "enable_thinking": False,
         }
     return {"extra_body": body} if body else {}
 
