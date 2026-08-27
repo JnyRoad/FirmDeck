@@ -1090,7 +1090,7 @@ function displayUser(session: Record<string, unknown>): string {
   );
 }
 
-function timingText(
+export function timingText(
   durationMs?: number | null,
   modelDurationMs?: number | null,
   modelCallCount?: number | null,
@@ -1103,7 +1103,11 @@ function timingText(
   if (names.length > 0) {
     parts.push(names.length <= 2 ? names.join('、') : `${names.slice(0, 2).join('、')} 等 ${names.length} 个模型`);
   }
-  if (typeof modelDurationMs === 'number') parts.push(`模型耗时 ${formatDuration(modelDurationMs)}`);
+  if (typeof modelDurationMs === 'number') {
+    parts.push(
+      `${typeof durationMs === 'number' ? '其中模型' : '模型耗时'} ${formatDuration(modelDurationMs)}`,
+    );
+  }
   if (typeof modelCallCount === 'number' && modelCallCount > 0) {
     parts.push(`${modelCallCount} 次调用`);
   } else if (showMissingModel && typeof durationMs === 'number' && modelDurationMs == null) {

@@ -2,9 +2,18 @@ import { describe, expect, it } from 'vitest';
 
 import type { TraceLineRead } from '@/types';
 
-import { traceDetails } from './ConversationLogsTab';
+import { timingText, traceDetails } from './ConversationLogsTab';
 
 describe('conversation log trace details', () => {
+  it('labels model time as a subset when total elapsed time is present', () => {
+    expect(timingText(80_231, 78_749, undefined, ['glm-5.2'])).toBe(
+      '总 80.2s · glm-5.2 · 其中模型 78.7s',
+    );
+    expect(timingText(undefined, 3_524, 1, ['glm-5.2'])).toBe(
+      'glm-5.2 · 模型耗时 3.52s · 1 次调用',
+    );
+  });
+
   it('keeps measured model decisions in the elapsed-time breakdown', () => {
     const lines: TraceLineRead[] = [
       {
