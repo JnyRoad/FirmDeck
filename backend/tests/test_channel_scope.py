@@ -134,10 +134,20 @@ def test_external_account_scope_resolution() -> None:
         empty = ChannelBinding(
             id="chan_fallback", tenant_id="t", agent_id="a4", channel="wecom", config_json={}
         )
+        feishu = ChannelBinding(
+            tenant_id="t",
+            agent_id="a5",
+            channel="feishu",
+            # 存量数据中 identity_scope_key 可能是空字符串。
+            identity_scope_key="",
+            provider_tenant_key="tenant-key",
+            config_json={"app_id": "cli_test"},
+        )
         assert external_account_scope(db, wechat) == ""
         assert external_account_scope(db, corp) == "corpX"
         assert external_account_scope(db, bot_only) == "b2"
         assert external_account_scope(db, empty) == "chan_fallback"
+        assert external_account_scope(db, feishu) == "app:8:cli_test:tenant:10:tenant-key"
 
 
 # ---------- 维护者场景 ----------

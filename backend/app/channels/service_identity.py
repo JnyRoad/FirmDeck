@@ -36,7 +36,20 @@ def channel_label(channel: str) -> str:
 
 
 def scope_from_config(config: dict, binding: ChannelBinding) -> str:
-    """按配置计算生效 scope:wecom 取 corp_id/bot_id,兜底 binding.id;其他渠道置空。"""
+    """按配置计算生效 scope。
+
+    飞书身份作用域同时包含 app_id 和 provider_tenant_key；历史绑定可能只
+    持久化了空的 identity_scope_key，因此这里必须能从绑定配置恢复有效作用域。
+    """
+    if binding.channel == "feishu":
+        app_id = str(config.get("app_id") or "").strip()
+        tenant_key = str(binding.provider_tenant_key or config.get("provider_tenant_key") or "").strip()
+        if app_id and tenant_key:
+            # 局部导入避免 service_feishu_inbox -> service_identity 循环依赖。
+            from app.channels.service_feishu_inbox import feishu_identity_scope
+
+            return feishu_identity_scope(app_id, tenant_key)
+        return ""
     if binding.channel != "wecom":
         if binding.channel == "dingtalk":
             return str(config.get("provider_tenant_key") or "").strip() or binding.id
@@ -46,8 +59,9 @@ def scope_from_config(config: dict, binding: ChannelBinding) -> str:
 
 def external_account_scope(db: Session, binding: ChannelBinding) -> str:
     """渠道账号作用域:以绑定当前配置为准(corp_id > bot_id > binding.id)。"""
-    if binding.identity_scope_key is not None:
-        return binding.identity_scope_key
+    configured_scope = str(binding.identity_scope_key or "").strip()
+    if configured_scope:
+        return configured_scope
     return scope_from_config(dict(binding.config_json or {}), binding)
 
 
