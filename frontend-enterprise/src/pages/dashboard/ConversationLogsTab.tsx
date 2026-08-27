@@ -1056,10 +1056,18 @@ function FeedbackTraceBlock({ trace }: { trace: TurnTraceRead }) {
   );
 }
 
-function traceDetails(lines: TraceLineRead[]): TraceLineRead[] {
+export function traceDetails(lines: TraceLineRead[]): TraceLineRead[] {
   const hiddenPlaceholders = new Set(['正在思考', '已完成思考', '正在执行', '执行记录']);
   return lines.filter((line) => {
-    if (line.kind === 'thinking' && line.state !== 'failed') return false;
+    // Keep generic streaming placeholders out of the archived log, but retain
+    // measured Harness model decisions. Those rows form part of the task's
+    // elapsed-time breakdown and hiding them makes the visible subtotals look
+    // inconsistent with the task total.
+    if (
+      line.kind === 'thinking' &&
+      line.state !== 'failed' &&
+      typeof line.model_duration_ms !== 'number'
+    ) return false;
     if (hiddenPlaceholders.has(line.text) && !line.detail && !line.code && !line.output) return false;
     return true;
   });

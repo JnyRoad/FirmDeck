@@ -42,7 +42,6 @@ def enrich_turn_traces_with_timings(
     spans_by_turn = _model_spans_by_turn(events, aliases)
     observations_by_turn = _trace_observations_by_turn(events, aliases)
     windows_by_turn = _resolve_trace_windows(traces, observations_by_turn)
-    _extend_action_windows_with_model_decisions(events, aliases, spans_by_turn, windows_by_turn)
     _extend_router_windows_with_planner(
         spans_by_turn,
         windows_by_turn,
@@ -463,48 +462,6 @@ def _next_observation_ms(
     return None
 
 
-def _extend_action_windows_with_model_decisions(
-    events: list[AgentEvent],
-    aliases: dict[str, str],
-    spans_by_turn: dict[str, list[_ModelSpan]],
-    windows_by_turn: dict[str, dict[str, tuple[float, float]]],
-) -> None:
-    actions_by_turn: dict[str, list[tuple[float, str]]] = {}
-    for event in events:
-        if event.event_type != "harness_action_created":
-            continue
-        turn_id = _event_turn_id(event, aliases)
-        line_id = _trace_line_id(event)
-        if turn_id and line_id:
-            actions_by_turn.setdefault(turn_id, []).append((_event_ms(event), line_id))
-
-    for turn_id, actions in actions_by_turn.items():
-        available = [
-            span
-            for span in spans_by_turn.get(turn_id, [])
-            if span.operation == "harness.task_action"
-        ]
-        used: set[int] = set()
-        for action_ms, line_id in sorted(actions):
-            candidates = [
-                (index, span)
-                for index, span in enumerate(available)
-                if index not in used and span.finished_ms <= action_ms + 250
-            ]
-            if not candidates:
-                continue
-            index, span = max(candidates, key=lambda item: item[1].finished_ms)
-            used.add(index)
-            current = windows_by_turn.setdefault(turn_id, {}).get(line_id)
-            if current:
-                windows_by_turn[turn_id][line_id] = (
-                    span.started_ms
-                    if line_id.startswith("harness_finish_")
-                    else min(span.started_ms, current[0]),
-                    current[1],
-                )
-
-
 def _extend_router_windows_with_planner(
     spans_by_turn: dict[str, list[_ModelSpan]],
     windows_by_turn: dict[str, dict[str, tuple[float, float]]],
@@ -529,40 +486,6 @@ def _extend_router_windows_with_planner(
                 else planner.started_ms
             )
             windows["decision_router"] = (started_ms, current[1])
-
-
-def _trace_line_id(event: AgentEvent) -> str:
-    payload = event.payload_json or {}
-    event_type = event.event_type
-    frame_id = str(payload.get("task_frame_id") or event.id).strip()
-    iteration = str(payload.get("iteration") or "").strip()
-    if event_type in {"task_frame_started", "task_frame_finished"}:
-        return f"harness_frame_{frame_id}"
-    if event_type == "harness_action_created":
-        action = str(payload.get("action") or "").strip()
-        if action == "tool":
-            return f"harness_action_{frame_id}_{iteration or event.id}"
-        if action == "finish":
-            return f"harness_finish_{frame_id}_{iteration or event.id}"
-    if event_type == "harness_tool_completed":
-        return f"harness_action_{frame_id}_{iteration or event.id}"
-    if event_type == "router_decision_created":
-        return "decision_router"
-    if event_type in {"knowledge_query_started", "knowledge_query_finished", "knowledge_result"}:
-        query = payload.get("query")
-        if isinstance(query, dict):
-            query = query.get("query")
-        query_text = " ".join(str(query or payload.get("text") or "").split())
-        return f"knowledge_lookup_{query_text}" if query_text else "knowledge_lookup"
-    if event_type in {"tool_call_started", "tool_call_finished"}:
-        tool_name = str(payload.get("tool_name") or payload.get("name") or "").strip()
-        call_id = str(payload.get("tool_call_id") or tool_name or event.id).strip()
-        return f"tool_{call_id}"
-    if event_type == "tool_result":
-        raw_name = str(payload.get("rawToolName") or payload.get("toolId") or "").strip()
-        call_id = str(payload.get("toolCallId") or raw_name or event.id).strip()
-        return f"tool_{call_id}"
-    return ""
 
 
 def _model_duration_in_window(

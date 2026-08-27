@@ -149,7 +149,10 @@ def test_enterprise_trace_timings_include_each_step_and_model_time() -> None:
     assert lines["decision_router"]["model_names"] == ["GLM Test"]
     assert lines["harness_frame_task_demo"]["duration_ms"] == 4000
     assert lines["harness_frame_task_demo"]["model_duration_ms"] == 2400
-    assert lines["harness_action_task_demo_1"]["duration_ms"] == 2800
+    # The ability row starts when the action is dispatched. The preceding
+    # Harness model decision is projected as its own child row and must not be
+    # counted a second time in the ability duration.
+    assert lines["harness_action_task_demo_1"]["duration_ms"] == 1850
     assert "model_duration_ms" not in lines["harness_action_task_demo_1"]
     assert lines["harness_action_task_demo_1"]["depth"] == 1
     assert "duration_ms" not in lines["harness_finish_task_demo_2"]
