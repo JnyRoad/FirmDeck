@@ -1,6 +1,21 @@
-import { describe, expect, it } from 'vitest';
+// @vitest-environment jsdom
 
-import { ApiError } from './client';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+import { api, ApiError } from './client';
+
+function response(status: number, body: unknown, statusText = ''): Response {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    statusText,
+    text: async () => typeof body === 'string' ? body : JSON.stringify(body),
+  } as Response;
+}
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
 
 describe('ApiError', () => {
   it('preserves a structured backend error code and human-readable message', () => {
@@ -31,5 +46,33 @@ describe('ApiError', () => {
 
     expect(error.code).toBe('MODEL_PROTOCOL_OPTIONS_INVALID');
     expect(error.message).toBe('MODEL_PROTOCOL_OPTIONS_INVALID');
+  });
+});
+
+describe('gateway retry policy', () => {
+  it('retries an idempotent GET after a transient gateway response', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(response(502, 'Bad Gateway', 'Bad Gateway'))
+      .mockResolvedValueOnce(response(200, { status: 'ok' }, 'OK'));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(api.get<{ status: string }>('/api/health')).resolves.toEqual({ status: 'ok' });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('stops retrying GET requests after two gateway retries', async () => {
+    const fetchMock = vi.fn(async () => response(502, 'Bad Gateway', 'Bad Gateway'));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(api.get('/api/health')).rejects.toMatchObject({ status: 502 });
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it('does not retry state-changing requests', async () => {
+    const fetchMock = vi.fn(async () => response(502, 'Bad Gateway', 'Bad Gateway'));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(api.post('/api/chat/stream', {})).rejects.toMatchObject({ status: 502 });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });

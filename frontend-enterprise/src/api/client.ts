@@ -9,6 +9,8 @@ const resolveApiBase = () => {
 };
 
 const API_BASE = resolveApiBase();
+const RETRYABLE_GATEWAY_STATUSES = new Set([502, 503, 504]);
+const GET_GATEWAY_RETRY_DELAYS_MS = [150, 450];
 
 export const TENANT_ID = import.meta.env.VITE_TENANT_ID || 'tenant_demo';
 export const SHOW_DEBUG = import.meta.env.VITE_SHOW_DEBUG === 'true';
@@ -33,20 +35,34 @@ export function isAuthError(error: unknown): boolean {
 }
 
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
-  const response = await fetch(`${API_BASE}${path}`, {
+  const method = String(options.method || 'GET').toUpperCase();
+  const requestOptions: RequestInit = {
     headers: {
       'Content-Type': 'application/json',
       ...authHeader(),
       ...(options.headers || {}),
     },
     ...options,
-  });
+  };
+  let response = await fetch(`${API_BASE}${path}`, requestOptions);
+  if (method === 'GET') {
+    for (const delayMs of GET_GATEWAY_RETRY_DELAYS_MS) {
+      if (!RETRYABLE_GATEWAY_STATUSES.has(response.status)) break;
+      await response.body?.cancel().catch(() => undefined);
+      await delay(delayMs);
+      response = await fetch(`${API_BASE}${path}`, requestOptions);
+    }
+  }
   if (!response.ok) {
     const text = await response.text();
     throw new ApiError(response.status, text, response.statusText);
   }
   const text = await response.text();
   return (text ? JSON.parse(text) : {}) as T;
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => globalThis.setTimeout(resolve, milliseconds));
 }
 
 async function keepalivePost<T>(path: string, body?: unknown): Promise<T> {

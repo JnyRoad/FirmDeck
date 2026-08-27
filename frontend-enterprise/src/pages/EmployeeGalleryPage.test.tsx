@@ -116,7 +116,7 @@ describe('EmployeeGalleryPage teams tab', () => {
       const url = String(input);
       if (url.includes('/api/enterprise/teams')) {
         teamRequestCount += 1;
-        if (teamRequestCount === 1) {
+        if (teamRequestCount <= 3) {
           return {
             ok: false,
             status: 502,
@@ -132,12 +132,12 @@ describe('EmployeeGalleryPage teams tab', () => {
     vi.stubGlobal('fetch', fetchMock);
     renderGallery();
 
-    await waitFor(() => expect(teamRequestCount).toBe(1));
+    await waitFor(() => expect(teamRequestCount).toBe(3));
     await user.click(await screen.findByRole('tab', { name: '团队对话' }));
 
     const section = await screen.findByRole('region', { name: '团队' });
     expect(await within(section).findByText('增长团队')).toBeTruthy();
-    expect(teamRequestCount).toBe(2);
+    expect(teamRequestCount).toBe(4);
   });
 
   it('opens the persistent team group in the chat app', async () => {

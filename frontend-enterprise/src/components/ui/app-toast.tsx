@@ -67,6 +67,11 @@ function localizedErrorMessage(message: ReactNode): ReactNode {
   return apiErrorMessage(message, message);
 }
 
+function errorToastOptions(message: ReactNode, options?: AppToastOptions): AppToastOptions {
+  if (options?.id != null || typeof message !== 'string') return options || {};
+  return { ...options, id: `app-error:${message}` };
+}
+
 /**
  * Global toast helper. `success` / `error` render the SD1 message pill;
  * `warning` / `info` / `loading` delegate to sonner so they share the same
@@ -75,8 +80,10 @@ function localizedErrorMessage(message: ReactNode): ReactNode {
 export const notify = {
   success: (message: ReactNode, options?: AppToastOptions) =>
     showVariant('success', message, options),
-  error: (message: ReactNode, options?: AppToastOptions) =>
-    showVariant('error', localizedErrorMessage(message), options),
+  error: (message: ReactNode, options?: AppToastOptions) => {
+    const localized = localizedErrorMessage(message);
+    return showVariant('error', localized, errorToastOptions(localized, options));
+  },
   warning: (message: ReactNode, options?: AppToastOptions) => toast.warning(message, options),
   info: (message: ReactNode, options?: AppToastOptions) => toast.info(message, options),
   loading: (message: ReactNode, options?: AppToastOptions) => toast.loading(message, options),
