@@ -18,6 +18,12 @@ class _ModelSpan:
     request_max_attempts: int
     json_attempt: int
     json_max_attempts: int
+    status: str
+    finish_reason: str
+    error_type: str
+    output_tokens: int
+    reasoning_chars: int
+    ttft_ms: float | None
     started_ms: float
     finished_ms: float
     duration_ms: float
@@ -213,7 +219,7 @@ def _project_harness_model_calls(
                     "kind": "thinking",
                     "text": _harness_model_call_text(line, iteration, call_index, len(matches)),
                     "detail": _harness_model_call_detail(span),
-                    "state": "completed",
+                    "state": "completed" if span.status == "success" else "failed",
                     "depth": 1,
                     "model_duration_ms": round(span.duration_ms, 3),
                     "model_names": [span.model_name] if span.model_name else [],
@@ -264,6 +270,19 @@ def _harness_model_call_text(
 
 def _harness_model_call_detail(span: _ModelSpan) -> str:
     parts = ["Harness 模型决策"]
+    if span.status == "empty":
+        parts.append("空响应")
+    elif span.status == "failed":
+        parts.append(f"失败{f' ({span.error_type})' if span.error_type else ''}")
+    if span.finish_reason:
+        label = "达到输出上限" if span.finish_reason == "length" else span.finish_reason
+        parts.append(f"结束原因 {label}")
+    if span.reasoning_chars > 0:
+        parts.append(f"推理字符 {span.reasoning_chars}")
+    if span.output_tokens > 0:
+        parts.append(f"输出 token {span.output_tokens}")
+    if span.ttft_ms is not None:
+        parts.append(f"首个正文 {round(span.ttft_ms / 1000, 2)}s")
     if span.json_max_attempts > 1:
         parts.append(f"JSON 尝试 {span.json_attempt}/{span.json_max_attempts}")
     if span.request_max_attempts > 1:
@@ -305,7 +324,7 @@ def _model_spans_by_turn(
 ) -> dict[str, list[_ModelSpan]]:
     spans_by_turn: dict[str, list[_ModelSpan]] = {}
     for event in events:
-        if event.event_type != "llm_call_finished":
+        if event.event_type not in {"llm_call_finished", "llm_call_failed"}:
             continue
         turn_id = _event_turn_id(event, aliases)
         if not turn_id:
@@ -329,6 +348,19 @@ def _model_spans_by_turn(
                 request_max_attempts=_positive_int(payload.get("max_attempts"), default=1),
                 json_attempt=_positive_int(payload.get("json_attempt"), default=1),
                 json_max_attempts=_positive_int(payload.get("json_max_attempts"), default=1),
+                status=str(
+                    payload.get("status")
+                    or ("failed" if event.event_type == "llm_call_failed" else "success")
+                ).strip(),
+                finish_reason=str(payload.get("finish_reason") or "").strip(),
+                error_type=str(payload.get("error_type") or "").strip(),
+                output_tokens=_nonnegative_int(payload.get("output_tokens")),
+                reasoning_chars=_nonnegative_int(payload.get("reasoning_chars")),
+                ttft_ms=(
+                    _float_ms(payload.get("ttft_ms"))
+                    if payload.get("ttft_ms") is not None
+                    else None
+                ),
                 started_ms=started_ms,
                 finished_ms=finished_ms,
                 duration_ms=duration_ms or max(0.0, finished_ms - started_ms),
@@ -561,3 +593,10 @@ def _positive_int(value: object, *, default: int) -> int:
         return max(1, int(value or default))
     except (TypeError, ValueError):
         return default
+
+
+def _nonnegative_int(value: object) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0

@@ -1159,7 +1159,33 @@ def test_internal_output_budget_never_increases_smaller_model_config():
 
 def test_knowledge_router_does_not_retry_empty_control_plane_responses():
     assert operation_empty_response_retries("knowledge.bucket_route", 2) == 0
+    assert operation_empty_response_retries("harness.task_action", 2) == 0
     assert operation_empty_response_retries("response.generate", 2) == 2
+
+
+def test_harness_empty_json_response_gets_one_corrected_non_json_retry():
+    client = object.__new__(LLMClient)
+    client.client = _FakeOpenAIClient()
+    client.model = "demo-model"
+    client.temperature = 0.2
+    client.max_output_tokens = 256
+
+    def fake_create(**kwargs):  # noqa: ANN003
+        client.client.chat.completions.calls.append(kwargs)
+        if "response_format" in kwargs:
+            return _completion_with_content("")
+        return _completion_with_content('{"action":"finish","status":"completed"}')
+
+    client.client.chat.completions.create = fake_create
+
+    with llm_operation("harness.task_action"):
+        result = client.generate_json("prompt", {})
+
+    assert result["action"] == "finish"
+    assert len(client.client.chat.completions.calls) == 2
+    retry = client.client.chat.completions.calls[1]
+    assert "response_format" not in retry
+    assert "_empty_response_repair" in retry["messages"][-1]["content"]
 
 
 def test_user_visible_response_uses_configured_output_budget():

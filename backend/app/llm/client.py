@@ -685,7 +685,15 @@ class LLMClient:
             if _response_format_unsupported(message):
                 return message
             if _empty_response(message):
-                return call_generate_text(system_prompt, user_payload)
+                retry_payload = copy.deepcopy(user_payload)
+                retry_payload["_empty_response_repair"] = {
+                    "instruction": (
+                        "上一轮模型把输出预算耗尽在推理中，未返回任何正文。"
+                        "请停止展开分析，立即按系统要求输出最短可用结果；"
+                        "不得复述上下文或思考过程。"
+                    )
+                }
+                return call_generate_text(system_prompt, retry_payload)
             raise
 
 

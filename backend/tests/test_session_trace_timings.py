@@ -251,6 +251,86 @@ def test_enterprise_trace_timings_merge_overlapping_model_spans() -> None:
     assert all(line["model_duration_ms"] <= line["duration_ms"] for line in trace["lines"])
 
 
+def test_harness_empty_model_attempt_exposes_failure_diagnostics() -> None:
+    started_at = datetime(2026, 8, 2, 11, 30, 0)
+    turn_payload = {
+        "turn_id": "msg_empty",
+        "user_message_id": "msg_empty",
+        "client_turn_id": "turn_empty",
+    }
+    frame_payload = {**turn_payload, "task_frame_id": "task_empty"}
+    messages = [
+        Message(
+            id="msg_empty",
+            tenant_id="tenant_demo",
+            session_id="session_demo",
+            role="user",
+            content="查询病假",
+            created_at=started_at,
+        ),
+        Message(
+            id="msg_empty_reply",
+            tenant_id="tenant_demo",
+            session_id="session_demo",
+            role="assistant",
+            content="完成",
+            created_at=started_at + timedelta(milliseconds=3100),
+        ),
+    ]
+    empty_span = _model_span(
+        started_at,
+        finished_after_ms=2500,
+        started_after_ms=500,
+        duration_ms=2000,
+        operation="harness.task_action",
+        turn_id="turn_empty",
+        task_frame_id="task_empty",
+        iteration=1,
+    )
+    empty_span.payload_json.update(
+        {
+            "status": "empty",
+            "finish_reason": "length",
+            "reasoning_chars": 32182,
+            "output_tokens": 8193,
+            "ttft_ms": 2000,
+            "attempt": 1,
+            "max_attempts": 3,
+        }
+    )
+    events = [
+        _event("user_message_received", started_at, {**turn_payload, "message_id": "msg_empty"}),
+        _event("task_frame_started", started_at + timedelta(milliseconds=100), frame_payload),
+        empty_span,
+        _event(
+            "harness_action_created",
+            started_at + timedelta(milliseconds=2600),
+            {**frame_payload, "iteration": 1, "action": "finish"},
+        ),
+        _event(
+            "task_frame_finished",
+            started_at + timedelta(milliseconds=2700),
+            {**frame_payload, "status": "completed"},
+        ),
+        _event(
+            "assistant_message_created",
+            started_at + timedelta(milliseconds=3100),
+            {**turn_payload, "message_id": "msg_empty_reply"},
+        ),
+    ]
+
+    traces = enrich_turn_traces_with_timings(_build_turn_traces(messages, events, {}), events)
+
+    model_line = next(
+        line for line in traces[0]["lines"] if str(line["id"]).startswith("harness_model_")
+    )
+    assert model_line["state"] == "failed"
+    assert "空响应" in model_line["detail"]
+    assert "达到输出上限" in model_line["detail"]
+    assert "推理字符 32182" in model_line["detail"]
+    assert "输出 token 8193" in model_line["detail"]
+
+
 def test_enterprise_trace_without_model_spans_does_not_report_fake_zero() -> None:
     started_at = datetime(2026, 8, 2, 12, 0, 0)
     payload = {

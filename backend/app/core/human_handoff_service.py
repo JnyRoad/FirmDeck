@@ -51,6 +51,17 @@ class HumanHandoffService:
                 "pending_question": existing.pending_question,
             }
             chat_session.updated_at = utc_now()
+            self.events.record(
+                tenant_id,
+                chat_session.id,
+                "human_handoff_reused",
+                {
+                    "handoff_id": existing.id,
+                    "assignee_user_id": existing.assignee_user_id,
+                    "notify_message_id": existing.notify_message_id,
+                    "reason": "pending_handoff_exists",
+                },
+            )
             return existing
 
         current_step = current_step_resolver()

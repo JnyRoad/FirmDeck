@@ -802,16 +802,16 @@ class AgentLoop:
         chat_session: ChatSession,
         handoff: HumanHandoffRequest,
     ) -> None:
-        """按通知渠道偏好解析投递 binding,给 assignee 登记渠道私聊通知。
+        """按通知渠道偏好解析可达 binding,给 assignee 登记渠道私聊通知。
 
         绑定解析规则:
-        - 偏好为具体渠道(如 feishu)时:优先会话所属 binding(渠道匹配且 active);
-          会话无 binding 或渠道不匹配时,在租户内找该渠道的任一 active 员工绑定。
-        - 偏好为 None(默认)时:用会话所属 binding(渠道支持私聊通知即可达)。
+        - 偏好为具体渠道(如 feishu)时:在该渠道所有 active 员工 binding 中,
+          选择 assignee 在对应 scope 下确实有私聊身份的 binding。
+        - 偏好为 None(默认)时:沿用会话渠道,但仍允许同渠道的另一个可达 binding。
         - 偏好为 "web" 时:仅网页收件箱,直接返回。
 
-        无可用 binding(含日志说明)或 assignee 在该 binding scope 无非群聊身份时,
-        由 notify_handoff_assignee 内部跳过,网页收件箱兜底。
+        所有跳过/登记结果都写入 durable event 与 handoff metadata,避免人工链路
+        静默失败；网页收件箱始终保留兜底。
         """
         from app.channels.service_outbox import (
             HANDOFF_NOTIFY_CHANNELS,
@@ -822,45 +822,113 @@ class AgentLoop:
         metadata = handoff.metadata_json if isinstance(handoff.metadata_json, dict) else {}
         notify_channel = str(metadata.get("assignee_notify_channel") or "").strip()
         if notify_channel == "web":
+            self._record_handoff_notify_state(
+                tenant_id,
+                handoff,
+                status="web_only",
+                reason="assignee_notify_channel_web",
+            )
             return
-        binding: ChannelBinding | None = None
-        if notify_channel:
-            # 指定渠道:优先会话所属 binding,渠道不匹配时回退租户内该渠道任一 binding。
-            if chat_session.channel_binding_id:
-                session_binding = self.db.get(ChannelBinding, chat_session.channel_binding_id)
-                if (
-                    session_binding
-                    and session_binding.tenant_id == tenant_id
-                    and session_binding.channel == notify_channel
-                    and session_binding.status == "active"
-                ):
-                    binding = session_binding
-            binding = binding or resolve_handoff_notify_binding(self.db, tenant_id, notify_channel)
-            if binding is None:
-                logger.warning(
-                    "handoff 通知跳过:租户无可用的 %s 绑定 handoff=%s", notify_channel, handoff.id
-                )
-                return
-        else:
-            # 默认投递:用会话所属 binding,渠道支持私聊通知即可达。
-            if not chat_session.channel_binding_id:
-                return
-            session_binding = self.db.get(ChannelBinding, chat_session.channel_binding_id)
-            if (
-                not session_binding
-                or session_binding.tenant_id != tenant_id
-                or session_binding.status != "active"
-            ):
-                return
-            if session_binding.channel not in HANDOFF_NOTIFY_CHANNELS:
-                return
-            binding = session_binding
-        notify_handoff_assignee(
+        session_binding = (
+            self.db.get(ChannelBinding, chat_session.channel_binding_id)
+            if chat_session.channel_binding_id
+            else None
+        )
+        target_channel = notify_channel or (
+            session_binding.channel
+            if session_binding
+            and session_binding.tenant_id == tenant_id
+            and session_binding.status == "active"
+            else ""
+        )
+        if target_channel not in HANDOFF_NOTIFY_CHANNELS:
+            self._record_handoff_notify_state(
+                tenant_id,
+                handoff,
+                status="skipped",
+                reason="unsupported_or_missing_notify_channel",
+                notify_channel=target_channel,
+            )
+            return
+        preferred_binding_id = (
+            session_binding.id
+            if session_binding
+            and session_binding.tenant_id == tenant_id
+            and session_binding.status == "active"
+            and session_binding.channel == target_channel
+            else None
+        )
+        binding = resolve_handoff_notify_binding(
+            self.db,
+            tenant_id,
+            target_channel,
+            assignee_user_id=handoff.assignee_user_id,
+            preferred_binding_id=preferred_binding_id,
+        )
+        if binding is None:
+            logger.warning(
+                "handoff 通知跳过:assignee 在租户 %s 的 %s active binding 中均无可私聊身份 "
+                "handoff=%s assignee=%s",
+                tenant_id,
+                target_channel,
+                handoff.id,
+                handoff.assignee_user_id,
+            )
+            self._record_handoff_notify_state(
+                tenant_id,
+                handoff,
+                status="unreachable",
+                reason="assignee_identity_not_found_in_active_binding_scope",
+                notify_channel=target_channel,
+            )
+            return
+        delivery = notify_handoff_assignee(
             self.db,
             binding,
             handoff,
             handoff.pending_question or "",
             handoff.context_summary or "",
+        )
+        self._record_handoff_notify_state(
+            tenant_id,
+            handoff,
+            status="staged" if delivery is not None else "failed",
+            reason="notice_staged" if delivery is not None else "notice_stage_failed",
+            notify_channel=target_channel,
+            binding_id=binding.id,
+            delivery_id=delivery.id if delivery is not None else None,
+        )
+
+    def _record_handoff_notify_state(
+        self,
+        tenant_id: str,
+        handoff: HumanHandoffRequest,
+        *,
+        status: str,
+        reason: str,
+        notify_channel: str | None = None,
+        binding_id: str | None = None,
+        delivery_id: str | None = None,
+    ) -> None:
+        payload = {
+            "handoff_id": handoff.id,
+            "assignee_user_id": handoff.assignee_user_id,
+            "status": status,
+            "reason": reason,
+            "notify_channel": notify_channel,
+            "binding_id": binding_id,
+            "delivery_id": delivery_id,
+            "attempted_at": utc_now().isoformat(),
+        }
+        metadata = dict(handoff.metadata_json or {})
+        metadata["assignee_notification"] = payload
+        handoff.metadata_json = metadata
+        handoff.updated_at = utc_now()
+        self.events.record(
+            tenant_id,
+            handoff.session_id,
+            "human_handoff_notification_updated",
+            payload,
         )
 
     def _apply_step_result(

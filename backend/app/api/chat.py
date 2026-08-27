@@ -3569,6 +3569,49 @@ def _event_trace_line(
     tool_names: dict[str, str] | None = None,
 ) -> dict | list[dict] | None:
     payload = event.payload_json or {}
+    if event.event_type == "human_handoff_requested":
+        assignee = str(payload.get("assignee_user_id") or "").strip()
+        return {
+            "id": f"human_handoff_requested_{payload.get('handoff_id') or event.id}",
+            "kind": "decision",
+            "text": "创建人工介入任务",
+            "detail": f"处理人 {assignee}" if assignee else None,
+            "state": "completed",
+        }
+    if event.event_type == "human_handoff_reused":
+        notice = str(payload.get("notify_message_id") or "").strip()
+        return {
+            "id": f"human_handoff_reused_{event.id}",
+            "kind": "decision",
+            "text": "复用待处理人工任务",
+            "detail": "已有坐席通知" if notice else "尚无坐席通知，重新尝试投递",
+            "state": "completed",
+        }
+    if event.event_type == "human_handoff_notification_updated":
+        status = str(payload.get("status") or "").strip()
+        labels = {
+            "staged": "已登记坐席通知",
+            "web_only": "仅进入网页人工收件箱",
+            "unreachable": "坐席通知未发出",
+            "skipped": "坐席通知已跳过",
+            "failed": "坐席通知登记失败",
+        }
+        detail = " · ".join(
+            part
+            for part in (
+                f"渠道 {payload.get('notify_channel')}" if payload.get("notify_channel") else "",
+                f"绑定 {payload.get('binding_id')}" if payload.get("binding_id") else "",
+                str(payload.get("reason") or "").strip(),
+            )
+            if part
+        )
+        return {
+            "id": f"human_handoff_notification_{event.id}",
+            "kind": "decision",
+            "text": labels.get(status, "更新坐席通知状态"),
+            "detail": detail or None,
+            "state": "failed" if status in {"unreachable", "failed"} else "completed",
+        }
     if event.event_type in {
         "task_frame_started",
         "task_frame_finished",

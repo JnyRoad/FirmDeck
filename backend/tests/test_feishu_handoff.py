@@ -843,6 +843,34 @@ def test_resolve_handoff_notify_binding_finds_active_employee_binding() -> None:
         assert resolve_handoff_notify_binding(db, "tenant_demo", "") is None
 
 
+def test_resolve_handoff_notify_binding_uses_assignee_reachable_scope() -> None:
+    """同渠道多应用时,不能因会话 binding 优先而把坐席 open_id 发给错误应用。"""
+    from app.channels.service_outbox import resolve_handoff_notify_binding
+
+    engine = _test_engine()
+    with Session(engine) as db:
+        _seed_tenant(db)
+        session_binding = _feishu_binding(binding_id="binding_session", app_id="cli_session")
+        session_binding.identity_scope_key = "scope_session"
+        reachable = _feishu_binding(binding_id="binding_reachable", app_id="cli_reachable")
+        reachable.identity_scope_key = "scope_reachable"
+        db.add(session_binding)
+        db.add(reachable)
+        db.add(_channel_identity(scope="scope_reachable"))
+        db.commit()
+
+        resolved = resolve_handoff_notify_binding(
+            db,
+            "tenant_demo",
+            "feishu",
+            assignee_user_id="assignee_user",
+            preferred_binding_id="binding_session",
+        )
+
+        assert resolved is not None
+        assert resolved.id == "binding_reachable"
+
+
 # ---------------------------------------------------------------------------
 # AgentLoop 通知路由:按 notify_channel 解析 binding,不再 feishu 硬编码
 # ---------------------------------------------------------------------------
@@ -870,9 +898,11 @@ def test_agent_loop_notify_routes_declared_channel_to_matching_binding() -> None
     with Session(engine) as db:
         _seed_tenant(db)
         feishu = _feishu_binding(binding_id="binding_feishu", app_id="cli_a")
+        feishu.identity_scope_key = "scope_feishu"
         wecom = _wecom_binding()
         db.add(feishu)
         db.add(wecom)
+        db.add(_channel_identity(scope="scope_feishu"))
         agent = AgentProfile(id="agent_demo", tenant_id="tenant_demo", name="demo", config_json={})
         db.add(agent)
         session = ChatSession(
@@ -916,6 +946,7 @@ def test_agent_loop_notify_prefers_session_binding_when_channel_matches() -> Non
         wecom_other.external_account_key = "wecom:corp:10:corp_other:bot:5:bot_1"
         db.add(wecom_session)
         db.add(wecom_other)
+        db.add(_channel_identity(channel="wecom", scope="corp_session"))
         agent = AgentProfile(id="agent_demo", tenant_id="tenant_demo", name="demo", config_json={})
         db.add(agent)
         session = ChatSession(
@@ -988,6 +1019,7 @@ def test_agent_loop_notify_default_uses_session_binding_when_supported() -> None
         _seed_tenant(db)
         wecom = _wecom_binding()
         db.add(wecom)
+        db.add(_channel_identity(channel="wecom", scope="corp_1"))
         agent = AgentProfile(id="agent_demo", tenant_id="tenant_demo", name="demo", config_json={})
         db.add(agent)
         session = ChatSession(

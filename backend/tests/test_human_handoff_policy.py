@@ -317,7 +317,11 @@ def test_handoff_finalize_creates_pending_request_for_declared_step():
     assert handoff.resume_payload_json["slots"] == {"order_id": "A001"}
     assert handoff.pending_question == "需要人工复核订单 A001"
     assert session.awaiting_input_json["handoff_id"] == handoff.id
-    assert [record[2] for record in loop.events.records] == ["human_handoff_requested"]
+    assert [record[2] for record in loop.events.records] == [
+        "human_handoff_requested",
+        "human_handoff_notification_updated",
+    ]
+    assert loop.events.records[-1][3]["status"] == "skipped"
 
 
 def test_handoff_finalize_reuses_existing_pending_request():
@@ -347,7 +351,11 @@ def test_handoff_finalize_reuses_existing_pending_request():
         "pending_question": "之前已经创建的人工请求",
     }
     assert not loop.db.added
-    assert loop.events.records == []
+    assert [record[2] for record in loop.events.records] == [
+        "human_handoff_reused",
+        "human_handoff_notification_updated",
+    ]
+    assert loop.events.records[-1][3]["status"] == "skipped"
 
 
 def test_handoff_request_is_ignored_when_step_does_not_declare_handoff():

@@ -4,6 +4,10 @@ from __future__ import annotations
 # Control-plane routers already have deterministic fallbacks. Retrying an empty
 # reasoning-only response delays the real work without improving routing.
 OPERATION_EMPTY_RESPONSE_RETRIES: dict[str, int] = {
+    # Harness has its own protocol/error handling. Repeating an identical
+    # reasoning-only request can consume the full output budget for minutes
+    # without producing an action; JSON fallback below gets one corrected try.
+    "harness.task_action": 0,
     "knowledge.document_route": 0,
     "knowledge.bucket_route": 0,
 }

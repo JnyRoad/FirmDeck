@@ -136,6 +136,10 @@ prior_task_results 还可能包含由当前 Slot 中标识符精确引用的、�
 
 每次只输出一个 JSON object：
 
+内部决策必须简短：禁止在 reasoning/thinking 中复述 TaskRequirement、工具结果或反复比较同一
+方案。通常在少量判断后立即输出动作 JSON；即使工具结果很长，也只定位当前 requirement 所需的
+下一步。绝不能耗尽输出预算后仍不返回 JSON 正文。
+
 调用工具：
 {
   "action": "tool",

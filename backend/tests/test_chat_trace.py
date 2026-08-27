@@ -79,6 +79,28 @@ def test_event_log_binds_all_execution_events_to_current_turn() -> None:
         }
 
 
+def test_handoff_notification_failure_is_visible_in_execution_trace() -> None:
+    event = AgentEvent(
+        id="evt_handoff_notice",
+        tenant_id="tenant_demo",
+        session_id="session_test",
+        event_type="human_handoff_notification_updated",
+        payload_json={
+            "handoff_id": "handoff_demo",
+            "status": "unreachable",
+            "notify_channel": "feishu",
+            "reason": "assignee_identity_not_found_in_active_binding_scope",
+        },
+    )
+
+    lines = _event_trace_lines(event, {})
+
+    assert len(lines) == 1
+    assert lines[0]["text"] == "坐席通知未发出"
+    assert lines[0]["state"] == "failed"
+    assert "渠道 feishu" in lines[0]["detail"]
+
+
 def test_session_spans_endpoint_returns_internal_spans_without_relaying_them() -> None:
     engine = create_engine(
         "sqlite://",

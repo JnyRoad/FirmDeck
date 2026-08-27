@@ -962,11 +962,16 @@ def resolve_handoff_notify_binding(
     db: Session,
     tenant_id: str,
     notify_channel: str,
+    *,
+    assignee_user_id: str | None = None,
+    preferred_binding_id: str | None = None,
 ) -> ChannelBinding | None:
     """按通知渠道偏好解析可达的投递 binding。
 
     notify_channel 为具体渠道(如 feishu)时,在租户内找该渠道的 active binding
-    (排除团队绑定与非交付渠道);找不到返回 None。
+    (排除团队绑定与非交付渠道)。指定 assignee 时,优先选择该 assignee 在对应
+    binding scope 下确实存在私聊身份的 binding,避免拿 A 应用的 open_id 经 B 应用
+    发送。preferred_binding_id 仅在同样可达时优先。找不到可达 binding 返回 None。
     """
     notify_channel = str(notify_channel or "").strip()
     if not notify_channel or notify_channel == "web":
@@ -978,7 +983,25 @@ def resolve_handoff_notify_binding(
             ChannelBinding.status == "active",
         )
     ).all()
-    return next((row for row in bindings if not row.team_id), None)
+    candidates = [row for row in bindings if not row.team_id]
+    if not candidates:
+        return None
+    preferred = next(
+        (row for row in candidates if row.id == preferred_binding_id),
+        None,
+    )
+    if assignee_user_id:
+        if preferred and resolve_assignee_channel_identity(db, preferred, assignee_user_id):
+            return preferred
+        return next(
+            (
+                row
+                for row in candidates
+                if resolve_assignee_channel_identity(db, row, assignee_user_id)
+            ),
+            None,
+        )
+    return preferred or candidates[0]
 
 
 def _write_handoff_notify_message_id(
@@ -1084,7 +1107,7 @@ def notify_handoff_assignee(
     handoff: HumanHandoffRequest,
     pending_question: str,
     context_summary: str,
-) -> None:
+) -> ChannelDelivery | None:
     """转人工时给 assignee 发渠道私聊通知(kind=handoff_notice)。
 
     通用链路:assignee_user_id → 当前 binding scope 下的非群聊 ChannelIdentity
@@ -1100,17 +1123,17 @@ def notify_handoff_assignee(
                 binding.id,
                 binding.channel,
             )
-            return
+            return None
         existing_notice = db.exec(
             select(ChannelDelivery).where(
                 ChannelDelivery.tenant_id == binding.tenant_id,
-                ChannelDelivery.binding_id == binding.id,
                 ChannelDelivery.kind == "handoff_notice",
                 ChannelDelivery.session_id == f"handoff:{handoff.id}",
+                ChannelDelivery.status.in_({"pending", "sending", "delivered"}),
             )
         ).first()
         if existing_notice:
-            return
+            return existing_notice
         identity = resolve_assignee_channel_identity(db, binding, handoff.assignee_user_id)
         external_user_id = identity.external_user_id if identity else None
         if not external_user_id:
@@ -1120,7 +1143,7 @@ def notify_handoff_assignee(
                 binding.id,
                 handoff.assignee_user_id,
             )
-            return
+            return None
         # assignee 显示名:从 User 表取,无则空
         assignee = db.get(User, handoff.assignee_user_id) if handoff.assignee_user_id else None
         name = ""
@@ -1142,21 +1165,23 @@ def notify_handoff_assignee(
         build_target = _HANDOFF_NOTIFY_TARGET_BUILDERS[binding.channel]
         target = build_target(external_user_id, handoff.id)
         target["handoff_id"] = handoff.id
-        db.add(
-            ChannelDelivery(
-                tenant_id=binding.tenant_id,
-                binding_id=binding.id,
-                session_id=f"handoff:{handoff.id}",
-                message_id=None,
-                target_json=target,
-                kind="handoff_notice",
-                text=text,
-                status="pending",
-                next_attempt_at=utc_now(),
-                idempotency_key=new_id("hnotice"),
-            )
+        delivery = ChannelDelivery(
+            tenant_id=binding.tenant_id,
+            binding_id=binding.id,
+            session_id=f"handoff:{handoff.id}",
+            message_id=None,
+            target_json=target,
+            kind="handoff_notice",
+            text=text,
+            status="pending",
+            next_attempt_at=utc_now(),
+            idempotency_key=new_id("hnotice"),
         )
+        db.add(delivery)
         db.commit()
+        db.refresh(delivery)
+        return delivery
     except Exception:
         db.rollback()
         logger.exception("handoff 通知登记失败 handoff=%s binding=%s", handoff.id, binding.id)
+        return None
