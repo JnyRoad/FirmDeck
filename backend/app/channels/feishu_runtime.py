@@ -11,7 +11,11 @@ from sqlmodel import Session, create_engine
 
 from app.channels.adapters.base import ChannelInbound, ChannelInboundAttachment
 from app.channels.crypto import decrypt_channel_secret
-from app.channels.service_feishu_inbox import StageDisposition, stage_feishu_inbound
+from app.channels.service_feishu_inbox import (
+    StageDisposition,
+    feishu_identity_scope,
+    stage_feishu_inbound,
+)
 from app.db.models import ChannelBinding
 from feishu_connector_worker import SDK_CONTRACT_VERSION
 
@@ -241,6 +245,7 @@ def _normalize_event(event, *, bot_open_id: str) -> tuple[ChannelInbound, dict] 
             "message": {"message_id": message_id, "chat_id": chat_id},
         },
         sender_name="",
+        account_scope=feishu_identity_scope(app_id, tenant_key),
         attachments=attachments,
     )
     target = {
