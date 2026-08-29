@@ -160,7 +160,7 @@ export default function MessageBubble({ chat, item, render }: MessageBubbleProps
   }
 
   return (
-    <div className={cn(CHAT_MESSAGE_ITEM_CLASS, queuedMessage && CHAT_QUEUED_MESSAGE_ITEM_CLASS)}>
+    <div className={cn('group/message', CHAT_MESSAGE_ITEM_CLASS, queuedMessage && CHAT_QUEUED_MESSAGE_ITEM_CLASS)}>
       <div className={cn(chatRowClass(item.role), groupAssistantMessage && CHAT_GROUP_MESSAGE_ROW_CLASS)}>
         {groupAssistantMessage && (
           <EmployeeAvatar
@@ -312,15 +312,6 @@ export default function MessageBubble({ chat, item, render }: MessageBubbleProps
 
           {!statusOnly && visibleContent && item.role === 'assistant' && !item.isStreaming && !teamProgress && (
             <div className={CHAT_FEEDBACK_CLASS}>
-              <button
-                type="button"
-                className={CHAT_FEEDBACK_BTN_CLASS}
-                aria-label={copied ? '已复制' : '复制'}
-                title={copied ? '已复制' : '复制'}
-                onClick={() => void handleCopy()}
-              >
-                {copied ? <Check size={15} /> : <Copy size={15} />}
-              </button>
               {canRateMessage(item) && (
                 <>
                   <button
@@ -344,6 +335,15 @@ export default function MessageBubble({ chat, item, render }: MessageBubbleProps
                   </button>
                 </>
               )}
+              <button
+                type="button"
+                className={CHAT_FEEDBACK_BTN_CLASS}
+                aria-label={copied ? '已复制' : '复制'}
+                title={copied ? '已复制' : '复制'}
+                onClick={() => void handleCopy()}
+              >
+                {copied ? <Check size={15} /> : <Copy size={15} />}
+              </button>
             </div>
           )}
           </div>
