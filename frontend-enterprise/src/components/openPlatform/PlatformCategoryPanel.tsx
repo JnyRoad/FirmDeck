@@ -80,6 +80,7 @@ export default function PlatformCategoryPanel({
             <IconSearch className="size-[14px] shrink-0 text-[#858b9c]" />
             <input
               autoComplete="off"
+              aria-label={searchPlaceholder}
               data-1p-ignore="true"
               data-lpignore="true"
               data-bwignore="true"
