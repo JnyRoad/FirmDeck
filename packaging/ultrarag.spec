@@ -14,7 +14,9 @@ ICNS = ASSETS / "staffdeck.icns"
 ICO = ASSETS / "staffdeck.ico"
 assert DIST.exists(), "先构建前端：npm --prefix frontend-enterprise run build"
 
-RAW_VERSION = os.environ.get("VERSION", "0.1.0").strip() or "0.1.0"
+DEFAULT_VERSION_FILE = BACKEND / "VERSION"
+DEFAULT_VERSION = DEFAULT_VERSION_FILE.read_text(encoding="utf-8").strip() if DEFAULT_VERSION_FILE.exists() else "0.0.0-dev"
+RAW_VERSION = os.environ.get("VERSION", DEFAULT_VERSION).strip() or DEFAULT_VERSION
 if not re.fullmatch(
     r"[vV]?\d+(?:\.\d+)*(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
     r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?",

@@ -4,7 +4,6 @@ import { describe, expect, it } from 'vitest';
 
 import {
   buildApiEndpointLinks,
-  buildBaseUrlEnvironmentExample,
   validateContextSettings,
   validateNetworkSettings,
 } from './RuntimeSettingsPage';
@@ -54,20 +53,10 @@ describe('runtime context settings validation', () => {
 });
 
 describe('network and API endpoint helpers', () => {
-  it('derives public API documentation links from a non-default active port', () => {
+  it('derives exactly one current same-machine Base URL for display', () => {
     expect(buildApiEndpointLinks('http://127.0.0.1:6204/api/v1/')).toEqual({
       baseUrl: 'http://127.0.0.1:6204/api/v1',
-      docsUrl: 'http://127.0.0.1:6204/api/v1/docs',
-      openapiUrl: 'http://127.0.0.1:6204/api/v1/openapi.json',
     });
-  });
-
-  it('generates a copyable environment example without embedding an API key', () => {
-    const example = buildBaseUrlEnvironmentExample('http://127.0.0.1:6204/api/v1');
-
-    expect(example).toBe('STAFFDECK_API_BASE_URL=http://127.0.0.1:6204/api/v1');
-    expect(example.toLowerCase()).not.toContain('api_key');
-    expect(example.toLowerCase()).not.toContain('secret');
   });
 
   it('validates local, LAN, and public next-launch input before save', () => {
