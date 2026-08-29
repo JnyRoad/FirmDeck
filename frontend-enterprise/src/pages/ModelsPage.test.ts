@@ -1,12 +1,41 @@
-import { describe, expect, it } from 'vitest';
+// @vitest-environment jsdom
+
+import { createElement, useEffect } from 'react';
+import { cleanup, render, screen, waitFor } from '@testing-library/react';
+import { afterEach, describe, expect, it } from 'vitest';
 
 import { ApiError } from '../api/client';
+import { I18nProvider, useI18n } from '../i18n';
 import {
   modelActionError,
   modelAuthModeLabel,
   modelProviderDiagnosticText,
   modelProviderErrorMessage,
 } from './ModelsPage';
+
+const subscriptionStatusCopy = {
+  '已连接 ChatGPT 订阅': 'ChatGPT subscription connected',
+  '已在默认浏览器中打开 ChatGPT 授权页面':
+    'Opened the ChatGPT authorization page in your default browser',
+  '尚未连接 ChatGPT 订阅': 'ChatGPT subscription is not connected',
+  '本机 Codex 订阅运行时不可用': 'The local Codex subscription runtime is unavailable',
+};
+
+// 切换测试页面到英文，以验证 API 返回的订阅状态会被实际国际化运行时翻译。
+function SwitchToEnglish() {
+  const { setLocale } = useI18n();
+
+  useEffect(() => {
+    setLocale('en-US');
+  }, [setLocale]);
+
+  return null;
+}
+
+afterEach(() => {
+  cleanup();
+  window.localStorage.clear();
+});
 
 describe('model provider diagnostics', () => {
   it('shows a friendly message and keeps raw upstream fields out of it', () => {
@@ -89,5 +118,24 @@ describe('model provider diagnostics', () => {
       code: 'MODEL_SUBSCRIPTION_AUTH_REQUIRED',
       message: 'login required',
     }, '测试失败')).toBe('请先连接本机的 ChatGPT 订阅，再测试或启用此模型。');
+  });
+
+  it('renders ChatGPT subscription account statuses in English', async () => {
+    render(
+      createElement(
+        I18nProvider,
+        null,
+        createElement(SwitchToEnglish),
+        ...Object.keys(subscriptionStatusCopy).map((message) =>
+          createElement('p', { key: message }, message),
+        ),
+      ),
+    );
+
+    await waitFor(() => {
+      for (const translation of Object.values(subscriptionStatusCopy)) {
+        expect(screen.getByText(translation)).toBeTruthy();
+      }
+    });
   });
 });
