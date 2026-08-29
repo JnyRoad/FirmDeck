@@ -1,5 +1,6 @@
 # packaging/ultrarag.spec
 # 运行：cd backend && pyinstaller ../packaging/ultrarag.spec --noconfirm
+import json
 import os
 import re
 import sys
@@ -15,7 +16,14 @@ ICO = ASSETS / "staffdeck.ico"
 assert DIST.exists(), "先构建前端：npm --prefix frontend-enterprise run build"
 
 DEFAULT_VERSION_FILE = BACKEND / "VERSION"
-DEFAULT_VERSION = DEFAULT_VERSION_FILE.read_text(encoding="utf-8").strip() if DEFAULT_VERSION_FILE.exists() else "0.0.0-dev"
+PACKAGE_VERSION_FILE = REPO / "frontend-enterprise" / "package.json"
+DEFAULT_VERSION = (
+    DEFAULT_VERSION_FILE.read_text(encoding="utf-8").strip()
+    if DEFAULT_VERSION_FILE.exists()
+    else json.loads(PACKAGE_VERSION_FILE.read_text(encoding="utf-8"))["version"]
+    if PACKAGE_VERSION_FILE.exists()
+    else "0.0.0-dev"
+)
 RAW_VERSION = os.environ.get("VERSION", DEFAULT_VERSION).strip() or DEFAULT_VERSION
 if not re.fullmatch(
     r"[vV]?\d+(?:\.\d+)*(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"

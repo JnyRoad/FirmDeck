@@ -39,9 +39,11 @@ def test_macos_bundle_version_uses_the_release_source_of_truth() -> None:
     spec = (root / "packaging" / "ultrarag.spec").read_text(encoding="utf-8")
     build_script = (root / "packaging" / "build_macos.sh").read_text(encoding="utf-8")
 
+    assert "node -p 'require(process.argv[1]).version'" in build_script
     assert 'export VERSION' in build_script
     assert 'DEFAULT_VERSION_FILE = BACKEND / "VERSION"' in spec
-    assert 'DEFAULT_VERSION = DEFAULT_VERSION_FILE.read_text(encoding="utf-8").strip()' in spec
+    assert 'PACKAGE_VERSION_FILE = REPO / "frontend-enterprise" / "package.json"' in spec
+    assert 'json.loads(PACKAGE_VERSION_FILE.read_text(encoding="utf-8"))["version"]' in spec
     assert 'RAW_VERSION = os.environ.get("VERSION", DEFAULT_VERSION).strip() or DEFAULT_VERSION' in spec
 
 
