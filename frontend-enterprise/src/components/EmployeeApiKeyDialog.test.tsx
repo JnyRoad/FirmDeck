@@ -31,7 +31,7 @@ function jsonResponse(body: unknown): Response {
 }
 
 /** 模拟员工密钥生命周期接口，并让刷新请求返回最新状态。 */
-function stubEmployeeCredentialFetch() {
+function stubEmployeeCredentialFetch(canReveal = true) {
   let status = 'active';
   let exists = true;
   const credential = () => ({
@@ -40,6 +40,7 @@ function stubEmployeeCredentialFetch() {
     name: '员工运行密钥',
     access: 'runtime',
     key_prefix: 'sd_live_test…',
+    can_reveal: canReveal,
     scopes: ['runs:*'],
     status,
     created_at: '2026-08-29T00:00:00Z',
@@ -52,6 +53,12 @@ function stubEmployeeCredentialFetch() {
     ) {
       status = 'revoked';
       return jsonResponse(credential());
+    }
+    if (
+      init?.method === 'POST'
+      && url.endsWith('/api/enterprise/agents/agent-1/api-credentials/employee-key-1/reveal?tenant_id=tenant_demo')
+    ) {
+      return jsonResponse({ api_key: 'sd_live_full_employee_key' });
     }
     if (
       init?.method === 'DELETE'
@@ -117,5 +124,36 @@ describe('EmployeeApiKeyDialog', () => {
       '/api/enterprise/agents/agent-1/api-credentials/employee-key-1?tenant_id=tenant_demo',
       expect.objectContaining({ method: 'DELETE' }),
     );
+  });
+
+  it('copies the complete employee key through the scoped read operation', async () => {
+    const user = userEvent.setup();
+    const fetchMock = stubEmployeeCredentialFetch();
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText },
+    });
+
+    render(<EmployeeApiKeyDialog agent={agent} open onClose={vi.fn()} />);
+
+    await screen.findByText('员工运行密钥');
+    await user.click(screen.getByRole('button', { name: '复制完整密钥' }));
+
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith('sd_live_full_employee_key'));
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/enterprise/agents/agent-1/api-credentials/employee-key-1/reveal?tenant_id=tenant_demo',
+      expect.objectContaining({ method: 'POST' }),
+    );
+  });
+
+  it('guides employee managers to rotate legacy keys that cannot be recovered', async () => {
+    stubEmployeeCredentialFetch(false);
+
+    render(<EmployeeApiKeyDialog agent={agent} open onClose={vi.fn()} />);
+
+    await screen.findByText('员工运行密钥');
+    expect(screen.getByText('旧密钥需轮换后复制')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: '复制完整密钥' })).toBeNull();
   });
 });
