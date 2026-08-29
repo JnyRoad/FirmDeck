@@ -95,12 +95,16 @@ const BLANK_MODEL_FORM: ModelForm = {
 
 const SUBSCRIPTION_PROVIDER_USER_MESSAGES: Record<string, string> = {
   MODEL_SUBSCRIPTION_ACCESS_DENIED: '当前 ChatGPT 订阅无权使用此模型，请检查订阅权益或模型名称。',
-  MODEL_SUBSCRIPTION_AUTH_FAILED: 'ChatGPT 授权未完成，请在浏览器中重新连接订阅。',
-  MODEL_SUBSCRIPTION_AUTH_REQUIRED: '请先在浏览器中连接 ChatGPT 订阅，再测试或启用此模型。',
-  MODEL_SUBSCRIPTION_CALLBACK_UNAVAILABLE: '无法监听本机浏览器授权回调，请关闭占用端口的程序后重试。',
+  MODEL_SUBSCRIPTION_AUTH_FAILED: '本机 Codex 登录未完成，请重新连接 ChatGPT 订阅。',
+  MODEL_SUBSCRIPTION_AUTH_REQUIRED: '请先在本机 Codex 中登录 ChatGPT 订阅，再测试或启用此模型。',
+  MODEL_SUBSCRIPTION_BROWSER_UNAVAILABLE: '无法打开本机 Codex 登录页面，请检查桌面浏览器后重试。',
   MODEL_SUBSCRIPTION_NETWORK_UNAVAILABLE: '暂时无法连接 ChatGPT 订阅服务，请检查网络后重试。',
   MODEL_SUBSCRIPTION_QUOTA_EXCEEDED: 'ChatGPT 订阅额度暂不可用，请稍后重试。',
   MODEL_SUBSCRIPTION_REFRESH_FAILED: 'ChatGPT 授权已失效，请在浏览器中重新连接订阅。',
+  MODEL_SUBSCRIPTION_RUNTIME_FAILED: '本机 Codex runtime 未能完成模型请求，请检查登录状态和模型名称后重试。',
+  MODEL_SUBSCRIPTION_RUNTIME_PROTOCOL_ERROR: '本机 Codex runtime 返回了无法识别的结果，请升级 Codex 后重试。',
+  MODEL_SUBSCRIPTION_RUNTIME_TIMEOUT: '本机 Codex runtime 请求超时，请稍后重试。',
+  MODEL_SUBSCRIPTION_RUNTIME_UNAVAILABLE: '未找到可用的本机 Codex runtime，请安装并登录 Codex 后重试。',
 };
 export function modelAuthModeLabel(authMode: ModelAuthMode | string | null | undefined): string {
   return authMode === 'chatgpt_subscription' ? 'ChatGPT 订阅（Codex）' : 'API Key';
@@ -353,11 +357,11 @@ export default function ModelsPage({
   }
 
   function startSubscriptionLogin() {
-    void updateSubscriptionAccount('login', '无法打开 ChatGPT 授权页面');
+    void updateSubscriptionAccount('login', '无法启动本机 Codex 登录');
   }
 
   function cancelSubscriptionLogin() {
-    void updateSubscriptionAccount('login/cancel', '无法取消 ChatGPT 授权');
+    void updateSubscriptionAccount('login/cancel', '无法取消本机 Codex 登录');
   }
 
   function confirmSubscriptionLogout() {
@@ -495,7 +499,7 @@ export default function ModelsPage({
         <div className="flex min-w-0 flex-col gap-[2px]">
           <span className="line-clamp-1 wrap-break-word text-[#464c5e]">{modelAuthModeLabel(row.auth_mode)}</span>
           <span className="line-clamp-1 wrap-break-word text-[#858b9c]">
-            {row.auth_mode === 'chatgpt_subscription' ? 'ChatGPT 浏览器授权' : row.base_url || '未设置 Base URL'}
+            {row.auth_mode === 'chatgpt_subscription' ? '本机 Codex runtime' : row.base_url || '未设置 Base URL'}
           </span>
         </div>
       ),
@@ -687,7 +691,7 @@ export default function ModelsPage({
                         className="h-[30px] gap-[4px] border-[#cbd8f2] bg-white px-[10px] text-[12px] text-[#464c5e]"
                       >
                         <LogOut className="size-[13px]" />
-                        退出订阅
+                        退出本机 Codex
                       </UIButton>
                     ) : subscriptionAccount?.status === 'pending' ? (
                       <UIButton
@@ -697,7 +701,7 @@ export default function ModelsPage({
                         onClick={cancelSubscriptionLogin}
                         className="h-[30px] border-[#cbd8f2] bg-white px-[10px] text-[12px] text-[#464c5e]"
                       >
-                        取消授权
+                        取消登录
                       </UIButton>
                     ) : (
                       <UIButton
@@ -712,7 +716,7 @@ export default function ModelsPage({
                     )}
                   </div>
                   <p className="text-[11px] leading-[16px] text-[#7483a0]">
-                    授权会在默认浏览器中直接完成。StaffDeck 不要求粘贴 API Key 或 OAuth code；为保持登录会在本机加密保存必要订阅凭据。
+                    登录由本机 Codex runtime 管理。StaffDeck 不保存 ChatGPT OAuth code、access token 或 refresh token。
                   </p>
                 </div>
               ) : (
@@ -841,9 +845,9 @@ export default function ModelsPage({
         onOpenChange={setSubscriptionLogoutConfirmOpen}
         loading={subscriptionLoading}
         destructive={false}
-        title="退出 ChatGPT 订阅？"
-        description="这会移除 StaffDeck 已加密保存的 ChatGPT 订阅凭据。所有采用“ChatGPT 订阅（Codex）”的模型都会失去授权；API Key 模型不受影响。"
-        confirmText="退出订阅"
+        title="退出本机 Codex？"
+        description="这会让本机 Codex 退出 ChatGPT。所有采用“ChatGPT 订阅（Codex）”的模型都会失去授权；同一台电脑上使用该 Codex 登录的其他应用也可能受影响。API Key 模型不受影响。"
+        confirmText="退出本机 Codex"
         onConfirm={confirmSubscriptionLogout}
       />
     </div>

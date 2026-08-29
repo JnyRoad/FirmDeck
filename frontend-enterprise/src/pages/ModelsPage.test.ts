@@ -15,17 +15,17 @@ import ModelsPage, {
 } from './ModelsPage';
 
 const subscriptionStatusCopy = {
-  '已连接 ChatGPT 订阅': {
+  '已连接本机 Codex 管理的 ChatGPT 订阅。': {
     status: 'connected',
-    translation: 'ChatGPT subscription connected',
+    translation: 'Connected to the ChatGPT subscription managed by local Codex.',
   },
-  '请在浏览器中完成 ChatGPT 授权。': {
+  '请在 Codex 打开的浏览器页面完成 ChatGPT 登录。': {
     status: 'pending',
-    translation: 'Complete ChatGPT authorization in your browser.',
+    translation: 'Complete the ChatGPT login in the browser opened by Codex.',
   },
-  '尚未连接 ChatGPT 订阅': {
+  '本机 Codex 尚未登录 ChatGPT 订阅。': {
     status: 'requires_login',
-    translation: 'ChatGPT subscription is not connected',
+    translation: 'Local Codex is not signed in to the ChatGPT subscription.',
   },
 } as const;
 
@@ -137,7 +137,7 @@ describe('model provider diagnostics', () => {
     expect(modelProviderErrorMessage({
       code: 'MODEL_SUBSCRIPTION_AUTH_REQUIRED',
       message: 'login required',
-    }, '测试失败')).toBe('请先在浏览器中连接 ChatGPT 订阅，再测试或启用此模型。');
+    }, '测试失败')).toBe('请先在本机 Codex 中登录 ChatGPT 订阅，再测试或启用此模型。');
   });
 
   it('renders ChatGPT subscription account statuses from the API in English', async () => {
@@ -168,5 +168,30 @@ describe('model provider diagnostics', () => {
       vi.unstubAllGlobals();
       window.localStorage.setItem('staffdeck_locale', 'en-US');
     }
+  });
+
+  it('explains that Codex, rather than StaffDeck, owns ChatGPT login credentials', async () => {
+    const fetchMock = stubModelsPageFetch({
+      status: 'connected',
+      plan_type: null,
+      message: '已连接本机 Codex 管理的 ChatGPT 订阅。',
+    });
+    const user = userEvent.setup();
+    render(createElement(I18nProvider, null, createElement(ModelsPage)));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        expect.stringContaining('/codex-subscription/account'),
+        expect.anything(),
+      );
+    });
+    window.dispatchEvent(new CustomEvent(OPEN_MODEL_CREATE_EVENT));
+    await user.click((await screen.findAllByRole('combobox'))[0]);
+    await user.click(await screen.findByRole('option', { name: 'ChatGPT 订阅（Codex）' }));
+
+    expect(await screen.findByText(
+      '登录由本机 Codex runtime 管理。StaffDeck 不保存 ChatGPT OAuth code、access token 或 refresh token。',
+    )).toBeTruthy();
+    expect(screen.queryByText(/加密保存必要订阅凭据/)).toBeNull();
   });
 });

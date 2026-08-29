@@ -658,11 +658,19 @@ def _subscription_account_response(
 
 
 def _subscription_error_status(code: str) -> int:
-    """将直接 OAuth 的安全错误码映射为稳定 HTTP 状态，不暴露上游原因。"""
-    if code == "MODEL_SUBSCRIPTION_CALLBACK_UNAVAILABLE":
-        return 409
-    if code == "MODEL_SUBSCRIPTION_BROWSER_UNAVAILABLE":
+    """将订阅运行时安全错误码映射为稳定 HTTP 状态，不暴露子进程细节。"""
+    if code in {
+        "MODEL_SUBSCRIPTION_BROWSER_UNAVAILABLE",
+        "MODEL_SUBSCRIPTION_RUNTIME_UNAVAILABLE",
+    }:
         return 503
+    if code == "MODEL_SUBSCRIPTION_RUNTIME_TIMEOUT":
+        return 504
+    if code in {
+        "MODEL_SUBSCRIPTION_RUNTIME_PROTOCOL_ERROR",
+        "MODEL_SUBSCRIPTION_RUNTIME_FAILED",
+    }:
+        return 502
     return 503
 
 
