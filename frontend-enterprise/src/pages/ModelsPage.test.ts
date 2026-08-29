@@ -1,7 +1,11 @@
 import { describe, expect, it } from 'vitest';
 
 import { ApiError } from '../api/client';
-import { modelActionError, modelProviderErrorMessage } from './ModelsPage';
+import {
+  modelActionError,
+  modelAuthModeLabel,
+  modelProviderErrorMessage,
+} from './ModelsPage';
 
 describe('model provider diagnostics', () => {
   it('renders upstream status, provider code, body and request id', () => {
@@ -51,5 +55,10 @@ describe('model provider diagnostics', () => {
     const error = new ApiError(422, JSON.stringify({ detail: 'MODEL_NEW_FAILURE' }), '');
 
     expect(modelActionError(error, '保存失败')).toBe('操作失败（错误码：MODEL_NEW_FAILURE）');
+  });
+
+  it('labels authentication modes', () => {
+    expect(modelAuthModeLabel('api_key')).toBe('API Key');
+    expect(modelAuthModeLabel('chatgpt_subscription')).toBe('ChatGPT 订阅（Codex）');
   });
 });
