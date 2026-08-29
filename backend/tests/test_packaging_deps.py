@@ -34,6 +34,17 @@ def test_pyinstaller_bundle_contains_the_build_version_resource() -> None:
     assert '(str(VERSION_FILE), ".")' in content
 
 
+def test_macos_bundle_version_uses_the_release_source_of_truth() -> None:
+    root = Path(__file__).resolve().parents[2]
+    spec = (root / "packaging" / "ultrarag.spec").read_text(encoding="utf-8")
+    build_script = (root / "packaging" / "build_macos.sh").read_text(encoding="utf-8")
+
+    assert 'export VERSION' in build_script
+    assert 'DEFAULT_VERSION_FILE = BACKEND / "VERSION"' in spec
+    assert 'DEFAULT_VERSION = DEFAULT_VERSION_FILE.read_text(encoding="utf-8").strip()' in spec
+    assert 'RAW_VERSION = os.environ.get("VERSION", DEFAULT_VERSION).strip() or DEFAULT_VERSION' in spec
+
+
 def test_pyinstaller_bundle_contains_lark_sdk_metadata() -> None:
     spec_path = Path(__file__).resolve().parents[2] / "packaging" / "ultrarag.spec"
     content = spec_path.read_text(encoding="utf-8")

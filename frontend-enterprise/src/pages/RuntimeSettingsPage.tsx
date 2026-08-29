@@ -6,7 +6,7 @@ import type { EnterpriseAuthUser } from '../auth';
 import AccountApiKeyDialog from '../components/AccountApiKeyDialog';
 import { copyTextToClipboard } from '../lib/clipboard';
 import type { NetworkSettingsRead, UIConfigRead } from '../types';
-import { BrainCircuit, Copy, ExternalLink, KeyRound, Network, RotateCcw, ShieldCheck } from 'lucide-react';
+import { BrainCircuit, Copy, KeyRound, Network, RotateCcw, ShieldCheck } from 'lucide-react';
 
 type UiConfigForm = {
   show_thinking_trace: boolean;
@@ -291,10 +291,6 @@ export default function RuntimeSettingsPage({ currentUser }: { currentUser: Ente
       <Card className="editor-card settings-card">
         <CardHeader><CardTitle className="flex items-center gap-[8px]"><Network className="size-[16px]" />网络与 API</CardTitle></CardHeader>
         <CardContent className="flex flex-col gap-[16px]">
-          <div className="rounded-[11px] border border-[#dce8fb] bg-[#f7faff] px-[13px] py-[11px] text-[12px] leading-[18px] text-[#52637d]">
-            <p className="font-medium text-[#2f3442]">StaffDeck Open API</p>
-            <p className="mt-[3px]">下面是当前桌面服务实际监听端口的 API 地址，不是 OpenAI 模型服务的 Base URL。账号 API 密钥在下方单独管理，密钥不会写入或复制到这里。</p>
-          </div>
           {networkSettings && <NetworkEndpointDetails settings={networkSettings} />}
           <div className="grid gap-[14px] md:grid-cols-2">
             <LabeledField label="下次启动访问范围" hint="保存后不改变当前服务；端口或访问范围变更需完全退出并重启 StaffDeck。">
@@ -396,15 +392,10 @@ export function validateContextSettings(form: UiConfigForm): string | null {
   return null;
 }
 
-/** Builds the matching StaffDeck Open API references from an already normalized Base URL. */
-export function buildApiEndpointLinks(activeBaseUrl: string): { baseUrl: string; docsUrl: string; openapiUrl: string } {
+/** Normalizes the one current same-machine API Base URL that the settings card displays. */
+export function buildApiEndpointLinks(activeBaseUrl: string): { baseUrl: string } {
   const baseUrl = activeBaseUrl.replace(/\/+$/, '');
-  return { baseUrl, docsUrl: `${baseUrl}/docs`, openapiUrl: `${baseUrl}/openapi.json` };
-}
-
-/** Returns an integration example containing the Base URL only, never an account API key. */
-export function buildBaseUrlEnvironmentExample(baseUrl: string): string {
-  return `STAFFDECK_API_BASE_URL=${baseUrl.replace(/\/+$/, '')}`;
+  return { baseUrl };
 }
 
 /** Validates next-launch browser input before the backend repeats the authoritative validation. */
@@ -446,24 +437,16 @@ function NetworkEndpointDetails({ settings }: { settings: NetworkSettingsRead })
   }
 
   const links = buildApiEndpointLinks(settings.active_base_url);
-  const publicLinks = settings.active_public_base_url
-    ? buildApiEndpointLinks(settings.active_public_base_url)
-    : null;
   return <div className="flex flex-col gap-[10px] rounded-[11px] border border-[#e6e9f0] bg-[#fbfbfc] px-[13px] py-[12px]">
     <EndpointRow label="当前本机 API Base URL" value={links.baseUrl} onCopy={() => void copyApiValue(links.baseUrl, 'Base URL')} />
-    <EndpointRow label="接口文档" value={links.docsUrl} href={links.docsUrl} onCopy={() => void copyApiValue(links.docsUrl, '接口文档地址')} />
-    <EndpointRow label="OpenAPI JSON" value={links.openapiUrl} href={links.openapiUrl} onCopy={() => void copyApiValue(links.openapiUrl, 'OpenAPI 地址')} />
-    <EndpointRow label="环境变量示例" value={buildBaseUrlEnvironmentExample(links.baseUrl)} onCopy={() => void copyApiValue(buildBaseUrlEnvironmentExample(links.baseUrl), '环境变量示例')} />
-    {publicLinks && <EndpointRow label="当前外部发布 API Base URL" value={publicLinks.baseUrl} onCopy={() => void copyApiValue(publicLinks.baseUrl, '外部发布 Base URL')} />}
   </div>;
 }
 
-function EndpointRow({ label, value, href, onCopy }: { label: string; value: string; href?: string; onCopy: () => void }) {
-  /** Renders one read-only API reference with explicit copy and optional document-navigation actions. */
+function EndpointRow({ label, value, onCopy }: { label: string; value: string; onCopy: () => void }) {
+  /** Renders the one read-only API Base URL and its explicit copy action. */
   return <div className="flex flex-wrap items-center justify-between gap-[8px] border-b border-[#e8ebf0] pb-[10px] last:border-0 last:pb-0">
     <div className="min-w-0"><p className="text-[11px] font-medium text-[#464c5e]">{label}</p><code className="mt-[3px] block break-all text-[11px] text-[#52637d]">{value}</code></div>
     <div className="flex shrink-0 gap-[6px]">
-      {href && <UIButton type="button" variant="outline" size="sm" asChild><a href={href} target="_blank" rel="noreferrer"><ExternalLink className="size-[13px]" />打开</a></UIButton>}
       <UIButton type="button" variant="outline" size="sm" onClick={onCopy}><Copy className="size-[13px]" />复制</UIButton>
     </div>
   </div>;
