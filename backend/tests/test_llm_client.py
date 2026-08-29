@@ -131,8 +131,8 @@ def test_llm_client_sets_outbound_user_agent_for_chat_completions(monkeypatch) -
         (),
         {
             "api_key_encrypted": "encrypted",
-            "base_url": "https://ytapi.ycflow.com/v1",
-            "model": "grok-4.6",
+            "base_url": "https://gateway.example.test/v1",
+            "model": "demo-model",
             "temperature": 0.2,
             "max_output_tokens": 128,
             "extra_body_json": {},
