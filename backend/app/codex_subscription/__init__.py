@@ -1,15 +1,15 @@
 from app.codex_subscription.app_server import (
-    CodexAppServer,
-    CodexAppServerError,
+    ChatGPTSubscriptionService,
     CodexSubscriptionAccount,
-    get_codex_app_server,
-    stop_codex_app_server,
+    CodexSubscriptionError,
+    get_codex_subscription_service,
+    stop_codex_subscription_service,
 )
 
 __all__ = [
-    "CodexAppServer",
-    "CodexAppServerError",
+    "ChatGPTSubscriptionService",
     "CodexSubscriptionAccount",
-    "get_codex_app_server",
-    "stop_codex_app_server",
+    "CodexSubscriptionError",
+    "get_codex_subscription_service",
+    "stop_codex_subscription_service",
 ]

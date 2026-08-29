@@ -93,6 +93,15 @@ const BLANK_MODEL_FORM: ModelForm = {
   enabled: true,
 };
 
+const SUBSCRIPTION_PROVIDER_USER_MESSAGES: Record<string, string> = {
+  MODEL_SUBSCRIPTION_ACCESS_DENIED: '当前 ChatGPT 订阅无权使用此模型，请检查订阅权益或模型名称。',
+  MODEL_SUBSCRIPTION_AUTH_FAILED: 'ChatGPT 授权未完成，请在浏览器中重新连接订阅。',
+  MODEL_SUBSCRIPTION_AUTH_REQUIRED: '请先在浏览器中连接 ChatGPT 订阅，再测试或启用此模型。',
+  MODEL_SUBSCRIPTION_CALLBACK_UNAVAILABLE: '无法监听本机浏览器授权回调，请关闭占用端口的程序后重试。',
+  MODEL_SUBSCRIPTION_NETWORK_UNAVAILABLE: '暂时无法连接 ChatGPT 订阅服务，请检查网络后重试。',
+  MODEL_SUBSCRIPTION_QUOTA_EXCEEDED: 'ChatGPT 订阅额度暂不可用，请稍后重试。',
+  MODEL_SUBSCRIPTION_REFRESH_FAILED: 'ChatGPT 授权已失效，请在浏览器中重新连接订阅。',
+};
 export function modelAuthModeLabel(authMode: ModelAuthMode | string | null | undefined): string {
   return authMode === 'chatgpt_subscription' ? 'ChatGPT 订阅（Codex）' : 'API Key';
 }
@@ -101,6 +110,8 @@ export function modelProviderErrorMessage(
   fallback: string,
 ): string {
   if (!error) return fallback;
+  const subscriptionMessage = SUBSCRIPTION_PROVIDER_USER_MESSAGES[error.code];
+  if (subscriptionMessage) return subscriptionMessage;
   const parts = [error.code || fallback];
   if (typeof error.upstream_status === 'number') parts.push(`HTTP ${error.upstream_status}`);
   if (error.provider_code) parts.push(`上游错误码：${error.provider_code}`);
@@ -351,7 +362,7 @@ export default function ModelsPage({
 
   function confirmSubscriptionLogout() {
     setSubscriptionLogoutConfirmOpen(false);
-    void updateSubscriptionAccount('logout', '无法退出本机 ChatGPT 订阅');
+    void updateSubscriptionAccount('logout', '无法退出 ChatGPT 订阅');
   }
 
   async function confirmDelete() {
@@ -484,7 +495,7 @@ export default function ModelsPage({
         <div className="flex min-w-0 flex-col gap-[2px]">
           <span className="line-clamp-1 wrap-break-word text-[#464c5e]">{modelAuthModeLabel(row.auth_mode)}</span>
           <span className="line-clamp-1 wrap-break-word text-[#858b9c]">
-            {row.auth_mode === 'chatgpt_subscription' ? '本机 Codex' : row.base_url || '未设置 Base URL'}
+            {row.auth_mode === 'chatgpt_subscription' ? 'ChatGPT 浏览器授权' : row.base_url || '未设置 Base URL'}
           </span>
         </div>
       ),
@@ -525,7 +536,7 @@ export default function ModelsPage({
       </div>
       <p className="mt-[8px] line-clamp-1 wrap-break-word text-[12px] text-[#858b9c]">{row.model}</p>
       <p className="mt-[4px] line-clamp-1 wrap-break-word font-mono text-[12px] text-[#858b9c]">
-        {row.auth_mode === 'chatgpt_subscription' ? '本机 Codex 订阅' : row.api_key_masked || '-'}
+        {row.auth_mode === 'chatgpt_subscription' ? 'ChatGPT 订阅' : row.api_key_masked || '-'}
       </p>
     </article>
   );
@@ -659,9 +670,9 @@ export default function ModelsPage({
                 <div className="flex flex-col gap-[10px] rounded-[10px] border border-[#dce7ff] bg-[#f6f9ff] p-[12px] sm:col-span-2">
                   <div className="flex flex-wrap items-start justify-between gap-[10px]">
                     <div className="min-w-0">
-                      <p className="text-[12px] font-medium text-[#29466f]">本机 ChatGPT 订阅</p>
+                      <p className="text-[12px] font-medium text-[#29466f]">ChatGPT 订阅</p>
                       <p className="mt-[3px] text-[12px] leading-[18px] text-[#5d6f8c]">
-                        {subscriptionAccount?.message || '正在读取本机 Codex 订阅状态…'}
+                        {subscriptionAccount?.message || '正在读取 ChatGPT 订阅状态…'}
                         {subscriptionAccount?.status === 'connected' && subscriptionAccount.plan_type
                           ? `（${subscriptionAccount.plan_type}）`
                           : ''}
@@ -676,7 +687,7 @@ export default function ModelsPage({
                         className="h-[30px] gap-[4px] border-[#cbd8f2] bg-white px-[10px] text-[12px] text-[#464c5e]"
                       >
                         <LogOut className="size-[13px]" />
-                        退出本机订阅
+                        退出订阅
                       </UIButton>
                     ) : subscriptionAccount?.status === 'pending' ? (
                       <UIButton
@@ -701,7 +712,7 @@ export default function ModelsPage({
                     )}
                   </div>
                   <p className="text-[11px] leading-[16px] text-[#7483a0]">
-                    授权会在默认浏览器中完成。StaffDeck 不保存 API Key、OAuth code 或访问令牌。
+                    授权会在默认浏览器中直接完成。StaffDeck 不要求粘贴 API Key 或 OAuth code；为保持登录会在本机加密保存必要订阅凭据。
                   </p>
                 </div>
               ) : (
@@ -830,8 +841,8 @@ export default function ModelsPage({
         onOpenChange={setSubscriptionLogoutConfirmOpen}
         loading={subscriptionLoading}
         destructive={false}
-        title="退出本机 ChatGPT 订阅？"
-        description="这会退出当前设备上 Codex 使用的 ChatGPT 订阅。所有采用“ChatGPT 订阅（Codex）”的模型都会失去授权；API Key 模型不受影响。"
+        title="退出 ChatGPT 订阅？"
+        description="这会移除 StaffDeck 已加密保存的 ChatGPT 订阅凭据。所有采用“ChatGPT 订阅（Codex）”的模型都会失去授权；API Key 模型不受影响。"
         confirmText="退出订阅"
         onConfirm={confirmSubscriptionLogout}
       />

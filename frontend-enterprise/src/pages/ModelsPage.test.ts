@@ -19,17 +19,13 @@ const subscriptionStatusCopy = {
     status: 'connected',
     translation: 'ChatGPT subscription connected',
   },
-  '已在默认浏览器中打开 ChatGPT 授权页面': {
+  '请在浏览器中完成 ChatGPT 授权。': {
     status: 'pending',
-    translation: 'Opened the ChatGPT authorization page in your default browser',
+    translation: 'Complete ChatGPT authorization in your browser.',
   },
   '尚未连接 ChatGPT 订阅': {
     status: 'requires_login',
     translation: 'ChatGPT subscription is not connected',
-  },
-  '本机 Codex 订阅运行时不可用': {
-    status: 'unavailable',
-    translation: 'The local Codex subscription runtime is unavailable',
   },
 } as const;
 
@@ -138,6 +134,10 @@ describe('model provider diagnostics', () => {
   it('labels authentication modes', () => {
     expect(modelAuthModeLabel('api_key')).toBe('API Key');
     expect(modelAuthModeLabel('chatgpt_subscription')).toBe('ChatGPT 订阅（Codex）');
+    expect(modelProviderErrorMessage({
+      code: 'MODEL_SUBSCRIPTION_AUTH_REQUIRED',
+      message: 'login required',
+    }, '测试失败')).toBe('请先在浏览器中连接 ChatGPT 订阅，再测试或启用此模型。');
   });
 
   it('renders ChatGPT subscription account statuses from the API in English', async () => {
@@ -162,6 +162,7 @@ describe('model provider diagnostics', () => {
       await user.click((await screen.findAllByRole('combobox'))[0]);
       await user.click(await screen.findByRole('option', { name: 'ChatGPT Subscription (Codex)' }));
       expect(await screen.findByText(account.translation)).toBeTruthy();
+      expect(screen.queryByText(/local Codex subscription runtime/i)).toBeNull();
 
       cleanup();
       vi.unstubAllGlobals();

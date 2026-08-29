@@ -1,20 +1,17 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
-from dataclasses import dataclass
 import base64
 import binascii
 import json
 import re
-from types import SimpleNamespace
+from collections.abc import Iterator
+from dataclasses import dataclass
 from threading import Event
+from types import SimpleNamespace
 from typing import Any, Protocol
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 import httpx
-
-from app.codex_subscription import CodexAppServer, CodexAppServerError
-
 
 _DATA_URL = re.compile(r"^data:(image/(?:jpeg|png|gif|webp));base64,(.+)$", re.DOTALL)
 _MAX_IMAGE_BYTES = 5 * 1024 * 1024
@@ -110,93 +107,10 @@ class ChatCompletionsDriver:
 
 
 @dataclass(frozen=True)
-class CodexAppServerDriver:
-    """Map StaffDeck's internal prompt shape to a local Codex subscription turn."""
-
-    app_server: CodexAppServer
-    model: str
-    request_kind: str = "codex.app_server"
-
-    def observable_request(
-        self,
-        request: dict[str, Any],
-        *,
-        stream: bool,
-    ) -> dict[str, Any]:
-        return {
-            "model": self.model,
-            "messages": request.get("messages") or [],
-            "stream": stream,
-        }
-
-    def complete(self, request: dict[str, Any]) -> Any:
-        text = "".join(self._text_stream(request))
-        return SimpleNamespace(
-            id=None,
-            choices=[
-                SimpleNamespace(
-                    message=SimpleNamespace(content=text),
-                    finish_reason="stop",
-                )
-            ],
-        )
-
-    def stream(self, request: dict[str, Any]) -> Iterator[Any]:
-        def iterate() -> Iterator[Any]:
-            for text in self._text_stream(request):
-                yield _stream_chunk(None, text=text)
-            yield _stream_chunk(None, finish_reason="stop")
-
-        return iterate()
-
-    def _text_stream(self, request: dict[str, Any]) -> Iterator[str]:
-        _raise_if_cancelled(request)
-        system_prompt, user_prompt = _codex_prompts(request.get("messages") or [])
-        try:
-            for text in self.app_server.stream_text(
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                model=self.model,
-                cancellation=request.get("_cancellation"),
-            ):
-                _raise_if_cancelled(request)
-                if text:
-                    yield text
-        except ProtocolCallError:
-            raise
-        except CodexAppServerError as exc:
-            raise ProtocolCallError(exc.code) from exc
-
-
-def _codex_prompts(messages: list[dict[str, Any]]) -> tuple[str, str]:
-    system_parts: list[str] = []
-    conversation_parts: list[str] = []
-    user_parts: list[str] = []
-    for message in messages:
-        role = str(message.get("role") or "user")
-        content = _content_text(message.get("content"))
-        if not content:
-            continue
-        if role in {"system", "developer"}:
-            system_parts.append(content)
-        elif role == "user":
-            user_parts.append(content)
-            conversation_parts.append(f"用户：{content}")
-        elif role == "assistant":
-            conversation_parts.append(f"助手：{content}")
-
-    system_prompt = "\n\n".join(system_parts)
-    if len(conversation_parts) == 1 and len(user_parts) == 1:
-        return system_prompt, user_parts[0]
-    if conversation_parts:
-        return system_prompt, "\n\n".join(conversation_parts)
-    return system_prompt, ""
-
-
-@dataclass(frozen=True)
 class OpenAIResponsesDriver:
     client: Any
     request_kind: str = "responses"
+    subscription_error_mapping: bool = False
 
     def observable_request(
         self,
@@ -216,7 +130,7 @@ class OpenAIResponsesDriver:
         except ProtocolCallError:
             raise
         except Exception as exc:
-            raise _protocol_call_error(exc) from exc
+            raise self._call_error(exc) from exc
         return _responses_completion(response)
 
     def stream(self, request: dict[str, Any]) -> Iterator[Any]:
@@ -227,7 +141,7 @@ class OpenAIResponsesDriver:
                 stream=True,
             )
         except Exception as exc:
-            raise _protocol_call_error(exc) from exc
+            raise self._call_error(exc) from exc
         response_id = None
         try:
             for event in events:
@@ -258,6 +172,8 @@ class OpenAIResponsesDriver:
                     error = _object_value(event, "error") or _object_value(
                         _object_value(event, "response"), "error"
                     )
+                    if self.subscription_error_mapping:
+                        raise _subscription_stream_error(error)
                     provider_code, provider_message = _provider_error_fields(error)
                     raise ProtocolCallError(
                         "MODEL_UPSTREAM_ERROR",
@@ -274,6 +190,12 @@ class OpenAIResponsesDriver:
             close = getattr(events, "close", None)
             if callable(close):
                 close()
+
+    def _call_error(self, exc: Exception) -> ProtocolCallError:
+        """将 ChatGPT 订阅上游错误映射为可执行的订阅提示，其余协议维持原分类。"""
+        if self.subscription_error_mapping:
+            return subscription_protocol_call_error(exc)
+        return _protocol_call_error(exc)
 
 
 @dataclass(frozen=True)
@@ -792,6 +714,52 @@ def _protocol_call_error(exc: Exception) -> ProtocolCallError:
     }
     code, retryable = _model_error_classification(status=status, exception_name=name)
     return ProtocolCallError(code, retryable=retryable, **details)
+
+
+def subscription_protocol_call_error(exc: Exception) -> ProtocolCallError:
+    """把 ChatGPT 订阅端点错误转换为授权、权益、配额或网络的安全错误码。"""
+    generic = _protocol_call_error(exc)
+    status = generic.status_code
+    if status == 401:
+        code, retryable = "MODEL_SUBSCRIPTION_AUTH_REQUIRED", False
+    elif status == 403:
+        code, retryable = "MODEL_SUBSCRIPTION_ACCESS_DENIED", False
+    elif status == 429:
+        code, retryable = "MODEL_SUBSCRIPTION_QUOTA_EXCEEDED", True
+    elif status is None or status >= 500:
+        code, retryable = "MODEL_SUBSCRIPTION_NETWORK_UNAVAILABLE", True
+    else:
+        return generic
+    return ProtocolCallError(
+        code,
+        retryable=retryable,
+        status_code=generic.status_code,
+        provider_code=generic.provider_code,
+        provider_message=generic.provider_message,
+        upstream_body=generic.upstream_body,
+        request_id=generic.request_id,
+    )
+
+
+def _subscription_stream_error(error: Any) -> ProtocolCallError:
+    """分类流式订阅错误事件，避免将额度或授权问题降级为通用上游错误。"""
+    provider_code, provider_message = _provider_error_fields(error)
+    normalized = f"{provider_code or ''} {provider_message or ''}".lower()
+    if any(term in normalized for term in ("quota", "rate", "limit")):
+        code, retryable = "MODEL_SUBSCRIPTION_QUOTA_EXCEEDED", True
+    elif any(term in normalized for term in ("permission", "access", "entitlement")):
+        code, retryable = "MODEL_SUBSCRIPTION_ACCESS_DENIED", False
+    elif any(term in normalized for term in ("auth", "login", "token")):
+        code, retryable = "MODEL_SUBSCRIPTION_AUTH_REQUIRED", False
+    else:
+        code, retryable = "MODEL_SUBSCRIPTION_NETWORK_UNAVAILABLE", True
+    return ProtocolCallError(
+        code,
+        retryable=retryable,
+        provider_code=provider_code,
+        provider_message=provider_message,
+        upstream_body=_safe_upstream_body(error),
+    )
 
 
 def _model_error_classification(

@@ -22,7 +22,6 @@ class Settings(BaseSettings):
     codex_a2a_workspace_root: str = ""
     codex_a2a_timeout_seconds: float = 1800.0
     codex_a2a_token: str = ""
-    codex_subscription_command: str = "codex"
     codex_subscription_timeout_seconds: float = 30.0
     tool_base_url: str = "http://localhost:5173"
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
