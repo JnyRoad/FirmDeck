@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -289,7 +290,7 @@ class _SubscriptionRuntime:
 
     def start_login(self) -> _SubscriptionAccount:
         self.calls.append("login")
-        return _SubscriptionAccount("pending", None, "已在默认浏览器中打开 ChatGPT 授权页面")
+        return _SubscriptionAccount("pending", None, "请在浏览器中完成 ChatGPT 授权。")
 
     def cancel_login(self) -> _SubscriptionAccount:
         self.calls.append("cancel")
@@ -311,7 +312,7 @@ def test_subscription_account_routes_return_only_safe_status(monkeypatch) -> Non
         pytest.fail("model configuration API must expose subscription account controls")
 
     runtime = _SubscriptionRuntime()
-    monkeypatch.setattr(model_configs_module, "get_codex_app_server", lambda: runtime)
+    monkeypatch.setattr(model_configs_module, "get_codex_subscription_service", lambda: runtime)
 
     connected = model_configs_module.get_codex_subscription_account("tenant_a", _admin())
     pending = model_configs_module.start_codex_subscription_login("tenant_a", _admin())
@@ -326,6 +327,29 @@ def test_subscription_account_routes_return_only_safe_status(monkeypatch) -> Non
     assert runtime.calls == ["status", "login", "cancel", "logout"]
     assert "authUrl" not in str(connected.model_dump())
     assert "secret" not in str(pending.model_dump())
+
+
+def test_subscription_account_routes_map_direct_oauth_errors_without_upstream_detail(monkeypatch) -> None:
+    subscription_module = importlib.import_module("app.codex_subscription")
+
+    class _UnavailableBrowserRuntime:
+        def start_login(self) -> _SubscriptionAccount:
+            raise subscription_module.CodexSubscriptionError(
+                "MODEL_SUBSCRIPTION_CALLBACK_UNAVAILABLE"
+            )
+
+    monkeypatch.setattr(
+        model_configs_module,
+        "get_codex_subscription_service",
+        lambda: _UnavailableBrowserRuntime(),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        model_configs_module.start_codex_subscription_login("tenant_a", _admin())
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail == "MODEL_SUBSCRIPTION_CALLBACK_UNAVAILABLE"
+    assert "token" not in str(exc_info.value.detail).lower()
 
 
 def test_chat_extra_body_is_not_validated_as_protocol_options(tmp_path) -> None:

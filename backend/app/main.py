@@ -31,7 +31,7 @@ from app.api import (
 )
 from app.async_jobs import shutdown_async_jobs, start_async_jobs
 from app.channels import start_channel_services, stop_channel_services
-from app.codex_subscription import stop_codex_app_server
+from app.codex_subscription import stop_codex_subscription_service
 from app.config import get_settings
 from app.core.harness_recovery import (
     recover_orphan_harness_runs,
@@ -100,7 +100,7 @@ def on_startup() -> None:
 def on_shutdown() -> None:
     try:
         stop_codex_a2a_tasks()
-        stop_codex_app_server()
+        stop_codex_subscription_service()
         stop_public_api_maintenance()
         stop_channel_services()
         stop_background_worker()

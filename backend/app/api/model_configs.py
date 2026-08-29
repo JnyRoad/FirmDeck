@@ -11,9 +11,9 @@ from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from app.codex_subscription import (
-    CodexAppServerError,
     CodexSubscriptionAccount,
-    get_codex_app_server,
+    CodexSubscriptionError,
+    get_codex_subscription_service,
 )
 from app.db import get_session
 from app.db.models import AgentModelBinding, ModelConfig, User, utc_now
@@ -127,7 +127,7 @@ def get_codex_subscription_account(
     tenant_id: str = Query(...), current_user: User = Depends(get_current_user)
 ) -> CodexSubscriptionAccountRead:
     ensure_tenant_admin(tenant_id, current_user)
-    return _subscription_account_response(get_codex_app_server().account_status)
+    return _subscription_account_response(get_codex_subscription_service().account_status)
 
 
 @router.post(
@@ -139,7 +139,7 @@ def start_codex_subscription_login(
     tenant_id: str = Query(...), current_user: User = Depends(get_current_user)
 ) -> CodexSubscriptionAccountRead:
     ensure_tenant_admin(tenant_id, current_user)
-    return _subscription_account_response(get_codex_app_server().start_login)
+    return _subscription_account_response(get_codex_subscription_service().start_login)
 
 
 @router.post(
@@ -151,7 +151,7 @@ def cancel_codex_subscription_login(
     tenant_id: str = Query(...), current_user: User = Depends(get_current_user)
 ) -> CodexSubscriptionAccountRead:
     ensure_tenant_admin(tenant_id, current_user)
-    return _subscription_account_response(get_codex_app_server().cancel_login)
+    return _subscription_account_response(get_codex_subscription_service().cancel_login)
 
 
 @router.post(
@@ -163,7 +163,7 @@ def logout_codex_subscription(
     tenant_id: str = Query(...), current_user: User = Depends(get_current_user)
 ) -> CodexSubscriptionAccountRead:
     ensure_tenant_admin(tenant_id, current_user)
-    return _subscription_account_response(get_codex_app_server().logout)
+    return _subscription_account_response(get_codex_subscription_service().logout)
 
 
 @router.post("", response_model=ModelConfigRead)
@@ -652,9 +652,18 @@ def _subscription_account_response(
 ) -> CodexSubscriptionAccountRead:
     try:
         result = operation()
-    except CodexAppServerError as exc:
-        raise HTTPException(status_code=503, detail=exc.code) from exc
+    except CodexSubscriptionError as exc:
+        raise HTTPException(status_code=_subscription_error_status(exc.code), detail=exc.code) from exc
     return CodexSubscriptionAccountRead(**result.to_dict())
+
+
+def _subscription_error_status(code: str) -> int:
+    """将直接 OAuth 的安全错误码映射为稳定 HTTP 状态，不暴露上游原因。"""
+    if code == "MODEL_SUBSCRIPTION_CALLBACK_UNAVAILABLE":
+        return 409
+    if code == "MODEL_SUBSCRIPTION_BROWSER_UNAVAILABLE":
+        return 503
+    return 503
 
 
 def _validate_subscription_update_request(request: ModelConfigUpdateRequest) -> None:

@@ -114,7 +114,7 @@ PowerShell 运行 .\scripts\dev_up.ps1 --detach；验证 /api/health 和
 - 支持 macOS、Linux、WSL 或 Windows PowerShell
 - Python **3.11+**
 - Node.js **20+** 与 npm
-- 一种模型连接方式：OpenAI 兼容接口与 API Key，或已使用 ChatGPT 订阅登录的本机 Codex
+- 一种模型连接方式：OpenAI 兼容接口与 API Key，或在本机浏览器中直接授权的 ChatGPT 订阅
 - 应用本身不要求 CUDA；硬件要求由所选择的模型服务决定
 
 ### 1. 克隆并安装
@@ -157,7 +157,7 @@ DEMO_MODEL_API_KEY="你的API-Key"
 
 API Key 用于创建初始模型配置，存入数据库前会被加密。请勿提交 `backend/.env`。
 
-也可以在服务启动后打开 **管理员 → 模型配置 → 新建模型**，选择 **ChatGPT 订阅（Codex）**，再点击 **连接 ChatGPT 订阅**。本机 Codex 会在默认浏览器中完成正常登录；StaffDeck 不要求、不保存也不返回 ChatGPT OAuth code、回调地址、访问令牌或 API Key。API Key 模型与订阅模型可同时存在。退出订阅会影响这台设备上的 Codex 账号及所有使用它的订阅模型。
+也可以在服务启动后打开 **管理员 → 模型配置 → 新建模型**，选择 **ChatGPT 订阅（Codex）**，再点击 **连接 ChatGPT 订阅**。StaffDeck 会在同一台设备的默认浏览器中直接打开正常的 ChatGPT 授权页面，不要求本机安装 Codex；StaffDeck 不要求也不返回 ChatGPT OAuth code、回调地址、访问令牌或 API Key。为保持已授权订阅，它会将必要订阅凭据加密保存到本机数据库，并与模型 API Key 字段隔离。API Key 模型与订阅模型可同时存在。退出订阅会移除该本机加密凭据，并影响所有使用它的订阅模型。该流程仅支持能够打开默认浏览器并绑定 `localhost:1455` 的本机桌面安装，不支持远程或无头部署。
 
 ### 3. 启动 Web Demo
 
@@ -285,13 +285,13 @@ StaffDeck/
 <details>
 <summary><strong>页面可以打开，但数字员工不回答。</strong></summary>
 
-检查所选模型配置、模型名和连接路径。API Key 模型请检查密钥与模型服务网络；订阅模型请确认本机 Codex 已登录预期的 ChatGPT 订阅。随后查看执行记录与 `.dev/logs/app.log` 中的错误码。
+检查所选模型配置、模型名和连接路径。API Key 模型请检查密钥与模型服务网络；订阅模型请在本机浏览器中重新连接预期的 ChatGPT 订阅。随后查看执行记录与 `.dev/logs/app.log` 中的错误码。
 </details>
 
 <details>
 <summary><strong>没有本地 GPU 可以运行吗？</strong></summary>
 
-可以。API Key 模型会调用你配置的接口，订阅模型则使用本机 Codex 运行时；两种方式都不要求 StaffDeck 自身使用 GPU。GPU 要求由你自行部署或使用的模型服务决定。
+可以。API Key 模型会调用你配置的接口，订阅模型则使用直接 ChatGPT 授权路径；两种方式都不要求 StaffDeck 自身使用 GPU。GPU 要求由你自行部署或使用的模型服务决定。
 </details>
 
 <details>

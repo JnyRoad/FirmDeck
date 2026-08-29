@@ -1,21 +1,21 @@
 from __future__ import annotations
 
 import ast
-from collections.abc import Iterator, Mapping
 import copy
 import hashlib
 import json
 import math
 import re
+from collections.abc import Iterator, Mapping
 from typing import Any
 from urllib.parse import urlsplit
 
 import httpx
-from openai import OpenAI
 from anthropic import Anthropic
+from openai import OpenAI
 
+from app.codex_subscription import CodexSubscriptionError, get_codex_subscription_service
 from app.config import get_settings
-from app.codex_subscription import get_codex_app_server
 from app.db.models import ModelConfig
 from app.llm.model_protocols import ModelApiProtocol
 from app.llm.output_policy import (
@@ -26,7 +26,6 @@ from app.llm.protocol_drivers import (
     AnthropicMessagesDriver,
     CancellationToken,
     ChatCompletionsDriver,
-    CodexAppServerDriver,
     GeminiGenerateContentDriver,
     OpenAIResponsesDriver,
     ProtocolCallError,
@@ -116,8 +115,17 @@ class LLMClient:
         )
         self.base_url = str(model_config.base_url or "")
         if protocol is ModelApiProtocol.CODEX_APP_SERVER:
-            self.client = None
-            self.driver = CodexAppServerDriver(get_codex_app_server(), model_config.model)
+            try:
+                self.client = get_codex_subscription_service().create_openai_client(
+                    timeout_seconds=self.timeout_seconds,
+                )
+            except CodexSubscriptionError as exc:
+                raise LLMError(exc.code) from exc
+            self.driver = OpenAIResponsesDriver(
+                self.client,
+                request_kind="codex.subscription.responses",
+                subscription_error_mapping=True,
+            )
         elif protocol is ModelApiProtocol.OPENAI_CHAT_COMPLETIONS:
             self.client = OpenAI(
                 api_key=api_key,
@@ -535,7 +543,6 @@ class LLMClient:
         self,
     ) -> (
         ChatCompletionsDriver
-        | CodexAppServerDriver
         | OpenAIResponsesDriver
         | AnthropicMessagesDriver
         | GeminiGenerateContentDriver
@@ -551,6 +558,12 @@ class LLMClient:
                     self.base_url,
                     getattr(self, "api_key", ""),
                     self.model,
+                )
+            elif protocol is ModelApiProtocol.CODEX_APP_SERVER:
+                driver = OpenAIResponsesDriver(
+                    self.client,
+                    request_kind="codex.subscription.responses",
+                    subscription_error_mapping=True,
                 )
             elif protocol is ModelApiProtocol.OPENAI_RESPONSES:
                 driver = OpenAIResponsesDriver(self.client)
