@@ -8,7 +8,7 @@ load every matching file.
 |---|---|
 | Read, change, test, or debug backend code | `agent-rules/context.md` + `agent-rules/backend.md` |
 | Read, change, test, or debug frontend code | `agent-rules/context.md` + `agent-rules/frontend.md` |
-| Change UI copy, localization, or locale behavior | `agent-rules/i18n.md` (and `frontend.md` when frontend code changes) |
+| Change UI copy, localization, or locale behavior | `agent-rules/i18n.md` (and `agent-rules/frontend.md` when frontend code changes) |
 | Run the local application | `agent-rules/local-runtime.md` |
 | Change configuration, credentials, or security-sensitive behavior | `agent-rules/security.md` |
 | Write or reorganize project documentation | `agent-rules/documentation.md` |
