@@ -114,7 +114,7 @@ plus /workspace/gallery before reporting success.
 - macOS, Linux, WSL, or Windows PowerShell
 - Python **3.11+**
 - Node.js **20+** and npm
-- One model connection option: an OpenAI-compatible endpoint and API key, or a ChatGPT subscription authorized directly in the local browser
+- One model connection option: an OpenAI-compatible endpoint and API key, or a ChatGPT subscription through a locally installed and authenticated Codex CLI
 - No CUDA requirement for the application itself; hardware requirements depend on the selected model service
 
 ### 1. Clone and Install
@@ -159,13 +159,13 @@ The API key is used to create the initial model configuration and is encrypted b
 
 Alternatively, start StaffDeck, open **Admin → Model Configuration → New Model**, select
 **ChatGPT subscription (Codex)**, and choose **Connect ChatGPT subscription**. StaffDeck opens the
-normal ChatGPT authorization page in the default browser on the same machine; it never requires a
-local Codex installation. StaffDeck does not ask for or return a ChatGPT OAuth code, callback,
-access token, or API key. To retain the approved subscription, it encrypts the necessary
-subscription credential in the local database, separately from model API-key fields. API Key and
-subscription models can coexist. Signing out removes that local encrypted subscription credential
-and affects every subscription model that uses it. This flow requires a local desktop/browser
-installation that can open the default browser and bind `localhost:1455`; it is not supported from
+Codex-managed ChatGPT login page in the default browser on the same machine. The configured
+`CODEX_SUBSCRIPTION_COMMAND` defaults to `codex` and is resolved from `PATH` at runtime, so the
+actual installed Codex CLI is used. StaffDeck does not ask for, return, or store a ChatGPT OAuth
+code, callback, access token, refresh token, or subscription credential. API Key and subscription
+models can coexist. Signing out signs the local Codex CLI out of ChatGPT, affecting every
+subscription model and potentially other applications on the same computer that share that Codex
+login. This flow requires a local Codex CLI that can open a browser; it is not supported from
 remote or headless deployments.
 
 ### 3. Launch the Web Demo
@@ -293,17 +293,17 @@ StaffDeck/
 <summary><strong>The page opens, but the digital employee does not answer.</strong></summary>
 
 Check the selected model configuration, model name, and connection path. For API Key models,
-check the key and model-service network; for subscription models, reconnect the intended ChatGPT
-subscription in the local browser. Then inspect the execution record and `.dev/logs/app.log` for
-the error code.
+check the key and model-service network; for subscription models, confirm the intended local Codex
+CLI is installed and signed in to ChatGPT. Then inspect the execution record and `.dev/logs/app.log`
+for the error code.
 </details>
 
 <details>
 <summary><strong>Can StaffDeck run without a local GPU?</strong></summary>
 
-Yes. API Key models call the endpoint you configure, while subscription models use the direct
-ChatGPT authorization route; neither path requires a GPU for StaffDeck itself. GPU requirements
-depend on the model service you deploy or use.
+Yes. API Key models call the endpoint you configure, while subscription models use the local Codex
+runtime; neither path requires a GPU for StaffDeck itself. GPU requirements depend on the model
+service you deploy or use.
 </details>
 
 <details>
