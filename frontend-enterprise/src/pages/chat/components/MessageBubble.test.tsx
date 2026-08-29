@@ -210,6 +210,40 @@ describe('MessageBubble copy button', () => {
     } as unknown as UseChatSession;
   }
 
+  it('keeps assistant feedback ahead of copy and reveals the actions on message hover', () => {
+    const item: ChatMessage = {
+      id: 'message-assistant-actions',
+      role: 'assistant',
+      content: '这是助手的回复内容',
+      created_at: '2026-08-15T00:00:00Z',
+    };
+    const messageRender: MessageRender = {
+      traceTurnId: 'turn-assistant-actions',
+      summary: null,
+      details: [],
+      expanded: false,
+      showInlineTrace: false,
+      visibleContent: item.content,
+      citations: [],
+      scheduledDraft: null,
+      scheduledTaskPrompt: false,
+      attachments: [],
+      harnessArtifacts: [],
+      statusOnly: false,
+    };
+
+    const { container } = render(<MessageBubble chat={baseChat()} item={item} render={messageRender} />);
+    const actionButtons = screen.getAllByRole('button');
+    const actions = actionButtons[0].parentElement;
+
+    expect(actionButtons.map((button) => button.getAttribute('aria-label'))).toEqual(['点赞', '点踩', '复制']);
+    expect(container.firstElementChild?.className).toContain('group/message');
+    expect(actions?.className).toContain('max-h-0');
+    expect(actions?.className).toContain('opacity-0');
+    expect(actions?.className).toContain('group-hover/message:max-h-[28px]');
+    expect(actions?.className).toContain('group-focus-within/message:max-h-[28px]');
+  });
+
   it('copies an assistant reply to the clipboard and shows confirmation', async () => {
     copyTextToClipboardMock.mockClear();
     const item: ChatMessage = {
@@ -242,7 +276,7 @@ describe('MessageBubble copy button', () => {
     await waitFor(() => expect(screen.getByRole('button', { name: '已复制' })).toBeTruthy());
   });
 
-  it('shows a copy button for a plain user message', () => {
+  it('reveals the plain user message copy action only on message hover', () => {
     const item: ChatMessage = {
       id: 'message-user-1',
       role: 'user',
@@ -264,9 +298,15 @@ describe('MessageBubble copy button', () => {
       statusOnly: false,
     };
 
-    render(<MessageBubble chat={baseChat()} item={item} render={messageRender} />);
+    const { container } = render(<MessageBubble chat={baseChat()} item={item} render={messageRender} />);
+    const copyButton = screen.getByRole('button', { name: '复制' });
+    const actions = copyButton.parentElement;
 
-    expect(screen.getByRole('button', { name: '复制' })).toBeTruthy();
+    expect(container.firstElementChild?.className).toContain('group/message');
+    expect(actions?.className).toContain('max-h-0');
+    expect(actions?.className).toContain('opacity-0');
+    expect(actions?.className).toContain('group-hover/message:max-h-[28px]');
+    expect(actions?.className).toContain('group-focus-within/message:max-h-[28px]');
   });
 
   it('hides the copy button while an assistant reply is still streaming', () => {
