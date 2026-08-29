@@ -999,24 +999,32 @@ function ChatSessionRow({
           </TooltipContent>
         )}
       </Tooltip>
-      <span className="flex min-w-0 flex-1 flex-col justify-between self-stretch py-[3px]">
-        <span className="flex min-w-0 items-center gap-[4px]">
-          <span className="truncate text-[14px] leading-none text-[#464c5e] capitalize" title={displayTitle}>
-            {displayTitle}
-          </span>
-          {isTeamGroup && (
-            <span
-              aria-label="群聊"
-              className="inline-flex h-[16px] shrink-0 items-center rounded-full bg-[#e8f0ff] px-[5px] text-[10px] font-medium leading-none text-[#1a71ff]"
-            >
-              群聊
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <span className="flex min-w-0 flex-1 flex-col justify-between self-stretch py-[3px]">
+            <span className="flex min-w-0 items-center gap-[4px]">
+              <span className="truncate text-[14px] leading-none text-[#464c5e] capitalize">
+                {displayTitle}
+              </span>
+              {isTeamGroup && (
+                <span
+                  aria-label="群聊"
+                  className="inline-flex h-[16px] shrink-0 items-center rounded-full bg-[#e8f0ff] px-[5px] text-[10px] font-medium leading-none text-[#1a71ff]"
+                >
+                  群聊
+                </span>
+              )}
             </span>
-          )}
-        </span>
-        <span className="truncate text-[12px] leading-none text-[#757f9c]" title={displaySubtitle}>
-          {displaySubtitle}
-        </span>
-      </span>
+            <span className="truncate text-[12px] leading-none text-[#757f9c]">
+              {displaySubtitle}
+            </span>
+          </span>
+        </TooltipTrigger>
+        <TooltipContent side="right" align="start" className="flex-col items-start gap-0.5 whitespace-normal text-left max-w-[260px]">
+          <span className="font-medium">{displayTitle}</span>
+          {displaySubtitle && <span className="text-background/70">{displaySubtitle}</span>}
+        </TooltipContent>
+      </Tooltip>
       {unread && (
         <span className="ml-[2px] size-[7px] shrink-0 rounded-full bg-[#f5483b]" aria-label="未读回复" />
       )}
