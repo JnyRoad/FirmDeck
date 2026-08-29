@@ -1,12 +1,14 @@
 // @vitest-environment jsdom
 
-import { createElement, useEffect } from 'react';
+import { createElement } from 'react';
 import { cleanup, render, screen, waitFor } from '@testing-library/react';
-import { afterEach, describe, expect, it } from 'vitest';
+import userEvent from '@testing-library/user-event';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { ApiError } from '../api/client';
-import { I18nProvider, useI18n } from '../i18n';
-import {
+import { I18nProvider } from '../i18n';
+import { OPEN_MODEL_CREATE_EVENT } from '@/components/QuickStartGuide';
+import ModelsPage, {
   modelActionError,
   modelAuthModeLabel,
   modelProviderDiagnosticText,
@@ -14,26 +16,73 @@ import {
 } from './ModelsPage';
 
 const subscriptionStatusCopy = {
-  '已连接 ChatGPT 订阅': 'ChatGPT subscription connected',
-  '已在默认浏览器中打开 ChatGPT 授权页面':
-    'Opened the ChatGPT authorization page in your default browser',
-  '尚未连接 ChatGPT 订阅': 'ChatGPT subscription is not connected',
-  '本机 Codex 订阅运行时不可用': 'The local Codex subscription runtime is unavailable',
-};
+  '已连接 ChatGPT 订阅': {
+    status: 'connected',
+    translation: 'ChatGPT subscription connected',
+  },
+  '已在默认浏览器中打开 ChatGPT 授权页面': {
+    status: 'pending',
+    translation: 'Opened the ChatGPT authorization page in your default browser',
+  },
+  '尚未连接 ChatGPT 订阅': {
+    status: 'requires_login',
+    translation: 'ChatGPT subscription is not connected',
+  },
+  '本机 Codex 订阅运行时不可用': {
+    status: 'unavailable',
+    translation: 'The local Codex subscription runtime is unavailable',
+  },
+} as const;
 
-// 切换测试页面到英文，以验证 API 返回的订阅状态会被实际国际化运行时翻译。
-function SwitchToEnglish() {
-  const { setLocale } = useI18n();
-
-  useEffect(() => {
-    setLocale('en-US');
-  }, [setLocale]);
-
-  return null;
+// 构造满足前端请求封装的成功响应，避免测试依赖真实网络。
+function jsonResponse(body: unknown): Response {
+  return {
+    ok: true,
+    status: 200,
+    statusText: 'OK',
+    text: async () => JSON.stringify(body),
+  } as Response;
 }
+
+// 模拟模型页初始化请求，并把订阅状态交给真实页面渲染。
+function stubModelsPageFetch(subscriptionAccount: {
+  status: 'connected' | 'pending' | 'requires_login' | 'unavailable';
+  plan_type: null;
+  message: string;
+}) {
+  const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.includes('/codex-subscription/account')) return jsonResponse(subscriptionAccount);
+    if (url.includes('/model-configs/protocols')) {
+      return jsonResponse({ protocols: ['openai_chat_completions'] });
+    }
+    if (url.includes('/model-configs')) return jsonResponse([]);
+    return jsonResponse({});
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  return fetchMock;
+}
+
+// 补齐 jsdom 未实现的指针捕获 API，供生产 Select 组件处理用户点击。
+function stubSelectPointerCapture() {
+  if (!Element.prototype.hasPointerCapture) {
+    Element.prototype.hasPointerCapture = () => false;
+  }
+  if (!Element.prototype.releasePointerCapture) {
+    Element.prototype.releasePointerCapture = () => {};
+  }
+  if (!Element.prototype.scrollIntoView) {
+    Element.prototype.scrollIntoView = () => {};
+  }
+}
+
+beforeEach(() => {
+  stubSelectPointerCapture();
+});
 
 afterEach(() => {
   cleanup();
+  vi.unstubAllGlobals();
   window.localStorage.clear();
 });
 
@@ -120,22 +169,32 @@ describe('model provider diagnostics', () => {
     }, '测试失败')).toBe('请先连接本机的 ChatGPT 订阅，再测试或启用此模型。');
   });
 
-  it('renders ChatGPT subscription account statuses in English', async () => {
-    render(
-      createElement(
-        I18nProvider,
-        null,
-        createElement(SwitchToEnglish),
-        ...Object.keys(subscriptionStatusCopy).map((message) =>
-          createElement('p', { key: message }, message),
-        ),
-      ),
-    );
+  it('renders ChatGPT subscription account statuses from the API in English', async () => {
+    window.localStorage.setItem('staffdeck_locale', 'en-US');
 
-    await waitFor(() => {
-      for (const translation of Object.values(subscriptionStatusCopy)) {
-        expect(screen.getByText(translation)).toBeTruthy();
-      }
-    });
+    for (const [message, account] of Object.entries(subscriptionStatusCopy)) {
+      const fetchMock = stubModelsPageFetch({
+        status: account.status,
+        plan_type: null,
+        message,
+      });
+      const user = userEvent.setup();
+      render(createElement(I18nProvider, null, createElement(ModelsPage)));
+
+      await waitFor(() => {
+        expect(fetchMock).toHaveBeenCalledWith(
+          expect.stringContaining('/codex-subscription/account'),
+          expect.anything(),
+        );
+      });
+      window.dispatchEvent(new CustomEvent(OPEN_MODEL_CREATE_EVENT));
+      await user.click((await screen.findAllByRole('combobox'))[0]);
+      await user.click(await screen.findByRole('option', { name: 'ChatGPT Subscription (Codex)' }));
+      expect(await screen.findByText(account.translation)).toBeTruthy();
+
+      cleanup();
+      vi.unstubAllGlobals();
+      window.localStorage.setItem('staffdeck_locale', 'en-US');
+    }
   });
 });
