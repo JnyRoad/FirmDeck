@@ -88,7 +88,7 @@ DEFAULT_INPUT_TOKEN_BUDGET = 32_000
 # 2.48.0"). Send an honest, identifiable UA instead of spoofing a browser: a
 # browser UA that doesn't match the connection's TLS/HTTP2 fingerprint risks
 # being flagged as suspicious by stricter WAFs.
-_OUTBOUND_USER_AGENT = "StaffDeck/0.1.0 (+https://github.com/OpenBMB/StaffDeck)"
+_OUTBOUND_USER_AGENT = "StaffDeck/0.1.0"
 TURN_STAGE_MESSAGE_MARKER = "_agent_turn_message"
 class _CurrentStageText(str):
     pass
