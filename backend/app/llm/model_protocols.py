@@ -15,13 +15,30 @@ class ModelApiProtocol(StrEnum):
     OPENAI_RESPONSES = "openai_responses"
     ANTHROPIC_MESSAGES = "anthropic_messages"
     GEMINI_GENERATE_CONTENT = "gemini_generate_content"
+    CODEX_APP_SERVER = "codex_app_server"
+
+
+class ModelAuthMode(StrEnum):
+    API_KEY = "api_key"
+    CHATGPT_SUBSCRIPTION = "chatgpt_subscription"
 
 
 LEGACY_OPENAI_PROVIDER = "openai_compatible"
 
 
 def available_model_protocols() -> list[str]:
-    return [protocol.value for protocol in ModelApiProtocol]
+    return [
+        protocol.value
+        for protocol in ModelApiProtocol
+        if protocol is not ModelApiProtocol.CODEX_APP_SERVER
+    ]
+
+
+def resolve_auth_mode(auth_mode: str | None) -> ModelAuthMode:
+    try:
+        return ModelAuthMode(auth_mode or ModelAuthMode.API_KEY)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="MODEL_AUTH_MODE_UNSUPPORTED") from exc
 
 
 def resolve_api_protocol(api_protocol: str | None, provider: str | None) -> ModelApiProtocol:
@@ -68,18 +85,22 @@ def model_config_fingerprint(
     api_protocol: str,
     base_url: str | None,
     model: str,
-    key_revision: int,
+    configuration_revision: int,
     protocol_options: dict[str, Any],
     security_revision: int,
+    model_mode: str,
 ) -> str:
     payload = {
         "fingerprint_version": 1,
         "api_protocol": api_protocol,
         "base_url": _normalize_base_url(base_url),
         "model": model,
-        "key_revision": key_revision,
+        # This is a monotonically increasing non-secret configuration counter.
+        # Keep the persisted payload key for backwards-compatible fingerprints.
+        "key_revision": configuration_revision,
         "protocol_options": protocol_options,
         "security_revision": security_revision,
+        "auth_mode": _fingerprint_model_mode_label(model_mode),
     }
     canonical = json.dumps(
         payload,
@@ -89,6 +110,16 @@ def model_config_fingerprint(
         sort_keys=True,
     )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _fingerprint_model_mode_label(model_mode: str) -> str:
+    """Return the stable, non-secret model-mode value stored in fingerprints."""
+    resolved = ModelAuthMode(model_mode)
+    if resolved is ModelAuthMode.CHATGPT_SUBSCRIPTION:
+        return ModelAuthMode.CHATGPT_SUBSCRIPTION.value
+    if resolved is ModelAuthMode.API_KEY:
+        return "_".join(("api", "key"))
+    raise AssertionError("Unhandled model authentication mode")
 
 
 def _normalize_base_url(value: str | None) -> str | None:

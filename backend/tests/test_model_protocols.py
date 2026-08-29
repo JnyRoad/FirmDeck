@@ -14,6 +14,7 @@ from app.llm.model_config_resolver import (
 )
 from app.llm.client import _normalize_extra_body
 from app.llm.model_protocols import (
+    ModelAuthMode,
     ModelApiProtocol,
     available_model_protocols,
     model_config_fingerprint,
@@ -73,12 +74,28 @@ def test_fingerprint_normalizes_equivalent_base_urls() -> None:
     common = {
         "api_protocol": "openai_chat_completions",
         "model": "model-a",
-        "key_revision": 1,
+        "configuration_revision": 1,
         "protocol_options": {},
         "security_revision": 1,
+        "model_mode": ModelAuthMode.API_KEY,
     }
     assert model_config_fingerprint(base_url="HTTPS://EXAMPLE.COM:443/v1/", **common) == (
         model_config_fingerprint(base_url="https://example.com/v1", **common)
+    )
+
+
+def test_fingerprint_keeps_non_secret_configuration_revision_compatible() -> None:
+    assert (
+        model_config_fingerprint(
+            api_protocol="openai_chat_completions",
+            base_url="https://example.com/v1",
+            model="gpt-5",
+            configuration_revision=1,
+            protocol_options={},
+            security_revision=1,
+            model_mode="api_key",
+        )
+        == "4b6fa0173a7d7f3367451039c32c1b262a50820b615872f70ad2d29407a09b34"
     )
 
 
@@ -159,6 +176,12 @@ def test_all_implemented_protocols_are_available() -> None:
         "anthropic_messages",
         "gemini_generate_content",
     ]
+
+
+def test_model_config_defaults_to_api_key_authentication_mode() -> None:
+    config = _row()
+
+    assert getattr(config, "auth_mode", None) == "api_key"
 
 
 def test_snapshot_model_config_preserves_anthropic_protocol_and_options() -> None:
