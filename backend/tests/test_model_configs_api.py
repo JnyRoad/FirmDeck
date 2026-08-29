@@ -329,13 +329,13 @@ def test_subscription_account_routes_return_only_safe_status(monkeypatch) -> Non
     assert "secret" not in str(pending.model_dump())
 
 
-def test_subscription_account_routes_map_direct_oauth_errors_without_upstream_detail(monkeypatch) -> None:
+def test_subscription_account_routes_map_runtime_browser_errors_without_upstream_detail(monkeypatch) -> None:
     subscription_module = importlib.import_module("app.codex_subscription")
 
     class _UnavailableBrowserRuntime:
         def start_login(self) -> _SubscriptionAccount:
             raise subscription_module.CodexSubscriptionError(
-                "MODEL_SUBSCRIPTION_CALLBACK_UNAVAILABLE"
+                "MODEL_SUBSCRIPTION_BROWSER_UNAVAILABLE"
             )
 
     monkeypatch.setattr(
@@ -347,9 +347,47 @@ def test_subscription_account_routes_map_direct_oauth_errors_without_upstream_de
     with pytest.raises(HTTPException) as exc_info:
         model_configs_module.start_codex_subscription_login("tenant_a", _admin())
 
-    assert exc_info.value.status_code == 409
-    assert exc_info.value.detail == "MODEL_SUBSCRIPTION_CALLBACK_UNAVAILABLE"
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.detail == "MODEL_SUBSCRIPTION_BROWSER_UNAVAILABLE"
     assert "token" not in str(exc_info.value.detail).lower()
+
+
+@pytest.mark.parametrize(
+    ("code", "status_code"),
+    [
+        ("MODEL_SUBSCRIPTION_RUNTIME_UNAVAILABLE", 503),
+        ("MODEL_SUBSCRIPTION_RUNTIME_TIMEOUT", 504),
+        ("MODEL_SUBSCRIPTION_RUNTIME_PROTOCOL_ERROR", 502),
+        ("MODEL_SUBSCRIPTION_RUNTIME_FAILED", 502),
+    ],
+)
+def test_subscription_runtime_errors_use_safe_http_statuses(
+    monkeypatch,
+    code: str,
+    status_code: int,
+) -> None:
+    """运行时启动登录失败时仅返回稳定状态码和安全错误码。"""
+    subscription_module = importlib.import_module("app.codex_subscription")
+
+    class _FailingRuntime:
+        """模拟返回错误码但不泄漏底层进程输出的本机运行时。"""
+
+        def start_login(self) -> _SubscriptionAccount:
+            """抛出本用例指定的安全运行时错误。"""
+            raise subscription_module.CodexSubscriptionError(code)
+
+    monkeypatch.setattr(
+        model_configs_module,
+        "get_codex_subscription_service",
+        lambda: _FailingRuntime(),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        model_configs_module.start_codex_subscription_login("tenant_a", _admin())
+
+    assert exc_info.value.status_code == status_code
+    assert exc_info.value.detail == code
+    assert "traceback" not in str(exc_info.value.detail).lower()
 
 
 def test_chat_extra_body_is_not_validated_as_protocol_options(tmp_path) -> None:
@@ -674,6 +712,57 @@ def test_verification_runs_bounded_text_stream_and_json_probes(tmp_path, monkeyp
             ("init", 64, 35.0),
             ("json",),
         ]
+
+
+def test_subscription_verification_uses_the_codex_app_server_protocol(tmp_path, monkeypatch) -> None:
+    """订阅模型验证沿用三项探针，但每项都保留 runtime 协议而非退回 API Key 分支。"""
+    observed_protocols: list[str] = []
+
+    class FakeClient:
+        """模拟执行成功的 LLM 客户端，并记录每个验证探针收到的协议。"""
+
+        def __init__(self, config) -> None:  # noqa: ANN001
+            """保存配置协议，供断言验证调用链没有改写订阅模型。"""
+            observed_protocols.append(config.api_protocol.value)
+
+        def generate_text(self, _prompt, _payload):  # noqa: ANN001
+            """模拟文本探针的成功响应。"""
+            return "ok"
+
+        def generate_text_stream(self, _prompt, _payload):  # noqa: ANN001
+            """模拟流式探针的成功响应。"""
+            yield "ok"
+
+        def generate_json(self, _prompt, _payload):  # noqa: ANN001
+            """模拟 JSON 探针的成功响应。"""
+            return {"ok": True}
+
+    monkeypatch.setattr("app.api.model_configs.LLMClient", FakeClient)
+    with _db(tmp_path) as db:
+        db.add(
+            ModelConfig(
+                id="subscription_model",
+                tenant_id="tenant_a",
+                name="Subscription",
+                api_key_encrypted="",
+                auth_mode="chatgpt_subscription",
+                api_protocol="codex_app_server",
+                model="gpt-5.1-codex",
+                max_output_tokens=64,
+                trust_status="unverified",
+                enabled=False,
+            )
+        )
+        db.commit()
+
+        result = run_model_config_test(
+            "subscription_model",
+            tenant_id="tenant_a",
+            db=db,
+        )
+
+    assert result.success is True
+    assert observed_protocols == ["codex_app_server"] * 3
 
 
 def test_initial_verification_can_atomically_activate_first_model(tmp_path, monkeypatch) -> None:
