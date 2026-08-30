@@ -24,6 +24,7 @@ from app.db.models import (
     HarnessTurnRecord,
     Team,
     Tenant,
+    UIConfig,
     User,
 )
 from app.teams.service import delete_team
@@ -215,11 +216,6 @@ def test_task_workspace_candidates_prefer_snapshot_and_reject_symlinked_root(
     engine = _test_engine()
     snapshot_root = tmp_path / "snapshot-workspace"
     legacy_root = tmp_path / "app-data" / "harness_workspaces"
-    candidate_paths = getattr(
-        harness_session_cleanup,
-        "harness_task_workspace_candidates",
-        lambda **_kwargs: (),
-    )
 
     with Session(engine) as db:
         db.add(
@@ -243,13 +239,13 @@ def test_task_workspace_candidates_prefer_snapshot_and_reject_symlinked_root(
         )
         db.commit()
 
-        snapshot_candidates = candidate_paths(
+        snapshot_candidates = harness_task_workspace_candidates(
             tenant_id="tenant_demo",
             session_id="session_demo",
             task_frame_id="task_snapshot",
             db=db,
         )
-        legacy_candidates = candidate_paths(
+        legacy_candidates = harness_task_workspace_candidates(
             tenant_id="tenant_demo",
             session_id="session_demo",
             task_frame_id="task_legacy",
@@ -259,7 +255,7 @@ def test_task_workspace_candidates_prefer_snapshot_and_reject_symlinked_root(
         assert len(snapshot_candidates) == 2
         assert snapshot_candidates[0].is_relative_to(snapshot_root)
         assert snapshot_candidates[1].is_relative_to(legacy_root)
-        assert len(legacy_candidates) == 1
+        assert len(legacy_candidates) == 2
         assert legacy_candidates[0].is_relative_to(legacy_root)
         assert harness_session_cleanup.harness_task_workspace_path(
             tenant_id="tenant_demo",
@@ -285,12 +281,54 @@ def test_task_workspace_candidates_prefer_snapshot_and_reject_symlinked_root(
         db.commit()
 
         with pytest.raises(OSError, match="symlink"):
-            candidate_paths(
+            harness_task_workspace_candidates(
                 tenant_id="tenant_demo",
                 session_id="session_demo",
                 task_frame_id="task_unsafe",
                 db=db,
             )
+
+
+def test_task_workspace_candidates_keep_custom_root_for_frames_without_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pre-snapshot TaskFrames must probe the configured root after the old default root."""
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("ULTRARAG_DATA_DIR", str(tmp_path / "app-data"))
+    engine = _test_engine()
+    configured_root = tmp_path / "configured-workspaces"
+    legacy_root = tmp_path / "app-data" / "harness_workspaces"
+
+    with Session(engine) as db:
+        db.add(
+            UIConfig(
+                tenant_id="tenant_demo",
+                sandbox_enabled=False,
+                harness_storage_path=str(configured_root),
+            )
+        )
+        db.add(
+            HarnessTaskFrameRecord(
+                id="htask_legacy_configured",
+                tenant_id="tenant_demo",
+                session_id="session_demo",
+                source_turn_id="turn_legacy_configured",
+                task_id="task_legacy_configured",
+            )
+        )
+        db.commit()
+
+        legacy_candidate, configured_candidate = harness_task_workspace_candidates(
+            tenant_id="tenant_demo",
+            session_id="session_demo",
+            task_frame_id="task_legacy_configured",
+            db=db,
+        )
+
+    assert configured_candidate.is_relative_to(configured_root)
+    assert legacy_candidate.is_relative_to(legacy_root)
 
 
 def test_default_task_workspace_uses_home_without_writing_to_app_data(

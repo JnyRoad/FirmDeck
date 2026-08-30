@@ -85,6 +85,7 @@ from app.db.models import (
     utc_now,
 )
 from app.general_skills.schema import GeneralSkillRunResponse
+from app.harness import artifacts as harness_artifacts
 from app.harness import publish_harness_artifacts
 from app.harness.errors import HarnessExecutionError
 from app.knowledge.schema import KnowledgeSearchResponse
@@ -1937,6 +1938,43 @@ def test_harness_reads_published_deliverable_from_an_earlier_task_frame(
         assert read["success"] is True
         assert read["data"]["content"] == content
         assert read["data"]["task_frame_id"] == "task-previous"
+
+        artifact_path = workspace / "results" / "schedule.md"
+        original_sha256 = harness_artifacts.OpenedHarnessArtifact.sha256
+        replaced = False
+
+        def replace_path_after_validation(
+            opened: harness_artifacts.OpenedHarnessArtifact,
+        ) -> str:
+            nonlocal replaced
+            digest = original_sha256(opened)
+            if not replaced:
+                replacement = artifact_path.with_suffix(".replacement")
+                replacement.write_text("replacement content", encoding="utf-8")
+                replacement.replace(artifact_path)
+                replaced = True
+            return digest
+
+        monkeypatch.setattr(
+            harness_artifacts.OpenedHarnessArtifact,
+            "sha256",
+            replace_path_after_validation,
+        )
+        descriptor_bound = invoker.invoke(
+            "read_published_deliverable",
+            {
+                "task_frame_id": "task-previous",
+                "path": "results/schedule.md",
+            },
+        )
+        monkeypatch.setattr(
+            harness_artifacts.OpenedHarnessArtifact,
+            "sha256",
+            original_sha256,
+        )
+
+        assert descriptor_bound["success"] is True
+        assert descriptor_bound["data"]["content"] == content
 
         denied = invoker.invoke(
             "read_published_deliverable",

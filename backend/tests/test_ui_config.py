@@ -86,6 +86,26 @@ def test_harness_workspace_config_uses_user_default_and_preserves_stable_path_co
     assert error.value.detail == {"code": "HARNESS_WORKSPACE_PATH_ABSOLUTE"}
 
 
+def test_harness_workspace_config_treats_legacy_whitespace_as_the_default_root(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A whitespace-only stored path must not resolve to the server working directory."""
+
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+
+    result = ui_config_read(
+        UIConfig(
+            tenant_id="tenant_demo",
+            sandbox_enabled=False,
+            harness_storage_path="  ",
+        )
+    )
+
+    assert result.effective_harness_storage_path == str(home / ".staffdeck" / "workspaces")
+
+
 def test_context_runtime_settings_validate_related_limits() -> None:
     with pytest.raises(ValidationError, match="不能超过上下文预算"):
         UIConfigUpdateRequest(

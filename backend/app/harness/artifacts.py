@@ -5,7 +5,9 @@ import os
 import stat
 import sys
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import BinaryIO
 
 HarnessWorkspaceSnapshot = dict[str, tuple[int, int, int, int]]
 
@@ -46,6 +48,14 @@ class OpenedHarnessArtifact:
                 yield block
         finally:
             self.close()
+
+    @contextmanager
+    def open_reader(self) -> Iterator[BinaryIO]:
+        """Yield an independent reader for the already verified file descriptor."""
+
+        descriptor = os.dup(self._require_descriptor())
+        with os.fdopen(descriptor, "rb") as handle:
+            yield handle
 
     def close(self) -> None:
         descriptor, self._descriptor = self._descriptor, None

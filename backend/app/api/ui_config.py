@@ -281,8 +281,9 @@ def _validate_storage_path(value: str) -> str | None:
 def _effective_storage_path(row: UIConfig) -> str:
     """Return the current Harness root used for new workspaces under this row's sandbox policy."""
 
-    if not row.sandbox_enabled and row.harness_storage_path:
-        return str(Path(row.harness_storage_path).expanduser().resolve())
+    configured = str(row.harness_storage_path or "").strip()
+    if not row.sandbox_enabled and configured:
+        return str(Path(configured).expanduser().resolve())
     try:
         return str(default_harness_storage_root())
     except OSError:

@@ -345,7 +345,10 @@ def harness_task_workspace_candidates(
     if snapshot_root is not None:
         roots = [snapshot_root, legacy_harness_storage_root()]
     elif has_task_frame:
-        roots = [legacy_harness_storage_root()]
+        roots = [
+            legacy_harness_storage_root(),
+            harness_storage_root(tenant_id=tenant_id, db=db),
+        ]
     else:
         roots = [harness_storage_root(tenant_id=tenant_id, db=db)]
     task_paths: list[Path] = []
