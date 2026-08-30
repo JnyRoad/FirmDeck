@@ -428,6 +428,21 @@ def test_windows_artifact_open_does_not_require_posix_flags(
         opened.close()
 
 
+def test_opened_artifact_reader_preserves_descriptor_offset(tmp_path: Path) -> None:
+    workspace = (tmp_path / "task").resolve()
+    workspace.mkdir()
+    payload = b"the original artifact bytes"
+    (workspace / "result.txt").write_bytes(payload)
+
+    opened = open_harness_artifact(workspace, "result.txt")
+    try:
+        with opened.open_reader() as reader:
+            assert reader.read(3) == payload[:3]
+        assert b"".join(opened.iter_bytes()) == payload
+    finally:
+        opened.close()
+
+
 def test_publisher_rejects_hard_linked_files(tmp_path: Path) -> None:
     workspace = (tmp_path / "task").resolve()
     workspace.mkdir()

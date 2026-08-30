@@ -1942,11 +1942,13 @@ def test_harness_reads_published_deliverable_from_an_earlier_task_frame(
         artifact_path = workspace / "results" / "schedule.md"
         original_sha256 = harness_artifacts.OpenedHarnessArtifact.sha256
         replaced = False
+        sha256_calls = 0
 
         def replace_path_after_validation(
             opened: harness_artifacts.OpenedHarnessArtifact,
         ) -> str:
-            nonlocal replaced
+            nonlocal replaced, sha256_calls
+            sha256_calls += 1
             digest = original_sha256(opened)
             if not replaced:
                 replacement = artifact_path.with_suffix(".replacement")
@@ -1975,6 +1977,7 @@ def test_harness_reads_published_deliverable_from_an_earlier_task_frame(
 
         assert descriptor_bound["success"] is True
         assert descriptor_bound["data"]["content"] == content
+        assert sha256_calls == 1
 
         denied = invoker.invoke(
             "read_published_deliverable",

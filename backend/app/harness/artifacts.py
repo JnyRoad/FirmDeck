@@ -51,11 +51,23 @@ class OpenedHarnessArtifact:
 
     @contextmanager
     def open_reader(self) -> Iterator[BinaryIO]:
-        """Yield an independent reader for the already verified file descriptor."""
+        """Yield a reader for the verified file while preserving this descriptor's offset."""
 
-        descriptor = os.dup(self._require_descriptor())
-        with os.fdopen(descriptor, "rb") as handle:
-            yield handle
+        descriptor = self._require_descriptor()
+        original_offset = os.lseek(descriptor, 0, os.SEEK_CUR)
+        reader_descriptor = os.dup(descriptor)
+        try:
+            reader = os.fdopen(reader_descriptor, "rb")
+        except Exception:
+            os.close(reader_descriptor)
+            raise
+        try:
+            with reader as handle:
+                yield handle
+        finally:
+            held_descriptor = self._descriptor
+            if held_descriptor is not None:
+                os.lseek(held_descriptor, original_offset, os.SEEK_SET)
 
     def close(self) -> None:
         descriptor, self._descriptor = self._descriptor, None

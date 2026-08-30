@@ -592,6 +592,7 @@ class HarnessCapabilityInvoker:
                 read_file_arguments,
                 opened,
                 path=str(artifact.get("path") or path),
+                sha256=actual_sha256,
             )
         except HarnessWorkspaceArtifactConflictError:
             return _failure(

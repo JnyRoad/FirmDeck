@@ -417,6 +417,7 @@ def read_opened_harness_artifact(
     opened: OpenedHarnessArtifact,
     *,
     path: str,
+    sha256: str | None = None,
 ) -> dict[str, Any]:
     """Read a published artifact from its verified descriptor without reopening its workspace path."""
 
@@ -435,7 +436,7 @@ def read_opened_harness_artifact(
         args,
         path=path,
         size=opened.size,
-        digest=opened.sha256(),
+        digest=sha256 if sha256 is not None else opened.sha256(),
         open_reader=opened.open_reader,
     )
 
