@@ -1,5 +1,9 @@
+"""Verify release packages keep their required runtime and build-time contracts."""
+
 import importlib
 from pathlib import Path
+
+import yaml
 
 # 渠道(微信/企微)打包必需依赖:PyInstaller hiddenimports 防回归删漏
 REQUIRED_MODULES = ("aibot", "websockets", "aiohttp", "pyee", "dotenv", "cryptography")
@@ -58,3 +62,22 @@ def test_windows_release_supports_external_signer_and_fails_closed() -> None:
     assert '$signature.Status -ne "Valid"' in signer
     for extension in ('".exe"', '".dll"', '".pyd"', '".node"'):
         assert extension in build
+
+
+def test_pyinstaller_bundle_contains_distribution_metadata_resource() -> None:
+    """Catch packaged applications omitting their immutable release repository identity."""
+    spec_path = Path(__file__).resolve().parents[2] / "packaging" / "ultrarag.spec"
+    content = spec_path.read_text(encoding="utf-8")
+
+    assert "staffdeck-distribution.json" in content
+    assert "DISTRIBUTION_METADATA_FILE" in content
+    assert '(str(DISTRIBUTION_METADATA_FILE), ".")' in content
+
+
+def test_release_workflow_binds_distribution_to_running_repository() -> None:
+    """Catch release jobs building packages that trust a hard-coded distributor."""
+    workflow_path = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "release.yml"
+    workflow = yaml.load(workflow_path.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+    build_step = next(step for step in workflow["jobs"]["build"]["steps"] if step.get("name") == "Build")
+
+    assert build_step["env"]["STAFFDECK_RELEASE_REPOSITORY"] == "${{ github.repository }}"
