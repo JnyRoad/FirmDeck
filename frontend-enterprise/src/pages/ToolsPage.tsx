@@ -70,7 +70,6 @@ import { useClientPagination } from '../hooks/useClientPagination';
 import {
   emitAgentScopeChange,
   isTeamScope,
-  persistSharedAgentScope,
   readEmployeeScope,
 } from '../lib/agent-scope-storage';
 import { StatusBadge } from './scheduled-tasks/StatusBadge';
@@ -425,7 +424,6 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
       });
       setImportOpen(false);
       if (targetAgentId !== agentId) {
-        persistSharedAgentScope(targetAgentId, currentUser?.id);
         emitAgentScopeChange(targetAgentId);
         setAgentId(targetAgentId);
       } else {
