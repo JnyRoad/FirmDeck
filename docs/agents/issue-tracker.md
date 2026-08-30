@@ -1,3 +1,4 @@
-# Issue Tracker
+# Issue 跟踪器
 
-This repository does not use an issue tracker for agent workflows. Do not create, update, label, or close issues. Keep implementation work in the current branch and report results directly to the user.
+本仓库的 Agent 工作流不使用 Issue 跟踪器。不要创建、更新、标记或关闭 Issue。将实施工作留在
+当前分支中，并直接向用户报告结果。

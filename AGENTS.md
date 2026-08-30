@@ -1,20 +1,20 @@
-# StaffDeck Agent Rule Router
+# StaffDeck Agent 规则路由
 
-This file only routes project rules. Do not preload rule files; read only the
-files selected below for the current task. When a task spans multiple scopes,
-load every matching file.
+本文件仅用于路由项目规则。不要预加载规则文件；仅按当前任务读取下表选中的文件。当任务
+跨越多个范围时，读取所有匹配的文件。
 
-| Task scope | Read |
+| 任务范围 | 读取 |
 |---|---|
-| Read, change, test, or debug backend code | `agent-rules/context.md` + `agent-rules/backend.md` |
-| Read, change, test, or debug frontend code | `agent-rules/context.md` + `agent-rules/frontend.md` |
-| Change UI copy, localization, or locale behavior | `agent-rules/i18n.md` (and `agent-rules/frontend.md` when frontend code changes) |
-| Run the local application | `agent-rules/local-runtime.md` |
-| Change configuration, credentials, or security-sensitive behavior | `agent-rules/security.md` |
-| Write or reorganize project documentation | `agent-rules/documentation.md` |
-| Create or manage issues | `agent-rules/issues.md` |
-| Commit, push, create, or review a pull request | `agent-rules/git.md` |
-| Prepare a versioned release or change the app version | `agent-rules/release.md` |
+| 读取、修改、测试或调试后端代码 | `docs/agents/domain.md` + `docs/agents/backend.md` |
+| 读取、修改、测试或调试前端代码 | `docs/agents/domain.md` + `docs/agents/frontend.md` |
+| 修改 UI 文案、本地化或语言区域行为 | `docs/agents/i18n.md`（修改前端代码时还需读取 `docs/agents/frontend.md`） |
+| 运行本地应用 | `docs/agents/local-runtime.md` |
+| 修改配置、凭据或安全敏感行为 | `docs/agents/security.md` |
+| 编写或整理项目文档 | `docs/agents/documentation.md` |
+| 编写涉及领域术语或 ADR 的项目文档 | `docs/agents/domain.md` + `docs/agents/documentation.md` |
+| 创建或管理 Issue | `docs/agents/issue-tracker.md` + `docs/agents/triage-labels.md` |
+| 提交、推送、创建或审查 Pull Request | `docs/agents/git.md` |
+| 准备带版本号的发布或修改应用版本 | `docs/agents/release.md` |
 
-If no route matches, no project-specific rule needs loading. Re-read a selected
-rule only if the task changes or the conversation context no longer contains it.
+如无路由匹配，无需加载项目专项规则。仅当任务发生变化，或对话上下文不再包含已读规则时，
+重新读取相应文件。

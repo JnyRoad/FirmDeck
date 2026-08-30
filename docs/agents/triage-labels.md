@@ -1,3 +1,4 @@
-# Triage Labels
+# 分诊标签
 
-Issue triage labels are not used because agent workflows do not create or manage issues in this repository. The canonical roles `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, and `wontfix` are all not applicable.
+由于 Agent 工作流不会在本仓库创建或管理 Issue，因此不使用 Issue 分诊标签。标准标签
+`needs-triage`、`needs-info`、`ready-for-agent`、`ready-for-human` 和 `wontfix` 均不适用。
