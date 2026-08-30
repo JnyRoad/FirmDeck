@@ -343,12 +343,14 @@ def _active_runtime_network() -> dict[str, str | int]:
 
 def _web_runtime_network() -> dict[str, str | int]:
     """Build a stable API display value from trusted Web-process configuration only."""
-    host = (
-        os.environ.get("APP_HOST")
-        or os.environ.get("ULTRARAG_HOST")
-        or "127.0.0.1"
-    )
-    raw_port = os.environ.get("APP_PORT") or os.environ.get("ULTRARAG_PORT") or "5173"
+    app_host = os.environ.get("APP_HOST")
+    app_port = os.environ.get("APP_PORT")
+    if app_host or app_port:
+        host = app_host or "127.0.0.1"
+        raw_port = app_port or "5173"
+    else:
+        host = os.environ.get("ULTRARAG_HOST") or "127.0.0.1"
+        raw_port = os.environ.get("ULTRARAG_PORT") or "5173"
     try:
         port = int(raw_port)
     except ValueError as exc:
