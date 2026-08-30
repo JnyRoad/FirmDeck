@@ -1,6 +1,10 @@
 """Verify release packages keep their required runtime and build-time contracts."""
 
 import importlib
+import shutil
+import subprocess
+import sys
+import textwrap
 from pathlib import Path
 
 import yaml
@@ -94,3 +98,73 @@ def test_release_workflow_binds_distribution_to_running_repository() -> None:
     build_step = next(step for step in workflow["jobs"]["build"]["steps"] if step.get("name") == "Build")
 
     assert build_step["env"]["STAFFDECK_RELEASE_REPOSITORY"] == "${{ github.repository }}"
+
+
+def test_pyinstaller_spec_imports_backend_modules_before_analysis(tmp_path: Path) -> None:
+    """Run the real spec in isolation; writes stay in tmp_path and import failures fail the test."""
+    source_root = Path(__file__).resolve().parents[2]
+    isolated_root = tmp_path / "checkout"
+    isolated_backend = isolated_root / "backend"
+    isolated_packaging = isolated_root / "packaging"
+    isolated_app = isolated_backend / "app"
+
+    isolated_app.mkdir(parents=True)
+    isolated_packaging.mkdir(parents=True)
+    (isolated_root / "frontend-enterprise" / "dist").mkdir(parents=True)
+    shutil.copy2(source_root / "packaging" / "ultrarag.spec", isolated_packaging / "ultrarag.spec")
+    shutil.copy2(source_root / "backend" / "app" / "distribution.py", isolated_app / "distribution.py")
+    (isolated_app / "__init__.py").write_text("", encoding="utf-8")
+    (isolated_backend / "VERSION").write_text("0.0.0-test\n", encoding="utf-8")
+
+    spec_runner = textwrap.dedent(
+        """
+        import runpy
+        import sys
+        import types
+
+        pyinstaller = types.ModuleType("PyInstaller")
+        pyinstaller.__path__ = []
+        utils = types.ModuleType("PyInstaller.utils")
+        utils.__path__ = []
+        hooks = types.ModuleType("PyInstaller.utils.hooks")
+        hooks.collect_data_files = lambda *args, **kwargs: []
+        hooks.collect_submodules = lambda *args, **kwargs: []
+        hooks.copy_metadata = lambda *args, **kwargs: []
+        sys.modules.update(
+            {
+                "PyInstaller": pyinstaller,
+                "PyInstaller.utils": utils,
+                "PyInstaller.utils.hooks": hooks,
+            }
+        )
+
+        def analysis(*args, **kwargs):
+            'Return the minimal Analysis shape consumed by the spec.'
+            return types.SimpleNamespace(pure=[], scripts=[], binaries=[], datas=[])
+
+        def build_target(*args, **kwargs):
+            'Stand in for build targets without producing filesystem artifacts.'
+            return types.SimpleNamespace()
+
+        runpy.run_path(
+            sys.argv[1],
+            init_globals={
+                "Analysis": analysis,
+                "PYZ": build_target,
+                "EXE": build_target,
+                "COLLECT": build_target,
+                "BUNDLE": build_target,
+            },
+        )
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", spec_runner, str(isolated_packaging / "ultrarag.spec")],
+        cwd=isolated_backend,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stderr

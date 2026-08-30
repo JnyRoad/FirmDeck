@@ -7,9 +7,11 @@ import sys
 from pathlib import Path
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules, copy_metadata
 
-from app.distribution import resolve_build_release_repository, write_distribution_metadata
-
 BACKEND = Path.cwd()                      # 约定在 backend/ 下执行
+sys.path.insert(0, str(BACKEND))
+
+from app.distribution import resolve_build_release_repository, write_distribution_metadata  # noqa: E402
+
 REPO = BACKEND.parent
 DIST = REPO / "frontend-enterprise" / "dist"
 ASSETS = REPO / "packaging" / "assets"
