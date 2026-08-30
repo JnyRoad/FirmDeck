@@ -88,6 +88,25 @@ def test_network_settings_read_supports_web_runtime_without_desktop_snapshot(
     assert response.json()["active_public_base_url"] == "https://staff.example.com/api/v1"
 
 
+def test_network_settings_read_keeps_app_host_and_port_configuration_paired(
+    monkeypatch, tmp_path
+) -> None:
+    """Use the APP_PORT default when APP_HOST selects the Web supervisor listener."""
+    monkeypatch.setattr(desktop_launcher, "user_data_dir", lambda: tmp_path)
+    monkeypatch.delenv("STAFFDECK_RUNTIME_NETWORK", raising=False)
+    monkeypatch.setenv("APP_HOST", "0.0.0.0")
+    monkeypatch.delenv("APP_PORT", raising=False)
+    monkeypatch.setenv("ULTRARAG_PORT", "6206")
+    monkeypatch.delenv("STAFFDECK_PUBLIC_URL", raising=False)
+
+    response = _client_for(_admin_user()).get(
+        "/api/enterprise/network-settings?tenant_id=tenant_demo"
+    )
+
+    assert response.status_code == 200
+    assert response.json()["active_base_url"] == "http://127.0.0.1:5173/api/v1"
+
+
 def test_network_settings_rejects_members_and_unauthenticated_callers(monkeypatch) -> None:
     """Enforce the administrator guard on endpoint reads rather than trusting console routing."""
     _set_active_runtime(monkeypatch)
