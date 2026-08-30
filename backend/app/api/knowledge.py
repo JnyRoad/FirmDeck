@@ -20,38 +20,23 @@ from app.agents.branching import (
     mark_resource_private_for_agent,
     metadata_preserving_creator,
     user_creator_metadata,
-    visible_knowledge_base_versions,
     visible_knowledge_base_version_ids,
+    visible_knowledge_base_versions,
 )
 from app.async_jobs import enqueue_async_job
 from app.db import get_session
 from app.db.models import (
+    KnowledgeBase,
+    KnowledgeBaseVersion,
     KnowledgeBucket,
     KnowledgeChunk,
     KnowledgeConcept,
     KnowledgeDiscoverySuggestion,
     KnowledgeDocument,
     KnowledgeIngestJob,
-    KnowledgeBase,
-    KnowledgeBaseVersion,
     ModelConfig,
     User,
     utc_now,
-)
-from app.llm.model_config_resolver import resolve_model_config_for_runtime
-from app.knowledge.schema import (
-    KnowledgeBucketRead,
-    KnowledgeChunkRead,
-    KnowledgeChunkUpdateRequest,
-    KnowledgeDiscoveryRead,
-    KnowledgeDocumentRead,
-    KnowledgeDocumentUpdateRequest,
-    KnowledgeDocumentUploadRequest,
-    KnowledgeBucketUpdateRequest,
-    KnowledgeOkfImportRequest,
-    KnowledgeIngestJobRead,
-    KnowledgeSearchRequest,
-    KnowledgeSearchResponse,
 )
 from app.knowledge.errors import KNOWLEDGE_MODE_INVALID, KnowledgeError, knowledge_error
 from app.knowledge.management import require_team_knowledge_manager
@@ -60,6 +45,20 @@ from app.knowledge.okf import (
     create_concept_evidence_rows,
     parse_okf_bundle,
     upsert_concepts,
+)
+from app.knowledge.schema import (
+    KnowledgeBucketRead,
+    KnowledgeBucketUpdateRequest,
+    KnowledgeChunkRead,
+    KnowledgeChunkUpdateRequest,
+    KnowledgeDiscoveryRead,
+    KnowledgeDocumentRead,
+    KnowledgeDocumentUpdateRequest,
+    KnowledgeDocumentUploadRequest,
+    KnowledgeIngestJobRead,
+    KnowledgeOkfImportRequest,
+    KnowledgeSearchRequest,
+    KnowledgeSearchResponse,
 )
 from app.knowledge.service import (
     IngestPayload,
@@ -71,6 +70,7 @@ from app.knowledge.service import (
     validate_discovered_skill,
 )
 from app.knowledge.versioning import SharedKnowledgeVersionService
+from app.llm.model_config_resolver import resolve_model_config_for_runtime
 from app.security.auth import ensure_current_user_tenant, get_current_user
 from app.security.permissions import (
     ensure_agent_scope_manager,
@@ -142,8 +142,8 @@ def _shared_writable_asset_version(
 def upload_document(
     request: KnowledgeDocumentUploadRequest,
     agent_id: str | None = Query(None),
-    db: Session = Depends(get_session),
-    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_session),  # noqa: B008
+    current_user: User = Depends(get_current_user),  # noqa: B008
 ) -> KnowledgeIngestJobRead:
     """上传到专用分支或显式共享草稿，绝不直接写共享正式版。"""
     ensure_tenant(db, request.tenant_id)

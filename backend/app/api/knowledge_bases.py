@@ -36,6 +36,7 @@ from app.db.models import (
     KnowledgeDiscoverySuggestion,
     KnowledgeDocument,
     KnowledgeIngestJob,
+    Team,
     TeamKnowledgeBaseBinding,
     TeamMember,
     User,
@@ -77,12 +78,14 @@ from app.knowledge.schema import (
     SharedKnowledgePublishRequest,
     SharedKnowledgeRejectRequest,
     SharedKnowledgeRollbackRequest,
+    SharedKnowledgeTeamRead,
 )
 from app.knowledge.versioning import SharedKnowledgeVersionService
 from app.security.auth import get_current_user
 from app.security.permissions import (
     ensure_agent_scope_manager,
     ensure_open_gallery_admin,
+    is_admin_user,
     require_agent_scope_viewer,
 )
 from app.security.tenant import ensure_tenant
@@ -303,8 +306,8 @@ def list_knowledge_bases(
 def create_knowledge_base(
     request: KnowledgeBaseCreateRequest,
     agent_id: str | None = Query(None),
-    db: Session = Depends(get_session),
-    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_session),  # noqa: B008
+    current_user: User = Depends(get_current_user),  # noqa: B008
 ) -> KnowledgeBaseRead:
     """按请求模式创建员工专用库或不隐式绑定团队的共享库。"""
     ensure_tenant(db, request.tenant_id)
@@ -669,6 +672,52 @@ def update_knowledge_base(
         _knowledge_base_stats(db, request.tenant_id).get(row.id, {}),
         version_row=version,
     )
+
+
+@router.get(
+    "/{knowledge_base_id}/teams",
+    response_model=list[SharedKnowledgeTeamRead],
+    dependencies=[Depends(require_agent_scope_viewer)],
+)
+def list_shared_knowledge_teams(
+    knowledge_base_id: str,
+    tenant_id: str = Query(...),
+    db: Session = Depends(get_session),  # noqa: B008
+    current_user: User = Depends(get_current_user),  # noqa: B008
+) -> list[SharedKnowledgeTeamRead]:
+    """一次查询返回当前用户可管理且活动绑定到共享库的团队。"""
+    ensure_tenant(db, tenant_id)
+    try:
+        require_shared_knowledge_history_viewer(
+            db,
+            tenant_id=tenant_id,
+            knowledge_base_id=knowledge_base_id,
+            current_user=current_user,
+        )
+    except KnowledgeError as exc:
+        raise _knowledge_http_error(exc) from exc
+
+    statement = (
+        select(Team)
+        .join(
+            TeamKnowledgeBaseBinding,
+            TeamKnowledgeBaseBinding.team_id == Team.id,
+        )
+        .where(
+            Team.tenant_id == tenant_id,
+            Team.status == "active",
+            TeamKnowledgeBaseBinding.tenant_id == tenant_id,
+            TeamKnowledgeBaseBinding.knowledge_base_id == knowledge_base_id,
+            TeamKnowledgeBaseBinding.status == "active",
+        )
+        .order_by(Team.name, Team.id)
+    )
+    if not is_admin_user(current_user):
+        statement = statement.where(Team.owner_user_id == current_user.id)
+    return [
+        SharedKnowledgeTeamRead(id=team.id, name=team.name)
+        for team in db.exec(statement).all()
+    ]
 
 
 @router.get("/{knowledge_base_id}/versions", dependencies=[Depends(require_agent_scope_viewer)])
@@ -1191,8 +1240,8 @@ def promote_knowledge_base_to_overall(
 def rollback_knowledge_base(
     knowledge_base_id: str,
     request: KnowledgeBaseRollbackRequest | SharedKnowledgeRollbackRequest,
-    db: Session = Depends(get_session),
-    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_session),  # noqa: B008
+    current_user: User = Depends(get_current_user),  # noqa: B008
 ) -> dict[str, object]:
     """共享库移动全局正式指针，专用库继续回滚员工分支头。"""
     if isinstance(request, SharedKnowledgeRollbackRequest):

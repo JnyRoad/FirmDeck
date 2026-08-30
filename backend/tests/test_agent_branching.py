@@ -757,8 +757,17 @@ def test_staffdeck_gallery_seed_skips_shared_knowledge_bases() -> None:
             status="active",
             metadata_json={"source": "team"},
         )
+        dedicated = KnowledgeBase(
+            id="kb_seed_dedicated",
+            tenant_id=staffdeck_seed.TENANT_ID,
+            name="专用知识库模板",
+            mode="dedicated",
+            status="active",
+            metadata_json={"source": "seed"},
+        )
         db.add(overall)
         db.add(shared)
+        db.add(dedicated)
         db.flush()
 
         staffdeck_seed._publish_gallery_resources(
@@ -767,7 +776,10 @@ def test_staffdeck_gallery_seed_skips_shared_knowledge_bases() -> None:
                 "skill": {},
                 "general_skill": {},
                 "tool": {},
-                "knowledge_base": {shared.id: shared.id},
+                "knowledge_base": {
+                    shared.id: shared.id,
+                    dedicated.id: dedicated.id,
+                },
             },
         )
         db.commit()
@@ -779,6 +791,14 @@ def test_staffdeck_gallery_seed_skips_shared_knowledge_bases() -> None:
                 AgentResourceBinding.resource_id == shared.id,
             )
         ).first() is None
+        assert db.exec(
+            select(AgentResourceBinding).where(
+                AgentResourceBinding.agent_id == overall.id,
+                AgentResourceBinding.resource_type == "knowledge_base",
+                AgentResourceBinding.resource_id == dedicated.id,
+                AgentResourceBinding.status == "active",
+            )
+        ).first() is not None
         db.refresh(shared)
         assert shared.metadata_json == {"source": "team"}
 

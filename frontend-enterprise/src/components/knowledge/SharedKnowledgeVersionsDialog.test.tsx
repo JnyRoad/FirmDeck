@@ -214,7 +214,7 @@ describe('SharedKnowledgeVersionsDialog', () => {
         return conflictResponse();
       }
       if (String(input).includes('/audit-events')) return jsonResponse(auditPage);
-      versionReads += 1;
+      if (String(input).includes('/knowledge-bases/kb-shared/versions?')) versionReads += 1;
       return jsonResponse(versions);
     });
     vi.stubGlobal('fetch', fetchMock);
@@ -228,6 +228,27 @@ describe('SharedKnowledgeVersionsDialog', () => {
       '正式版本已变化，请基于最新版本重新操作。',
     );
     await waitFor(() => expect(versionReads).toBeGreaterThanOrEqual(2));
+  });
+
+  it('disables publish and rollback when the server returns no published head', async () => {
+    const user = userEvent.setup();
+    const headlessVersions = versions.map((version) => ({
+      ...version,
+      is_published_head: false,
+    }));
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => (
+      String(input).includes('/audit-events')
+        ? jsonResponse(auditPage)
+        : jsonResponse(headlessVersions)
+    )));
+    renderDialog();
+
+    const dialog = await screen.findByRole('dialog', { name: /共享版本：团队选题库/ });
+    await user.type(within(dialog).getByLabelText('变更原因'), '等待正式版本恢复');
+
+    expect((within(dialog).getByRole('button', { name: '发布 1.1.0' }) as HTMLButtonElement).disabled).toBe(true);
+    expect((within(dialog).getByRole('button', { name: '回滚到 1.0.0' }) as HTMLButtonElement).disabled).toBe(true);
+    expect((within(dialog).getByRole('button', { name: '驳回 1.1.0' }) as HTMLButtonElement).disabled).toBe(false);
   });
 
   it('renders audit provenance, permission transitions, and server-side filters', async () => {

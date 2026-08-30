@@ -222,6 +222,10 @@ function stubDetailFetch(overrides?: {
   taskDetails?: Record<string, TeamTaskRead>;
   knowledgeRows?: TeamKnowledgeBindingRead[];
   conflictOnGrantSave?: boolean;
+  onGrantSave?: (
+    knowledgeBaseId: string,
+    init: RequestInit,
+  ) => Promise<Response>;
 }) {
   let boardRows = [...(overrides?.entries ?? [])];
   let teamKnowledgeRows = [...(overrides?.knowledgeRows ?? [])];
@@ -230,6 +234,8 @@ function stubDetailFetch(overrides?: {
     if (url.includes('/knowledge-bases')) {
       const method = (init?.method || 'GET').toUpperCase();
       if (method === 'PUT' && url.includes('/grants')) {
+        const knowledgeBaseId = url.split('/knowledge-bases/')[1]?.split('/')[0] || '';
+        if (overrides?.onGrantSave) return overrides.onGrantSave(knowledgeBaseId, init || {});
         if (overrides?.conflictOnGrantSave) {
           return errorResponse(409, {
             detail: {
@@ -457,6 +463,42 @@ describe('TeamDetailPage', () => {
     await waitFor(() => {
       expect(errorNotice).toHaveBeenCalledWith('权限配置已被其他管理员更新，请刷新后重新确认。');
     });
+  });
+
+  it('keeps each knowledge binding busy until its own overlapping save completes', async () => {
+    const user = userEvent.setup();
+    const secondBinding: TeamKnowledgeBindingRead = {
+      ...knowledgeBindings[0],
+      id: 'teamkb-2',
+      knowledge_base_id: 'kb-shared-2',
+      knowledge_base_name: '共享选题库',
+    };
+    let resolveFirst!: (response: Response) => void;
+    let resolveSecond!: (response: Response) => void;
+    const first = new Promise<Response>((resolve) => { resolveFirst = resolve; });
+    const second = new Promise<Response>((resolve) => { resolveSecond = resolve; });
+    stubDetailFetch({
+      knowledgeRows: [...knowledgeBindings, secondBinding],
+      onGrantSave: (knowledgeBaseId) => (
+        knowledgeBaseId === 'kb-shared-1' ? first : second
+      ),
+    });
+    renderDetail();
+
+    const section = await screen.findByLabelText('团队知识库');
+    const firstButton = within(section).getByRole('button', { name: '保存 共享制度库 权限' });
+    const secondButton = within(section).getByRole('button', { name: '保存 共享选题库 权限' });
+    await user.click(firstButton);
+    await user.click(secondButton);
+    expect((firstButton as HTMLButtonElement).disabled).toBe(true);
+    expect((secondButton as HTMLButtonElement).disabled).toBe(true);
+
+    resolveFirst(jsonResponse({ ...knowledgeBindings[0], revision: 5 }));
+    await waitFor(() => expect((firstButton as HTMLButtonElement).disabled).toBe(false));
+    expect((secondButton as HTMLButtonElement).disabled).toBe(true);
+
+    resolveSecond(jsonResponse({ ...secondBinding, revision: 5 }));
+    await waitFor(() => expect((secondButton as HTMLButtonElement).disabled).toBe(false));
   });
 
   it('opens the complete team execution log online and keeps JSON download available', async () => {

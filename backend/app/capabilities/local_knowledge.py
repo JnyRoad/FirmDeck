@@ -188,6 +188,7 @@ class SharedKnowledgeAgentRuntime:
         )
         replay = self._replay(
             context,
+            knowledge_base_id=target.knowledge_base_id,
             action="draft_created",
             arguments=arguments,
             request_payload=request_payload,
@@ -212,6 +213,7 @@ class SharedKnowledgeAgentRuntime:
         )
         return self._persisted_result(
             context,
+            knowledge_base_id=target.knowledge_base_id,
             action="draft_created",
             arguments=arguments,
             request_payload=request_payload,
@@ -239,6 +241,7 @@ class SharedKnowledgeAgentRuntime:
         )
         replay = self._replay(
             context,
+            knowledge_base_id=draft.knowledge_base_id,
             action="draft_updated",
             arguments=arguments,
             request_payload=request_payload,
@@ -263,6 +266,7 @@ class SharedKnowledgeAgentRuntime:
         )
         result = self._persisted_result(
             context,
+            knowledge_base_id=draft.knowledge_base_id,
             action="draft_updated",
             arguments=arguments,
             request_payload=request_payload,
@@ -295,6 +299,7 @@ class SharedKnowledgeAgentRuntime:
         )
         replay = self._replay(
             context,
+            knowledge_base_id=draft.knowledge_base_id,
             action="version_published",
             arguments=arguments,
             request_payload=request_payload,
@@ -319,6 +324,7 @@ class SharedKnowledgeAgentRuntime:
         )
         return self._persisted_result(
             context,
+            knowledge_base_id=draft.knowledge_base_id,
             action="version_published",
             arguments=arguments,
             request_payload=request_payload,
@@ -346,6 +352,7 @@ class SharedKnowledgeAgentRuntime:
         )
         replay = self._replay(
             context,
+            knowledge_base_id=draft.knowledge_base_id,
             action="draft_rejected",
             arguments=arguments,
             request_payload=request_payload,
@@ -366,6 +373,7 @@ class SharedKnowledgeAgentRuntime:
         )
         return self._persisted_result(
             context,
+            knowledge_base_id=draft.knowledge_base_id,
             action="draft_rejected",
             arguments=arguments,
             request_payload=request_payload,
@@ -394,6 +402,7 @@ class SharedKnowledgeAgentRuntime:
         )
         replay = self._replay(
             context,
+            knowledge_base_id=target.knowledge_base_id,
             action="version_rolled_back",
             arguments=arguments,
             request_payload=request_payload,
@@ -418,6 +427,7 @@ class SharedKnowledgeAgentRuntime:
         )
         return self._persisted_result(
             context,
+            knowledge_base_id=target.knowledge_base_id,
             action="version_rolled_back",
             arguments=arguments,
             request_payload=request_payload,
@@ -450,6 +460,7 @@ class SharedKnowledgeAgentRuntime:
         self,
         context: CapabilityContext,
         *,
+        knowledge_base_id: str,
         action: str,
         arguments: dict[str, Any],
         request_payload: dict[str, Any],
@@ -457,6 +468,7 @@ class SharedKnowledgeAgentRuntime:
         """在实时授权通过后返回相同 Agent 变更的首个持久化结果。"""
         receipt = self._audit.replay_agent_mutation(
             tenant_id=context.tenant_id,
+            knowledge_base_id=knowledge_base_id,
             actor_id=context.agent_id,
             action=action,
             idempotency_key=_required_argument(arguments, "idempotency_key"),
@@ -470,6 +482,7 @@ class SharedKnowledgeAgentRuntime:
         self,
         context: CapabilityContext,
         *,
+        knowledge_base_id: str,
         action: str,
         arguments: dict[str, Any],
         request_payload: dict[str, Any],
@@ -478,6 +491,7 @@ class SharedKnowledgeAgentRuntime:
         self._db.flush()
         receipt: KnowledgeMutationReceipt | None = self._audit.replay_agent_mutation(
             tenant_id=context.tenant_id,
+            knowledge_base_id=knowledge_base_id,
             actor_id=context.agent_id,
             action=action,
             idempotency_key=_required_argument(arguments, "idempotency_key"),

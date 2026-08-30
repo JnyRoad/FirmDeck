@@ -6,7 +6,10 @@ import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { I18nProvider } from '@/i18n';
-import { ENTERPRISE_AGENT_STORAGE_KEY } from '@/lib/agent-scope-storage';
+import {
+  ENTERPRISE_AGENT_STORAGE_KEY,
+  sessionFilterStorageKey,
+} from '@/lib/agent-scope-storage';
 import type { ChatSession } from '@/types';
 
 import { useChatSession } from './useChatSession';
@@ -109,7 +112,7 @@ describe('useChatSession team scope', () => {
     expect(window.localStorage.getItem(ENTERPRISE_AGENT_STORAGE_KEY)).toBe('agent-1');
   });
 
-  it('leaves the previous team scope when opening an employee private chat', async () => {
+  it('replaces the previous team scope when opening an employee private chat', async () => {
     window.localStorage.setItem(ENTERPRISE_AGENT_STORAGE_KEY, 'team:team-1');
     stubChatFetch([teamSession, employeeSession]);
     renderChatSession('/workspace/chat/session-emp-1');
@@ -117,6 +120,21 @@ describe('useChatSession team scope', () => {
     await waitFor(() => {
       expect(window.localStorage.getItem(ENTERPRISE_AGENT_STORAGE_KEY)).toBe('agent-1');
     });
+  });
+
+  it('keeps a manual session-list filter separate from the active chat scope', async () => {
+    window.localStorage.setItem(ENTERPRISE_AGENT_STORAGE_KEY, 'agent-1');
+    stubChatFetch([teamSession, employeeSession]);
+    const { result } = renderChatSession('/workspace/chat/session-emp-1');
+
+    await waitFor(() => {
+      expect(result.current.sessionsLoading).toBe(false);
+    });
+    act(() => result.current.setSessionAgentFilter('team:team-1'));
+
+    expect(result.current.sessionAgentFilter).toBe('team:team-1');
+    expect(window.localStorage.getItem(sessionFilterStorageKey('user-1'))).toBe('team:team-1');
+    expect(window.localStorage.getItem(ENTERPRISE_AGENT_STORAGE_KEY)).toBe('agent-1');
   });
 
   it('filters the unified session list to a selected team group', async () => {

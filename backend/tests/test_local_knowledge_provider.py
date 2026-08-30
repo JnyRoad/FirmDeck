@@ -6,6 +6,7 @@ import pytest
 from app.capabilities.contracts import CapabilityContext, KnowledgeSearchQuery
 from app.capabilities.errors import CapabilityProviderError
 from app.capabilities.local_knowledge import LocalKnowledgeRuntime
+from app.knowledge.errors import KnowledgeError
 from app.knowledge.schema import KnowledgeChunkRead, KnowledgeSearchResponse
 
 
@@ -247,7 +248,7 @@ def test_shared_knowledge_actions_reject_private_conversation_context() -> None:
     assert runtime_model is not None, "missing SharedKnowledgeAgentRuntime"
     runtime = runtime_model(db=object())
 
-    with pytest.raises(Exception) as denied:
+    with pytest.raises(KnowledgeError) as denied:
         runtime.execute(
             CapabilityContext(
                 request_id="req-private-action",

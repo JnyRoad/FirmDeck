@@ -235,6 +235,7 @@ def test_agent_idempotency_replays_the_original_durable_result() -> None:
         }
         assert service.replay_agent_mutation(
             tenant_id="tenant_demo",
+            knowledge_base_id="kb_shared",
             actor_id="agent_publisher",
             action="version_published",
             idempotency_key="turn-1-call-1",
@@ -262,6 +263,7 @@ def test_agent_idempotency_replays_the_original_durable_result() -> None:
 
         receipt = service.replay_agent_mutation(
             tenant_id="tenant_demo",
+            knowledge_base_id="kb_shared",
             actor_id="agent_publisher",
             action="version_published",
             idempotency_key="turn-1-call-1",
@@ -305,6 +307,7 @@ def test_agent_idempotency_rejects_changed_input_and_missing_keys() -> None:
         with pytest.raises(error_model) as conflict:
             service.replay_agent_mutation(
                 tenant_id="tenant_demo",
+                knowledge_base_id="kb_shared",
                 actor_id="agent_publisher",
                 action="draft_rejected",
                 idempotency_key="turn-2-call-1",
@@ -328,6 +331,41 @@ def test_agent_idempotency_rejects_changed_input_and_missing_keys() -> None:
     assert conflict.value.status_code == 409
     assert missing.value.code == "KNOWLEDGE_IDEMPOTENCY_REQUIRED"
     assert missing.value.status_code == 400
+
+
+def test_agent_idempotency_key_cannot_replay_a_different_knowledge_base() -> None:
+    """同一 Agent 动作的幂等键只能属于一个知识库，不能跨库串回放结果。"""
+    service_model, error_model = _audit_api()
+    with _session() as db:
+        service = service_model(db)
+        payload = {"change_reason": "批准发布"}
+        service.append_event(
+            tenant_id="tenant_demo",
+            knowledge_base_id="kb_shared",
+            team_id="team_a",
+            knowledge_base_version_id=None,
+            actor_type="agent",
+            actor_id="agent_publisher",
+            action="version_published",
+            idempotency_key="turn-cross-base",
+            reason="批准发布",
+            request_payload=payload,
+            durable_result={"published_version_id": "kbver_shared"},
+        )
+        db.commit()
+
+        with pytest.raises(error_model) as conflict:
+            service.replay_agent_mutation(
+                tenant_id="tenant_demo",
+                knowledge_base_id="kb_other",
+                actor_id="agent_publisher",
+                action="version_published",
+                idempotency_key="turn-cross-base",
+                request_payload=payload,
+            )
+
+    assert conflict.value.code == "KNOWLEDGE_IDEMPOTENCY_CONFLICT"
+    assert conflict.value.status_code == 409
 
 
 def test_audit_query_paginates_filters_and_never_crosses_tenants() -> None:

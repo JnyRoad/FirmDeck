@@ -128,6 +128,12 @@ def update_knowledge_base(
     db: Session = Depends(get_session),
 ) -> dict:
     enforce_agent_access(principal, agent_id, write=True)
+    _ensure_public_dedicated_knowledge_base(
+        db,
+        principal,
+        agent_id,
+        knowledge_base_id,
+    )
     request = KnowledgeBaseUpdateRequest(tenant_id=principal.tenant_id, **body)
     return _dump(internal_knowledge_bases.update_knowledge_base(knowledge_base_id, request, agent_id, db, principal.actor_user))
 

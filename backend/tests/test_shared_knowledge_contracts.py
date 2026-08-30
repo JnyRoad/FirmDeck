@@ -194,6 +194,7 @@ def test_conversion_contract_keeps_default_team_inside_initial_bindings() -> Non
         request_model(
             tenant_id="tenant_demo",
             agent_id="agent_writer",
+            source_version_id="kbver_private",
             name="团队内容库",
             change_reason="批准团队协作",
             team_bindings=["team_a"],

@@ -135,6 +135,7 @@ class KnowledgeAuditService:
         self,
         *,
         tenant_id: str,
+        knowledge_base_id: str,
         actor_id: str,
         action: str,
         idempotency_key: str | None,
@@ -152,6 +153,12 @@ class KnowledgeAuditService:
         ).first()
         if event is None:
             return None
+
+        if event.knowledge_base_id != knowledge_base_id:
+            raise knowledge_error(
+                KNOWLEDGE_IDEMPOTENCY_CONFLICT,
+                details={"event_id": event.id},
+            )
 
         receipt = dict((event.details_json or {}).get(_RECEIPT_KEY) or {})
         if receipt.get("request_hash") != _request_fingerprint(request_payload):
