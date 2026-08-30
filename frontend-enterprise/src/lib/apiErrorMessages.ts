@@ -3,6 +3,10 @@ import { ApiError, GENERIC_ERROR_MESSAGE, plausibleShortMessage } from '@/api/cl
 const STABLE_ERROR_CODE_PATTERN = /^[A-Z][A-Z0-9_]+$/;
 
 const API_ERROR_MESSAGES: Record<string, string> = {
+  HARNESS_WORKSPACE_PATH_ABSOLUTE: 'Harness 工作区目录必须是绝对路径',
+  HARNESS_WORKSPACE_PATH_CREATE_FAILED: '无法创建 Harness 工作区目录，请检查路径和权限',
+  HARNESS_WORKSPACE_PATH_NOT_WRITABLE: 'Harness 工作区目录不可写，请检查权限',
+  HARNESS_WORKSPACE_PATH_ROOT_FORBIDDEN: 'Harness 工作区目录不能是文件系统根目录',
   KNOWLEDGE_BINDING_REVISION_CONFLICT: '权限配置已被其他管理员更新，请刷新后重新确认。',
   KNOWLEDGE_CONTEXT_MISMATCH: '当前团队、知识库或会话范围不匹配，请刷新后重试。',
   KNOWLEDGE_DEFAULT_NOT_CONFIGURED: '团队尚未设置默认写入知识库，请先选择目标知识库。',
