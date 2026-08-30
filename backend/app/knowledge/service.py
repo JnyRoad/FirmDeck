@@ -20,6 +20,7 @@ from app.db import engine
 from app.db.models import (
     KnowledgeBucket,
     KnowledgeBase,
+    KnowledgeBaseVersion,
     KnowledgeChunk,
     KnowledgeConcept,
     KnowledgeDiscoverySuggestion,
@@ -30,6 +31,7 @@ from app.db.models import (
     Tool,
     utc_now,
 )
+from app.knowledge.access import KnowledgeAccessService
 from app.knowledge.parser import KnowledgeParseError, extract_text
 from app.llm.model_config_resolver import resolve_model_config_for_runtime
 from app.knowledge.schema import (
@@ -586,7 +588,21 @@ class KnowledgeService:
             )
             self._clear_embedded_content(job)
 
-    def search(self, request: KnowledgeSearchRequest, model_config: ModelConfig | None = None) -> KnowledgeSearchResponse:
+    def search(
+        self,
+        request: KnowledgeSearchRequest,
+        model_config: ModelConfig | None = None,
+        *,
+        trusted_team_id: str | None = None,
+        authorized_knowledge_versions: dict[str, str] | None = None,
+    ) -> KnowledgeSearchResponse:
+        """检索知识；内部调用可附带服务端授权映射以执行实时二次校验。"""
+        if authorized_knowledge_versions is not None:
+            request = self._authorized_search_request(
+                request,
+                trusted_team_id=trusted_team_id,
+                authorized_knowledge_versions=authorized_knowledge_versions,
+            )
         with observed_span(
             "knowledge_span",
             "knowledge.search",
@@ -596,6 +612,55 @@ class KnowledgeService:
             max_depth=request.max_depth,
         ):
             return self._search(request, model_config)
+
+    def _authorized_search_request(
+        self,
+        request: KnowledgeSearchRequest,
+        *,
+        trusted_team_id: str | None,
+        authorized_knowledge_versions: dict[str, str],
+    ) -> KnowledgeSearchRequest:
+        """实时重验上下文并只保留仍授权且版本归属正确的服务端冻结映射。"""
+        if not request.agent_id:
+            return request.model_copy(
+                update={
+                    "knowledge_base_ids": [],
+                    "knowledge_base_version_ids": [],
+                }
+            )
+        live = KnowledgeAccessService(self.db).resolve_projections(
+            tenant_id=request.tenant_id,
+            agent_id=request.agent_id,
+            team_id=trusted_team_id,
+        )
+        live_by_base = {
+            projection.knowledge_base_id: projection for projection in live
+        }
+        requested_ids = set(request.knowledge_base_ids) or set(
+            authorized_knowledge_versions
+        )
+        selected_versions: dict[str, str] = {}
+        for knowledge_base_id in sorted(
+            requested_ids & set(live_by_base) & set(authorized_knowledge_versions)
+        ):
+            version_id = authorized_knowledge_versions[knowledge_base_id]
+            version = self.db.get(KnowledgeBaseVersion, version_id)
+            projection = live_by_base[knowledge_base_id]
+            if (
+                version is None
+                or version.tenant_id != request.tenant_id
+                or version.knowledge_base_id != knowledge_base_id
+            ):
+                continue
+            if projection.mode == "shared" and version.publication_state != "released":
+                continue
+            selected_versions[knowledge_base_id] = version.id
+        return request.model_copy(
+            update={
+                "knowledge_base_ids": list(selected_versions),
+                "knowledge_base_version_ids": list(selected_versions.values()),
+            }
+        )
 
     def _search(self, request: KnowledgeSearchRequest, model_config: ModelConfig | None = None) -> KnowledgeSearchResponse:
         query = request.query.strip()

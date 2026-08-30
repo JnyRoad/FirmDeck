@@ -15,6 +15,8 @@ from app.db.models import (
     AgentProfile,
     ChatSession,
     HarnessInvocationRecord,
+    KnowledgeBase,
+    KnowledgeBaseVersion,
     Message,
     Team,
     TeamRun,
@@ -35,6 +37,8 @@ from app.teams import wakeup
 from app.teams.schema import (
     ReviewOverrideRequest,
     TeamCreateRequest,
+    TeamKnowledgeGrantsUpdateRequest,
+    TeamKnowledgeSelection,
     TeamLeaderUpdateRequest,
     TeamMemberAddRequest,
     TeamTaskResumeRequest,
@@ -170,6 +174,76 @@ def test_team_crud_and_unique_name() -> None:
 
         assert teams_api.delete_team_endpoint(team.id, "tenant_demo", db, admin) == {"ok": True}
         assert teams_api.list_teams("tenant_demo", db, admin) == []
+
+
+def test_team_create_and_knowledge_endpoints_expose_binding_revision() -> None:
+    """团队创建可直接绑定共享库，后续授权端点返回递增修订号。"""
+    with _test_session() as db:
+        _seed_agents(db)
+        version = KnowledgeBaseVersion(
+            id="kbver_api_shared",
+            tenant_id="tenant_demo",
+            knowledge_base_id="kb_api_shared",
+            version="1.0.0",
+            name="API 共享库",
+            publication_state="released",
+        )
+        base = KnowledgeBase(
+            id="kb_api_shared",
+            tenant_id="tenant_demo",
+            name="API 共享库",
+            mode="shared",
+            published_version_id=version.id,
+        )
+        db.add(base)
+        db.add(version)
+        db.commit()
+
+        team = teams_api.create_team_endpoint(
+            TeamCreateRequest(
+                tenant_id="tenant_demo",
+                name="API 知识团队",
+                knowledge_bases=[
+                    TeamKnowledgeSelection(
+                        existing_knowledge_base_id=base.id,
+                        is_default=True,
+                    )
+                ],
+            ),
+            db,
+            _admin_user(),
+        )
+        teams_api.add_member_endpoint(
+            team.id,
+            TeamMemberAddRequest(tenant_id="tenant_demo", agent_id="agent_worker"),
+            db,
+            _admin_user(),
+        )
+
+        [binding] = teams_api.list_team_knowledge_bases(
+            team.id,
+            "tenant_demo",
+            db,
+            _admin_user(),
+        )
+        assert binding.is_default is True
+        assert binding.revision == 1
+
+        updated = teams_api.replace_team_knowledge_grants_endpoint(
+            team.id,
+            base.id,
+            TeamKnowledgeGrantsUpdateRequest(
+                tenant_id="tenant_demo",
+                expected_revision=1,
+                grants=[{"agent_id": "agent_worker", "permission": "editor"}],
+            ),
+            db,
+            _admin_user(),
+        )
+        assert updated.revision == 2
+        assert [(grant.agent_id, grant.permission) for grant in updated.grants] == [
+            ("agent_worker", "editor")
+        ]
 
 
 def test_delete_team_cascades_members_and_tasks() -> None:

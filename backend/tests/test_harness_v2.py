@@ -23,7 +23,11 @@ from app.core.capability_manifest import (
     general_skill_snapshot_digest,
     tool_snapshot_digest,
 )
-from app.core.harness_agent import HarnessTaskAgent, _transcript_for_model
+from app.core.harness_agent import (
+    HarnessExecutionFenced,
+    HarnessTaskAgent,
+    _transcript_for_model,
+)
 from app.core.harness_attachments import (
     ValidatedTaskImagePayload,
     materialize_task_attachments,
@@ -46,6 +50,7 @@ from app.core.harness_v2_engine import (
     _turn_planner_message,
     _turn_skill_projection,
     _with_recoverable_first_session,
+    get_or_create_harness_session,
 )
 from app.core.task_frame_store import (
     MAX_TASK_FRAMES_PER_TURN,
@@ -71,11 +76,17 @@ from app.db.models import (
     HarnessRunRecord,
     HarnessTaskFrameRecord,
     HarnessTurnRecord,
+    KnowledgeBase,
+    KnowledgeBaseVersion,
     Message,
     ModelConfig,
     ScheduledTask,
     ScheduledTaskRun,
     Skill,
+    Team,
+    TeamKnowledgeBaseBinding,
+    TeamKnowledgeBaseGrant,
+    TeamMember,
     Tenant,
     Tool,
     utc_now,
@@ -91,6 +102,7 @@ from app.scheduled_tasks.service import (
     _skip_misfired_run,
     due_scheduled_tasks,
 )
+from app.session.attachment_store import stage_chat_attachment
 from app.session.session_schema import (
     ChatAttachmentRead,
     ChatTurnRequest,
@@ -101,7 +113,6 @@ from app.session.session_schema import (
     TeamPlannerMember,
     TurnPlan,
 )
-from app.session.attachment_store import stage_chat_attachment
 from app.skills.skill_schema import SkillCapabilityRefs
 from app.tools.tool_schema import ToolResult
 
@@ -180,6 +191,156 @@ def test_team_planner_receives_only_visible_user_message() -> None:
 
     assert planner_message == "查询请假制度和采购制度"
     assert "调度说明" not in planner_message
+
+
+def test_team_turn_fails_closed_without_a_persisted_team_session() -> None:
+    """团队执行不能在缺少可信 team_id 的会话上降级到员工专用知识。"""
+    engine = _test_engine()
+    with Session(engine) as db:
+        session = ChatSession(
+            id="session-private-team-mode",
+            tenant_id="tenant-demo",
+            user_id="user-1",
+            agent_id="agent-1",
+            status="active",
+            team_id=None,
+        )
+        db.add(session)
+        db.commit()
+        owner = SimpleNamespace(
+            db=db,
+            _get_or_create_session=lambda request: db.get(
+                ChatSession,
+                request.session_id,
+            ),
+        )
+
+        with pytest.raises(HarnessExecutionFenced, match="team context"):
+            get_or_create_harness_session(
+                owner,
+                ChatTurnRequest(
+                    tenant_id="tenant-demo",
+                    session_id=session.id,
+                    agent_id="agent-1",
+                    user_id="user-1",
+                    client_turn_id="turn-team-without-team",
+                    message="执行团队任务",
+                    interaction_mode="team_task",
+                ),
+            )
+
+
+def test_shared_knowledge_version_is_stable_this_turn_and_fresh_next_turn() -> None:
+    """发布指针变化后，本轮清单保持旧版，下一轮冻结到全局最新正式版。"""
+    engine = _test_engine()
+    with Session(engine) as db:
+        db.add(Tenant(id="tenant-demo", name="Demo"))
+        db.add(AgentProfile(id="agent-writer", tenant_id="tenant-demo", name="Writer"))
+        db.add(
+            Team(
+                id="team-content",
+                tenant_id="tenant-demo",
+                name="Content",
+                owner_user_id="user-1",
+            )
+        )
+        db.add(TeamMember(team_id="team-content", agent_id="agent-writer"))
+        db.add(
+            KnowledgeBase(
+                id="kb-shared",
+                tenant_id="tenant-demo",
+                name="Shared",
+                mode="shared",
+                published_version_id="kbver-v1",
+            )
+        )
+        for version_id, version in (("kbver-v1", "1.0.0"), ("kbver-v2", "1.1.0")):
+            db.add(
+                KnowledgeBaseVersion(
+                    id=version_id,
+                    tenant_id="tenant-demo",
+                    knowledge_base_id="kb-shared",
+                    version=version,
+                    name="Shared",
+                    publication_state="released",
+                )
+            )
+        db.add(
+            TeamKnowledgeBaseBinding(
+                tenant_id="tenant-demo",
+                team_id="team-content",
+                knowledge_base_id="kb-shared",
+                created_by_user_id="user-1",
+            )
+        )
+        db.add(
+            TeamKnowledgeBaseGrant(
+                tenant_id="tenant-demo",
+                team_id="team-content",
+                knowledge_base_id="kb-shared",
+                agent_id="agent-writer",
+                permission="publisher",
+                created_by_user_id="user-1",
+            )
+        )
+        session = ChatSession(
+            id="session-team-knowledge",
+            tenant_id="tenant-demo",
+            user_id="user-1",
+            agent_id="agent-writer",
+            status="active",
+            team_id="team-content",
+        )
+        db.add(session)
+        db.commit()
+
+        harness = object.__new__(HarnessV2Engine)
+        harness.db = db
+        current_turn = harness._freeze_turn_knowledge_versions("tenant-demo", session)
+        assert current_turn == {"kb-shared": "kbver-v1"}
+
+        builder = CapabilityManifestBuilder(db)
+        current_manifest = builder.build(
+            "tenant-demo",
+            "agent-writer",
+            None,
+            None,
+            team_id="team-content",
+            frozen_knowledge_versions=current_turn,
+        )
+        base = db.get(KnowledgeBase, "kb-shared")
+        assert base is not None
+        base.published_version_id = "kbver-v2"
+        db.add(base)
+        db.commit()
+
+        same_turn_manifest = builder.build(
+            "tenant-demo",
+            "agent-writer",
+            None,
+            None,
+            team_id="team-content",
+            frozen_knowledge_versions=current_turn,
+        )
+        next_turn = harness._freeze_turn_knowledge_versions("tenant-demo", session)
+        next_turn_manifest = builder.build(
+            "tenant-demo",
+            "agent-writer",
+            None,
+            None,
+            team_id="team-content",
+            frozen_knowledge_versions=next_turn,
+        )
+
+    def frozen_version(manifest: CapabilityManifest) -> str:
+        """从知识搜索描述符读取该轮冻结版本。"""
+        descriptor = next(item for item in manifest.available if item.name == "knowledge_search")
+        return str(descriptor.metadata["knowledge_version_by_base_id"]["kb-shared"])
+
+    assert frozen_version(current_manifest) == "kbver-v1"
+    assert frozen_version(same_turn_manifest) == "kbver-v1"
+    assert next_turn == {"kb-shared": "kbver-v2"}
+    assert frozen_version(next_turn_manifest) == "kbver-v2"
 
 
 def test_agent_loop_has_no_legacy_runtime_switch(monkeypatch) -> None:

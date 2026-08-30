@@ -109,6 +109,16 @@ describe('useChatSession team scope', () => {
     expect(window.localStorage.getItem(ENTERPRISE_AGENT_STORAGE_KEY)).toBe('agent-1');
   });
 
+  it('leaves the previous team scope when opening an employee private chat', async () => {
+    window.localStorage.setItem(ENTERPRISE_AGENT_STORAGE_KEY, 'team:team-1');
+    stubChatFetch([teamSession, employeeSession]);
+    renderChatSession('/workspace/chat/session-emp-1');
+
+    await waitFor(() => {
+      expect(window.localStorage.getItem(ENTERPRISE_AGENT_STORAGE_KEY)).toBe('agent-1');
+    });
+  });
+
   it('filters the unified session list to a selected team group', async () => {
     window.localStorage.setItem(ENTERPRISE_AGENT_STORAGE_KEY, 'team:team-1');
     stubChatFetch([teamSession, employeeSession]);
