@@ -29,12 +29,16 @@ from app.core.capability_manifest import (
     tool_snapshot_digest,
 )
 from app.core.harness_agent import HarnessExecutionCancelled
+from app.core.harness_session_cleanup import (
+    HarnessWorkspaceArtifactConflictError,
+    harness_task_workspace_path,
+    open_harness_task_artifact,
+)
 from app.core.published_deliverables import (
     MAX_PUBLISHED_DELIVERABLES,
     find_published_deliverable,
     list_published_deliverables,
 )
-from app.core.harness_session_cleanup import harness_task_workspace_path
 from app.core.task_request_compiler import CapabilityDescriptor, CapabilityManifest
 from app.core.tool_replay_policy import ToolReplayPolicy
 from app.db.models import (
@@ -60,15 +64,14 @@ from app.harness import (
     register_skill_script_tools,
     snapshot_harness_workspace,
 )
-from app.harness.execution_context import SANDBOX_WORKSPACE
 from app.harness.errors import HarnessExecutionError
+from app.harness.execution_context import SANDBOX_WORKSPACE
 from app.harness.sandbox import parse_network_policy
 from app.knowledge.citations import knowledge_citations_from_results
 from app.knowledge.schema import KnowledgeSearchRequest
 from app.knowledge.service import KnowledgeService
 from app.tools.tool_executor import ToolExecutor
 from app.tools.tool_schema import ToolCall
-
 
 _INLINE_JSON_TOOL_RESULT_MAX_CHARS = 2_000
 _INTERNAL_TOOL_RESULT_DIRECTORY = ".harness/tool-results"
@@ -549,15 +552,15 @@ class HarnessCapabilityInvoker:
                 "PUBLISHED_DELIVERABLE_NOT_FOUND",
                 "当前会话中没有该历史交付物。",
             )
-        workspace_root = _workspace_root(
-            self.tenant_id,
-            self.session.id,
-            task_frame_id,
-            db=self.db,
-        )
         opened = None
         try:
-            opened = open_harness_artifact(workspace_root, path)
+            opened, workspace_root = open_harness_task_artifact(
+                tenant_id=self.tenant_id,
+                session_id=self.session.id,
+                task_frame_id=task_frame_id,
+                path=path,
+                db=self.db,
+            )
             actual_sha256 = opened.sha256()
             expected_sha256 = str(artifact.get("sha256") or "").strip().lower()
             expected_size = artifact.get("size")
@@ -569,6 +572,11 @@ class HarnessCapabilityInvoker:
                     "PUBLISHED_DELIVERABLE_CHANGED",
                     "历史交付物在发布后已发生变化，拒绝读取。",
                 )
+        except HarnessWorkspaceArtifactConflictError:
+            return _failure(
+                "PUBLISHED_DELIVERABLE_LOCATION_CONFLICT",
+                "历史交付物在多个兼容工作区位置同时存在，拒绝读取。",
+            )
         except (HarnessArtifactAccessError, OSError):
             return _failure(
                 "PUBLISHED_DELIVERABLE_NOT_FOUND",
