@@ -22,6 +22,7 @@ from runtime_network import (
     NetworkSettingsValidationError,
     normalize_network_settings,
     parse_runtime_network_snapshot,
+    runtime_network_snapshot,
 )
 
 enterprise_router = APIRouter(
@@ -321,15 +322,50 @@ def get_chat_ui_config(
 
 
 def _active_runtime_network() -> dict[str, str | int]:
-    """Read the immutable launcher snapshot instead of reflecting caller-controlled headers."""
+    """Read desktop runtime state first, then derive a trusted web-server runtime state."""
     raw_snapshot = os.environ.get("STAFFDECK_RUNTIME_NETWORK", "")
+    if raw_snapshot:
+        try:
+            return parse_runtime_network_snapshot(raw_snapshot)
+        except NetworkSettingsValidationError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="当前运行网络状态不可用，请通过 StaffDeck 桌面启动器重新启动",
+            ) from exc
     try:
-        return parse_runtime_network_snapshot(raw_snapshot)
+        return _web_runtime_network()
     except NetworkSettingsValidationError as exc:
         raise HTTPException(
             status_code=503,
-            detail="当前运行网络状态不可用，请通过 StaffDeck 桌面启动器重新启动",
+            detail="当前运行网络状态不可用，请检查 Web 服务的监听配置",
         ) from exc
+
+
+def _web_runtime_network() -> dict[str, str | int]:
+    """Build a stable API display value from trusted Web-process configuration only."""
+    app_host = os.environ.get("APP_HOST")
+    app_port = os.environ.get("APP_PORT")
+    if app_host or app_port:
+        host = app_host or "127.0.0.1"
+        raw_port = app_port or "5173"
+    else:
+        host = os.environ.get("ULTRARAG_HOST") or "127.0.0.1"
+        raw_port = os.environ.get("ULTRARAG_PORT") or "5173"
+    try:
+        port = int(raw_port)
+    except ValueError as exc:
+        raise NetworkSettingsValidationError("Web 服务监听端口无效") from exc
+    public_url = os.environ.get("STAFFDECK_PUBLIC_URL", "").strip()
+    mode = (
+        "public"
+        if public_url
+        else ("local" if host in {"127.0.0.1", "localhost", "::1"} else "lan")
+    )
+    return parse_runtime_network_snapshot(
+        runtime_network_snapshot(
+            {"mode": mode, "host": host, "port": port, "public_url": public_url}
+        )
+    )
 
 
 def _next_launch_network(active: dict[str, str | int]) -> dict[str, str | int]:
