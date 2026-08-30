@@ -6,6 +6,7 @@ from io import BytesIO
 
 import pytest
 from docx import Document
+from fastapi import HTTPException
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
@@ -18,6 +19,7 @@ from app.api.knowledge import (
     update_document,
 )
 from app.api.knowledge_bases import knowledge_base_read
+from app.api.knowledge_bases import upsert_okf_concept
 from app.db.models import (
     AgentProfile,
     KnowledgeBase,
@@ -35,7 +37,7 @@ from app.db.models import (
     User,
     utc_now,
 )
-from app.knowledge.schema import KnowledgeChunkUpdateRequest, KnowledgeDocumentUpdateRequest, KnowledgeSearchRequest, KnowledgeSearchResponse
+from app.knowledge.schema import KnowledgeChunkUpdateRequest, KnowledgeConceptUpdateRequest, KnowledgeDocumentUpdateRequest, KnowledgeSearchRequest, KnowledgeSearchResponse
 from app.knowledge.okf import search_concepts
 from app.knowledge.parser import extract_text
 from app.knowledge.service import (
@@ -1703,6 +1705,86 @@ def test_discovery_only_marks_valid_skill_as_pending(monkeypatch: pytest.MonkeyP
         stored_skill = valid_row.payload_json["draft_skill"]
         assert stored_skill["nodes"][0]["node_id"] == "collect"
         assert stored_skill["nodes"][0]["expected_user_info"] == []
+
+
+def test_legacy_document_and_okf_writes_cannot_mutate_shared_published_snapshot() -> None:
+    """旧管理写入口必须拒绝直接修改共享知识库当前正式版本。"""
+    with _test_session() as db:
+        db.add(Tenant(id="tenant_demo", name="Demo"))
+        user = User(
+            id="user_admin",
+            tenant_id="tenant_demo",
+            username="admin",
+            role="admin",
+            password_hash="test",
+        )
+        version = KnowledgeBaseVersion(
+            id="kbver_shared_release",
+            tenant_id="tenant_demo",
+            knowledge_base_id="kb_shared",
+            version="1.0.0",
+            name="共享制度库",
+            publication_state="released",
+        )
+        base = KnowledgeBase(
+            id="kb_shared",
+            tenant_id="tenant_demo",
+            name="共享制度库",
+            mode="shared",
+            published_version_id=version.id,
+        )
+        document = KnowledgeDocument(
+            id="kdoc_shared_release",
+            tenant_id="tenant_demo",
+            knowledge_base_id=base.id,
+            knowledge_base_version_id=version.id,
+            filename="制度.md",
+            file_type="md",
+            title="正式制度",
+            status="ready",
+        )
+        db.add(base)
+        db.add(version)
+        db.add(document)
+        ensure_open_gallery_binding(
+            db,
+            "tenant_demo",
+            "knowledge_base",
+            base.id,
+            "active",
+        )
+        db.commit()
+
+        with pytest.raises(HTTPException) as document_error:
+            update_document(
+                document.id,
+                KnowledgeDocumentUpdateRequest(
+                    tenant_id="tenant_demo",
+                    title="被直接覆盖",
+                ),
+                db=db,
+                current_user=user,
+                agent_id=None,
+            )
+        assert document_error.value.status_code == 409
+        assert document_error.value.detail["code"] == "KNOWLEDGE_MODE_INVALID"
+
+        with pytest.raises(HTTPException) as concept_error:
+            upsert_okf_concept(
+                base.id,
+                "policy/direct-edit",
+                KnowledgeConceptUpdateRequest(
+                    tenant_id="tenant_demo",
+                    content_md="# 禁止直接编辑\n\n正文",
+                ),
+                agent_id=None,
+                db=db,
+                current_user=user,
+            )
+        assert concept_error.value.status_code == 409
+        assert concept_error.value.detail["code"] == "KNOWLEDGE_MODE_INVALID"
+        db.refresh(document)
+        assert document.title == "正式制度"
 
 
 def _b64(text: str) -> str:
