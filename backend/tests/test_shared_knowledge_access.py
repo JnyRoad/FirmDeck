@@ -30,6 +30,7 @@ class _AccessFixture:
     private_knowledge_base_id: str
     colleague_agent_id: str
     colleague_private_knowledge_base_id: str
+    nonmember_agent_id: str
     team_a_id: str
     team_b_id: str
     shared_a_id: str
@@ -76,7 +77,7 @@ def _add_shared_base(
 
 
 def _seed_access_matrix(db: Session) -> _AccessFixture:
-    """建立同一员工跨两团队、另有专用知识库的最小授权矩阵。"""
+    """建立跨团队员工、同租户非成员与专用知识库的最小授权矩阵。"""
     agent_id = "agent_writer"
     db.add(Tenant(id="tenant_demo", name="Demo"))
     db.add(AgentProfile(id=agent_id, tenant_id="tenant_demo", name="内容员工"))
@@ -93,6 +94,15 @@ def _seed_access_matrix(db: Session) -> _AccessFixture:
             id="agent_other_tenant",
             tenant_id="tenant_other",
             name="其他租户员工",
+        )
+    )
+    nonmember_agent_id = "agent_nonmember"
+    db.add(
+        AgentProfile(
+            id=nonmember_agent_id,
+            tenant_id="tenant_demo",
+            name="同租户非团队成员",
+            status="active",
         )
     )
     private_base = KnowledgeBase(
@@ -182,6 +192,7 @@ def _seed_access_matrix(db: Session) -> _AccessFixture:
         private_knowledge_base_id=private_base.id,
         colleague_agent_id=colleague_agent_id,
         colleague_private_knowledge_base_id=colleague_private_base.id,
+        nonmember_agent_id=nonmember_agent_id,
         team_a_id=team_a.id,
         team_b_id=team_b.id,
         shared_a_id=shared_a.id,
@@ -269,7 +280,7 @@ def test_team_context_fails_closed_for_nonmembers_and_cross_tenant_agents() -> N
         with pytest.raises(KnowledgeError) as nonmember:
             service.resolve_projections(
                 tenant_id="tenant_demo",
-                agent_id="agent_not_member",
+                agent_id=fixture.nonmember_agent_id,
                 team_id=fixture.team_a_id,
             )
         with pytest.raises(KnowledgeError) as cross_tenant:
