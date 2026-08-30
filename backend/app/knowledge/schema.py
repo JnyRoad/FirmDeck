@@ -118,6 +118,13 @@ class KnowledgeBaseAuditPageRead(BaseModel):
     has_more: bool
 
 
+class SharedKnowledgeTeamRead(BaseModel):
+    """一个当前用户可管理且已绑定共享知识库的活动团队。"""
+
+    id: str
+    name: str
+
+
 class SharedKnowledgeDraftCreateRequest(BaseModel):
     tenant_id: str
     team_id: str

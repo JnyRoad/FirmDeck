@@ -6,6 +6,7 @@ import base64
 from collections.abc import Sequence
 from typing import Any
 
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select, update
 
 from app.agents.branching import clone_knowledge_version_assets
@@ -116,7 +117,7 @@ class SharedKnowledgeVersionService:
         ):
             raise self._publish_conflict(base, expected_published_version_id)
 
-        # 版本标签按已有快照单调分配；并行草稿因此保持独立身份。
+        # 版本标签按已有快照单调分配；唯一约束负责检测并行分配冲突。
         labels = self.db.exec(
             select(KnowledgeBaseVersion.version).where(
                 KnowledgeBaseVersion.tenant_id == tenant_id,
@@ -149,8 +150,12 @@ class SharedKnowledgeVersionService:
                 "provenance": provenance,
             },
         )
-        self.db.add(draft)
-        self.db.flush()
+        try:
+            with self.db.begin_nested():
+                self.db.add(draft)
+                self.db.flush()
+        except IntegrityError as exc:
+            raise self._publish_conflict(base, parent.id) from exc
         clone_knowledge_version_assets(
             self.db,
             tenant_id,
@@ -239,7 +244,7 @@ class SharedKnowledgeVersionService:
                 KnowledgeIngestJob.tenant_id == version.tenant_id,
                 KnowledgeIngestJob.knowledge_base_id == version.knowledge_base_id,
                 KnowledgeIngestJob.knowledge_base_version_id == version.id,
-                KnowledgeIngestJob.status != "succeeded",
+                KnowledgeIngestJob.status.not_in(("succeeded", "failed", "cancelled")),
             )
         ).first()
         if blocking_document or blocking_job:

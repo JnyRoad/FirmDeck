@@ -38,8 +38,8 @@ from app.knowledge.service import IngestPayload, KnowledgeService
 from app.security.auth import get_current_user
 from app.security.permissions import is_admin_user as _is_admin_user
 from app.security.tenant import ensure_tenant
-from app.session.message_visibility import visible_message_content, visible_message_rows
 from app.session.message_read import message_read
+from app.session.message_visibility import visible_message_content, visible_message_rows
 from app.session.session_schema import ChatTurnRequest
 from app.teams import service as team_service
 from app.teams.schema import (
@@ -55,18 +55,18 @@ from app.teams.schema import (
     TeamConversationKind,
     TeamConversationMessageRead,
     TeamConversationRead,
-    TeamConversationStreamRead,
     TeamConversationsResponse,
+    TeamConversationStreamRead,
     TeamConversationTLRead,
     TeamCreateRequest,
     TeamEventRead,
-    TeamLeaderUpdateRequest,
     TeamKnowledgeBindingRead,
     TeamKnowledgeBindingUpdateRequest,
     TeamKnowledgeBindRequest,
     TeamKnowledgeGrantRead,
     TeamKnowledgeGrantsUpdateRequest,
     TeamKnowledgeUnbindRequest,
+    TeamLeaderUpdateRequest,
     TeamMemberAddRequest,
     TeamMemberRead,
     TeamRead,
@@ -90,15 +90,15 @@ from app.teams.service import (
     delete_team,
     get_team,
     get_team_leader,
-    list_team_members,
     list_team_knowledge_bindings,
+    list_team_members,
     normalize_blackboard_content,
     normalize_blackboard_tags,
     record_task_event,
     remove_member,
     replace_team_knowledge_grants,
-    set_team_default_knowledge_base,
     set_leader,
+    set_team_default_knowledge_base,
     strip_json_blocks,
     unbind_team_knowledge_base,
     write_blackboard_entries,
@@ -111,6 +111,7 @@ from app.teams.wakeup import (
     start_bidding,
     start_wakeup_async,
 )
+
 router = APIRouter(prefix="/api/enterprise/teams", tags=["enterprise:teams"])
 
 TEAM_LOG_EXPORT_SCHEMA = "staffdeck.team-conversation-log.v1"
@@ -247,15 +248,18 @@ def create_team_endpoint(
 ) -> TeamRead:
     ensure_tenant(db, request.tenant_id)
     _ensure_request_tenant(request.tenant_id, current_user)
-    team = create_team(
-        db,
-        tenant_id=request.tenant_id,
-        name=request.name,
-        description=request.description,
-        owner_user_id=current_user.id,
-        config=request.config,
-        knowledge_bases=request.knowledge_bases,
-    )
+    try:
+        team = create_team(
+            db,
+            tenant_id=request.tenant_id,
+            name=request.name,
+            description=request.description,
+            owner_user_id=current_user.id,
+            config=request.config,
+            knowledge_bases=request.knowledge_bases,
+        )
+    except KnowledgeError as exc:
+        raise _knowledge_http_error(exc) from exc
     return _team_read(db, team)
 
 

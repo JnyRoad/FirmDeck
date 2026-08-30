@@ -994,22 +994,25 @@ class HarnessCapabilityInvoker:
             for knowledge_base_id in selected
             if str(version_by_base.get(knowledge_base_id) or "").strip()
         }
-        response = KnowledgeService(self.db).search(
-            KnowledgeSearchRequest(
-                tenant_id=self.tenant_id,
-                agent_id=self.agent_id,
-                query=query,
-                mode="chat",
-                knowledge_base_ids=selected,
-                knowledge_base_version_ids=selected_version_ids,
-                max_chunks=max(
-                    1, min(int(arguments.get("max_chunks") or 8), 12)
+        try:
+            response = KnowledgeService(self.db).search(
+                KnowledgeSearchRequest(
+                    tenant_id=self.tenant_id,
+                    agent_id=self.agent_id,
+                    query=query,
+                    mode="chat",
+                    knowledge_base_ids=selected,
+                    knowledge_base_version_ids=selected_version_ids,
+                    max_chunks=max(
+                        1, min(int(arguments.get("max_chunks") or 8), 12)
+                    ),
                 ),
-            ),
-            self.model_config,
-            trusted_team_id=self.session.team_id,
-            authorized_knowledge_versions=authorized_versions,
-        )
+                self.model_config,
+                trusted_team_id=self.session.team_id,
+                authorized_knowledge_versions=authorized_versions,
+            )
+        except KnowledgeError as exc:
+            return _failure(exc.code, exc.message, **exc.details)
         payload = response.model_dump(mode="json")
         result = {
             "success": True,

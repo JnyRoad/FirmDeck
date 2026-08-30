@@ -3445,14 +3445,8 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
   }, [navigate]);
 
   const changeSessionAgentFilter = useCallback((value: string) => {
-    const next = value || 'all';
-    persistChatSessionAgentFilter(next);
-    if (next !== 'all') {
-      setSelectedAgentId(next);
-      persistSharedAgentScope(next, userId);
-      emitAgentScopeChange(next);
-    }
-  }, [persistChatSessionAgentFilter, userId]);
+    persistChatSessionAgentFilter(value || 'all');
+  }, [persistChatSessionAgentFilter]);
 
   return {
     auth,

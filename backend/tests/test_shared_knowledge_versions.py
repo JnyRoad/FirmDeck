@@ -9,6 +9,7 @@ from app.api.knowledge_bases import (
     create_shared_knowledge_draft,
     list_knowledge_base_versions,
     list_shared_knowledge_audit_events,
+    list_shared_knowledge_teams,
     publish_shared_knowledge_version,
     reject_shared_knowledge_version,
     rollback_knowledge_base,
@@ -179,6 +180,70 @@ def test_create_draft_clones_published_snapshot_and_records_provenance() -> None
         assert event.details_json["parent_version_id"] == released.id
 
 
+def test_shared_knowledge_teams_are_loaded_in_one_authorized_projection() -> None:
+    """管理员看全部活动绑定，普通所有者只看到自己可管理的绑定团队。"""
+    with _test_session() as db:
+        base, _released = _seed_shared_base(db)
+        owned = _bind_team(db, base)
+        other = Team(
+            id="team_other",
+            tenant_id="tenant_demo",
+            name="其他团队",
+            owner_user_id="user_other",
+        )
+        db.add(other)
+        db.add(
+            TeamKnowledgeBaseBinding(
+                id="teamkb_other",
+                tenant_id="tenant_demo",
+                team_id=other.id,
+                knowledge_base_id=base.id,
+                created_by_user_id="user_admin",
+            )
+        )
+        db.commit()
+
+        owner_rows = list_shared_knowledge_teams(
+            base.id,
+            "tenant_demo",
+            db,
+            User(
+                id="user_owner",
+                tenant_id="tenant_demo",
+                username="owner",
+                role="member",
+                password_hash="test",
+            ),
+        )
+        admin_rows = list_shared_knowledge_teams(
+            base.id,
+            "tenant_demo",
+            db,
+            _admin_user(),
+        )
+
+    assert [(row.id, row.name) for row in owner_rows] == [(owned.id, owned.name)]
+    assert [(row.id, row.name) for row in admin_rows] == [
+        (other.id, other.name),
+        (owned.id, owned.name),
+    ]
+
+
+def test_create_draft_maps_version_label_collision_to_publish_conflict(monkeypatch) -> None:
+    """并行草稿版本标签冲突时返回可重试领域错误，不泄漏数据库异常。"""
+    with _test_session() as db:
+        _base, released = _seed_shared_base(db)
+        monkeypatch.setattr(
+            "app.knowledge.versioning._next_shared_version_label",
+            lambda _labels: released.version,
+        )
+
+        with pytest.raises(KnowledgeError) as conflict:
+            _create_draft(db, expected_published_version_id=released.id)
+
+    assert conflict.value.code == "KNOWLEDGE_PUBLISH_CONFLICT"
+
+
 def test_publish_requires_ready_ingestion_and_freezes_released_version() -> None:
     """未完成或失败的摄取阻止发布；发布后该快照不再允许写入。"""
     with _test_session() as db:
@@ -242,6 +307,44 @@ def test_publish_requires_ready_ingestion_and_freezes_released_version() -> None
                 version_id=published.id,
             )
         assert immutable.value.code == "KNOWLEDGE_MODE_INVALID"
+
+
+def test_terminal_failed_or_cancelled_ingest_jobs_do_not_block_ready_draft() -> None:
+    """已终止任务不再阻塞发布；失败文档本身仍保持阻塞。"""
+    with _test_session() as db:
+        _base, released = _seed_shared_base(db)
+        draft = _create_draft(db, expected_published_version_id=released.id)
+        for job_id, status in (("kjob_failed", "failed"), ("kjob_cancelled", "cancelled")):
+            db.add(
+                KnowledgeIngestJob(
+                    id=job_id,
+                    tenant_id="tenant_demo",
+                    knowledge_base_id="kb_shared",
+                    knowledge_base_version_id=draft.id,
+                    filename=f"{job_id}.md",
+                    status=status,
+                )
+            )
+        db.commit()
+        service = SharedKnowledgeVersionService(db)
+
+        service.ensure_ready(draft)
+
+        failed_document = KnowledgeDocument(
+            id="kdoc_failed",
+            tenant_id="tenant_demo",
+            knowledge_base_id="kb_shared",
+            knowledge_base_version_id=draft.id,
+            filename="failed.md",
+            file_type="md",
+            status="failed",
+        )
+        db.add(failed_document)
+        db.commit()
+        with pytest.raises(KnowledgeError) as not_ready:
+            service.ensure_ready(draft)
+
+    assert not_ready.value.code == "KNOWLEDGE_VERSION_NOT_READY"
 
 
 def test_publish_compare_and_swap_rejects_stale_parallel_draft() -> None:

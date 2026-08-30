@@ -25,22 +25,25 @@ from app.db.models import (
     utc_now,
 )
 from app.knowledge.audit import KnowledgeAuditService
+from app.knowledge.errors import (
+    KNOWLEDGE_CONVERSION_VALIDATION_FAILED,
+    KNOWLEDGE_MODE_INVALID,
+    KnowledgeError,
+)
 
 
-class KnowledgeConversionError(RuntimeError):
+class KnowledgeConversionError(KnowledgeError):
     """Base error for an invalid or unsafe dedicated-to-shared conversion."""
 
     def __init__(
         self,
         message: str,
         *,
-        code: str = "KNOWLEDGE_MODE_INVALID",
+        code: str = KNOWLEDGE_MODE_INVALID,
         status_code: int = 409,
     ) -> None:
         """Attach a stable API code without exposing tenant-scoped records."""
-        super().__init__(message)
-        self.code = code
-        self.status_code = status_code
+        super().__init__(code, message, status_code=status_code)
 
 
 class KnowledgeConversionValidationError(KnowledgeConversionError):
@@ -50,7 +53,7 @@ class KnowledgeConversionValidationError(KnowledgeConversionError):
         """Mark clone validation failures as retryable conversion conflicts."""
         super().__init__(
             message,
-            code="KNOWLEDGE_CONVERSION_VALIDATION_FAILED",
+            code=KNOWLEDGE_CONVERSION_VALIDATION_FAILED,
             status_code=409,
         )
 

@@ -93,6 +93,7 @@ from app.db.models import (
 )
 from app.general_skills.schema import GeneralSkillRunResponse
 from app.harness.errors import HarnessExecutionError
+from app.knowledge.errors import KnowledgeError
 from app.knowledge.schema import KnowledgeSearchResponse
 from app.observability.event_log import EventLog
 from app.scheduled_tasks.service import (
@@ -381,6 +382,76 @@ def test_agent_loop_has_no_legacy_runtime_switch(monkeypatch) -> None:
         )
 
     assert calls == [("web", "normal"), ("scheduled_task", "scheduled_task")]
+
+
+def test_turn_claim_is_durable_before_knowledge_version_freeze(monkeypatch) -> None:
+    """冻结知识版本失败时也已占用 client_turn_id，重试不会重复执行该轮。"""
+    engine = _test_engine()
+    monkeypatch.setattr(
+        HarnessV2Engine,
+        "_freeze_turn_knowledge_versions",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("freeze failed")),
+    )
+    request = ChatTurnRequest(
+        tenant_id="tenant-demo",
+        user_id="user-1",
+        agent_id="agent-1",
+        client_turn_id="client-turn-freeze-failure",
+        message="查询制度",
+    )
+
+    with Session(engine) as db:
+        response = AgentLoop(db).handle_turn(request)
+        records = db.exec(
+            select(HarnessTurnRecord).where(
+                HarnessTurnRecord.client_turn_id == request.client_turn_id
+            )
+        ).all()
+
+    assert "HARNESS_V2_ERROR" in response.reply
+    assert len(records) == 1
+    assert records[0].status == "failed"
+    assert records[0].error_json["code"] == "HARNESS_V2_ERROR"
+
+
+def test_knowledge_search_maps_live_authorization_error_to_tool_failure(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """运行时授权撤销返回稳定知识错误，而不是通用 Harness 工具异常。"""
+    monkeypatch.setenv("ULTRARAG_DATA_DIR", str(tmp_path / "data"))
+
+    def denied(*_args, **_kwargs):  # noqa: ANN002, ANN003
+        raise KnowledgeError("KNOWLEDGE_GRANT_REQUIRED")
+
+    monkeypatch.setattr(
+        "app.core.harness_capability_invoker.KnowledgeService.search",
+        denied,
+    )
+    engine = _test_engine()
+    with Session(engine) as db:
+        invoker = HarnessCapabilityInvoker(
+            db,
+            tenant_id="tenant-demo",
+            session=_chat_session(),
+            task_frame_id="task-revoked-knowledge",
+            model_config=_model_config(),
+            manifest=CapabilityManifest(available=[]),
+            active_skill=None,
+            active_step_id=None,
+            agent_id="agent-1",
+        )
+        result = invoker._search_knowledge(  # noqa: SLF001
+            {
+                "allowed_knowledge_base_ids": ["kb-policy"],
+                "knowledge_version_by_base_id": {"kb-policy": "kbver-policy"},
+            },
+            {"query": "报销制度"},
+            call_id="hcall-revoked-knowledge",
+        )
+
+    assert result["success"] is False
+    assert result["error"]["code"] == "KNOWLEDGE_GRANT_REQUIRED"
 
 
 def test_first_harness_turn_recovers_from_a_concurrent_session_insert(

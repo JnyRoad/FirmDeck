@@ -216,10 +216,6 @@ class HarnessV2Engine:
             )
         session = self._get_or_create_session(session_request)
         self.session = session
-        self.turn_knowledge_versions = self._freeze_turn_knowledge_versions(
-            request.tenant_id,
-            session,
-        )
         if self._session_lock is None:
             self._session_lock_id = session.id
             self._session_lock = acquire_harness_session(session.id)
@@ -228,6 +224,10 @@ class HarnessV2Engine:
         self.turn_record = turn_claim.record
         if turn_claim.replay is not None:
             return turn_claim.replay
+        self.turn_knowledge_versions = self._freeze_turn_knowledge_versions(
+            request.tenant_id,
+            session,
+        )
         self.owner._mark_session_running(session)
         user_message = self.owner._append_message(
             request.tenant_id,

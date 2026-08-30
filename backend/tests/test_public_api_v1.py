@@ -688,6 +688,37 @@ def test_public_employee_resource_write_rejects_shared_knowledge_base(monkeypatc
         ).first() is None
 
 
+def test_public_employee_resource_update_rejects_shared_knowledge_base(monkeypatch) -> None:
+    """员工资源 API 不能通过通用更新入口修改团队管理的共享知识库。"""
+    client, engine, admin_token = _client(monkeypatch)
+    key = _tenant_key(client, admin_token, ["knowledge:read", "knowledge:write"])
+    auth = {"Authorization": f"Bearer {key}"}
+    with Session(engine) as db:
+        db.add(
+            KnowledgeBase(
+                id="kb_public_shared_patch",
+                tenant_id="tenant_api",
+                name="Shared before patch",
+                mode="shared",
+                status="active",
+            )
+        )
+        db.commit()
+
+    response = client.patch(
+        "/agents/agent_api/knowledge-bases/kb_public_shared_patch",
+        headers=auth,
+        json={"name": "Shared after patch"},
+    )
+
+    assert response.status_code == 404
+    assert response.json()["code"] == "KNOWLEDGE_BASE_NOT_FOUND"
+    with Session(engine) as db:
+        row = db.get(KnowledgeBase, "kb_public_shared_patch")
+        assert row is not None
+        assert row.name == "Shared before patch"
+
+
 def test_run_handler_relays_live_public_trace_and_returns_citations(monkeypatch) -> None:
     _client_value, engine, _token = _client(monkeypatch)
     with Session(engine) as db:

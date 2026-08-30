@@ -1027,7 +1027,11 @@ def remove_member(
             binding.updated_at = now
             db.add(binding)
     db.delete(member)
-    db.commit()
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
 
 
 def resolve_team_knowledge_write_base(

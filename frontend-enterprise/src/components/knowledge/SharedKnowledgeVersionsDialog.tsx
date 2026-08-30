@@ -485,7 +485,7 @@ export function SharedKnowledgeVersionsDialog({
                     <>
                       <Button
                         size="sm"
-                        disabled={!canMutate}
+                        disabled={!canMutate || !publishedHead}
                         onClick={() => publishDraft(version)}
                         aria-label={`发布 ${version.version}`}
                       >
@@ -506,7 +506,7 @@ export function SharedKnowledgeVersionsDialog({
                     <Button
                       size="sm"
                       variant="outline"
-                      disabled={!canMutate}
+                      disabled={!canMutate || !publishedHead}
                       onClick={() => rollbackTo(version)}
                       aria-label={`回滚到 ${version.version}`}
                     >

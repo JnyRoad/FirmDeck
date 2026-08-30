@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-import importlib
-import importlib.util
+import inspect
 from dataclasses import dataclass
 
 import pytest
@@ -30,6 +29,7 @@ from app.db.models import (
     Tenant,
     User,
 )
+from app.knowledge import conversion as conversion_module
 from app.knowledge.schema import KnowledgeBaseConvertToSharedRequest
 
 
@@ -42,14 +42,6 @@ class _ConversionFixture:
     source_agent_id: str
     sibling_agent_id: str
     team_id: str
-
-
-def _conversion_api():
-    """延迟加载转换服务，让缺失实现形成清晰的 TDD 红灯。"""
-    assert importlib.util.find_spec("app.knowledge.conversion") is not None, (
-        "missing service module: app.knowledge.conversion"
-    )
-    return importlib.import_module("app.knowledge.conversion")
 
 
 def _session() -> Session:
@@ -235,7 +227,7 @@ def _asset_counts(
 
 def test_conversion_copies_assets_binds_team_and_archives_only_selected_source() -> None:
     """成功转换创建新共享正式版，并仅归档发起员工的专用实例。"""
-    module = _conversion_api()
+    module = conversion_module
     with _session() as db:
         fixture = _seed_dedicated_lineage(db)
         result = module.KnowledgeConversionService(db).convert_to_shared(
@@ -300,7 +292,7 @@ def test_clone_failure_preserves_source_and_removes_partial_shared_lineage(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """复制异常回滚新共享谱系，来源分支和绑定继续可用。"""
-    module = _conversion_api()
+    module = conversion_module
 
     def fail_clone(*args, **kwargs):
         """模拟底层复制在写入共享资产前失败。"""
@@ -342,15 +334,16 @@ def test_asset_count_mismatch_rolls_back_conversion(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """任一资产类型少于来源时，转换不得发布或归档来源。"""
-    module = _conversion_api()
+    module = conversion_module
     original_clone = module.clone_knowledge_version_assets
 
     def drop_one_chunk(*args, **kwargs):
         """先真实复制，再删除一个目标 chunk 以触发数量校验。"""
+        bound = inspect.signature(original_clone).bind(*args, **kwargs)
         original_clone(*args, **kwargs)
-        db = args[0]
-        target_base_id = kwargs["target_knowledge_base_id"]
-        target_version_id = args[4]
+        db = bound.arguments["db"]
+        target_base_id = bound.arguments["target_knowledge_base_id"]
+        target_version_id = bound.arguments["target_version_id"]
         chunk = db.exec(
             select(KnowledgeChunk).where(
                 KnowledgeChunk.knowledge_base_id == target_base_id,
@@ -455,7 +448,7 @@ def test_conversion_endpoint_rejects_cross_tenant_team_without_archiving_source(
 
 def test_conversion_endpoint_rejects_a_bound_shared_base_as_reverse_conversion() -> None:
     """已绑定团队的共享库不能作为专用来源再次执行反向转换。"""
-    module = _conversion_api()
+    module = conversion_module
     with _session() as db:
         fixture = _seed_dedicated_lineage(db)
         first = module.KnowledgeConversionService(db).convert_to_shared(

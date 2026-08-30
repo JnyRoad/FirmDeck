@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import importlib
-import importlib.util
 from dataclasses import dataclass
 
 import pytest
@@ -20,6 +18,8 @@ from app.db.models import (
     TeamMember,
     Tenant,
 )
+from app.knowledge.access import KnowledgeAccessService
+from app.knowledge.errors import KnowledgeError
 
 
 @dataclass(frozen=True)
@@ -34,15 +34,6 @@ class _AccessFixture:
     team_b_id: str
     shared_a_id: str
     shared_b_id: str
-
-
-def _access_api():
-    """延迟加载访问服务，让缺失实现以清晰断言形成 TDD 红灯。"""
-    assert importlib.util.find_spec("app.knowledge.access") is not None, (
-        "missing service module: app.knowledge.access"
-    )
-    module = importlib.import_module("app.knowledge.access")
-    return module.KnowledgeAccessService
 
 
 def _session() -> Session:
@@ -200,10 +191,9 @@ def _seed_access_matrix(db: Session) -> _AccessFixture:
 
 def test_team_reads_own_dedicated_and_current_team_shared_knowledge() -> None:
     """群聊合并当前员工专用知识与本团队授权共享知识，私聊仍只含专用知识。"""
-    service_model = _access_api()
     with _session() as db:
         fixture = _seed_access_matrix(db)
-        service = service_model(db)
+        service = KnowledgeAccessService(db)
 
         team_a = service.resolve_projections(
             tenant_id="tenant_demo",
@@ -272,18 +262,17 @@ def test_management_list_unions_dedicated_branches_with_granted_shared_bases() -
 
 def test_team_context_fails_closed_for_nonmembers_and_cross_tenant_agents() -> None:
     """团队成员或租户不匹配时拒绝整个上下文，不降级到私有或空权限。"""
-    service_model = _access_api()
     with _session() as db:
         fixture = _seed_access_matrix(db)
-        service = service_model(db)
+        service = KnowledgeAccessService(db)
 
-        with pytest.raises(Exception) as nonmember:
+        with pytest.raises(KnowledgeError) as nonmember:
             service.resolve_projections(
                 tenant_id="tenant_demo",
                 agent_id="agent_not_member",
                 team_id=fixture.team_a_id,
             )
-        with pytest.raises(Exception) as cross_tenant:
+        with pytest.raises(KnowledgeError) as cross_tenant:
             service.resolve_projections(
                 tenant_id="tenant_demo",
                 agent_id="agent_other_tenant",
@@ -296,37 +285,36 @@ def test_team_context_fails_closed_for_nonmembers_and_cross_tenant_agents() -> N
 
 def test_write_target_uses_only_an_authorized_explicit_or_team_default_base() -> None:
     """写入仅解析显式目标或团队默认目标，并按权限等级快速失败。"""
-    service_model = _access_api()
     with _session() as db:
         fixture = _seed_access_matrix(db)
-        service = service_model(db)
+        service = KnowledgeAccessService(db)
 
         default_target = service.resolve_write_target(
             tenant_id="tenant_demo",
             agent_id=fixture.agent_id,
             team_id=fixture.team_b_id,
         )
-        with pytest.raises(Exception) as missing_default:
+        with pytest.raises(KnowledgeError) as missing_default:
             service.resolve_write_target(
                 tenant_id="tenant_demo",
                 agent_id=fixture.agent_id,
                 team_id=fixture.team_a_id,
             )
-        with pytest.raises(Exception) as insufficient:
+        with pytest.raises(KnowledgeError) as insufficient:
             service.resolve_write_target(
                 tenant_id="tenant_demo",
                 agent_id=fixture.agent_id,
                 team_id=fixture.team_a_id,
                 knowledge_base_id=fixture.shared_a_id,
             )
-        with pytest.raises(Exception) as unrelated:
+        with pytest.raises(KnowledgeError) as unrelated:
             service.resolve_write_target(
                 tenant_id="tenant_demo",
                 agent_id=fixture.agent_id,
                 team_id=fixture.team_b_id,
                 knowledge_base_id=fixture.shared_a_id,
             )
-        with pytest.raises(Exception) as dedicated_read_projection:
+        with pytest.raises(KnowledgeError) as dedicated_read_projection:
             service.resolve_write_target(
                 tenant_id="tenant_demo",
                 agent_id=fixture.agent_id,
@@ -348,10 +336,9 @@ def test_write_target_uses_only_an_authorized_explicit_or_team_default_base() ->
 
 def test_revoked_grant_is_removed_from_live_access_without_changing_the_frozen_version() -> None:
     """撤销授权后实时解析立即失效，先前保存的版本标识本身不被修改。"""
-    service_model = _access_api()
     with _session() as db:
         fixture = _seed_access_matrix(db)
-        service = service_model(db)
+        service = KnowledgeAccessService(db)
         before = next(
             projection
             for projection in service.resolve_projections(
@@ -376,7 +363,7 @@ def test_revoked_grant_is_removed_from_live_access_without_changing_the_frozen_v
             agent_id=fixture.agent_id,
             team_id=fixture.team_b_id,
         )
-        with pytest.raises(Exception) as revoked:
+        with pytest.raises(KnowledgeError) as revoked:
             service.require_projection(
                 tenant_id="tenant_demo",
                 agent_id=fixture.agent_id,

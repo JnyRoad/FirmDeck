@@ -221,7 +221,7 @@ export default function TeamDetailPage({
   const [promotingEntryId, setPromotingEntryId] = useState<string | null>(null);
   const [knowledgeBindings, setKnowledgeBindings] = useState<TeamKnowledgeBindingRead[]>([]);
   const [availableSharedKnowledge, setAvailableSharedKnowledge] = useState<KnowledgeBaseRead[]>([]);
-  const [knowledgeBusyId, setKnowledgeBusyId] = useState('');
+  const [knowledgeBusyIds, setKnowledgeBusyIds] = useState<Set<string>>(() => new Set());
   const [addKnowledgeBaseId, setAddKnowledgeBaseId] = useState('');
   const [newSharedKnowledgeName, setNewSharedKnowledgeName] = useState('');
   const openedTaskParamRef = useRef<string | null>(null);
@@ -638,7 +638,7 @@ export default function TeamDetailPage({
     grants: TeamKnowledgeGrantInput[],
   ) {
     /** Save the complete displayed matrix under the binding's optimistic-lock revision. */
-    setKnowledgeBusyId(binding.id);
+    setKnowledgeBusyIds((current) => new Set(current).add(binding.id));
     try {
       const updated = await api.put<TeamKnowledgeBindingRead>(
         `/api/enterprise/teams/${teamId}/knowledge-bases/${binding.knowledge_base_id}/grants`,
@@ -658,13 +658,17 @@ export default function TeamDetailPage({
         await loadKnowledgeBindings();
       }
     } finally {
-      setKnowledgeBusyId('');
+      setKnowledgeBusyIds((current) => {
+        const next = new Set(current);
+        next.delete(binding.id);
+        return next;
+      });
     }
   }
 
   async function setDefaultKnowledgeBase(binding: TeamKnowledgeBindingRead) {
     /** Select one bound shared base as the team's default write target. */
-    setKnowledgeBusyId(binding.id);
+    setKnowledgeBusyIds((current) => new Set(current).add(binding.id));
     try {
       await api.put<TeamKnowledgeBindingRead>(
         `/api/enterprise/teams/${teamId}/knowledge-bases/${binding.knowledge_base_id}`,
@@ -682,7 +686,11 @@ export default function TeamDetailPage({
         await loadKnowledgeBindings();
       }
     } finally {
-      setKnowledgeBusyId('');
+      setKnowledgeBusyIds((current) => {
+        const next = new Set(current);
+        next.delete(binding.id);
+        return next;
+      });
     }
   }
 
@@ -691,7 +699,7 @@ export default function TeamDetailPage({
     if (!window.confirm(
       `确认从团队移除「${binding.knowledge_base_name}」？团队权限会被撤销，但共享知识库本身不会删除。`,
     )) return;
-    setKnowledgeBusyId(binding.id);
+    setKnowledgeBusyIds((current) => new Set(current).add(binding.id));
     try {
       await api.delete(
         `/api/enterprise/teams/${teamId}/knowledge-bases/${binding.knowledge_base_id}`,
@@ -708,14 +716,18 @@ export default function TeamDetailPage({
         await loadKnowledgeBindings();
       }
     } finally {
-      setKnowledgeBusyId('');
+      setKnowledgeBusyIds((current) => {
+        const next = new Set(current);
+        next.delete(binding.id);
+        return next;
+      });
     }
   }
 
   async function bindExistingKnowledgeBase() {
     /** Bind one reusable shared base selected from the tenant management list. */
     if (!addKnowledgeBaseId) return;
-    setKnowledgeBusyId('add-existing');
+    setKnowledgeBusyIds((current) => new Set(current).add('add-existing'));
     try {
       await api.post<TeamKnowledgeBindingRead>(
         `/api/enterprise/teams/${teamId}/knowledge-bases`,
@@ -731,7 +743,11 @@ export default function TeamDetailPage({
     } catch (error) {
       notify.error(apiErrorMessage(error, '绑定共享知识库失败'));
     } finally {
-      setKnowledgeBusyId('');
+      setKnowledgeBusyIds((current) => {
+        const next = new Set(current);
+        next.delete('add-existing');
+        return next;
+      });
     }
   }
 
@@ -739,7 +755,7 @@ export default function TeamDetailPage({
     /** Create a generic shared base and bind it to this team in one request. */
     const name = newSharedKnowledgeName.trim();
     if (!name) return;
-    setKnowledgeBusyId('create-shared');
+    setKnowledgeBusyIds((current) => new Set(current).add('create-shared'));
     try {
       await api.post<TeamKnowledgeBindingRead>(
         `/api/enterprise/teams/${teamId}/knowledge-bases`,
@@ -755,7 +771,11 @@ export default function TeamDetailPage({
     } catch (error) {
       notify.error(apiErrorMessage(error, '创建共享知识库失败'));
     } finally {
-      setKnowledgeBusyId('');
+      setKnowledgeBusyIds((current) => {
+        const next = new Set(current);
+        next.delete('create-shared');
+        return next;
+      });
     }
   }
 
@@ -1240,7 +1260,7 @@ export default function TeamDetailPage({
               key={binding.id}
               binding={binding}
               members={team?.members || []}
-              busy={knowledgeBusyId === binding.id}
+              busy={knowledgeBusyIds.has(binding.id)}
               onSave={saveKnowledgeGrants}
               onSetDefault={setDefaultKnowledgeBase}
               onRemove={removeKnowledgeBase}
@@ -1272,7 +1292,7 @@ export default function TeamDetailPage({
             </select>
             <Button
               type="button"
-              disabled={!addKnowledgeBaseId || Boolean(knowledgeBusyId)}
+              disabled={!addKnowledgeBaseId || knowledgeBusyIds.size > 0}
               onClick={() => void bindExistingKnowledgeBase()}
               className="h-[34px] shrink-0 rounded-[9px] bg-[#18181a] px-[12px] text-[12px] text-white"
             >
@@ -1289,7 +1309,7 @@ export default function TeamDetailPage({
             />
             <Button
               type="button"
-              disabled={!newSharedKnowledgeName.trim() || Boolean(knowledgeBusyId)}
+              disabled={!newSharedKnowledgeName.trim() || knowledgeBusyIds.size > 0}
               onClick={() => void createAndBindSharedKnowledgeBase()}
               className="h-[34px] shrink-0 rounded-[9px] bg-[#18181a] px-[12px] text-[12px] text-white"
             >

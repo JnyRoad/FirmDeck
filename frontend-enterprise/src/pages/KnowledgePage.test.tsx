@@ -83,6 +83,9 @@ function stubKnowledgeFetch(options?: { agents?: AgentProfileRead[] }) {
     if (url.includes('/audit-events')) {
       return jsonResponse({ items: [], total: 0, offset: 0, limit: 20, has_more: false });
     }
+    if (url.includes('/knowledge-bases/kb-shared/teams')) {
+      return jsonResponse([{ id: 'team-content', name: '内容团队' }]);
+    }
     if (url.includes('/knowledge-bases/kb-shared/versions')) {
       return jsonResponse([{
         id: 'kbver-shared-100',
@@ -224,7 +227,7 @@ describe('KnowledgePage shared knowledge', () => {
   it('offers conversion only for an active dedicated base in an employee scope', async () => {
     /** 验证专用员工分支出现转换入口，而共享库不出现反向转换入口。 */
     const user = userEvent.setup();
-    window.localStorage.setItem('ultrarag_enterprise_agent_scope', employeeAgent.id);
+    window.localStorage.setItem('ultrarag_enterprise_agent_scope', 'agent-source');
     stubKnowledgeFetch({ agents: [employeeAgent] });
     render(
       <I18nProvider>
@@ -250,13 +253,14 @@ describe('KnowledgePage shared knowledge', () => {
     await user.click(within(sharedRow as HTMLTableRowElement).getByRole('button', {
       name: '知识库操作',
     }));
+    expect(await screen.findByRole('menuitem', { name: '版本管理' })).toBeTruthy();
     expect(screen.queryByRole('menuitem', { name: '转换为共享知识库' })).toBeNull();
   });
 
   it('opens the shared version dialog with an audit-history entry point', async () => {
     /** 共享库的版本管理入口必须同时承载正式版本和审计复盘视图。 */
     const user = userEvent.setup();
-    stubKnowledgeFetch();
+    const fetchMock = stubKnowledgeFetch();
     render(
       <I18nProvider>
         <TooltipProvider>
@@ -277,5 +281,11 @@ describe('KnowledgePage shared knowledge', () => {
 
     const dialog = await screen.findByRole('dialog', { name: /共享版本：团队选题库/ });
     expect(within(dialog).getByRole('tab', { name: '审计历史' })).toBeTruthy();
+    expect(fetchMock.mock.calls.filter(([input]) => (
+      String(input).includes('/knowledge-bases/kb-shared/teams?')
+    ))).toHaveLength(1);
+    expect(fetchMock.mock.calls.some(([input]) => (
+      String(input).includes('/teams/team-content/knowledge-bases')
+    ))).toBe(false);
   });
 });

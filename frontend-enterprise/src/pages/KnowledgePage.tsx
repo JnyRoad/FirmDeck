@@ -102,8 +102,6 @@ import type {
   ModelConfigRead,
   KnowledgeBaseConversionRead,
   KnowledgeBaseVersionRead,
-  TeamKnowledgeBindingRead,
-  TeamRead,
 } from '../types';
 
 const KNOWLEDGE_PAGE_SIZE = 10;
@@ -799,22 +797,9 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
 
   async function loadSharedVersionTeams(row: KnowledgeBaseRead) {
     /** 找出当前账号可管理且已绑定此共享库的团队，供生命周期动作选择。 */
-    const teams = await api.get<TeamRead[]>(`/api/enterprise/teams?tenant_id=${TENANT_ID}`);
-    const bindingRows = await Promise.all(teams.map(async (team) => {
-      try {
-        const bindings = await api.get<TeamKnowledgeBindingRead[]>(
-          `/api/enterprise/teams/${team.id}/knowledge-bases?tenant_id=${TENANT_ID}`,
-        );
-        return bindings.some((binding) => (
-          binding.knowledge_base_id === row.id && binding.status === 'active'
-        ))
-          ? { id: team.id, name: team.name }
-          : null;
-      } catch {
-        return null;
-      }
-    }));
-    return bindingRows.filter((team): team is { id: string; name: string } => Boolean(team));
+    return api.get<Array<{ id: string; name: string }>>(
+      `/api/enterprise/knowledge-bases/${row.id}/teams?tenant_id=${TENANT_ID}`,
+    );
   }
 
   async function openKnowledgeBaseVersions(row: KnowledgeBaseRead) {
