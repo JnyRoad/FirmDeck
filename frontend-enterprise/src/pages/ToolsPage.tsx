@@ -88,7 +88,10 @@ import type {
   MCPServerConnection,
   MCPDiscoverResponse,
   MCPSyncResponse,
+  MCPAuthMode,
   MCPAppsMode,
+  MCPOAuthStartResult,
+  MCPOAuthStatusRead,
   MCPTransport,
   MCPDiscoveredTool,
 } from '../types';
@@ -115,6 +118,9 @@ const TOOLS_MESSAGE_IDS = {
   actionSave: 'toolsPage.action.save',
   actionDiscover: 'toolsPage.action.discover',
   actionSync: 'toolsPage.action.sync',
+  actionOAuthConnect: 'toolsPage.action.oauthConnect',
+  actionOAuthReconnect: 'toolsPage.action.oauthReconnect',
+  actionOAuthDisconnect: 'toolsPage.action.oauthDisconnect',
   actionCancel: 'toolsPage.action.cancel',
   actionProbe: 'toolsPage.action.probe',
   statsTotal: 'toolsPage.stats.total',
@@ -142,6 +148,10 @@ const TOOLS_MESSAGE_IDS = {
   statusCredentialMissing: 'toolsPage.status.credentialMissing',
   statusImported: 'toolsPage.status.imported',
   statusNotImported: 'toolsPage.status.notImported',
+  statusOAuthDisconnected: 'toolsPage.oauth.status.disconnected',
+  statusOAuthAuthorizing: 'toolsPage.oauth.status.authorizing',
+  statusOAuthConnected: 'toolsPage.oauth.status.connected',
+  statusOAuthReconnectRequired: 'toolsPage.oauth.status.reconnectRequired',
   serverHeading: 'toolsPage.server.heading',
   serverList: 'toolsPage.server.list',
   serverName: 'toolsPage.server.name',
@@ -195,6 +205,7 @@ const TOOLS_MESSAGE_IDS = {
   sectionInfo: 'toolsPage.section.info',
   sectionConnection: 'toolsPage.section.connection',
   sectionDiscovery: 'toolsPage.section.discovery',
+  sectionOAuth: 'toolsPage.section.oauth',
   sectionProbe: 'toolsPage.section.probe',
   sectionCallTest: 'toolsPage.section.callTest',
   sectionLoading: 'toolsPage.status.loading',
@@ -222,6 +233,10 @@ const TOOLS_MESSAGE_IDS = {
   fieldMcpBucket: 'toolsPage.field.mcpBucket',
   fieldMcpUrl: 'toolsPage.field.mcpUrl',
   fieldMcpHeaders: 'toolsPage.field.mcpHeaders',
+  fieldMcpAuthMode: 'toolsPage.field.mcpAuthMode',
+  fieldMcpOAuthClientId: 'toolsPage.field.mcpOAuthClientId',
+  fieldMcpOAuthClientMetadataUrl: 'toolsPage.field.mcpOAuthClientMetadataUrl',
+  fieldMcpOAuthRedirectUri: 'toolsPage.field.mcpOAuthRedirectUri',
   fieldCommand: 'toolsPage.field.command',
   fieldArgs: 'toolsPage.field.args',
   fieldEnv: 'toolsPage.field.env',
@@ -236,6 +251,9 @@ const TOOLS_MESSAGE_IDS = {
   hintMcpNameRules: 'toolsPage.hint.mcpNameRules',
   hintMcpArgs: 'toolsPage.hint.mcpArgs',
   hintMcpCwd: 'toolsPage.hint.mcpCwd',
+  hintMcpAuthMode: 'toolsPage.hint.mcpAuthMode',
+  hintMcpOAuthPublicOnly: 'toolsPage.hint.mcpOAuthPublicOnly',
+  hintMcpOAuthStatus: 'toolsPage.hint.mcpOAuthStatus',
   hintEnabledToolGroup: 'toolsPage.hint.enabledToolGroup',
   hintEnabledTool: 'toolsPage.hint.enabledTool',
   hintA2AAgentCard: 'toolsPage.hint.a2aAgentCard',
@@ -266,6 +284,8 @@ const TOOLS_MESSAGE_IDS = {
   appsValueOff: 'toolsPage.apps.valueOff',
   appsOnly: 'toolsPage.apps.only',
   appsModelAndApp: 'toolsPage.apps.modelAndApp',
+  oauthModeNone: 'toolsPage.oauth.mode.none',
+  oauthModePersonal: 'toolsPage.oauth.mode.personal',
   a2aHeading: 'toolsPage.a2a.heading',
   a2aCodexAdapter: 'toolsPage.a2a.codexAdapter',
   a2aStandardAgent: 'toolsPage.a2a.standardAgent',
@@ -327,6 +347,14 @@ const TOOLS_MESSAGE_IDS = {
   toastSelectToolToSync: 'toolsPage.toast.selectToolToSync',
   toastSyncFailed: 'toolsPage.toast.syncFailed',
   toastSynced: 'toolsPage.toast.synced',
+  toastOAuthStatusFailed: 'toolsPage.toast.oauthStatusFailed',
+  toastOAuthStartFailed: 'toolsPage.toast.oauthStartFailed',
+  toastOAuthDisconnectFailed: 'toolsPage.toast.oauthDisconnectFailed',
+  toastOAuthDisconnected: 'toolsPage.toast.oauthDisconnected',
+  toastOAuthCompleted: 'toolsPage.toast.oauthCompleted',
+  toastOAuthDenied: 'toolsPage.toast.oauthDenied',
+  toastOAuthExpired: 'toolsPage.toast.oauthExpired',
+  toastOAuthCallbackFailed: 'toolsPage.toast.oauthCallbackFailed',
   toastProbeFailed: 'toolsPage.toast.probeFailed',
   toastInvalidProbeArguments: 'toolsPage.toast.invalidProbeArguments',
   toastQueryArgumentRule: 'toolsPage.toast.queryArgumentRule',
@@ -336,6 +364,9 @@ const TOOLS_MESSAGE_IDS = {
   placeholderMcpDisplayName: 'toolsPage.placeholder.mcpDisplayName',
   placeholderMcpName: 'toolsPage.placeholder.mcpName',
   placeholderMcpUrl: 'toolsPage.placeholder.mcpUrl',
+  placeholderMcpOAuthClientId: 'toolsPage.placeholder.mcpOAuthClientId',
+  placeholderMcpOAuthClientMetadataUrl: 'toolsPage.placeholder.mcpOAuthClientMetadataUrl',
+  placeholderMcpOAuthRedirectUri: 'toolsPage.placeholder.mcpOAuthRedirectUri',
   placeholderMcpCommand: 'toolsPage.placeholder.mcpCommand',
   placeholderMcpArgs: 'toolsPage.placeholder.mcpArgs',
   placeholderMcpCwd: 'toolsPage.placeholder.mcpCwd',
@@ -558,6 +589,25 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
     setSearchParams(next, { replace: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [agentScopeLoaded, isOverallAgent, searchParams, setSearchParams]);
+
+  useEffect(() => {
+    const outcome = searchParams.get('mcp_oauth');
+    if (!outcome) return;
+    if (outcome === 'completed') {
+      toast.success(createMessageDescriptor(TOOLS_MESSAGE_IDS.toastOAuthCompleted));
+    } else if (outcome === 'denied') {
+      toast.error(createMessageDescriptor(TOOLS_MESSAGE_IDS.toastOAuthDenied));
+    } else if (outcome === 'expired') {
+      toast.error(createMessageDescriptor(TOOLS_MESSAGE_IDS.toastOAuthExpired));
+    } else if (outcome === 'failed') {
+      toast.error(createMessageDescriptor(TOOLS_MESSAGE_IDS.toastOAuthCallbackFailed));
+    }
+    const next = new URLSearchParams(searchParams);
+    next.delete('mcp_oauth');
+    setSearchParams(next, { replace: true });
+    // The callback result is one-time UI state and is removed immediately after projection.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams, setSearchParams]);
 
   const visibleRows = useMemo(() => (isOverallAgent ? rows : rows.filter((row) => row.enabled)), [isOverallAgent, rows]);
   const bucketStats = useMemo(() => buildBucketStats(visibleRows), [visibleRows]);
@@ -1962,6 +2012,10 @@ type McpFormValues = {
   env: string;
   cwd: string;
   apps_mode: MCPAppsMode;
+  auth_mode: MCPAuthMode;
+  oauth_client_id: string;
+  oauth_client_metadata_url: string;
+  oauth_redirect_uri: string;
   capability_scope: CapabilityScope;
   enabled: boolean;
 };
@@ -1979,6 +2033,10 @@ const MCP_FORM_INITIAL_VALUES: McpFormValues = {
   env: '{}',
   cwd: '',
   apps_mode: 'disabled',
+  auth_mode: 'none',
+  oauth_client_id: '',
+  oauth_client_metadata_url: '',
+  oauth_redirect_uri: '',
   capability_scope: 'general',
   enabled: true,
 };
@@ -1995,6 +2053,8 @@ function McpServerEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'e
   const [saving, setSaving] = useState(false);
   const [discovering, setDiscovering] = useState(false);
   const [syncing, setSyncing] = useState(false);
+  const [oauthBusy, setOauthBusy] = useState(false);
+  const [oauthStatus, setOauthStatus] = useState<MCPOAuthStatusRead | null>(null);
   const [discovered, setDiscovered] = useState<DiscoveredRow[]>([]);
   const navigate = useNavigate();
   const { serverId } = useParams();
@@ -2007,6 +2067,7 @@ function McpServerEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'e
     if (!isEdit) {
       setValues({ ...MCP_FORM_INITIAL_VALUES });
       setServer(null);
+      setOauthStatus(null);
       setDiscovered([]);
       return;
     }
@@ -2017,6 +2078,11 @@ function McpServerEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'e
       .then((row) => {
         setServer(row);
         setValues(serverToFormValues(row));
+        if (row.auth_mode === 'oauth_personal') {
+          void loadOAuthStatus(row.id);
+        } else {
+          setOauthStatus(null);
+        }
       })
       .catch((error) => {
         console.error('[tools-page] load MCP server failed', error);
@@ -2028,6 +2094,74 @@ function McpServerEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'e
   const transportOption = TRANSPORT_OPTIONS.find((item) => item.value === values.transport);
   const isRemote = values.transport === 'streamable_http' || values.transport === 'sse';
   const isStdio = values.transport === 'stdio';
+  const isOAuth = values.auth_mode === 'oauth_personal';
+  const savedOAuthValues = server ? serverToFormValues(server) : null;
+  const oauthConfigurationDirty = Boolean(savedOAuthValues && (
+    values.auth_mode !== savedOAuthValues.auth_mode
+    || values.transport !== savedOAuthValues.transport
+    || values.url.trim() !== savedOAuthValues.url.trim()
+    || values.headers.trim() !== savedOAuthValues.headers.trim()
+    || values.oauth_client_id.trim() !== savedOAuthValues.oauth_client_id.trim()
+    || values.oauth_client_metadata_url.trim() !== savedOAuthValues.oauth_client_metadata_url.trim()
+    || values.oauth_redirect_uri.trim() !== savedOAuthValues.oauth_redirect_uri.trim()
+  ));
+
+  async function loadOAuthStatus(targetServerId: string): Promise<void> {
+    /** Refresh only the signed-in user's credential-free authorization projection. */
+    try {
+      const status = await api.get<MCPOAuthStatusRead>(
+        `/api/enterprise/mcp-servers/${targetServerId}/oauth/status?tenant_id=${TENANT_ID}`,
+      );
+      setOauthStatus(status);
+    } catch (error) {
+      console.error('[tools-page] load MCP OAuth status failed', error);
+      toast.error(toolErrorDescriptor(error, TOOLS_MESSAGE_IDS.toastOAuthStatusFailed));
+    }
+  }
+
+  async function beginOAuth(): Promise<void> {
+    /** Ask the backend SDK bridge for a one-time URL and continue in the current tab. */
+    if (!server) return;
+    setOauthBusy(true);
+    try {
+      const started = await api.post<MCPOAuthStartResult>(
+        `/api/enterprise/mcp-servers/${server.id}/oauth/start`,
+        { tenant_id: TENANT_ID },
+      );
+      setOauthStatus({
+        server_id: server.id,
+        auth_mode: 'oauth_personal',
+        state: 'authorizing',
+        expires_at: started.expires_at,
+        scopes: [],
+        error_code: null,
+      });
+      window.open(started.authorization_url, '_self');
+    } catch (error) {
+      console.error('[tools-page] start MCP OAuth failed', error);
+      toast.error(toolErrorDescriptor(error, TOOLS_MESSAGE_IDS.toastOAuthStartFailed));
+    } finally {
+      setOauthBusy(false);
+    }
+  }
+
+  async function disconnectOAuth(): Promise<void> {
+    /** Remove only the signed-in user's grant, then refresh its non-secret state. */
+    if (!server) return;
+    setOauthBusy(true);
+    try {
+      await api.delete(
+        `/api/enterprise/mcp-servers/${server.id}/oauth?tenant_id=${TENANT_ID}`,
+      );
+      await loadOAuthStatus(server.id);
+      toast.success(createMessageDescriptor(TOOLS_MESSAGE_IDS.toastOAuthDisconnected));
+    } catch (error) {
+      console.error('[tools-page] disconnect MCP OAuth failed', error);
+      toast.error(toolErrorDescriptor(error, TOOLS_MESSAGE_IDS.toastOAuthDisconnectFailed));
+    } finally {
+      setOauthBusy(false);
+    }
+  }
 
   function buildConnection(): MCPServerConnection | null {
     let headers: Record<string, string>;
@@ -2075,6 +2209,10 @@ function McpServerEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'e
         bucket: values.bucket,
         connection,
         apps_mode: values.apps_mode,
+        auth_mode: values.auth_mode,
+        oauth_client_id: values.oauth_client_id.trim() || null,
+        oauth_client_metadata_url: values.oauth_client_metadata_url.trim() || null,
+        oauth_redirect_uri: values.oauth_redirect_uri.trim() || null,
         capability_scope: values.capability_scope,
         enabled: values.enabled,
       },
@@ -2100,6 +2238,11 @@ function McpServerEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'e
       });
       setServer(saved);
       setValues(serverToFormValues(saved));
+      if (saved.auth_mode === 'oauth_personal') {
+        void loadOAuthStatus(saved.id);
+      } else {
+        setOauthStatus(null);
+      }
       if (!isEdit) {
         navigate(`/enterprise/tools/mcp/${saved.id}/edit`, { replace: true });
       }
@@ -2366,7 +2509,13 @@ function McpServerEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'e
             >
               <UISelect
                 value={values.transport}
-                onValueChange={(value) => setField('transport', value as MCPTransport)}
+                onValueChange={(value) => {
+                  const transport = value as MCPTransport;
+                  setField('transport', transport);
+                  if (transport !== 'streamable_http' && values.auth_mode === 'oauth_personal') {
+                    setField('auth_mode', 'none');
+                  }
+                }}
               >
                 <SelectTrigger className={cn(SELECT_TRIGGER_CLASS, 'w-full')}>
                   <SelectValue />
@@ -2377,6 +2526,30 @@ function McpServerEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'e
                       {t(item.labelId)}
                     </SelectItem>
                   ))}
+                </SelectContent>
+              </UISelect>
+            </Field>
+
+            <Field
+              label={t(TOOLS_MESSAGE_IDS.fieldMcpAuthMode)}
+              hint={t(TOOLS_MESSAGE_IDS.hintMcpAuthMode)}
+            >
+              <UISelect
+                value={values.auth_mode}
+                onValueChange={(value) => {
+                  const authMode = value as MCPAuthMode;
+                  setField('auth_mode', authMode);
+                  if (authMode === 'oauth_personal') setField('transport', 'streamable_http');
+                }}
+              >
+                <SelectTrigger className={cn(SELECT_TRIGGER_CLASS, 'w-full')}>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="none">{t(TOOLS_MESSAGE_IDS.oauthModeNone)}</SelectItem>
+                  <SelectItem value="oauth_personal">
+                    {t(TOOLS_MESSAGE_IDS.oauthModePersonal)}
+                  </SelectItem>
                 </SelectContent>
               </UISelect>
             </Field>
@@ -2401,6 +2574,96 @@ function McpServerEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'e
                   />
                 </Field>
               </>
+            )}
+
+            {isOAuth && (
+              <div className="flex flex-col gap-[14px] rounded-[14px] border border-[#dce6f7] bg-[#f7f9fd] p-[16px]">
+                <div className="flex flex-col gap-[4px]">
+                  <span className="text-[14px] font-medium text-[#18181a]">
+                    {t(TOOLS_MESSAGE_IDS.sectionOAuth)}
+                  </span>
+                  <span className={HINT_CLASS}>
+                    {t(TOOLS_MESSAGE_IDS.hintMcpOAuthPublicOnly)}
+                  </span>
+                </div>
+                <div className="grid grid-cols-1 gap-[14px] sm:grid-cols-2">
+                  <Field
+                    label={t(TOOLS_MESSAGE_IDS.fieldMcpOAuthClientId)}
+                    htmlFor="mcp-oauth-client-id"
+                  >
+                    <Input
+                      id="mcp-oauth-client-id"
+                      placeholder={t(TOOLS_MESSAGE_IDS.placeholderMcpOAuthClientId)}
+                      value={values.oauth_client_id}
+                      onChange={(event) => setField('oauth_client_id', event.target.value)}
+                    />
+                  </Field>
+                  <Field
+                    label={t(TOOLS_MESSAGE_IDS.fieldMcpOAuthClientMetadataUrl)}
+                    htmlFor="mcp-oauth-client-metadata-url"
+                  >
+                    <Input
+                      id="mcp-oauth-client-metadata-url"
+                      placeholder={t(TOOLS_MESSAGE_IDS.placeholderMcpOAuthClientMetadataUrl)}
+                      value={values.oauth_client_metadata_url}
+                      onChange={(event) => setField('oauth_client_metadata_url', event.target.value)}
+                    />
+                  </Field>
+                </div>
+                <Field
+                  label={t(TOOLS_MESSAGE_IDS.fieldMcpOAuthRedirectUri)}
+                  htmlFor="mcp-oauth-redirect-uri"
+                >
+                  <Input
+                    id="mcp-oauth-redirect-uri"
+                    placeholder={t(TOOLS_MESSAGE_IDS.placeholderMcpOAuthRedirectUri)}
+                    value={values.oauth_redirect_uri}
+                    onChange={(event) => setField('oauth_redirect_uri', event.target.value)}
+                  />
+                </Field>
+                {server && (
+                  <div className="flex flex-wrap items-center justify-between gap-[12px] rounded-[12px] border border-[#e5e7eb] bg-white px-[14px] py-[12px]">
+                    <div className="flex min-w-0 flex-col gap-[4px]">
+                      <StatusBadge tone={oauthStatus?.state === 'connected' ? 'green' : oauthStatus?.state === 'reconnect_required' ? 'red' : 'gray'}>
+                        {t(
+                          oauthStatus?.state === 'connected'
+                            ? TOOLS_MESSAGE_IDS.statusOAuthConnected
+                            : oauthStatus?.state === 'authorizing'
+                              ? TOOLS_MESSAGE_IDS.statusOAuthAuthorizing
+                              : oauthStatus?.state === 'reconnect_required'
+                                ? TOOLS_MESSAGE_IDS.statusOAuthReconnectRequired
+                                : TOOLS_MESSAGE_IDS.statusOAuthDisconnected,
+                        )}
+                      </StatusBadge>
+                      <span className={HINT_CLASS}>{t(TOOLS_MESSAGE_IDS.hintMcpOAuthStatus)}</span>
+                    </div>
+                    <div className="flex flex-wrap gap-[8px]">
+                      {oauthStatus?.state === 'connected' || oauthStatus?.state === 'authorizing' ? (
+                        <UIButton
+                          variant="outline"
+                          disabled={oauthBusy}
+                          onClick={() => void disconnectOAuth()}
+                          className={RETURN_BUTTON_CLASS}
+                        >
+                          {t(TOOLS_MESSAGE_IDS.actionOAuthDisconnect)}
+                        </UIButton>
+                      ) : (
+                        <UIButton
+                          disabled={oauthBusy || oauthConfigurationDirty}
+                          onClick={() => void beginOAuth()}
+                          className={PRIMARY_BUTTON_CLASS}
+                        >
+                          {t(
+                            oauthStatus?.state === 'reconnect_required'
+                              ? TOOLS_MESSAGE_IDS.actionOAuthReconnect
+                              : TOOLS_MESSAGE_IDS.actionOAuthConnect,
+                          )}
+                        </UIButton>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
             )}
 
             {isStdio && (
@@ -3101,6 +3364,10 @@ function serverToFormValues(row: MCPServerRead): McpFormValues {
     env: JSON.stringify(connection.env || {}, null, 2),
     cwd: connection.cwd || '',
     apps_mode: row.apps_mode || 'disabled',
+    auth_mode: row.auth_mode || 'none',
+    oauth_client_id: row.oauth_client_id || '',
+    oauth_client_metadata_url: row.oauth_client_metadata_url || '',
+    oauth_redirect_uri: row.oauth_redirect_uri || '',
     capability_scope: normalizeCapabilityScope(row.capability_scope),
     enabled: row.enabled,
   };

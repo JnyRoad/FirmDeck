@@ -3,13 +3,34 @@
 import { createElement, type ComponentType, type ReactNode } from 'react';
 import { cleanup, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { MemoryRouter } from 'react-router-dom';
+import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { AppIntlProvider } from '@/i18n/provider';
 import type { AppLocale } from '@/i18n/locales';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import type { AgentProfileRead, ToolRead } from '@/types';
+
+const toastSpies = vi.hoisted(() => ({
+  success: vi.fn(),
+  error: vi.fn(),
+  warning: vi.fn(),
+  info: vi.fn(),
+  loading: vi.fn(),
+  dismiss: vi.fn(),
+}));
+
+/** Capture the localized toast text emitted by OAuth callback recovery handling. */
+vi.mock('@/components/ui/app-toast', () => ({
+  createToastNotifier: (translator: { t: (id: string) => string }) => ({
+    success: (descriptor: { id: string }) => toastSpies.success(translator.t(descriptor.id)),
+    error: (descriptor: { id: string }) => toastSpies.error(translator.t(descriptor.id)),
+    warning: (descriptor: { id: string }) => toastSpies.warning(translator.t(descriptor.id)),
+    info: (descriptor: { id: string }) => toastSpies.info(translator.t(descriptor.id)),
+    loading: (descriptor: { id: string }) => toastSpies.loading(translator.t(descriptor.id)),
+    dismiss: toastSpies.dismiss,
+  }),
+}));
 
 /** 隔离仍使用 legacy locale 的全局页头，使本文件只验证语义 Provider 下的工具页。 */
 vi.mock('../components/AppHeader', () => ({
@@ -19,7 +40,7 @@ vi.mock('../components/AppHeader', () => ({
 }));
 
 import { parseMcpArgs } from './ToolsPage';
-import ToolsPage, { ToolNewPage } from './ToolsPage';
+import ToolsPage, { McpServerEditPage, ToolNewPage } from './ToolsPage';
 
 const overallAgent: AgentProfileRead = {
   id: 'agent-overall',
@@ -88,6 +109,40 @@ function jsonResponse(body: unknown): Response {
   } as Response;
 }
 
+/** Return the public, secret-free server policy shared by OAuth editor tests. */
+function oauthServerResponse(): Record<string, unknown> {
+  return {
+    id: 'server-oauth',
+    tenant_id: 'tenant_demo',
+    name: 'protected',
+    display_name: 'Protected MCP',
+    description: '',
+    bucket: 'MCP tools',
+    connection: {
+      transport: 'streamable_http',
+      url: 'https://mcp.example/mcp',
+      headers: {},
+      command: null,
+      args: [],
+      env: {},
+      cwd: null,
+    },
+    apps_mode: 'disabled',
+    auth_mode: 'oauth_personal',
+    oauth_client_id: 'staffdeck-public',
+    oauth_client_metadata_url: null,
+    oauth_redirect_uri: 'https://staffdeck.example/api/enterprise/mcp-servers/oauth/callback',
+    apps_negotiated: false,
+    negotiated_capabilities: {},
+    capability_scope: 'general',
+    enabled: true,
+    last_synced_at: null,
+    tool_count: 0,
+    created_at: '2026-08-31T12:00:00Z',
+    updated_at: '2026-08-31T12:00:00Z',
+  };
+}
+
 /** 为工具页的作用域、工具列表和 MCP 服务器请求提供确定性的 API 数据。 */
 function stubToolsFetch(): void {
   vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
@@ -126,7 +181,11 @@ function stubBrowserApis(): void {
 }
 
 /** 在不挂载 legacy Provider 或 observer 的前提下渲染工具页。 */
-function renderSemanticTools(locale: AppLocale, role: 'admin' | 'member' = 'admin'): void {
+function renderSemanticTools(
+  locale: AppLocale,
+  role: 'admin' | 'member' = 'admin',
+  initialEntry = '/workspace/tools',
+): void {
   type SemanticToolsProps = NonNullable<Parameters<typeof ToolsPage>[0]>;
   const SemanticToolsPage = ToolsPage as ComponentType<SemanticToolsProps>;
   const page = createElement(SemanticToolsPage, {
@@ -135,7 +194,7 @@ function renderSemanticTools(locale: AppLocale, role: 'admin' | 'member' = 'admi
   render(
     createElement(AppIntlProvider, {
       initialLocale: locale,
-      children: createElement(MemoryRouter, { children: page }),
+      children: createElement(MemoryRouter, { initialEntries: [initialEntry], children: page }),
     }),
   );
 }
@@ -158,9 +217,40 @@ function renderSemanticToolEditor(locale: AppLocale): void {
   );
 }
 
+/** 渲染带真实路由参数的 MCP 编辑页，覆盖个人 OAuth 生命周期交互。 */
+function renderSemanticMcpEditor(locale: AppLocale): void {
+  const SemanticMcpServerEditPage = McpServerEditPage as ComponentType<
+    NonNullable<Parameters<typeof McpServerEditPage>[0]>
+  >;
+  render(
+    createElement(AppIntlProvider, {
+      initialLocale: locale,
+      children: createElement(TooltipProvider, {
+        children: createElement(MemoryRouter, {
+          initialEntries: ['/enterprise/tools/mcp/server-oauth/edit'],
+          children: createElement(Routes, {
+            children: createElement(Route, {
+              path: '/enterprise/tools/mcp/:serverId/edit',
+              element: createElement(SemanticMcpServerEditPage, {
+                currentUser: {
+                  id: 'user-1',
+                  tenant_id: 'tenant_demo',
+                  username: 'demo',
+                  role: 'admin',
+                },
+              }),
+            }),
+          }),
+        }),
+      }),
+    }),
+  );
+}
+
 beforeEach(() => {
   stubBrowserApis();
   stubToolsFetch();
+  Object.values(toastSpies).forEach((spy) => spy.mockClear());
   window.localStorage.clear();
 });
 
@@ -260,5 +350,254 @@ describe('ToolsPage semantic locale matrix', () => {
 
     await waitFor(() => expect(screen.getAllByText(rawTool.name).length).toBeGreaterThan(0));
     expect(screen.queryByRole('button', { name: 'Add' })).toBeNull();
+  });
+});
+
+describe('MCP personal OAuth lifecycle', () => {
+  it.each([
+    ['zh-CN', 'completed', 'success', 'MCP 账户授权完成'],
+    ['en-US', 'denied', 'error', 'MCP authorization was denied. Start it again when ready.'],
+    ['zh-CN', 'expired', 'error', 'MCP 授权已过期，请重新发起连接。'],
+    ['en-US', 'failed', 'error', 'MCP authorization failed. Start the connection again.'],
+  ] as const)(
+    'shows a localized recoverable %s callback outcome in %s',
+    async (locale, outcome, variant, message) => {
+      renderSemanticTools(locale, 'admin', `/enterprise/tools?mcp_oauth=${outcome}`);
+
+      await waitFor(() => {
+        expect(toastSpies[variant]).toHaveBeenCalledWith(message);
+      });
+    },
+  );
+
+  it.each([
+    ['en-US', 'connected', 'Connected', 'Disconnect account'],
+    ['zh-CN', 'reconnect_required', '需要重新连接', '重新连接账户'],
+  ] as const)(
+    'renders the current-user %s status and recovery action in %s',
+    async (locale, state, statusLabel, actionLabel) => {
+      vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes('/oauth/status')) {
+          return jsonResponse({
+            server_id: 'server-oauth',
+            auth_mode: 'oauth_personal',
+            state,
+            expires_at: null,
+            scopes: [],
+            error_code: state === 'reconnect_required' ? 'MCP_TOKEN_REFRESH_FAILED' : null,
+          });
+        }
+        if (url.includes('/api/enterprise/mcp-servers/server-oauth')) {
+          return jsonResponse(oauthServerResponse());
+        }
+        return jsonResponse([]);
+      }));
+
+      renderSemanticMcpEditor(locale);
+
+      expect(await screen.findByText(statusLabel)).toBeTruthy();
+      expect(await screen.findByRole('button', { name: actionLabel })).toBeTruthy();
+    },
+  );
+
+  it('disconnects only the current account and refreshes to a reconnectable state', async () => {
+    let disconnected = false;
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes('/oauth/status')) {
+        return jsonResponse({
+          server_id: 'server-oauth',
+          auth_mode: 'oauth_personal',
+          state: disconnected ? 'disconnected' : 'connected',
+          expires_at: null,
+          scopes: [],
+          error_code: null,
+        });
+      }
+      if (url.includes('/oauth?') && init?.method === 'DELETE') {
+        disconnected = true;
+        return jsonResponse(null);
+      }
+      if (url.includes('/api/enterprise/mcp-servers/server-oauth')) {
+        return jsonResponse(oauthServerResponse());
+      }
+      return jsonResponse([]);
+    }));
+
+    const user = userEvent.setup();
+    renderSemanticMcpEditor('en-US');
+
+    await user.click(await screen.findByRole('button', { name: 'Disconnect account' }));
+    expect(await screen.findByRole('button', { name: 'Connect personal account' })).toBeTruthy();
+  });
+
+  it('prevents authorization from starting with unsaved OAuth configuration', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/oauth/status')) {
+        return jsonResponse({
+          server_id: 'server-oauth',
+          auth_mode: 'oauth_personal',
+          state: 'disconnected',
+          expires_at: null,
+          scopes: [],
+          error_code: null,
+        });
+      }
+      if (url.includes('/api/enterprise/mcp-servers/server-oauth')) {
+        return jsonResponse(oauthServerResponse());
+      }
+      return jsonResponse([]);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const user = userEvent.setup();
+    renderSemanticMcpEditor('en-US');
+
+    const clientId = await screen.findByLabelText('Public client ID');
+    await user.clear(clientId);
+    await user.type(clientId, 'unsaved-client');
+
+    const connect = await screen.findByRole('button', { name: 'Connect personal account' });
+    expect((connect as HTMLButtonElement).disabled).toBe(true);
+    expect(fetchMock.mock.calls.some(([input]) => String(input).includes('/oauth/start'))).toBe(false);
+  });
+
+  it('prevents authorization after editing the saved server URL or static headers', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/oauth/status')) {
+        return jsonResponse({
+          server_id: 'server-oauth',
+          auth_mode: 'oauth_personal',
+          state: 'disconnected',
+          expires_at: null,
+          scopes: [],
+          error_code: null,
+        });
+      }
+      if (url.includes('/api/enterprise/mcp-servers/server-oauth')) {
+        return jsonResponse(oauthServerResponse());
+      }
+      return jsonResponse([]);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const user = userEvent.setup();
+    renderSemanticMcpEditor('en-US');
+
+    const serverUrl = await screen.findByLabelText('Server URL');
+    await user.clear(serverUrl);
+    await user.type(serverUrl, 'https://new-target.example/mcp');
+
+    const connect = await screen.findByRole('button', { name: 'Connect personal account' });
+    expect((connect as HTMLButtonElement).disabled).toBe(true);
+    expect(fetchMock.mock.calls.some(([input]) => String(input).includes('/oauth/start'))).toBe(false);
+  });
+
+  it('offers disconnect recovery while authorization is still pending', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/oauth/status')) {
+        return jsonResponse({
+          server_id: 'server-oauth',
+          auth_mode: 'oauth_personal',
+          state: 'authorizing',
+          expires_at: null,
+          scopes: [],
+          error_code: null,
+        });
+      }
+      if (url.includes('/api/enterprise/mcp-servers/server-oauth')) {
+        return jsonResponse(oauthServerResponse());
+      }
+      return jsonResponse([]);
+    }));
+
+    renderSemanticMcpEditor('en-US');
+
+    const disconnect = await screen.findByRole('button', { name: 'Disconnect account' });
+    expect((disconnect as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it.each([
+    ['zh-CN', '连接个人账户', '个人 OAuth 授权'],
+    ['en-US', 'Connect personal account', 'Personal OAuth authorization'],
+  ] as const)('loads current-user status and navigates the current tab for authorization in %s', async (
+    locale,
+    connectLabel,
+    sectionLabel,
+  ) => {
+    const authorizationUrl = 'https://auth.example/authorize?state=opaque';
+    const openWindow = vi.spyOn(window, 'open').mockImplementation(() => null);
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes('/oauth/status')) {
+        return jsonResponse({
+          server_id: 'server-oauth',
+          auth_mode: 'oauth_personal',
+          state: 'disconnected',
+          expires_at: null,
+          scopes: [],
+          error_code: null,
+        });
+      }
+      if (url.includes('/oauth/start') && init?.method === 'POST') {
+        return jsonResponse({
+          authorization_url: authorizationUrl,
+          flow_id: 'flow-1',
+          expires_at: '2026-08-31T13:00:00Z',
+        });
+      }
+      if (url.includes('/api/enterprise/mcp-servers/server-oauth')) {
+        return jsonResponse({
+          id: 'server-oauth',
+          tenant_id: 'tenant_demo',
+          name: 'protected',
+          display_name: 'Protected MCP',
+          description: '',
+          bucket: 'MCP tools',
+          connection: {
+            transport: 'streamable_http',
+            url: 'https://mcp.example/mcp',
+            headers: {},
+            command: null,
+            args: [],
+            env: {},
+            cwd: null,
+          },
+          apps_mode: 'disabled',
+          auth_mode: 'oauth_personal',
+          oauth_client_id: 'staffdeck-public',
+          oauth_client_metadata_url: null,
+          oauth_redirect_uri: 'https://staffdeck.example/api/enterprise/mcp-servers/oauth/callback',
+          apps_negotiated: false,
+          negotiated_capabilities: {},
+          capability_scope: 'general',
+          enabled: true,
+          last_synced_at: null,
+          tool_count: 0,
+          created_at: '2026-08-31T12:00:00Z',
+          updated_at: '2026-08-31T12:00:00Z',
+        });
+      }
+      return jsonResponse([]);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const user = userEvent.setup();
+    renderSemanticMcpEditor(locale);
+
+    expect(await screen.findByText(sectionLabel)).toBeTruthy();
+    await user.click(await screen.findByRole('button', { name: connectLabel }));
+    await waitFor(() => {
+      expect(openWindow).toHaveBeenCalledWith(authorizationUrl, '_self');
+    });
+    const startCall = fetchMock.mock.calls.find(([input, init]) => (
+      String(input).includes('/oauth/start') && init?.method === 'POST'
+    ));
+    expect(startCall?.[1]).toEqual(expect.objectContaining({ credentials: 'include' }));
+    expect(screen.queryByLabelText(/access token/i)).toBeNull();
   });
 });

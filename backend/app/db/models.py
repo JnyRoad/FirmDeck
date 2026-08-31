@@ -812,11 +812,75 @@ class MCPServer(SQLModel, table=True):
         default_factory=dict,
         sa_column=Column(JSON),
     )
+    # OAuth policy is shared, while every token remains in a separate user grant.
+    auth_mode: str = Field(default="none", index=True)
+    oauth_client_id: Optional[str] = None
+    oauth_client_metadata_url: Optional[str] = None
+    oauth_redirect_uri: Optional[str] = None
     # 最近一次发现的原始工具定义（预览/审计用）
     discovered_tools_json: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
     last_synced_at: Optional[datetime] = None
     capability_scope: str = Field(default="general", index=True)
     enabled: bool = True
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class MCPUserOAuthGrant(SQLModel, table=True):
+    """Encrypted personal OAuth state for one tenant, MCP server, and user."""
+
+    __tablename__ = "mcp_user_oauth_grants"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "server_id",
+            "user_id",
+            name="uq_mcp_oauth_grant_owner",
+        ),
+        Index(
+            "ix_mcp_oauth_grants_tenant_user_status",
+            "tenant_id",
+            "user_id",
+            "status",
+        ),
+    )
+
+    id: str = Field(default_factory=lambda: new_id("mcpgrant"), primary_key=True)
+    tenant_id: str = Field(index=True)
+    server_id: str = Field(index=True)
+    user_id: str = Field(index=True)
+    config_fingerprint: str = Field(default="")
+    encrypted_payload: str
+    expires_at: Optional[datetime] = Field(default=None, index=True)
+    status: str = Field(default="authorizing", index=True)
+    version: int = 1
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class MCPOAuthFlow(SQLModel, table=True):
+    """Credential-free audit record for one bounded browser authorization attempt."""
+
+    __tablename__ = "mcp_oauth_flows"
+    __table_args__ = (
+        UniqueConstraint("state_digest", name="uq_mcp_oauth_flow_state_digest"),
+        Index(
+            "ix_mcp_oauth_flows_state_status_expiry",
+            "state_digest",
+            "status",
+            "expires_at",
+        ),
+    )
+
+    id: str = Field(default_factory=lambda: new_id("mcpflow"), primary_key=True)
+    tenant_id: str = Field(index=True)
+    server_id: str = Field(index=True)
+    user_id: str = Field(index=True)
+    state_digest: str = Field(index=True)
+    redirect_uri: str
+    status: str = Field(default="pending", index=True)
+    expires_at: datetime = Field(index=True)
+    error_code: Optional[str] = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 

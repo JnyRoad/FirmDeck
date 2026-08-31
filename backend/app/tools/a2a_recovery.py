@@ -134,4 +134,5 @@ def _recover_one(run_id: str) -> None:
             session_id=run.session_id,
             invocation_id=run.invocation_id,
             language_context=language_context,
+            user_id=session.user_id if session is not None else None,
         )

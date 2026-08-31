@@ -50,6 +50,7 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
       ...(options.headers || {}),
     },
     ...options,
+    credentials: 'include',
   });
   if (!response.ok) {
     const text = await response.text();
@@ -63,6 +64,7 @@ async function keepalivePost<T>(path: string, body?: unknown): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {
     method: 'POST',
     keepalive: true,
+    credentials: 'include',
     headers: {
       'Content-Type': 'application/json',
       ...authHeader(),
@@ -96,6 +98,7 @@ export const api = {
   }),
   blob: async (path: string) => {
     const response = await fetch(`${API_BASE}${path}`, {
+      credentials: 'include',
       headers: {
         ...authHeader(),
       },
@@ -109,6 +112,7 @@ export const api = {
   postBlob: async (path: string, body: unknown) => {
     const response = await fetch(`${API_BASE}${path}`, {
       method: 'POST',
+      credentials: 'include',
       headers: {
         'Content-Type': 'application/json',
         ...authHeader(),
@@ -132,6 +136,7 @@ export async function uploadChatAttachments<T>(
   files.forEach((file) => form.append('files', file));
   const response = await fetch(`${API_BASE}/api/chat/attachments?tenant_id=${encodeURIComponent(tenantId)}`, {
     method: 'POST',
+    credentials: 'include',
     headers: { ...authHeader() },
     body: form,
     signal,
@@ -164,6 +169,7 @@ export async function streamPost(
 ): Promise<void> {
   const response = await fetch(`${API_BASE}${path}`, {
     method: 'POST',
+    credentials: 'include',
     headers: { 'Content-Type': 'application/json', ...authHeader() },
     body: JSON.stringify(body),
     signal,
@@ -202,7 +208,11 @@ export async function streamGet(
   onEvent: (item: StreamEvent) => void,
   signal?: AbortSignal,
 ): Promise<void> {
-  const response = await fetch(`${API_BASE}${path}`, { headers: { ...authHeader() }, signal });
+  const response = await fetch(`${API_BASE}${path}`, {
+    credentials: 'include',
+    headers: { ...authHeader() },
+    signal,
+  });
   if (!response.ok) {
     const text = await response.text();
     throw new ApiError(response.status, text, response.statusText);
