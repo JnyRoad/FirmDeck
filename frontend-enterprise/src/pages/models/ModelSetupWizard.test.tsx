@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { createElement } from 'react';
-import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -21,6 +21,8 @@ vi.mock('@/api/client', async (importOriginal) => {
 const mockedPost = vi.mocked(api.post);
 const mockedPut = vi.mocked(api.put);
 
+type TenantAwareWizardProps = ModelSetupWizardProps & { tenantId: string };
+
 function stubSelectPointerCapture() {
   if (!Element.prototype.hasPointerCapture) {
     Element.prototype.hasPointerCapture = () => false;
@@ -33,9 +35,11 @@ function stubSelectPointerCapture() {
   }
 }
 
-function renderWizard(overrides: Partial<ModelSetupWizardProps> = {}) {
-  const props: ModelSetupWizardProps = {
+/** 使用显式租户和默认依赖渲染模型创建向导。 */
+function renderWizard(overrides: Partial<TenantAwareWizardProps> = {}) {
+  const props: TenantAwareWizardProps = {
     open: true,
+    tenantId: 'tenant-isolated',
     onOpenChange: vi.fn(),
     onCreated: vi.fn(),
     availableProtocols: ['openai_chat_completions', 'anthropic_messages', 'gemini_generate_content'],
@@ -191,6 +195,7 @@ describe('ModelSetupWizard — vendor branch (US1)', () => {
     expect(body.api_key).toBe('sk-test-123');
     expect(body.model).toBe('gpt-4o');
     expect(body.enabled).toBe(true);
+    expect(body.tenant_id).toBe('tenant-isolated');
 
     // A passing test already means the model is saved — the wizard closes
     // itself instead of showing a banner that needs a "完成" click.
@@ -320,6 +325,61 @@ describe('ModelSetupWizard — vendor branch (US1)', () => {
 });
 
 describe('ModelSetupWizard — auto-fetching the model list', () => {
+  it('ignores a pending model-list response after switching tenants and refetches for the new tenant', async () => {
+    let resolveFirstTenant:
+      | ((value: { success: boolean; models: Array<{ id: string; label: string }> }) => void)
+      | undefined;
+    mockedPost.mockImplementation((url: unknown) => {
+      const requestUrl = String(url);
+      if (requestUrl.includes('/list-models') && requestUrl.includes('tenant_id=tenant-first')) {
+        return new Promise((resolve) => {
+          resolveFirstTenant = resolve;
+        });
+      }
+      if (requestUrl.includes('/list-models') && requestUrl.includes('tenant_id=tenant-second')) {
+        return Promise.resolve({
+          success: true,
+          models: [{ id: 'tenant-second-model', label: 'tenant-second-model' }],
+        });
+      }
+      return Promise.reject(new Error(`unexpected call: ${requestUrl}`));
+    });
+    const user = userEvent.setup();
+    const rendered = renderWizard({ tenantId: 'tenant-first' });
+
+    await selectChannelAndAdvance(user, 'OpenAI');
+    const apiKeyInput = screen.getByPlaceholderText('sk-...');
+    await user.type(apiKeyInput, 'sk-shared-key');
+    await user.tab();
+    await waitFor(() =>
+      expect(mockedPost.mock.calls.some(([url]) => String(url).includes('tenant_id=tenant-first'))).toBe(true),
+    );
+
+    rendered.rerender(
+      createElement(
+        I18nProvider,
+        null,
+        createElement(ModelSetupWizard, { ...rendered.props, tenantId: 'tenant-second' }),
+      ),
+    );
+    await act(async () => {
+      resolveFirstTenant?.({
+        success: true,
+        models: [{ id: 'tenant-first-model', label: 'tenant-first-model' }],
+      });
+      await Promise.resolve();
+    });
+
+    await user.click(apiKeyInput);
+    await user.tab();
+    expect(await screen.findByText(/已自动获取到 1 个模型/)).toBeTruthy();
+    expect(mockedPost.mock.calls.some(([url]) => String(url).includes('tenant_id=tenant-second'))).toBe(true);
+
+    await user.click(screen.getByPlaceholderText('选择或输入模型'));
+    expect(await screen.findByText('tenant-second-model')).toBeTruthy();
+    expect(screen.queryByText('tenant-first-model')).toBeNull();
+  });
+
   it('fetches vendor models on API Key blur and offers them in the combobox', async () => {
     mockedPost.mockImplementation((url: unknown) => {
       if (String(url).includes('/list-models')) {
@@ -341,6 +401,8 @@ describe('ModelSetupWizard — auto-fetching the model list', () => {
     expect(await screen.findByText(/已自动获取到 1 个模型/)).toBeTruthy();
     const [url, body] = mockedPost.mock.calls[0] as [string, Record<string, unknown>];
     expect(url).toContain('/list-models');
+    expect(url).toContain('tenant_id=tenant-isolated');
+    expect(body.tenant_id).toBe('tenant-isolated');
     expect(body.api_protocol).toBe('openai_chat_completions');
     expect(body.base_url).toBe('https://api.openai.com/v1');
     expect(body.api_key).toBe('sk-real-key');
@@ -667,6 +729,7 @@ describe('ModelSetupWizard — closing mid-flow discards unsaved input', () => {
 
     rerender(createElement(I18nProvider, null, createElement(ModelSetupWizard, {
       open: true,
+      tenantId: 'tenant-isolated',
       onOpenChange,
       onCreated: vi.fn(),
       availableProtocols: ['openai_chat_completions'],

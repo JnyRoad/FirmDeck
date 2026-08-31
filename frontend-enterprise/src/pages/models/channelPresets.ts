@@ -1,4 +1,4 @@
-import { api, TENANT_ID } from '@/api/client';
+import { api } from '@/api/client';
 import type { ModelAuthMode, ModelConfigRead } from '@/types';
 
 export type ApiKeyProtocol = Exclude<ModelConfigRead['api_protocol'], 'codex_app_server'>;
@@ -212,15 +212,16 @@ export type ListModelsResult = {
  * { success: false, models: [] }，调用方据此回退到手动输入，不抛出异常。
  */
 export async function fetchProviderModels(params: {
+  tenantId: string;
   apiProtocol: ModelConfigRead['api_protocol'];
   baseUrl?: string;
   apiKey?: string;
 }): Promise<ListModelsResult> {
   try {
     return await api.post<ListModelsResult>(
-      `/api/enterprise/model-configs/list-models?tenant_id=${TENANT_ID}`,
+      `/api/enterprise/model-configs/list-models?tenant_id=${encodeURIComponent(params.tenantId)}`,
       {
-        tenant_id: TENANT_ID,
+        tenant_id: params.tenantId,
         api_protocol: params.apiProtocol,
         base_url: params.baseUrl,
         api_key: params.apiKey,
