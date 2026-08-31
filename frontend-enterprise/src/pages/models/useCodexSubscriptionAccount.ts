@@ -61,6 +61,8 @@ export function useCodexSubscriptionAccount({
       notify.error(apiErrorMessage(error, t('无法读取 ChatGPT 订阅状态')));
     }
   }, [enabled, t, tenantId]);
+  const reloadRef = useRef(reload);
+  reloadRef.current = reload;
 
   useEffect(() => {
     requestGenerationRef.current += 1;
@@ -70,8 +72,8 @@ export function useCodexSubscriptionAccount({
     if (!enabled) {
       return;
     }
-    void reload();
-  }, [enabled, reload]);
+    void reloadRef.current();
+  }, [enabled, tenantId]);
 
   useEffect(() => {
     if (!enabled || loading || account?.status !== 'pending') return;
