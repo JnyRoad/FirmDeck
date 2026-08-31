@@ -13,7 +13,7 @@ import {
   X,
 } from 'lucide-react';
 
-import { api, ApiError, TENANT_ID } from '@/api/client';
+import { api, ApiError } from '@/api/client';
 import {
   Dialog,
   DialogContent,
@@ -44,6 +44,7 @@ import ModelCombobox, { type ModelComboboxOption } from './ModelCombobox';
 
 export type ModelSetupWizardProps = {
   open: boolean;
+  tenantId: string;
   onOpenChange: (open: boolean) => void;
   onCreated: (model: ModelConfigRead, options?: { tested: boolean }) => void;
   availableProtocols: ApiKeyProtocol[];
@@ -52,6 +53,7 @@ export type ModelSetupWizardProps = {
   onStartSubscriptionLogin: () => void;
   onCancelSubscriptionLogin: () => void;
   onRequestSubscriptionLogout: () => void;
+  requireVerified?: boolean;
 };
 
 type Step = 1 | 2;
@@ -88,8 +90,10 @@ function channelIcon(preset: ChannelPreset) {
   return <span>{preset.badgeLabel}</span>;
 }
 
+/** 引导管理员选择模型渠道，并在调用方租户内保存或验证模型配置。 */
 export default function ModelSetupWizard({
   open,
+  tenantId,
   onOpenChange,
   onCreated,
   availableProtocols,
@@ -98,6 +102,7 @@ export default function ModelSetupWizard({
   onStartSubscriptionLogin,
   onCancelSubscriptionLogin,
   onRequestSubscriptionLogout,
+  requireVerified = false,
 }: ModelSetupWizardProps) {
   const [step, setStep] = useState<Step>(1);
   const [selectedChannelId, setSelectedChannelId] = useState<string | null>(null);
@@ -209,6 +214,7 @@ export default function ModelSetupWizard({
     vendorFetchSignatureRef.current = signature;
     setVendorModelsState((prev) => ({ ...prev, status: 'loading' }));
     const result = await fetchProviderModels({
+      tenantId,
       apiProtocol: channel.apiProtocol,
       baseUrl: channel.baseUrl,
       apiKey: trimmedKey,
@@ -232,7 +238,7 @@ export default function ModelSetupWizard({
     if (customFetchSignatureRef.current === signature) return;
     customFetchSignatureRef.current = signature;
     setCustomModelsState((prev) => ({ ...prev, status: 'loading' }));
-    const result = await fetchProviderModels({ apiProtocol: form.apiProtocol, baseUrl, apiKey });
+    const result = await fetchProviderModels({ tenantId, apiProtocol: form.apiProtocol, baseUrl, apiKey });
     if (customFetchSignatureRef.current !== signature) return;
     if (result.success && result.models.length > 0) {
       setCustomModelsState({
@@ -277,7 +283,7 @@ export default function ModelSetupWizard({
     if (subscriptionFetchedRef.current) return;
     subscriptionFetchedRef.current = true;
     setSubscriptionModelsState({ status: 'loading', options: [] });
-    void fetchProviderModels({ apiProtocol: 'codex_app_server' }).then((result) => {
+    void fetchProviderModels({ tenantId, apiProtocol: 'codex_app_server' }).then((result) => {
       if (result.success && result.models.length > 0) {
         setSubscriptionModelsState({
           status: 'success',
@@ -329,7 +335,7 @@ export default function ModelSetupWizard({
       enabled: verify && enabled,
     });
     const query = verify ? '?verify_before_save=true' : '';
-    const body = { tenant_id: TENANT_ID, ...payload };
+    const body = { tenant_id: tenantId, ...payload };
     const saved = savedModelId
       ? await api.put<ModelConfigRead>(`/api/enterprise/model-configs/${savedModelId}${query}`, body)
       : await api.post<ModelConfigRead>(`/api/enterprise/model-configs${query}`, body);
@@ -740,15 +746,17 @@ export default function ModelSetupWizard({
                     {testing && <LoaderCircle className="size-[14px] animate-spin" />}
                     {testing ? '测试中' : '测试'}
                   </UIButton>
-                  <UIButton
-                    type="button"
-                    disabled={saving || testing || !step2Complete || !configName.trim()}
-                    onClick={() => void saveDraft()}
-                    className="h-[34px] gap-[6px] rounded-[10px] bg-[#18181a] px-[20px] text-[13px] text-white hover:bg-[#303030] disabled:opacity-40"
-                  >
-                    {saving && <LoaderCircle className="size-[14px] animate-spin" />}
-                    {saving ? '保存中' : '保存'}
-                  </UIButton>
+                  {!requireVerified && (
+                    <UIButton
+                      type="button"
+                      disabled={saving || testing || !step2Complete || !configName.trim()}
+                      onClick={() => void saveDraft()}
+                      className="h-[34px] gap-[6px] rounded-[10px] bg-[#18181a] px-[20px] text-[13px] text-white hover:bg-[#303030] disabled:opacity-40"
+                    >
+                      {saving && <LoaderCircle className="size-[14px] animate-spin" />}
+                      {saving ? '保存中' : '保存'}
+                    </UIButton>
+                  )}
                 </div>
               )}
             </div>
