@@ -63,6 +63,7 @@ import type {
 import { formatHandoffAssigneeValue, parseHandoffAssigneeValue } from '../lib/handoff-assignee';
 import { feishuAppIdFromIdentityScope } from '../lib/identity-scope';
 import WechatSetup from './channels/WechatSetup';
+import WechatKfSetup from './channels/WechatKfSetup';
 import WecomSetup from './channels/WecomSetup';
 import FeishuSetup from './channels/FeishuSetup';
 import DingTalkSetup from './channels/DingTalkSetup';
@@ -124,6 +125,13 @@ const CHANNEL_PRESENTATION_MESSAGE_IDS: Record<string, {
     userLabel: 'channels.provider.wechatUser',
     blurb: 'channels.provider.wechatBlurb',
     disconnectDescription: 'channels.provider.wechatDisconnect',
+  },
+  wechat_kf: {
+    name: 'channels.provider.wechatKf',
+    identifierLabel: 'channels.provider.wechatKfIdLabel',
+    userLabel: 'channels.provider.wechatKfUser',
+    blurb: 'channels.provider.wechatKfBlurb',
+    disconnectDescription: 'channels.provider.wechatKfDisconnect',
   },
   wecom: {
     name: 'channels.provider.wecom',
@@ -1014,7 +1022,9 @@ export default function ChannelsPage({
     return status?.messageId ? t(status.messageId) : status?.raw || fallback;
   }
 
+  /** 为内置微信客服强制专用 setup，避免旧 metadata 或缺失 metadata 回退到扫码流程。 */
   function setupKindFor(channel: string): string {
+    if (channel === 'wechat_kf') return 'wechat_kf';
     return metaFor(channel)?.setup || (channel === 'wechat' ? 'qrcode' : 'credentials');
   }
 
@@ -1299,7 +1309,17 @@ export default function ChannelsPage({
         {binding.status === 'expired' && setupKindFor(binding.channel) !== 'qrcode' && (
           <span className="text-[12px] text-[#d20b0b]">{t('channels.status.connectionUnavailable')}</span>
         )}
-        {binding.channel === 'feishu' ? (
+        {binding.channel === 'wechat_kf' ? (
+          <WechatKfSetup
+            key={binding.id}
+            binding={binding}
+            onChanged={(updated) =>
+              setBindings((current) =>
+                current.map((item) => (item.id === updated.id ? updated : item)),
+              )
+            }
+          />
+        ) : binding.channel === 'feishu' ? (
           <FeishuSetup
             key={binding.id}
             binding={binding}

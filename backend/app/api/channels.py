@@ -208,8 +208,8 @@ def _patch_binding_config_key(
         raise _channel_http_error(status_code=404, detail="渠道绑定不存在")
 
 SUPPORTED_CHANNELS = {"wechat", "wechat_kf", "wecom", "feishu", "dingtalk"}
-# 微信客服 API 已可供受控内部调用；Task 3 setup UI 上线前不向旧接入页枚举。
-_CHANNEL_META_VISIBLE = {"wechat", "wecom", "feishu", "dingtalk"}
+# 微信客服专用 setup 与语义化 UI 已就绪，可与既有渠道一同在接入页枚举。
+_CHANNEL_META_VISIBLE = {"wechat", "wechat_kf", "wecom", "feishu", "dingtalk"}
 INGRESS_QUIESCE_TIMEOUT_SECONDS = 5.0
 # 渠道中文名:错误信息与通知文案共用
 _CHANNEL_LABELS = {

@@ -92,10 +92,16 @@ function jsonResponse(body: unknown): Response {
   } as Response;
 }
 
-function makeFetchMock(overrides: { bindings?: unknown; teams?: unknown; agents?: unknown } = {}) {
+function makeFetchMock(overrides: {
+  bindings?: unknown;
+  teams?: unknown;
+  agents?: unknown;
+  metas?: unknown;
+} = {}) {
   const bindings = overrides.bindings ?? [];
   const teams = overrides.teams ?? [team];
   const agents = overrides.agents ?? [agent];
+  const metas = overrides.metas ?? channelMetas;
   return vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
     const method = init?.method || 'GET';
@@ -107,7 +113,7 @@ function makeFetchMock(overrides: { bindings?: unknown; teams?: unknown; agents?
       const base = Array.isArray(bindings) && bindings[0] ? bindings[0] : teamBinding;
       return jsonResponse({ ...base, ...(body.name !== undefined ? { name: body.name } : {}) });
     }
-    if (url.includes('/channels/meta')) return jsonResponse(channelMetas);
+    if (url.includes('/channels/meta')) return jsonResponse(metas);
     if (url.includes('/my-identity-bindings')) return jsonResponse([]);
     if (url.includes('/deliveries/days')) {
       return jsonResponse({ days: [], total_days: 0, offset: 0, limit: 7 });
@@ -156,6 +162,37 @@ afterEach(() => {
 });
 
 describe('ChannelsPage', () => {
+  it('routes WeChat Customer Service to its dedicated setup instead of WeChat QR setup', async () => {
+    const user = userEvent.setup();
+    const wechatKfBinding: ChannelBindingRead = {
+      ...teamBinding,
+      id: 'binding-kf',
+      channel: 'wechat_kf',
+      name: 'Service Desk',
+      status: 'pending',
+      connected: false,
+      team_id: null,
+      team_name: null,
+      my_role: 'owner',
+    };
+    const fetchMock = makeFetchMock({
+      bindings: [wechatKfBinding],
+      metas: [{
+        channel: 'wechat_kf',
+        name: '微信客服',
+        setup: 'wechat_kf',
+        capabilities: ['text', 'callback'],
+      }],
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    renderPage();
+    await user.click(await screen.findByRole('button', { name: /Service Desk/ }));
+
+    expect(await screen.findByRole('heading', { name: '微信客服设置' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: '扫码接入' })).toBeNull();
+  });
+
   it('creates a binding with agent_id when the agent target is selected', async () => {
     const user = userEvent.setup();
     const fetchMock = makeFetchMock();

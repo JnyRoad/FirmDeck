@@ -95,8 +95,8 @@ def _auth(user: User) -> dict[str, str]:
     return {"Authorization": f"Bearer {create_access_token(user)}"}
 
 
-def test_wechat_kf_is_hidden_until_setup_ui_is_ready_without_changing_existing_metadata() -> None:
-    """Task 3 前隐藏微信客服 metadata，同时保持现有渠道 setup 与字段不变。"""
+def test_wechat_kf_metadata_is_visible_with_dedicated_setup_without_changing_existing_channels() -> None:
+    """Task 3 UI 就绪后开放微信客服专用 setup，同时锁定既有渠道 metadata。"""
     db_engine = _engine()
     users, _ = _seed(db_engine)
     payload = (
@@ -110,10 +110,12 @@ def test_wechat_kf_is_hidden_until_setup_ui_is_ready_without_changing_existing_m
     )
     by_channel = {item["channel"]: item for item in payload}
 
-    assert "wechat_kf" not in by_channel
+    assert by_channel["wechat_kf"]["name"] == "微信客服"
+    assert by_channel["wechat_kf"]["setup"] == "wechat_kf"
+    assert by_channel["wechat_kf"]["capabilities"] == ["text", "callback"]
     assert by_channel["wechat"]["setup"] == "qrcode"
     assert by_channel["wecom"]["setup"] == "credentials"
-    assert set(by_channel) == {"wechat", "wecom", "feishu", "dingtalk"}
+    assert set(by_channel) == {"wechat", "wechat_kf", "wecom", "feishu", "dingtalk"}
 
 
 def test_runtime_dependencies_list_defusedxml_once() -> None:

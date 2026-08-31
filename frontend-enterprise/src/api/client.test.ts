@@ -1,6 +1,8 @@
-import { describe, expect, it } from 'vitest';
+// @vitest-environment jsdom
 
-import { ApiError, GENERIC_ERROR_MESSAGE } from './client';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+import { ApiError, GENERIC_ERROR_MESSAGE, wechatKfApi } from './client';
 
 type ErrorField = 'params' | 'retryable' | 'request_id' | 'trace_id';
 
@@ -137,5 +139,86 @@ describe('ApiError', () => {
     expect(error.message).toBe(GENERIC_ERROR_MESSAGE);
     expect(error.message).not.toContain(rawDetail);
     expect(error.body).toContain(rawDetail);
+  });
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
+describe('WeChat Customer Service API client', () => {
+  it('uses the Task 2 routes and leaves multipart content type to the browser', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) => ({
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      text: async () => String(input).includes('/accounts')
+        ? JSON.stringify({ accounts: [] })
+        : JSON.stringify({ id: 'binding-1', accounts: [] }),
+    }) as Response);
+    vi.stubGlobal('fetch', fetchMock);
+
+    const payload = { tenant_id: 'tenant_demo', corp_id: 'ww-corp' };
+
+    await wechatKfApi.prepareCallback('binding-1', payload);
+    await wechatKfApi.saveCredentials('binding-1', {
+      ...payload,
+      secret: 'provider-secret',
+      callback_token: 'callback-token',
+      encoding_aes_key: 'encoding-key',
+    });
+    await wechatKfApi.listAccounts('binding-1', 'tenant_demo');
+    await wechatKfApi.selectAccount('binding-1', {
+      tenant_id: 'tenant_demo',
+      open_kfid: 'wk-existing',
+    });
+    await wechatKfApi.createAccount('binding-1', {
+      tenant_id: 'tenant_demo',
+      name: 'Provider Account',
+      media_id: 'media-create',
+    });
+    await wechatKfApi.updateAccount('binding-1', {
+      tenant_id: 'tenant_demo',
+      open_kfid: 'wk-existing',
+      name: 'Updated Account',
+      media_id: 'media-update',
+    });
+    await wechatKfApi.deleteAccount('binding-1', 'wk-existing', 'tenant_demo');
+    await wechatKfApi.uploadAvatar(
+      'binding-1',
+      new File(['avatar'], 'avatar.png', { type: 'image/png' }),
+      'tenant_demo',
+    );
+    await wechatKfApi.createContactWay(
+      'binding-1',
+      'wk-existing',
+      'tenant_demo',
+    );
+
+    const calls = fetchMock.mock.calls.map(([input, init]) => ({
+      url: String(input),
+      method: init?.method || 'GET',
+      headers: init?.headers as Record<string, string> | undefined,
+      body: init?.body,
+    }));
+    expect(calls.map(({ url, method }) => [method, url])).toEqual([
+      ['POST', '/api/enterprise/channels/binding-1/wechat_kf/callback-config'],
+      ['POST', '/api/enterprise/channels/binding-1/wechat_kf/credentials'],
+      ['GET', '/api/enterprise/channels/binding-1/wechat_kf/accounts?tenant_id=tenant_demo'],
+      ['POST', '/api/enterprise/channels/binding-1/wechat_kf/account'],
+      ['POST', '/api/enterprise/channels/binding-1/wechat_kf/accounts'],
+      ['PATCH', '/api/enterprise/channels/binding-1/wechat_kf/account'],
+      ['DELETE', '/api/enterprise/channels/binding-1/wechat_kf/account/wk-existing?tenant_id=tenant_demo'],
+      ['POST', '/api/enterprise/channels/binding-1/wechat_kf/avatar?tenant_id=tenant_demo'],
+      ['POST', '/api/enterprise/channels/binding-1/wechat_kf/contact-way?tenant_id=tenant_demo&open_kfid=wk-existing&scene=staffdeck'],
+    ]);
+    expect(calls[1]?.body).toBe(JSON.stringify({
+      ...payload,
+      secret: 'provider-secret',
+      callback_token: 'callback-token',
+      encoding_aes_key: 'encoding-key',
+    }));
+    expect(calls[7]?.body).toBeInstanceOf(FormData);
+    expect(calls[7]?.headers).not.toHaveProperty('Content-Type');
   });
 });
