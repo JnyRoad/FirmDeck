@@ -290,7 +290,7 @@ async def test_disconnect_and_refresh_failure_are_owner_scoped_and_credential_fr
     assert "server_1" not in rendered
     assert "user_1" not in rendered
     assert "user_2" not in rendered
-    assert all(getattr(record, "owner_fingerprint", None) for record in caplog.records)
+    assert all(getattr(record, "owner_fingerprint", None) is None for record in caplog.records)
     events = [getattr(record, "oauth_event", None) for record in caplog.records]
     assert events == ["mcp_oauth.disconnected", "mcp_oauth.refresh_failed"]
 

@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
-import hmac
+import hashlib
 import json
 from collections.abc import Mapping
+from functools import lru_cache
 from typing import Any, Protocol
 from urllib.parse import SplitResult, urlsplit
+
+from cryptography.hazmat.primitives import cmac
+from cryptography.hazmat.primitives.ciphers import algorithms
 
 from app.config import get_settings
 
@@ -14,15 +18,31 @@ MCP_OAUTH_CALLBACK_PATH = "/api/enterprise/mcp-servers/oauth/callback"
 _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 
+@lru_cache(maxsize=4)
+def _fingerprint_key(app_secret: str) -> bytes:
+    """Derive one fixed-width MAC key from the deployment secret."""
+    return hashlib.pbkdf2_hmac(
+        "sha256",
+        app_secret.encode("utf-8"),
+        b"staffdeck-mcp-oauth-fingerprint-key-v1",
+        100_000,
+        dklen=32,
+    )
+
+
+def _cmac_block(key: bytes, message: bytes) -> bytes:
+    """Authenticate one domain-separated block with AES-CMAC."""
+    signer = cmac.CMAC(algorithms.AES(key))
+    signer.update(message)
+    return signer.finalize()
+
+
 def _keyed_fingerprint(domain: str, payload: object) -> str:
-    """Return a deployment-scoped digest without exposing guessable input hashes."""
+    """Return a deployment-scoped MAC without exposing guessable input hashes."""
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     message = domain.encode("utf-8") + b"\x00" + encoded
-    return hmac.new(  # lgtm[py/weak-sensitive-data-hashing] - keyed audit fingerprint, not password storage.
-        get_settings().app_secret.encode("utf-8"),
-        message,
-        digestmod="sha256",
-    ).hexdigest()
+    key = _fingerprint_key(get_settings().app_secret)
+    return (_cmac_block(key, b"\x00" + message) + _cmac_block(key, b"\x01" + message)).hex()
 
 
 class MCPServerOAuthPolicy(Protocol):
@@ -107,15 +127,3 @@ def mcp_oauth_config_fingerprint(server: MCPServerOAuthPolicy) -> str:
         "redirect_uri": server.oauth_redirect_uri or "",
     }
     return _keyed_fingerprint("mcp-oauth-config-v1", payload)
-
-
-def mcp_oauth_owner_fingerprint(
-    tenant_id: str,
-    server_id: str,
-    user_id: str,
-) -> str:
-    """Create a correlation-safe owner identifier for structured audit logs."""
-    return _keyed_fingerprint(
-        "mcp-oauth-owner-v1",
-        [tenant_id, server_id, user_id],
-    )

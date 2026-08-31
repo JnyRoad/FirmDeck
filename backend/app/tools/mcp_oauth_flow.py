@@ -19,7 +19,6 @@ from sqlalchemy import Engine, update
 from sqlmodel import Session, select
 
 from app.db.models import MCPOAuthFlow, new_id, utc_now
-from app.tools.mcp_oauth_policy import mcp_oauth_owner_fingerprint
 
 FLOW_TTL_SECONDS = 600
 logger = logging.getLogger(__name__)
@@ -35,18 +34,10 @@ def _log_oauth_event(
     error_code: str | None = None,
 ) -> None:
     """Write one credential-free structured lifecycle event for authorized diagnostics."""
-    owner_fingerprint = None
-    if tenant_id is not None and server_id is not None and user_id is not None:
-        owner_fingerprint = mcp_oauth_owner_fingerprint(
-            tenant_id,
-            server_id,
-            user_id,
-        )
-    logger.info(  # lgtm[py/clear-text-logging-sensitive-data] - raw owner identifiers never reach the sink.
+    logger.info(
         "MCP OAuth lifecycle event",
         extra={
             "oauth_event": oauth_event,
-            "owner_fingerprint": owner_fingerprint,
             "flow_id": flow_id,
             "error_code": error_code,
         },

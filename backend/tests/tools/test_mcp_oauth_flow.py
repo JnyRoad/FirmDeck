@@ -424,7 +424,7 @@ async def test_flow_security_events_never_log_state_or_authorization_code(
     assert "tenant_1" not in rendered
     assert "server_1" not in rendered
     assert "user_1" not in rendered
-    assert all(getattr(record, "owner_fingerprint", None) for record in caplog.records)
+    assert all(getattr(record, "owner_fingerprint", None) is None for record in caplog.records)
     events = [getattr(record, "oauth_event", None) for record in caplog.records]
     assert "mcp_oauth.started" in events
     assert "mcp_oauth.completed" in events
