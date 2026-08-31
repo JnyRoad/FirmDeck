@@ -2,15 +2,28 @@
 
 from __future__ import annotations
 
-import hashlib
+import hmac
 import json
 import os
 from collections.abc import Mapping
 from typing import Any, Protocol
 from urllib.parse import SplitResult, urlsplit
 
+from app.config import get_settings
+
 MCP_OAUTH_CALLBACK_PATH = "/api/enterprise/mcp-servers/oauth/callback"
 _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
+
+
+def _keyed_fingerprint(domain: str, payload: object) -> str:
+    """Return a deployment-scoped digest without exposing guessable input hashes."""
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    message = domain.encode("utf-8") + b"\x00" + encoded
+    return hmac.new(
+        get_settings().app_secret.encode("utf-8"),
+        message,
+        digestmod="sha256",
+    ).hexdigest()
 
 
 class MCPServerOAuthPolicy(Protocol):
@@ -73,13 +86,12 @@ def validate_mcp_oauth_redirect_uri(redirect_uri: str) -> str:
 
 
 def mcp_oauth_headers_fingerprint(headers: Mapping[str, Any] | None) -> str:
-    """Hash normalized static headers so rotations permanently invalidate old grants."""
+    """Key normalized static headers so rotations permanently invalidate old grants."""
     normalized = {
         str(name).strip().lower(): str(value)
         for name, value in (headers or {}).items()
     }
-    encoded = json.dumps(normalized, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    return _keyed_fingerprint("mcp-oauth-headers-v1", normalized)
 
 
 def mcp_oauth_config_fingerprint(server: MCPServerOAuthPolicy) -> str:
@@ -95,5 +107,16 @@ def mcp_oauth_config_fingerprint(server: MCPServerOAuthPolicy) -> str:
         "client_metadata_url": server.oauth_client_metadata_url or "",
         "redirect_uri": server.oauth_redirect_uri or "",
     }
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    return _keyed_fingerprint("mcp-oauth-config-v1", payload)
+
+
+def mcp_oauth_owner_fingerprint(
+    tenant_id: str,
+    server_id: str,
+    user_id: str,
+) -> str:
+    """Create a correlation-safe owner identifier for structured audit logs."""
+    return _keyed_fingerprint(
+        "mcp-oauth-owner-v1",
+        [tenant_id, server_id, user_id],
+    )

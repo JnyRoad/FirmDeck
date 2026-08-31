@@ -48,6 +48,26 @@ def test_oauth_config_fingerprint_tracks_static_header_rotation() -> None:
     assert "rotated-secret" not in rotated
 
 
+def test_oauth_header_fingerprint_is_keyed_by_the_application_secret(monkeypatch) -> None:
+    """Prevent an exposed digest from supporting offline guesses of static credentials."""
+    from app.config import get_settings
+    from app.tools.mcp_oauth_policy import mcp_oauth_headers_fingerprint
+
+    try:
+        monkeypatch.setenv("APP_SECRET", "oauth-fingerprint-key-one")
+        get_settings.cache_clear()
+        first = mcp_oauth_headers_fingerprint({"X-API-Key": "low-entropy-value"})
+
+        monkeypatch.setenv("APP_SECRET", "oauth-fingerprint-key-two")
+        get_settings.cache_clear()
+        second = mcp_oauth_headers_fingerprint({"X-API-Key": "low-entropy-value"})
+
+        assert first != second
+        assert len(first) == len(second) == 64
+    finally:
+        get_settings.cache_clear()
+
+
 @pytest.mark.asyncio
 async def test_grant_storage_encrypts_tokens_and_returns_non_secret_status(tmp_path) -> None:
     """Catch plaintext token persistence or token projection through status responses."""
@@ -264,6 +284,11 @@ async def test_disconnect_and_refresh_failure_are_owner_scoped_and_credential_fr
     rendered = "\n".join(record.getMessage() + repr(record.__dict__) for record in caplog.records)
     assert "first-never-log" not in rendered
     assert "second-never-log" not in rendered
+    assert "tenant_1" not in rendered
+    assert "server_1" not in rendered
+    assert "user_1" not in rendered
+    assert "user_2" not in rendered
+    assert all(getattr(record, "owner_fingerprint", None) for record in caplog.records)
     events = [getattr(record, "oauth_event", None) for record in caplog.records]
     assert events == ["mcp_oauth.disconnected", "mcp_oauth.refresh_failed"]
 

@@ -16,7 +16,10 @@ from sqlmodel import Session, select
 
 from app.db.models import MCPServer, MCPUserOAuthGrant, User, utc_now
 from app.security.encryption import decrypt_secret, encrypt_secret
-from app.tools.mcp_oauth_policy import mcp_oauth_config_fingerprint
+from app.tools.mcp_oauth_policy import (
+    mcp_oauth_config_fingerprint,
+    mcp_oauth_owner_fingerprint,
+)
 
 logger = logging.getLogger(__name__)
 _operation_locks_guard = Lock()
@@ -72,9 +75,11 @@ class MCPGrantTokenStorage:
             "MCP OAuth grant lifecycle event",
             extra={
                 "oauth_event": oauth_event,
-                "tenant_id": self.tenant_id,
-                "server_id": self.server_id,
-                "user_id": self.user_id,
+                "owner_fingerprint": mcp_oauth_owner_fingerprint(
+                    self.tenant_id,
+                    self.server_id,
+                    self.user_id,
+                ),
                 "error_code": error_code,
             },
         )
