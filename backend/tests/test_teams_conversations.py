@@ -125,9 +125,9 @@ def test_member_task_and_tl_review_sessions_carry_team_id(monkeypatch: pytest.Mo
         wakeup.execute_wake_event(db, db.get(TeamWakeEvent, review_wake.id))
 
         sessions = db.exec(select(ChatSession).where(ChatSession.team_id == team.id)).all()
-        titles = {item.title for item in sessions}
-        assert f"团队任务:{task.title}" in titles
-        assert f"团队任务验收:{task.title}" in titles
+        session_contracts = {(item.session_kind, item.title) for item in sessions}
+        assert ("team_member_task", task.title) in session_contracts
+        assert ("team_tl_review", task.title) in session_contracts
         db.refresh(task)
         assert task.status == "done"
 
@@ -152,20 +152,22 @@ def test_bid_request_and_award_sessions_carry_team_id(monkeypatch: pytest.Monkey
         for wake in wakes:
             _run_wake(db, wake.id)
         bid_sessions = db.exec(
-            select(ChatSession).where(ChatSession.title.like("团队竞标:%"))
+            select(ChatSession).where(ChatSession.session_kind == "team_member_bid")
         ).all()
         assert len(bid_sessions) == 2
         assert all(item.team_id == team.id for item in bid_sessions)
+        assert all(item.title == task.title for item in bid_sessions)
 
         judge = _pending_wakes(db, "bid_judge")
         assert len(judge) == 1
         assert judge[0].payload_json["mode"] == "award"
         _run_wake(db, judge[0].id)
         award_sessions = db.exec(
-            select(ChatSession).where(ChatSession.title.like("团队竞标裁决:%"))
+            select(ChatSession).where(ChatSession.session_kind == "team_bid_judge")
         ).all()
         assert len(award_sessions) == 1
         assert award_sessions[0].team_id == team.id
+        assert award_sessions[0].title == task.title
 
 
 def test_bid_score_session_carries_team_id(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -190,10 +192,11 @@ def test_bid_score_session_carries_team_id(monkeypatch: pytest.MonkeyPatch) -> N
         assert judge[0].payload_json["mode"] == "score"
         _run_wake(db, judge[0].id)
         score_sessions = db.exec(
-            select(ChatSession).where(ChatSession.title.like("团队竞标打分:%"))
+            select(ChatSession).where(ChatSession.session_kind == "team_bid_score")
         ).all()
         assert len(score_sessions) == 1
         assert score_sessions[0].team_id == team.id
+        assert score_sessions[0].title == task.title
 
 
 # ---------- 团队会话列表端点 ----------

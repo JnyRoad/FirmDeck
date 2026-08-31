@@ -456,12 +456,19 @@ def test_blackboard_promote_creates_ingest_job_idempotent(
         assert job.status == "queued"
         assert job.tenant_id == "tenant_demo"
         assert job.knowledge_base_id == resp.knowledge_base_id
-        # 原始资料 markdown:含条目内容、tags、来源团队/任务标注
+        # 业务正文逐字保留，产品来源信息使用结构化元数据而不混入正文。
         markdown = base64.b64decode(job.metadata_json["content_base64"]).decode("utf-8")
-        assert "竞品 A 定价 99 元" in markdown
-        assert "pricing" in markdown
-        assert team.name in markdown
-        assert task.title in markdown
+        assert markdown == "竞品 A 定价 99 元"
+        assert job.metadata_json["title"] == "竞品 A 定价 99 元"
+        assert job.metadata_json["metadata"] == {
+            "source": "team_blackboard",
+            "team_id": team.id,
+            "team_name": team.name,
+            "blackboard_entry_id": entry.id,
+            "source_task_id": task.id,
+            "source_task_title": task.title,
+            "tags": ["pricing"],
+        }
         # citation 回写
         db.refresh(entry)
         assert entry.citation_json["knowledge_base_id"] == resp.knowledge_base_id

@@ -23,7 +23,7 @@ def test_unknown_login_does_not_create_account() -> None:
             login(LoginRequest(tenant_id="tenant_demo", username="missing", password="secret"), db)
         except HTTPException as error:
             assert error.status_code == 401
-            assert error.detail == "Invalid username or password"
+            assert error.detail["code"] == "AUTH_INVALID_CREDENTIALS"
         else:
             raise AssertionError("unknown account must not be created during login")
 
@@ -151,7 +151,7 @@ def test_duplicate_display_name_cannot_be_used_to_login() -> None:
             )
         except HTTPException as error:
             assert error.status_code == 401
-            assert error.detail == "Invalid username or password"
+            assert error.detail["code"] == "AUTH_INVALID_CREDENTIALS"
         else:
             raise AssertionError("an ambiguous display name must not authenticate any account")
 

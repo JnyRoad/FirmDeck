@@ -2,8 +2,21 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from typing import Any
+
+from app.contracts.error_registry import (
+    ERROR_REGISTRY,
+    ErrorContractViolation,
+    ErrorVisibility,
+)
+from app.contracts.errors import (
+    ErrorDescriptor,
+    ErrorOccurrence,
+    InternalErrorContext,
+    JsonValue,
+)
 
 KNOWLEDGE_CONTEXT_MISMATCH = "KNOWLEDGE_CONTEXT_MISMATCH"
 KNOWLEDGE_GRANT_REQUIRED = "KNOWLEDGE_GRANT_REQUIRED"
@@ -29,6 +42,45 @@ _ERROR_DEFAULTS: dict[str, tuple[int, str]] = {
     KNOWLEDGE_CONVERSION_VALIDATION_FAILED: (409, "知识库转换后的资产校验失败。"),
 }
 
+_SAFE_PARAM_SUFFIXES = (
+    "_count",
+    "_counts",
+    "_id",
+    "_ids",
+    "_permission",
+    "_revision",
+    "_state",
+    "_status",
+    "_version",
+)
+_SAFE_PARAM_NAMES = {"count", "revision", "status", "version"}
+
+
+def _is_safe_param_value(value: Any) -> bool:
+    """Accept bounded JSON metadata while rejecting opaque objects and unbounded collections."""
+    if value is None or isinstance(value, str | bool | int | float):
+        return not isinstance(value, str) or len(value) <= 256
+    if isinstance(value, list):
+        return len(value) <= 50 and all(_is_safe_param_value(item) for item in value)
+    if isinstance(value, dict):
+        return len(value) <= 50 and all(
+            isinstance(key, str)
+            and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", key) is not None
+            and _is_safe_param_value(item)
+            for key, item in value.items()
+        )
+    return False
+
+
+def _safe_knowledge_params(details: Mapping[str, Any]) -> dict[str, JsonValue]:
+    """Keep stable identifiers and bounded metadata, excluding source prose and provider bodies."""
+    params: dict[str, JsonValue] = {}
+    for name, value in details.items():
+        stable_name = name in _SAFE_PARAM_NAMES or name.endswith(_SAFE_PARAM_SUFFIXES)
+        if stable_name and _is_safe_param_value(value):
+            params[name] = value
+    return params
+
 
 class KnowledgeError(RuntimeError):
     """可由 API 和 Harness 统一映射的知识库领域错误。"""
@@ -40,6 +92,9 @@ class KnowledgeError(RuntimeError):
         *,
         status_code: int | None = None,
         details: Mapping[str, Any] | None = None,
+        retryable: bool = False,
+        request_id: str | None = None,
+        trace_id: str | None = None,
     ) -> None:
         """保存稳定代码、HTTP 状态和不含受保护内容的诊断标识。"""
         default_status, default_message = _ERROR_DEFAULTS.get(
@@ -50,7 +105,72 @@ class KnowledgeError(RuntimeError):
         self.status_code = status_code or default_status
         self.message = message or default_message
         self.details = dict(details or {})
+        self.retryable = retryable
+        self.request_id = request_id
+        self.trace_id = trace_id
         super().__init__(self.message)
+
+    def to_descriptor(self) -> ErrorDescriptor:
+        """Validate exact registry params before exposing a knowledge descriptor."""
+        # Workflow: resolve the domain code before creating a descriptor; unknown or
+        # internal values or mismatched params become the public-safe fallback.
+        entry = ERROR_REGISTRY.get(self.code)
+        safe_params = _safe_knowledge_params(self.details)
+        if entry is None or entry.visibility is not ErrorVisibility.PUBLIC:
+            fallback = ERROR_REGISTRY.require("INTERNAL_ERROR")
+            return ErrorDescriptor(
+                code=fallback.code,
+                params={},
+                retryable=fallback.retryable_default,
+                request_id=self.request_id,
+                trace_id=self.trace_id,
+            )
+        try:
+            descriptor = ErrorDescriptor(
+                code=entry.code,
+                params=safe_params,
+                retryable=self.retryable,
+                request_id=self.request_id,
+                trace_id=self.trace_id,
+            )
+            return ERROR_REGISTRY.validate(descriptor)
+        except (ErrorContractViolation, ValueError, TypeError):
+            fallback = ERROR_REGISTRY.require("INTERNAL_ERROR")
+            return ErrorDescriptor(
+                code=fallback.code,
+                params={},
+                retryable=fallback.retryable_default,
+                request_id=self.request_id,
+                trace_id=self.trace_id,
+            )
+
+    def to_occurrence(self) -> ErrorOccurrence:
+        """Retain the legacy message and full details as private diagnostic context."""
+        return ErrorOccurrence(
+            descriptor=self.to_descriptor(),
+            internal=InternalErrorContext(
+                source="knowledge",
+                exception_type=type(self).__name__,
+                raw_message=self.message,
+                upstream_code=self.code,
+            ),
+        )
+
+    def to_public_payload(self) -> dict[str, JsonValue]:
+        """Project only the registry-validated public descriptor and never legacy prose."""
+        occurrence = self.to_occurrence()
+        descriptor = occurrence.descriptor
+        entry = ERROR_REGISTRY.get(descriptor.code)
+        if entry is None or entry.visibility is not ErrorVisibility.PUBLIC:
+            fallback = ERROR_REGISTRY.require("INTERNAL_ERROR")
+            descriptor = ErrorDescriptor(
+                code=fallback.code,
+                params={},
+                retryable=fallback.retryable_default,
+                request_id=descriptor.request_id,
+                trace_id=descriptor.trace_id,
+            )
+        return descriptor.model_dump(mode="json")
 
 
 def knowledge_error(
@@ -59,6 +179,9 @@ def knowledge_error(
     message: str | None = None,
     status_code: int | None = None,
     details: Mapping[str, Any] | None = None,
+    retryable: bool = False,
+    request_id: str | None = None,
+    trace_id: str | None = None,
 ) -> KnowledgeError:
     """按稳定错误代码创建知识库异常，供服务层保持一致的失败语义。"""
     return KnowledgeError(
@@ -66,4 +189,7 @@ def knowledge_error(
         message,
         status_code=status_code,
         details=details,
+        retryable=retryable,
+        request_id=request_id,
+        trace_id=trace_id,
     )

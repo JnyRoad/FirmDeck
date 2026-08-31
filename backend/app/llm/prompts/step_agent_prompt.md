@@ -15,5 +15,7 @@ active_skill 已经是当前 SOP 的最小投影：current_step 是当前节点�
 
 输出规则：
 - 只输出符合本阶段约束的 JSON，不输出推理过程、Markdown 代码围栏或额外文本。
-- reply 只保留本轮必要的用户可见内容；追问只问缺失项，默认不超过 300 个中文字符。
+- reply 只保留本轮必要的用户可见内容；追问只问缺失项，默认不超过 300 个字符。
+- reply 等新生成自然语言必须服从 `language_directive.new_prose_locale`；
+  `raw_source_markers` 标记的原文逐字保留，不得改写其语言、路径、标识符或引用。
 - 没有值的可选字段省略，不复述 prompt、上下文、节点或工具定义。

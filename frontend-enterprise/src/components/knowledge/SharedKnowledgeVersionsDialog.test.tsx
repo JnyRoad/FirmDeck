@@ -4,7 +4,7 @@ import { cleanup, render, screen, waitFor, within } from '@testing-library/react
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 
-import { I18nProvider } from '@/i18n';
+import { AppIntlProvider, I18nProvider } from '@/i18n';
 import type { KnowledgeBaseRead, KnowledgeBaseVersionRead } from '@/types';
 
 import { SharedKnowledgeVersionsDialog } from './SharedKnowledgeVersionsDialog';
@@ -159,6 +159,21 @@ function renderDialog() {
   );
 }
 
+function renderLocalizedDialog(locale: 'zh-CN' | 'en-US') {
+  /** 使用纯语义 Provider 渲染版本面板；不启用 legacy observer 或修改来源字段。 */
+  return render(
+    <AppIntlProvider locale={locale}>
+      <SharedKnowledgeVersionsDialog
+        open
+        knowledgeBase={knowledgeBase}
+        teamOptions={[{ id: 'team-content', name: '内容团队' }]}
+        onClose={vi.fn()}
+        onChanged={vi.fn()}
+      />
+    </AppIntlProvider>,
+  );
+}
+
 beforeAll(() => {
   // Radix Dialog 在 jsdom 中需要这些浏览器 API。
   window.HTMLElement.prototype.scrollIntoView = vi.fn();
@@ -265,10 +280,12 @@ describe('SharedKnowledgeVersionsDialog', () => {
     await user.click(within(dialog).getByRole('tab', { name: '审计历史' }));
 
     expect(await within(dialog).findByText('通过审校后发布')).toBeTruthy();
-    expect(within(dialog).getByText(/发布员工.*Agent/)).toBeTruthy();
+    expect(within(dialog).getByText('发布员工')).toBeTruthy();
+    expect(within(dialog).getByText('Agent')).toBeTruthy();
     expect(within(dialog).getAllByText('内容团队').length).toBeGreaterThanOrEqual(1);
     expect(within(dialog).getByText('v1.0.0 → v1.1.0')).toBeTruthy();
-    expect(within(dialog).getByText('来源任务：task-publish')).toBeTruthy();
+    expect(within(dialog).getByText(/来源任务：/)).toBeTruthy();
+    expect(within(dialog).getByText('task-publish')).toBeTruthy();
     expect(within(dialog).getByText('可编辑 → 可发布')).toBeTruthy();
 
     await user.selectOptions(within(dialog).getByLabelText('审计动作'), 'version_published');
@@ -284,5 +301,31 @@ describe('SharedKnowledgeVersionsDialog', () => {
           && url.includes('team_id=team-content');
       })).toBe(true);
     });
+  });
+
+  it.each([
+    ['zh-CN', '共享版本：团队选题库', '正式版本', '草稿', '审计历史'],
+    ['en-US', 'Shared versions: 团队选题库', 'Published version', 'Draft', 'Audit history'],
+  ] as const)('localizes version and permission product UI in %s while retaining audit source data', async (
+    locale,
+    dialogName,
+    releasedLabel,
+    draftLabel,
+    auditLabel,
+  ) => {
+    /** 生命周期和权限标签应翻译，知识库、团队、操作者及审计原因必须保持原文。 */
+    const user = userEvent.setup();
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => (
+      String(input).includes('/audit-events') ? jsonResponse(auditPage) : jsonResponse(versions)
+    )));
+    renderLocalizedDialog(locale);
+
+    const dialog = await screen.findByRole('dialog', { name: dialogName });
+    expect(within(dialog).getByText(releasedLabel)).toBeTruthy();
+    expect(within(dialog).getByText(draftLabel)).toBeTruthy();
+    await user.click(within(dialog).getByRole('tab', { name: auditLabel }));
+    expect(await within(dialog).findByText('通过审校后发布')).toBeTruthy();
+    expect(within(dialog).getAllByText('内容团队').length).toBeGreaterThanOrEqual(1);
+    expect(within(dialog).getByText(/发布员工/)).toBeTruthy();
   });
 });

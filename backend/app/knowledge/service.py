@@ -44,8 +44,11 @@ from app.knowledge.parser import KnowledgeParseError, extract_text
 from app.knowledge.schema import (
     KnowledgeBucketRead,
     KnowledgeChunkRead,
+    KnowledgeIngestStep,
     KnowledgeSearchRequest,
     KnowledgeSearchResponse,
+    KnowledgeStageDescriptor,
+    KnowledgeTraceItem,
 )
 from app.llm import LLMClient, LLMError
 from app.llm.model_config_resolver import resolve_model_config_for_runtime
@@ -89,20 +92,73 @@ QUERY_NOISE_PHRASES = (
 )
 
 INGEST_STAGES: list[dict[str, Any]] = [
-    {"key": "queued", "label": "排队中", "progress": 0.0},
-    {"key": "parsing", "label": "解析原始资料", "progress": 0.08},
-    {"key": "normalizing", "label": "规范化 Source", "progress": 0.16},
-    {"key": "documenting", "label": "写入 Source Document", "progress": 0.24},
-    {"key": "bucketing", "label": "规划 Wiki 页面", "progress": 0.36},
-    {"key": "bucket_writing", "label": "写入 OKF Wiki", "progress": 0.48},
-    {"key": "chunking", "label": "生成引用来源", "progress": 0.62},
-    {"key": "summarizing", "label": "刷新 PageIndex", "progress": 0.74},
-    {"key": "discovering", "label": "发现 SOP/工具", "progress": 0.88},
-    {"key": "done", "label": "完成入库", "progress": 1.0},
+    {"key": "queued", "code": "queued", "progress": 0.0},
+    {"key": "parsing", "code": "parsing", "progress": 0.08},
+    {"key": "normalizing", "code": "normalizing", "progress": 0.16},
+    {"key": "documenting", "code": "documenting", "progress": 0.24},
+    {"key": "bucketing", "code": "bucketing", "progress": 0.36},
+    {"key": "bucket_writing", "code": "bucket_writing", "progress": 0.48},
+    {"key": "chunking", "code": "chunking", "progress": 0.62},
+    {"key": "summarizing", "code": "summarizing", "progress": 0.74},
+    {"key": "discovering", "code": "discovering", "progress": 0.88},
+    {"key": "done", "code": "done", "progress": 1.0},
 ]
 
 INGEST_STAGE_BY_KEY = {stage["key"]: stage for stage in INGEST_STAGES}
 logger = logging.getLogger(__name__)
+
+
+def _knowledge_trace(
+    phase: str,
+    *,
+    params: dict[str, Any] | None = None,
+    **fields: Any,
+) -> KnowledgeTraceItem:
+    """Build one stable retrieval trace item while keeping provider prose private."""
+    item: KnowledgeTraceItem = {
+        "phase": phase,
+        "code": phase,
+        "params": dict(params or {}),
+    }
+    item.update(fields)
+    return item
+
+
+def _knowledge_stage_descriptor(
+    code: str,
+    params: dict[str, Any] | None = None,
+) -> KnowledgeStageDescriptor:
+    """Build one persisted ingest-stage descriptor from a stable code and safe params."""
+    return {"code": code, "params": dict(params or {})}
+
+
+def _internal_knowledge_error_payload(
+    *,
+    retryable: bool = False,
+    raw_context: object | None = None,
+) -> dict[str, Any]:
+    """Return the only replay-safe ingest error payload currently allowed."""
+    del raw_context
+    return {
+        "code": "INTERNAL_ERROR",
+        "params": {},
+        "retryable": retryable,
+        "request_id": None,
+        "trace_id": None,
+    }
+
+
+def serialize_knowledge_error(
+    *,
+    retryable: bool = False,
+    raw_context: object | None = None,
+) -> str:
+    """Serialize one persisted knowledge error as canonical JSON for later safe replay."""
+    return json.dumps(
+        _internal_knowledge_error_payload(retryable=retryable, raw_context=raw_context),
+        ensure_ascii=False,
+        sort_keys=True,
+    )
 
 
 @dataclass
@@ -349,21 +405,24 @@ class KnowledgeService:
         return document
 
     def cancel_ingest_job(self, job_id: str, tenant_id: str) -> KnowledgeIngestJob | None:
+        """Request or finalize cancellation for one tenant-owned ingest job."""
         job = self.db.get(KnowledgeIngestJob, job_id)
         if not job or job.tenant_id != tenant_id:
             return None
         if job.status in TERMINAL_INGEST_STATUSES:
             return job
         if job.status == "queued":
-            self._finalize_cancelled_job(job, "入库任务已取消")
+            self._finalize_cancelled_job(job)
             return job
         if job.status == "cancel_requested":
-            self._finalize_cancelled_job(job, "入库任务已取消")
+            self._finalize_cancelled_job(job)
             return job
 
         metadata = dict(job.metadata_json or {})
-        metadata["stage_label"] = "取消中"
-        metadata["stage_detail"] = "已收到取消请求，正在停止当前入库阶段"
+        metadata.pop("stage_label", None)
+        metadata["stage_code"] = job.stage
+        metadata["stage_params"] = {}
+        metadata["stage_detail"] = _knowledge_stage_descriptor("cancel_requested")
         metadata["cancel_requested_at"] = utc_now().isoformat()
         metadata["ingest_steps"] = _ingest_steps_for(job.stage, float(job.progress or 0.0), "cancel_requested")
         job.metadata_json = metadata
@@ -391,12 +450,13 @@ class KnowledgeService:
         job: KnowledgeIngestJob,
         grace_period: timedelta = CANCEL_REQUEST_STALE_AFTER,
     ) -> KnowledgeIngestJob | None:
+        """Finalize a cancellation request only after its bounded grace period expires."""
         if job.status != "cancel_requested":
             return None
         last_update = job.updated_at or job.created_at
         if utc_now() - last_update < grace_period:
             return None
-        self._finalize_cancelled_job(job, "入库任务已取消")
+        self._finalize_cancelled_job(job)
         return job
 
     def run_ingest_job(self, job_id: str) -> None:
@@ -405,6 +465,7 @@ class KnowledgeService:
             service._run_ingest_job(job_id)
 
     def _run_ingest_job(self, job_id: str) -> None:
+        """Execute one ingest job and persist only canonical failure payloads on error."""
         job = self.db.get(KnowledgeIngestJob, job_id)
         if not job:
             return
@@ -414,7 +475,7 @@ class KnowledgeService:
                 "parsing",
                 status="running",
                 started_at=utc_now(),
-                detail="正在识别文件格式并抽取正文",
+                detail_code="parsing",
             )
             metadata = job.metadata_json or {}
             content = base64.b64decode(str(metadata.get("content_base64") or ""))
@@ -423,7 +484,7 @@ class KnowledgeService:
             self._update_ingest_stage(
                 job,
                 "normalizing",
-                detail=f"已抽取 {file_type} 文本，正在清理空行和段落",
+                detail_code="normalizing",
             )
             normalized_text = _normalize_text(text)
             if not normalized_text:
@@ -433,7 +494,7 @@ class KnowledgeService:
             self._update_ingest_stage(
                 job,
                 "documenting",
-                detail=f"已获得 {len(normalized_text):,} 字符，正在识别章节导航树",
+                detail_code="documenting",
                 stats={"char_count": len(normalized_text), "file_type": file_type},
             )
             section_nodes = _build_section_nodes(normalized_text)
@@ -475,7 +536,7 @@ class KnowledgeService:
             self._update_ingest_stage(
                 job,
                 "bucketing",
-                detail="正在按目录结构、章节语义和任务用途规划 OKF Wiki 页面",
+                detail_code="bucketing",
                 document_id=document.id,
                 stats={"section_count": len(section_nodes)},
             )
@@ -492,13 +553,13 @@ class KnowledgeService:
             self._update_ingest_stage(
                 job,
                 "bucket_writing",
-                detail=f"已规划 {len(buckets)} 个知识主题，正在写入 OKF Wiki 与内部索引",
+                detail_code="bucket_writing",
                 stats={"bucket_count": len(buckets), "section_count": len(section_nodes)},
             )
             self._update_ingest_stage(
                 job,
                 "chunking",
-                detail="正在从 OKF Wiki 与原始资料回填引用来源",
+                detail_code="chunking",
                 stats={"bucket_count": len(buckets)},
             )
             chunk_count = self._build_chunks(job.tenant_id, job.knowledge_base_id, document, buckets, section_nodes, job)
@@ -543,13 +604,13 @@ class KnowledgeService:
             self._update_ingest_stage(
                 job,
                 "summarizing",
-                detail=f"已生成 {chunk_count} 个引用来源，正在刷新 PageIndex 与来源摘要",
+                detail_code="summarizing",
                 stats={"concept_count": len(concept_rows), "bucket_count": len(buckets), "chunk_count": chunk_count},
             )
             self._update_ingest_stage(
                 job,
                 "discovering",
-                detail="正在从 OKF Wiki 和引用来源发现可确认的 SOP/工具建议",
+                detail_code="discovering",
                 stats={"bucket_count": len(buckets), "chunk_count": chunk_count},
             )
 
@@ -559,7 +620,7 @@ class KnowledgeService:
                 "done",
                 status="succeeded",
                 finished_at=utc_now(),
-                detail=f"完成入库：{len(concept_rows)} 个 Wiki 页面，{len(buckets)} 个内部索引，{chunk_count} 个引用来源",
+                detail_code="done",
                 stats={
                     "concept_count": len(concept_rows),
                     "bucket_count": len(buckets),
@@ -567,23 +628,25 @@ class KnowledgeService:
                 },
             )
             self._clear_embedded_content(job)
-        except KnowledgeIngestCancelled as exc:
-            self._finalize_cancelled_job(job, str(exc) or "入库任务已取消")
+        except KnowledgeIngestCancelled:
+            self._finalize_cancelled_job(job)
         except Exception as exc:  # noqa: BLE001 - persist stable job failure.
+            logger.exception("Knowledge ingest job %s failed", job_id)
+            public_error = serialize_knowledge_error(raw_context=exc)
             if job.document_id:
                 document = self.db.get(KnowledgeDocument, job.document_id)
                 if document:
                     document.status = "failed"
-                    document.error = str(exc)
+                    document.error = public_error
                     document.updated_at = utc_now()
                     self.db.add(document)
             self._update_ingest_stage(
                 job,
                 "failed",
                 status="failed",
-                error=str(exc),
+                error=public_error,
                 finished_at=utc_now(),
-                detail=str(exc),
+                detail_code="failed",
             )
             self._clear_embedded_content(job)
 
@@ -608,9 +671,7 @@ class KnowledgeService:
             and not request.knowledge_base_ids
             and not request.knowledge_base_version_ids
         ):
-            route_trace = [
-                {"phase": "no_visible_knowledge", "message": "当前上下文没有可见知识"}
-            ]
+            route_trace = [_knowledge_trace("no_visible_knowledge")]
             return KnowledgeSearchResponse(trace=route_trace, route_trace=route_trace)
         with observed_span(
             "knowledge_span",
@@ -675,9 +736,9 @@ class KnowledgeService:
         query = request.query.strip()
         if not query:
             return KnowledgeSearchResponse()
-        route_trace: list[dict[str, Any]] = []
+        route_trace: list[KnowledgeTraceItem] = []
         if request.agent_id and not request.knowledge_base_ids and not request.knowledge_base_version_ids:
-            route_trace.append({"phase": "no_visible_knowledge", "message": "当前智能体没有可见知识"})
+            route_trace.append(_knowledge_trace("no_visible_knowledge"))
             return KnowledgeSearchResponse(trace=route_trace, route_trace=route_trace)
 
         with observed_span("knowledge_span", "knowledge.load_concepts") as span:
@@ -692,22 +753,21 @@ class KnowledgeService:
         okf_citations = okf_citations_for_concepts(selected_concepts)
         if concepts:
             route_trace.append(
-                {
-                    "phase": "okf_concept_route",
-                    "message": "正在选择 OKF Wiki 页面",
-                    "candidate_count": len(concepts),
-                    "selected_count": len(selected_concepts),
-                }
+                _knowledge_trace(
+                    "okf_concept_route",
+                    candidate_count=len(concepts),
+                    selected_count=len(selected_concepts),
+                )
             )
 
         with observed_span("knowledge_span", "knowledge.load_documents") as span:
             documents = self._load_documents_for_search(request)
             span.finish(candidate_count=len(documents))
         if not documents and not selected_concepts:
-            route_trace.append({"phase": "no_documents", "message": "没有可检索的知识文档或 OKF 概念"})
+            route_trace.append(_knowledge_trace("no_documents"))
             return KnowledgeSearchResponse(trace=route_trace, route_trace=route_trace)
         if not documents:
-            route_trace.append({"phase": "okf_only", "message": "仅命中 OKF Wiki 页面"})
+            route_trace.append(_knowledge_trace("okf_only"))
             return KnowledgeSearchResponse(
                 trace=route_trace,
                 route_trace=route_trace,
@@ -716,12 +776,11 @@ class KnowledgeService:
             )
 
         route_trace.append(
-            {
-                "phase": "document_route",
-                "message": "正在选择知识文档",
-                "candidate_count": len(documents),
-                "mode": request.mode,
-            }
+            _knowledge_trace(
+                "document_route",
+                candidate_count=len(documents),
+                mode=request.mode,
+            )
         )
         with observed_span(
             "knowledge_span",
@@ -744,22 +803,20 @@ class KnowledgeService:
                         row.id for row in _score_documents(query, documents)[:5]
                     ]
                     route_trace.append(
-                        {
-                            "phase": "document_route_lexical_fallback",
-                            "message": "模型路由不可用，已按检索相关性选择知识文档",
-                            "selected_count": len(selected_document_ids),
-                        }
+                        _knowledge_trace(
+                            "document_route_lexical_fallback",
+                            selected_count=len(selected_document_ids),
+                        )
                     )
                 else:
                     selected_document_ids = llm_document_ids
             else:
                 selected_document_ids = [row.id for row in _score_documents(query, documents)[:5]]
                 route_trace.append(
-                    {
-                        "phase": "document_route_lexical",
-                        "message": "按检索相关性选择知识文档",
-                        "selected_count": len(selected_document_ids),
-                    }
+                    _knowledge_trace(
+                        "document_route_lexical",
+                        selected_count=len(selected_document_ids),
+                    )
                 )
             span.finish(selected_count=len(selected_document_ids))
         concept_document_ids = [
@@ -773,7 +830,7 @@ class KnowledgeService:
         selected_documents = [row for row in documents if row.id in set(selected_document_ids)]
         selected_document_cards = [_document_card_for_search(row) for row in selected_documents]
         if not selected_documents and not selected_concepts:
-            route_trace.append({"phase": "document_route_no_match", "message": "没有足够相关的知识文档"})
+            route_trace.append(_knowledge_trace("document_route_no_match"))
             return KnowledgeSearchResponse(trace=route_trace, route_trace=route_trace)
 
         with observed_span(
@@ -782,7 +839,7 @@ class KnowledgeService:
             buckets = self._load_buckets_for_search(request, selected_document_ids)
             span.finish(candidate_count=len(buckets))
         if not buckets:
-            route_trace.append({"phase": "no_buckets", "message": "所选文档没有可展开的内部索引"})
+            route_trace.append(_knowledge_trace("no_buckets"))
             return KnowledgeSearchResponse(
                 trace=route_trace,
                 route_trace=route_trace,
@@ -792,12 +849,11 @@ class KnowledgeService:
             )
 
         route_trace.append(
-            {
-                "phase": "bucket_route",
-                    "message": "正在选择内部索引",
-                "candidate_count": len(buckets),
-                "selected_document_ids": selected_document_ids,
-            }
+            _knowledge_trace(
+                "bucket_route",
+                candidate_count=len(buckets),
+                selected_document_ids=selected_document_ids,
+            )
         )
         with observed_span(
             "knowledge_span",
@@ -828,11 +884,10 @@ class KnowledgeService:
                         ]
                     ]
                     route_trace.append(
-                        {
-                            "phase": "bucket_route_lexical_fallback",
-                            "message": "模型路由不可用，已按检索相关性选择内部索引",
-                            "selected_count": len(selected_ids),
-                        }
+                        _knowledge_trace(
+                            "bucket_route_lexical_fallback",
+                            selected_count=len(selected_ids),
+                        )
                     )
                 else:
                     selected_ids = llm_bucket_ids
@@ -844,18 +899,17 @@ class KnowledgeService:
                     ]
                 ]
                 route_trace.append(
-                    {
-                        "phase": "bucket_route_lexical",
-                        "message": "按检索相关性选择内部索引",
-                        "selected_count": len(selected_ids),
-                    }
+                    _knowledge_trace(
+                        "bucket_route_lexical",
+                        selected_count=len(selected_ids),
+                    )
                 )
             span.finish(selected_count=len(selected_ids))
 
         bucket_by_id = {bucket.id: bucket for bucket in buckets}
         selected_buckets = [bucket_by_id[bucket_id] for bucket_id in selected_ids if bucket_id in bucket_by_id]
         if not selected_buckets and not selected_concepts:
-            route_trace.append({"phase": "bucket_route_no_match", "message": "没有足够相关的内部索引"})
+            route_trace.append(_knowledge_trace("bucket_route_no_match"))
             return KnowledgeSearchResponse(
                 trace=route_trace,
                 route_trace=route_trace,
@@ -872,11 +926,7 @@ class KnowledgeService:
             )
             span.finish(section_count=len(expanded_sections))
         route_trace.append(
-            {
-                "phase": "section_expand",
-                "message": "正在展开章节",
-                "section_count": len(expanded_sections),
-            }
+            _knowledge_trace("section_expand", section_count=len(expanded_sections))
         )
         with observed_span(
             "knowledge_span", "knowledge.load_chunks", bucket_count=len(selected_ids)
@@ -916,8 +966,8 @@ class KnowledgeService:
             span.finish(evidence_count=len(evidence_pack))
         route_trace.extend(
             [
-                {"phase": "read_chunks", "message": "读取引用来源", "chunk_count": len(ranked_chunks)},
-                {"phase": "evidence_pack", "message": "整理引用来源包", "evidence_count": len(evidence_pack)},
+                _knowledge_trace("read_chunks", chunk_count=len(ranked_chunks)),
+                _knowledge_trace("evidence_pack", evidence_count=len(evidence_pack)),
             ]
         )
         return KnowledgeSearchResponse(
@@ -1317,7 +1367,7 @@ class KnowledgeService:
         documents: list[KnowledgeDocument],
         max_documents: int,
         model_config: ModelConfig,
-        trace: list[dict[str, Any]],
+        trace: list[KnowledgeTraceItem],
     ) -> list[str] | None:
         payload = {
             "query": query,
@@ -1329,12 +1379,12 @@ class KnowledgeService:
                 raw = LLMClient(model_config).generate_json(
                     DOCUMENT_ROUTE_PROMPT.read_text(encoding="utf-8"), payload
                 )
-        except (LLMError, Exception) as exc:
-            trace.append({"phase": "document_route_failed", "message": str(exc)})
+        except Exception:  # noqa: BLE001 - provider diagnostics stay private.
+            trace.append(_knowledge_trace("document_route_failed"))
             return None
         ids = raw.get("selected_document_ids") if isinstance(raw, dict) else None
         if not isinstance(ids, list):
-            trace.append({"phase": "document_route_invalid", "message": "模型未返回文档 ID 数组"})
+            trace.append(_knowledge_trace("document_route_invalid"))
             return None
         allowed = {row.id for row in documents}
         return [str(item) for item in ids if str(item) in allowed][:max_documents]
@@ -1345,7 +1395,7 @@ class KnowledgeService:
         buckets: list[KnowledgeBucket],
         max_buckets: int,
         model_config: ModelConfig,
-        trace: list[dict[str, Any]],
+        trace: list[KnowledgeTraceItem],
         query_type: str = "answer",
     ) -> list[str] | None:
         payload = {
@@ -1375,12 +1425,12 @@ class KnowledgeService:
                 raw = LLMClient(model_config).generate_json(
                     SEARCH_PROMPT.read_text(encoding="utf-8"), payload
                 )
-        except (LLMError, Exception) as exc:
-            trace.append({"phase": "bucket_selection_failed", "message": str(exc)})
+        except Exception:  # noqa: BLE001 - provider diagnostics stay private.
+            trace.append(_knowledge_trace("bucket_selection_failed"))
             return None
         ids = raw.get("selected_bucket_ids") if isinstance(raw, dict) else None
         if not isinstance(ids, list):
-            trace.append({"phase": "bucket_route_invalid", "message": "模型未返回内部索引 ID 数组"})
+            trace.append(_knowledge_trace("bucket_route_invalid"))
             return None
         allowed = {bucket.id for bucket in buckets}
         return [str(item) for item in ids if str(item) in allowed][:max_buckets]
@@ -1504,14 +1554,17 @@ class KnowledgeService:
         if job.status in CANCELLING_INGEST_STATUSES:
             raise KnowledgeIngestCancelled("入库任务已取消")
 
-    def _finalize_cancelled_job(self, job: KnowledgeIngestJob, detail: str) -> None:
+    def _finalize_cancelled_job(self, job: KnowledgeIngestJob) -> None:
+        """Finalize cancellation with stable stage data and remove any partial artifacts."""
         cancelled_document_id = job.document_id
         if cancelled_document_id:
             self._delete_partial_ingest_document(job)
         metadata = dict(job.metadata_json or {})
         metadata.pop("content_base64", None)
-        metadata["stage_label"] = "已取消"
-        metadata["stage_detail"] = detail
+        metadata.pop("stage_label", None)
+        metadata["stage_code"] = "cancelled"
+        metadata["stage_params"] = {}
+        metadata["stage_detail"] = _knowledge_stage_descriptor("cancelled")
         metadata["cancelled_at"] = utc_now().isoformat()
         if cancelled_document_id:
             metadata["cancelled_document_id"] = cancelled_document_id
@@ -1544,17 +1597,24 @@ class KnowledgeService:
         self,
         job: KnowledgeIngestJob,
         stage: str,
-        detail: str = "",
+        detail_code: str | None = None,
+        detail_params: dict[str, Any] | None = None,
         stats: dict[str, Any] | None = None,
         **changes: Any,
     ) -> None:
+        """Persist one ingest stage using stable codes while keeping diagnostics out of metadata."""
         if changes.get("status") not in {"failed", "cancelled"}:
             self._raise_if_ingest_cancelled(job)
         stage_def = INGEST_STAGE_BY_KEY.get(stage)
         progress = float(stage_def["progress"]) if stage_def else float(job.progress or 0.0)
         metadata = dict(job.metadata_json or {})
-        metadata["stage_label"] = str(stage_def["label"] if stage_def else stage)
-        metadata["stage_detail"] = detail
+        metadata.pop("stage_label", None)
+        metadata["stage_code"] = stage
+        metadata["stage_params"] = {}
+        metadata["stage_detail"] = _knowledge_stage_descriptor(
+            detail_code or stage,
+            detail_params,
+        )
         if stats is not None:
             metadata["stage_stats"] = stats
         metadata["ingest_steps"] = _ingest_steps_for(stage, progress, changes.get("status") or job.status)
@@ -1769,18 +1829,25 @@ def _hard_split_text(text: str, max_chars: int) -> list[str]:
     return [text[index:index + max_chars].strip() for index in range(0, len(text), max_chars) if text[index:index + max_chars].strip()]
 
 
-def _ingest_steps_for(stage: str, progress: float, status: str) -> list[dict[str, Any]]:
+def _ingest_steps_for(stage: str, progress: float, status: str) -> list[KnowledgeIngestStep]:
+    """Build ingest progress data from stable stage codes without localized labels."""
     if stage == "failed" or status in {"failed", "cancelled"}:
         return [
             {
-                **item,
+                "key": item["key"],
+                "code": item["code"],
+                "params": {},
+                "progress": float(item["progress"]),
                 "status": "done" if float(item["progress"]) < progress else "pending",
             }
             for item in INGEST_STAGES
         ]
     return [
         {
-            **item,
+            "key": item["key"],
+            "code": item["code"],
+            "params": {},
+            "progress": float(item["progress"]),
             "status": (
                 "running"
                 if item["key"] == stage

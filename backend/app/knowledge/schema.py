@@ -4,12 +4,55 @@ from datetime import datetime
 from typing import Annotated, Any, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
+from typing_extensions import TypedDict
 
 from app.capability_scope import CapabilityScope
 
 KnowledgeBaseMode = Literal["dedicated", "shared"]
 KnowledgePublicationState = Literal["draft", "released", "rejected"]
 NonEmptyText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+
+
+class KnowledgeErrorDescriptor(TypedDict):
+    """持久化知识任务对外暴露的稳定错误字段，不包含异常原文。"""
+
+    code: str
+    params: dict[str, Any]
+    retryable: bool
+    request_id: str | None
+    trace_id: str | None
+
+
+class KnowledgeStageDescriptor(TypedDict):
+    """知识入库阶段的稳定代码和具名参数，显示文案由客户端语言决定。"""
+
+    code: str
+    params: dict[str, Any]
+
+
+class KnowledgeIngestStep(TypedDict):
+    """知识入库进度条使用的机器阶段数据，不携带已翻译标签。"""
+
+    key: str
+    code: str
+    params: dict[str, Any]
+    progress: float
+    status: Literal["pending", "running", "done"]
+
+
+class KnowledgeTraceItem(TypedDict, total=False):
+    """检索诊断步骤的稳定代码、参数和受控统计字段。"""
+
+    phase: str
+    code: str
+    params: dict[str, Any]
+    candidate_count: int
+    selected_count: int
+    section_count: int
+    chunk_count: int
+    evidence_count: int
+    mode: str
+    selected_document_ids: list[str]
 
 
 class KnowledgeBaseCreateRequest(BaseModel):
@@ -207,7 +250,7 @@ class KnowledgeIngestJobRead(BaseModel):
     status: str
     stage: str
     progress: float
-    error: Optional[str] = None
+    error: KnowledgeErrorDescriptor | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     created_at: str
     started_at: Optional[str] = None
@@ -229,7 +272,7 @@ class KnowledgeDocumentRead(BaseModel):
     bucket_count: int
     chunk_count: int
     metadata: dict[str, Any] = Field(default_factory=dict)
-    error: Optional[str] = None
+    error: KnowledgeErrorDescriptor | None = None
     created_at: str
     updated_at: str
 
@@ -355,8 +398,8 @@ class KnowledgeSearchRequest(BaseModel):
 class KnowledgeSearchResponse(BaseModel):
     selected_buckets: list[KnowledgeBucketRead] = Field(default_factory=list)
     chunks: list[KnowledgeChunkRead] = Field(default_factory=list)
-    trace: list[dict[str, Any]] = Field(default_factory=list)
-    route_trace: list[dict[str, Any]] = Field(default_factory=list)
+    trace: list[KnowledgeTraceItem] = Field(default_factory=list)
+    route_trace: list[KnowledgeTraceItem] = Field(default_factory=list)
     selected_documents: list[dict[str, Any]] = Field(default_factory=list)
     selected_concepts: list[dict[str, Any]] = Field(default_factory=list)
     expanded_sections: list[dict[str, Any]] = Field(default_factory=list)

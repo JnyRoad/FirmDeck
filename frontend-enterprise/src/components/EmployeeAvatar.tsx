@@ -1,5 +1,7 @@
 import type { CSSProperties } from 'react';
 
+import { useAppIntl } from '@/i18n/useAppIntl';
+
 import {
   DEFAULT_AVATAR_PRESET,
   employeeAvatarImage,
@@ -30,6 +32,7 @@ type EmployeeAvatarProps = {
   style?: CSSProperties;
 };
 
+/** Render an employee avatar with localized assistive chrome and raw profile data kept out of messages. */
 export default function EmployeeAvatar({
   agent,
   profile: profileOverride,
@@ -43,6 +46,7 @@ export default function EmployeeAvatar({
   style,
 }: EmployeeAvatarProps) {
   const profile = profileOverride || employeeProfile(agent);
+  const { t } = useAppIntl();
 
   const className_ = [
     'employee-avatar',
@@ -73,7 +77,7 @@ export default function EmployeeAvatar({
     <span
       className={className_}
       style={boxStyle}
-      aria-label={`${profile.avatarText || '员'}员工头像`}
+      aria-label={t('employeeAvatar.ariaLabel')}
     >
       <img src={employeeAvatarImage(profile)} alt="" style={imageStyle} />
     </span>

@@ -10,8 +10,16 @@ on:
         required: true
         default: "0.1.0"
 
+permissions:
+  contents: read
+
 jobs:
+  quality:
+    name: Quality gate
+    uses: ./.github/workflows/quality.yml
+
   build:
+    needs: quality
     env:
       PYTHONUTF8: "1"
       PYTHONIOENCODING: "utf-8"
@@ -58,7 +66,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install frontend deps
-        run: npm --prefix frontend-enterprise ci || npm --prefix frontend-enterprise install
+        run: npm --prefix frontend-enterprise ci
 
       - name: macOS tools
         if: startsWith(matrix.os, 'macos')

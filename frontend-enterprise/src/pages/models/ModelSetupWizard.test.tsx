@@ -263,7 +263,7 @@ describe('ModelSetupWizard — vendor branch (US1)', () => {
 
     await user.click(testButton());
 
-    expect(await screen.findByText('boom')).toBeTruthy();
+    expect(await screen.findByText('模型保存或连接测试失败，请检查配置后重试。')).toBeTruthy();
     expect(onCreated).not.toHaveBeenCalled();
     expect(props.onOpenChange).not.toHaveBeenCalled();
     // Both buttons must still be there so the user can fix the problem and retry.
@@ -695,12 +695,12 @@ describe('ModelSetupWizard — switching channels clears stale credentials (FR-0
     await user.type(screen.getByPlaceholderText('sk-...'), 'sk-test-123');
     await user.type(screen.getByPlaceholderText('选择或输入模型'), 'gpt-4o');
     await user.click(testButton());
-    expect(await screen.findByText('openai test failed')).toBeTruthy();
+    expect(await screen.findByText('模型保存或连接测试失败，请检查配置后重试。')).toBeTruthy();
 
     await user.click(screen.getByRole('button', { name: '上一步' }));
     await selectChannelAndAdvance(user, 'Anthropic');
 
-    expect(screen.queryByText('openai test failed')).toBeNull();
+    expect(screen.queryByText('模型保存或连接测试失败，请检查配置后重试。')).toBeNull();
   });
 });
 

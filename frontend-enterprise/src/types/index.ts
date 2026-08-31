@@ -1,3 +1,6 @@
+import type { LanguageContextSource } from '@/i18n/languagePreferences';
+import type { AppLocale } from '@/i18n/locales';
+
 export type CapabilityScope = 'general' | 'sop_specific';
 
 export type SkillCapabilityRefs = {
@@ -38,6 +41,34 @@ export type SkillCard = {
   response_rules: string[];
 };
 
+export type KnowledgeErrorDescriptor = {
+  code: string;
+  params: Record<string, unknown>;
+  retryable: boolean;
+  request_id?: string | null;
+  trace_id?: string | null;
+};
+
+export type KnowledgeStageDescriptor = {
+  code: string;
+  params: Record<string, unknown>;
+};
+
+export type KnowledgeIngestStep = {
+  key: string;
+  code: string;
+  params: Record<string, unknown>;
+  progress: number;
+  status: 'pending' | 'running' | 'done';
+};
+
+export type KnowledgeIngestMetadata = Record<string, unknown> & {
+  stage_code?: string;
+  stage_params?: Record<string, unknown>;
+  stage_detail?: KnowledgeStageDescriptor;
+  ingest_steps?: KnowledgeIngestStep[];
+};
+
 export type KnowledgeIngestJobRead = {
   id: string;
   tenant_id: string;
@@ -47,8 +78,8 @@ export type KnowledgeIngestJobRead = {
   status: string;
   stage: string;
   progress: number;
-  error?: string;
-  metadata?: Record<string, unknown>;
+  error?: KnowledgeErrorDescriptor | null;
+  metadata?: KnowledgeIngestMetadata;
   created_at: string;
   started_at?: string;
   finished_at?: string;
@@ -232,11 +263,24 @@ export type KnowledgeSearchEvidence = {
   confidence_reason?: string;
 };
 
+export type KnowledgeSearchTrace = {
+  phase: string;
+  code: string;
+  params: Record<string, unknown>;
+  candidate_count?: number;
+  selected_count?: number;
+  section_count?: number;
+  chunk_count?: number;
+  evidence_count?: number;
+  mode?: string;
+  selected_document_ids?: string[];
+};
+
 export type KnowledgeSearchResponse = {
   selected_buckets: KnowledgeBucketRead[];
   chunks: KnowledgeChunkRead[];
-  trace: Array<Record<string, unknown>>;
-  route_trace: Array<Record<string, unknown>>;
+  trace: KnowledgeSearchTrace[];
+  route_trace: KnowledgeSearchTrace[];
   selected_documents: Array<Record<string, unknown>>;
   expanded_sections: Array<Record<string, unknown>>;
   selected_concepts: Array<Record<string, unknown>>;
@@ -424,6 +468,21 @@ export type PersonaRead = {
   updated_at: string;
 };
 
+/** Raw sandbox runtime metadata returned beside a localized status code. */
+export type SandboxStatusParams = {
+  backend: string | null;
+};
+
+/** Raw command values associated with a localized sandbox remediation. */
+export type SandboxRemediationParams = {
+  command: string | null;
+};
+
+/** Raw administrator command kept separate from localized sandbox setup prose. */
+export type SandboxSetupParams = {
+  command: string;
+};
+
 export type UIConfigRead = {
   tenant_id: string;
   show_thinking_trace: boolean;
@@ -447,11 +506,13 @@ export type UIConfigRead = {
   sandbox_allowed_domains: string[];
   sandbox_backend?: string | null;
   sandbox_setup_required?: boolean;
-  sandbox_setup_instructions?: string | null;
   sandbox_status?: 'ready' | 'unavailable' | 'degraded' | 'disabled';
   sandbox_status_code?: string | null;
-  sandbox_status_message?: string | null;
-  sandbox_status_remediation?: string | null;
+  sandbox_status_params?: SandboxStatusParams;
+  sandbox_remediation_code?: string | null;
+  sandbox_remediation_params?: SandboxRemediationParams | null;
+  sandbox_setup_code?: string | null;
+  sandbox_setup_params?: SandboxSetupParams | null;
   updated_at: string;
 };
 
@@ -684,6 +745,9 @@ export type ChatSession = {
   /** 团队会话归属（后端逐步放开，可能缺省）。 */
   team_id?: string | null;
   team_name?: string | null;
+  /** 已绑定会话的 Agent 回复语言；一旦存在即优先于后续用户偏好。 */
+  agent_reply_locale?: AppLocale | null;
+  agent_reply_locale_source?: LanguageContextSource | null;
   updated_at: string;
 };
 
@@ -886,6 +950,10 @@ export type TraceLineRead = {
   kind: 'thinking' | 'decision' | 'skill' | 'tool' | 'code' | 'knowledge';
   text: string;
   detail?: string | null;
+  event_type?: string | null;
+  event_code?: string | null;
+  params?: Record<string, unknown> | null;
+  event_data?: Record<string, unknown> | null;
   code?: string | null;
   language?: string | null;
   output?: string | null;

@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.i18n.language_context import SupportedLocale, normalize_locale
 
 ScheduleType = Literal["once", "daily", "weekly", "monthly"]
 ScheduledTaskStatus = Literal["active", "paused", "completed", "archived"]
@@ -58,6 +59,16 @@ class ScheduledTaskDraftRequest(BaseModel):
     session_id: Optional[str] = None
     message: str
     timezone: Optional[str] = None
+    ui_locale: SupportedLocale | None = None
+    agent_reply_locale: SupportedLocale | None = None
+
+    @field_validator("ui_locale", "agent_reply_locale", mode="before")
+    @classmethod
+    def _normalize_locale_fields(cls, value: object) -> SupportedLocale | None:
+        """Normalize standalone draft locale aliases through the canonical resolver."""
+        if value is not None and not isinstance(value, (str, SupportedLocale)):
+            raise ValueError("locale must be a supported BCP 47 string")
+        return normalize_locale(value)
 
 
 class ScheduledTaskDraftRead(BaseModel):
@@ -119,7 +130,7 @@ class ScheduledTaskRunRead(BaseModel):
     started_at: Optional[str] = None
     finished_at: Optional[str] = None
     result_summary: Optional[str] = None
-    error: Optional[str] = None
+    error: dict[str, Any] = Field(default_factory=dict)
     trace: dict[str, Any] = Field(default_factory=dict)
     created_at: str
     updated_at: str

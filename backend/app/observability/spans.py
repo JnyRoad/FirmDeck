@@ -9,6 +9,10 @@ from time import perf_counter
 from typing import Any
 from uuid import uuid4
 
+from app.contracts.error_registry import ERROR_REGISTRY
+from app.contracts.errors import ErrorDescriptor, ErrorOccurrence, InternalErrorContext
+from app.contracts.projections import project_public_error
+
 
 SpanSink = Callable[[str, dict[str, Any]], None]
 
@@ -110,18 +114,27 @@ class ManualSpan:
             ),
         )
 
-    def fail(self, error: BaseException, **attributes: Any) -> None:
+    def fail(
+        self,
+        error: BaseException | None = None,
+        *,
+        exception_type: str | None = None,
+        **attributes: Any,
+    ) -> None:
+        """Emit a failed span with a canonical public error while leaving raw text in logs only."""
         if self._finished:
             return
         self._finished = True
+        resolved_exception_type = exception_type
+        if resolved_exception_type is None and error is not None:
+            resolved_exception_type = error.__class__.__name__
         emit_span_event(
             f"{self.event_prefix}_failed",
             self._payload(
                 finished_at=_utc_iso(),
                 duration_ms=self.elapsed_ms(),
                 status="failed",
-                error_type=error.__class__.__name__,
-                error=str(error)[:500],
+                error=_span_public_error(exception_type=resolved_exception_type),
                 **attributes,
             ),
         )
@@ -147,8 +160,8 @@ def observed_span(
     parent_token = _parent_span_id.set(span.span_id)
     try:
         yield span
-    except BaseException as exc:
-        span.fail(exc)
+    except BaseException:
+        span.fail()
         raise
     else:
         span.finish()
@@ -162,3 +175,20 @@ def start_llm_call(**attributes: Any) -> ManualSpan:
         _span_operation.get(),
         {**_span_attributes.get(), **attributes},
     )
+
+
+def _span_public_error(*, exception_type: str | None) -> dict[str, Any]:
+    """Project one span failure to a safe canonical descriptor."""
+    occurrence = ErrorOccurrence(
+        descriptor=ErrorDescriptor(
+            code="INTERNAL_ERROR",
+            params={},
+            retryable=False,
+        ),
+        internal=InternalErrorContext(
+            source="observability.span",
+            exception_type=exception_type,
+            upstream_code=exception_type,
+        ),
+    )
+    return project_public_error(occurrence, ERROR_REGISTRY)

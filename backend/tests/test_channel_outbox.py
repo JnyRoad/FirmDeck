@@ -157,6 +157,28 @@ def _assistant_message(session_id: str, message_id: str, content: str = "回复�
     )
 
 
+def _language_snapshot() -> dict[str, object]:
+    """Return one mixed immutable snapshot copied from the generated assistant message."""
+    return {
+        "version": 1,
+        "ui_locale": "en-US",
+        "agent_reply_locale": "zh-CN",
+        "ui_locale_source": "explicit_request",
+        "agent_reply_locale_source": "channel_default",
+    }
+
+
+def _legacy_language_snapshot() -> dict[str, object]:
+    """Return the controlled compatibility snapshot for legacy assistant messages."""
+    return {
+        "version": 1,
+        "ui_locale": "zh-CN",
+        "agent_reply_locale": "zh-CN",
+        "ui_locale_source": "legacy_default",
+        "agent_reply_locale_source": "legacy_default",
+    }
+
+
 def test_web_session_is_not_staged() -> None:
     engine = _test_engine()
     with Session(engine) as db:
@@ -259,6 +281,75 @@ def test_channel_session_stages_delivery_in_same_transaction() -> None:
         assert delivery.kind == "reply"
         assert delivery.status == "pending"
         assert delivery.target_json == {"to_user_id": "u1", "context_token": "ctx"}
+
+
+def test_channel_staging_copies_message_language_snapshot_and_raw_reply() -> None:
+    """Copy the assistant snapshot into outbox while preserving generated external text verbatim."""
+    engine = _test_engine()
+    with Session(engine) as db:
+        binding = _seed_binding(db)
+        chat_session = _channel_session(binding)
+        message = _assistant_message(
+            chat_session.id,
+            "msg_language_snapshot",
+            "外部回复《保持原样》",
+        )
+        message.metadata_json = {"language_context": _language_snapshot()}
+        db.add(chat_session)
+        db.add(message)
+        db.commit()
+
+        stage_channel_delivery(db, chat_session, message)
+        db.commit()
+
+        delivery = db.exec(select(ChannelDelivery)).one()
+        assert delivery.language_context_json == _language_snapshot()
+        assert delivery.text == "外部回复《保持原样》"
+        assert message.content == "外部回复《保持原样》"
+
+
+def test_channel_staging_without_snapshot_uses_controlled_legacy_context() -> None:
+    """Backfill a versioned legacy snapshot for an otherwise valid old assistant message."""
+    engine = _test_engine()
+    with Session(engine) as db:
+        binding = _seed_binding(db)
+        chat_session = _channel_session(binding)
+        message = _assistant_message(chat_session.id, "msg_language_legacy", "旧回复原文")
+        db.add(chat_session)
+        db.add(message)
+        db.commit()
+
+        stage_channel_delivery(db, chat_session, message)
+        db.commit()
+
+        delivery = db.exec(select(ChannelDelivery)).one()
+        assert delivery.language_context_json == _legacy_language_snapshot()
+        assert delivery.text == "旧回复原文"
+
+
+def test_channel_staging_fails_closed_for_invalid_language_snapshot() -> None:
+    """Reject malformed locale metadata instead of silently staging an unauditable delivery."""
+    engine = _test_engine()
+    with Session(engine) as db:
+        binding = _seed_binding(db)
+        chat_session = _channel_session(binding)
+        message = _assistant_message(chat_session.id, "msg_language_invalid")
+        message.metadata_json = {
+            "language_context": {
+                **_language_snapshot(),
+                "version": 2,
+                "agent_reply_locale": "fr-FR",
+            }
+        }
+        db.add(chat_session)
+        db.add(message)
+        db.commit()
+
+        with pytest.raises(ValueError):
+            stage_channel_delivery(db, chat_session, message)
+        db.rollback()
+
+        assert db.exec(select(ChannelDelivery)).all() == []
 
 
 def test_staging_is_idempotent_per_message() -> None:
@@ -512,6 +603,60 @@ def test_daemon_recovers_then_delivers() -> None:
         delivery = db.get(ChannelDelivery, delivery_id)
         assert delivery.status == "delivered"
         assert delivery.attempts == 2
+
+
+def test_delivery_retry_reuses_snapshot_after_binding_locale_changes() -> None:
+    """Deliver retries from the durable snapshot and resend the already-generated raw text."""
+    engine = _test_engine()
+    adapter = FakeAdapter(fail_times=1)
+    register_channel_adapter("fake", adapter)
+
+    with Session(engine) as db:
+        binding = _seed_binding(db)
+        binding.config_json = {"ui_locale": "en-US", "agent_reply_locale": "zh-CN"}
+        db.add(binding)
+        db.commit()
+        binding_id = binding.id
+        delivery = _make_delivery(
+            db,
+            binding,
+            message_id="msg_language_retry",
+            idempotency_key="msg_language_retry",
+            text="已生成回复《不要重新翻译》",
+            language_context_json=_language_snapshot(),
+        )
+        delivery_id = delivery.id
+
+    run_delivery_daemon(once=True, db_engine=engine)
+    with Session(engine) as db:
+        pending = db.get(ChannelDelivery, delivery_id)
+        assert pending is not None
+        assert pending.status == "pending"
+        assert pending.language_context_json == _language_snapshot()
+        binding = db.get(ChannelBinding, pending.binding_id)
+        assert binding is not None
+        binding.config_json = {"ui_locale": "zh-CN", "agent_reply_locale": "en-US"}
+        pending.next_attempt_at = utc_now() - timedelta(seconds=1)
+        db.add(binding)
+        db.add(pending)
+        db.commit()
+
+    run_delivery_daemon(once=True, db_engine=engine)
+    with Session(engine) as db:
+        delivered = db.get(ChannelDelivery, delivery_id)
+        assert delivered is not None
+        assert delivered.status == "delivered"
+        assert delivered.attempts == 2
+        assert delivered.language_context_json == _language_snapshot()
+
+    assert adapter.sent == [
+        (
+            binding_id,
+            {"to_user_id": "u1", "context_token": "ctx"},
+            "已生成回复《不要重新翻译》",
+        )
+    ]
+    assert adapter.dedupe_keys == ["msg_language_retry", "msg_language_retry"]
 
 
 def test_daemon_resets_stuck_sending() -> None:

@@ -13,8 +13,8 @@ import app.channels.service_intake as intake_module
 import app.core.agent_loop as agent_loop_module
 from app.channels.adapters.wecom import (
     WeComAdapter,
-    WeComTokenProvider,
     WeComStreamManager,
+    WeComTokenProvider,
     is_self_frame,
     normalize_wecom_frame,
 )
@@ -324,7 +324,10 @@ def test_file_message_with_image_bytes_is_promoted_to_image(monkeypatch) -> None
 
 
 def test_wecom_replay_restores_attachment_dataclass() -> None:
-    from app.channels.service_wecom_inbox import decode_wecom_replay_envelope, encode_wecom_replay_envelope
+    from app.channels.service_wecom_inbox import (
+        decode_wecom_replay_envelope,
+        encode_wecom_replay_envelope,
+    )
 
     inbound = normalize_wecom_frame(
         _text_frame(msgtype="image", text=None, image={"media_id": "media-image"})
@@ -1429,7 +1432,7 @@ def test_wecom_credentials_rejects_bot_change_without_stopping_ingress(monkeypat
     )
 
     assert response.status_code == 400
-    assert "删除后重新创建绑定" in response.json()["detail"]
+    assert response.json()["detail"]["code"] == "CHANNEL_BAD_REQUEST"
     assert calls == []
     with Session(engine) as db:
         binding = db.get(ChannelBinding, binding_id)

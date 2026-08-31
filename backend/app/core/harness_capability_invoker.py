@@ -8,7 +8,7 @@ import json
 import mimetypes
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +25,12 @@ from app.capabilities.local_knowledge import (
     SharedKnowledgeAgentActionResult,
     SharedKnowledgeAgentRuntime,
 )
+from app.contracts.error_registry import (
+    ERROR_REGISTRY,
+    ErrorContractViolation,
+    ErrorVisibility,
+)
+from app.contracts.errors import ErrorDescriptor, InternalErrorContext
 from app.core.capability_discovery import (
     CAPABILITY_SEARCH_MAX_RESULTS,
     catalog_entry,
@@ -54,6 +60,7 @@ from app.db.models import (
     ChatSession,
     GeneralSkill,
     HarnessInvocationRecord,
+    HarnessRunRecord,
     ModelConfig,
     Skill,
     Tool,
@@ -61,6 +68,7 @@ from app.db.models import (
     new_id,
     utc_now,
 )
+from app.general_skills.runner import canonical_general_skill_trace_payload
 from app.harness import (
     HarnessArtifactAccessError,
     HarnessExecutor,
@@ -77,6 +85,12 @@ from app.harness.errors import HarnessExecutionError
 from app.harness.execution_context import SANDBOX_WORKSPACE
 from app.harness.filesystem import ReadFileArguments, read_opened_harness_artifact
 from app.harness.sandbox import parse_network_policy
+from app.i18n.language_context import (
+    LanguageContext,
+    LanguageContextInputs,
+    resolve_compatible_language_context,
+    resolve_language_context,
+)
 from app.knowledge.citations import knowledge_citations_from_results
 from app.knowledge.errors import KnowledgeError
 from app.knowledge.schema import KnowledgeSearchRequest
@@ -88,6 +102,7 @@ _INLINE_JSON_TOOL_RESULT_MAX_CHARS = 2_000
 _INTERNAL_TOOL_RESULT_DIRECTORY = ".harness/tool-results"
 _GENERAL_SKILL_PACKAGE_DIRECTORY = ".harness/skill-packages"
 _SANDBOX_JSON_FILE_KIND = "sandbox_json_file"
+_INTERNAL_ERROR_CODE = "INTERNAL_ERROR"
 
 
 class HarnessCapabilityInvoker:
@@ -111,7 +126,9 @@ class HarnessCapabilityInvoker:
         ensure_execution_lease: Any | None = None,
         trace_sink: Callable[[str, dict[str, Any]], None] | None = None,
         step_deadline_monotonic: float | None = None,
+        language_context: LanguageContext | dict[str, Any] | None = None,
     ) -> None:
+        """Bind capability execution to the immutable locale snapshot of its Harness run."""
         self.db = db
         self.tenant_id = tenant_id
         self.session = session
@@ -129,6 +146,12 @@ class HarnessCapabilityInvoker:
         self.trace_sink = trace_sink
         self.step_deadline_monotonic = step_deadline_monotonic
         self.run_id = str(run_id or new_id("hrun"))
+        self.language_context = _invoker_language_context(
+            db,
+            self.run_id,
+            session,
+            language_context,
+        )
         self.workspace_root = _workspace_root(
             tenant_id, session.id, task_frame_id, db=self.db
         )
@@ -222,6 +245,7 @@ class HarnessCapabilityInvoker:
             logical_action_key=logical_action_key,
             status="started",
             arguments_json=_audit_arguments(arguments),
+            language_context_json=self.language_context.model_dump(mode="json"),
         )
         self.db.add(invocation)
         try:
@@ -267,7 +291,12 @@ class HarnessCapabilityInvoker:
                             call_id=call_id,
                         )
                     except KnowledgeError as exc:
-                        result = _failure(exc.code, exc.message, **exc.details)
+                        entry = ERROR_REGISTRY.get(exc.code)
+                        result = (
+                            _failure(_INTERNAL_ERROR_CODE, "共享知识动作失败。")
+                            if entry is None
+                            else _failure(entry.code, exc.message, params=exc.details)
+                        )
                     else:
                         result = {"success": True, "data": action_result.data}
                         if not action_result.replayed:
@@ -293,7 +322,17 @@ class HarnessCapabilityInvoker:
             self.db.commit()
             raise
         except Exception as exc:  # noqa: BLE001 - map provider failures to a stable tool result.
-            result = _failure("HARNESS_TOOL_ERROR", str(exc))
+            result = _failure(
+                "HARNESS_TOOL_ERROR",
+                str(exc),
+                request_id=call_id,
+                trace_id=self.run_id,
+                internal=InternalErrorContext(
+                    source="harness_capability",
+                    exception_type=type(exc).__name__,
+                    raw_message=str(exc),
+                ),
+            )
         # 将业务结果与调用记录一次提交；失败类型决定 Harness 是否释放重试声明。
         if result.get("success") is True:
             invocation.status = "completed"
@@ -648,11 +687,14 @@ class HarnessCapabilityInvoker:
                 "历史交付物不存在或无法安全读取。",
             )
         except HarnessExecutionError as exc:
+            entry = ERROR_REGISTRY.get(exc.error.code)
+            if entry is None:
+                return _failure(_INTERNAL_ERROR_CODE, "历史交付物读取失败。")
             return _failure(
-                exc.error.code,
+                entry.code,
                 exc.error.message,
                 retryable=exc.error.retryable,
-                details=dict(exc.error.details),
+                params=dict(exc.error.details),
             )
         finally:
             if opened is not None:
@@ -825,7 +867,6 @@ class HarnessCapabilityInvoker:
                 "operation": "read",
                 "requested_operation": requested_operation,
                 "phase": "instructions_loaded",
-                "message": "已加载技能说明，AgentLoop 将按说明选择 Harness 工具",
             },
         )
         return result
@@ -948,6 +989,9 @@ class HarnessCapabilityInvoker:
         event_type: str,
         payload: dict[str, Any],
     ) -> None:
+        """Emit a trace event, projecting general-Skill payloads to stable descriptors."""
+        if event_type == "general_skill_trace":
+            payload = canonical_general_skill_trace_payload(payload)
         if callable(self.trace_sink):
             self.trace_sink(event_type, payload)
 
@@ -1010,7 +1054,12 @@ class HarnessCapabilityInvoker:
                 authorized_knowledge_versions=authorized_versions,
             )
         except KnowledgeError as exc:
-            return _failure(exc.code, exc.message, **exc.details)
+            entry = ERROR_REGISTRY.get(exc.code)
+            return (
+                _failure(_INTERNAL_ERROR_CODE, "知识检索失败。")
+                if entry is None
+                else _failure(entry.code, exc.message, params=exc.details)
+            )
         payload = response.model_dump(mode="json")
         result = {
             "success": True,
@@ -1094,20 +1143,28 @@ class HarnessCapabilityInvoker:
                 schema=(tool.input_schema if isinstance(tool.input_schema, dict) else None),
             )
         except HarnessExecutionError as exc:
+            entry = ERROR_REGISTRY.get(exc.error.code)
+            if entry is None:
+                return _failure(_INTERNAL_ERROR_CODE, "工具结果引用解析失败。")
             return _failure(
-                exc.error.code,
+                entry.code,
                 exc.error.message,
                 retryable=exc.error.retryable,
-                details=dict(exc.error.details),
+                params=dict(exc.error.details),
             )
         result = ToolExecutor(self.db).execute(
             self.tenant_id,
-            ToolCall(name=source_tool_name, arguments=resolved_arguments),
+            ToolCall(
+                name=source_tool_name,
+                arguments=resolved_arguments,
+                language_context=self.language_context,
+            ),
             active_skill_id=self.active_skill_id,
             agent_id=self.agent_id,
             session_id=self.session.id,
             invocation_id=call_id,
             timeout_seconds_override=self._remaining_step_seconds(),
+            language_context=self.language_context,
         )
         payload = result.model_dump(mode="json")
         # MCP Apps payloads belong to the host UI, not to the isolated model
@@ -1418,13 +1475,67 @@ def _intersect_knowledge_metadata(
     }
 
 
-def _failure(code: str, message: str, **details: Any) -> dict[str, Any]:
-    error = {
-        "code": code,
-        "message": message,
-        "retryable": False,
-    }
-    error.update(details)
+def _failure(
+    code: str,
+    message: str,
+    *,
+    params: Mapping[str, Any] | None = None,
+    retryable: bool = False,
+    request_id: str | None = None,
+    trace_id: str | None = None,
+    internal: InternalErrorContext | None = None,
+    details: Mapping[str, Any] | None = None,
+    cause: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Project one Harness failure after exact registry validation and private-cause separation."""
+    # Compatibility workflow: accept the historical details alias as safe params, then
+    # validate the complete descriptor before choosing a public code.
+    safe_params = dict(params or {})
+    safe_params.update(details or {})
+    public_code = code
+    public_retryable = retryable
+    private_internal = internal
+    try:
+        entry = ERROR_REGISTRY.require(code)
+        if entry.visibility is not ErrorVisibility.PUBLIC:
+            raise ErrorContractViolation(f"non-public Harness error code: {code}")
+        descriptor = ErrorDescriptor(
+            code=code,
+            params=safe_params,
+            retryable=retryable,
+            request_id=request_id,
+            trace_id=trace_id,
+        )
+        ERROR_REGISTRY.validate(descriptor)
+    except (ErrorContractViolation, ValidationError):
+        # Unknown or drifted producer data is never allowed to reach a product sink;
+        # preserve the original code and prose only through a private diagnostic cause.
+        public_code = _INTERNAL_ERROR_CODE
+        safe_params = {}
+        public_retryable = ERROR_REGISTRY.require(public_code).retryable_default
+        if private_internal is None:
+            private_internal = InternalErrorContext(
+                source="harness_failure",
+                exception_type="ErrorContractViolation",
+                raw_message=message,
+                upstream_code=code,
+            )
+    if cause is not None and private_internal is None:
+        private_internal = InternalErrorContext(
+            source="harness_failure",
+            exception_type="HarnessFailureCause",
+            raw_message=str(cause.get("message") or message),
+            upstream_code=str(cause.get("code") or code),
+        )
+    error = HarnessExecutionError(
+        public_code,
+        message,
+        retryable=public_retryable,
+        details=safe_params,
+        request_id=request_id,
+        trace_id=trace_id,
+        internal=private_internal,
+    ).to_public_payload()
     return {
         "success": False,
         "error": error,
@@ -1570,6 +1681,38 @@ def _failure_was_not_sent(result: dict[str, Any]) -> bool:
         "KNOWLEDGE_IDEMPOTENCY_CONFLICT",
         "KNOWLEDGE_IDEMPOTENCY_REQUIRED",
     }
+
+
+def _invoker_language_context(
+    db: Any,
+    run_id: str,
+    session: ChatSession,
+    supplied: LanguageContext | dict[str, Any] | None,
+) -> LanguageContext:
+    """Resolve invoker locale from a supplied, durable run, or controlled legacy session snapshot."""
+    candidates: list[object] = [supplied]
+    if run_id:
+        run = db.get(HarnessRunRecord, run_id)
+        if run is not None:
+            candidates.append(run.language_context_json)
+    candidates.append(None)
+    for snapshot in candidates:
+        if snapshot is None:
+            continue
+        try:
+            return resolve_compatible_language_context(
+                snapshot=snapshot,
+                legacy_ui_locale=getattr(session, "ui_locale", None),
+                legacy_agent_reply_locale=getattr(session, "agent_reply_locale", None),
+            )
+        except (TypeError, ValueError):
+            continue
+    return resolve_language_context(
+        LanguageContextInputs(
+            user_ui_locale=getattr(session, "ui_locale", None),
+            session_agent_reply_locale=getattr(session, "agent_reply_locale", None),
+        )
+    )
 
 
 def _replayed_result(invocation: HarnessInvocationRecord) -> dict[str, Any]:

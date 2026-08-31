@@ -1,0 +1,109 @@
+{
+  "schema_version": 1,
+  "task": "T105",
+  "owner": "backend/teams + frontend-enterprise/TeamDetailPage",
+  "scope": "canonical team skip and failure events",
+  "catalogs": [
+    "en-US",
+    "zh-CN"
+  ],
+  "catalog_status": "pending-catalog-unlock",
+  "generated_contract": "frontend-enterprise/src/i18n/generated/backendContract.ts",
+  "entries": [
+    {
+      "id": "teamDetailPage.event.blackboardEntrySkipped",
+      "event_code": "team.blackboard.entry.skipped",
+      "kind": "event",
+      "sources": [
+        "backend/app/teams/service.py",
+        "frontend-enterprise/src/pages/TeamDetailPage.tsx"
+      ],
+      "en-US": "Skipped blackboard entry ({reason_code})",
+      "zh-CN": "跳过黑板条目（{reason_code}）",
+      "params": {
+        "reason_code": "string"
+      },
+      "icu": {
+        "params": [
+          "reason_code"
+        ],
+        "kinds": {
+          "reason_code": "string"
+        },
+        "structure": "named-arguments"
+      }
+    },
+    {
+      "id": "teamDetailPage.event.bidFailure",
+      "event_code": "team.task.bid.failed",
+      "kind": "event",
+      "sources": [
+        "backend/app/teams/wakeup.py",
+        "frontend-enterprise/src/pages/TeamDetailPage.tsx"
+      ],
+      "en-US": "Bid failed ({reason_code}, round {round, number})",
+      "zh-CN": "竞标失败（{reason_code}，第 {round, number} 轮）",
+      "params": {
+        "reason_code": "string",
+        "round": "integer"
+      },
+      "icu": {
+        "params": [
+          "reason_code",
+          "round"
+        ],
+        "kinds": {
+          "reason_code": "string",
+          "round": "integer"
+        },
+        "structure": "named-arguments"
+      }
+    },
+    {
+      "id": "teamDetailPage.event.reviewFailure",
+      "event_code": "team.task.review.failed",
+      "kind": "event",
+      "sources": [
+        "backend/app/teams/wakeup.py",
+        "frontend-enterprise/src/pages/TeamDetailPage.tsx"
+      ],
+      "en-US": "Review failed ({reason_code})",
+      "zh-CN": "验收失败（{reason_code}）",
+      "params": {
+        "reason_code": "string"
+      },
+      "icu": {
+        "params": [
+          "reason_code"
+        ],
+        "kinds": {
+          "reason_code": "string"
+        },
+        "structure": "named-arguments"
+      }
+    },
+    {
+      "id": "teamDetailPage.event.taskEscalation",
+      "event_code": "team.task.escalated",
+      "kind": "event",
+      "sources": [
+        "backend/app/teams/wakeup.py",
+        "frontend-enterprise/src/pages/TeamDetailPage.tsx"
+      ],
+      "en-US": "Task escalated ({reason_code})",
+      "zh-CN": "任务已升级（{reason_code}）",
+      "params": {
+        "reason_code": "string"
+      },
+      "icu": {
+        "params": [
+          "reason_code"
+        ],
+        "kinds": {
+          "reason_code": "string"
+        },
+        "structure": "named-arguments"
+      }
+    }
+  ]
+}

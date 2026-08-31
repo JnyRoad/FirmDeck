@@ -1,18 +1,22 @@
 import type { UnderlineTabItem } from '@/components/ui';
-import { formatClientDateTime, parseBackendDateTime } from '@/lib/timezone';
+import { createAppTranslator, type AppTranslator, type MessageId } from '@/i18n';
+import { getClientTimeZone, parseBackendDateTime } from '@/lib/timezone';
 import type { ScheduledTaskRead, ScheduledTaskRunRead } from '../../types';
 
 export const ENTERPRISE_AGENT_STORAGE_KEY = 'ultrarag_enterprise_agent_scope';
 export const TASK_PAGE_SIZE = 10;
 
-export const WEEKDAY_OPTIONS = [
-  { label: '周一', value: 0 },
-  { label: '周二', value: 1 },
-  { label: '周三', value: 2 },
-  { label: '周四', value: 3 },
-  { label: '周五', value: 4 },
-  { label: '周六', value: 5 },
-  { label: '周日', value: 6 },
+export type ScheduledTasksIntl = Pick<AppTranslator, 'locale' | 't'>;
+type ScheduledTasksMessageId = MessageId;
+
+const WEEKDAY_MESSAGE_IDS: readonly ScheduledTasksMessageId[] = [
+  'scheduledTasksPage.schedule.weekday.monday',
+  'scheduledTasksPage.schedule.weekday.tuesday',
+  'scheduledTasksPage.schedule.weekday.wednesday',
+  'scheduledTasksPage.schedule.weekday.thursday',
+  'scheduledTasksPage.schedule.weekday.friday',
+  'scheduledTasksPage.schedule.weekday.saturday',
+  'scheduledTasksPage.schedule.weekday.sunday',
 ];
 
 export type TaskFormValues = {
@@ -48,18 +52,55 @@ export const INITIAL_VALUES: TaskFormValues = {
 export type TaskListFilter = 'all' | 'pending' | 'completed' | 'paused';
 export type RunListFilter = 'all' | 'pending' | 'completed' | 'failed';
 
-export const TASK_FILTER_TABS: UnderlineTabItem<TaskListFilter>[] = [
-  { label: '全部', value: 'all' },
-  { label: '待完成', value: 'pending' },
-  { label: '已完成', value: 'completed' },
-  { label: '已暂停', value: 'paused' },
-];
-export const RUN_FILTER_TABS: UnderlineTabItem<RunListFilter>[] = [
-  { label: '全部', value: 'all' },
-  { label: '待完成', value: 'pending' },
-  { label: '已完成', value: 'completed' },
-  { label: '失败/跳过', value: 'failed' },
-];
+const TASK_FILTER_VALUES: readonly TaskListFilter[] = ['all', 'pending', 'completed', 'paused'];
+const RUN_FILTER_VALUES: readonly RunListFilter[] = ['all', 'pending', 'completed', 'failed'];
+const TASK_FILTER_MESSAGE_IDS: Record<TaskListFilter, ScheduledTasksMessageId> = {
+  all: 'scheduledTasksPage.filter.all',
+  pending: 'scheduledTasksPage.filter.pending',
+  completed: 'scheduledTasksPage.filter.completed',
+  paused: 'scheduledTasksPage.filter.paused',
+};
+const RUN_FILTER_MESSAGE_IDS: Record<RunListFilter, ScheduledTasksMessageId> = {
+  all: 'scheduledTasksPage.filter.all',
+  pending: 'scheduledTasksPage.filter.pending',
+  completed: 'scheduledTasksPage.filter.completed',
+  failed: 'scheduledTasksPage.filter.failed',
+};
+
+/** Create the explicit default translator for pure scheduled-task helpers. */
+function defaultScheduledTasksIntl(): ScheduledTasksIntl {
+  return createAppTranslator('zh-CN');
+}
+
+/** Build task filter tabs from the active UI locale; filter values remain stable protocol enums. */
+export function taskFilterTabs(
+  intl: ScheduledTasksIntl = defaultScheduledTasksIntl(),
+): UnderlineTabItem<TaskListFilter>[] {
+  return TASK_FILTER_VALUES.map((value) => ({
+    label: intl.t(TASK_FILTER_MESSAGE_IDS[value]),
+    value,
+  }));
+}
+
+/** Build execution filter tabs from the active UI locale; filter values remain stable protocol enums. */
+export function runFilterTabs(
+  intl: ScheduledTasksIntl = defaultScheduledTasksIntl(),
+): UnderlineTabItem<RunListFilter>[] {
+  return RUN_FILTER_VALUES.map((value) => ({
+    label: intl.t(RUN_FILTER_MESSAGE_IDS[value]),
+    value,
+  }));
+}
+
+/** Build weekday choices from the active UI locale without embedding translated labels in code. */
+export function weekdayOptions(
+  intl: ScheduledTasksIntl = defaultScheduledTasksIntl(),
+): { label: string; value: number }[] {
+  return WEEKDAY_MESSAGE_IDS.map((messageId, value) => ({
+    label: intl.t(messageId),
+    value,
+  }));
+}
 
 const TASK_FILTERS: Record<TaskListFilter, (row: ScheduledTaskRead) => boolean> = {
   all: () => true,
@@ -100,20 +141,41 @@ export const BADGE_TONE_CLASS: Record<BadgeTone, string> = {
   red: 'bg-[#fce7e7] text-[#d20b0b]',
   gray: 'bg-[#f2f3f7] text-[#858b9c]',
 };
-export const TASK_STATUS_BADGE: Record<string, { tone: BadgeTone; text: string }> = {
-  active: { tone: 'blue', text: '启用' },
-  paused: { tone: 'orange', text: '暂停' },
-  completed: { tone: 'green', text: '已完成' },
-  archived: { tone: 'gray', text: '已删除' },
+export const TASK_STATUS_BADGE: Record<string, { tone: BadgeTone; messageId: ScheduledTasksMessageId }> = {
+  active: { tone: 'blue', messageId: 'scheduledTasksPage.status.active' },
+  paused: { tone: 'orange', messageId: 'scheduledTasksPage.status.paused' },
+  completed: { tone: 'green', messageId: 'scheduledTasksPage.status.completed' },
+  archived: { tone: 'gray', messageId: 'scheduledTasksPage.status.archived' },
 };
-export const RUN_STATUS_BADGE: Record<string, { tone: BadgeTone; text: string }> = {
-  succeeded: { tone: 'green', text: '成功' },
-  failed: { tone: 'red', text: '失败' },
-  running: { tone: 'blue', text: '执行中' },
-  needs_input: { tone: 'orange', text: '待补充信息' },
-  incomplete: { tone: 'orange', text: '未完成' },
-  skipped: { tone: 'gray', text: '已跳过' },
+export const RUN_STATUS_BADGE: Record<string, { tone: BadgeTone; messageId: ScheduledTasksMessageId }> = {
+  succeeded: { tone: 'green', messageId: 'scheduledTasksPage.status.succeeded' },
+  failed: { tone: 'red', messageId: 'scheduledTasksPage.status.failed' },
+  running: { tone: 'blue', messageId: 'scheduledTasksPage.status.running' },
+  needs_input: { tone: 'orange', messageId: 'scheduledTasksPage.status.needsInput' },
+  incomplete: { tone: 'orange', messageId: 'scheduledTasksPage.status.incomplete' },
+  skipped: { tone: 'gray', messageId: 'scheduledTasksPage.status.skipped' },
 };
+
+/** Localize a task status badge while preserving unknown status codes for diagnostics. */
+export function taskStatusBadge(
+  status: string,
+  intl: ScheduledTasksIntl = defaultScheduledTasksIntl(),
+): { tone: BadgeTone; text: string } {
+  const preset = TASK_STATUS_BADGE[status] || TASK_STATUS_BADGE.archived;
+  return { tone: preset.tone, text: intl.t(preset.messageId) };
+}
+
+/** Localize a run status badge while preserving unknown provider status codes for diagnostics. */
+export function runStatusBadge(
+  status: string,
+  intl: ScheduledTasksIntl = defaultScheduledTasksIntl(),
+): { tone: BadgeTone; text: string } {
+  const preset = RUN_STATUS_BADGE[status];
+  return {
+    tone: preset?.tone || 'gray',
+    text: preset ? intl.t(preset.messageId) : status || intl.t('scheduledTasksPage.empty.none'),
+  };
+}
 
 const SCHEDULE_TYPES = new Set<TaskFormValues['schedule_type']>(['once', 'daily', 'weekly', 'monthly']);
 const SCHEDULE_BUILDERS: Record<
@@ -131,24 +193,6 @@ const SCHEDULE_BUILDERS: Record<
   }),
   daily: (values) => ({ time: values.time || '09:00' }),
 };
-const SCHEDULE_FORMATTERS: Record<
-  TaskFormValues['schedule_type'],
-  (row: ScheduledTaskRead, schedule: Record<string, unknown>) => string
-> = {
-  once: (row, schedule) => `一次性 · ${formatTime(String(schedule.run_at || row.next_run_at || ''))}`,
-  weekly: (_row, schedule) => {
-    const days = Array.isArray(schedule.weekdays)
-      ? schedule.weekdays
-          .map((item) => WEEKDAY_OPTIONS[Number(item)]?.label)
-          .filter(Boolean)
-          .join('、')
-      : '周一';
-    return `每周 ${days} ${schedule.time || '09:00'}`;
-  },
-  monthly: (_row, schedule) => `每月 ${schedule.day_of_month || 1} 号 ${schedule.time || '09:00'}`,
-  daily: (_row, schedule) => `每天 ${schedule.time || '09:00'}`,
-};
-
 export function buildSchedule(values: TaskFormValues): Record<string, unknown> {
   return SCHEDULE_BUILDERS[values.schedule_type](values);
 }
@@ -185,11 +229,53 @@ export function toDatetimeLocal(value: string): string {
   return local.toISOString().slice(0, 16);
 }
 
-export function formatSchedule(row: ScheduledTaskRead): string {
+/** Format a persisted schedule with locale-aware weekday lists and semantic message templates. */
+export function formatSchedule(
+  row: ScheduledTaskRead,
+  intl: ScheduledTasksIntl = defaultScheduledTasksIntl(),
+): string {
   const schedule = row.schedule || {};
-  return SCHEDULE_FORMATTERS[normalizeScheduleType(row.schedule_type)](row, schedule);
+  const scheduleType = normalizeScheduleType(row.schedule_type);
+  if (scheduleType === 'once') {
+    return intl.t('scheduledTasksPage.schedule.once', {
+      time: formatTime(String(schedule.run_at || row.next_run_at || ''), intl),
+    });
+  }
+  if (scheduleType === 'weekly') {
+    const days = Array.isArray(schedule.weekdays)
+      ? schedule.weekdays
+        .map((item) => Number(item))
+        .filter((item) => Number.isInteger(item) && item >= 0 && item < WEEKDAY_MESSAGE_IDS.length)
+        .map((item) => intl.t(WEEKDAY_MESSAGE_IDS[item]))
+      : [];
+    return intl.t('scheduledTasksPage.schedule.weekly', {
+      weekdays: new Intl.ListFormat(intl.locale, { type: 'conjunction' }).format(
+        days.length ? days : [intl.t(WEEKDAY_MESSAGE_IDS[0])],
+      ),
+      time: String(schedule.time || '09:00'),
+    });
+  }
+  if (scheduleType === 'monthly') {
+    return intl.t('scheduledTasksPage.schedule.monthly', {
+      day: Number(schedule.day_of_month || 1),
+      time: String(schedule.time || '09:00'),
+    });
+  }
+  return intl.t('scheduledTasksPage.schedule.daily', { time: String(schedule.time || '09:00') });
 }
 
-export function formatTime(value?: string): string {
-  return formatClientDateTime(value, '暂无');
+/** Format a backend timestamp using the active locale and browser timezone; invalid values use a catalog key. */
+export function formatTime(
+  value: string | undefined,
+  intl: ScheduledTasksIntl = defaultScheduledTasksIntl(),
+): string {
+  if (!value) return intl.t('scheduledTasksPage.empty.none');
+  const date = parseBackendDateTime(value);
+  if (Number.isNaN(date.getTime())) return intl.t('scheduledTasksPage.empty.none');
+  return new Intl.DateTimeFormat(intl.locale, {
+    dateStyle: 'medium',
+    timeStyle: 'short',
+    hour12: false,
+    timeZone: getClientTimeZone(),
+  }).format(date);
 }

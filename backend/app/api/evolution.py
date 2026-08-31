@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Query
 from sqlmodel import Session
 
+from app.contracts.http import build_http_exception
 from app.db import get_session
 from app.db.models import EvolutionProposal, User
 from app.evolution import EvolutionService
@@ -15,7 +16,6 @@ from app.evolution.schema import (
 from app.security.auth import get_current_user
 from app.security.permissions import ensure_agent_scope_manager
 from app.security.tenant import ensure_tenant
-
 
 router = APIRouter(prefix="/api/enterprise", tags=["enterprise:evolution"])
 
@@ -129,13 +129,7 @@ def _proposal(db: Session, tenant_id: str, proposal_id: str) -> EvolutionProposa
     ensure_tenant(db, tenant_id)
     row = db.get(EvolutionProposal, proposal_id)
     if not row or row.tenant_id != tenant_id:
-        raise HTTPException(
-            status_code=404,
-            detail={
-                "code": "EVOLUTION_PROPOSAL_NOT_FOUND",
-                "message": "未找到自进化候选",
-            },
-        )
+        raise build_http_exception("EVOLUTION_PROPOSAL_NOT_FOUND")
     return row
 
 

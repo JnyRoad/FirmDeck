@@ -8,14 +8,14 @@ from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine
 
 from app.db.models import ModelConfig
+from app.llm.client import _normalize_extra_body
 from app.llm.model_config_resolver import (
     resolve_model_config_for_runtime,
     resolve_model_config_for_verification,
 )
-from app.llm.client import _normalize_extra_body
 from app.llm.model_protocols import (
-    ModelAuthMode,
     ModelApiProtocol,
+    ModelAuthMode,
     available_model_protocols,
     model_config_fingerprint,
     normalize_chat_protocol_options,
@@ -58,7 +58,7 @@ def test_protocol_boundary_accepts_only_chat_compatibility() -> None:
     )
     with pytest.raises(HTTPException) as exc_info:
         resolve_api_protocol(None, "anthropic")
-    assert exc_info.value.detail == "MODEL_PROVIDER_UNSUPPORTED"
+    assert exc_info.value.detail["code"] == "MODEL_PROVIDER_UNSUPPORTED"
 
 
 def test_chat_thinking_options_are_strictly_typed() -> None:
@@ -67,7 +67,7 @@ def test_chat_thinking_options_are_strictly_typed() -> None:
     ) == {"thinking": {"type": "disabled", "clear_thinking": True}}
     with pytest.raises(HTTPException) as exc_info:
         normalize_chat_protocol_options({"thinking": {"type": "disabled", "vendor": 1}})
-    assert exc_info.value.detail == "MODEL_PROTOCOL_OPTIONS_INVALID"
+    assert exc_info.value.detail["code"] == "MODEL_PROTOCOL_OPTIONS_INVALID"
 
 
 def test_fingerprint_normalizes_equivalent_base_urls() -> None:
@@ -151,7 +151,7 @@ def test_runtime_resolver_rejects_unverified_but_verification_resolver_allows_it
 
         with pytest.raises(HTTPException) as exc_info:
             resolve_model_config_for_runtime(db, "tenant_a", "model_a")
-        assert exc_info.value.detail == "MODEL_CONFIG_DISABLED"
+        assert exc_info.value.detail["code"] == "MODEL_CONFIG_DISABLED"
 
         resolved = resolve_model_config_for_verification(
             db, "tenant_a", "model_a", "attempt_a"
@@ -166,7 +166,7 @@ def test_verified_runtime_requires_matching_fingerprint() -> None:
 
         with pytest.raises(HTTPException) as exc_info:
             resolve_model_config_for_runtime(db, "tenant_a", "model_a")
-        assert exc_info.value.detail == "MODEL_CONFIG_VERIFICATION_REQUIRED"
+        assert exc_info.value.detail["code"] == "MODEL_CONFIG_VERIFICATION_REQUIRED"
 
 
 def test_all_implemented_protocols_are_available() -> None:

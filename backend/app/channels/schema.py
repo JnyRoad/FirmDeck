@@ -1,10 +1,13 @@
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional
 
 from pydantic import BaseModel
 from sqlmodel import Session, select
 
+from app.contracts.error_registry import ERROR_REGISTRY
+from app.contracts.errors import ErrorDescriptor, ErrorOccurrence, InternalErrorContext
+from app.contracts.projections import project_public_error
 from app.db.models import ChannelBinding, ChannelDelivery, Team, User
 
 
@@ -172,6 +175,8 @@ class ChannelDeliveryRead(BaseModel):
     status: str
     attempts: int
     last_error: Optional[str] = None
+    error: dict[str, Any] | None = None
+    language_context: dict[str, Any] | None = None
     delivered_at: Optional[str] = None
     created_at: str
 
@@ -357,7 +362,46 @@ def channel_binding_read(
     )
 
 
+def _channel_delivery_error_code(raw_error: str | None) -> str | None:
+    """Map private delivery failures to the closest registered public channel code."""
+    error = str(raw_error or "").strip()
+    if not error:
+        return None
+    if error in {"渠道绑定不存在或已停用", "binding_missing_or_inactive", "binding_deleted"}:
+        return "CHANNEL_NOT_FOUND"
+    if error in {"渠道会话与绑定账号不一致", "reaction 事件边界无效"}:
+        return "CHANNEL_CONFLICT"
+    if error in {"reaction 渠道无效", "delivery_target_missing"}:
+        return "CHANNEL_BAD_REQUEST"
+    if error == "remote_state_unknown":
+        return "CHANNEL_UPSTREAM_ERROR"
+    return "CHANNEL_UPSTREAM_ERROR"
+
+
+def _channel_delivery_public_error(delivery: ChannelDelivery) -> dict[str, Any] | None:
+    """Project one delivery failure to a safe public descriptor while keeping raw cause private."""
+    code = _channel_delivery_error_code(delivery.last_error)
+    if code is None:
+        return None
+    entry = ERROR_REGISTRY.get(code) or ERROR_REGISTRY.require("INTERNAL_ERROR")
+    occurrence = ErrorOccurrence(
+        descriptor=ErrorDescriptor(
+            code=entry.code,
+            params={},
+            retryable=entry.retryable_default if delivery.status == "pending" else False,
+        ),
+        internal=InternalErrorContext(
+            source="channels.delivery",
+            raw_message=str(delivery.last_error or "")[:500] or None,
+            upstream_code=code,
+        ),
+    )
+    return project_public_error(occurrence, ERROR_REGISTRY)
+
+
 def channel_delivery_read(delivery: ChannelDelivery) -> ChannelDeliveryRead:
+    """Project one delivery row without exposing provider/raw failure text to public APIs."""
+    public_error = _channel_delivery_public_error(delivery)
     return ChannelDeliveryRead(
         id=delivery.id,
         binding_id=delivery.binding_id,
@@ -367,7 +411,9 @@ def channel_delivery_read(delivery: ChannelDelivery) -> ChannelDeliveryRead:
         text=delivery.text,
         status=delivery.status,
         attempts=delivery.attempts,
-        last_error=delivery.last_error,
+        last_error=public_error["code"] if public_error else None,
+        error=public_error,
+        language_context=delivery.language_context_json,
         delivered_at=delivery.delivered_at.isoformat() if delivery.delivered_at else None,
         created_at=delivery.created_at.isoformat(),
     )

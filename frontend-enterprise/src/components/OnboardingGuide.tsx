@@ -8,6 +8,8 @@ import {
   XIcon,
 } from "lucide-react";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
+import { useAppIntl } from "@/i18n/useAppIntl";
+import type { MessageId } from "@/i18n/types";
 import galleryImage from "@/assets/onboarding-gallery.png";
 import profileImage from "@/assets/onboarding-profile.png";
 
@@ -19,15 +21,15 @@ export const OPEN_QUICK_START_EVENT = "staffdeck-open-quick-start";
 
 type GuideCard = {
   icon: ReactNode;
-  title: string;
-  description: string;
+  titleId: MessageId;
+  descriptionId: MessageId;
 };
 
 type GuideStep = {
   image: string;
-  eyebrow: string;
-  titleLines: string[];
-  description: string;
+  eyebrowId: MessageId;
+  titleLineIds: MessageId[];
+  descriptionId: MessageId;
   cards: GuideCard[];
 };
 
@@ -38,54 +40,54 @@ const CARD_BADGE_CLASS =
 const STEPS: GuideStep[] = [
   {
     image: galleryImage,
-    eyebrow: "欢迎使用 StaffDeck",
-    titleLines: ["数字员工", "全流程构建与管理平台"],
-    description:
-      "像招聘、培养、管理真人员工一样，构建你的数字员工团队。把重复的事情交给数字员工，让自己专注更重要的工作。",
+    eyebrowId: "onboarding.welcome.eyebrow",
+    titleLineIds: ["onboarding.welcome.titlePrimary", "onboarding.welcome.titleSecondary"],
+    descriptionId: "onboarding.welcome.description",
     cards: [
       {
         icon: <IdCard className={CARD_ICON_CLASS} />,
-        title: "像管员工一样管AI",
-        description: "每位数字员工都有档案、岗位与成长记录。",
+        titleId: "onboarding.welcome.card.manage.title",
+        descriptionId: "onboarding.welcome.card.manage.description",
       },
       {
         icon: <Workflow className={CARD_ICON_CLASS} />,
-        title: "按流程执行任务",
-        description: "每位数字员工都有档案、岗位与成长记录。",
+        titleId: "onboarding.welcome.card.process.title",
+        descriptionId: "onboarding.welcome.card.process.description",
       },
       {
         icon: <Brain className={CARD_ICON_CLASS} />,
-        title: "理解业务而非检索",
-        description: "每位数字员工都有档案、岗位与成长记录。",
+        titleId: "onboarding.welcome.card.business.title",
+        descriptionId: "onboarding.welcome.card.business.description",
       },
     ],
   },
   {
     image: profileImage,
-    eyebrow: "核心概念",
-    titleLines: ["三步搭建你的数字员工"],
-    description: "先给它配大脑，再给它配能力，最后上岗对话。",
+    eyebrowId: "onboarding.concepts.eyebrow",
+    titleLineIds: ["onboarding.concepts.title"],
+    descriptionId: "onboarding.concepts.description",
     cards: [
       {
         icon: <span className={CARD_BADGE_CLASS}>01</span>,
-        title: "模型",
-        description: "数字员工的大脑，接入 OpenAI 兼容模型即可。",
+        titleId: "onboarding.concepts.card.model.title",
+        descriptionId: "onboarding.concepts.card.model.description",
       },
       {
         icon: <span className={CARD_BADGE_CLASS}>02</span>,
-        title: "能力",
-        description: "知识库、技能、SOP、工具，决定它懂什么、会做什么。",
+        titleId: "onboarding.concepts.card.capability.title",
+        descriptionId: "onboarding.concepts.card.capability.description",
       },
       {
         icon: <span className={CARD_BADGE_CLASS}>03</span>,
-        title: "上岗",
-        description: "创建数字员工并绑定能力，去对话端与它协作。",
+        titleId: "onboarding.concepts.card.deploy.title",
+        descriptionId: "onboarding.concepts.card.deploy.description",
       },
     ],
   },
 ];
 
 export default function OnboardingGuide() {
+  const { t } = useAppIntl();
   const [open, setOpen] = useState(false);
   const [step, setStep] = useState(0);
 
@@ -106,16 +108,19 @@ export default function OnboardingGuide() {
     return () => window.removeEventListener(OPEN_ONBOARDING_EVENT, reopen);
   }, []);
 
+  /** 记录欢迎引导已完成，并接续打开快速开始引导。 */
   function finish() {
     window.localStorage.setItem(ONBOARDING_SEEN_KEY, "1");
     setOpen(false);
     window.dispatchEvent(new Event(OPEN_QUICK_START_EVENT));
   }
 
+  /** 返回上一个欢迎引导步骤。 */
   function goPrev() {
     setStep((prev) => Math.max(0, prev - 1));
   }
 
+  /** 进入下一个步骤，末页时完成引导。 */
   function goNext() {
     if (step >= STEPS.length - 1) {
       finish();
@@ -124,6 +129,7 @@ export default function OnboardingGuide() {
     }
   }
 
+  /** 将 Dialog 的关闭交互映射为引导完成。 */
   function handleOpenChange(next: boolean) {
     if (!next) finish();
     else setOpen(true);
@@ -140,7 +146,7 @@ export default function OnboardingGuide() {
         className="grid w-[904px] max-w-[calc(100vw-2rem)] grid-cols-1 gap-0 overflow-hidden rounded-[20px] border-0 p-0 ring-0 md:grid-cols-[474px_430px] sm:max-w-[904px]"
       >
         <DialogTitle className="sr-only">
-          {current.titleLines.join("")}
+          {current.titleLineIds.map((id) => t(id)).join("")}
         </DialogTitle>
 
         <div className="hidden h-[560px] bg-[#e9eef6] md:block">
@@ -157,7 +163,7 @@ export default function OnboardingGuide() {
             <button
               type="button"
               onClick={finish}
-              aria-label="关闭引导"
+              aria-label={t("onboarding.action.close")}
               className="flex size-[20px] items-center justify-center text-[#757f9c] transition-colors hover:text-[#18181a]"
             >
               <XIcon className="size-[14px]" />
@@ -167,27 +173,27 @@ export default function OnboardingGuide() {
           <div className="flex flex-col gap-[24px]">
             <div className="flex flex-col gap-[4px]">
               <span className="-skew-x-6 text-[12px] leading-none text-[#464c5e]">
-                {current.eyebrow}
+                {t(current.eyebrowId)}
               </span>
               <div className="-skew-x-6">
-                {current.titleLines.map((line) => (
+                {current.titleLineIds.map((lineId) => (
                   <p
-                    key={line}
+                    key={lineId}
                     className="bg-linear-to-r from-[#105acf] to-[#007bff] bg-clip-text text-[32px] leading-[44px] font-semibold text-transparent"
                   >
-                    {line}
+                    {t(lineId)}
                   </p>
                 ))}
               </div>
               <p className="text-[12px] leading-[20px] text-[#757f9c]">
-                {current.description}
+                {t(current.descriptionId)}
               </p>
             </div>
 
             <div className="flex flex-col gap-[12px]">
               {current.cards.map((card) => (
                 <div
-                  key={card.title}
+                  key={card.titleId}
                   className="flex items-center gap-[8px] rounded-[14px] bg-white/60 px-[12px] py-[10px]"
                 >
                   <div className="flex size-[32px] shrink-0 items-center justify-center rounded-[8px] bg-linear-to-br from-[#89b6ff] to-[#527aff]">
@@ -195,10 +201,10 @@ export default function OnboardingGuide() {
                   </div>
                   <div className="flex min-w-0 flex-col gap-[4px]">
                     <p className="truncate text-[14px] leading-none text-[#464c5e]">
-                      {card.title}
+                      {t(card.titleId)}
                     </p>
                     <p className="truncate text-[12px] leading-none text-[#757f9c]">
-                      {card.description}
+                      {t(card.descriptionId)}
                     </p>
                   </div>
                 </div>
@@ -212,7 +218,7 @@ export default function OnboardingGuide() {
                 type="button"
                 onClick={goPrev}
                 disabled={isFirst}
-                aria-label="上一步"
+                aria-label={t("onboarding.action.previous")}
                 className="flex size-[14px] items-center justify-center transition-colors enabled:hover:text-[#18181a] disabled:cursor-default disabled:opacity-40"
               >
                 <ChevronLeft className="size-[14px]" />
@@ -224,7 +230,7 @@ export default function OnboardingGuide() {
                 type="button"
                 onClick={goNext}
                 disabled={isLast}
-                aria-label="下一步"
+                aria-label={t("onboarding.action.next")}
                 className="flex size-[14px] items-center justify-center transition-colors enabled:hover:text-[#18181a] disabled:cursor-default disabled:opacity-40"
               >
                 <ChevronRight className="size-[14px]" />
@@ -237,14 +243,14 @@ export default function OnboardingGuide() {
                 onClick={finish}
                 className="flex w-[80px] items-center justify-center rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[20px] py-[8px] text-[14px] text-[#757f9c] transition-colors hover:bg-[#f6f6f6] hover:text-[#18181a]"
               >
-                跳过
+                {t("onboarding.action.skip")}
               </button>
               <button
                 type="button"
                 onClick={goNext}
                 className="flex w-[134px] items-center justify-center rounded-[10px] bg-[#18181a] px-[32px] py-[8px] text-[14px] text-white transition-colors hover:bg-[#303030]"
               >
-                {isLast ? "开始使用" : "下一步"}
+                {isLast ? t("onboarding.action.start") : t("onboarding.action.next")}
               </button>
             </div>
           </div>

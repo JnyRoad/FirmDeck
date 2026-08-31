@@ -789,7 +789,7 @@ def test_private_tool_edit_does_not_mutate_open_gallery_tool() -> None:
                 current_user=owner,
             )
         assert rename_error.value.status_code == 400
-        assert rename_error.value.detail == "Tool name cannot be modified"
+        assert rename_error.value.detail["code"] == "TOOL_BAD_REQUEST"
 
 
 def test_tool_name_cannot_be_modified_after_create() -> None:
@@ -831,7 +831,7 @@ def test_tool_name_cannot_be_modified_after_create() -> None:
             )
 
         assert exc_info.value.status_code == 400
-        assert exc_info.value.detail == "Tool name cannot be modified"
+        assert exc_info.value.detail["code"] == "TOOL_BAD_REQUEST"
 
 
 def test_private_general_skill_edit_does_not_mutate_open_gallery_skill() -> None:
@@ -914,7 +914,7 @@ def test_private_general_skill_edit_does_not_mutate_open_gallery_skill() -> None
                 current_user=owner,
             )
         assert rename_error.value.status_code == 400
-        assert rename_error.value.detail == "General skill slug cannot be modified"
+        assert rename_error.value.detail["code"] == "GENERAL_SKILL_SLUG_IMMUTABLE"
 
 
 def test_copy_agent_deep_copies_private_general_skill_package() -> None:

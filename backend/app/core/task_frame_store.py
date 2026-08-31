@@ -6,6 +6,11 @@ from typing import Any
 from sqlalchemy import update
 from sqlmodel import Session, select
 
+from app.contracts.error_registry import ERROR_REGISTRY
+from app.contracts.projections import (
+    project_public_error_payload,
+    project_public_result_payload,
+)
 from app.core.harness_session_cleanup import harness_storage_root
 from app.db.models import (
     ChatSession,
@@ -16,6 +21,7 @@ from app.db.models import (
     new_id,
     utc_now,
 )
+from app.i18n.language_context import LanguageContext
 from app.session.session_schema import PlannedTaskFrame, TurnPlan
 
 TERMINAL_FRAME_STATUSES = {"completed", "cancelled", "failed"}
@@ -26,6 +32,21 @@ DEPENDENCY_WAITING_ERROR_CODES = {
 HARNESS_CONTEXT_KEY = "harness_v2"
 FRAME_LEASE_SECONDS = 900
 MAX_TASK_FRAMES_PER_TURN = 8
+
+
+def _language_snapshot(
+    supplied: LanguageContext | dict[str, Any] | None,
+    existing: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Bind one immutable Harness locale snapshot and reject later mutation."""
+    if supplied is None:
+        return dict(existing) if isinstance(existing, dict) else None
+    snapshot = LanguageContext.model_validate(supplied).model_dump(mode="json")
+    if existing is not None:
+        durable = LanguageContext.model_validate(existing).model_dump(mode="json")
+        if durable != snapshot:
+            raise ValueError("Harness language context conflicts with the durable snapshot")
+    return snapshot
 
 
 class TaskFrameClaimConflict(RuntimeError):
@@ -137,6 +158,8 @@ class TaskFrameStore:
         session: ChatSession,
         source_turn_id: str,
         plan: TurnPlan,
+        *,
+        language_context: LanguageContext | dict[str, Any] | None = None,
     ) -> list[HarnessTaskFrameRecord]:
         """Persist a bounded plan while retaining every TaskFrame's first effective workspace root.
 
@@ -191,6 +214,10 @@ class TaskFrameStore:
                         f"TaskFrame {row.task_id} is already running."
                     )
             row.source_turn_id = source_turn_id
+            row.language_context_json = _language_snapshot(
+                language_context,
+                row.language_context_json,
+            )
             if created:
                 row.kind = frame.kind
             row.decision = frame.decision
@@ -377,8 +404,22 @@ class TaskFrameStore:
         lease_owner: str | None = None,
         attempt_no: int | None = None,
     ) -> None:
-        error = result.get("error")
-        error_json = dict(error) if isinstance(error, dict) else {}
+        """Persist a fenced TaskFrame completion with canonical nested error metadata."""
+        projected_result = project_public_result_payload(
+            result,
+            ERROR_REGISTRY,
+            source="harness-task-frame-persisted",
+        )
+        projected_error = projected_result.get("error")
+        error_json = (
+            project_public_error_payload(
+                projected_error,
+                ERROR_REGISTRY,
+                source="harness-task-frame-error-persisted",
+            )
+            if projected_error not in (None, {})
+            else {}
+        )
         should_fence = lease_owner is not None or row.status == "running"
         if should_fence:
             expected_owner = lease_owner or row.lease_owner
@@ -405,7 +446,7 @@ class TaskFrameStore:
                     status=status,
                     step_id=step_id,
                     slots_json=dict(slots),
-                    result_json=dict(result),
+                    result_json=projected_result,
                     error_json=error_json,
                     updated_at=now,
                     lease_owner=None,
@@ -426,7 +467,7 @@ class TaskFrameStore:
         row.status = status
         row.step_id = step_id
         row.slots_json = dict(slots)
-        row.result_json = result
+        row.result_json = projected_result
         row.error_json = error_json
         row.updated_at = utc_now()
         row.lease_owner = None
@@ -442,7 +483,9 @@ class TaskFrameStore:
         capability_snapshot: dict[str, Any],
         lease_owner: str | None = None,
         attempt_no: int | None = None,
+        language_context: LanguageContext | dict[str, Any] | None = None,
     ) -> HarnessRunRecord:
+        """Start one Harness attempt with the TaskFrame's immutable locale snapshot."""
         expected_owner = lease_owner or row.lease_owner
         expected_attempt = (
             int(attempt_no)
@@ -462,6 +505,10 @@ class TaskFrameStore:
             lease_expires_at=row.lease_expires_at,
             task_requirement_json=requirement,
             capability_snapshot_json=capability_snapshot,
+            language_context_json=_language_snapshot(
+                language_context,
+                row.language_context_json,
+            ),
         )
         self.db.add(run)
         self.db.flush()
@@ -491,6 +538,12 @@ class TaskFrameStore:
         lease_owner: str | None = None,
         attempt_no: int | None = None,
     ) -> None:
+        """Persist a fenced Harness attempt with canonical nested error metadata."""
+        projected_result = project_public_result_payload(
+            result,
+            ERROR_REGISTRY,
+            source="harness-run-persisted",
+        )
         expected_owner = lease_owner or run.lease_owner
         expected_attempt = (
             int(attempt_no)
@@ -514,7 +567,7 @@ class TaskFrameStore:
             .values(
                 status=status,
                 action_count=max(0, int(action_count)),
-                result_json=dict(result),
+                result_json=projected_result,
                 finished_at=now,
                 lease_owner=None,
                 lease_expires_at=None,

@@ -14,6 +14,7 @@ import {
 } from 'lucide-react';
 
 import { api, ApiError } from '@/api/client';
+import { useAppIntl } from '@/i18n';
 import {
   Dialog,
   DialogContent,
@@ -29,7 +30,12 @@ import {
 } from '@/components/ui';
 import { Button as UIButton } from '@/components/ui/button';
 import type { CodexSubscriptionAccountRead, ModelConfigRead } from '@/types';
-import { modelActionError, providerErrorFromApiError, modelProviderErrorMessage } from '../ModelsPage';
+import {
+  modelActionError,
+  providerErrorFromApiError,
+  modelProviderErrorMessage,
+  subscriptionAccountMessage,
+} from '../ModelsPage';
 import {
   CHANNEL_PRESETS,
   CONFIG_NAME_MAX_LENGTH,
@@ -70,13 +76,6 @@ const BLANK_CUSTOM_FORM: CustomFormValues = {
 };
 const BLANK_SUBSCRIPTION_FORM = { model: '' };
 
-const PROTOCOL_LABELS: Record<ApiKeyProtocol, string> = {
-  openai_chat_completions: 'OpenAI 兼容（Chat Completions）',
-  openai_responses: 'OpenAI 兼容（Responses）',
-  anthropic_messages: 'Anthropic Messages',
-  gemini_generate_content: 'Gemini Generate Content',
-};
-
 type ModelsFetchState = {
   status: 'idle' | 'loading' | 'success' | 'empty' | 'error';
   options: ModelComboboxOption[];
@@ -91,6 +90,32 @@ function channelIcon(preset: ChannelPreset) {
 }
 
 /** 引导管理员在调用方租户内配置模型，并只接受当前请求代次的异步结果。 */
+/** 返回渠道的语义展示名；vendor 固定品牌名保留原样，内建渠道改用 message id。 */
+function channelLabel(preset: ChannelPreset, t: ReturnType<typeof useAppIntl>['t']): string {
+  if (preset.id === 'chatgpt_subscription') return t('modelSetup.channel.chatgptSubscription');
+  if (preset.id === 'custom') return t('modelSetup.channel.custom');
+  return preset.name;
+}
+
+/** 返回渠道描述文案；静态目录只保存 message id，不保存自然语言描述。 */
+function channelDescription(preset: ChannelPreset, t: ReturnType<typeof useAppIntl>['t']): string {
+  return t(preset.descriptionMessageId);
+}
+
+/** 将 API 协议映射为语义名称，避免在多个页面复制协议标签字面量。 */
+function protocolLabel(protocol: ApiKeyProtocol, t: ReturnType<typeof useAppIntl>['t']): string {
+  switch (protocol) {
+    case 'openai_chat_completions':
+      return t('chat.modelSetup.protocol.openaiChat');
+    case 'openai_responses':
+      return t('chat.modelSetup.protocol.openaiResponses');
+    case 'anthropic_messages':
+      return t('chat.modelSetup.protocol.anthropicMessages');
+    default:
+      return t('chat.modelSetup.protocol.gemini');
+  }
+}
+
 export default function ModelSetupWizard({
   open,
   tenantId,
@@ -104,6 +129,7 @@ export default function ModelSetupWizard({
   onRequestSubscriptionLogout,
   requireVerified = false,
 }: ModelSetupWizardProps) {
+  const { t } = useAppIntl();
   const [step, setStep] = useState<Step>(1);
   const [selectedChannelId, setSelectedChannelId] = useState<string | null>(null);
   const [search, setSearch] = useState('');
@@ -144,9 +170,9 @@ export default function ModelSetupWizard({
     const keyword = search.trim().toLowerCase();
     if (!keyword) return CHANNEL_PRESETS;
     return CHANNEL_PRESETS.filter((preset) =>
-      preset.name.toLowerCase().includes(keyword) || preset.description.toLowerCase().includes(keyword),
+      channelLabel(preset, t).toLowerCase().includes(keyword) || channelDescription(preset, t).toLowerCase().includes(keyword),
     );
-  }, [search]);
+  }, [search, t]);
 
   /** 清空模型列表并让所有尚未完成的列表请求失效。 */
   function resetModelListRequests() {
@@ -356,7 +382,8 @@ export default function ModelSetupWizard({
   function suggestedName(): string {
     if (!selectedChannel || !currentFormValues) return '';
     const model = currentFormValues.model;
-    const name = model ? `${selectedChannel.name} · ${model}` : selectedChannel.name;
+    const baseName = channelLabel(selectedChannel, t);
+    const name = model ? `${baseName} · ${model}` : baseName;
     return name.slice(0, CONFIG_NAME_MAX_LENGTH);
   }
 
@@ -403,7 +430,9 @@ export default function ModelSetupWizard({
     } catch (error) {
       const providerError = error instanceof ApiError ? providerErrorFromApiError(error) : null;
       setSaveErrorMessage(
-        providerError ? modelProviderErrorMessage(providerError, '保存失败') : modelActionError(error, '保存失败'),
+        providerError
+          ? modelProviderErrorMessage(providerError, t('modelSetup.toast.saveFailed'))
+          : modelActionError(error, t('modelSetup.toast.saveFailed')),
       );
       setSaveResult('error');
     } finally {
@@ -427,7 +456,9 @@ export default function ModelSetupWizard({
     } catch (error) {
       const providerError = error instanceof ApiError ? providerErrorFromApiError(error) : null;
       setSaveErrorMessage(
-        providerError ? modelProviderErrorMessage(providerError, '测试失败') : modelActionError(error, '测试失败'),
+        providerError
+          ? modelProviderErrorMessage(providerError, t('modelSetup.toast.testFailed'))
+          : modelActionError(error, t('modelSetup.toast.testFailed')),
       );
       setSaveResult('error');
     } finally {
@@ -435,7 +466,7 @@ export default function ModelSetupWizard({
     }
   }
 
-  const step1Summary = selectedChannel?.name;
+  const step1Summary = selectedChannel ? channelLabel(selectedChannel, t) : undefined;
 
   return (
     <Dialog open={open} onOpenChange={(next) => !next && handleClose()}>
@@ -444,21 +475,21 @@ export default function ModelSetupWizard({
         showCloseButton={false}
         className="flex h-[720px] max-h-[calc(100dvh-4rem)] w-[calc(100%-2rem)] flex-col overflow-hidden rounded-[14px] p-0 sm:max-w-[860px]"
       >
-        <DialogTitle className="sr-only">新建模型</DialogTitle>
+        <DialogTitle className="sr-only">{t('modelSetup.title')}</DialogTitle>
         <div className="flex min-h-0 flex-1">
           <nav className="flex w-[220px] shrink-0 flex-col gap-[4px] border-r border-[#f0f1f4] bg-[#fafbfc] p-[20px_14px]">
-            <span className="px-[10px] pb-[14px] text-[12px] font-semibold text-[#858b9c]">新建模型</span>
-            <SidebarStep index={1} label="选择渠道" current={step} summary={step1Summary} onJump={setStep} />
+            <span className="px-[10px] pb-[14px] text-[12px] font-semibold text-[#858b9c]">{t('modelSetup.title')}</span>
+            <SidebarStep index={1} label={t('modelSetup.steps.select')} current={step} summary={step1Summary} onJump={setStep} />
             <SidebarConnector />
-            <SidebarStep index={2} label="填写凭证并保存" current={step} onJump={setStep} />
+            <SidebarStep index={2} label={t('modelSetup.steps.credentials')} current={step} onJump={setStep} />
           </nav>
 
           <div className="flex min-w-0 flex-1 flex-col">
             <div className="flex items-start justify-between gap-[10px] px-[24px] pt-[18px]">
-              <StepHeader step={step} selectedChannel={selectedChannel} />
+              <StepHeader step={step} selectedChannel={selectedChannel} t={t} />
               <button
                 type="button"
-                aria-label="关闭"
+                aria-label={t('modelSetup.actions.close')}
                 onClick={handleClose}
                 className="grid size-[28px] shrink-0 place-items-center rounded-[8px] text-[#858b9c] outline-none hover:text-[#18181a]"
               >
@@ -474,19 +505,21 @@ export default function ModelSetupWizard({
                     <input
                       value={search}
                       onChange={(event) => setSearch(event.target.value)}
-                      placeholder="搜索厂商或渠道，例如 OpenAI"
+                      placeholder={t('modelSetup.search.placeholder')}
                       className="min-w-0 flex-1 border-none text-[13px] text-[#18181a] outline-none"
                     />
                   </label>
 
                   <div className="min-h-0 flex-1 overflow-y-auto rounded-[12px] border border-[#e3e7f1]">
                     {filteredPresets.length === 0 ? (
-                      <p className="p-[24px] text-center text-[13px] text-[#858b9c]">未找到匹配的渠道</p>
+                      <p className="p-[24px] text-center text-[13px] text-[#858b9c]">{t('modelSetup.emptySearch')}</p>
                     ) : (
                       filteredPresets.map((preset) => (
                         <ChannelRow
                           key={preset.id}
                           preset={preset}
+                          label={channelLabel(preset, t)}
+                          description={channelDescription(preset, t)}
                           selected={preset.id === selectedChannelId}
                           onSelect={() => selectChannel(preset)}
                         />
@@ -497,7 +530,7 @@ export default function ModelSetupWizard({
               )}
 
               {step === 2 && selectedChannel && (
-                <LabeledField label="配置名称">
+                <LabeledField label={t('chat.modelSetup.name')}>
                   <Input
                     value={configName}
                     maxLength={CONFIG_NAME_MAX_LENGTH}
@@ -508,7 +541,7 @@ export default function ModelSetupWizard({
                   />
                   {configName.length >= CONFIG_NAME_MAX_LENGTH && (
                     <p className="text-[11px] text-[#b42318]">
-                      配置名称最长 {CONFIG_NAME_MAX_LENGTH} 个字符，已达到上限。
+                      {t('modelSetup.validation.nameLength', { count: CONFIG_NAME_MAX_LENGTH })}
                     </p>
                   )}
                 </LabeledField>
@@ -516,28 +549,28 @@ export default function ModelSetupWizard({
 
               {step === 2 && selectedChannel?.category === 'vendor' && (
                 <div className="mt-[16px] flex flex-col gap-[16px]">
-                  <LabeledField label="API Key">
+                  <LabeledField label={t('chat.modelSetup.apiKey')}>
                     <Input
                       type="password"
                       value={vendorForm.apiKey}
-                      placeholder="sk-..."
+                      placeholder={t('modelSetup.field.apiKeyPlaceholder')}
                       onChange={(event) => setVendorForm((prev) => ({ ...prev, apiKey: event.target.value }))}
                       onBlur={() => void fetchVendorModelsNow(selectedChannel, vendorForm.apiKey)}
                     />
                   </LabeledField>
-                  <LabeledField label="模型">
+                  <LabeledField label={t('modelSetup.field.modelLabel')}>
                     <ModelCombobox
                       value={vendorForm.model}
                       onChange={(value) => setVendorForm((prev) => ({ ...prev, model: value }))}
                       options={vendorModelsState.status === 'success' ? vendorModelsState.options : []}
                       loading={vendorModelsState.status === 'loading'}
-                      placeholder="选择或输入模型"
+                      placeholder={t('modelSetup.field.modelPlaceholder')}
                     />
                     {vendorModelsState.status === 'success' && (
-                      <p className="text-[11px] text-[#247447]">已自动获取到 {vendorModelsState.options.length} 个模型，也可以直接输入。</p>
+                      <p className="text-[11px] text-[#247447]">{t('modelSetup.vendor.modelsFetched', { count: vendorModelsState.options.length })}</p>
                     )}
                     {(vendorModelsState.status === 'empty' || vendorModelsState.status === 'error') && (
-                      <p className="text-[11px] text-[#858b9c]">未能自动获取模型列表，请直接手动输入模型名称。</p>
+                      <p className="text-[11px] text-[#858b9c]">{t('modelSetup.vendor.modelsFallback')}</p>
                     )}
                   </LabeledField>
                   <button
@@ -546,11 +579,14 @@ export default function ModelSetupWizard({
                     className="flex w-fit items-center gap-[4px] text-[12px] text-[#757f9c] hover:text-[#18181a]"
                   >
                     <ChevronRight className={`size-[12px] transition-transform ${showAdvanced ? 'rotate-90' : ''}`} />
-                    高级设置（协议 / 接口地址）
+                    {t('modelSetup.vendor.advancedToggle')}
                   </button>
                   {showAdvanced && (
                     <p className="rounded-[10px] bg-[#f6f6f7] p-[12px] text-[12px] leading-[18px] text-[#757f9c]">
-                      协议：{PROTOCOL_LABELS[selectedChannel.apiProtocol as ApiKeyProtocol]} · Base URL：{selectedChannel.baseUrl}（系统预置，无需修改）
+                      {t('modelSetup.vendor.advancedSummary', {
+                        protocol: protocolLabel(selectedChannel.apiProtocol as ApiKeyProtocol, t),
+                        baseUrl: selectedChannel.baseUrl ?? '',
+                      })}
                     </p>
                   )}
                 </div>
@@ -559,7 +595,7 @@ export default function ModelSetupWizard({
               {step === 2 && selectedChannel?.category === 'custom' && (
                 <div className="mt-[16px] flex flex-col gap-[14px]">
                   <div className="grid grid-cols-2 gap-[14px]">
-                    <LabeledField label="API 协议">
+                    <LabeledField label={t('chat.modelSetup.protocol')}>
                       <Select
                         value={customForm.apiProtocol}
                         onValueChange={(value) => {
@@ -577,43 +613,43 @@ export default function ModelSetupWizard({
                         <SelectTrigger><SelectValue /></SelectTrigger>
                         <SelectContent>
                           {availableProtocols.map((protocol) => (
-                            <SelectItem key={protocol} value={protocol}>{PROTOCOL_LABELS[protocol]}</SelectItem>
+                            <SelectItem key={protocol} value={protocol}>{protocolLabel(protocol, t)}</SelectItem>
                           ))}
                         </SelectContent>
                       </Select>
                     </LabeledField>
-                    <LabeledField label="模型">
+                    <LabeledField label={t('modelSetup.field.modelLabel')}>
                       <ModelCombobox
                         value={customForm.model}
                         onChange={(value) => setCustomForm((prev) => ({ ...prev, model: value }))}
                         options={customModelsState.options}
                         loading={customModelsState.status === 'loading'}
-                        placeholder="选择或输入模型"
+                        placeholder={t('modelSetup.field.modelPlaceholder')}
                       />
                     </LabeledField>
                   </div>
-                  <LabeledField label="Base URL">
+                  <LabeledField label={t('chat.modelSetup.baseUrl')}>
                     <Input
                       value={customForm.baseUrl}
-                      placeholder="例如 https://your-proxy.example.com/v1"
+                      placeholder={t('modelSetup.custom.baseUrlPlaceholder')}
                       onChange={(event) => setCustomForm((prev) => ({ ...prev, baseUrl: event.target.value }))}
                       onBlur={() => void fetchCustomModelsNow(customForm)}
                     />
                   </LabeledField>
-                  <LabeledField label="API Key">
+                  <LabeledField label={t('chat.modelSetup.apiKey')}>
                     <Input
                       type="password"
                       value={customForm.apiKey}
-                      placeholder="sk-..."
+                      placeholder={t('modelSetup.field.apiKeyPlaceholder')}
                       onChange={(event) => setCustomForm((prev) => ({ ...prev, apiKey: event.target.value }))}
                       onBlur={() => void fetchCustomModelsNow(customForm)}
                     />
                   </LabeledField>
                   {(customModelsState.status === 'empty' || customModelsState.status === 'error') && (
-                    <p className="-mt-[6px] text-[11px] text-[#858b9c]">未能自动获取模型列表，请在上方"模型"里手动输入。</p>
+                    <p className="-mt-[6px] text-[11px] text-[#858b9c]">{t('modelSetup.custom.modelsFallback')}</p>
                   )}
                   {customModelsState.status === 'success' && (
-                    <p className="-mt-[6px] text-[11px] text-[#247447]">已自动获取到 {customModelsState.options.length} 个模型，可以回到上方"模型"里选择。</p>
+                    <p className="-mt-[6px] text-[11px] text-[#247447]">{t('modelSetup.custom.modelsFetched', { count: customModelsState.options.length })}</p>
                   )}
                   <button
                     type="button"
@@ -621,12 +657,12 @@ export default function ModelSetupWizard({
                     className="flex w-fit items-center gap-[4px] text-[12px] text-[#757f9c] hover:text-[#18181a]"
                   >
                     <ChevronRight className={`size-[12px] transition-transform ${showCustomAdvanced ? 'rotate-90' : ''}`} />
-                    高级参数（Temperature / Max Tokens / extra_body，可选）
+                    {t('modelSetup.custom.advancedToggle')}
                   </button>
                   {showCustomAdvanced && (
                     <div className="flex flex-col gap-[14px]">
                       <div className="grid grid-cols-2 gap-[14px]">
-                        <LabeledField label="Temperature">
+                        <LabeledField label={t('chat.modelSetup.temperature')}>
                           <Input
                             type="number"
                             min={0}
@@ -636,7 +672,7 @@ export default function ModelSetupWizard({
                             onChange={(event) => setCustomForm((prev) => ({ ...prev, temperature: event.target.value }))}
                           />
                         </LabeledField>
-                        <LabeledField label="Max Tokens">
+                        <LabeledField label={t('chat.modelSetup.maxTokens')}>
                           <Input
                             type="number"
                             min={128}
@@ -646,11 +682,11 @@ export default function ModelSetupWizard({
                           />
                         </LabeledField>
                       </div>
-                      <LabeledField label="额外请求参数（extra_body JSON）">
+                      <LabeledField label={t('modelSetup.custom.extraBodyLabel')}>
                         <Textarea
                           rows={5}
                           value={customForm.extraBody}
-                          placeholder={'{\n  "thinking": {\n    "type": "disabled"\n  }\n}'}
+                          placeholder={t('modelSetup.custom.extraBodyPlaceholder')}
                           className="min-h-[116px] resize-y font-mono text-[12px]"
                           onChange={(event) => setCustomForm((prev) => ({ ...prev, extraBody: event.target.value }))}
                         />
@@ -666,10 +702,10 @@ export default function ModelSetupWizard({
                     <div className="flex flex-wrap items-center justify-between gap-[12px]">
                       <div>
                         <p className="text-[13px] font-semibold text-[#29466f]">
-                          {subscriptionAccount?.status === 'connected' ? '已连接 ChatGPT 订阅' : '尚未连接 ChatGPT 订阅'}
+                          {t('modelsPage.card.subscription')}
                         </p>
                         <p className="mt-[2px] text-[12px] text-[#5d6f8c]">
-                          {subscriptionAccount?.message || '点击连接后会打开本机浏览器完成登录'}
+                          {subscriptionAccount ? subscriptionAccountMessage(subscriptionAccount) : t('modelsPage.subscription.pending')}
                         </p>
                       </div>
                       {subscriptionAccount?.status === 'connected' ? (
@@ -681,7 +717,7 @@ export default function ModelSetupWizard({
                           className="h-[32px] gap-[6px] border-[#cbd8f2] bg-white px-[10px] text-[12px] text-[#464c5e]"
                         >
                           <LogOut className="size-[13px]" />
-                          退出本机 Codex
+                          {t('modelsPage.confirm.logout.confirm')}
                         </UIButton>
                       ) : subscriptionAccount?.status === 'pending' ? (
                         <UIButton
@@ -691,7 +727,7 @@ export default function ModelSetupWizard({
                           onClick={onCancelSubscriptionLogin}
                           className="h-[32px] border-[#cbd8f2] bg-white px-[10px] text-[12px] text-[#464c5e]"
                         >
-                          取消登录
+                          {t('modelSetup.actions.cancelLogin')}
                         </UIButton>
                       ) : (
                         <UIButton
@@ -701,28 +737,28 @@ export default function ModelSetupWizard({
                           className="h-[32px] gap-[6px] bg-[#1a71ff] px-[10px] text-[12px] text-white hover:bg-[#1463df]"
                         >
                           {subscriptionLoading ? <LoaderCircle className="size-[13px] animate-spin" /> : <LogIn className="size-[13px]" />}
-                          连接 ChatGPT 订阅
+                          {t('modelSetup.actions.connectSubscription')}
                         </UIButton>
                       )}
                     </div>
                     <p className="text-[11px] leading-[16px] text-[#7483a0]">
-                      登录由本机 Codex runtime 管理。StaffDeck 不保存 ChatGPT OAuth code、access token 或 refresh token。
+                      {t('modelsPage.subscription.ownershipNotice')}
                     </p>
                   </div>
-                  <LabeledField label="模型">
+                  <LabeledField label={t('modelSetup.field.modelLabel')}>
                     <ModelCombobox
                       disabled={!subscriptionStepComplete}
                       value={subscriptionForm.model}
                       options={subscriptionModelsState.status === 'success' ? subscriptionModelsState.options : []}
                       loading={subscriptionModelsState.status === 'loading'}
-                      placeholder={subscriptionStepComplete ? '选择或输入模型' : '先完成连接再填写'}
+                      placeholder={subscriptionStepComplete ? t('modelSetup.field.modelPlaceholder') : t('modelSetup.subscription.modelPlaceholderDisabled')}
                       onChange={(value) => setSubscriptionForm({ model: value })}
                     />
                     {subscriptionModelsState.status === 'success' && (
-                      <p className="text-[11px] text-[#247447]">已自动获取到 {subscriptionModelsState.options.length} 个模型，也可以直接输入。</p>
+                      <p className="text-[11px] text-[#247447]">{t('modelSetup.vendor.modelsFetched', { count: subscriptionModelsState.options.length })}</p>
                     )}
                     {(subscriptionModelsState.status === 'empty' || subscriptionModelsState.status === 'error') && (
-                      <p className="text-[11px] text-[#858b9c]">未能自动获取模型列表，请直接手动输入模型名称。</p>
+                      <p className="text-[11px] text-[#858b9c]">{t('modelSetup.vendor.modelsFallback')}</p>
                     )}
                   </LabeledField>
                 </div>
@@ -733,11 +769,11 @@ export default function ModelSetupWizard({
                   <div className="flex flex-wrap items-center gap-[24px]">
                     <label className="flex cursor-pointer items-center gap-[8px]">
                       <Switch checked={isDefault} onCheckedChange={setIsDefault} />
-                      <span className="text-[12px] font-medium text-[#464c5e]">设为默认模型</span>
+                      <span className="text-[12px] font-medium text-[#464c5e]">{t('modelSetup.toggle.default')}</span>
                     </label>
                     <label className="flex cursor-pointer items-center gap-[8px]">
                       <Switch checked={enabled} onCheckedChange={setEnabled} />
-                      <span className="text-[12px] font-medium text-[#464c5e]">启用</span>
+                      <span className="text-[12px] font-medium text-[#464c5e]">{t('modelSetup.toggle.enabled')}</span>
                     </label>
                   </div>
 
@@ -748,7 +784,7 @@ export default function ModelSetupWizard({
                   )}
                   {saveResult !== 'error' && savedModelId && (
                     <p className="text-[12px] text-[#858b9c]">
-                      已保存为草稿（未启用），点击"测试"验证并启用。
+                      {t('modelSetup.draftSavedHint')}
                     </p>
                   )}
                 </div>
@@ -757,9 +793,9 @@ export default function ModelSetupWizard({
 
             <div className="flex items-center justify-between border-t border-[#f0f1f4] px-[24px] py-[14px]">
               {step === 1 ? (
-                <button type="button" onClick={handleClose} className="h-[32px] px-[8px] text-[13px] text-[#757f9c] hover:text-[#18181a]">
-                  取消
-                </button>
+                  <button type="button" onClick={handleClose} className="h-[32px] px-[8px] text-[13px] text-[#757f9c] hover:text-[#18181a]">
+                  {t('modelSetup.actions.cancel')}
+                  </button>
               ) : (
                 <UIButton
                   type="button"
@@ -769,7 +805,7 @@ export default function ModelSetupWizard({
                   className="h-[34px] gap-[6px] rounded-[10px] border-[#e3e7f1] bg-white px-[16px] text-[13px] text-[#464c5e]"
                 >
                   <ArrowLeft className="size-[14px]" />
-                  上一步
+                  {t('modelSetup.actions.back')}
                 </UIButton>
               )}
 
@@ -780,7 +816,7 @@ export default function ModelSetupWizard({
                   onClick={() => setStep(2)}
                   className="h-[34px] gap-[6px] rounded-[10px] bg-[#18181a] px-[20px] text-[13px] text-white hover:bg-[#303030] disabled:opacity-40"
                 >
-                  下一步
+                  {t('modelSetup.actions.next')}
                   <ArrowRight className="size-[14px]" />
                 </UIButton>
               )}
@@ -794,7 +830,7 @@ export default function ModelSetupWizard({
                     className="h-[34px] gap-[6px] rounded-[10px] border-[#e3e7f1] bg-white px-[16px] text-[13px] text-[#464c5e] disabled:opacity-40"
                   >
                     {testing && <LoaderCircle className="size-[14px] animate-spin" />}
-                    {testing ? '测试中' : '测试'}
+                    {testing ? t('modelSetup.actions.testing') : t('modelsPage.actions.test')}
                   </UIButton>
                   {!requireVerified && (
                     <UIButton
@@ -804,7 +840,7 @@ export default function ModelSetupWizard({
                       className="h-[34px] gap-[6px] rounded-[10px] bg-[#18181a] px-[20px] text-[13px] text-white hover:bg-[#303030] disabled:opacity-40"
                     >
                       {saving && <LoaderCircle className="size-[14px] animate-spin" />}
-                      {saving ? '保存中' : '保存'}
+                      {saving ? t('modelSetup.actions.saving') : t('common.action.save')}
                     </UIButton>
                   )}
                 </div>
@@ -817,25 +853,33 @@ export default function ModelSetupWizard({
   );
 }
 
-function StepHeader({ step, selectedChannel }: { step: Step; selectedChannel: ChannelPreset | null }) {
+function StepHeader({
+  step,
+  selectedChannel,
+  t,
+}: {
+  step: Step;
+  selectedChannel: ChannelPreset | null;
+  t: ReturnType<typeof useAppIntl>['t'];
+}) {
   if (step === 1) {
     return (
       <div>
-        <h2 className="text-[18px] font-semibold text-[#18181a]">选择渠道</h2>
-        <p className="mt-[4px] text-[13px] text-[#858b9c]">选择你要接入的 AI 平台，选完会展开对应需要填写的内容。</p>
+        <h2 className="text-[18px] font-semibold text-[#18181a]">{t('modelSetup.steps.select')}</h2>
+        <p className="mt-[4px] text-[13px] text-[#858b9c]">{t('modelSetup.step.selectDescription')}</p>
       </div>
     );
   }
   const title = selectedChannel?.category === 'vendor'
-    ? `配置 ${selectedChannel.name}`
+    ? t('modelSetup.step.vendorTitle', { name: selectedChannel.name })
     : selectedChannel?.category === 'custom'
-      ? '配置自定义渠道'
-      : '配置 ChatGPT 订阅';
+      ? t('modelSetup.step.customTitle')
+      : t('modelSetup.step.subscriptionTitle');
   const desc = selectedChannel?.category === 'vendor'
-    ? '接口地址和协议已经预置好，只需要填 API Key 和模型，起个名字就能保存并测试。'
+    ? t('modelSetup.step.vendorDescription')
     : selectedChannel?.category === 'custom'
-      ? '面向自建代理 / 私有部署，需要手动填写协议与接口地址，起个名字就能保存并测试。'
-      : '不需要 API Key，登录一次即可复用本机 Codex 的订阅额度，起个名字就能保存并测试。';
+      ? t('modelSetup.step.customDescription')
+      : t('modelSetup.step.subscriptionDescription');
   return (
     <div>
       <h2 className="text-[18px] font-semibold text-[#18181a]">{title}</h2>
@@ -844,12 +888,24 @@ function StepHeader({ step, selectedChannel }: { step: Step; selectedChannel: Ch
   );
 }
 
-function ChannelRow({ preset, selected, onSelect }: { preset: ChannelPreset; selected: boolean; onSelect: () => void }) {
+function ChannelRow({
+  preset,
+  label,
+  description,
+  selected,
+  onSelect,
+}: {
+  preset: ChannelPreset;
+  label: string;
+  description: string;
+  selected: boolean;
+  onSelect: () => void;
+}) {
   return (
     <div
       role="option"
       aria-selected={selected}
-      aria-label={preset.name}
+      aria-label={label}
       tabIndex={0}
       onClick={onSelect}
       onKeyDown={(event) => {
@@ -864,8 +920,8 @@ function ChannelRow({ preset, selected, onSelect }: { preset: ChannelPreset; sel
         {channelIcon(preset)}
       </div>
       <div className="min-w-0 flex-1">
-        <p className={`text-[13px] font-semibold ${selected ? 'text-[#1a71ff]' : 'text-[#18181a]'}`}>{preset.name}</p>
-        <p className="mt-[1px] truncate text-[11.5px] text-[#858b9c]">{preset.description}</p>
+        <p className={`text-[13px] font-semibold ${selected ? 'text-[#1a71ff]' : 'text-[#18181a]'}`}>{label}</p>
+        <p className="mt-[1px] truncate text-[11.5px] text-[#858b9c]">{description}</p>
       </div>
       {selected ? (
         <div className="grid size-[16px] shrink-0 place-items-center rounded-full bg-[#1a71ff]">

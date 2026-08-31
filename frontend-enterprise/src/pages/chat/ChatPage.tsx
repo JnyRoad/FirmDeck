@@ -23,7 +23,7 @@ export default function ChatPage() {
       }}
       style={
         {
-          '--sidebar-width': '220px',
+          '--sidebar-width': '240px',
           '--sidebar-width-icon': '72px',
         } as CSSProperties
       }

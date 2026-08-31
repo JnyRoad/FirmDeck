@@ -4,14 +4,85 @@ from pathlib import Path
 
 import httpx
 import pytest
-
-from app.agents.branching import ensure_private_resource_binding
-from app.tools.tool_executor import ToolExecutor
-from app.tools.tool_schema import ToolCall
-from app.db.models import A2ATaskEvent, A2ATaskRun, AgentProfile, MCPServer, Tenant, Tool
-from app.security.internal_service import INTERNAL_SERVICE_HEADER, internal_service_token
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
+
+from app.agents.branching import ensure_private_resource_binding
+from app.db.models import A2ATaskEvent, A2ATaskRun, AgentProfile, MCPServer, Tenant, Tool
+from app.i18n.language_context import (
+    LanguageContext,
+    LocaleResolutionSource,
+    SupportedLocale,
+)
+from app.security.internal_service import INTERNAL_SERVICE_HEADER, internal_service_token
+from app.tools.mcp_client import MCPClientError
+from app.tools.tool_executor import ToolExecutor
+from app.tools.tool_schema import ToolCall
+
+
+def test_tool_error_keeps_remote_cause_private_and_preserves_correlation() -> None:
+    """Expose canonical Tool error fields without serializing an MCP diagnostic message."""
+    raw_provider_error = "MCP response secret=do-not-publish path=/private/mcp.sock"
+    executor = object.__new__(ToolExecutor)
+
+    result = executor._error(
+        "mcp.remote",
+        "MCP_ERROR",
+        raw_provider_error,
+        retryable=True,
+        params={"transport": "stdio"},
+        request_id="req-tool",
+        trace_id="trace-tool",
+    )
+
+    assert result.error is not None
+    assert result.error.model_dump(mode="json") == {
+        "code": "INTERNAL_ERROR",
+        "message": "INTERNAL_ERROR",
+        "params": {},
+        "retryable": False,
+        "request_id": "req-tool",
+        "trace_id": "trace-tool",
+        "deprecated_fields": ["message"],
+    }
+    assert result.error.internal_context is not None
+    assert result.error.internal_context.raw_message == raw_provider_error
+    assert raw_provider_error not in repr(result.model_dump(mode="json"))
+
+
+def test_mcp_client_error_exposes_safe_descriptor_and_private_diagnostic() -> None:
+    """Keep MCP transport prose in InternalErrorContext while preserving request and trace IDs."""
+    raw_provider_error = "HTTP MCP body contains api_key=do-not-publish"
+    error = MCPClientError(
+        raw_provider_error,
+        request_id="req-mcp",
+        trace_id="trace-mcp",
+        params={"transport": "http"},
+    )
+
+    assert error.to_public_payload() == {
+        "code": "MCP_ERROR",
+        "params": {"transport": "http"},
+        "retryable": False,
+        "request_id": "req-mcp",
+        "trace_id": "trace-mcp",
+    }
+    assert error.occurrence.internal is not None
+    assert error.occurrence.internal.raw_message == raw_provider_error
+    assert raw_provider_error not in repr(error.to_public_payload())
+
+
+def test_tool_success_preserves_raw_external_content() -> None:
+    """Return successful provider content byte-for-byte at the data projection boundary."""
+    raw_content = {"text": "原始正文 <b>do not translate</b>", "citation": "外部来源.pdf#页=7"}
+    response = httpx.Response(
+        200,
+        json=raw_content,
+        request=httpx.Request("GET", "https://provider.example.test/raw"),
+    )
+    executor = object.__new__(ToolExecutor)
+
+    assert executor._response_data(response) == raw_content
 
 
 def test_resolve_secret_header(monkeypatch):
@@ -801,6 +872,7 @@ def test_execute_stdio_mcp_tool_success() -> None:
 
 
 def test_execute_stdio_mcp_tool_error_is_stable() -> None:
+    """Keep stdio provider validation prose private while returning the stable MCP code."""
     with _test_session() as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
         db.add(
@@ -836,7 +908,11 @@ def test_execute_stdio_mcp_tool_error_is_stable() -> None:
         assert result.success is False
         assert result.error is not None
         assert result.error.code == "MCP_ERROR"
-        assert "numbers" in result.error.message
+        assert result.error.message == "MCP_ERROR"
+        assert result.error.deprecated_fields == ["message"]
+        assert result.error.internal_context is not None
+        assert "numbers" in str(result.error.internal_context.raw_message)
+        assert "numbers" not in repr(result.model_dump(mode="json"))
 
 
 def test_execute_get_tool_preserves_query_string_when_arguments_empty(monkeypatch) -> None:
@@ -907,3 +983,160 @@ def _test_session():
     )
     SQLModel.metadata.create_all(engine)
     return Session(engine)
+
+
+def _a2a_en_us_context() -> LanguageContext:
+    """Build the explicit outbound A2A locale snapshot used by contract tests."""
+    return LanguageContext(
+        ui_locale=SupportedLocale.EN_US,
+        agent_reply_locale=SupportedLocale.EN_US,
+        ui_locale_source=LocaleResolutionSource.EXPLICIT_REQUEST,
+        agent_reply_locale_source=LocaleResolutionSource.EXPLICIT_REQUEST,
+    )
+
+
+def test_execute_a2a_sends_locale_metadata_and_persists_the_same_snapshot(monkeypatch) -> None:
+    """Keep A2A message text raw while carrying the immutable locale in protocol metadata."""
+    captured: dict[str, object] = {}
+
+    class FakeClient:
+        def __init__(self, *, timeout: float):
+            del timeout
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def get(self, url, *, headers=None):
+            raise RuntimeError("agent card unavailable")
+
+        def post(self, url, *, headers=None, json=None):
+            captured["payload"] = json
+            return httpx.Response(
+                200,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": json["id"],
+                    "result": {"id": "remote-locale", "status": {"state": "completed"}},
+                },
+                request=httpx.Request("POST", url),
+            )
+
+    monkeypatch.setattr(httpx, "Client", FakeClient)
+    context = _a2a_en_us_context()
+    raw_text = "原始用户输入，不应被翻译"
+    with _test_session() as db:
+        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.add(
+            Tool(
+                id="tool_a2a_locale",
+                tenant_id="tenant_demo",
+                name="a2a.locale",
+                tool_type="a2a",
+                method="POST",
+                url="https://agent.example.test/a2a",
+                config_json={"discover_agent_card": False},
+                enabled=True,
+            )
+        )
+        db.commit()
+
+        result = ToolExecutor(db).execute(
+            "tenant_demo",
+            ToolCall(name="a2a.locale", arguments={"text": raw_text}),
+            invocation_id="call-locale",
+            session_id="session-locale",
+            language_context=context,
+        )
+        run = db.exec(select(A2ATaskRun)).one()
+
+    expected = context.model_dump(mode="json")
+    assert result.success is True
+    assert run.language_context_json == expected
+    payload = captured["payload"]
+    assert payload["params"]["message"]["parts"] == [{"text": raw_text}]
+    assert payload["params"]["metadata"]["language_context"] == expected
+
+
+def test_execute_a2a_recovery_reuses_persisted_locale_metadata(monkeypatch) -> None:
+    """Recovery must use the durable locale snapshot instead of a changed current preference."""
+    captured: list[dict[str, object]] = []
+
+    class FakeClient:
+        def __init__(self, *, timeout: float):
+            del timeout
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def post(self, url, *, headers=None, json=None):
+            captured.append(json)
+            return httpx.Response(
+                200,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": json["id"],
+                    "result": {"id": "remote-recovery", "status": {"state": "completed"}},
+                },
+                request=httpx.Request("POST", url),
+            )
+
+    monkeypatch.setattr(httpx, "Client", FakeClient)
+    stored_context = _a2a_en_us_context()
+    current_context = stored_context.model_copy(
+        update={"ui_locale": SupportedLocale.ZH_CN, "agent_reply_locale": SupportedLocale.ZH_CN}
+    )
+    with _test_session() as db:
+        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.add(
+            Tool(
+                id="tool_a2a_recovery_locale",
+                tenant_id="tenant_demo",
+                name="a2a.recovery-locale",
+                tool_type="a2a",
+                method="POST",
+                url="https://agent.example.test/a2a",
+                config_json={"discover_agent_card": False},
+                enabled=True,
+            )
+        )
+        db.add(
+            A2ATaskRun(
+                id="a2arun-recovery-locale",
+                direction="client",
+                tenant_id="tenant_demo",
+                tool_id="tool_a2a_recovery_locale",
+                invocation_id="call-recovery-locale",
+                endpoint_url="https://agent.example.test/a2a",
+                status="submitted",
+                request_json={
+                    "arguments": {"text": "raw recovery input"},
+                    "message": {
+                        "messageId": "message-recovery-locale",
+                        "role": "ROLE_USER",
+                        "parts": [{"text": "raw recovery input"}],
+                    },
+                },
+                language_context_json=stored_context.model_dump(mode="json"),
+            )
+        )
+        db.commit()
+
+        result = ToolExecutor(db).execute(
+            "tenant_demo",
+            ToolCall(name="a2a.recovery-locale", arguments={"text": "changed input"}),
+            invocation_id="call-recovery-locale",
+            language_context=current_context,
+        )
+
+    assert result.success is True
+    assert len(captured) == 1
+    assert captured[0]["params"]["message"]["parts"] == [{"text": "raw recovery input"}]
+    assert captured[0]["params"]["metadata"]["language_context"] == stored_context.model_dump(
+        mode="json"
+    )

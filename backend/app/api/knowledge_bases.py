@@ -24,6 +24,13 @@ from app.agents.branching import (
     user_creator_metadata,
 )
 from app.capability_scope import normalize_capability_scope
+from app.contracts.error_registry import (
+    ERROR_REGISTRY,
+    ErrorContractViolation,
+    ErrorVisibility,
+)
+from app.contracts.errors import ErrorDescriptor, InternalErrorContext
+from app.contracts.http import build_http_exception
 from app.db import get_session
 from app.db.models import (
     AgentKnowledgeBranch,
@@ -98,10 +105,57 @@ router = APIRouter(
 
 
 def _knowledge_http_error(exc: KnowledgeError) -> HTTPException:
-    """把共享知识领域错误映射为不泄漏内容的稳定 HTTP 载荷。"""
+    """把共享知识领域错误映射为 canonical 且不泄漏诊断文本的 HTTP 载荷。"""
     return HTTPException(
         status_code=exc.status_code,
-        detail={"code": exc.code, "message": exc.message, **exc.details},
+        detail=exc.to_public_payload(),
+    )
+
+
+def _knowledge_public_error(
+    code: str,
+    status_code: int,
+    *,
+    params: dict[str, object] | None = None,
+    cause: Exception | None = None,
+) -> HTTPException:
+    """Build a stable knowledge-base error while retaining raw causes only for diagnostics."""
+    # Workflow: resolve the public code, validate its named parameters, then project it;
+    # unknown or malformed provider/domain data fails closed to the canonical fallback.
+    entry = ERROR_REGISTRY.get(code)
+    safe_params = dict(params or {})
+    if entry is None or entry.visibility is not ErrorVisibility.PUBLIC:
+        entry = ERROR_REGISTRY.require("INTERNAL_ERROR")
+        safe_params = {}
+        safe_status_code = 500
+    else:
+        safe_status_code = status_code
+        try:
+            ERROR_REGISTRY.validate(
+                ErrorDescriptor(
+                    code=entry.code,
+                    params=safe_params,
+                    retryable=entry.retryable_default,
+                )
+            )
+        except ErrorContractViolation:
+            entry = ERROR_REGISTRY.require("INTERNAL_ERROR")
+            safe_params = {}
+            safe_status_code = 500
+    internal = (
+        InternalErrorContext(
+            source="knowledge_bases_api",
+            exception_type=type(cause).__name__,
+            raw_message=str(cause),
+        )
+        if cause is not None
+        else None
+    )
+    return build_http_exception(
+        entry.code,
+        status_code=safe_status_code,
+        params=safe_params,
+        internal=internal,
     )
 
 
@@ -313,26 +367,20 @@ def create_knowledge_base(
     ensure_tenant(db, request.tenant_id)
     name = request.name.strip()
     if not name:
-        raise HTTPException(status_code=400, detail="Knowledge base name cannot be empty")
+        raise _knowledge_public_error("KNOWLEDGE_NAME_REQUIRED", 400)
     existing = db.exec(
         select(KnowledgeBase).where(
             KnowledgeBase.tenant_id == request.tenant_id, KnowledgeBase.name == name
         )
     ).first()
     if existing:
-        raise HTTPException(status_code=409, detail="Knowledge base name already exists")
+        raise _knowledge_public_error("KNOWLEDGE_NAME_CONFLICT", 409)
     query_agent_id = agent_id if isinstance(agent_id, str) and agent_id else None
     if request.agent_id and query_agent_id and request.agent_id != query_agent_id:
-        raise HTTPException(status_code=400, detail="Conflicting employee knowledge scope")
+        raise _knowledge_public_error("KNOWLEDGE_SCOPE_CONFLICT", 400)
     resolved_agent_id = request.agent_id or query_agent_id
     if request.mode == "shared" and resolved_agent_id:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "KNOWLEDGE_MODE_INVALID",
-                "message": "共享知识库不能归属单个员工。",
-            },
-        )
+        raise _knowledge_public_error(KNOWLEDGE_MODE_INVALID, 409)
     agent = ensure_agent_scope_manager(
         db,
         request.tenant_id,
@@ -420,13 +468,7 @@ def convert_knowledge_base_to_shared(
     ensure_tenant(db, request.tenant_id)
     source = _get_knowledge_base(db, request.tenant_id, knowledge_base_id)
     if source.mode != "dedicated":
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "KNOWLEDGE_MODE_INVALID",
-                "message": "共享知识库不能转换回专用知识库。",
-            },
-        )
+        raise _knowledge_public_error(KNOWLEDGE_MODE_INVALID, 409)
     agent = ensure_agent_scope_manager(
         db,
         request.tenant_id,
@@ -434,13 +476,7 @@ def convert_knowledge_base_to_shared(
         current_user,
     )
     if agent is None or agent.is_overall:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "KNOWLEDGE_MODE_INVALID",
-                "message": "只能转换具体员工的专用知识分支。",
-            },
-        )
+        raise _knowledge_public_error(KNOWLEDGE_MODE_INVALID, 409)
 
     try:
         result = KnowledgeConversionService(db).convert_to_shared(
@@ -458,10 +494,7 @@ def convert_knowledge_base_to_shared(
         db.commit()
     except KnowledgeConversionError as exc:
         db.rollback()
-        raise HTTPException(
-            status_code=exc.status_code,
-            detail={"code": exc.code, "message": str(exc)},
-        ) from exc
+        raise _knowledge_http_error(exc) from exc
     except Exception:
         db.rollback()
         raise
@@ -469,13 +502,7 @@ def convert_knowledge_base_to_shared(
     shared = db.get(KnowledgeBase, result.shared_knowledge_base_id)
     released = db.get(KnowledgeBaseVersion, result.released_version_id)
     if shared is None or released is None:
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "code": "KNOWLEDGE_CONVERSION_INCOMPLETE",
-                "message": "转换结果未能完整回读。",
-            },
-        )
+        raise _knowledge_public_error("KNOWLEDGE_CONVERSION_INCOMPLETE", 500)
     stats = _knowledge_base_stats(db, request.tenant_id, [released.id]).get(shared.id, {})
     stats["bound_team_count"] = len(result.team_binding_ids)
     return KnowledgeBaseConversionRead(
@@ -567,7 +594,7 @@ def update_knowledge_base(
         if request.name is not None:
             name = request.name.strip()
             if not name:
-                raise HTTPException(status_code=400, detail="Knowledge base name cannot be empty")
+                raise _knowledge_public_error("KNOWLEDGE_NAME_REQUIRED", 400)
             version.name = name
         if request.description is not None:
             version.description = request.description
@@ -622,7 +649,7 @@ def update_knowledge_base(
     if request.name is not None:
         name = request.name.strip()
         if not name:
-            raise HTTPException(status_code=400, detail="Knowledge base name cannot be empty")
+            raise _knowledge_public_error("KNOWLEDGE_NAME_REQUIRED", 400)
         conflict = db.exec(
             select(KnowledgeBase).where(
                 KnowledgeBase.tenant_id == request.tenant_id,
@@ -631,7 +658,7 @@ def update_knowledge_base(
             )
         ).first()
         if conflict:
-            raise HTTPException(status_code=409, detail="Knowledge base name already exists")
+            raise _knowledge_public_error("KNOWLEDGE_NAME_CONFLICT", 409)
         row.name = name
         version.name = name
     if request.description is not None:
@@ -1149,9 +1176,7 @@ def delete_knowledge_base(
     row = _get_knowledge_base(db, tenant_id, knowledge_base_id)
     if agent and agent.is_overall:
         if not is_open_gallery_resource(db, tenant_id, "knowledge_base", row):
-            raise HTTPException(
-                status_code=404, detail="Knowledge base not visible in open gallery"
-            )
+            raise _knowledge_public_error("KNOWLEDGE_OPEN_GALLERY_NOT_VISIBLE", 404)
         ensure_open_gallery_admin(tenant_id, current_user)
         hide_open_gallery_binding(db, tenant_id, "knowledge_base", row.id)
         db.commit()
@@ -1199,9 +1224,9 @@ def sync_knowledge_base_from_overall(
 ) -> dict[str, object]:
     agent = ensure_agent_scope_manager(db, tenant_id, agent_id, current_user)
     if not agent:
-        raise HTTPException(status_code=404, detail="Agent not found")
+        raise _knowledge_public_error("KNOWLEDGE_AGENT_NOT_FOUND", 404)
     if agent.is_overall:
-        raise HTTPException(status_code=400, detail="Overall agent is already the trunk")
+        raise _knowledge_public_error("KNOWLEDGE_OVERALL_AGENT_INVALID", 400)
     branch = sync_knowledge_branch_from_overall(db, tenant_id, agent_id, knowledge_base_id)
     db.commit()
     return {
@@ -1221,11 +1246,9 @@ def promote_knowledge_base_to_overall(
 ) -> dict[str, object]:
     agent = get_agent(db, tenant_id, agent_id)
     if not agent:
-        raise HTTPException(status_code=404, detail="Agent not found")
+        raise _knowledge_public_error("KNOWLEDGE_AGENT_NOT_FOUND", 404)
     if agent.is_overall:
-        raise HTTPException(
-            status_code=400, detail="Overall agent does not have a branch to promote"
-        )
+        raise _knowledge_public_error("KNOWLEDGE_OVERALL_AGENT_INVALID", 400)
     ensure_open_gallery_admin(tenant_id, current_user)
     version = promote_knowledge_branch_to_overall(db, tenant_id, agent_id, knowledge_base_id)
     db.commit()
@@ -1275,11 +1298,9 @@ def rollback_knowledge_base(
             raise _knowledge_http_error(exc) from exc
     agent = ensure_agent_scope_manager(db, request.tenant_id, request.agent_id, current_user)
     if not agent:
-        raise HTTPException(status_code=404, detail="Agent not found")
+        raise _knowledge_public_error("KNOWLEDGE_AGENT_NOT_FOUND", 404)
     if agent.is_overall:
-        raise HTTPException(
-            status_code=400, detail="Use overall version management for trunk knowledge base"
-        )
+        raise _knowledge_public_error("KNOWLEDGE_OVERALL_AGENT_INVALID", 400)
     branch = rollback_knowledge_branch(
         db, request.tenant_id, request.agent_id, knowledge_base_id, request.version
     )
@@ -1373,7 +1394,11 @@ def _visible_knowledge_version(
     versions = _management_knowledge_base_versions(db, tenant_id, agent_id)
     version = versions.get(knowledge_base_id)
     if not version:
-        raise HTTPException(status_code=404, detail="Knowledge base version not visible")
+        raise _knowledge_public_error(
+            "KNOWLEDGE_BASE_VERSION_NOT_VISIBLE",
+            404,
+            params={"knowledge_base_id": knowledge_base_id},
+        )
     return version
 
 
@@ -1476,7 +1501,11 @@ def _get_concept(
         )
     ).first()
     if not row:
-        raise HTTPException(status_code=404, detail="OKF concept not found")
+        raise _knowledge_public_error(
+            "KNOWLEDGE_OKF_CONCEPT_NOT_FOUND",
+            404,
+            params={"concept_id": normalized},
+        )
     return row
 
 
@@ -1559,7 +1588,7 @@ def _get_knowledge_base(db: Session, tenant_id: str, knowledge_base_id: str) -> 
     ensure_tenant(db, tenant_id)
     row = db.get(KnowledgeBase, knowledge_base_id)
     if not row or row.tenant_id != tenant_id:
-        raise HTTPException(status_code=404, detail="Knowledge base not found")
+        raise _knowledge_public_error("KNOWLEDGE_BASE_NOT_FOUND", 404)
     return row
 
 

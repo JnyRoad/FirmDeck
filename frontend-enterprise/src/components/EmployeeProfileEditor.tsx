@@ -14,8 +14,13 @@ import {
   SelectValue,
   Switch,
   Textarea,
-  notify,
 } from '@/components/ui';
+import { createToastNotifier } from '@/components/ui/app-toast';
+import { createMessageDescriptor, type MessageDescriptor } from '@/i18n/descriptors';
+import { RawContent, RawIdentifier } from '@/i18n/RawContent';
+import { useAppIntl } from '@/i18n/useAppIntl';
+import type { MessageId } from '@/i18n/types';
+import { backendErrorMessageDescriptor } from '@/lib/apiErrorMessages';
 import { SELECT_TRIGGER_CLASS } from '@/lib/enterprise-ui';
 import { api, TENANT_ID } from '../api/client';
 import type { EnterpriseAuthUser } from '../auth';
@@ -41,6 +46,36 @@ type EmployeeProfileFormValues = {
 const STYLE_OPTIONS = ['目标明确', '证据优先', '动作可追溯', '事实先行', '流程推进', '风险克制', '及时追问'];
 const EXPERTISE_OPTIONS = ['业务问答', 'SOP 执行', '工具调用', '代码检索', '报销核对', '事务跟进', '资料维护'];
 const WORK_MODE_OPTIONS = ['识别意图', '补齐信息', '调用 SOP', '查询资料', '执行并复盘', '确认后执行', '必要时转人工'];
+
+const STYLE_MESSAGE_IDS: Record<string, MessageId> = {
+  '目标明确': 'employeeProfile.option.style.goalFocused',
+  '证据优先': 'employeeProfile.option.style.evidenceFirst',
+  '动作可追溯': 'employeeProfile.option.style.traceableActions',
+  '事实先行': 'employeeProfile.option.style.factsFirst',
+  '流程推进': 'employeeProfile.option.style.processDriven',
+  '风险克制': 'employeeProfile.option.style.riskAware',
+  '及时追问': 'employeeProfile.option.style.clarifyEarly',
+};
+
+const EXPERTISE_MESSAGE_IDS: Record<string, MessageId> = {
+  '业务问答': 'employeeProfile.option.expertise.businessQa',
+  'SOP 执行': 'employeeProfile.option.expertise.sopExecution',
+  '工具调用': 'employeeProfile.option.expertise.toolUse',
+  '代码检索': 'employeeProfile.option.expertise.codeRetrieval',
+  '报销核对': 'employeeProfile.option.expertise.expenseReview',
+  '事务跟进': 'employeeProfile.option.expertise.followUp',
+  '资料维护': 'employeeProfile.option.expertise.contentMaintenance',
+};
+
+const WORK_MODE_MESSAGE_IDS: Record<string, MessageId> = {
+  '识别意图': 'employeeProfile.option.mode.intentRecognition',
+  '补齐信息': 'employeeProfile.option.mode.fillGaps',
+  '调用 SOP': 'employeeProfile.option.mode.sopExecution',
+  '查询资料': 'employeeProfile.option.mode.research',
+  '执行并复盘': 'employeeProfile.option.mode.executeReview',
+  '确认后执行': 'employeeProfile.option.mode.confirmThenAct',
+  '必要时转人工': 'employeeProfile.option.mode.escalate',
+};
 
 const BLANK_FORM: EmployeeProfileFormValues = {
   name: '',
@@ -70,10 +105,13 @@ export default function EmployeeProfileEditor({
   onSaved?: (agent: AgentProfileRead) => void;
   currentUser?: EnterpriseAuthUser;
 }) {
+  const { t } = useAppIntl();
+  const toast = createToastNotifier({ t });
   const [form, setForm] = useState<EmployeeProfileFormValues>(BLANK_FORM);
   const [saving, setSaving] = useState(false);
   const profile = useMemo(() => employeeProfile(agent), [agent]);
 
+  /** Apply a partial form update without transforming raw employee-entered values. */
   const update = (patch: Partial<EmployeeProfileFormValues>) => setForm((prev) => ({ ...prev, ...patch }));
 
   useEffect(() => {
@@ -94,10 +132,11 @@ export default function EmployeeProfileEditor({
     });
   }, [agent, open, profile]);
 
+  /** Persist the profile and route validation/API failures through stable localized descriptors. */
   async function save() {
     if (!agent) return;
     if (!form.name.trim()) {
-      notify.error('请输入数字员工姓名');
+      toast.error(createMessageDescriptor('employeeProfile.validation.nameRequired'));
       return;
     }
     setSaving(true);
@@ -132,12 +171,15 @@ export default function EmployeeProfileEditor({
         harness_max_actions: Math.max(1, Math.min(100, form.harnessMaxActions || 32)),
         metadata,
       });
-      notify.success('数字员工档案已更新');
+      toast.success(createMessageDescriptor('employeeProfile.toast.updated'));
       onSaved?.(saved);
       onClose();
       window.dispatchEvent(new Event('ultrarag-enterprise-agent-scope-refresh'));
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '保存数字员工档案失败');
+      const descriptor = backendErrorMessageDescriptor(error);
+      toast.error(descriptor
+        ? { id: descriptor.messageId, values: descriptor.values }
+        : createMessageDescriptor('employeeProfile.toast.saveFailed'));
     } finally {
       setSaving(false);
     }
@@ -150,7 +192,13 @@ export default function EmployeeProfileEditor({
         className="employee-profile-modal flex max-h-[calc(100dvh-4rem)] w-[calc(100%-2rem)] flex-col gap-[16px] overflow-hidden rounded-[14px] px-[20px] py-[16px] sm:max-w-[860px]"
       >
         <DialogTitle className="px-[12px] text-[14px] font-normal leading-none text-[#757f9c]">
-          {agent ? `编辑数字员工档案：${employeeDisplayName(agent)}` : '编辑数字员工档案'}
+          {agent ? (
+            <>
+              <span>{t('employeeProfile.dialog.title')}</span>
+              <span aria-hidden="true">{t('employeeProfile.dialog.titleSeparator')}</span>
+              <RawIdentifier value={employeeDisplayName(agent)} />
+            </>
+          ) : t('employeeProfile.dialog.title')}
         </DialogTitle>
 
         <div className="min-h-0 flex-1 overflow-y-auto px-[12px]">
@@ -158,55 +206,61 @@ export default function EmployeeProfileEditor({
             <div className="employee-profile-preview">
               <EmployeeAvatar agent={agent} size={92} />
               <div>
-                <span className="m-0 block text-[12px] text-muted-foreground">数字员工档案</span>
-                <h4 className="mt-[4px] mb-[6px] text-[18px] font-semibold text-[#18181a]">{agent ? employeeDisplayName(agent) : '数字员工'}</h4>
-                <span className="m-0 block text-[12px] text-muted-foreground">{profile.roleName}</span>
+                <span className="m-0 block text-[12px] text-muted-foreground">{t('employeeProfile.preview.label')}</span>
+                <h4 className="mt-[4px] mb-[6px] text-[18px] font-semibold text-[#18181a]">
+                  {agent
+                    ? <RawIdentifier value={employeeDisplayName(agent)} />
+                    : t('employeeProfile.preview.fallbackName')}
+                </h4>
+                <span className="m-0 block text-[12px] text-muted-foreground">
+                  <RawContent value={profile.roleName} />
+                </span>
               </div>
               <span className="employee-profile-preview-icon"><IdcardOutlined /></span>
             </div>
 
             <div className="employee-profile-form flex flex-col gap-[14px]">
               <div className="employee-profile-form-grid">
-                <LabeledField label="数字员工姓名">
-                  <Input value={form.name} placeholder="例如：默认员工" onChange={(event) => update({ name: event.target.value })} />
+                <LabeledField label={t('employeeProfile.field.name')}>
+                  <Input value={form.name} placeholder={t('employeeProfile.placeholder.name')} onChange={(event) => update({ name: event.target.value })} />
                 </LabeledField>
-                <LabeledField label="岗位">
-                  <Input value={form.roleName} placeholder="例如：研发" onChange={(event) => update({ roleName: event.target.value })} />
+                <LabeledField label={t('employeeProfile.field.role')}>
+                  <Input value={form.roleName} placeholder={t('employeeProfile.placeholder.role')} onChange={(event) => update({ roleName: event.target.value })} />
                 </LabeledField>
-                <LabeledField label="入职时间">
+                <LabeledField label={t('employeeProfile.field.onboardedAt')}>
                   <Input type="date" value={form.onboardedAt} onChange={(event) => update({ onboardedAt: event.target.value })} />
                 </LabeledField>
-                <LabeledField label="工作状态">
+                <LabeledField label={t('employeeProfile.field.status')}>
                   <Select value={form.status} onValueChange={(value) => update({ status: value as 'active' | 'archived' })}>
                     <SelectTrigger className={`${SELECT_TRIGGER_CLASS} w-full`}>
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
-                      <SelectItem value="active">在线</SelectItem>
-                      <SelectItem value="archived">下线</SelectItem>
+                      <SelectItem value="active">{t('employeeProfile.status.active')}</SelectItem>
+                      <SelectItem value="archived">{t('employeeProfile.status.archived')}</SelectItem>
                     </SelectContent>
                   </Select>
                 </LabeledField>
               </div>
 
-              <LabeledField label="岗位描述">
-                <Textarea rows={3} value={form.description} placeholder="概括这个数字员工的岗位边界、服务风格和执行重点" onChange={(event) => update({ description: event.target.value })} />
+              <LabeledField label={t('employeeProfile.field.description')}>
+                <Textarea rows={3} value={form.description} placeholder={t('employeeProfile.placeholder.description')} onChange={(event) => update({ description: event.target.value })} />
               </LabeledField>
-              <LabeledField label="看板摘要">
-                <Textarea rows={2} value={form.systemPromptSummary} placeholder="用于数字员工档案页顶部展示的 system prompt 摘要" onChange={(event) => update({ systemPromptSummary: event.target.value })} />
+              <LabeledField label={t('employeeProfile.field.summary')}>
+                <Textarea rows={2} value={form.systemPromptSummary} placeholder={t('employeeProfile.placeholder.summary')} onChange={(event) => update({ systemPromptSummary: event.target.value })} />
               </LabeledField>
-              <LabeledField label="岗位执行约束">
-                <Textarea rows={4} value={form.personaPrompt} placeholder="员工在对话中的角色、人设、回复风格和执行边界" onChange={(event) => update({ personaPrompt: event.target.value })} />
+              <LabeledField label={t('employeeProfile.field.persona')}>
+                <Textarea rows={4} value={form.personaPrompt} placeholder={t('employeeProfile.placeholder.persona')} onChange={(event) => update({ personaPrompt: event.target.value })} />
               </LabeledField>
-              <LabeledField label="默认模型">
+              <LabeledField label={t('employeeProfile.field.defaultModel')}>
                 <div className="flex min-h-10 items-center rounded-[10px] border border-[#e3e7f1] bg-[#f7f8fa] px-3 text-[13px] text-[#59627a]">
-                  统一继承模型配置中的全局默认模型
+                  {t('employeeProfile.model.inherited')}
                 </div>
-                <span className="text-[11px] text-muted-foreground">员工不再单独绑定模型；切换全局默认模型后，所有员工立即生效。</span>
+                <span className="text-[11px] text-muted-foreground">{t('employeeProfile.model.hint')}</span>
               </LabeledField>
 
               <div className="rounded-[14px] border border-[#e3e7f1] bg-[#fafbfc] p-[14px]">
-                <LabeledField label="单次 HarnessLoop 最大调用轮次">
+                <LabeledField label={t('employeeProfile.field.maxActions')}>
                   <Input
                     type="number"
                     min={1}
@@ -220,27 +274,27 @@ export default function EmployeeProfileEditor({
                   />
                 </LabeledField>
                 <p className="m-0 mt-[6px] text-[11px] leading-[1.5] text-muted-foreground">
-                  限制该员工在一轮对话中可自主执行的模型动作与能力调用总数，范围 1–100；达到上限后未完成任务会进入后续轮次。
+                  {t('employeeProfile.maxActions.hint')}
                 </p>
               </div>
 
               <div className="employee-profile-form-grid is-tags">
-                <LabeledField label="掌握方向">
-                  <TagsField value={form.expertiseTags} options={EXPERTISE_OPTIONS} placeholder="输入后回车添加" onChange={(next) => update({ expertiseTags: next })} />
+                <LabeledField label={t('employeeProfile.field.expertise')}>
+                  <TagsField value={form.expertiseTags} options={EXPERTISE_OPTIONS} messageIds={EXPERTISE_MESSAGE_IDS} placeholder={t('employeeProfile.placeholder.tags')} onChange={(next) => update({ expertiseTags: next })} />
                 </LabeledField>
-                <LabeledField label="工作风格">
-                  <TagsField value={form.workStyles} options={STYLE_OPTIONS} placeholder="输入后回车添加" onChange={(next) => update({ workStyles: next })} />
+                <LabeledField label={t('employeeProfile.field.workStyles')}>
+                  <TagsField value={form.workStyles} options={STYLE_OPTIONS} messageIds={STYLE_MESSAGE_IDS} placeholder={t('employeeProfile.placeholder.tags')} onChange={(next) => update({ workStyles: next })} />
                 </LabeledField>
-                <LabeledField label="工作模式">
-                  <TagsField value={form.workModes} options={WORK_MODE_OPTIONS} placeholder="输入后回车添加" onChange={(next) => update({ workModes: next })} />
+                <LabeledField label={t('employeeProfile.field.workModes')}>
+                  <TagsField value={form.workModes} options={WORK_MODE_OPTIONS} messageIds={WORK_MODE_MESSAGE_IDS} placeholder={t('employeeProfile.placeholder.tags')} onChange={(next) => update({ workModes: next })} />
                 </LabeledField>
               </div>
 
               <div className="employee-profile-publish">
                 <div>
-                  <strong className="text-[13px] text-[#18181a]">发布到广场</strong>
+                  <strong className="text-[13px] text-[#18181a]">{t('employeeProfile.gallery.label')}</strong>
                   <p className="m-0 mt-[4px] text-[12px] text-muted-foreground">
-                    开启后，其他账号可以在对话端和数字员工广场中选择这个员工。
+                    {t('employeeProfile.gallery.hint')}
                   </p>
                 </div>
                 <Switch checked={form.publishedToGallery} onCheckedChange={(next) => update({ publishedToGallery: next })} />
@@ -249,21 +303,21 @@ export default function EmployeeProfileEditor({
           </div>
         </div>
 
-        <div className="flex items-center justify-end gap-[8px] px-[12px]">
+        <div className="flex shrink-0 flex-wrap items-center justify-end gap-[8px] px-[12px]">
           <UIButton
             variant="outline"
             disabled={saving}
             onClick={onClose}
-            className="h-[32px] w-[80px] rounded-[10px] border-[#e3e7f1] bg-white px-[12px] text-[14px] font-normal text-[#464c5e] hover:border-[#e3e7f1] hover:bg-[#f6f6f6] hover:text-[#18181a]"
+            className="h-[32px] min-w-[80px] whitespace-nowrap rounded-[10px] border-[#e3e7f1] bg-white px-[12px] text-[14px] font-normal text-[#464c5e] hover:border-[#e3e7f1] hover:bg-[#f6f6f6] hover:text-[#18181a]"
           >
-            取消
+            {t('employeeProfile.action.cancel')}
           </UIButton>
           <UIButton
             disabled={saving}
             onClick={() => void save()}
-            className="h-[32px] w-[80px] rounded-[10px] bg-[#18181a] px-[12px] text-[14px] font-normal text-white hover:bg-[#303030]"
+            className="h-[32px] min-w-[80px] whitespace-nowrap rounded-[10px] bg-[#18181a] px-[12px] text-[14px] font-normal text-white hover:bg-[#303030]"
           >
-            保存
+            {t('employeeProfile.action.save')}
           </UIButton>
         </div>
       </DialogContent>
@@ -271,6 +325,7 @@ export default function EmployeeProfileEditor({
   );
 }
 
+/** Render a localized form label around a controlled editor field. */
 function LabeledField({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <label className="flex flex-col gap-[6px]">
@@ -283,14 +338,17 @@ function LabeledField({ label, children }: { label: string; children: React.Reac
 function TagsField({
   value,
   options,
+  messageIds,
   placeholder,
   onChange,
 }: {
   value: string[];
   options: string[];
+  messageIds: Record<string, MessageId>;
   placeholder?: string;
   onChange: (next: string[]) => void;
 }) {
+  const { t } = useAppIntl();
   const [draft, setDraft] = useState('');
   const addTags = (raw: string) => {
     const parts = raw.split(/[,，]/).map((item) => item.trim()).filter(Boolean);
@@ -308,10 +366,10 @@ function TagsField({
             key={tag}
             className="inline-flex items-center gap-[4px] rounded-[6px] bg-[#f2f3f7] px-[8px] py-[2px] text-[12px] text-[#18181a]"
           >
-            {tag}
+            <RawContent value={tag} />
             <button
               type="button"
-              aria-label={`移除 ${tag}`}
+              aria-label={t('employeeProfile.tags.remove')}
               onClick={() => removeTag(tag)}
               className="grid place-items-center text-[#858b9c] hover:text-[#18181a]"
             >
@@ -348,7 +406,7 @@ function TagsField({
               onClick={() => addTags(item)}
               className="rounded-[6px] border-[0.5px] border-[#e3e7f1] px-[8px] py-[2px] text-[12px] text-[#858b9c] hover:border-[#18181a] hover:text-[#18181a]"
             >
-              + {item}
+              + {t(messageIds[item])}
             </button>
           ))}
         </div>
@@ -357,6 +415,7 @@ function TagsField({
   );
 }
 
+/** Deduplicate and bound raw tag values before sending them to the backend. */
 function compactTags(values: string[] | undefined): string[] {
   return Array.from(new Set((values || []).map((item) => item.trim()).filter(Boolean))).slice(0, 12);
 }

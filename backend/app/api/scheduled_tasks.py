@@ -3,8 +3,15 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlmodel import Session, select
 
+from app.contracts.domain_http import domain_http_error
 from app.db import get_session
-from app.db.models import Message, ScheduledTask, ScheduledTaskRun, User, utc_now
+from app.db.models import ChatSession, Message, ScheduledTask, ScheduledTaskRun, User, utc_now
+from app.i18n.language_context import (
+    LanguageContext,
+    LanguageContextInputs,
+    ReplyLocaleConflict,
+    resolve_language_context,
+)
 from app.scheduled_tasks.schema import (
     ScheduledTaskCreateRequest,
     ScheduledTaskDraftRead,
@@ -25,10 +32,26 @@ from app.security.auth import get_current_user
 from app.security.permissions import is_admin_user as _is_admin_user
 from app.security.tenant import ensure_tenant
 
-
 enterprise_router = APIRouter(prefix="/api/enterprise/scheduled-tasks", tags=["enterprise:scheduled-tasks"])
 chat_router = APIRouter(prefix="/api/chat/scheduled-tasks", tags=["chat:scheduled-tasks"])
 chat_draft_router = APIRouter(prefix="/api/chat/scheduled-task-drafts", tags=["chat:scheduled-task-drafts"])
+
+
+def _scheduled_task_api_error(
+    code: str,
+    status_code: int | None = None,
+    *,
+    params: dict[str, object] | None = None,
+    cause: BaseException | None = None,
+) -> HTTPException:
+    """Build a canonical scheduled-task API error without exposing raw task diagnostics."""
+    return domain_http_error(
+        code,
+        source="scheduled_tasks.api",
+        status_code=status_code,
+        params=params,
+        cause=cause,
+    )
 
 
 @enterprise_router.get("", response_model=list[ScheduledTaskRead])
@@ -148,7 +171,7 @@ def run_enterprise_scheduled_task_now(
 ) -> ScheduledTaskRunRead:
     row = _get_task(db, tenant_id, task_id, current_user)
     if row.status == "archived":
-        raise HTTPException(status_code=400, detail="已删除的自动任务不能运行")
+        raise _scheduled_task_api_error("SCHEDULED_TASK_ARCHIVED", 400)
     run = start_scheduled_task_async(db, row, scheduled_for=utc_now(), manual=True)
     return scheduled_task_run_read(run, row)
 
@@ -184,7 +207,9 @@ def create_chat_scheduled_task_draft(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_session),
 ) -> ScheduledTaskDraftRead:
+    """Resolve an immutable standalone locale snapshot before invoking draft detection."""
     _ensure_request_tenant(request.tenant_id, current_user)
+    language_context = _resolve_draft_language_context(db, request, current_user)
     draft = detect_scheduled_task_draft(
         db,
         request.tenant_id,
@@ -193,6 +218,7 @@ def create_chat_scheduled_task_draft(
         request.message,
         request.session_id,
         request.timezone,
+        language_context=language_context,
     )
     if not draft:
         return ScheduledTaskDraftRead(
@@ -202,6 +228,42 @@ def create_chat_scheduled_task_draft(
             source_session_id=request.session_id,
         )
     return draft
+
+
+def _resolve_draft_language_context(
+    db: Session,
+    request: ScheduledTaskDraftRequest,
+    current_user: User,
+) -> LanguageContext:
+    """Resolve explicit, session, and user locale inputs into one immutable draft snapshot."""
+    session = db.get(ChatSession, request.session_id) if request.session_id else None
+    session_reply_locale = (
+        session.agent_reply_locale
+        if session is not None
+        and session.tenant_id == request.tenant_id
+        and session.user_id == current_user.id
+        else None
+    )
+    try:
+        return resolve_language_context(
+            LanguageContextInputs(
+                explicit_ui_locale=request.ui_locale,
+                explicit_agent_reply_locale=request.agent_reply_locale,
+                session_agent_reply_locale=session_reply_locale,
+                user_ui_locale=current_user.ui_locale,
+                user_agent_reply_locale=current_user.agent_reply_locale,
+            )
+        )
+    except ReplyLocaleConflict as exc:
+        raise _scheduled_task_api_error(
+            "AGENT_REPLY_LOCALE_CONFLICT",
+            409,
+            params={
+                "requested": exc.params["requested"],
+                "session": exc.params["session"],
+            },
+            cause=exc,
+        ) from exc
 
 
 def _mark_chat_draft_created(db: Session, row: ScheduledTask, read: ScheduledTaskRead) -> None:
@@ -250,12 +312,12 @@ def _get_task(db: Session, tenant_id: str, task_id: str, current_user: User) -> 
     _ensure_request_tenant(tenant_id, current_user)
     row = db.get(ScheduledTask, task_id)
     if not row or row.tenant_id != tenant_id:
-        raise HTTPException(status_code=404, detail="自动任务不存在")
+        raise _scheduled_task_api_error("SCHEDULED_TASK_NOT_FOUND", 404)
     if not _is_admin_user(current_user) and row.created_by_user_id != current_user.id:
-        raise HTTPException(status_code=403, detail="无权访问该自动任务")
+        raise _scheduled_task_api_error("SCHEDULED_TASK_ACCESS_FORBIDDEN", 403)
     return row
 
 
 def _ensure_request_tenant(tenant_id: str, current_user: User) -> None:
     if current_user.tenant_id != tenant_id:
-        raise HTTPException(status_code=403, detail="Cannot access another tenant")
+        raise _scheduled_task_api_error("TENANT_MISMATCH", 403)

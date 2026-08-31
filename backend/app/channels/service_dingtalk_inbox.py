@@ -4,12 +4,16 @@ import json
 from dataclasses import asdict
 from typing import Any
 
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy import or_, update
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlmodel import Session, select
 
 from app.channels.adapters.base import ChannelInbound, ChannelInboundAttachment
-from app.channels.service_durable_inbox import StageDisposition, StageResult
+from app.channels.service_durable_inbox import (
+    StageDisposition,
+    StageResult,
+    channel_ingress_language_context,
+)
 from app.db.models import ChannelBinding, ChannelInboundEvent, new_id, utc_now
 
 DINGTALK_ENVELOPE_VERSION = 1
@@ -132,6 +136,9 @@ def stage_dingtalk_inbound(
                 id=new_id("chevt"), tenant_id=binding.tenant_id, binding_id=binding.id,
                 channel="dingtalk", event_id=inbound.event_id, payload_json=envelope,
                 config_revision=expected_revision, target_json=target, status="received",
+                language_context_json=channel_ingress_language_context(binding).model_dump(
+                    mode="json"
+                ),
             )
             db.add(event)
             try:

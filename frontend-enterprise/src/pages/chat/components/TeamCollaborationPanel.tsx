@@ -4,6 +4,8 @@ import { ChevronDown, CircleAlert, LoaderCircle, SendHorizontal } from 'lucide-r
 import { api, TENANT_ID } from '@/api/client';
 import EmployeeAvatar from '@/components/EmployeeAvatar';
 import { staffdeckDisplayText } from '@/employee';
+import { RawContent, RawIdentifier } from '@/i18n/RawContent';
+import { useAppIntl } from '@/i18n/useAppIntl';
 import { cn } from '@/lib/utils';
 import type {
   AgentProfileRead,
@@ -59,20 +61,28 @@ function collaborationTrace(rows: TurnTraceRead[]): { turnId: string; trace: Tur
   };
 }
 
+/** 从团队会话标题中移除协议前缀；返回的标题属于业务数据，不进行翻译。 */
 function conversationTitle(conversation: TeamConversationRead): string {
   return staffdeckDisplayText(conversation.title)
     .replace(/^团队任务验收:/, '')
     .replace(/^团队竞标(?:打分|裁决)?:/, '')
     .replace(/^团队任务:/, '')
-    .trim() || '团队任务';
+    .trim();
 }
 
-export function collaborationQuestion(conversation: TeamConversationRead): string {
-  const memberName = conversation.agent_name || '团队成员';
-  const title = conversationTitle(conversation);
-  return conversation.kind === 'member_bid'
-    ? `@${memberName}，请参与「${title}」竞标`
-    : `@${memberName}，请处理「${title}」`;
+/** Return structured question data; the caller formats product chrome via a stable ICU message. */
+export function collaborationQuestion(conversation: TeamConversationRead): {
+  messageId: 'chat.team.memberBidPromptTail' | 'chat.team.memberTaskPromptTail';
+  memberName: string;
+  title: string;
+} {
+  return {
+    messageId: conversation.kind === 'member_bid'
+      ? 'chat.team.memberBidPromptTail'
+      : 'chat.team.memberTaskPromptTail',
+    memberName: conversation.agent_name || '',
+    title: conversationTitle(conversation),
+  };
 }
 
 function conversationTimestamp(conversation: TeamConversationRead): number {
@@ -174,6 +184,7 @@ export default function TeamCollaborationPanel({
   conversation?: TeamConversationRead;
   onOpenCitation?: (citation: KnowledgeCitation) => void;
 }) {
+  const { t } = useAppIntl();
   const loadedConversations = useTeamCollaborations(conversation ? undefined : team);
   const conversations = conversation ? [conversation] : loadedConversations;
   const [expandedSessionId, setExpandedSessionId] = useState('');
@@ -269,6 +280,7 @@ export default function TeamCollaborationPanel({
     }
   }
 
+  /** 提交人工补充信息并恢复同一团队任务；技术异常仅记录日志，界面展示稳定错误消息。 */
   async function resumeTask(conversation: TeamConversationRead) {
     const taskId = conversation.task_id;
     const answer = taskId ? (answerByTaskId[taskId] || '').trim() : '';
@@ -284,9 +296,10 @@ export default function TeamCollaborationPanel({
         current.includes(taskId) ? current : [...current, taskId]
       ));
     } catch (error) {
+      console.error('[team-chat] resume task failed', error);
       setSubmitErrorByTaskId((current) => ({
         ...current,
-        [taskId]: error instanceof Error ? error.message : '补充信息提交失败',
+        [taskId]: t('chat.error.replyFailed'),
       }));
     } finally {
       setSubmittingTaskId('');
@@ -299,7 +312,9 @@ export default function TeamCollaborationPanel({
     const memberAgent = conversation.agent_id
       ? agentById.get(conversation.agent_id)
       : undefined;
-    const memberName = conversation.agent_name || '团队成员';
+    const rawMemberName = conversation.agent_name || '';
+    const memberName = rawMemberName || t('chat.team.memberFallback');
+    const title = conversationTitle(conversation) || t('chat.team.taskFallback');
     const expanded = expandedSessionId === conversation.session_id;
     const loading = loadingSessionId === conversation.session_id;
     const memberReplies = (messagesBySession[conversation.session_id] || [])
@@ -309,27 +324,25 @@ export default function TeamCollaborationPanel({
     const traceLines = traceSnapshot?.trace.lines || [];
     const traceLineDetails = traceDetails(traceLines);
     const traceLineSummary = traceSnapshot
-      ? traceSummary(traceSnapshot.trace, traceLines)
+      ? traceSummary(traceSnapshot.trace, traceLines, t)
       : null;
     const streamReply = staffdeckDisplayText(stream?.content || '');
     const showStreamReply = Boolean(
       streamReply
       && memberReplies.length === 0,
     );
-    const preview = staffdeckDisplayText(conversation.preview || '成员正在处理…');
+    const preview = staffdeckDisplayText(conversation.preview || '');
     const taskId = conversation.task_id || '';
     const waitingForInput = Boolean(conversation.needs_input && taskId);
     const submitted = Boolean(taskId && submittedTaskIds.includes(taskId));
-    const pendingQuestion = staffdeckDisplayText(
-      conversation.pending_question || conversation.preview || '请补充任务所需信息。',
-    );
+    const pendingQuestion = staffdeckDisplayText(conversation.pending_question || conversation.preview || '');
     const taskAnswer = taskId ? (answerByTaskId[taskId] || '') : '';
     const submitError = taskId ? submitErrorByTaskId[taskId] : '';
 
     return (
       <div
         key={conversation.session_id}
-        aria-label={`团队协作 ${memberName}`}
+        aria-label={t('chat.team.label', { memberName })}
         className="relative flex min-w-0 flex-col gap-[10px]"
       >
         <div className="flex min-w-0 items-start gap-[10px]">
@@ -337,17 +350,25 @@ export default function TeamCollaborationPanel({
           <div className="flex min-w-0 max-w-[680px] flex-1 flex-col gap-[5px]">
             <div className="flex items-center gap-[6px] px-[2px]">
               <span className="text-[11px] font-medium text-[#757f9c]">
-                {leaderMember?.agent_name || '项目领导'}
+                {leaderMember?.agent_name
+                  ? <RawIdentifier value={leaderMember.agent_name} />
+                  : t('chat.team.projectLead')}
               </span>
               <span className="rounded-full bg-[#edf3ff] px-[6px] py-px text-[9px] font-medium text-[#1a71ff]">
-                项目领导
+                {t('chat.team.projectLead')}
               </span>
             </div>
             <div className="rounded-[14px] border border-[#d9e5ff] bg-[#f6f9ff] px-[14px] py-[10px] text-[13px] leading-[20px] text-[#18181a]">
-              <span className="font-medium text-[#1a71ff]">{`@${memberName}`}</span>
+              <span
+                className="font-medium text-[#1a71ff]"
+                translate="no"
+                data-i18n-raw-kind="identifier"
+              >
+                @{memberName}
+              </span>
               {conversation.kind === 'member_bid'
-                ? `，请参与「${conversationTitle(conversation)}」竞标`
-                : `，请处理「${conversationTitle(conversation)}」`}
+                ? t('chat.team.memberBidPromptTail', { title })
+                : t('chat.team.memberTaskPromptTail', { title })}
             </div>
           </div>
         </div>
@@ -357,27 +378,29 @@ export default function TeamCollaborationPanel({
         <div className="flex min-w-0 items-start gap-[10px]">
           <EmployeeAvatar agent={memberAgent} size={36} radius={10} />
           <div className="flex min-w-0 max-w-[680px] flex-1 flex-col gap-[5px]">
-            <span className="px-[2px] text-[11px] font-medium text-[#757f9c]">{memberName}</span>
+            <span className="px-[2px] text-[11px] font-medium text-[#757f9c]">
+              {rawMemberName ? <RawIdentifier value={rawMemberName} /> : memberName}
+            </span>
             {waitingForInput ? (
               <div className="w-full rounded-[16px] border border-[#f0d8a8] bg-[#fffdf7] px-[14px] py-[12px] shadow-[0_8px_24px_rgba(90,61,8,0.06)]">
                 <div className="flex items-center gap-[7px] text-[11px] font-medium text-[#9a6811]">
                   <CircleAlert className="size-[14px]" />
-                  <span>{`${memberName}需要补充信息`}</span>
+                  <span>{t('chat.team.needsInfo', { memberName })}</span>
                   <span className="rounded-full bg-[#fff0c8] px-[7px] py-[2px] text-[9px] text-[#8a5b0a]">
-                    等待回复
+                    {t('chat.team.waitingForReply')}
                   </span>
                 </div>
                 <p className="mt-[8px] whitespace-pre-wrap text-[13px] leading-[21px] text-[#34302a]">
-                  {pendingQuestion}
+                  <RawContent value={pendingQuestion} />
                 </p>
                 {submitted ? (
                   <div className="mt-[11px] rounded-[10px] bg-[#eef8f3] px-[11px] py-[9px] text-[12px] text-[#277657]">
-                    已补充，任务正在继续执行
+                    {t('chat.team.submitted')}
                   </div>
                 ) : (
                   <div className="mt-[11px] flex items-end gap-[8px]">
                     <textarea
-                      aria-label={`回复${memberName}的补充问题`}
+                      aria-label={t('chat.team.replyQuestion', { memberName })}
                       value={taskAnswer}
                       onChange={(event) => setAnswerByTaskId((current) => ({
                         ...current,
@@ -390,12 +413,12 @@ export default function TeamCollaborationPanel({
                         }
                       }}
                       rows={2}
-                      placeholder="补充所需信息，Enter 发送"
+                      placeholder={t('chat.team.replyPlaceholder')}
                       className="min-h-[58px] min-w-0 flex-1 resize-none rounded-[11px] border border-[#e5d7b7] bg-white px-[11px] py-[8px] text-[12px] leading-[18px] text-[#18181a] outline-none transition focus:border-[#c99838] focus:ring-2 focus:ring-[#efdba8]/60"
                     />
                     <button
                       type="button"
-                      aria-label="补充并继续"
+                      aria-label={t('chat.team.continueAction')}
                       disabled={!taskAnswer.trim() || submittingTaskId === taskId}
                       onClick={() => void resumeTask(conversation)}
                       className="flex h-[36px] shrink-0 items-center gap-[5px] rounded-[10px] bg-[#18181a] px-[12px] text-[11px] font-medium text-white transition hover:bg-[#343437] disabled:cursor-not-allowed disabled:opacity-40"
@@ -403,7 +426,7 @@ export default function TeamCollaborationPanel({
                       {submittingTaskId === taskId
                         ? <LoaderCircle className="size-[13px] animate-spin" />
                         : <SendHorizontal className="size-[13px]" />}
-                      继续执行
+                      {t('chat.team.resume')}
                     </button>
                   </div>
                 )}
@@ -417,13 +440,16 @@ export default function TeamCollaborationPanel({
               >
                 <button
                   type="button"
-                  aria-label={`${expanded ? '收起' : '展开'}${memberName}的回复`}
+                  aria-label={t(
+                    expanded ? 'chat.team.collapseReply' : 'chat.team.expandReply',
+                    { memberName },
+                  )}
                   aria-expanded={expanded}
                   onClick={() => void toggleReply(conversation)}
                   className="flex w-full items-center gap-[8px] text-left"
                 >
                   <span className="min-w-0 flex-1 truncate text-[12px] text-[#464c5e]">
-                    {`${memberName}回复：${preview}`}
+                    {t('chat.team.replyPrefix', { memberName, preview })}
                   </span>
                   {loading ? (
                     <LoaderCircle className="size-[13px] shrink-0 animate-spin text-[#858b9c]" />
@@ -465,9 +491,10 @@ export default function TeamCollaborationPanel({
                       <div
                         key={message.id}
                         className="mb-[10px] text-[13px] leading-[21px] text-[#18181a] last:mb-0"
-                        data-i18n-ignore
                       >
-                        <MarkdownMessage content={visibleContent} />
+                        <div translate="no" data-i18n-raw-kind="content">
+                          <MarkdownMessage content={visibleContent} />
+                        </div>
                         <HarnessArtifactDownloads
                           artifacts={artifacts}
                           tenantId={TENANT_ID}
@@ -484,9 +511,10 @@ export default function TeamCollaborationPanel({
                     <div
                       className="mb-[8px] block text-[13px] leading-[21px] text-[#18181a] last:mb-0"
                       aria-live="polite"
-                      data-i18n-ignore
                     >
-                      <MarkdownMessage content={streamReply} />
+                      <div translate="no" data-i18n-raw-kind="content">
+                        <MarkdownMessage content={streamReply} />
+                      </div>
                       {stream?.status === 'running' && (
                         <span className="ml-[3px] inline-block h-[14px] w-[2px] animate-pulse rounded-full bg-[#1a71ff] align-[-2px]" />
                       )}
@@ -497,7 +525,9 @@ export default function TeamCollaborationPanel({
                       {stream?.status === 'running' && (
                         <LoaderCircle className="size-[12px] animate-spin" />
                       )}
-                      {stream?.phase || '成员正在处理，回复会实时显示在这里'}
+                      {stream?.phase
+                        ? <RawIdentifier value={stream.phase} />
+                        : t('chat.team.processing')}
                     </span>
                   )}
                 </div>

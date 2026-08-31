@@ -1,6 +1,9 @@
 import { UnderlineTabs, type UnderlineTabItem } from '@/components/ui';
 import { notify } from '@/components/ui/app-toast';
+import { useAppIntl } from '@/i18n/useAppIntl';
+import { RawContent } from '@/i18n/RawContent';
 import { cn } from '@/lib/utils';
+import { apiErrorMessage } from '@/lib/apiErrorMessages';
 
 import IconPlus from '../assets/icons/plus.svg?react';
 import IconSearch from '../assets/icons/search.svg?react';
@@ -29,6 +32,11 @@ import type { AgentProfileRead } from '../types';
 
 const ENTERPRISE_AGENT_STORAGE_KEY = 'ultrarag_enterprise_agent_scope';
 
+/** 按 locale 生成统计卡片的次级计数字符串，不把数字硬编码到固定语言片段里。 */
+function onlineSummary(count: number, translate: ReturnType<typeof useAppIntl>['t']): string {
+  return translate('agentsPage.summary.onlineCount', { count });
+}
+
 export default function AgentsPage({
   currentUser,
   isAdmin = false,
@@ -40,6 +48,7 @@ export default function AgentsPage({
   onCreateAgent?: () => void;
   onLogout?: () => void;
 }) {
+  const { t } = useAppIntl();
   const [agents, setAgents] = useState<AgentProfileRead[]>([]);
   const [loading, setLoading] = useState(false);
   const [avatarAgent, setAvatarAgent] = useState<AgentProfileRead | null>(null);
@@ -61,7 +70,9 @@ export default function AgentsPage({
       const rows = await api.get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${TENANT_ID}`);
       setAgents(rows);
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '加载员工失败');
+      notify.error(apiErrorMessage(error, 'common.error.generic') === 'common.error.generic'
+        ? t('agentsPage.toast.loadFailed')
+        : apiErrorMessage(error, 'common.error.generic'));
     } finally {
       setLoading(false);
     }
@@ -128,7 +139,9 @@ export default function AgentsPage({
       emitAgentScopeChange(selectedRow.id);
       navigate('/enterprise/dashboard');
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '加载员工失败');
+      notify.error(apiErrorMessage(error, 'common.error.generic') === 'common.error.generic'
+        ? t('agentsPage.toast.loadFailed')
+        : apiErrorMessage(error, 'common.error.generic'));
     } finally {
       setSelectingAgentId(null);
     }
@@ -145,11 +158,13 @@ export default function AgentsPage({
         status,
         metadata: row.metadata || {},
       });
-      notify.success(status === 'active' ? '员工已上线' : '员工已下线');
+      notify.success(status === 'active' ? t('agentsPage.toast.published') : t('agentsPage.toast.archived'));
       await load();
       window.dispatchEvent(new Event('ultrarag-enterprise-agent-scope-refresh'));
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '更新员工状态失败');
+      notify.error(apiErrorMessage(error, 'common.error.generic') === 'common.error.generic'
+        ? t('agentsPage.toast.updateStatusFailed')
+        : apiErrorMessage(error, 'common.error.generic'));
     }
   }
 
@@ -165,11 +180,17 @@ export default function AgentsPage({
         tenant_id: TENANT_ID,
         metadata,
       });
-      notify.success(published ? '已发布到广场' : '已从广场下架');
+      notify.success(
+        published
+          ? t('agentsPage.toast.marketplacePublished')
+          : t('agentsPage.toast.marketplaceUnpublished'),
+      );
       await load();
       window.dispatchEvent(new Event('ultrarag-enterprise-agent-scope-refresh'));
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '更新广场状态失败');
+      notify.error(apiErrorMessage(error, 'common.error.generic') === 'common.error.generic'
+        ? t('agentsPage.toast.updateMarketplaceFailed')
+        : apiErrorMessage(error, 'common.error.generic'));
     }
   }
 
@@ -190,12 +211,14 @@ export default function AgentsPage({
           window.dispatchEvent(new CustomEvent('ultrarag-enterprise-agent-scope-change', { detail: { agentId: '' } }));
         }
       }
-      notify.success('员工已删除');
+      notify.success(t('agentsPage.toast.deleted'));
       setDeleteTarget(null);
       await load();
       window.dispatchEvent(new Event('ultrarag-enterprise-agent-scope-refresh'));
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '删除员工失败');
+      notify.error(apiErrorMessage(error, 'common.error.generic') === 'common.error.generic'
+        ? t('agentsPage.toast.deleteFailed')
+        : apiErrorMessage(error, 'common.error.generic'));
     } finally {
       setDeleting(false);
     }
@@ -206,21 +229,21 @@ export default function AgentsPage({
   }
 
   const employeeTabs: UnderlineTabItem<typeof employeeFilter>[] = [
-    { value: 'all', label: '全部员工' },
-    { value: 'online', label: '在线员工' },
-    { value: 'offline', label: '下线员工' },
+    { value: 'all', label: t('agentsPage.tabs.all') },
+    { value: 'online', label: t('agentsPage.tabs.online') },
+    { value: 'offline', label: t('agentsPage.tabs.offline') },
   ];
 
   const summaryCardClass =
     'flex h-[100px] flex-1 basis-[220px] items-center gap-[16px] rounded-[20px] bg-[#f6f6f6] px-[32px] py-[20px] text-left transition-shadow';
   const summaryStats: { key: typeof employeeFilter; value: number; label: string; sub: string }[] = [
-    { key: 'all', value: employees.length, label: '员工总数', sub: `${onlineEmployees.length}位在线` },
-    { key: 'offline', value: offlineEmployees.length, label: '下线员工', sub: '0位在线' },
+    { key: 'all', value: employees.length, label: t('agentsPage.stats.totalEmployees'), sub: onlineSummary(onlineEmployees.length, t) },
+    { key: 'offline', value: offlineEmployees.length, label: t('agentsPage.tabs.offline'), sub: onlineSummary(0, t) },
     {
       key: 'pending',
       value: pendingEmployees.length,
-      label: '待审批',
-      sub: `${pendingEmployees.filter((item) => item.status === 'active').length}位在线`,
+      label: t('agentsPage.tabs.pending'),
+      sub: onlineSummary(pendingEmployees.filter((item) => item.status === 'active').length, t),
     },
   ];
 
@@ -239,8 +262,8 @@ export default function AgentsPage({
               data-bwignore="true"
               value={searchTerm}
               onChange={(event) => setSearchTerm(event.target.value)}
-              placeholder="搜索"
-              aria-label="搜索员工"
+              placeholder={t('agentsPage.search.placeholder')}
+              aria-label={t('agentsPage.search.label')}
               className="min-w-0 flex-1 border-0 bg-transparent text-[14px] text-[#18181A] outline-none placeholder:text-[#757F9C]"
             />
           </div>
@@ -248,7 +271,7 @@ export default function AgentsPage({
       />
 
 
-      <div className="flex flex-wrap items-stretch gap-[20px] my-[36px]" aria-label="数字员工统计">
+      <div className="flex flex-wrap items-stretch gap-[20px] my-[36px]" aria-label={t('agentsPage.stats.ariaLabel')}>
         {summaryStats.map((stat) => (
           <button
             key={stat.key}
@@ -271,18 +294,19 @@ export default function AgentsPage({
             <IconPlus className="size-[38px]" />
           </span>
           <span className="flex min-w-0 flex-col gap-[4px]">
-            <span className="whitespace-nowrap text-[14px] text-[#464C5E]">创建新员工</span>
-            <span className="whitespace-nowrap text-[12px] text-[#757F9C]">几步搭好你的数字员工</span>
+            <span className="whitespace-nowrap text-[14px] text-[#464C5E]">{t('agentsPage.actions.create')}</span>
+            <span className="whitespace-nowrap text-[12px] text-[#757F9C]">{t('agentsPage.actions.createHint')}</span>
           </span>
         </button>
       </div>
 
       <UnderlineTabs
-        className="mb-[16px]"
-        aria-label="数字员工分类"
+        className="mb-[16px] w-full max-w-[520px]"
+        aria-label={t('agentsPage.tabs.ariaLabel')}
         value={employeeFilter}
         onChange={setEmployeeFilter}
         items={employeeTabs}
+        tabClassName="min-w-max flex-1 px-[12px]"
       />
 
       <div className="grid auto-rows-[minmax(262px,auto)] grid-cols-1 content-start gap-[32px] sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4 max-[900px]:gap-[18px]">
@@ -304,7 +328,10 @@ export default function AgentsPage({
           />
         ))}
         {!filteredEmployees.length && (
-          <AgentsEmptyState />
+          <AgentsEmptyState
+            title={t('agentsPage.empty.title')}
+            description={t('agentsPage.empty.description')}
+          />
         )}
       </div>
       <EmployeeAvatarEditor
@@ -331,15 +358,21 @@ export default function AgentsPage({
           if (!open) setDeleteTarget(null);
         }}
         loading={deleting}
-        title={`删除员工「${deleteTarget ? employeeDisplayName(deleteTarget) : ''}」？`}
-        description="删除后该员工的所有配置将一并移除，操作不可撤销。"
+        title={deleteTarget ? (
+          <>
+            {t('agentsPage.dialog.delete.titlePrefix')}
+            <RawContent value={employeeDisplayName(deleteTarget)} />
+            {t('agentsPage.dialog.delete.titleSuffix')}
+          </>
+        ) : ''}
+        description={t('agentsPage.dialog.delete.description')}
         onConfirm={() => void confirmDelete()}
       />
     </div>
   );
 }
 
-function AgentsEmptyState() {
+function AgentsEmptyState({ title, description }: { title: string; description: string }) {
   return (
     <div className="flex h-[262px] w-full items-center justify-center rounded-[20px] border border-dashed border-[#e4e9f2] bg-[#fbfcfe] px-[24px] text-center">
       <div className="flex max-w-[210px] flex-col items-center">
@@ -347,10 +380,10 @@ function AgentsEmptyState() {
           <IconSearch className="size-[16px] shrink-0" />
         </span>
         <p className="mt-[12px] text-[14px] font-medium leading-[20px] text-[#7f879a]">
-          没有匹配的数字员工
+          {title}
         </p>
         <p className="mt-[4px] text-[11px] leading-[17px] text-[#a7adbb]">
-          调整筛选条件，或换个关键词再试试
+          {description}
         </p>
       </div>
     </div>

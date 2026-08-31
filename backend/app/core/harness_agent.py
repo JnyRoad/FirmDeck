@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import time
 from collections.abc import Callable
 from dataclasses import is_dataclass, replace
@@ -20,7 +21,10 @@ from app.core.task_request_compiler import (
     TaskRequirement,
 )
 from app.db.models import ModelConfig
+from app.i18n.language_context import LanguageContext
+from app.i18n.raw_source import RawSourceKind, RawSourceMarker
 from app.llm import LLMClient, LLMError
+from app.llm.prompts.language import language_prompt_contract, localized_compat_text
 from app.observability.spans import llm_operation
 from app.session.slot_policy import strip_router_generated_message_slots
 
@@ -29,6 +33,7 @@ MAX_SUCCESSFUL_KNOWLEDGE_SEARCHES_PER_TASK = 2
 ToolInvoker = Callable[[str, dict[str, Any]], dict[str, Any]]
 TraceSink = Callable[[str, dict[str, Any]], None]
 CancellationCheck = Callable[[], bool]
+logger = logging.getLogger(__name__)
 
 
 class HarnessExecutionCancelled(RuntimeError):
@@ -51,6 +56,58 @@ class HarnessAction(BaseModel):
     structured_result: Any | None = None
 
 
+def _public_harness_error(code: str) -> dict[str, str]:
+    """Project one Harness failure as stable public metadata without raw exception text."""
+    return {"code": code, "message": code}
+
+
+def _harness_raw_source_markers(
+    requirement: TaskRequirement,
+) -> list[RawSourceMarker]:
+    """Mark present user, history, provider, path, and transcript fields in a Harness payload."""
+    markers = [
+        RawSourceMarker(
+            json_pointer="/task_requirement/source_user_message",
+            kind=RawSourceKind.USER_INPUT,
+        )
+    ]
+    if requirement.memory_projection:
+        markers.append(
+            RawSourceMarker(
+                json_pointer="/task_requirement/memory_projection",
+                kind=RawSourceKind.HISTORY,
+            )
+        )
+    if requirement.prior_task_results:
+        markers.append(
+            RawSourceMarker(
+                json_pointer="/task_requirement/prior_task_results",
+                kind=RawSourceKind.TOOL_PROVIDER_OUTPUT,
+            )
+        )
+    if requirement.attachments:
+        markers.append(
+            RawSourceMarker(
+                json_pointer="/task_requirement/attachments",
+                kind=RawSourceKind.PATH,
+            )
+        )
+    if requirement.published_deliverables:
+        markers.append(
+            RawSourceMarker(
+                json_pointer="/task_requirement/published_deliverables",
+                kind=RawSourceKind.PATH,
+            )
+        )
+    markers.append(
+        RawSourceMarker(
+            json_pointer="/harness_transcript",
+            kind=RawSourceKind.TOOL_PROVIDER_OUTPUT,
+        )
+    )
+    return markers
+
+
 class HarnessTaskAgent:
     """Runs one isolated TaskRequirement without outer conversation messages."""
 
@@ -67,7 +124,11 @@ class HarnessTaskAgent:
         step_deadline_monotonic: float | None = None,
         step_timeout_seconds: int | None = None,
         checkpoint: dict[str, Any] | None = None,
+        language_context: LanguageContext | None = None,
     ) -> TaskExecutionResult:
+        """Run one isolated requirement under an immutable reply-locale and raw-source contract."""
+        # Workflow: restore only the same frame/step checkpoint before constructing model input.
+        language_context = language_context or requirement.language_context
         max_actions = max(1, min(int(max_actions), 100))
         checkpoint = dict(checkpoint or {})
         current_step_id = _requirement_step_id(requirement)
@@ -146,6 +207,7 @@ class HarnessTaskAgent:
             return result
 
         for iteration in range(1, max_actions + 1):
+            # Workflow: build a fresh stage payload so each model action sees current tool evidence.
             _raise_if_cancelled(is_cancelled)
             if _deadline_expired(step_deadline_monotonic):
                 return finish(_step_timeout_result(
@@ -157,6 +219,7 @@ class HarnessTaskAgent:
                     evidence_results=evidence_results,
                     artifacts=artifacts,
                     trace_sink=trace_sink,
+                    language_context=language_context,
                 ))
             requirement_payload = requirement.model_dump(mode="json")
             attachment_descriptors, attachment_context = isolated_attachment_context(
@@ -165,6 +228,10 @@ class HarnessTaskAgent:
             )
             requirement_payload["attachments"] = attachment_descriptors
             payload = {
+                **language_prompt_contract(
+                    language_context,
+                    _harness_raw_source_markers(requirement),
+                ),
                 "task_requirement": requirement_payload,
                 "harness_transcript": _transcript_for_model(transcript),
                 "iteration": iteration,
@@ -227,6 +294,7 @@ class HarnessTaskAgent:
                             action = _adapt_general_skill_structured_result(
                                 raw,
                                 loaded_general_skill_names=loaded_general_skill_names,
+                                language_context=language_context,
                             )
                             if action is not None:
                                 if trace_sink:
@@ -268,7 +336,7 @@ class HarnessTaskAgent:
                                         "harness_action_repair_requested",
                                         {
                                             "iteration": iteration,
-                                            "error": str(exc),
+                                            "error": "HARNESS_ACTION_INVALID",
                                         },
                                     )
                                 continue
@@ -278,7 +346,11 @@ class HarnessTaskAgent:
                     if validation_error is not None:
                         raise validation_error
                     raise RuntimeError("Harness action generation returned no action.")
-            except (ValidationError, ValueError, LLMError) as exc:
+            except (ValidationError, ValueError, LLMError):
+                logger.exception(
+                    "harness action generation failed",
+                    extra={"task_frame_id": requirement.task_frame_id, "iteration": iteration},
+                )
                 if _deadline_expired(step_deadline_monotonic):
                     return finish(_step_timeout_result(
                         requirement,
@@ -289,23 +361,32 @@ class HarnessTaskAgent:
                         evidence_results=evidence_results,
                         artifacts=artifacts,
                         trace_sink=trace_sink,
+                        language_context=language_context,
                     ))
                 if trace_sink:
                     trace_sink(
                         "harness_action_failed",
                         {
                             "iteration": iteration,
-                            "error": str(exc),
+                            "error": "HARNESS_ACTION_INVALID",
                         },
                     )
                 return finish(TaskExecutionResult(
                     task_frame_id=requirement.task_frame_id,
                     status="failed",
-                    reply_fragment="当前任务的执行模型没有返回有效动作。",
-                    task_summary="Harness 动作解析失败。",
+                    reply_fragment=localized_compat_text(
+                        language_context,
+                        zh_cn="当前任务的执行模型没有返回有效动作。",
+                        en_us="The task execution model did not return a valid action.",
+                    ),
+                    task_summary=localized_compat_text(
+                        language_context,
+                        zh_cn="Harness 动作解析失败。",
+                        en_us="Harness action parsing failed.",
+                    ),
                     capability_results=capability_results,
                     action_count=iteration,
-                    error={"code": "HARNESS_ACTION_INVALID", "message": str(exc)},
+                    error=_public_harness_error("MODEL_INVALID_PROVIDER_RESPONSE"),
                 ))
             _raise_if_cancelled(is_cancelled)
             if _deadline_expired(step_deadline_monotonic):
@@ -318,6 +399,7 @@ class HarnessTaskAgent:
                     evidence_results=evidence_results,
                     artifacts=artifacts,
                     trace_sink=trace_sink,
+                    language_context=language_context,
                 ))
 
             if trace_sink:
@@ -451,13 +533,14 @@ class HarnessTaskAgent:
                         _raise_if_cancelled(is_cancelled)
                     except (HarnessExecutionCancelled, HarnessExecutionFenced):
                         raise
-                    except Exception as exc:
+                    except Exception:
+                        logger.exception(
+                            "harness tool invocation failed",
+                            extra={"task_frame_id": requirement.task_frame_id, "tool_name": tool_name},
+                        )
                         result = {
                             "success": False,
-                            "error": {
-                                "code": "HARNESS_TOOL_ERROR",
-                                "message": str(exc),
-                            },
+                            "error": _public_harness_error("TOOL_UPSTREAM_ERROR"),
                         }
                     if _is_non_retryable_failure(result):
                         non_retryable_action_signatures.add(action_signature)
@@ -491,6 +574,7 @@ class HarnessTaskAgent:
                     evidence_results=evidence_results,
                     artifacts=artifacts,
                     trace_sink=trace_sink,
+                    language_context=language_context,
                 ))
             activated_names = _activate_described_capabilities(
                 requirement,
@@ -534,12 +618,20 @@ class HarnessTaskAgent:
         return finish(TaskExecutionResult(
             task_frame_id=requirement.task_frame_id,
             status="action_budget",
-            reply_fragment="当前任务已达到本轮自动执行上限，需要下一轮继续。",
+            reply_fragment=localized_compat_text(
+                language_context,
+                zh_cn="当前任务已达到本轮自动执行上限，需要下一轮继续。",
+                en_us="This task reached the automatic action limit and must continue next turn.",
+            ),
             citations=citations,
             evidence_results=evidence_results,
             capability_results=capability_results,
             artifacts=artifacts,
-            task_summary="Harness 达到 action budget。",
+            task_summary=localized_compat_text(
+                language_context,
+                zh_cn="Harness 达到 action budget。",
+                en_us="Harness reached its action budget.",
+            ),
             action_count=max_actions,
             error={"code": "ACTION_BUDGET_EXHAUSTED"},
         ))
@@ -661,6 +753,7 @@ def _adapt_general_skill_structured_result(
     raw: object,
     *,
     loaded_general_skill_names: list[str],
+    language_context: LanguageContext | None = None,
 ) -> HarnessAction | None:
     """Turn an instruction-only Skill's bare business JSON into a safe finish action.
 
@@ -690,7 +783,13 @@ def _adapt_general_skill_structured_result(
         status="completed",
         reply_fragment=reply_fragment,
         task_summary=(
-            f"{loaded_general_skill_names[-1]} 已生成结构化业务结果。"
+            localized_compat_text(
+                language_context,
+                zh_cn=f"{loaded_general_skill_names[-1]} 已生成结构化业务结果。",
+                en_us=(
+                    f"{loaded_general_skill_names[-1]} generated a structured business result."
+                ),
+            )
         ),
         structured_result=raw,
     )
@@ -812,11 +911,21 @@ def _step_timeout_result(
     evidence_results: list[dict[str, Any]],
     artifacts: list[dict[str, Any]],
     trace_sink: TraceSink | None,
+    language_context: LanguageContext | None = None,
 ) -> TaskExecutionResult:
-    limit_text = f"{timeout_seconds} 秒" if timeout_seconds else "配置的时间"
+    """Create a locale-bound timeout result while retaining stable machine fields."""
+    limit_text = localized_compat_text(
+        language_context,
+        zh_cn=f"{timeout_seconds} 秒" if timeout_seconds else "配置的时间",
+        en_us=f"{timeout_seconds} seconds" if timeout_seconds else "the configured time",
+    )
     error = {
         "code": "SOP_STEP_TIMEOUT",
-        "message": f"当前 SOP 单步运行超过 {limit_text}，已停止继续执行。",
+        "message": localized_compat_text(
+            language_context,
+            zh_cn=f"当前 SOP 单步运行超过 {limit_text}，已停止继续执行。",
+            en_us=f"The SOP step exceeded {limit_text} and execution was stopped.",
+        ),
         "timeout_seconds": timeout_seconds,
     }
     if trace_sink:
@@ -836,7 +945,11 @@ def _step_timeout_result(
         evidence_results=evidence_results,
         capability_results=capability_results,
         artifacts=artifacts,
-        task_summary="SOP 单步运行超时。",
+        task_summary=localized_compat_text(
+            language_context,
+            zh_cn="SOP 单步运行超时。",
+            en_us="The SOP step timed out.",
+        ),
         action_count=max(0, action_count),
         error=error,
     )

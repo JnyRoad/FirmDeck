@@ -28,6 +28,15 @@ from app.db.models import (
     new_id,
     utc_now,
 )
+from app.i18n.language_context import LanguageContext, resolve_compatible_language_context
+from app.session.session_kinds import (
+    SESSION_KIND_TEAM_BID_JUDGE,
+    SESSION_KIND_TEAM_BID_SCORE,
+    SESSION_KIND_TEAM_MEMBER_BID,
+    SESSION_KIND_TEAM_MEMBER_TASK,
+    SESSION_KIND_TEAM_SYNTHESIS,
+    SESSION_KIND_TEAM_TL_REVIEW,
+)
 from app.session.session_schema import (
     ChatTurnRequest,
     ChatTurnResponse,
@@ -56,6 +65,7 @@ from app.teams.service import (
     record_task_event,
     select_bid_candidates,
     task_activation_state,
+    team_reason_payload,
     team_roster_lines,
     write_blackboard_entries,
 )
@@ -127,6 +137,106 @@ TL_BID_JUDGE_REPAIR_MESSAGE = (
     "或 winner_agent_id 不在候选列表中,裁决未生效。"
     "请立即输出规定的 bid_award JSON 代码块(可只输出代码块)。"
 )
+TEAM_WAKE_EXECUTION_FAILED = "TEAM_WAKE_EXECUTION_FAILED"
+
+
+def _public_wake_failure_code() -> str:
+    """Return the stable public code used by wake and task audit payloads on failure."""
+    return TEAM_WAKE_EXECUTION_FAILED
+
+
+def _wake_failure_audit_payload(
+    event: TeamWakeEvent,
+    *,
+    reason_code: str,
+) -> dict[str, object]:
+    """Build the registered team failure envelope for a wake-triggered task outcome."""
+    if event.trigger_type in {"bid_request", "bid_judge"}:
+        round_ = int(event.payload_json.get("round") or 1)
+        return {
+            **team_reason_payload(
+                "team.task.bid.failed",
+                reason_code=reason_code,
+                params={"round": round_},
+            ),
+            "round": round_,
+        }
+    if event.trigger_type == "task_report":
+        return team_reason_payload(
+            "team.task.review.failed",
+            reason_code=reason_code,
+        )
+    return team_reason_payload(
+        "team.task.escalated",
+        reason_code=reason_code,
+    )
+
+
+def _team_language_context(
+    db: Session,
+    *,
+    snapshot: object = None,
+    event: TeamWakeEvent | None = None,
+    task: TeamTask | None = None,
+    run: TeamRun | None = None,
+    source_turn_id: str | None = None,
+    legacy_agent_reply_locale: str | None = None,
+) -> LanguageContext:
+    """Resolve one team execution snapshot without consulting mutable UI preferences.
+
+    The explicit snapshot and durable team rows are authoritative.  A source user
+    message is used only when a pre-migration row has not yet been backfilled;
+    records with no snapshot use the shared compatibility resolver so the fallback
+    remains observable and can be removed after the migration window.
+    """
+    candidates = [
+        snapshot,
+        event.language_context_json if event is not None else None,
+        task.language_context_json if task is not None else None,
+        run.language_context_json if run is not None else None,
+    ]
+    if source_turn_id:
+        source_message = db.get(Message, source_turn_id)
+        source_metadata = (
+            source_message.metadata_json
+            if source_message is not None and isinstance(source_message.metadata_json, dict)
+            else {}
+        )
+        candidates.append(source_metadata.get("language_context"))
+    for candidate in candidates:
+        if candidate is not None:
+            return resolve_compatible_language_context(
+                snapshot=candidate,
+                legacy_ui_locale=None,
+                legacy_agent_reply_locale=legacy_agent_reply_locale,
+            )
+    return resolve_compatible_language_context(
+        snapshot=None,
+        legacy_ui_locale=None,
+        legacy_agent_reply_locale=legacy_agent_reply_locale,
+    )
+
+
+def _bind_team_language_context(
+    db: Session,
+    context: LanguageContext,
+    *rows: object | None,
+) -> None:
+    """Backfill team execution rows while rejecting contradictory snapshots."""
+    expected = context.model_dump(mode="json")
+    for row in rows:
+        if row is None:
+            continue
+        current = getattr(row, "language_context_json", None)
+        if current is None:
+            row.language_context_json = expected
+        elif resolve_compatible_language_context(
+            snapshot=current,
+            legacy_ui_locale=None,
+            legacy_agent_reply_locale=None,
+        ) != context:
+            raise RuntimeError("团队执行语言快照冲突")
+        db.add(row)
 
 
 def build_team_planner_context(db: Session, team: Team) -> TeamPlannerContext:
@@ -363,14 +473,36 @@ def enqueue_wake_event(
     target_agent_id: str,
     trigger_type: str,
     payload: dict | None = None,
+    language_context: LanguageContext | dict | None = None,
 ) -> TeamWakeEvent:
+    """Create a wake event bound to the originating team's locale snapshot."""
+    payload_json = dict(payload or {})
+    task_id = str(payload_json.get("task_id") or "").strip()
+    task = db.get(TeamTask, task_id) if task_id else None
+    if task is not None and (
+        task.team_id != team.id or task.tenant_id != team.tenant_id
+    ):
+        task = None
+    run_id = str(payload_json.get("team_run_id") or "").strip()
+    run = db.get(TeamRun, run_id) if run_id else None
+    if run is not None and (run.team_id != team.id or run.tenant_id != team.tenant_id):
+        run = None
+    context = _team_language_context(
+        db,
+        snapshot=language_context,
+        task=task,
+        run=run,
+        source_turn_id=task.source_turn_id if task is not None else None,
+    )
+    _bind_team_language_context(db, context, task, run)
     event = TeamWakeEvent(
         team_id=team.id,
         tenant_id=team.tenant_id,
         target_agent_id=target_agent_id,
         trigger_type=trigger_type,
-        payload_json=dict(payload or {}),
+        payload_json=payload_json,
         status="pending",
+        language_context_json=context.model_dump(mode="json"),
     )
     db.add(event)
     db.flush()
@@ -736,6 +868,7 @@ def run_agent_turn(
     client_turn_id: str | None = None,
     allow_needs_input: bool = False,
     message_visibility: Literal["visible", "internal"] = "visible",
+    language_context: LanguageContext | dict | None = None,
 ) -> TeamAgentTurnResult:
     """在独立会话里执行一轮 agent turn，并复用单聊落库消息作为结果源。
 
@@ -750,6 +883,16 @@ def run_agent_turn(
         agent=agent,
         session_id=session_id,
     )
+    context = _team_language_context(
+        db,
+        snapshot=language_context,
+        legacy_agent_reply_locale=session.agent_reply_locale,
+    )
+    if session.agent_reply_locale != context.agent_reply_locale.value:
+        session.agent_reply_locale = context.agent_reply_locale.value
+        session.agent_reply_locale_source = context.agent_reply_locale_source.value
+        session.updated_at = utc_now()
+        db.add(session)
     turn_id = client_turn_id or wake_event_id
     request = ChatTurnRequest(
         tenant_id=team.tenant_id,
@@ -761,6 +904,9 @@ def run_agent_turn(
         channel="team",
         interaction_mode=interaction_mode,
         message_visibility=message_visibility,
+        ui_locale=context.ui_locale,
+        agent_reply_locale=context.agent_reply_locale,
+        language_context=context,
     )
     result: ChatTurnResponse | None = None
     for item in AgentLoop(db).handle_turn_stream(request):
@@ -862,15 +1008,24 @@ def execute_wake_event(db: Session, event: TeamWakeEvent) -> TeamWakeEvent:
             "wake_completed",
             {"trigger_type": event.trigger_type, "agent_id": event.target_agent_id},
         )
-    except Exception as exc:
+    except Exception:
+        public_error_code = _public_wake_failure_code()
+        logger.exception(
+            "team wake execution failed",
+            extra={
+                "wake_event_id": event.id,
+                "trigger_type": event.trigger_type,
+                "target_agent_id": event.target_agent_id,
+            },
+        )
         if event.trigger_type == "bid_request":
-            _handle_bid_failure(db, event, exc)
+            _handle_bid_failure(db, event, public_error_code)
         elif event.trigger_type == "team_synthesis":
             run_id = str(event.payload_json.get("team_run_id") or "")
             run = db.get(TeamRun, run_id) if run_id else None
             if run is not None:
                 run.status = "failed"
-                run.error = str(exc)
+                run.error = public_error_code
                 run.updated_at = utc_now()
                 db.add(run)
                 tasks = list(
@@ -882,9 +1037,9 @@ def execute_wake_event(db: Session, event: TeamWakeEvent) -> TeamWakeEvent:
                 )
                 _update_team_run_progress_message(db, run, tasks, phase="failed")
         else:
-            _escalate_task_on_failure(db, event, exc)
+            _escalate_task_on_failure(db, event, public_error_code)
         event.status = "failed"
-        event.error = str(exc)
+        event.error = public_error_code
         _record_wake_lifecycle(
             db,
             event,
@@ -892,7 +1047,7 @@ def execute_wake_event(db: Session, event: TeamWakeEvent) -> TeamWakeEvent:
             {
                 "trigger_type": event.trigger_type,
                 "agent_id": event.target_agent_id,
-                "error": str(exc),
+                "error": public_error_code,
             },
         )
     finally:
@@ -917,7 +1072,10 @@ def execute_wake_event(db: Session, event: TeamWakeEvent) -> TeamWakeEvent:
     return event
 
 
-def _escalate_task_on_failure(db: Session, event: TeamWakeEvent, exc: Exception) -> None:
+def _escalate_task_on_failure(
+    db: Session, event: TeamWakeEvent, _public_reason: str
+) -> None:
+    """Escalate one failed wake task with a safe public reason while raw details stay in logs."""
     task_id = str(event.payload_json.get("task_id") or "")
     if not task_id:
         return
@@ -932,7 +1090,13 @@ def _escalate_task_on_failure(db: Session, event: TeamWakeEvent, exc: Exception)
             actor_type="system",
             actor_id=None,
             event_type="task_escalated",
-            payload={"reason": str(exc), "wake_event_id": event.id},
+            payload={
+                **_wake_failure_audit_payload(
+                    event,
+                    reason_code="execution_failed",
+                ),
+                "wake_event_id": event.id,
+            },
         )
         db.commit()
     except Exception:
@@ -951,10 +1115,27 @@ def _execute_member_task(db: Session, event: TeamWakeEvent, team: Team, agent: A
             db,
             event,
             "member_execution_skipped",
-            {"reason": "task_already_terminal", "task_status": task.status},
+            {
+                "event_code": "team.task.member.skipped",
+                "params": {"reason_code": "task_already_terminal"},
+                "reason": {
+                    "code": "task_already_terminal",
+                    "params": {"task_status": task.status},
+                },
+                "task_status": task.status,
+            },
         )
         return
     rework = event.trigger_type == "task_rework"
+    run = db.get(TeamRun, task.team_run_id) if task.team_run_id else None
+    context = _team_language_context(
+        db,
+        event=event,
+        task=task,
+        run=run,
+        source_turn_id=task.source_turn_id,
+    )
+    _bind_team_language_context(db, context, event, task, run)
     session = db.get(ChatSession, task.session_id) if task.session_id else None
     if session is None or session.team_id != team.id or session.agent_id != agent.id:
         session = ChatSession(
@@ -962,13 +1143,23 @@ def _execute_member_task(db: Session, event: TeamWakeEvent, team: Team, agent: A
             tenant_id=team.tenant_id,
             user_id=team.owner_user_id,
             agent_id=agent.id,
-            title=f"团队任务:{task.title}",
+            title=task.title,
             status="active",
             team_id=team.id,
+            session_kind=SESSION_KIND_TEAM_MEMBER_TASK,
+            agent_reply_locale=context.agent_reply_locale.value,
+            agent_reply_locale_source=context.agent_reply_locale_source.value,
         )
         db.add(session)
         db.flush()
         task.session_id = session.id
+    elif session.agent_reply_locale != context.agent_reply_locale.value:
+        # Team sessions are execution-scoped; restore the source snapshot before
+        # retry/rework instead of consulting a mutable user preference.
+        session.agent_reply_locale = context.agent_reply_locale.value
+        session.agent_reply_locale_source = context.agent_reply_locale_source.value
+        session.updated_at = utc_now()
+        db.add(session)
     # 恢复 claimed 孤儿事件时任务通常已经是 in_progress；复用原会话和
     # client_turn_id，避免重复创建会话、重复状态迁移或丢失 Harness 幂等语义。
     if task.status != "in_progress":
@@ -1000,6 +1191,7 @@ def _execute_member_task(db: Session, event: TeamWakeEvent, team: Team, agent: A
         message=message,
         interaction_mode="team_task",
         allow_needs_input=True,
+        language_context=context,
     ))
     reply = turn_result.reply
     outcome = _team_harness_outcome(
@@ -1079,7 +1271,12 @@ def _execute_member_task(db: Session, event: TeamWakeEvent, team: Team, agent: A
             actor_type="system",
             actor_id=None,
             event_type="task_escalated",
-            payload={"reason": "团队缺少 TL,无法验收"},
+            payload={
+                **team_reason_payload(
+                    "team.task.review.failed",
+                    reason_code="leader_unavailable",
+                ),
+            },
         )
         db.commit()
         return
@@ -1090,6 +1287,7 @@ def _execute_member_task(db: Session, event: TeamWakeEvent, team: Team, agent: A
         target_agent_id=leader.agent_id,
         trigger_type="task_report",
         payload={"task_id": task.id},
+        language_context=context,
     )
     db.commit()
     start_wakeup_async(wake.id)
@@ -1244,7 +1442,7 @@ def _update_team_run_progress_message(
     *,
     phase: Literal["collecting", "synthesizing", "completed", "failed"] | None = None,
 ) -> Message | None:
-    """Rewrite the original TL dispatch reply as the asynchronous team run advances."""
+    """Persist canonical team progress metadata without rewriting Agent-authored content."""
 
     message = _team_progress_message(db, run)
     if message is None:
@@ -1262,22 +1460,12 @@ def _update_team_run_progress_message(
         else:
             resolved_phase = "collecting"
 
-    if resolved_phase == "collecting":
-        if completed:
-            content = f"已收到 {completed}/{total} 项成员回复。"
-            status_text = "正在等待其他成员完成"
-        else:
-            content = f"已完成 {total} 个团队任务的拆分与派发。"
-            status_text = "正在等待成员回复"
-    elif resolved_phase == "synthesizing":
-        content = f"已收到全部 {total} 项成员回复。"
-        status_text = "正在整理答案"
-    elif resolved_phase == "completed":
-        content = f"已收到全部 {total} 项成员回复，汇总已完成。"
-        status_text = ""
-    else:
-        content = "成员回复已经收齐，但整理答案时遇到问题。"
-        status_text = ""
+    event_code = f"team.run.progress.{resolved_phase}"
+    params = (
+        {"completed_tasks": completed, "total_tasks": total}
+        if resolved_phase == "collecting"
+        else {"total_tasks": total}
+    )
 
     metadata = dict(message.metadata_json or {})
     current_progress = metadata.get("team_progress")
@@ -1292,16 +1480,11 @@ def _update_team_run_progress_message(
         "phase": resolved_phase,
         "completed_tasks": completed,
         "total_tasks": total,
-        "status_text": status_text,
+        "event_code": event_code,
+        "params": params,
     }
-    message.content = content
     message.metadata_json = metadata
     db.add(message)
-    session = db.get(ChatSession, run.tl_session_id)
-    if session is not None:
-        session.summary = f"最近回复：{content[:120]}"
-        session.updated_at = utc_now()
-        db.add(session)
     return message
 
 
@@ -1320,6 +1503,12 @@ def maybe_enqueue_team_synthesis(db: Session, team: Team, run_id: str) -> str | 
     )
     if not tasks:
         return None
+    context = _team_language_context(
+        db,
+        run=run,
+        source_turn_id=run.source_turn_id,
+    )
+    _bind_team_language_context(db, context, run, *tasks)
     waiting_for_input = any(
         task.status == "escalated"
         and bool((task.report_json or {}).get("needs_input"))
@@ -1372,6 +1561,7 @@ def maybe_enqueue_team_synthesis(db: Session, team: Team, run_id: str) -> str | 
         target_agent_id=leader.agent_id,
         trigger_type="team_synthesis",
         payload={"team_run_id": run.id},
+        language_context=context,
     )
     db.commit()
     start_wakeup_async(wake.id)
@@ -1399,6 +1589,13 @@ def _execute_team_synthesis(
     )
     if not tasks or any(task.status not in {"done", "escalated"} for task in tasks):
         raise RuntimeError("团队任务尚未全部结束，不能开始最终汇总")
+    context = _team_language_context(
+        db,
+        event=event,
+        run=run,
+        source_turn_id=run.source_turn_id,
+    )
+    _bind_team_language_context(db, context, event, run, *tasks)
     _update_team_run_progress_message(db, run, tasks, phase="synthesizing")
     db.commit()
     synthesis_session = (
@@ -1410,9 +1607,12 @@ def _execute_team_synthesis(
             tenant_id=team.tenant_id,
             user_id=run.created_by_user_id or team.owner_user_id,
             agent_id=agent.id,
-            title=f"团队结果汇总:{team.name}",
+            title=team.name,
             status="active",
             team_id=team.id,
+            session_kind=SESSION_KIND_TEAM_SYNTHESIS,
+            agent_reply_locale=context.agent_reply_locale.value,
+            agent_reply_locale_source=context.agent_reply_locale_source.value,
         )
         db.add(synthesis_session)
         db.flush()
@@ -1420,6 +1620,11 @@ def _execute_team_synthesis(
         run.updated_at = utc_now()
         db.add(run)
         db.commit()
+    elif synthesis_session.agent_reply_locale != context.agent_reply_locale.value:
+        synthesis_session.agent_reply_locale = context.agent_reply_locale.value
+        synthesis_session.agent_reply_locale_source = context.agent_reply_locale_source.value
+        synthesis_session.updated_at = utc_now()
+        db.add(synthesis_session)
     result = _coerce_team_turn_result(
         run_agent_turn(
             db,
@@ -1430,6 +1635,7 @@ def _execute_team_synthesis(
             message=build_team_synthesis_message(db, team, run, tasks),
             interaction_mode="team_task",
             message_visibility="internal",
+            language_context=context,
         )
     )
     member_citations, _ = _team_synthesis_evidence(tasks)
@@ -1449,6 +1655,7 @@ def _execute_team_synthesis(
             "team_synthesis": True,
             "knowledge_citations": member_citations or list(result.citations),
             "harness_artifacts": list(result.artifacts),
+            "language_context": context.model_dump(mode="json"),
         },
     )
     db.commit()
@@ -1485,14 +1692,26 @@ def _execute_tl_review(db: Session, event: TeamWakeEvent, team: Team, agent: Age
         )
         db.commit()
         return
+    run = db.get(TeamRun, task.team_run_id) if task.team_run_id else None
+    context = _team_language_context(
+        db,
+        event=event,
+        task=task,
+        run=run,
+        source_turn_id=task.source_turn_id,
+    )
+    _bind_team_language_context(db, context, event, task, run)
     session = ChatSession(
         id=new_id("session"),
         tenant_id=team.tenant_id,
         user_id=team.owner_user_id,
         agent_id=agent.id,
-        title=f"团队任务验收:{task.title}",
+        title=task.title,
         status="active",
         team_id=team.id,
+        session_kind=SESSION_KIND_TEAM_TL_REVIEW,
+        agent_reply_locale=context.agent_reply_locale.value,
+        agent_reply_locale_source=context.agent_reply_locale_source.value,
     )
     db.add(session)
     db.commit()
@@ -1505,6 +1724,7 @@ def _execute_tl_review(db: Session, event: TeamWakeEvent, team: Team, agent: Age
         wake_event_id=event.id,
         message=message,
         interaction_mode="team_tl",
+        language_context=context,
     )).reply
     verdict = parse_tl_review(reply)
     if verdict is None:
@@ -1540,6 +1760,7 @@ def _execute_tl_review(db: Session, event: TeamWakeEvent, team: Team, agent: Age
             client_turn_id=f"{event.id}-repair",
             message=f"{message}\n\n{TL_REVIEW_REPAIR_MESSAGE}",
             interaction_mode="team_tl",
+            language_context=context,
         )).reply
         verdict = parse_tl_review(repair_reply)
         if verdict is None:
@@ -1564,7 +1785,13 @@ def _execute_tl_review(db: Session, event: TeamWakeEvent, team: Team, agent: Age
             actor_type="agent",
             actor_id=agent.id,
             event_type="tl_review_repair_failed",
-            payload={"wake_event_id": event.id},
+            payload={
+                **team_reason_payload(
+                    "team.task.review.failed",
+                    reason_code="repair_failed",
+                ),
+                "wake_event_id": event.id,
+            },
         )
         db.commit()
         return
@@ -1618,6 +1845,7 @@ def _execute_tl_review(db: Session, event: TeamWakeEvent, team: Team, agent: Age
             target_agent_id=task.assignee_agent_id,
             trigger_type="task_rework",
             payload={"task_id": task.id},
+            language_context=context,
         )
         db.commit()
         start_wakeup_async(wake.id)
@@ -1640,7 +1868,13 @@ def start_bidding(db: Session, team: Team, task: TeamTask) -> None:
             actor_type="system",
             actor_id=None,
             event_type="task_escalated",
-            payload={"reason": "任务池竞标无候选成员"},
+            payload={
+                **team_reason_payload(
+                    "team.task.bid.failed",
+                    reason_code="no_candidates",
+                    params={"round": 1},
+                ),
+            },
         )
         db.commit()
         return
@@ -1742,7 +1976,13 @@ def _enqueue_bid_judge(
             actor_type="system",
             actor_id=None,
             event_type="task_escalated",
-            payload={"reason": "团队缺少 TL,无法裁决竞标"},
+            payload={
+                **team_reason_payload(
+                    "team.task.bid.failed",
+                    reason_code="leader_unavailable",
+                    params={"round": round_ or 1},
+                ),
+            },
         )
         db.commit()
         return
@@ -1797,7 +2037,13 @@ def _maybe_advance_bidding(db: Session, team: Team, task: TeamTask) -> None:
             actor_type="system",
             actor_id=None,
             event_type="task_escalated",
-            payload={"reason": "任务池竞标无人应标"},
+            payload={
+                **team_reason_payload(
+                    "team.task.bid.failed",
+                    reason_code="no_valid_bids",
+                    params={"round": 1},
+                ),
+            },
         )
         db.commit()
         return
@@ -1847,7 +2093,7 @@ def _maybe_advance_bidding(db: Session, team: Team, task: TeamTask) -> None:
             return
 
 
-def _handle_bid_failure(db: Session, event: TeamWakeEvent, exc: Exception) -> None:
+def _handle_bid_failure(db: Session, event: TeamWakeEvent, _public_reason: str) -> None:
     """竞标候选执行失败:记 bid_failed 审计并尝试推进竞标,不升级任务。"""
     task_id = str(event.payload_json.get("task_id") or "")
     if not task_id:
@@ -1878,9 +2124,11 @@ def _handle_bid_failure(db: Session, event: TeamWakeEvent, exc: Exception) -> No
             actor_id=event.target_agent_id,
             event_type="bid_failed",
             payload={
+                **_wake_failure_audit_payload(
+                    event,
+                    reason_code="execution_failed",
+                ),
                 "wake_event_id": event.id,
-                "round": int(event.payload_json.get("round") or 1),
-                "reason": str(exc),
             },
         )
         db.commit()
@@ -1899,6 +2147,15 @@ def _execute_bid_request(
     task = db.get(TeamTask, task_id)
     if task is None or task.team_id != team.id:
         raise RuntimeError("唤醒事件关联的团队任务不存在")
+    run = db.get(TeamRun, task.team_run_id) if task.team_run_id else None
+    context = _team_language_context(
+        db,
+        event=event,
+        task=task,
+        run=run,
+        source_turn_id=task.source_turn_id,
+    )
+    _bind_team_language_context(db, context, event, task, run)
     if task.status != "bidding":
         # 任务已被人改判或已完成裁决,迟到的竞标唤醒直接跳过
         record_task_event(
@@ -1938,9 +2195,12 @@ def _execute_bid_request(
         tenant_id=team.tenant_id,
         user_id=team.owner_user_id,
         agent_id=agent.id,
-        title=f"团队竞标:{task.title}",
+        title=task.title,
         status="active",
         team_id=team.id,
+        session_kind=SESSION_KIND_TEAM_MEMBER_BID,
+        agent_reply_locale=context.agent_reply_locale.value,
+        agent_reply_locale_source=context.agent_reply_locale_source.value,
     )
     db.add(session)
     db.commit()
@@ -1953,6 +2213,7 @@ def _execute_bid_request(
         wake_event_id=event.id,
         message=message,
         interaction_mode="team_task",
+        language_context=context,
     )).reply
     bid = parse_bid(reply)
     if bid is None:
@@ -2051,6 +2312,15 @@ def _execute_bid_judge(
     task = db.get(TeamTask, task_id)
     if task is None or task.team_id != team.id:
         raise RuntimeError("唤醒事件关联的团队任务不存在")
+    run = db.get(TeamRun, task.team_run_id) if task.team_run_id else None
+    context = _team_language_context(
+        db,
+        event=event,
+        task=task,
+        run=run,
+        source_turn_id=task.source_turn_id,
+    )
+    _bind_team_language_context(db, context, event, task, run)
     if task.status != "bidding":
         # 任务已被人改判,迟到的裁决唤醒直接跳过
         record_task_event(
@@ -2066,13 +2336,18 @@ def _execute_bid_judge(
         return
     mode = str(event.payload_json.get("mode") or "award")
     if mode == "score":
-        _execute_bid_score(db, event, team, agent, task)
+        _execute_bid_score(db, event, team, agent, task, context)
         return
-    _execute_bid_award(db, event, team, agent, task)
+    _execute_bid_award(db, event, team, agent, task, context)
 
 
 def _execute_bid_score(
-    db: Session, event: TeamWakeEvent, team: Team, agent: AgentProfile, task: TeamTask
+    db: Session,
+    event: TeamWakeEvent,
+    team: Team,
+    agent: AgentProfile,
+    task: TeamTask,
+    context: LanguageContext,
 ) -> None:
     """TL 每轮打分执行体:分数写回该轮 bid,血条归零审计淘汰,再推进竞标。
 
@@ -2110,9 +2385,12 @@ def _execute_bid_score(
         tenant_id=team.tenant_id,
         user_id=team.owner_user_id,
         agent_id=agent.id,
-        title=f"团队竞标打分:{task.title}",
+        title=task.title,
         status="active",
         team_id=team.id,
+        session_kind=SESSION_KIND_TEAM_BID_SCORE,
+        agent_reply_locale=context.agent_reply_locale.value,
+        agent_reply_locale_source=context.agent_reply_locale_source.value,
     )
     db.add(session)
     db.commit()
@@ -2125,6 +2403,7 @@ def _execute_bid_score(
         wake_event_id=event.id,
         message=message,
         interaction_mode="team_tl",
+        language_context=context,
     )).reply
     scores = _parse_bid_scores_with_fragments(
         db,
@@ -2155,6 +2434,7 @@ def _execute_bid_score(
             client_turn_id=f"{event.id}-repair",
             message=f"{message}\n\n{TL_BID_SCORE_REPAIR_MESSAGE}",
             interaction_mode="team_tl",
+            language_context=context,
         )).reply
         scores = _parse_bid_scores_with_fragments(
             db,
@@ -2220,7 +2500,12 @@ def _execute_bid_score(
 
 
 def _execute_bid_award(
-    db: Session, event: TeamWakeEvent, team: Team, agent: AgentProfile, task: TeamTask
+    db: Session,
+    event: TeamWakeEvent,
+    team: Team,
+    agent: AgentProfile,
+    task: TeamTask,
+    context: LanguageContext,
 ) -> None:
     """TL 最终裁决执行体:末轮打分写回,中标者(须在存活候选中)走 task_assigned 链路。"""
     candidates = _bidding_candidates(db, task)
@@ -2234,6 +2519,7 @@ def _execute_bid_award(
     alive = _alive_bid_candidates(candidates, bids)
     if not alive:
         # 存活候选为空(全部淘汰/无人应标):升级给人,不静默丢任务
+        round_ = max((bid.round for bid in bids), default=1)
         apply_task_transition(
             db,
             task,
@@ -2241,7 +2527,14 @@ def _execute_bid_award(
             actor_type="system",
             actor_id=None,
             event_type="task_escalated",
-            payload={"reason": "竞标无存活候选,无法裁决", "wake_event_id": event.id},
+            payload={
+                **team_reason_payload(
+                    "team.task.bid.failed",
+                    reason_code="no_surviving_candidates",
+                    params={"round": round_},
+                ),
+                "wake_event_id": event.id,
+            },
         )
         db.commit()
         return
@@ -2250,9 +2543,12 @@ def _execute_bid_award(
         tenant_id=team.tenant_id,
         user_id=team.owner_user_id,
         agent_id=agent.id,
-        title=f"团队竞标裁决:{task.title}",
+        title=task.title,
         status="active",
         team_id=team.id,
+        session_kind=SESSION_KIND_TEAM_BID_JUDGE,
+        agent_reply_locale=context.agent_reply_locale.value,
+        agent_reply_locale_source=context.agent_reply_locale_source.value,
     )
     db.add(session)
     db.commit()
@@ -2265,6 +2561,7 @@ def _execute_bid_award(
         wake_event_id=event.id,
         message=message,
         interaction_mode="team_tl",
+        language_context=context,
     )).reply
     award = _parse_bid_award_with_fragments(
         db,
@@ -2295,6 +2592,7 @@ def _execute_bid_award(
             client_turn_id=f"{event.id}-repair",
             message=f"{message}\n\n{TL_BID_JUDGE_REPAIR_MESSAGE}",
             interaction_mode="team_tl",
+            language_context=context,
         )).reply
         award = _parse_bid_award_with_fragments(
             db,
@@ -2306,6 +2604,7 @@ def _execute_bid_award(
         )
     if award is None:
         # 纠错后仍无有效裁决:升级给人,不静默丢任务
+        round_ = max((bid.round for bid in bids), default=1)
         apply_task_transition(
             db,
             task,
@@ -2313,7 +2612,14 @@ def _execute_bid_award(
             actor_type="system",
             actor_id=None,
             event_type="task_escalated",
-            payload={"reason": "TL 竞标裁决失败", "wake_event_id": event.id},
+            payload={
+                **team_reason_payload(
+                    "team.task.bid.failed",
+                    reason_code="award_unparsed",
+                    params={"round": round_},
+                ),
+                "wake_event_id": event.id,
+            },
         )
         db.commit()
         return
@@ -2406,6 +2712,11 @@ def publish_team_planner_frames(
     ]
     if not remote_frames:
         return None
+    source_context = _team_language_context(
+        db,
+        source_turn_id=source_turn_id,
+        legacy_agent_reply_locale=session.agent_reply_locale,
+    )
     existing_run = db.exec(
         select(TeamRun).where(
             TeamRun.tl_session_id == session.id,
@@ -2413,13 +2724,22 @@ def publish_team_planner_frames(
         )
     ).first()
     if existing_run is not None:
-        task_ids = [
-            row.id
-            for row in db.exec(
+        existing_tasks = list(
+            db.exec(
                 select(TeamTask)
                 .where(TeamTask.team_run_id == existing_run.id)
                 .order_by(TeamTask.created_at)
             ).all()
+        )
+        existing_context = _team_language_context(
+            db,
+            run=existing_run,
+            source_turn_id=source_turn_id,
+            snapshot=source_context,
+        )
+        _bind_team_language_context(db, existing_context, existing_run, *existing_tasks)
+        task_ids = [
+            row.id for row in existing_tasks
         ]
         return TeamPlanPublishResult(run_id=existing_run.id, task_ids=task_ids)
 
@@ -2441,6 +2761,7 @@ def publish_team_planner_frames(
         source_turn_id=source_turn_id,
         created_by_user_id=created_by_user_id,
         status="planning",
+        language_context_json=source_context.model_dump(mode="json"),
     )
     db.add(run)
     db.flush()
@@ -2485,6 +2806,7 @@ def publish_team_planner_frames(
             assignee_agent_id=frame.assignee_agent_id,
             depends_on_task_ids_json=dependencies,
             activation_condition_json=_normalized_team_activation_condition(frame),
+            language_context_json=source_context.model_dump(mode="json"),
         )
         db.add(task)
         db.flush()
@@ -2525,6 +2847,7 @@ def publish_team_planner_frames(
                 target_agent_id=str(frame.assignee_agent_id),
                 trigger_type="task_assigned",
                 payload={"task_id": task.id, "team_run_id": run.id},
+                language_context=source_context,
             )
             wake_ids.append(wake.id)
         created.append(task)
@@ -2560,6 +2883,8 @@ def process_tl_reply(
     tl_agent = db.get(AgentProfile, leader.agent_id)
     if tl_agent is None:
         return []
+    source_turn_id: str | None = None
+    source_snapshot: object = None
     if client_turn_id:
         receipt = db.exec(
             select(HarnessTurnRecord).where(
@@ -2569,6 +2894,8 @@ def process_tl_reply(
             )
         ).first()
         if receipt is not None and receipt.user_message_id:
+            source_turn_id = receipt.user_message_id
+            source_snapshot = receipt.language_context_json
             run = db.exec(
                 select(TeamRun).where(
                     TeamRun.tl_session_id == session.id,
@@ -2685,6 +3012,13 @@ def process_tl_reply(
     if graph_invalid or len(normalized) != len(prepared) or has_cycle():
         return []
 
+    source_context = _team_language_context(
+        db,
+        snapshot=source_snapshot,
+        source_turn_id=source_turn_id,
+        legacy_agent_reply_locale=session.agent_reply_locale,
+    )
+
     created: list[TeamTask] = []
     wake_ids: list[str] = []
     bidding_tasks: list[TeamTask] = []
@@ -2694,6 +3028,7 @@ def process_tl_reply(
             id=task_id,
             team_id=team.id,
             tenant_id=team.tenant_id,
+            source_turn_id=source_turn_id,
             title=item["title"],
             description=item.get("description"),
             status="blocked" if dependencies else "pending",
@@ -2702,6 +3037,7 @@ def process_tl_reply(
             assignee_agent_id=assignee or None,
             depends_on_task_ids_json=dependencies,
             activation_condition_json=condition if dependencies else {},
+            language_context_json=source_context.model_dump(mode="json"),
         )
         db.add(task)
         db.flush()
@@ -2737,6 +3073,7 @@ def process_tl_reply(
                 target_agent_id=assignee,
                 trigger_type="task_assigned",
                 payload={"task_id": task.id},
+                language_context=source_context,
             )
             wake_ids.append(wake.id)
         else:

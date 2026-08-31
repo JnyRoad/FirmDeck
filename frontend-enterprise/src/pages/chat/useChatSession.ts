@@ -37,7 +37,16 @@ import {
   visibleChatEmployees,
 } from '@/employee';
 import { notify } from '@/components/ui/app-toast';
-import { useI18n } from '@/i18n';
+import {
+  readAgentReplyLocalePreference,
+  resolveLanguageContextSnapshot,
+  writeAgentReplyLocalePreference,
+} from '@/i18n/languagePreferences';
+import { canonicalizeAppLocale, type AppLocale } from '@/i18n/locales';
+import type { MessageValues } from '@/i18n/imperative';
+import type { MessageId } from '@/i18n/types';
+import { useAppIntl } from '@/i18n/useAppIntl';
+import { backendEventMessage } from '@/lib/backendEventMessages';
 import type {
   AgentProfileRead,
   ChatAttachmentRead,
@@ -52,6 +61,7 @@ import type {
   ScheduledTaskDraftRead,
   ScheduledTaskRead,
   TeamRead,
+  TraceLineRead,
   TurnTraceRead,
   UIConfigRead,
 } from '@/types';
@@ -87,6 +97,7 @@ import {
   isDraftConversationKey,
   isKnowledgeTracePhase,
   isMissingChatSessionError,
+  isPlainRecord,
   isRecoverableRunningTrace,
   isScheduledSession,
   isStreamingMessageId,
@@ -146,8 +157,15 @@ import { buildSessionFilterOptions } from './sessionFilterOptions';
 const CHAT_BASE_PATH = '/workspace/chat';
 const STREAM_TEXT_EVENTS = new Set(['stream_replace', 'stream_delta', 'token']);
 const STREAM_RELAY_RECOVERY_POLL_INTERVAL_MS = 5 * 1000;
-const DEFAULT_SCHEDULE_TIME = '09:00';
-const SCHEDULE_WEEKDAY_LABELS = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'] as const;
+const SCHEDULE_WEEKDAY_IDS = [
+  'chat.draft.weekday.monday',
+  'chat.draft.weekday.tuesday',
+  'chat.draft.weekday.wednesday',
+  'chat.draft.weekday.thursday',
+  'chat.draft.weekday.friday',
+  'chat.draft.weekday.saturday',
+  'chat.draft.weekday.sunday',
+] as const satisfies readonly MessageId[];
 // Shared with the management shell (App.tsx `ENTERPRISE_SIDEBAR_STORAGE_KEY`) so
 // the collapse state is preserved when switching between 管理端 and 对话端.
 // Stored as '1' (expanded) / '0' (collapsed); unset defaults to expanded.
@@ -192,82 +210,140 @@ function queuedTurnPreview(turn: PreparedChatTurn): ChatMessage {
 }
 
 type DraftScheduleType = 'once' | 'daily' | 'weekly' | 'monthly';
-type DraftScheduleFormatter = (schedule: Record<string, unknown>) => string;
 
-const DRAFT_SCHEDULE_FORMATTERS: Record<DraftScheduleType, DraftScheduleFormatter> = {
-  once: (schedule) => `一次性 ${typeof schedule.run_at === 'string' ? schedule.run_at : '待确认时间'}`,
-  weekly: (schedule) => `每周 ${formatScheduleWeekdays(schedule.weekdays)} ${scheduleTime(schedule)}`,
-  monthly: (schedule) => `每月 ${schedule.day_of_month || 1} 号 ${scheduleTime(schedule)}`,
-  daily: (schedule) => `每天 ${scheduleTime(schedule)}`,
-};
+const DRAFT_SCHEDULE_TYPES = new Set<DraftScheduleType>(['once', 'daily', 'weekly', 'monthly']);
 
-function scheduleTime(schedule: Record<string, unknown>): string {
-  return typeof schedule.time === 'string' ? schedule.time : DEFAULT_SCHEDULE_TIME;
+/** 从定时任务数据中提取稳定的客户端时间值；缺省值属于产品状态而非业务输入。 */
+function scheduleTime(schedule: Record<string, unknown>, translate: TranslateMessage): string {
+  return typeof schedule.time === 'string' ? schedule.time : translate('chat.draft.defaultTime');
 }
 
+/** 将后端计划类型归一化为受支持的产品枚举，未知值安全落到 daily。 */
 function normalizeDraftScheduleType(value: unknown): DraftScheduleType {
   if (typeof value !== 'string') return 'daily';
-  return value in DRAFT_SCHEDULE_FORMATTERS ? (value as DraftScheduleType) : 'daily';
+  return DRAFT_SCHEDULE_TYPES.has(value as DraftScheduleType) ? (value as DraftScheduleType) : 'daily';
 }
 
-function formatScheduleWeekdays(value: unknown): string {
-  if (!Array.isArray(value)) return SCHEDULE_WEEKDAY_LABELS[0];
+type TranslateMessage = (id: MessageId, values?: MessageValues) => string;
+
+/** 将 canonical status 的 code/params 投影为当前 UI locale；未知或损坏事件安全显示通用状态。 */
+function canonicalStatusMessage(
+  data: Record<string, unknown>,
+  translate: TranslateMessage,
+): string | null {
+  const hasCode = Object.prototype.hasOwnProperty.call(data, 'code');
+  const hasStructuredEnvelope = (
+    Object.prototype.hasOwnProperty.call(data, 'event_type')
+    && Object.prototype.hasOwnProperty.call(data, 'params')
+  );
+  if (!hasCode && !hasStructuredEnvelope) return null;
+
+  return backendEventMessage(data.code, data.params, translate, 'chat.trace.thinking');
+}
+
+/** 使用当前界面 locale 格式化每周计划，避免在业务代码中固定中文星期或连接符。 */
+function formatScheduleWeekdays(value: unknown, locale: AppLocale, translate: TranslateMessage): string {
+  if (!Array.isArray(value)) return translate(SCHEDULE_WEEKDAY_IDS[0]);
   const labels = value
     .map((item) => Number(item))
-    .filter((item) => Number.isInteger(item) && item >= 0 && item < SCHEDULE_WEEKDAY_LABELS.length)
-    .map((item) => SCHEDULE_WEEKDAY_LABELS[item]);
-  return labels.length ? labels.join('、') : SCHEDULE_WEEKDAY_LABELS[0];
+    .filter((item) => Number.isInteger(item) && item >= 0 && item < SCHEDULE_WEEKDAY_IDS.length)
+    .map((item) => translate(SCHEDULE_WEEKDAY_IDS[item]));
+  return labels.length ? new Intl.ListFormat(locale, { type: 'conjunction' }).format(labels) : translate(SCHEDULE_WEEKDAY_IDS[0]);
 }
 
-function formatScheduledTaskDraftSchedule(draft?: Partial<ScheduledTaskDraftRead> | Record<string, unknown>): string {
+/** 将计划数据转换为本地化产品摘要；计划中的时间、日期和值保持原始业务语义。 */
+function formatScheduledTaskDraftSchedule(
+  draft: Partial<ScheduledTaskDraftRead> | Record<string, unknown> | undefined,
+  locale: AppLocale,
+  translate: TranslateMessage,
+): string {
   const schedule = draft?.schedule && typeof draft.schedule === 'object' && !Array.isArray(draft.schedule)
     ? draft.schedule as Record<string, unknown>
     : {};
   const scheduleType = normalizeDraftScheduleType(draft?.schedule_type);
-  return DRAFT_SCHEDULE_FORMATTERS[scheduleType](schedule);
+  if (scheduleType === 'once') {
+    return translate('chat.draft.onceSchedule', {
+      runAt: typeof schedule.run_at === 'string' ? schedule.run_at : translate('chat.draft.pendingTime'),
+    });
+  }
+  if (scheduleType === 'weekly') {
+    return translate('chat.draft.weeklySchedule', {
+      weekdays: formatScheduleWeekdays(schedule.weekdays, locale, translate),
+      time: scheduleTime(schedule, translate),
+    });
+  }
+  if (scheduleType === 'monthly') {
+    const day = typeof schedule.day_of_month === 'number' || typeof schedule.day_of_month === 'string'
+      ? schedule.day_of_month
+      : 1;
+    return translate('chat.draft.monthlySchedule', { day, time: scheduleTime(schedule, translate) });
+  }
+  return translate('chat.draft.dailySchedule', { time: scheduleTime(schedule, translate) });
 }
 
-function scheduledTaskDraftTraceDetail(draft?: Partial<ScheduledTaskDraftRead> | Record<string, unknown>): string | undefined {
+/** 生成定时任务 trace 详情，标题作为原始业务值仅通过具名参数插入消息。 */
+function scheduledTaskDraftTraceDetail(
+  draft: Partial<ScheduledTaskDraftRead> | Record<string, unknown> | undefined,
+  locale: AppLocale,
+  translate: TranslateMessage,
+): string | undefined {
   const title = typeof draft?.title === 'string' ? draft.title.trim() : '';
-  return [title, formatScheduledTaskDraftSchedule(draft), '等待确认后启用'].filter(Boolean).join(' · ');
+  return translate('chat.draft.traceDetail', {
+    title: title || translate('chat.draft.untitled'),
+    schedule: formatScheduledTaskDraftSchedule(draft, locale, translate),
+    status: translate('chat.draft.waitingConfirmation'),
+  });
 }
 
-function scheduledTaskTraceLines(draft?: Partial<ScheduledTaskDraftRead> | Record<string, unknown>): TraceLine[] {
+/** 构造定时任务的可展开 trace，产品 chrome 使用语义消息，业务标题/时间保持 raw。 */
+function scheduledTaskTraceLines(
+  draft: Partial<ScheduledTaskDraftRead> | Record<string, unknown> | undefined,
+  locale: AppLocale,
+  translate: TranslateMessage,
+): TraceLine[] {
   return [
     {
       id: 'scheduled_task_intent',
       kind: 'decision',
-      text: '识别定时任务需求',
-      detail: '用户选择了创建定时任务模式',
+      text: translate('chat.draft.traceIntent'),
+      detail: translate('chat.draft.traceIntentDetail'),
       state: 'completed',
       icon: 'judge',
     },
     {
       id: 'scheduled_task_parse',
       kind: 'decision',
-      text: '解析执行计划',
-      detail: `计划：${formatScheduledTaskDraftSchedule(draft)}`,
+      text: translate('chat.draft.traceParse'),
+      detail: translate('chat.draft.tracePlan', {
+        schedule: formatScheduledTaskDraftSchedule(draft, locale, translate),
+      }),
       state: 'completed',
       icon: 'advance',
     },
     {
       id: 'scheduled_task_draft',
       kind: 'decision',
-      text: '生成定时任务草案',
-      detail: scheduledTaskDraftTraceDetail(draft),
+      text: translate('chat.draft.traceDraft'),
+      detail: scheduledTaskDraftTraceDetail(draft, locale, translate),
       state: 'completed',
       icon: 'advance',
     },
   ];
 }
 
-function scheduledTaskStatusTraceLine(phase: string, data: Record<string, unknown>): TraceLine | null {
+/** 为流式定时任务阶段返回当前 locale 的 trace 行，未知阶段不改变既有协议行为。 */
+function scheduledTaskStatusTraceLine(
+  phase: string,
+  data: Record<string, unknown>,
+  locale: AppLocale,
+  translate: TranslateMessage,
+): TraceLine | null {
   if (phase === 'scheduled_task_intent') {
     return {
       id: 'scheduled_task_intent',
       kind: 'decision',
-      text: '识别定时任务需求',
-      detail: '用户选择了创建定时任务模式',
+      text: translate('chat.draft.traceIntent'),
+      detail: translate('chat.draft.traceIntentDetail'),
       state: 'running',
       icon: 'judge',
     };
@@ -276,7 +352,7 @@ function scheduledTaskStatusTraceLine(phase: string, data: Record<string, unknow
     return {
       id: 'scheduled_task_parse',
       kind: 'decision',
-      text: '解析执行计划',
+      text: translate('chat.draft.traceParse'),
       state: 'running',
       icon: 'advance',
     };
@@ -285,13 +361,64 @@ function scheduledTaskStatusTraceLine(phase: string, data: Record<string, unknow
     return {
       id: 'scheduled_task_draft',
       kind: 'decision',
-      text: '生成定时任务草案',
-      detail: scheduledTaskDraftTraceDetail(data),
+      text: translate('chat.draft.traceDraft'),
+      detail: scheduledTaskDraftTraceDetail(data, locale, translate),
       state: 'completed',
       icon: 'advance',
     };
   }
   return null;
+}
+
+const LEGACY_SCHEDULED_TRACE_CODES = {
+  scheduled_task_intent: 'chat.scheduled.intent',
+  scheduled_task_parse: 'chat.scheduled.plan',
+  scheduled_task_draft: 'chat.scheduled.draft',
+} as const;
+
+/** 将持久化计划任务轨迹按当前 UI locale 投影；后端旧 text/detail 不再作为产品文案来源。 */
+function localizedPersistedTraceLine(
+  line: TraceLineRead,
+  locale: AppLocale,
+  translate: TranslateMessage,
+): { text: string; detail?: string } {
+  const legacyCode = LEGACY_SCHEDULED_TRACE_CODES[
+    line.id as keyof typeof LEGACY_SCHEDULED_TRACE_CODES
+  ];
+  const eventCode = typeof line.event_code === 'string' ? line.event_code : legacyCode;
+  if (!eventCode) {
+    return {
+      text: line.text || translate('chat.trace.thinking'),
+      ...(line.detail ? { detail: line.detail } : {}),
+    };
+  }
+
+  const scheduledEvent = Object.values(LEGACY_SCHEDULED_TRACE_CODES).includes(
+    eventCode as (typeof LEGACY_SCHEDULED_TRACE_CODES)[keyof typeof LEGACY_SCHEDULED_TRACE_CODES],
+  );
+  if (!scheduledEvent) {
+    return {
+      text: backendEventMessage(eventCode, line.params || {}, translate, 'chat.trace.thinking'),
+    };
+  }
+
+  const data = line.event_data && typeof line.event_data === 'object' && !Array.isArray(line.event_data)
+    ? line.event_data
+    : {};
+  let detail: string | undefined;
+  if (eventCode === 'chat.scheduled.intent') {
+    detail = translate('chat.draft.traceIntentDetail');
+  } else if (eventCode === 'chat.scheduled.plan') {
+    detail = translate('chat.draft.tracePlan', {
+      schedule: formatScheduledTaskDraftSchedule(data, locale, translate),
+    });
+  } else {
+    detail = scheduledTaskDraftTraceDetail(data, locale, translate);
+  }
+  return {
+    text: backendEventMessage(eventCode, line.params || {}, translate, 'chat.trace.thinking'),
+    ...(detail ? { detail } : {}),
+  };
 }
 
 export type UseChatSession = ReturnType<typeof useChatSession>;
@@ -310,15 +437,19 @@ export type UseChatSessionOptions = {
   embedded?: boolean;
 };
 
+/** 管理聊天会话状态、流式事件和界面消息；所有产品文案均通过语义消息 ID 解析。 */
 export function useChatSession(options: UseChatSessionOptions = {}) {
   const { anonymous = false, embedded = false } = options;
-  const { t } = useI18n();
+  const { locale, t } = useAppIntl();
   const { sessionId: routeSessionId, draftAgentId } = useParams<{ sessionId?: string; draftAgentId?: string }>();
   const sessionId = options.sessionId || routeSessionId;
   const navigate = useNavigate();
   const [auth] = useState(() => getEnterpriseAuthSession());
   const tenantId = auth?.user.tenant_id || TENANT_ID;
   const userId = auth?.user.id || '';
+  const [agentReplyLocalePreference, setAgentReplyLocalePreference] = useState<AppLocale>(() => (
+    readAgentReplyLocalePreference(window.localStorage, userId)
+  ));
   const queueStorageKey = chatQueueStorageKey(tenantId, userId);
   const [restoredQueuedTurns] = useState(() => (
     readQueuedChatTurns(window.sessionStorage, queueStorageKey)
@@ -367,6 +498,11 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     const next = value || 'all';
     setSessionAgentFilter(next);
     window.localStorage.setItem(sessionFilterStorageKey(userId), next);
+  }, [userId]);
+  /** 更新当前用户的新会话回复语言偏好；既有 session 的权威快照不会被此操作改写。 */
+  const setAgentReplyLocale = useCallback((nextLocale: AppLocale) => {
+    setAgentReplyLocalePreference(nextLocale);
+    writeAgentReplyLocalePreference(window.localStorage, userId, nextLocale);
   }, [userId]);
   const [activeCitation, setActiveCitation] = useState<KnowledgeCitation | null>(null);
   const [handoffs, setHandoffs] = useState<HumanHandoffRead[]>([]);
@@ -463,24 +599,46 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     updateChatStickiness();
   }, [updateChatStickiness]);
 
-  const notifyRequestError = useCallback((scope: string, error: unknown, fallback: string) => {
+  /** 将请求异常收敛为稳定的界面错误消息；原始异常只进入诊断日志，不直出用户界面。 */
+  const notifyRequestError = useCallback((scope: string, error: unknown, fallbackId: MessageId) => {
     if (isAuthError(error)) {
       redirectToLogin();
       return true;
     }
-    const rawMessage = error instanceof Error ? error.message : fallback;
+    console.error('[chat] request failed', { scope, error });
     const isNetworkError = error instanceof TypeError;
     const noticeKey = isNetworkError ? 'chat-network-error' : `chat-${scope}-error`;
     const now = Date.now();
     const lastShownAt = loadErrorNoticeRef.current[noticeKey] || 0;
     if (now - lastShownAt < 12000) return false;
     loadErrorNoticeRef.current[noticeKey] = now;
-    notify.error(isNetworkError ? '接口连接失败，请检查本地服务或稍后重试' : (rawMessage || fallback), {
+    let localizedMessage = t('common.error.generic');
+    if (isNetworkError) {
+      localizedMessage = t('chat.error.network');
+    } else {
+      switch (fallbackId) {
+        case 'chat.error.sessionsLoad':
+          localizedMessage = t('chat.error.sessionsLoad');
+          break;
+        case 'chat.error.messagesLoad':
+          localizedMessage = t('chat.error.messagesLoad');
+          break;
+        case 'chat.error.traceLoad':
+          localizedMessage = t('chat.error.traceLoad');
+          break;
+        case 'chat.error.handoffsLoad':
+          localizedMessage = t('chat.error.handoffsLoad');
+          break;
+        default:
+          break;
+      }
+    }
+    notify.error(localizedMessage, {
       id: noticeKey,
       duration: 3000,
     });
     return false;
-  }, [redirectToLogin]);
+  }, [redirectToLogin, t]);
 
   const scrollChatToBottom = useCallback((options?: { preserveShortContentTop?: boolean; force?: boolean }) => {
     const element = chatMessagesRef.current;
@@ -527,6 +685,9 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
   }, [userId]);
 
   const currentSession = sessionId ? sessions.find((item) => item.id === sessionId) || null : null;
+  const sessionAgentReplyLocale = canonicalizeAppLocale(currentSession?.agent_reply_locale);
+  const agentReplyLocale = sessionAgentReplyLocale ?? agentReplyLocalePreference;
+  const agentReplyLocaleLocked = Boolean(sessionAgentReplyLocale);
   const availableAgents = visibleChatEmployees(agents, auth?.user);
   const explicitDraftAgentId = draftAgentId || '';
   const routeDraftAgent = explicitDraftAgentId
@@ -559,24 +720,32 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
   const displayedProfile = displayedAgent ? employeeProfile(displayedAgent) : null;
   const emptyProfileTags = displayedProfile?.workStyles.length
     ? displayedProfile.workStyles.slice(0, 3)
-    : ['结构化整理', '可追溯', '可追溯'];
+    : [t('chat.empty.defaultTagStructure'), t('chat.empty.defaultTagTraceable')];
   const emptyRoleSummary = displayedProfile
-    ? `#角色：${displayedProfile.roleName}「${displayedAgent ? employeeDisplayName(displayedAgent) : '--'}」一名经验丰富的${displayedProfile.roleName}`
-    : '--';
+    ? t('chat.empty.roleSummary', {
+      role: displayedProfile.roleName,
+      name: displayedAgent ? employeeDisplayName(displayedAgent) : t('chat.empty.unset'),
+    })
+    : t('chat.empty.noEmployee');
   const emptyStats = displayedAgent
     ? [
-      { label: '资料', value: agentResourceCount(displayedAgent, 'knowledge_base') },
-      { label: '技能', value: agentResourceCount(displayedAgent, 'general_skill') },
-      { label: 'SOP', value: agentResourceCount(displayedAgent, 'skill') },
+      { label: t('chat.empty.resourceCount'), value: agentResourceCount(displayedAgent, 'knowledge_base') },
+      { label: t('chat.empty.skillCount'), value: agentResourceCount(displayedAgent, 'general_skill') },
+      { label: t('chat.empty.sopCount'), value: agentResourceCount(displayedAgent, 'skill') },
     ]
     : [
-      { label: '资料', value: 0 },
-      { label: '技能', value: 0 },
-      { label: 'SOP', value: 0 },
+      { label: t('chat.empty.resourceCount'), value: 0 },
+      { label: t('chat.empty.skillCount'), value: 0 },
+      { label: t('chat.empty.sopCount'), value: 0 },
     ];
   const sessionFilterOptions = useMemo(() => {
-    return buildSessionFilterOptions(availableAgents, sessions, activeDraftAgentId);
-  }, [activeDraftAgentId, availableAgents, sessions]);
+    return buildSessionFilterOptions(availableAgents, sessions, {
+      locale,
+      allConversationsLabel: t('sidebar.allConversations'),
+      teamFallbackLabel: t('sidebar.team'),
+      activeDraftAgentId,
+    });
+  }, [activeDraftAgentId, availableAgents, locale, sessions, t]);
   const visibleSidebarSessions = useMemo(() => {
     const filterTeamId = teamIdFromScope(sessionAgentFilter);
     if (filterTeamId) {
@@ -596,8 +765,8 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
   const canConfigureModels = auth?.user.role === 'admin';
   const showModelSetupNotice = !modelConfigsLoading && !modelConfigsLoadError && !selectedModelConfig;
   const modelSetupNoticeText = canConfigureModels
-    ? t('还没有可用模型配置，发送消息前请先完成模型配置。')
-    : t('系统管理员尚未配置可用模型，暂时无法发送消息。请联系管理员完成模型配置。');
+    ? t('chat.model.noConfigAdmin')
+    : t('chat.model.noConfigMember');
 
   useEffect(() => {
     if (!auth || !displayedAgent?.id) {
@@ -649,18 +818,18 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
 
   const ensureModelAvailable = useCallback(() => {
     if (modelConfigsLoading) {
-      notify.warning(t('模型配置正在加载，请稍后再发送'));
+      notify.warning(t('chat.model.loading'));
       return false;
     }
     if (modelConfigsLoadError) {
-      notify.error(t('无法读取模型配置，请刷新页面后重试'));
+      notify.error(t('chat.model.loadFailed'));
       return false;
     }
     if (!selectedModelConfig) {
       if (canConfigureModels) {
         setModelSetupOpen(true);
       } else {
-        notify.warning(t('系统管理员尚未配置可用模型，请联系管理员完成模型配置'));
+        notify.warning(t('chat.model.noConfigMember'));
       }
       return false;
     }
@@ -745,12 +914,12 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
 
   useEffect(() => {
     if (!invalidDraftAgentId) return;
-    notify.error('Cannot access this agent', {
+    notify.error(t('chat.error.agentAccess'), {
       id: `chat-invalid-draft-agent-${explicitDraftAgentId}`,
       duration: 3000,
     });
     navigate('/workspace/gallery', { replace: true });
-  }, [explicitDraftAgentId, invalidDraftAgentId, navigate]);
+  }, [explicitDraftAgentId, invalidDraftAgentId, navigate, t]);
 
   useEffect(() => {
     if (!activeDraftAgentId) return;
@@ -838,7 +1007,8 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
           redirectToLogin();
           return;
         }
-        setModelConfigsLoadError(error instanceof Error ? error.message : '模型配置加载失败');
+        console.error('[chat] model configuration load failed', error);
+        setModelConfigsLoadError('failed');
       })
       .finally(() => setModelConfigsLoading(false));
   }, [auth, redirectToLogin, tenantId]);
@@ -1243,7 +1413,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
         }
       })
       .catch((error) => {
-        notifyRequestError('sessions', error, '会话加载失败');
+        notifyRequestError('sessions', error, 'chat.error.sessionsLoad');
       })
       .finally(() => {
         setSessionsLoading(false);
@@ -1281,7 +1451,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
           handleMissingSession(id);
           return [];
         }
-        notifyRequestError('messages', error, '消息加载失败');
+        notifyRequestError('messages', error, 'chat.error.messagesLoad');
         return [];
       });
   }, [clearStreamSlot, getSlot, getStreamSlot, handleMissingSession, notifyRequestError, notifyStore, pruneRealtime, tenantId]);
@@ -1299,20 +1469,23 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
         rows.forEach((row) => {
           const hasFinalAssistant = hasAssistantMessageForTurn(slot, row.turn_id);
           const hasAssistantCarrier = hasAssistantCarrierForTurn(slot, row.turn_id);
-          const traceLines = row.lines.map((line) => ({
-            id: line.id,
-            kind: line.kind,
-            text: line.text,
-            detail: line.detail || undefined,
-            code: line.code || undefined,
-            language: line.language || undefined,
-            output: line.output || undefined,
-            outputLanguage: line.outputLanguage || undefined,
-            outputTitle: line.outputTitle || undefined,
-            state: line.state,
-            depth: typeof line.depth === 'number' ? line.depth : undefined,
-            collapsible: Boolean(line.collapsible || line.code || line.output),
-          }));
+          const traceLines = row.lines.map((line) => {
+            const localized = localizedPersistedTraceLine(line, locale, t);
+            return {
+              id: line.id,
+              kind: line.kind,
+              text: localized.text,
+              detail: localized.detail,
+              code: line.code || undefined,
+              language: line.language || undefined,
+              output: line.output || undefined,
+              outputLanguage: line.outputLanguage || undefined,
+              outputTitle: line.outputTitle || undefined,
+              state: line.state,
+              depth: typeof line.depth === 'number' ? line.depth : undefined,
+              collapsible: Boolean(line.collapsible || line.code || line.output),
+            };
+          });
           let mergedTrace = mergeTurnTraceSnapshot(turnTraceRef.current.get(row.turn_id), {
             lines: traceLines,
             startedAt: parseMessageTime(row.started_at) || Date.now(),
@@ -1377,7 +1550,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
           streamChanged = streamChanged || stream.turnId !== recoveredRunningTurnId || !stream.loading || !stream.phase;
           stream.turnId = recoveredRunningTurnId;
           stream.loading = true;
-          stream.phase = stream.phase || '正在思考';
+          stream.phase = stream.phase || t('chat.trace.thinking');
           const recoveredTrace = turnTraceRef.current.get(recoveredRunningTurnId);
           const hasVisibleTrace = Boolean(recoveredTrace?.lines.some((line) => (
             !line.provisional && !line.placeholder && Boolean(normalizeMessageText(line.text))
@@ -1407,9 +1580,9 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
           handleMissingSession(id);
           return;
         }
-        notifyRequestError('trace', error, '轨迹加载失败');
+        notifyRequestError('trace', error, 'chat.error.traceLoad');
       });
-  }, [getSlot, getStreamSlot, handleMissingSession, notifyRequestError, notifyStore, notifyStream, notifyTrace, tenantId]);
+  }, [getSlot, getStreamSlot, handleMissingSession, locale, notifyRequestError, notifyStore, notifyStream, notifyTrace, t, tenantId]);
 
   const stopTerminalTurnSync = useCallback((sessionIdToStop: string, turnIdToStop: string) => {
     const key = `${sessionIdToStop}:${turnIdToStop}`;
@@ -1470,15 +1643,16 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       .get<HumanHandoffRead[]>(`/api/chat/handoffs?tenant_id=${tenantId}&status=pending`)
       .then(setHandoffs)
       .catch((error) => {
-        notifyRequestError('handoffs', error, '待回答加载失败');
+        notifyRequestError('handoffs', error, 'chat.error.handoffsLoad');
       })
       .finally(() => setHandoffsLoading(false));
   }, [auth, notifyRequestError, tenantId]);
 
+  /** 提交人工接续回复；服务错误仅记录技术根因并显示稳定的本地化错误。 */
   const replyToHandoff = useCallback(async (handoff: HumanHandoffRead, reply: string): Promise<boolean> => {
     try {
       await api.post<HumanHandoffRead>(`/api/chat/handoffs/${handoff.id}/reply`, { tenant_id: tenantId, reply });
-      notify.success('已回复，原会话会继续执行');
+      notify.success(t('chat.notice.handoffReplied'));
       setHandoffs((rows) => rows.filter((item) => item.id !== handoff.id));
       setHandoffReplies((prev) => {
         const next = { ...prev };
@@ -1495,20 +1669,22 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
         redirectToLogin();
         return false;
       }
-      notify.error(error instanceof Error ? error.message : '回复失败');
+      console.error('[chat] handoff reply failed', error);
+      notify.error(t('chat.error.replyFailed'));
       return false;
     }
-  }, [getSlot, loadMessages, loadSessions, loadTraces, redirectToLogin, tenantId]);
+  }, [getSlot, loadMessages, loadSessions, loadTraces, redirectToLogin, t, tenantId]);
 
+  /** 校验并提交人工接续文本；空输入使用稳定的语义校验消息。 */
   const submitHandoffReply = useCallback((handoff: HumanHandoffRead) => {
     const reply = (handoffReplies[handoff.id] || '').trim();
     if (!reply) {
-      notify.warning('请输入回复内容');
+      notify.warning(t('chat.error.replyRequired'));
       return;
     }
     if (!ensureModelAvailable()) return;
     void replyToHandoff(handoff, reply);
-  }, [ensureModelAvailable, handoffReplies, replyToHandoff]);
+  }, [ensureModelAvailable, handoffReplies, replyToHandoff, t]);
 
   const openHandoffInbox = useCallback(() => {
     setShowHandoffInbox(true);
@@ -1547,16 +1723,17 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     notifyStore();
   }, [getSlot, notifyStore]);
 
+  /** 将发送内容加入持久化队列，并以本地化产品通知反馈队列状态。 */
   const enqueuePreparedTurn = useCallback((turn: PreparedChatTurn) => {
     queuedTurnsRef.current = [...queuedTurnsRef.current, turn];
     const persisted = persistQueuedTurns();
     appendQueuedTurnPreview(turn);
     notifyQueue();
-    notify.info('已加入发送队列');
+    notify.info(t('chat.notice.queued'));
     if (!persisted) {
-      notify.warning('排队内容过大，刷新页面后可能无法恢复');
+      notify.warning(t('chat.notice.queuePersistenceWarning'));
     }
-  }, [appendQueuedTurnPreview, notifyQueue, persistQueuedTurns]);
+  }, [appendQueuedTurnPreview, notifyQueue, persistQueuedTurns, t]);
 
   const removeQueuedTurn = useCallback((turnId: string) => {
     if (!turnId) return;
@@ -1846,27 +2023,34 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     setRenameTitle(session.title || session.summary || session.last_agent_question || '');
   }, []);
 
+  /** 保存会话标题；标题本身是用户输入，校验与失败提示使用本地化产品文案。 */
   const saveRename = useCallback(async () => {
     if (!renameSession) return;
     const title = renameTitle.trim();
     if (!title) {
-      notify.warning('请输入会话名称');
+      notify.warning(t('chat.error.renameRequired'));
       return;
     }
-    const updated = await api.put<ChatSession>(`/api/chat/sessions/${renameSession.id}`, {
-      tenant_id: tenantId,
-      title,
-    });
-    setSessions((items) => items.map((item) => (item.id === updated.id ? updated : item)));
-    setRenameSession(null);
-    setRenameTitle('');
-    notify.success('已重命名');
-  }, [renameSession, renameTitle, tenantId]);
+    try {
+      const updated = await api.put<ChatSession>(`/api/chat/sessions/${renameSession.id}`, {
+        tenant_id: tenantId,
+        title,
+      });
+      setSessions((items) => items.map((item) => (item.id === updated.id ? updated : item)));
+      setRenameSession(null);
+      setRenameTitle('');
+      notify.success(t('chat.notice.renamed'));
+    } catch (error) {
+      console.error('[chat] rename session failed', error);
+      notify.error(t('chat.error.renameFailed'));
+    }
+  }, [renameSession, renameTitle, t, tenantId]);
 
   const requestDelete = useCallback((session: ChatSession) => {
     setPendingDelete(session);
   }, []);
 
+  /** 删除会话并清理本地流状态；技术异常保留在日志，用户只看到稳定错误。 */
   const confirmDeleteSession = useCallback(async () => {
     const target = pendingDelete;
     if (!target) return;
@@ -1881,15 +2065,16 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       if (target.id === sessionId) {
         navigate(CHAT_BASE_PATH);
       }
-      notify.success('已删除');
+      notify.success(t('chat.notice.deleted'));
     } catch (error) {
       if (isAuthError(error)) {
         redirectToLogin();
         return;
       }
-      notify.error(error instanceof Error ? error.message : '删除失败');
+      console.error('[chat] delete session failed', error);
+      notify.error(t('chat.error.deleteFailed'));
     }
-  }, [forgetMissingSession, getStreamSlot, navigate, pendingDelete, redirectToLogin, sessionId, tenantId]);
+  }, [forgetMissingSession, getStreamSlot, navigate, pendingDelete, redirectToLogin, t, sessionId, tenantId]);
 
   const abortStream = useCallback(() => {
     if (!activeConversationId) return;
@@ -1917,7 +2102,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       upsertTraceLine(cancelledTurnId, {
         id: 'generation_stopped',
         kind: 'decision',
-        text: '用户已停止生成',
+        text: t('chat.trace.generationStopped'),
         state: 'completed',
       });
       finishTrace(cancelledTurnId);
@@ -1956,9 +2141,11 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     notifyStream,
     runningTurn,
     tenantId,
+    t,
     upsertTraceLine,
   ]);
 
+  /** 保存消息反馈并在请求失败时恢复本地状态，错误文本不直接暴露服务端异常。 */
   const rateMessage = useCallback(async (item: ChatMessage, rating: 'up' | 'down') => {
     if (!sessionId) return;
     const previous = item.feedback_rating || null;
@@ -1976,10 +2163,12 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
         redirectToLogin();
         return;
       }
-      notify.error(error instanceof Error ? error.message : '反馈提交失败');
+      console.error('[chat] message feedback failed', error);
+      notify.error(t('chat.error.feedbackFailed'));
     }
-  }, [redirectToLogin, sessionId, tenantId, updateMessageFeedback]);
+  }, [redirectToLogin, sessionId, t, tenantId, updateMessageFeedback]);
 
+  /** 将用户确认的定时任务写入服务端；任务标题作为业务值插入本地化通知。 */
   const confirmScheduledTask = useCallback(async (draft: ScheduledTaskDraftRead, draftKey?: string) => {
     if (!sessionId) return;
     try {
@@ -2010,15 +2199,16 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
         delete next[sessionId];
         return next;
       });
-      notify.success(`定时任务「${saved.title}」已启用`);
+      notify.success(t('chat.notice.scheduledEnabled', { title: saved.title }));
     } catch (error) {
       if (isAuthError(error)) {
         redirectToLogin();
         return;
       }
-      notify.error(error instanceof Error ? error.message : '创建定时任务失败');
+      console.error('[chat] scheduled task creation failed', error);
+      notify.error(t('chat.error.scheduleCreateFailed'));
     }
-  }, [redirectToLogin, sessionId, tenantId]);
+  }, [redirectToLogin, sessionId, t, tenantId]);
 
   const dismissScheduledTaskDraft = useCallback((messageId?: string) => {
     if (!sessionId) return;
@@ -2065,7 +2255,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
         if (shouldTouchStream && eventStream.turnId !== traceTurnId) {
           eventStream.turnId = traceTurnId;
         }
-        scheduledTaskTraceLines(draft).forEach(upsertVisibleTraceLine);
+        scheduledTaskTraceLines(draft, locale, t).forEach(upsertVisibleTraceLine);
         finishTrace(traceTurnId);
         notifyStream();
       }
@@ -2077,11 +2267,11 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       }
     }
     if (item.event === 'router_decision') {
-      upsertVisibleTraceLine(routerDecisionTraceLine(item.data));
+      upsertVisibleTraceLine(routerDecisionTraceLine(item.data, t));
       return;
     }
     if (item.event === 'step_result') {
-      upsertVisibleTraceLine(stepResultTraceLine(item.data));
+      upsertVisibleTraceLine(stepResultTraceLine(item.data, t));
       return;
     }
     if (
@@ -2092,7 +2282,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       || item.event === 'harness_tool_completed'
       || item.event === 'harness_step_timeout'
     ) {
-      const line = harnessEventTraceLine(item.event, item.data);
+      const line = harnessEventTraceLine(item.event, item.data, t);
       if (line) upsertVisibleTraceLine(line);
       return;
     }
@@ -2102,13 +2292,13 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
         .map((entry) => normalizeTraceSkill(entry))
         .filter((entry): entry is NonNullable<typeof entry> => Boolean(entry))
         .forEach((skill, index) => {
-          const label = streamSkillLabel(item.data, skill);
+          const label = streamSkillLabel(item.data, skill, t);
           const stateKey = skill.stepId || String(index);
           upsertVisibleTraceLine({
             id: `skill_state_${skill.skillId}_${skill.state || 'active'}_${stateKey}`,
             kind: 'skill',
             text: `${label} ${skill.name || skill.skillId}`,
-            detail: skill.stepId ? `当前步骤 ${skill.stepId}` : undefined,
+            detail: skill.stepId ? t('chat.trace.taskFrameStep', { stepId: skill.stepId }) : undefined,
             state: skill.state === 'suspended' ? 'completed' : 'running',
             icon: 'advance',
           });
@@ -2121,7 +2311,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       upsertVisibleTraceLine({
         id: `general_skill_${skillSlug || skillName || 'selected'}`,
         kind: 'skill',
-        text: `选择通用技能 ${skillName || skillSlug || ''}`.trim(),
+        text: t('chat.trace.selectGeneralSkill', { skillName: skillName || skillSlug || t('chat.empty.unset') }),
         detail: skillSlug || undefined,
         state: 'running',
         icon: 'advance',
@@ -2134,7 +2324,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
         notifyStream();
         return;
       }
-      const text = typeof item.data.message === 'string' ? item.data.message : '执行通用技能';
+      const text = t('chat.trace.runGeneralSkill');
       const code = typeof item.data.code === 'string' ? item.data.code : '';
       const runtime = typeof item.data.runtime === 'string' ? item.data.runtime : '';
       const attempt = typeof item.data.attempt === 'number' || typeof item.data.attempt === 'string'
@@ -2150,7 +2340,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       const existing = trace.lines.find((line) => line.id === id);
       const previousOutput = existing?.output || existing?.detail || '';
       const detail = isOutputChunk && previousOutput && rawDetail ? `${previousOutput}${rawDetail}` : rawDetail;
-      const outputInfo = generalSkillTraceOutput(item.data, phase, detail);
+      const outputInfo = generalSkillTraceOutput(item.data, phase, detail, t);
       const codePhases = new Set(['plan_created', 'plan_failed', 'attempt_started', 'running_code', 'stdout_chunk', 'stderr_chunk', 'code_finished', 'code_timeout']);
       const runningPhases = new Set(['planning', 'repair_planning', 'attempt_started', 'running_code', 'reflection_reviewing', 'replying']);
       upsertVisibleTraceLine({
@@ -2177,8 +2367,8 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       upsertVisibleTraceLine({
         id: knowledgeTraceLineId(item.data),
         kind: 'knowledge',
-        text: '读取知识库',
-        detail: knowledgeResultTraceDetail(item.data),
+        text: t('chat.trace.readKnowledge'),
+        detail: knowledgeResultTraceDetail(item.data, t),
         state: 'completed',
         icon: 'advance',
       });
@@ -2191,11 +2381,13 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
         upsertVisibleTraceLine({
           id: `tool_${tool.toolCallId || tool.rawToolName || tool.toolId}`,
           kind: 'tool',
-          text: `${tool.isError ? '工具调用失败' : '调用工具'} ${tool.toolName}`,
-          detail: toolTraceDetail(tool),
+          text: tool.isError
+            ? t('chat.trace.toolCallFailed')
+            : t('chat.trace.toolCall', { toolName: tool.toolName }),
+          detail: toolTraceDetail(tool, t),
           output: output || undefined,
           outputLanguage: output ? 'json' : undefined,
-          outputTitle: output ? '查看工具结果' : undefined,
+          outputTitle: output ? t('chat.trace.toolResult') : undefined,
           state: tool.isError ? 'failed' : 'completed',
           icon: 'tool',
         });
@@ -2208,10 +2400,12 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       upsertVisibleTraceLine({
         id: `decision_stepping_tool_continuation_${iteration}`,
         kind: 'decision',
-        text: '重新分析',
+        text: t('chat.trace.reanalysis'),
         detail: item.event === 'agent_loop_continued'
-          ? (targetTool ? `决定继续调用 ${targetTool}` : '决定继续调用工具')
-          : '判断无需继续调用工具',
+          ? (targetTool
+            ? t('chat.trace.continueTool', { toolName: targetTool })
+            : t('chat.trace.continueToolGeneric'))
+          : t('chat.trace.noContinueTool'),
         state: 'completed',
         icon: 'loading',
       });
@@ -2220,11 +2414,25 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     if (item.event === 'reflection_decision') {
       const needsRetry = item.data.needs_retry === true;
       const skipped = item.data.skipped === true;
+      const attempt = item.data.attempt;
+      const maxAttempts = item.data.max_attempts;
+      const hasRetryMetadata = (
+        typeof attempt === 'number'
+        && Number.isInteger(attempt)
+        && typeof maxAttempts === 'number'
+        && Number.isInteger(maxAttempts)
+      );
       upsertVisibleTraceLine({
         id: 'reflection',
         kind: 'decision',
-        text: skipped ? '反思已关闭' : needsRetry ? '反思后继续尝试' : '反思通过',
-        detail: reflectionTraceDetail(item.data),
+        text: skipped
+          ? t('chat.trace.reflectionClosed')
+          : needsRetry
+            ? hasRetryMetadata
+              ? t('chat.trace.reflectionRetry', { attempt, max_attempts: maxAttempts })
+              : t('chat.trace.reflectionRetryLegacy')
+            : t('chat.trace.reflectionPassed'),
+        detail: reflectionTraceDetail(item.data, t),
         state: 'completed',
         icon: 'loading',
       });
@@ -2235,30 +2443,59 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
         eventStream.turnId = traceTurnId;
       }
       const phase = typeof item.data.phase === 'string' ? item.data.phase : 'thinking';
+      const canonicalMessage = canonicalStatusMessage(item.data, t);
+      if (canonicalMessage !== null) {
+        // Workflow: canonical events own product wording; legacy phase/text fields remain
+        // compatibility input only and cannot override the localized code projection.
+        if (shouldTouchStream) eventStream.phase = canonicalMessage;
+        if (phase !== 'responding') {
+          upsertVisibleTraceLine({
+            id: 'canonical_status',
+            kind: 'decision',
+            text: canonicalMessage,
+            state: 'running',
+            icon: 'advance',
+          });
+        }
+        notifyStream();
+        return;
+      }
       if (phase === 'responding') {
         notifyStream();
         return;
       }
       if (shouldTouchStream) {
-        eventStream.phase = publicStreamPhase(item.data);
+        eventStream.phase = publicStreamPhase(item.data, t);
       }
-      const scheduledTaskLine = scheduledTaskStatusTraceLine(phase, item.data);
+      const scheduledTaskLine = scheduledTaskStatusTraceLine(phase, item.data, locale, t);
       if (scheduledTaskLine) {
         upsertVisibleTraceLine(scheduledTaskLine);
       } else if (phase === 'error') {
-        upsertVisibleTraceLine(streamErrorTraceLine(item.data, 'error_occurred'));
+        upsertVisibleTraceLine(streamErrorTraceLine(item.data, 'error_occurred', t));
         finishTrace(traceTurnId, true);
       } else if (phase === 'tool' && typeof item.data.tool_name === 'string') {
         const toolCallId = typeof item.data.tool_call_id === 'string' ? item.data.tool_call_id : item.data.tool_name;
-        upsertVisibleTraceLine({ id: `tool_${toolCallId}`, kind: 'tool', text: `正在调用 ${item.data.tool_name}`, state: 'running', icon: 'tool' });
+        upsertVisibleTraceLine({
+          id: `tool_${toolCallId}`,
+          kind: 'tool',
+          text: t('chat.trace.callingTool', { toolName: item.data.tool_name }),
+          state: 'running',
+          icon: 'tool',
+        });
       } else if (phase === 'routing') {
-        upsertVisibleTraceLine({ id: 'decision_router', kind: 'decision', text: '判断意图', state: 'running', icon: 'judge' });
+        upsertVisibleTraceLine({
+          id: 'decision_router',
+          kind: 'decision',
+          text: t('chat.trace.decideIntent'),
+          state: 'running',
+          icon: 'judge',
+        });
       } else if (isKnowledgeTracePhase(phase)) {
         upsertVisibleTraceLine({
           id: knowledgeTraceLineId(item.data),
           kind: 'knowledge',
-          text: knowledgeTraceText(item.data),
-          detail: knowledgeTraceDetail(item.data),
+          text: knowledgeTraceText(item.data, t),
+          detail: knowledgeTraceDetail(item.data, t),
           state: phase === 'evidence_pack' || phase.startsWith('no_') || phase === 'okf_only' ? 'completed' : 'running',
           icon: 'advance',
         });
@@ -2268,17 +2505,23 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
         upsertVisibleTraceLine({
           id: `decision_stepping_${repairReason}${iteration}`,
           kind: 'decision',
-          text: repairReason === 'main' ? '决定下一步' : '重新分析',
+          text: repairReason === 'main' ? t('chat.trace.nextStep') : t('chat.trace.reanalysis'),
           state: 'running',
           icon: repairReason === 'main' ? 'advance' : 'loading',
         });
       } else if (phase === 'reflecting') {
-        upsertVisibleTraceLine({ id: 'reflection', kind: 'decision', text: '正在反思', state: 'running', icon: 'loading' });
+        upsertVisibleTraceLine({
+          id: 'reflection',
+          kind: 'decision',
+          text: t('chat.trace.reflecting'),
+          state: 'running',
+          icon: 'loading',
+        });
       } else if (phase !== 'received') {
         upsertVisibleTraceLine({
           id: `decision_status_${phase}`,
           kind: 'decision',
-          text: shouldTouchStream ? eventStream.phase : publicStreamPhase(item.data),
+          text: shouldTouchStream ? eventStream.phase : publicStreamPhase(item.data, t),
           state: 'running',
           icon: 'advance',
         });
@@ -2405,7 +2648,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       clearStreamSlot(eventSessionId, true);
       eventStream.relayRecoveryStartedAt = null;
       eventStream.relayRecoveryTurnId = null;
-      upsertVisibleTraceLine(streamErrorTraceLine(item.data, item.event));
+      upsertVisibleTraceLine(streamErrorTraceLine(item.data, item.event, t));
       window.setTimeout(() => {
         loadMessages(eventSessionId);
         loadTraces(eventSessionId);
@@ -2432,7 +2675,9 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
         upsertVisibleTraceLine({
           id: 'decision_router',
           kind: 'decision',
-          text: userIntent ? `判断意图 ${userIntent}` : '完成SOP判断',
+          text: userIntent
+            ? t('chat.trace.intentWithValue', { intent: userIntent })
+            : t('chat.trace.completedSopDecision'),
           detail: decisionReason || undefined,
           state: 'completed',
         });
@@ -2479,13 +2724,14 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
         current?.sessionId === eventSessionId && current.turnId === (eventStream.turnId || traceTurnId) ? null : current
       ));
       const errorTurnId = eventStream.turnId || traceTurnId;
-      upsertTraceLine(errorTurnId, streamErrorTraceLine(item.data, item.event));
+      upsertTraceLine(errorTurnId, streamErrorTraceLine(item.data, item.event, t));
       finishTrace(errorTurnId, true);
+      console.error('[chat] scheduled task execution failed', item.data);
       appendRealtime(eventSessionId, {
         id: `scheduled_error_${Date.now()}`,
         turnId: errorTurnId,
         role: 'assistant',
-        content: typeof item.data.message === 'string' ? item.data.message : '定时任务执行失败。',
+        content: t('chat.error.scheduledExecutionFailed'),
         created_at: new Date().toISOString(),
         isError: true,
       });
@@ -2511,6 +2757,8 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     ensureStreamingTraceMessage,
     syncTurnUntilAssistant,
     updateStreaming,
+    t,
+    locale,
     upsertTraceLine,
   ]);
 
@@ -2599,7 +2847,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     );
     stream.turnId = turnId;
     stream.loading = true;
-    stream.phase = stream.phase || '执行中';
+    stream.phase = stream.phase || t('chat.trace.running');
     stream.accumulated = text;
     stream.relayRecoveryStartedAt = stream.relayRecoveryStartedAt || Date.now();
     stream.relayRecoveryTurnId = turnId;
@@ -2688,8 +2936,8 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
             upsertTraceLine(recoveringTurnId, {
               id: 'stream_relay_timeout',
               kind: 'thinking',
-              text: '响应同步超时',
-              detail: '前端已从事件日志持续同步，但服务端没有写入完成事件。',
+              text: t('chat.trace.responseTimeout'),
+              detail: t('chat.trace.responseTimeoutDetail'),
               state: 'failed',
               icon: 'loading',
             });
@@ -2698,7 +2946,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
               id: `stream_relay_timeout_${recoveringTurnId}_${Date.now()}`,
               turnId: recoveringTurnId,
               role: 'assistant',
-              content: '本次响应同步超时，请重试发送。',
+              content: t('chat.error.streamSyncTimeout'),
               created_at: new Date().toISOString(),
               isError: true,
             });
@@ -2759,7 +3007,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
               return;
             }
             stream.loading = true;
-            stream.phase = '执行中';
+            stream.phase = t('chat.trace.running');
             if (hasRenderableStreamingText(stream.accumulated)) {
               updateStreaming(id, stream.accumulated, eventTurnId);
             }
@@ -2799,6 +3047,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     syncTurnUntilAssistant,
     tenantId,
     updateStreaming,
+    t,
     upsertTraceLine,
   ]);
 
@@ -2814,7 +3063,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
         {
           id: uploadKey,
           uploadKey,
-          filename: file.name || '剪贴板文件',
+          filename: file.name || t('chat.composer.clipboardFile'),
           content_type: file.type || 'application/octet-stream',
           size: file.size,
           kind: file.type.startsWith('image/') ? 'image' : 'binary',
@@ -2824,7 +3073,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       uploadChatAttachments<ChatAttachmentRead[]>(tenantId, [file], controller.signal)
         .then((items) => {
           const parsed = items[0];
-          if (!parsed) throw new Error('文件解析结果为空');
+          if (!parsed) throw new Error('chat.error.uploadParseFailed');
           setComposerAttachments((current) =>
             current.map((item) => (item.uploadKey === uploadKey ? { ...parsed, uploadKey, uploadStatus: 'ready' } : item)),
           );
@@ -2834,7 +3083,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
           setComposerAttachments((current) =>
             current.map((item) => (
               item.uploadKey === uploadKey
-                ? { ...item, uploadStatus: 'error', error: error instanceof Error ? error.message : '上传失败' }
+                ? { ...item, uploadStatus: 'error', error: t('chat.error.uploadFailed') }
                 : item
             )),
           );
@@ -2843,7 +3092,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
           uploadControllersRef.current.delete(uploadKey);
         });
     });
-  }, [tenantId]);
+  }, [t, tenantId]);
 
   const removeComposerAttachment = useCallback((uploadKey: string) => {
     uploadControllersRef.current.get(uploadKey)?.abort();
@@ -2916,6 +3165,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     return () => window.clearInterval(timer);
   }, [auth, pollScheduledSessionEvents, sessionId, sessions]);
 
+  /** 执行一次聊天发送及流式恢复流程；用户输入和附件作为 raw 业务数据原样传输。 */
   const executePreparedTurn = useCallback(async (
     prepared: PreparedChatTurn,
     options: { queued?: boolean } = {},
@@ -2948,11 +3198,18 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       },
       created_at: options.queued ? new Date().toISOString() : prepared.createdAt,
     });
-    upsertTraceLine(turnId, { id: 'decision_router', kind: 'decision', text: '判断意图', state: 'running', icon: 'judge', provisional: true });
+    upsertTraceLine(turnId, {
+      id: 'decision_router',
+      kind: 'decision',
+      text: t('chat.trace.decideIntent'),
+      state: 'running',
+      icon: 'judge',
+      provisional: true,
+    });
     setCollapsedTraceIds((current) => current.filter((item) => item !== turnId));
     setExpandedTraceIds((current) => (current.includes(turnId) ? current : [...current, turnId]));
     stream.loading = true;
-    stream.phase = '正在思考';
+    stream.phase = t('chat.trace.thinking');
     setRunningTurn({ sessionId: currentConversationId, turnId });
     notifyStream();
 
@@ -2977,6 +3234,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       }
     };
 
+    /** 在无法确认服务端会话时插入安全的本地化错误消息，根因保留在技术日志。 */
     const appendInterruptedResponse = (reason: string) => {
       const activeTurnId = getStreamSlot(liveConversationId).turnId || turnId;
       clearStreamSlot(liveConversationId, true);
@@ -3082,6 +3340,8 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
         status: 'active',
         summary: userText || undefined,
         last_agent_question: userText || undefined,
+        agent_reply_locale: prepared.languageContext.agentReplyLocale,
+        agent_reply_locale_source: prepared.languageContext.agentReplyLocaleSource,
         updated_at: now,
       });
       liveConversationId = nextSessionId;
@@ -3102,14 +3362,15 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       }
       const targetSessionId = liveConversationId;
       if (!targetSessionId || isDraftConversationKey(targetSessionId)) {
-        appendInterruptedResponse('本次响应连接中断，未能确认服务端会话。请重试发送。');
+        console.error('[chat] response connection interrupted before session confirmation');
+        appendInterruptedResponse(t('chat.error.connectionInterrupted'));
         return;
       }
       const activeStream = getStreamSlot(targetSessionId);
       const activeTurnId = activeStream.turnId || turnId;
       activeStream.abortController = null;
       activeStream.loading = true;
-      activeStream.phase = activeStream.phase || '执行中';
+      activeStream.phase = activeStream.phase || t('chat.trace.running');
       activeStream.turnId = activeTurnId;
       activeStream.relayRecoveryStartedAt = activeStream.relayRecoveryStartedAt || Date.now();
       activeStream.relayRecoveryTurnId = activeTurnId;
@@ -3126,6 +3387,9 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     }
 
     try {
+      // Workflow: request fields are derived only from the prepared turn snapshot so
+      // retries, queue resume, and a later UI preference change cannot alter execution.
+      const languageContext = prepared.languageContext;
       const requestBody: Record<string, unknown> = {
         tenant_id: tenantId,
         user_id: userId,
@@ -3137,6 +3401,17 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
         interaction_mode: resolvedInteractionMode,
         client_timezone: getClientTimeZone(),
         model_config_id: prepared.modelConfigId,
+        ui_locale: languageContext.uiLocale,
+        agent_reply_locale: languageContext.agentReplyLocale,
+        ui_locale_source: languageContext.uiLocaleSource,
+        agent_reply_locale_source: languageContext.agentReplyLocaleSource,
+        language_context: {
+          version: languageContext.version,
+          ui_locale: languageContext.uiLocale,
+          agent_reply_locale: languageContext.agentReplyLocale,
+          ui_locale_source: languageContext.uiLocaleSource,
+          agent_reply_locale_source: languageContext.agentReplyLocaleSource,
+        },
       };
       if (!startedAsDraftConversation) {
         requestBody.session_id = currentConversationId;
@@ -3250,6 +3525,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     updateStreaming,
     upsertOptimisticSession,
     upsertTraceLine,
+    t,
     userId,
   ]);
 
@@ -3257,12 +3533,12 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     const resolvedInteractionMode = interactionMode || composerIntent || 'normal';
     if (!activeConversationId) return;
     if (resolvedInteractionMode === 'scheduled_task' && !input.trim()) {
-      notify.warning('请输入要创建的定时任务内容');
+      notify.warning(t('chat.error.scheduleContentRequired'));
       return;
     }
     if (!input.trim() && readyComposerAttachments.length === 0) return;
     if (uploadingComposerAttachment) {
-      notify.warning('文件还在解析中，请稍后发送');
+      notify.warning(t('chat.error.uploadInProgress'));
       return;
     }
     if (!ensureModelAvailable()) return;
@@ -3272,16 +3548,16 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     ));
     if (pendingHandoff) {
       if (resolvedInteractionMode !== 'normal') {
-        notify.warning('待回答会话仅支持发送人工回复');
+        notify.warning(t('chat.error.handoffReplyOnly'));
         return;
       }
       if (readyComposerAttachments.length > 0) {
-        notify.warning('待回答暂不支持附件，请发送文字回复');
+        notify.warning(t('chat.error.handoffAttachmentUnsupported'));
         return;
       }
       const reply = input.trim();
       if (!reply) {
-        notify.warning('请输入回复内容');
+        notify.warning(t('chat.error.replyRequired'));
         return;
       }
       if (await replyToHandoff(pendingHandoff, reply)) {
@@ -3294,15 +3570,15 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     const activeSession = sessionId ? sessions.find((item) => item.id === sessionId) || null : null;
     if (!isDraftConversation && !activeSession && !optimisticSessionIdsRef.current.has(currentConversationId)) {
       if (sessionsLoading || handoffsLoading) {
-        notify.warning('任务信息还在加载，请稍后再发送');
+        notify.warning(t('chat.error.sessionLoading'));
       } else {
-        notify.warning('当前账号不能直接向该会话发送消息，请从待回答列表回复');
+        notify.warning(t('chat.error.sessionAccess'));
       }
       return;
     }
     const sessionAgentId = activeSession?.agent_id || activeDraftAgentId || selectedAgentId || displayedAgent?.id || '';
     if (!sessionAgentId) {
-      notify.warning('该任务没有绑定数字员工，请新建任务后再发送');
+      notify.warning(t('chat.error.agentRequired'));
       return;
     }
     const prepared: PreparedChatTurn = {
@@ -3315,6 +3591,11 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       interactionMode: resolvedInteractionMode,
       modelConfigId: selectedModelConfig?.id,
       createdAt: new Date().toISOString(),
+      languageContext: resolveLanguageContextSnapshot({
+        uiLocale: locale,
+        agentReplyLocalePreference,
+        sessionAgentReplyLocale: activeSession?.agent_reply_locale,
+      }),
     };
     setInput('');
     setComposerAttachments([]);
@@ -3335,6 +3616,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
   }, [
     activeConversationId,
     activeDraftAgentId,
+    agentReplyLocalePreference,
     composerIntent,
     currentSessionRunning,
     displayedAgent?.id,
@@ -3346,6 +3628,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     handoffsLoading,
     input,
     isDraftConversation,
+    locale,
     readyComposerAttachments,
     replyToHandoff,
     selectedAgentId,
@@ -3353,6 +3636,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     sessionId,
     sessions,
     sessionsLoading,
+    t,
     uploadingComposerAttachment,
   ]);
 
@@ -3470,6 +3754,9 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     displayedTeam,
     teamEmptyStats,
     currentSession,
+    agentReplyLocale,
+    agentReplyLocaleLocked,
+    setAgentReplyLocale,
     emptyProfileTags,
     emptyRoleSummary,
     emptyStats,

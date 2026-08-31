@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
 import hashlib
 import hmac
 import json
+import logging
 import secrets
+from datetime import UTC, datetime, timedelta
 from urllib.parse import urlsplit
 
 import httpx
@@ -14,6 +15,8 @@ from sqlmodel import Session, select
 
 from app.async_jobs import enqueue_async_job
 from app.config import get_settings
+from app.contracts.error_registry import ERROR_REGISTRY
+from app.contracts.projections import project_public_error_payload
 from app.db import engine, get_session
 from app.db.models import (
     APICredential,
@@ -26,8 +29,8 @@ from app.public_api.errors import PublicAPIError
 from app.public_api.schemas import WebhookCreate, WebhookRead
 from app.security.encryption import decrypt_secret, encrypt_secret
 
-
 router = APIRouter(prefix="/webhooks", tags=["webhooks"])
+logger = logging.getLogger(__name__)
 
 
 def _read(row: WebhookEndpoint) -> WebhookRead:
@@ -186,6 +189,7 @@ def list_webhook_deliveries(
     principal: PublicPrincipal = Depends(require_scopes("webhooks:read")),
     db: Session = Depends(get_session),
 ) -> list[dict]:
+    """Return delivery audit rows with canonical errors and no persisted exception prose."""
     _owned_endpoint(db, principal, endpoint_id)
     rows = db.exec(
         select(WebhookDelivery)
@@ -193,20 +197,24 @@ def list_webhook_deliveries(
         .order_by(WebhookDelivery.created_at.desc())
         .limit(100)
     ).all()
-    return [
-        {
-            "id": row.id,
-            "event_id": row.event_id,
-            "event_type": row.event_type,
-            "status": row.status,
-            "attempt_count": row.attempt_count,
-            "last_status_code": row.last_status_code,
-            "last_error": row.last_error,
-            "created_at": row.created_at,
-            "delivered_at": row.delivered_at,
-        }
-        for row in rows
-    ]
+    deliveries: list[dict[str, object]] = []
+    for row in rows:
+        error = _delivery_error(row)
+        deliveries.append(
+            {
+                "id": row.id,
+                "event_id": row.event_id,
+                "event_type": row.event_type,
+                "status": row.status,
+                "attempt_count": row.attempt_count,
+                "last_status_code": row.last_status_code,
+                "last_error": error.get("code") if row.last_error else None,
+                "error": error,
+                "created_at": row.created_at,
+                "delivered_at": row.delivered_at,
+            }
+        )
+    return deliveries
 
 
 def _owned_endpoint(
@@ -274,6 +282,7 @@ def enqueue_webhook_deliveries(delivery_ids: list[str]) -> None:
 
 
 def deliver_webhook(delivery_id: str) -> None:
+    """Deliver one leased webhook and retain only canonical retry metadata on failure."""
     with Session(engine) as db:
         owner = f"whlease_{secrets.token_hex(12)}"
         now = utc_now()
@@ -315,7 +324,7 @@ def deliver_webhook(delivery_id: str) -> None:
                 owner,
                 {
                     "status": "abandoned",
-                    "last_error": "Webhook endpoint is inactive",
+                    "last_error": "INTERNAL_ERROR",
                     "next_attempt_at": None,
                 },
             )
@@ -324,7 +333,7 @@ def deliver_webhook(delivery_id: str) -> None:
         timestamp = str(int(datetime_now_timestamp()))
         signature = hmac.new(
             decrypt_secret(endpoint.secret_encrypted).encode("utf-8"),
-            f"{timestamp}.{body}".encode("utf-8"),
+                f"{timestamp}.{body}".encode(),
             hashlib.sha256,
         ).hexdigest()
         delivery.attempt_count += 1
@@ -347,7 +356,8 @@ def deliver_webhook(delivery_id: str) -> None:
                 delivery.last_error = None
             else:
                 _schedule_retry(delivery, f"HTTP {response.status_code}")
-        except Exception as exc:  # noqa: BLE001 - persisted delivery boundary.
+        except Exception as exc:
+            logger.exception("webhook delivery failed delivery_id=%s", delivery.id)
             _schedule_retry(delivery, str(exc))
         _finish_webhook_delivery(
             db,
@@ -394,8 +404,37 @@ def _finish_webhook_delivery(
     return True
 
 
-def _schedule_retry(delivery: WebhookDelivery, error: str) -> None:
-    delivery.last_error = error[:1000]
+def _delivery_error(delivery: WebhookDelivery) -> dict[str, object]:
+    """Project one stored webhook error and preserve request/trace linkage from its event payload."""
+    if not delivery.last_error:
+        return {}
+    payload_data = delivery.payload_json.get("data") if isinstance(delivery.payload_json, dict) else None
+    payload_data = payload_data if isinstance(payload_data, dict) else {}
+    request_id = payload_data.get("request_id")
+    trace_id = payload_data.get("trace_id")
+    return project_public_error_payload(
+        {
+            "code": delivery.last_error,
+            "retryable": delivery.status == "retrying",
+        },
+        ERROR_REGISTRY,
+        source="public-api-webhook-delivery",
+        default_retryable=delivery.status == "retrying",
+        request_id=request_id if isinstance(request_id, str) else None,
+        trace_id=trace_id if isinstance(trace_id, str) else None,
+    )
+
+
+def _schedule_retry(delivery: WebhookDelivery, error: object) -> None:
+    """Persist only a stable error code before scheduling a webhook retry."""
+    candidate = error if isinstance(error, dict) else {"message": str(error)}
+    projected = project_public_error_payload(
+        candidate,
+        ERROR_REGISTRY,
+        source="public-api-webhook-retry",
+        default_retryable=True,
+    )
+    delivery.last_error = str(projected["code"])
     if delivery.attempt_count >= get_settings().public_api_webhook_max_attempts:
         delivery.status = "abandoned"
         delivery.next_attempt_at = None

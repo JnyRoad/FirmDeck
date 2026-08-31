@@ -6,8 +6,13 @@ import {
   DialogFooter,
   DialogHeader,
   DialogTitle,
-  notify,
 } from '@/components/ui';
+import { createToastNotifier } from '@/components/ui/app-toast';
+import { createMessageDescriptor, type MessageDescriptor } from '@/i18n/descriptors';
+import { RawIdentifier } from '@/i18n/RawContent';
+import { useAppIntl } from '@/i18n/useAppIntl';
+import type { MessageId } from '@/i18n/types';
+import { backendErrorMessageDescriptor } from '@/lib/apiErrorMessages';
 import { useEffect, useRef, useState } from 'react';
 import { api, TENANT_ID } from '../api/client';
 import {
@@ -22,6 +27,28 @@ import EmployeeAvatar from './EmployeeAvatar';
 const MAX_INPUT_IMAGE_BYTES = 5 * 1024 * 1024;
 const AVATAR_CANVAS_SIZE = 360;
 
+const AVATAR_PRESET_MESSAGE_IDS: Record<string, MessageId> = {
+  'service-orbit': 'employeeAvatar.preset.serviceOrbit',
+  'after-sales-seal': 'employeeAvatar.preset.afterSalesSeal',
+  'knowledge-node': 'employeeAvatar.preset.knowledgeNode',
+  'commerce-compass': 'employeeAvatar.preset.commerceCompass',
+  'ops-grid': 'employeeAvatar.preset.opsGrid',
+  'quality-star': 'employeeAvatar.preset.qualityStar',
+  'sales-handshake': 'employeeAvatar.preset.salesHandshake',
+  'marketing-spark': 'employeeAvatar.preset.marketingSpark',
+  'procurement-check': 'employeeAvatar.preset.procurementCheck',
+  'project-board': 'employeeAvatar.preset.projectBoard',
+  'data-insight': 'employeeAvatar.preset.dataInsight',
+};
+
+const AVATAR_UPLOAD_ERRORS = {
+  read: 'AVATAR_READ_FAILED',
+  image: 'AVATAR_IMAGE_INVALID',
+  file: 'AVATAR_FILE_REQUIRED',
+  size: 'AVATAR_FILE_TOO_LARGE',
+  processing: 'AVATAR_PROCESSING_UNAVAILABLE',
+} as const;
+
 type AvatarDraft = Pick<EmployeeProfile, 'avatarKind' | 'avatarImage' | 'avatarPreset' | 'avatarText' | 'avatarTone'>;
 
 export default function EmployeeAvatarEditor({
@@ -35,6 +62,8 @@ export default function EmployeeAvatarEditor({
   onClose: () => void;
   onSaved?: (agent: AgentProfileRead) => void;
 }) {
+  const { t } = useAppIntl();
+  const toast = createToastNotifier({ t });
   const inputRef = useRef<HTMLInputElement | null>(null);
   const [mode, setMode] = useState<'preset' | 'upload'>('preset');
   const [selectedPreset, setSelectedPreset] = useState(EMPLOYEE_AVATAR_PRESETS[0].key);
@@ -66,6 +95,7 @@ export default function EmployeeAvatarEditor({
       avatarTone: selected.tone,
     };
 
+  /** Accept and normalize an image file; user-facing errors are projected to descriptors. */
   async function handleUpload(file: File | undefined) {
     if (!file) return;
     try {
@@ -73,12 +103,13 @@ export default function EmployeeAvatarEditor({
       setUploadedImage(dataUrl);
       setMode('upload');
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '头像读取失败');
+      toast.error(avatarUploadErrorDescriptor(error));
     } finally {
       if (inputRef.current) inputRef.current.value = '';
     }
   }
 
+  /** Persist the selected avatar metadata and expose only stable toast descriptors. */
   async function save() {
     if (!agent) return;
     setSaving(true);
@@ -98,12 +129,15 @@ export default function EmployeeAvatarEditor({
         tenant_id: TENANT_ID,
         metadata,
       });
-      notify.success('员工头像已更新');
+      toast.success(createMessageDescriptor('employeeAvatar.toast.updated'));
       onSaved?.(saved);
       onClose();
       window.dispatchEvent(new Event('ultrarag-enterprise-agent-scope-refresh'));
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '保存头像失败');
+      const descriptor = backendErrorMessageDescriptor(error);
+      toast.error(descriptor
+        ? { id: descriptor.messageId, values: descriptor.values }
+        : createMessageDescriptor('employeeAvatar.toast.saveFailed'));
     } finally {
       setSaving(false);
     }
@@ -117,7 +151,13 @@ export default function EmployeeAvatarEditor({
       >
         <DialogHeader className="px-3">
           <DialogTitle className="text-sm font-normal leading-none text-[#757f9c]">
-            {agent ? `设置头像：${employeeDisplayName(agent)}` : '设置头像'}
+            {agent ? (
+              <>
+                <span>{t('employeeAvatar.dialog.title')}</span>
+                <span aria-hidden="true">{t('employeeAvatar.dialog.titleSeparator')}</span>
+                <RawIdentifier value={employeeDisplayName(agent)} />
+              </>
+            ) : t('employeeAvatar.dialog.title')}
           </DialogTitle>
         </DialogHeader>
 
@@ -125,17 +165,19 @@ export default function EmployeeAvatarEditor({
           <div className="grid grid-cols-[auto_minmax(0,1fr)] items-center gap-[18px] rounded-2xl border border-border bg-[linear-gradient(135deg,color-mix(in_srgb,var(--accent-soft)_34%,transparent),transparent_58%),var(--surface-subtle)] p-[18px]">
             <EmployeeAvatar profile={profile} width={104} height={122} />
             <div>
-              <strong className="block text-sm text-foreground">{mode === 'upload' ? '自定义头像' : selected.label}</strong>
+              <strong className="block text-sm text-foreground">
+                {mode === 'upload' ? t('employeeAvatar.mode.custom') : t(AVATAR_PRESET_MESSAGE_IDS[selected.key])}
+              </strong>
               <p className="mt-1 text-xs text-muted-foreground">
-                头像会显示在我的数字员工、数字员工档案页和对话端的员工选择中。
+                {t('employeeAvatar.preview.description')}
               </p>
             </div>
           </div>
 
           <section className="space-y-3">
             <div className="flex items-baseline justify-between gap-3">
-              <strong className="text-[13px] text-foreground">默认头像</strong>
-              <span className="text-xs text-muted-foreground">选择一个适合岗位的默认头像。</span>
+              <strong className="text-[13px] text-foreground">{t('employeeAvatar.preset.heading')}</strong>
+              <span className="text-xs text-muted-foreground">{t('employeeAvatar.preset.hint')}</span>
             </div>
             <div className="grid grid-cols-3 gap-2.5">
               {EMPLOYEE_AVATAR_PRESETS.map((preset) => {
@@ -161,7 +203,9 @@ export default function EmployeeAvatarEditor({
                       }}
                       size={52}
                     />
-                    <span className="min-w-0 truncate text-left font-[760]">{preset.label}</span>
+                    <span className="min-w-0 truncate text-left font-[760]">
+                      {t(AVATAR_PRESET_MESSAGE_IDS[preset.key])}
+                    </span>
                     {active && <CheckOutlined className="text-accent" />}
                   </button>
                 );
@@ -185,8 +229,8 @@ export default function EmployeeAvatarEditor({
               <UploadOutlined />
             </span>
             <span className="grid min-w-0 gap-0.5">
-              <span className="text-sm font-semibold text-foreground">上传自定义头像</span>
-              <span className="text-xs text-muted-foreground">支持常见图片格式，会自动裁剪为方形头像。</span>
+              <span className="text-sm font-semibold text-foreground">{t('employeeAvatar.upload.action')}</span>
+              <span className="text-xs text-muted-foreground">{t('employeeAvatar.upload.hint')}</span>
             </span>
           </button>
         </div>
@@ -198,14 +242,14 @@ export default function EmployeeAvatarEditor({
             onClick={onClose}
             className="h-8 w-[92px] rounded-[10px] border-[#e3e7f1] bg-white px-3 text-sm font-normal text-[#464c5e] hover:border-[#e3e7f1] hover:bg-[#f6f6f6] hover:text-[#18181a]"
           >
-            取消
+            {t('employeeAvatar.action.cancel')}
           </Button>
           <Button
             disabled={saving}
             onClick={() => void save()}
             className="h-8 w-[92px] rounded-[10px] bg-[#18181a] px-3 text-sm font-normal text-white hover:bg-[#303030]"
           >
-            保存头像
+            {t('employeeAvatar.action.save')}
           </Button>
         </DialogFooter>
       </DialogContent>
@@ -213,30 +257,33 @@ export default function EmployeeAvatarEditor({
   );
 }
 
+/** Read a selected file as a data URL; technical failures use stable private codes. */
 function readFileAsDataUrl(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
-    reader.onerror = () => reject(new Error('头像读取失败'));
+    reader.onerror = () => reject(new Error(AVATAR_UPLOAD_ERRORS.read));
     reader.onload = () => resolve(String(reader.result || ''));
     reader.readAsDataURL(file);
   });
 }
 
+/** Decode an avatar data URL; malformed image data is never exposed as UI text. */
 function loadImage(dataUrl: string): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
     const image = new Image();
-    image.onerror = () => reject(new Error('无法解析头像图片'));
+    image.onerror = () => reject(new Error(AVATAR_UPLOAD_ERRORS.image));
     image.onload = () => resolve(image);
     image.src = dataUrl;
   });
 }
 
+/** Crop an uploaded image to the avatar contract while retaining no user-facing raw error. */
 async function fileToAvatarDataUrl(file: File): Promise<string> {
   if (!file.type.startsWith('image/')) {
-    throw new Error('请选择图片文件');
+    throw new Error(AVATAR_UPLOAD_ERRORS.file);
   }
   if (file.size > MAX_INPUT_IMAGE_BYTES) {
-    throw new Error('头像图片不能超过 5MB');
+    throw new Error(AVATAR_UPLOAD_ERRORS.size);
   }
 
   const image = await loadImage(await readFileAsDataUrl(file));
@@ -244,7 +291,7 @@ async function fileToAvatarDataUrl(file: File): Promise<string> {
   canvas.width = AVATAR_CANVAS_SIZE;
   canvas.height = AVATAR_CANVAS_SIZE;
   const context = canvas.getContext('2d');
-  if (!context) throw new Error('当前浏览器无法处理头像图片');
+  if (!context) throw new Error(AVATAR_UPLOAD_ERRORS.processing);
 
   const side = Math.min(image.width, image.height);
   const sx = Math.max(0, (image.width - side) / 2);
@@ -255,4 +302,21 @@ async function fileToAvatarDataUrl(file: File): Promise<string> {
 
   const png = canvas.toDataURL('image/png');
   return png.length < 650_000 ? png : canvas.toDataURL('image/jpeg', 0.86);
+}
+
+/** Map private avatar-processing failures to stable localized descriptors. */
+function avatarUploadErrorDescriptor(error: unknown): MessageDescriptor {
+  const code = error instanceof Error ? error.message : '';
+  switch (code) {
+    case AVATAR_UPLOAD_ERRORS.file:
+      return createMessageDescriptor('employeeAvatar.error.fileRequired');
+    case AVATAR_UPLOAD_ERRORS.size:
+      return createMessageDescriptor('employeeAvatar.error.tooLarge');
+    case AVATAR_UPLOAD_ERRORS.image:
+      return createMessageDescriptor('employeeAvatar.error.imageInvalid');
+    case AVATAR_UPLOAD_ERRORS.processing:
+      return createMessageDescriptor('employeeAvatar.error.processingUnavailable');
+    default:
+      return createMessageDescriptor('employeeAvatar.error.readFailed');
+  }
 }

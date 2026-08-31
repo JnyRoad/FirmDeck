@@ -1,6 +1,8 @@
 import type { ReactNode } from 'react';
 import { toast, type ExternalToast } from 'sonner';
 
+import type { MessageDescriptor } from '@/i18n/descriptors';
+import type { AppTranslator } from '@/i18n/imperative';
 import { apiErrorMessage } from '@/lib/apiErrorMessages';
 import { cn } from '@/lib/utils';
 
@@ -53,6 +55,7 @@ export type AppToastOptions = Omit<
   'icon' | 'className' | 'style' | 'unstyled' | 'descriptionClassName'
 >;
 
+/** 以现有品牌样式显示一条任意 React 内容；只供 legacy notify 和已解析的 descriptor 使用。 */
 function showVariant(variant: ToastVariant, message: ReactNode, options?: AppToastOptions) {
   return toast.custom(() => <ToastPill variant={variant} message={message} />, {
     duration: variant === 'success' ? 3200 : 4800,
@@ -62,23 +65,94 @@ function showVariant(variant: ToastVariant, message: ReactNode, options?: AppToa
   });
 }
 
-function localizedErrorMessage(message: ReactNode): ReactNode {
-  if (typeof message !== 'string') return message;
-  return apiErrorMessage(message, message);
+/** 判断运行时输入是否为 descriptor，阻止 JavaScript 调用方把 raw 字符串送入产品 toast。 */
+function isMessageDescriptor(value: unknown): value is MessageDescriptor {
+  return typeof value === 'object'
+    && value !== null
+    && typeof (value as { id?: unknown }).id === 'string';
+}
+
+/** 用显式受控 translator 解析 descriptor；无效 raw 输入返回 null 且不会触发 toast。 */
+function localizeDescriptor(
+  translator: Pick<AppTranslator, 't'>,
+  value: unknown,
+): string | null {
+  if (!isMessageDescriptor(value)) return null;
+  return translator.t(value.id, value.values);
+}
+
+/** 通过受控 translator 解析 descriptor 并路由到品牌 toast；无效 raw 输入保持静默拒绝。 */
+function showLocalizedVariant(
+  translator: Pick<AppTranslator, 't'>,
+  variant: ToastVariant,
+  descriptor: unknown,
+  options?: AppToastOptions,
+): ReturnType<typeof showVariant> | undefined {
+  const message = localizeDescriptor(translator, descriptor);
+  return message == null ? undefined : showVariant(variant, message, options);
+}
+
+/** 创建只接受 MessageDescriptor 的 toast facade；所有文案通过调用方传入的 translator 解析。 */
+export function createToastNotifier(translator: Pick<AppTranslator, 't'>) {
+  /** 显示本地化 success descriptor，并保留品牌成功样式。 */
+  function success(descriptor: MessageDescriptor, options?: AppToastOptions) {
+    return showLocalizedVariant(translator, 'success', descriptor, options);
+  }
+
+  /** 显示本地化 error descriptor，并保留品牌错误样式。 */
+  function error(descriptor: MessageDescriptor, options?: AppToastOptions) {
+    return showLocalizedVariant(translator, 'error', descriptor, options);
+  }
+
+  /** 显示本地化 warning descriptor，并交由 Sonner 管理普通警告样式。 */
+  function warning(descriptor: MessageDescriptor, options?: AppToastOptions) {
+    const message = localizeDescriptor(translator, descriptor);
+    return message == null ? undefined : toast.warning(message, options);
+  }
+
+  /** 显示本地化 info descriptor，并交由 Sonner 管理普通信息样式。 */
+  function info(descriptor: MessageDescriptor, options?: AppToastOptions) {
+    const message = localizeDescriptor(translator, descriptor);
+    return message == null ? undefined : toast.info(message, options);
+  }
+
+  /** 显示本地化 loading descriptor，并交由 Sonner 管理加载状态。 */
+  function loading(descriptor: MessageDescriptor, options?: AppToastOptions) {
+    const message = localizeDescriptor(translator, descriptor);
+    return message == null ? undefined : toast.loading(message, options);
+  }
+
+  /** 关闭由受控 toast facade 返回的通知句柄。 */
+  function dismiss(id?: string | number) {
+    return toast.dismiss(id);
+  }
+
+  return { success, error, warning, info, loading, dismiss };
+}
+
+/** 将 legacy sink 输入收窄为已登记错误码或安全通用消息，拒绝任意 React/raw 内容透传。 */
+function localizedLegacyMessage(message: ReactNode): string {
+  return apiErrorMessage(typeof message === 'string' ? message : undefined, 'common.error.generic');
 }
 
 /**
- * Global toast helper. `success` / `error` render the SD1 message pill;
- * `warning` / `info` / `loading` delegate to sonner so they share the same
- * centered placement configured on the app-wide <Toaster />.
+ * Legacy toast compatibility boundary. New product-owned messages must use
+ * createToastNotifier with a MessageDescriptor; existing raw callers remain
+ * temporarily supported until their migration boundary is removed.
  */
 export const notify = {
   success: (message: ReactNode, options?: AppToastOptions) =>
-    showVariant('success', message, options),
+    showVariant('success', localizedLegacyMessage(message), options),
   error: (message: ReactNode, options?: AppToastOptions) =>
-    showVariant('error', localizedErrorMessage(message), options),
-  warning: (message: ReactNode, options?: AppToastOptions) => toast.warning(message, options),
-  info: (message: ReactNode, options?: AppToastOptions) => toast.info(message, options),
-  loading: (message: ReactNode, options?: AppToastOptions) => toast.loading(message, options),
+    showVariant('error', localizedLegacyMessage(message), options),
+  warning: (message: ReactNode, options?: AppToastOptions) => (
+    toast.warning(localizedLegacyMessage(message), options)
+  ),
+  info: (message: ReactNode, options?: AppToastOptions) => (
+    toast.info(localizedLegacyMessage(message), options)
+  ),
+  loading: (message: ReactNode, options?: AppToastOptions) => (
+    toast.loading(localizedLegacyMessage(message), options)
+  ),
   dismiss: (id?: string | number) => toast.dismiss(id),
 };

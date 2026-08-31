@@ -17,6 +17,7 @@ from app.db.models import (
     User,
     utc_now,
 )
+from app.i18n.language_context import LanguageContext, LocaleResolutionSource
 from app.session.session_schema import ChatTurnRequest, RouterDecision, StepAgentResult
 from app.session.slot_policy import strip_router_generated_message_slots
 
@@ -264,6 +265,12 @@ def test_handoff_assignee_uses_requester_when_no_owner_or_admin_exists():
 
 
 def test_handoff_finalize_creates_pending_request_for_declared_step():
+    context = LanguageContext(
+        ui_locale="en-US",
+        agent_reply_locale="zh-CN",
+        ui_locale_source=LocaleResolutionSource.EXPLICIT_REQUEST,
+        agent_reply_locale_source=LocaleResolutionSource.EXPLICIT_REQUEST,
+    )
     loop = AgentLoop.__new__(AgentLoop)
     db = FakeDb(
         exec_results=[
@@ -291,6 +298,7 @@ def test_handoff_finalize_creates_pending_request_for_declared_step():
     )
     loop.db = db
     loop.events = FakeEvents()
+    loop._language_context = context
     loop._should_complete_skill = lambda *_args, **_kwargs: False
     session = _handoff_session()
 
@@ -316,6 +324,7 @@ def test_handoff_finalize_creates_pending_request_for_declared_step():
     assert handoff.trigger_step_id == "manual_review"
     assert handoff.resume_payload_json["slots"] == {"order_id": "A001"}
     assert handoff.pending_question == "需要人工复核订单 A001"
+    assert handoff.language_context_json == context.model_dump(mode="json")
     assert session.awaiting_input_json["handoff_id"] == handoff.id
     assert [record[2] for record in loop.events.records] == ["human_handoff_requested"]
 
@@ -886,10 +895,20 @@ def test_handoff_resume_worker_persists_failed_resume(monkeypatch):
         assert handoff.status == "failed"
         assert handoff.metadata_json["resume_started_at"]
         assert handoff.metadata_json["resume_failed_at"]
-        assert "resume failed for session_handoff" in handoff.metadata_json["resume_error"]
+        assert handoff.metadata_json["resume_error"] == {
+            "code": "INTERNAL_ERROR",
+            "params": {},
+            "retryable": False,
+            "request_id": None,
+            "trace_id": None,
+        }
+        assert "resume failed for session_handoff" not in str(handoff.metadata_json)
         events = db.exec(select(AgentEvent).where(AgentEvent.event_type == "human_handoff_resume_failed")).all()
         assert len(events) == 1
         assert events[0].payload_json["handoff_id"] == "handoff_worker_failed"
+        assert events[0].payload_json["error"] == handoff.metadata_json["resume_error"]
+        assert "resume failed for session_handoff" not in str(events[0].payload_json)
+        assert events[0].payload_json["language_context"]["ui_locale"] == "zh-CN"
 
 
 def test_router_generated_message_slots_are_not_persisted():
@@ -904,3 +923,78 @@ def test_router_generated_message_slots_are_not_persisted():
     )
 
     assert cleaned == {"product_id": "A1", "quantity": 1}
+
+
+_HANDOFF_LANGUAGE_MATRIX = (
+    ("zh-CN", "zh-CN"),
+    ("zh-CN", "en-US"),
+    ("en-US", "zh-CN"),
+    ("en-US", "en-US"),
+)
+
+
+@pytest.mark.parametrize(("ui_locale", "agent_reply_locale"), _HANDOFF_LANGUAGE_MATRIX)
+def test_handoff_resume_reuses_bound_snapshot_after_ui_preference_switch(
+    ui_locale: str,
+    agent_reply_locale: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Resume with the source snapshot even when a mutable UI preference changed meanwhile."""
+    context = LanguageContext(
+        ui_locale=ui_locale,
+        agent_reply_locale=agent_reply_locale,
+        ui_locale_source=LocaleResolutionSource.EXPLICIT_REQUEST,
+        agent_reply_locale_source=LocaleResolutionSource.EXPLICIT_REQUEST,
+    )
+    expected_snapshot = context.model_dump(mode="json")
+    raw_human_reply = "人工原始答复：保留 SKU-A/42 与 /kb/C-42.md"
+    handled_requests: list[ChatTurnRequest] = []
+
+    class FakeAgentLoop:
+        def __init__(self, db: Session) -> None:
+            self.db = db
+
+        def handle_turn(self, request: ChatTurnRequest) -> None:
+            """Capture the resumed turn without invoking an actual model."""
+            handled_requests.append(request)
+
+    engine = _test_engine()
+    monkeypatch.setattr(chat_api, "engine", engine)
+    monkeypatch.setattr(chat_api, "AgentLoop", FakeAgentLoop)
+    with Session(engine) as db:
+        _admin, user, _other = _seed_handoff_users(db)
+        user.ui_locale = "en-US" if ui_locale == "zh-CN" else "zh-CN"
+        db.add(user)
+        db.add(
+            ChatSession(
+                id="session_handoff_language",
+                tenant_id="tenant_demo",
+                user_id=user.id,
+                agent_id="agent_demo",
+                status="active",
+            )
+        )
+        db.add(
+            HumanHandoffRequest(
+                id="handoff_language",
+                tenant_id="tenant_demo",
+                session_id="session_handoff_language",
+                agent_id="agent_demo",
+                requester_user_id=user.id,
+                assignee_user_id="admin_user",
+                pending_question="请人工确认",
+                status="answered",
+                human_reply=raw_human_reply,
+                language_context_json=expected_snapshot,
+            )
+        )
+        db.commit()
+
+    chat_api._resume_human_handoff_worker("handoff_language")
+
+    assert len(handled_requests) == 1
+    request = handled_requests[0]
+    assert request.language_context == context
+    assert request.ui_locale.value == ui_locale
+    assert request.agent_reply_locale.value == agent_reply_locale
+    assert request.message == raw_human_reply

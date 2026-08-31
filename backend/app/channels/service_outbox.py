@@ -8,8 +8,9 @@ from sqlalchemy import func, or_, update
 from sqlmodel import Session, select
 
 from app.channels.adapters.base import channel_reaction_token
-from app.channels.service_durable_inbox import reaction_target
+from app.channels.service_durable_inbox import channel_ingress_language_context, reaction_target
 from app.channels.service_identity import external_account_scope
+from app.channels.service_routing import ChannelNotice, render_channel_notice
 from app.config import get_settings
 from app.db import engine
 from app.db.models import (
@@ -25,6 +26,7 @@ from app.db.models import (
     new_id,
     utc_now,
 )
+from app.i18n.language_context import LanguageContext, resolve_compatible_language_context
 from app.session.origin import PILOTDECK_GROUP_CHAT_CHANNEL
 
 logger = logging.getLogger(__name__)
@@ -44,9 +46,7 @@ _NON_DELIVERY_CHANNELS = {
     "skill_test",
 }
 # handoff 问题描述里要过滤掉的内部 slot 键。
-_INTERNAL_SLOT_KEYS = frozenset(
-    {"handoff_confirmed", "message_content", "_tool_results"}
-)
+_INTERNAL_SLOT_KEYS = frozenset({"handoff_confirmed", "message_content", "_tool_results"})
 
 
 def _stage_failed_delivery(
@@ -57,6 +57,7 @@ def _stage_failed_delivery(
     binding_id: str,
     target: dict,
     error: str,
+    language_context: LanguageContext,
     idempotency_key: str | None = None,
 ) -> None:
     stable_key = idempotency_key or message.id
@@ -78,6 +79,7 @@ def _stage_failed_delivery(
             next_attempt_at=None,
             last_error=error,
             idempotency_key=stable_key,
+            language_context_json=language_context.model_dump(mode="json"),
         )
     )
 
@@ -162,6 +164,11 @@ def stage_channel_delivery(db: Session, chat_session: ChatSession, message: Mess
         channel = str(getattr(chat_session, "channel", None) or "").strip()
         if not channel or channel in _NON_DELIVERY_CHANNELS:
             return
+        language_context = resolve_compatible_language_context(
+            snapshot=(message.metadata_json or {}).get("language_context"),
+            legacy_ui_locale=None,
+            legacy_agent_reply_locale=None,
+        )
         # 已锚定会话绝不跨 binding 回退，避免携带旧 target/context_token 串 Bot。
         binding = None
         binding_id = getattr(chat_session, "channel_binding_id", None)
@@ -175,9 +182,13 @@ def stage_channel_delivery(db: Session, chat_session: ChatSession, message: Mess
                     binding_id=binding_id,
                     target=dict(chat_session.channel_target_json or {}),
                     error="binding_missing_or_inactive",
+                    language_context=language_context,
                 )
                 return
-            if binding.tenant_id != chat_session.tenant_id or binding.channel != chat_session.channel:
+            if (
+                binding.tenant_id != chat_session.tenant_id
+                or binding.channel != chat_session.channel
+            ):
                 raise RuntimeError("渠道会话与绑定租户或渠道不一致")
             if (
                 not chat_session.channel_account_key
@@ -213,9 +224,7 @@ def stage_channel_delivery(db: Session, chat_session: ChatSession, message: Mess
         target = _immutable_delivery_target(db, binding, chat_session, message)
         idempotency_key = _reply_idempotency_key(db, binding.id, message)
         existing = db.exec(
-            select(ChannelDelivery).where(
-                ChannelDelivery.idempotency_key == idempotency_key
-            )
+            select(ChannelDelivery).where(ChannelDelivery.idempotency_key == idempotency_key)
         ).first()
         if existing:
             return
@@ -231,6 +240,7 @@ def stage_channel_delivery(db: Session, chat_session: ChatSession, message: Mess
                 binding_id=binding.id,
                 target=target,
                 error="delivery_target_missing",
+                language_context=language_context,
                 idempotency_key=idempotency_key,
             )
             return
@@ -246,6 +256,7 @@ def stage_channel_delivery(db: Session, chat_session: ChatSession, message: Mess
                 status="pending",
                 next_attempt_at=utc_now(),
                 idempotency_key=idempotency_key,
+                language_context_json=language_context.model_dump(mode="json"),
             )
         )
     except Exception:
@@ -414,6 +425,7 @@ def _stage_reaction_removal(
             status="pending",
             next_attempt_at=utc_now(),
             idempotency_key=idempotency_key,
+            language_context_json=delivery.language_context_json,
         )
     )
 
@@ -432,9 +444,7 @@ def _event_has_delivered_response(
         if row.kind in _REACTION_KINDS:
             continue
         target = row.target_json or {}
-        is_final = row.kind in {"reply", "error_notice"} or bool(
-            target.get("reaction_final")
-        )
+        is_final = row.kind in {"reply", "error_notice"} or bool(target.get("reaction_final"))
         if is_final and str(target.get("message_id") or "") == event.event_id:
             return True
     return False
@@ -503,8 +513,7 @@ def _deliver_one_locked(db: Session, delivery: ChannelDelivery) -> None:
         and delivery.kind not in _REACTION_KINDS
         and delivery.attempts > 0
         and delivery.first_attempt_at is not None
-        and (utc_now() - delivery.first_attempt_at).total_seconds()
-        > _FEISHU_DEDUP_RECOVERY_SECONDS
+        and (utc_now() - delivery.first_attempt_at).total_seconds() > _FEISHU_DEDUP_RECOVERY_SECONDS
     ):
         _finish_delivery_claim(
             db,
@@ -542,9 +551,7 @@ def _deliver_one_locked(db: Session, delivery: ChannelDelivery) -> None:
                 raise RuntimeError("渠道适配器不支持 reaction")
             reaction_id = None
             # 重挂会产生第二个标记的渠道必须先回查;声明重挂幂等的渠道直接重发。
-            if delivery.attempts > 1 and not getattr(
-                adapter, "reaction_attach_idempotent", False
-            ):
+            if delivery.attempts > 1 and not getattr(adapter, "reaction_attach_idempotent", False):
                 find_reaction = getattr(adapter, "find_own_reaction", None)
                 if not callable(find_reaction):
                     raise RuntimeError("渠道适配器不支持 reaction 恢复")
@@ -555,9 +562,7 @@ def _deliver_one_locked(db: Session, delivery: ChannelDelivery) -> None:
                 reaction_event.reaction_id = reaction_id
                 reaction_event.updated_at = utc_now()
                 db.add(reaction_event)
-                if binding.status != "active" or _event_has_delivered_response(
-                    db, reaction_event
-                ):
+                if binding.status != "active" or _event_has_delivered_response(db, reaction_event):
                     _stage_reaction_removal(db, delivery, reaction_event)
         elif delivery.kind == "reaction_remove":
             remove_reaction = getattr(adapter, "remove_reaction", None)
@@ -592,7 +597,9 @@ def _deliver_one_locked(db: Session, delivery: ChannelDelivery) -> None:
             last_error=last_error,
             next_attempt_at=next_attempt_at,
         )
-        logger.warning("渠道投递失败(第 %s 次) delivery=%s: %s", delivery.attempts, delivery.id, exc)
+        logger.warning(
+            "渠道投递失败(第 %s 次) delivery=%s: %s", delivery.attempts, delivery.id, exc
+        )
         return
     # handoff_notice/handoff_ack 投递成功后,把飞书返回的 message_id 回写到 delivery;
     # handoff_notice 额外同步到 HumanHandoffRequest.notify_message_id。阶段 4 据此
@@ -604,9 +611,7 @@ def _deliver_one_locked(db: Session, delivery: ChannelDelivery) -> None:
     if channel_reaction_token(binding.channel) and delivery.kind not in _REACTION_KINDS:
         event = _reaction_event_for_delivery(db, delivery, binding.channel)
         target = delivery.target_json or {}
-        is_final = delivery.kind in {"reply", "error_notice"} or bool(
-            target.get("reaction_final")
-        )
+        is_final = delivery.kind in {"reply", "error_notice"} or bool(target.get("reaction_final"))
         if event and is_final:
             _stage_reaction_removal(db, delivery, event)
     _finish_delivery_claim(
@@ -767,7 +772,9 @@ def _run_delivery_lane(
     reaction_lane: bool,
 ) -> None:
     use_engine = db_engine or engine
-    interval = poll_seconds if poll_seconds is not None else get_settings().channel_delivery_poll_seconds
+    interval = (
+        poll_seconds if poll_seconds is not None else get_settings().channel_delivery_poll_seconds
+    )
     with Session(use_engine) as db:
         _reset_stuck_deliveries(db, reaction_lane=reaction_lane)
     while True:
@@ -877,6 +884,9 @@ def notify_binding_creator(db: Session, binding: ChannelBinding, text: str) -> N
                 status="pending",
                 next_attempt_at=utc_now(),
                 idempotency_key=new_id("chalert"),
+                language_context_json=channel_ingress_language_context(binding).model_dump(
+                    mode="json"
+                ),
             )
         )
         db.commit()
@@ -1030,6 +1040,7 @@ def _build_handoff_problem_description(
     db: Session,
     handoff: HumanHandoffRequest,
     binding: ChannelBinding,
+    language_context: LanguageContext,
 ) -> str:
     """构造给处理人看的问题描述:提问人 + 用户原始消息 + 已收集 slots + step 名称。
 
@@ -1048,7 +1059,12 @@ def _build_handoff_problem_description(
     if session:
         inquirer = _resolve_inquirer_display_name(db, session, binding)
         if inquirer:
-            parts.append(f"提问人:{inquirer}")
+            parts.append(
+                render_channel_notice(
+                    ChannelNotice("handoff.inquirer", {"inquirer": inquirer}),
+                    language_context,
+                )
+            )
         user_msg = db.exec(
             select(Message)
             .where(
@@ -1062,17 +1078,28 @@ def _build_handoff_problem_description(
         slots = session.slots_json or {}
         if isinstance(slots, dict) and slots:
             slot_lines = [
-                f"  {k}: {v}"
-                for k, v in slots.items()
-                if v and k not in _INTERNAL_SLOT_KEYS
+                f"  {k}: {v}" for k, v in slots.items() if v and k not in _INTERNAL_SLOT_KEYS
             ]
             if slot_lines:
-                parts.append("已收集信息:\n" + "\n".join(slot_lines))
+                parts.append(
+                    render_channel_notice(
+                        ChannelNotice(
+                            "handoff.collected_info",
+                            {"details": "\n".join(slot_lines)},
+                        ),
+                        language_context,
+                    )
+                )
+        pending = str(handoff.pending_question or "").strip()
+        if pending and pending not in parts:
+            # Keep the handoff question verbatim even when a newer user message
+            # is available; it may contain identifiers absent from that message.
+            parts.append(pending[:600])
     if not parts:
         fallback = (handoff.pending_question or "").strip()
         if fallback:
             return fallback[:600]
-        return "当前 SOP 需要人工确认后继续执行。"
+        return render_channel_notice(ChannelNotice("handoff.default_problem"), language_context)
     # 截断保证整条通知(含上下文摘要)不超过渠道单条消息上限:超限会拆分多条,
     # 处理人引用回复时只有末条消息 id 可关联,拆分会破坏引用回复匹配。
     return "\n".join(parts)[:600]
@@ -1101,6 +1128,13 @@ def notify_handoff_assignee(
                 binding.channel,
             )
             return
+        language_context = resolve_compatible_language_context(
+            snapshot=handoff.language_context_json,
+            legacy_ui_locale=None,
+            legacy_agent_reply_locale=None,
+        )
+        if handoff.language_context_json is None:
+            handoff.language_context_json = language_context.model_dump(mode="json")
         existing_notice = db.exec(
             select(ChannelDelivery).where(
                 ChannelDelivery.tenant_id == binding.tenant_id,
@@ -1110,6 +1144,10 @@ def notify_handoff_assignee(
             )
         ).first()
         if existing_notice:
+            if existing_notice.language_context_json is None:
+                existing_notice.language_context_json = language_context.model_dump(mode="json")
+                db.add(existing_notice)
+                db.commit()
             return
         identity = resolve_assignee_channel_identity(db, binding, handoff.assignee_user_id)
         external_user_id = identity.external_user_id if identity else None
@@ -1126,18 +1164,35 @@ def notify_handoff_assignee(
         name = ""
         if assignee:
             name = str(assignee.display_name or assignee.username or "").strip()
-        problem_description = _build_handoff_problem_description(db, handoff, binding)
+        problem_description = _build_handoff_problem_description(
+            db, handoff, binding, language_context
+        )
+        pending_question_text = str(pending_question or "").strip()
+        if pending_question_text and pending_question_text not in problem_description:
+            problem_description = f"{problem_description}\n{pending_question_text[:600]}"
+        title_notice = (
+            ChannelNotice("handoff.notice_assigned", {"assignee_name": name})
+            if name
+            else ChannelNotice("handoff.notice_unassigned")
+        )
         text_parts = [
-            f"【人工介入转接】{'已转接给真人员工 ' + name if name else '有一条人工介入待处理'}",
+            render_channel_notice(title_notice, language_context),
             "",
-            "问题:" + problem_description,
+            render_channel_notice(
+                ChannelNotice("handoff.problem_label", {"problem": problem_description}),
+                language_context,
+            ),
         ]
         if context_summary:
             text_parts.append("")
-            text_parts.append("上下文:")
+            text_parts.append(
+                render_channel_notice(ChannelNotice("handoff.context_label"), language_context)
+            )
             text_parts.append(context_summary[:800])
         text_parts.append("")
-        text_parts.append("如需答复，请直接回复本条消息（引用后输入答复内容）；也可发送 /回复反馈 <答复内容>。")
+        text_parts.append(
+            render_channel_notice(ChannelNotice("handoff.reply_instructions"), language_context)
+        )
         text = "\n".join(text_parts)
         build_target = _HANDOFF_NOTIFY_TARGET_BUILDERS[binding.channel]
         target = build_target(external_user_id, handoff.id)
@@ -1154,6 +1209,7 @@ def notify_handoff_assignee(
                 status="pending",
                 next_attempt_at=utc_now(),
                 idempotency_key=new_id("hnotice"),
+                language_context_json=language_context.model_dump(mode="json"),
             )
         )
         db.commit()

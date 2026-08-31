@@ -8,6 +8,8 @@ import IconFieldClear from '../assets/icons/field-clear.svg?react';
 import IconFieldEye from '../assets/icons/field-eye.svg?react';
 import IconFieldEyeOn from '../assets/icons/field-eye-on.svg?react';
 import loginPreview from '../assets/staffdeck/login-preview.png';
+import { useAppIntl } from '../i18n/useAppIntl';
+import { RawIdentifier } from '../i18n/RawContent';
 
 export type LoginPageProps = {
   onLogin: (session: EnterpriseAuthSession) => void;
@@ -20,6 +22,7 @@ export type LoginPageProps = {
  * down into view in place of the call-to-action button.
  */
 export default function LoginPage({ onLogin }: LoginPageProps) {
+  const { t } = useAppIntl();
   const [showForm, setShowForm] = useState(false);
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
@@ -28,11 +31,12 @@ export default function LoginPage({ onLogin }: LoginPageProps) {
   const [passwordError, setPasswordError] = useState('');
   const [loading, setLoading] = useState(false);
 
+  /** 校验并提交凭据；服务端原始错误保持原样，只有本地兜底文案进入消息目录。 */
   async function login() {
     const trimmedUsername = username.trim();
     const trimmedPassword = password.trim();
-    setUsernameError(trimmedUsername ? '' : '请输入账号');
-    setPasswordError(trimmedPassword ? '' : '请输入密码');
+    setUsernameError(trimmedUsername ? '' : t('auth.login.usernameRequired'));
+    setPasswordError(trimmedPassword ? '' : t('auth.login.passwordRequired'));
     if (!trimmedUsername || !trimmedPassword) return;
 
     setLoading(true);
@@ -45,14 +49,15 @@ export default function LoginPage({ onLogin }: LoginPageProps) {
       setEnterpriseAuthSession(session);
       onLogin(session);
     } catch (error) {
-      const messageText = error instanceof Error ? error.message : '登录失败';
-      setUsernameError('账号输入错误');
-      setPasswordError(messageText || '密码输入错误');
+      const messageText = error instanceof Error ? error.message : t('auth.login.failure');
+      setUsernameError(t('auth.login.invalidAccount'));
+      setPasswordError(messageText || t('auth.login.invalidPassword'));
     } finally {
       setLoading(false);
     }
   }
 
+  /** 允许凭据字段使用 Enter 提交，与表单按钮行为保持一致。 */
   function onFieldKeyDown(event: KeyboardEvent<HTMLInputElement>) {
     if (event.key === 'Enter') void login();
   }
@@ -71,12 +76,12 @@ export default function LoginPage({ onLogin }: LoginPageProps) {
       <main className="flex flex-1 flex-col items-center px-[32px]">
         <div className="flex flex-col items-center pt-[60px]">
           <span className="flex items-center justify-center rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-[#f6f6f6] px-[20px] py-[6px] text-[14px] text-[#464c5e]">
-            我们来做什么？
+            {t('auth.login.heroPrompt')}
           </span>
           <h1 className="mt-[6px] text-center text-[54px] font-semibold leading-[80px] tracking-[1.08px] text-[#18181a]">
-            StaffDeck
+            <RawIdentifier value="StaffDeck" />
             <br />
-            数字员工运营平台
+            {t('auth.login.productName')}
           </h1>
 
           {!showForm ? (
@@ -85,7 +90,7 @@ export default function LoginPage({ onLogin }: LoginPageProps) {
               onClick={() => setShowForm(true)}
               className="mt-[24px] flex items-center justify-center rounded-[10px] bg-[#18181a] px-[36px] py-[10px] text-[16px] font-normal text-white transition-colors hover:bg-[#18181a]/90"
             >
-              登录
+              {t('auth.login.action')}
             </button>
           ) : (
             <form
@@ -101,8 +106,8 @@ export default function LoginPage({ onLogin }: LoginPageProps) {
                 <input
                   value={username}
                   autoComplete="username"
-                  placeholder="请输入账号（首次使用请输入admin）"
-                  aria-label="账号"
+                  placeholder={t('auth.login.usernamePlaceholder')}
+                  aria-label={t('auth.login.accountLabel')}
                   onChange={(event) => {
                     setUsername(event.target.value);
                     if (usernameError) setUsernameError('');
@@ -113,7 +118,7 @@ export default function LoginPage({ onLogin }: LoginPageProps) {
                 {username && (
                   <button
                     type="button"
-                    aria-label="清空账号"
+                    aria-label={t('auth.login.clearAccount')}
                     onClick={() => {
                       setUsername('');
                       setUsernameError('');
@@ -132,8 +137,8 @@ export default function LoginPage({ onLogin }: LoginPageProps) {
                   value={password}
                   type={showPassword ? 'text' : 'password'}
                   autoComplete="current-password"
-                  placeholder="请输入密码（首次使用请输入admin）"
-                  aria-label="密码"
+                  placeholder={t('auth.login.passwordPlaceholder')}
+                  aria-label={t('auth.login.passwordLabel')}
                   onChange={(event) => {
                     setPassword(event.target.value);
                     if (passwordError) setPasswordError('');
@@ -143,7 +148,9 @@ export default function LoginPage({ onLogin }: LoginPageProps) {
                 />
                 <button
                   type="button"
-                  aria-label={showPassword ? '隐藏密码' : '显示密码'}
+                  aria-label={showPassword
+                    ? t('auth.login.hidePassword')
+                    : t('auth.login.showPassword')}
                   onClick={() => setShowPassword((prev) => !prev)}
                   className="grid size-[18px] shrink-0 place-items-center text-[#677185] outline-none transition-colors hover:text-[#464c5e]"
                 >
@@ -160,7 +167,7 @@ export default function LoginPage({ onLogin }: LoginPageProps) {
                 disabled={loading}
                 className="mt-[24px] flex h-[40px] w-[120px] items-center justify-center self-center rounded-[10px] bg-[#18181a] text-[16px] font-normal text-white transition-colors hover:bg-[#18181a]/90 disabled:cursor-not-allowed disabled:opacity-60"
               >
-                {loading ? '登录中…' : '登录'}
+                {loading ? t('auth.login.loading') : t('auth.login.action')}
               </button>
             </form>
           )}
@@ -169,7 +176,7 @@ export default function LoginPage({ onLogin }: LoginPageProps) {
         <div className="mt-[32px] flex w-full justify-center">
           <img
             src={loginPreview}
-            alt="StaffDeck 产品预览"
+            alt={t('auth.login.previewAlt')}
             className="h-auto w-full max-w-[1200px] select-none object-contain"
             draggable={false}
           />

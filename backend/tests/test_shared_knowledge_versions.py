@@ -25,7 +25,7 @@ from app.db.models import (
     Tenant,
     User,
 )
-from app.knowledge.errors import KnowledgeError
+from app.knowledge.errors import KNOWLEDGE_MODE_INVALID, KnowledgeError
 from app.knowledge.schema import (
     SharedKnowledgeDraftCreateRequest,
     SharedKnowledgePublishRequest,
@@ -307,6 +307,31 @@ def test_publish_requires_ready_ingestion_and_freezes_released_version() -> None
                 version_id=published.id,
             )
         assert immutable.value.code == "KNOWLEDGE_MODE_INVALID"
+
+
+def test_rollback_rejects_non_released_target_without_version_id_params() -> None:
+    """回滚目标不是正式快照时保留稳定错误码，但不公开目标版本标识。"""
+    with _test_session() as db:
+        base, released = _seed_shared_base(db)
+        draft = _create_draft(db, expected_published_version_id=released.id)
+        service = SharedKnowledgeVersionService(db)
+
+        with pytest.raises(KnowledgeError) as invalid:
+            service.rollback(
+                tenant_id="tenant_demo",
+                knowledge_base_id=base.id,
+                target_version_id=draft.id,
+                expected_published_version_id=released.id,
+                actor_type="user",
+                actor_id="user_admin",
+                source_team_id="team_content",
+                change_reason="不应回滚草稿",
+            )
+
+    assert invalid.value.code == KNOWLEDGE_MODE_INVALID
+    assert invalid.value.details == {}
+    assert invalid.value.to_public_payload()["code"] == KNOWLEDGE_MODE_INVALID
+    assert invalid.value.to_public_payload()["params"] == {}
 
 
 def test_terminal_failed_or_cancelled_ingest_jobs_do_not_block_ready_draft() -> None:

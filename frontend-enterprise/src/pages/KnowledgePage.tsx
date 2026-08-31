@@ -63,6 +63,18 @@ import {
 } from '@/components/ui';
 import { Button as UIButton } from '@/components/ui/button';
 import { notify } from '@/components/ui/app-toast';
+import { RawContent, RawIdentifier } from '@/i18n/RawContent';
+import { createMessageDescriptor } from '@/i18n/descriptors';
+import {
+  createAppTranslator,
+  getStoredLocale,
+  useAppIntl,
+  type AppTranslator,
+  type MessageId,
+} from '@/i18n';
+import type { AppLocale } from '@/i18n/locales';
+import { createUiSinks } from '@/i18n/sinks';
+import { apiErrorMessage } from '@/lib/apiErrorMessages';
 import { cn } from '@/lib/utils';
 import { DIALOG_CANCEL_BUTTON_CLASS, DIALOG_FOOTER_CLASS, DIALOG_PRIMARY_BUTTON_CLASS, MENU_CONTENT_CLASS, MENU_ITEM_CLASS, MENU_ITEM_DANGER_CLASS, MOBILE_CARD_CLASS, OUTLINE_ACTION_BUTTON_CLASS, OUTLINE_ACTION_BUTTON_SM_CLASS, SEARCH_COMBO_BUTTON_CLASS, SEARCH_COMBO_CLASS, SEARCH_COMBO_INPUT_CLASS, SELECT_TRIGGER_CLASS } from '@/lib/enterprise-ui';
 import {
@@ -87,7 +99,6 @@ import {
 } from '../employee';
 import { useClientPagination } from '../hooks/useClientPagination';
 import { renderMarkdownBlocks } from './chat/chatHelpers';
-import { getDateLocale } from '@/i18n';
 import type {
   CapabilityScope,
   KnowledgeBaseRead,
@@ -96,7 +107,10 @@ import type {
   KnowledgeConceptRead,
   KnowledgeDiscoveryRead,
   KnowledgeDocumentRead,
+  KnowledgeErrorDescriptor,
+  KnowledgeStageDescriptor,
   KnowledgeIngestJobRead,
+  KnowledgeSearchTrace,
   KnowledgeSearchResponse,
   AgentProfileRead,
   ModelConfigRead,
@@ -127,18 +141,108 @@ type OkfLintIssue = {
   document_id?: string;
 };
 
-const DEFAULT_INGEST_STEPS: IngestStepView[] = [
-  { key: 'queued', label: '排队中', progress: 0, status: 'pending' },
-  { key: 'parsing', label: '解析原始资料', progress: 0.08, status: 'pending' },
-  { key: 'normalizing', label: '规范化原始资料', progress: 0.16, status: 'pending' },
-  { key: 'documenting', label: '写入文档页', progress: 0.24, status: 'pending' },
-  { key: 'bucketing', label: '规划知识图谱', progress: 0.36, status: 'pending' },
-  { key: 'bucket_writing', label: '写入知识图谱', progress: 0.48, status: 'pending' },
-  { key: 'chunking', label: '生成引用来源', progress: 0.62, status: 'pending' },
-  { key: 'summarizing', label: '刷新 目录索引', progress: 0.74, status: 'pending' },
-  { key: 'discovering', label: '发现 SOP/工具', progress: 0.88, status: 'pending' },
-  { key: 'done', label: '完成入库', progress: 1, status: 'pending' },
-];
+/** 为知识域的非 Hook 辅助函数提供受控翻译入口；无上下文时回退当前持久化 locale。 */
+function currentKnowledgeTranslator() {
+  return createAppTranslator(getStoredLocale());
+}
+
+type KnowledgeTranslate = AppTranslator['t'];
+
+const KNOWLEDGE_STAGE_MESSAGE_IDS: Record<string, MessageId> = {
+  queued: 'knowledgePage.ingest.queued',
+  parsing: 'knowledgePage.ingest.parsing',
+  normalizing: 'knowledgePage.ingest.normalizing',
+  documenting: 'knowledgePage.ingest.documenting',
+  bucketing: 'knowledgePage.ingest.bucketing',
+  bucket_writing: 'knowledgePage.ingest.bucketWriting',
+  chunking: 'knowledgePage.ingest.chunking',
+  summarizing: 'knowledgePage.ingest.summarizing',
+  discovering: 'knowledgePage.ingest.discovering',
+  done: 'knowledgePage.ingest.done',
+  cancel_requested: 'knowledgePage.status.cancelRequested',
+  cancelled: 'knowledgePage.status.cancelled',
+  failed: 'knowledgePage.status.failed',
+};
+
+const KNOWLEDGE_ROUTE_MESSAGE_IDS: Record<string, MessageId> = {
+  document_route: 'knowledgePage.route.documentRoute',
+  document_route_lexical: 'knowledgePage.route.documentRouteLexical',
+  document_route_lexical_fallback: 'knowledgePage.route.documentRouteLexical',
+  okf_concept_route: 'knowledgePage.route.okfConceptRoute',
+  okf_only: 'knowledgePage.route.okfOnly',
+  bucket_route: 'knowledgePage.route.bucketRoute',
+  bucket_route_lexical: 'knowledgePage.route.bucketRouteLexical',
+  bucket_route_lexical_fallback: 'knowledgePage.route.bucketRouteLexical',
+  section_expand: 'knowledgePage.route.sectionExpand',
+  read_chunks: 'knowledgePage.route.readChunks',
+  evidence_pack: 'knowledgePage.route.evidencePack',
+  no_documents: 'knowledgePage.route.noDocuments',
+  no_buckets: 'knowledgePage.route.noBuckets',
+};
+
+const KNOWLEDGE_TRACE_PHASE_ALIASES: Record<string, string> = {
+  document_route_failed: 'document_route',
+  document_route_invalid: 'document_route',
+  document_route_no_match: 'document_route',
+  bucket_selection_failed: 'bucket_route',
+  bucket_route_invalid: 'bucket_route',
+  bucket_route_no_match: 'bucket_route',
+};
+
+/** 将稳定入库阶段代码映射为当前 UI 语言的产品标签；未知代码安全回退。 */
+export function knowledgeStageLabel(
+  stage: string,
+  translate: KnowledgeTranslate = currentKnowledgeTranslator().t,
+): string {
+  const messageId = KNOWLEDGE_STAGE_MESSAGE_IDS[stage];
+  return messageId ? translate(messageId) : translate('knowledgePage.add.stageFallback');
+}
+
+/** 将稳定阶段详情描述映射为当前 UI 语言；未知详情不把后端原文带入页面。 */
+export function knowledgeStageDetailLabel(
+  detail: KnowledgeStageDescriptor | undefined,
+  translate: KnowledgeTranslate = currentKnowledgeTranslator().t,
+): string {
+  if (!detail || typeof detail.code !== 'string') return '';
+  return knowledgeStageLabel(detail.code, translate);
+}
+
+/** 将检索 trace 的稳定阶段或代码映射为当前 UI 语言；不展示后端 message 字段。 */
+export function knowledgeRouteLabel(
+  trace: KnowledgeSearchTrace,
+  translate: KnowledgeTranslate = currentKnowledgeTranslator().t,
+): string {
+  const phase = KNOWLEDGE_TRACE_PHASE_ALIASES[trace.phase] || trace.phase;
+  const codePhase = KNOWLEDGE_TRACE_PHASE_ALIASES[trace.code] || trace.code;
+  const messageId = KNOWLEDGE_ROUTE_MESSAGE_IDS[phase] || KNOWLEDGE_ROUTE_MESSAGE_IDS[codePhase];
+  return messageId ? translate(messageId) : translate('knowledgePage.route.default');
+}
+
+/** 将后端稳定错误描述交给统一 registry 映射，禁止使用持久化 detail 或异常文本。 */
+export function knowledgeErrorLabel(
+  error: KnowledgeErrorDescriptor | null | undefined,
+  translate: KnowledgeTranslate = currentKnowledgeTranslator().t,
+): string {
+  return apiErrorMessage(error, 'common.error.generic', { t: translate });
+}
+
+/** 生成知识入库阶段的稳定本地化定义，避免把阶段名称硬编码到生产组件里。 */
+function defaultIngestSteps(
+  t: KnowledgeTranslate = currentKnowledgeTranslator().t,
+): IngestStepView[] {
+  return [
+    { key: 'queued', label: t('knowledgePage.ingest.queued'), progress: 0, status: 'pending' },
+    { key: 'parsing', label: t('knowledgePage.ingest.parsing'), progress: 0.08, status: 'pending' },
+    { key: 'normalizing', label: t('knowledgePage.ingest.normalizing'), progress: 0.16, status: 'pending' },
+    { key: 'documenting', label: t('knowledgePage.ingest.documenting'), progress: 0.24, status: 'pending' },
+    { key: 'bucketing', label: t('knowledgePage.ingest.bucketing'), progress: 0.36, status: 'pending' },
+    { key: 'bucket_writing', label: t('knowledgePage.ingest.bucketWriting'), progress: 0.48, status: 'pending' },
+    { key: 'chunking', label: t('knowledgePage.ingest.chunking'), progress: 0.62, status: 'pending' },
+    { key: 'summarizing', label: t('knowledgePage.ingest.summarizing'), progress: 0.74, status: 'pending' },
+    { key: 'discovering', label: t('knowledgePage.ingest.discovering'), progress: 0.88, status: 'pending' },
+    { key: 'done', label: t('knowledgePage.ingest.done'), progress: 1, status: 'pending' },
+  ];
+}
 
 type KnowledgePageProps = {
   currentUser?: EnterpriseAuthUser;
@@ -164,6 +268,8 @@ function effectiveKnowledgeAgentId(rows: AgentProfileRead[], agentId: string): s
 }
 
 export default function KnowledgeManagePage({ currentUser, onLogout }: KnowledgePageProps = {}) {
+  const { locale, t } = useAppIntl();
+  const uiSinks = useMemo(() => createUiSinks({ t }), [t]);
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const [documents, setDocuments] = useState<KnowledgeDocumentRead[]>([]);
@@ -270,9 +376,15 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
     });
   }, [documentSearch, visibleKnowledgeBases]);
 
-  const pageTitle = isOverallAgent ? '知识库广场' : '知识库';
-  const listLabel = isOverallAgent ? '知识库广场列表' : '知识库列表';
-  const listEmptyText = isOverallAgent ? '暂无知识库，点击「新增」创建一个吧' : '当前员工暂无知识库';
+  const pageTitle = t('knowledgePage.title');
+  const pageDescription = isOverallAgent
+    ? t('knowledgePage.description.marketplace')
+    : t('knowledgePage.description.employee');
+  const listLabel = t('knowledgePage.list.label');
+  const listEmptyText = t('knowledgePage.empty.employee');
+  const knowledgeErrorMessage = (error: unknown, fallbackId: Parameters<typeof t>[0]) => (
+    apiErrorMessage(error, fallbackId, { t })
+  );
 
   const stats = useMemo(() => ({
     total: visibleKnowledgeBases.length,
@@ -325,7 +437,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
     if (agents.length === 0) return;
     const resourceId = searchParams.get('resourceId') || undefined;
     if (isOverallAgent) {
-      notify.warning('请先选择一个数字员工，再从广场复制知识库');
+      notify.warning(t('knowledgePage.toast.selectEmployeeBeforeMarketplaceCopy'));
     } else {
       void openImportKnowledgeBases('plaza', resourceId);
     }
@@ -384,7 +496,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
       setAgentScopeLoaded(true);
     } catch (error) {
       clearKnowledgeViewState();
-      notify.error(error instanceof Error ? error.message : '加载员工失败');
+      notify.error(knowledgeErrorMessage(error, 'knowledgePage.error.loadAgents'));
       setAgentScopeLoaded(true);
     }
   }
@@ -431,7 +543,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
         await loadOkfConcepts(fallbackKnowledgeBaseId, false);
       }
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '刷新知识库失败');
+      notify.error(knowledgeErrorMessage(error, 'knowledgePage.error.refresh'));
     } finally {
       setLoading(false);
     }
@@ -451,7 +563,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
       setBuckets(rows);
     } catch (error) {
       setBuckets([]);
-      notify.error(error instanceof Error ? error.message : '加载内部索引失败');
+      notify.error(knowledgeErrorMessage(error, 'knowledgePage.error.loadBuckets'));
     }
   }
 
@@ -475,7 +587,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
         setOkfLintIssues([]);
         return;
       }
-      notify.error(error instanceof Error ? error.message : '加载知识图谱失败');
+      notify.error(knowledgeErrorMessage(error, 'knowledgePage.error.loadGraph'));
     } finally {
       if (showLoading) setOkfLoading(false);
     }
@@ -500,7 +612,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
   async function runKnowledgeSearch() {
     const query = searchQuery.trim();
     if (!query) {
-      notify.warning('请输入要调试的知识问题');
+      notify.warning(t('knowledgePage.toast.enterSearchQuery'));
       return;
     }
     setSearchLoading(true);
@@ -522,7 +634,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
       });
       setSearchResult(response);
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '知识检索失败');
+      notify.error(knowledgeErrorMessage(error, 'knowledgePage.error.search'));
     } finally {
       setSearchLoading(false);
     }
@@ -548,7 +660,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
         setImportSourceKnowledgeBases([]);
       }
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '加载员工失败');
+      notify.error(knowledgeErrorMessage(error, 'knowledgePage.error.loadAgents'));
     }
   }
 
@@ -564,22 +676,24 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
       setImportSourceKnowledgeBases(activeRows);
       return activeRows;
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '加载来源知识库失败');
+      notify.error(knowledgeErrorMessage(error, 'knowledgePage.error.loadSourceKnowledgeBases'));
       return [];
     }
   }
 
   async function submitImportKnowledgeBases() {
     if (!agentId) {
-      notify.warning('请先选择一个数字员工');
+      notify.warning(t('knowledgePage.toast.selectEmployee'));
       return;
     }
     if (!importSourceAgentId) {
-      notify.warning(importMode === 'plaza' ? '请选择开放广场' : '请选择来源员工');
+      notify.warning(importMode === 'plaza'
+        ? t('knowledgePage.toast.selectMarketplace')
+        : t('knowledgePage.toast.selectSourceEmployee'));
       return;
     }
     if (importSelectedKnowledgeBaseIds.length === 0) {
-      notify.warning('请选择要复制的知识库');
+      notify.warning(t('knowledgePage.toast.selectKnowledgeBasesToCopy'));
       return;
     }
     setImportLoading(true);
@@ -595,11 +709,11 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
       );
       const importedCount = result.imported?.length || 0;
       const missingCount = result.missing?.length || 0;
-      notify.success(`已复制 ${importedCount} 个知识库${missingCount ? `，${missingCount} 个未复制` : ''}`);
+      notify.success(t('knowledgePage.toast.importedKnowledgeBases', { importedCount, missingCount }));
       setImportOpen(false);
       await refresh();
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '复制知识库失败');
+      notify.error(knowledgeErrorMessage(error, 'knowledgePage.error.importKnowledgeBases'));
     } finally {
       setImportLoading(false);
     }
@@ -634,11 +748,11 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
         filename: file.name,
         content_base64: contentBase64,
       });
-      notify.success('已导入知识库备份包');
+      notify.success(t('knowledgePage.toast.importedBackup'));
       setOkfImportOpen(false);
       await refresh();
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '导入知识库备份包失败');
+      notify.error(knowledgeErrorMessage(error, 'knowledgePage.error.importBackup'));
     } finally {
       setOkfImporting(false);
     }
@@ -646,7 +760,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
 
   async function exportOkfBundle(targetKnowledgeBase = selectedKnowledgeBase) {
     if (!targetKnowledgeBase) {
-      notify.warning('请先选择知识库');
+      notify.warning(t('knowledgePage.toast.selectKnowledgeBase'));
       return;
     }
     const suffix = effectiveAgentId ? `&agent_id=${encodeURIComponent(effectiveAgentId)}` : '';
@@ -654,23 +768,21 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
       const blob = await api.blob(
         `/api/enterprise/knowledge-bases/${targetKnowledgeBase.id}/okf/export?tenant_id=${TENANT_ID}${suffix}`,
       );
-      const url = window.URL.createObjectURL(blob);
-      const link = document.createElement('a');
-      link.href = url;
-      link.download = `${targetKnowledgeBase.name || targetKnowledgeBase.id}-okf.zip`;
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      window.URL.revokeObjectURL(url);
-      notify.success('已导出知识库备份包');
+      uiSinks.download(
+        blob,
+        createMessageDescriptor('knowledgePage.download.backupPrefix'),
+        targetKnowledgeBase.name || targetKnowledgeBase.id,
+        'okf.zip',
+      );
+      notify.success(t('knowledgePage.toast.exportedBackup'));
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '导出知识库备份包失败');
+      notify.error(knowledgeErrorMessage(error, 'knowledgePage.error.exportBackup'));
     }
   }
 
   async function lintOkfBundle(targetKnowledgeBase = selectedKnowledgeBase) {
     if (!targetKnowledgeBase) {
-      notify.warning('请先选择知识库');
+      notify.warning(t('knowledgePage.toast.selectKnowledgeBase'));
       return;
     }
     if (targetKnowledgeBase.id !== selectedKnowledgeBase?.id) {
@@ -685,9 +797,11 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
       setOkfLintIssues(result.issues || []);
       setOkfLintKnowledgeBase(targetKnowledgeBase);
       setOkfLintReportOpen(true);
-      notify.success(result.issue_count ? `发现 ${result.issue_count} 个待处理建议` : '知识图谱检查通过');
+      notify.success(result.issue_count
+        ? t('knowledgePage.toast.graphLintIssues', { count: result.issue_count })
+        : t('knowledgePage.toast.graphLintPassed'));
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '知识图谱检查失败');
+      notify.error(knowledgeErrorMessage(error, 'knowledgePage.error.lintGraph'));
     } finally {
       setOkfLoading(false);
     }
@@ -724,10 +838,10 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
       );
       setOkfConcepts((current) => current.map((item) => (item.id === next.id ? next : item)));
       setEditingConcept(null);
-      notify.success('已保存知识图谱');
+      notify.success(t('knowledgePage.toast.savedGraph'));
       await loadOkfConcepts(selectedKnowledgeBase.id, false);
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '保存知识图谱失败');
+      notify.error(knowledgeErrorMessage(error, 'knowledgePage.error.saveGraph'));
     }
   }
 
@@ -754,10 +868,10 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
       });
       setKnowledgeBases((current) => current.map((item) => (item.id === next.id ? next : item)));
       setEditingKnowledgeBase(null);
-      notify.success('已保存知识库');
+      notify.success(t('knowledgePage.toast.savedKnowledgeBase'));
       await refresh();
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '保存知识库失败');
+      notify.error(knowledgeErrorMessage(error, 'knowledgePage.error.saveKnowledgeBase'));
     }
   }
 
@@ -769,10 +883,10 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
         status: active ? 'active' : 'archived',
       });
       setKnowledgeBases((current) => current.map((item) => (item.id === next.id ? next : item)));
-      notify.success(active ? '已上线知识库' : '已下线知识库');
+      notify.success(active ? t('knowledgePage.toast.publishedKnowledgeBase') : t('knowledgePage.toast.archivedKnowledgeBase'));
       await refresh();
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : active ? '上线失败' : '下线失败');
+      notify.error(knowledgeErrorMessage(error, active ? 'knowledgePage.error.publishKnowledgeBase' : 'knowledgePage.error.archiveKnowledgeBase'));
     }
   }
 
@@ -787,11 +901,11 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
     const suffix = effectiveAgentId ? `&agent_id=${encodeURIComponent(effectiveAgentId)}` : '';
     try {
       await api.delete(`/api/enterprise/knowledge-bases/${row.id}?tenant_id=${TENANT_ID}${suffix}`);
-      notify.success(branchMode ? '已移除知识库' : '已删除知识库');
+      notify.success(branchMode ? t('knowledgePage.toast.removedKnowledgeBase') : t('knowledgePage.toast.deletedKnowledgeBase'));
       setDeleteKbTarget(null);
       await refresh();
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '删除失败');
+      notify.error(knowledgeErrorMessage(error, 'knowledgePage.error.deleteKnowledgeBase'));
     }
   }
 
@@ -810,7 +924,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
         setVersionTeamOptions(teamOptions);
         setVersionKnowledgeBase(row);
       } catch (error) {
-        notify.error(error instanceof Error ? error.message : '加载团队知识库绑定失败');
+        notify.error(knowledgeErrorMessage(error, 'knowledgePage.error.loadVersionTeams'));
       }
       return;
     }
@@ -823,35 +937,35 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
       setVersionKnowledgeBase(row);
       setKnowledgeBaseVersions(versions);
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '加载版本失败');
+      notify.error(knowledgeErrorMessage(error, 'knowledgePage.error.loadVersions'));
     }
   }
 
   async function syncKnowledgeBaseFromOverall(row: KnowledgeBaseRead) {
     if (!agentId) {
-      notify.warning('请先选择员工');
+      notify.warning(t('knowledgePage.toast.selectEmployeeShort'));
       return;
     }
     try {
       await api.post(`/api/enterprise/knowledge-bases/${row.id}/sync-from-overall?tenant_id=${TENANT_ID}&agent_id=${encodeURIComponent(agentId)}`);
-      notify.success('已从广场同步');
+      notify.success(t('knowledgePage.toast.syncedFromMarketplace'));
       await refresh();
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '同步失败');
+      notify.error(knowledgeErrorMessage(error, 'knowledgePage.error.syncFromMarketplace'));
     }
   }
 
   async function promoteKnowledgeBaseToOverall(row: KnowledgeBaseRead) {
     if (!agentId) {
-      notify.warning('请先选择员工');
+      notify.warning(t('knowledgePage.toast.selectEmployeeShort'));
       return;
     }
     try {
       await api.post(`/api/enterprise/knowledge-bases/${row.id}/promote-to-overall?tenant_id=${TENANT_ID}&agent_id=${encodeURIComponent(agentId)}`);
-      notify.success('已发布到广场');
+      notify.success(t('knowledgePage.toast.publishedToMarketplace'));
       await refresh();
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '推送失败');
+      notify.error(knowledgeErrorMessage(error, 'knowledgePage.error.publishToMarketplace'));
     }
   }
 
@@ -863,11 +977,11 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
         agent_id: effectiveAgentId,
         version: version.version,
       });
-      notify.success(`已回滚到 ${version.version}`);
+      notify.success(t('knowledgePage.toast.rolledBackVersion', { version: version.version }));
       await openKnowledgeBaseVersions(versionKnowledgeBase);
       await refresh();
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '回滚失败');
+      notify.error(knowledgeErrorMessage(error, 'knowledgePage.error.rollbackVersion'));
     }
   }
 
@@ -917,7 +1031,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
   async function saveDocument() {
     if (!editingDocument) return;
     if (!documentDraft.content_md.trim()) {
-      notify.warning('文档正文不能为空');
+      notify.warning(t('knowledgePage.toast.documentContentRequired'));
       return;
     }
     setContentSaving(true);
@@ -935,9 +1049,9 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
       );
       setEditingDocument(null);
       await refresh(effectiveAgentId, next);
-      notify.success('已保存并重建知识索引');
+      notify.success(t('knowledgePage.toast.savedDocument'));
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '保存文档失败');
+      notify.error(knowledgeErrorMessage(error, 'knowledgePage.error.saveDocument'));
     } finally {
       setContentSaving(false);
     }
@@ -955,7 +1069,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
         Object.fromEntries(chunks.map((chunk) => [chunk.id, { content: chunk.content, summary: chunk.summary || '' }])),
       );
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '加载引用来源失败');
+      notify.error(knowledgeErrorMessage(error, 'knowledgePage.error.loadCitations'));
     }
   }
 
@@ -975,11 +1089,11 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
           summary: chunkDrafts[chunk.id]?.summary ?? chunk.summary,
         });
       }
-      notify.success('已保存知识内容');
+      notify.success(t('knowledgePage.toast.savedKnowledgeContent'));
       setEditingBucket(null);
       if (selectedDocument) await loadBuckets(selectedDocument, false);
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '保存知识内容失败');
+      notify.error(knowledgeErrorMessage(error, 'knowledgePage.error.saveKnowledgeContent'));
     } finally {
       setContentSaving(false);
     }
@@ -989,7 +1103,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
     return (
       <DropdownMenu>
         <DropdownMenuTrigger
-          aria-label="知识库操作"
+          aria-label={t('knowledgePage.table.actionsMenu')}
           className="grid size-7 place-items-center rounded-[8px] text-[#858b9c] transition-colors outline-none hover:bg-black/5 hover:text-[#18181a]"
           onClick={(event) => event.stopPropagation()}
         >
@@ -999,12 +1113,12 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
           {canManageCurrentScope && (
             <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => openEditKnowledgeBase(item)}>
               <EditOutlined />
-              详情
+              {t('knowledgePage.actions.details')}
             </DropdownMenuItem>
           )}
           <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => void openKnowledgeBaseVersions(item)}>
             <HistoryOutlined />
-            版本管理
+            {t('knowledgePage.actions.manageVersions')}
           </DropdownMenuItem>
           {canManageCurrentScope
             && Boolean(effectiveAgentId)
@@ -1015,25 +1129,25 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
                 onSelect={() => openSharedKnowledgeConversion(item)}
               >
                 <TeamOutlined />
-                转换为共享知识库
+                {t('knowledgePage.actions.convertToShared')}
               </DropdownMenuItem>
             ) : null}
           <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => void exportOkfBundle(item)}>
             <DownloadOutlined />
-            导出知识库备份包
+            {t('knowledgePage.actions.exportBackup')}
           </DropdownMenuItem>
           <DropdownMenuItem className={MENU_ITEM_CLASS} disabled={okfLoading} onSelect={() => void lintOkfBundle(item)}>
             <AuditOutlined />
-            知识图谱检查
+            {t('knowledgePage.actions.graphLint')}
           </DropdownMenuItem>
           {!isOverallAgent && item.mode !== 'shared' && (
             <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => void syncKnowledgeBaseFromOverall(item)}>
-              从广场同步
+              {t('knowledgePage.actions.syncFromMarketplace')}
             </DropdownMenuItem>
           )}
           {!isOverallAgent && item.mode !== 'shared' && (
             <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => void promoteKnowledgeBaseToOverall(item)}>
-              发布到广场
+              {t('knowledgePage.actions.publishToMarketplace')}
             </DropdownMenuItem>
           )}
           {canManageCurrentScope && (
@@ -1041,18 +1155,18 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
               {item.status === 'archived' ? (
                 <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => void setKnowledgeBaseStatus(item, true)}>
                   <PlayCircleOutlined />
-                  上线
+                  {t('knowledgePage.actions.publish')}
                 </DropdownMenuItem>
               ) : (
                 <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => void setKnowledgeBaseStatus(item, false)}>
                   <PauseCircleOutlined />
-                  下线
+                  {t('knowledgePage.actions.archive')}
                 </DropdownMenuItem>
               )}
               <DropdownMenuSeparator className="my-[2px] bg-[#eef0f4]" />
               <DropdownMenuItem variant="destructive" className={MENU_ITEM_DANGER_CLASS} onSelect={() => deleteKnowledgeBase(item)}>
                 <DeleteOutlined />
-                {isOverallAgent ? '删除' : '移除'}
+                {isOverallAgent ? t('knowledgePage.actions.delete') : t('knowledgePage.actions.remove')}
               </DropdownMenuItem>
             </>
           )}
@@ -1064,61 +1178,61 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
   const knowledgeBaseColumns: DataTableColumn<KnowledgeBaseRead>[] = [
     {
       key: 'name',
-      title: '名称',
+      title: t('knowledgePage.table.name'),
       render: (row) => (
         <div className="min-w-0">
           <div className="flex min-w-0 flex-wrap items-center gap-[6px]">
-            <strong className="truncate text-[13px] font-medium text-[#18181a]">{row.name}</strong>
+            <strong className="truncate text-[13px] font-medium text-[#18181a]"><RawContent value={row.name} /></strong>
             <KnowledgeTypeBadge mode={row.mode} />
             {row.mode === 'shared' ? (
-              <span className="text-[11px] text-[#858b9c]">{row.bound_team_count || 0} 个团队</span>
+              <span className="text-[11px] text-[#858b9c]">{t('knowledgePage.table.boundTeamsCount', { count: row.bound_team_count || 0 })}</span>
             ) : null}
           </div>
           {row.description ? (
-            <span className="mt-[2px] block truncate text-[12px] text-[#858b9c]">{row.description}</span>
+            <span className="mt-[2px] block truncate text-[12px] text-[#858b9c]"><RawContent value={row.description} /></span>
           ) : null}
         </div>
       ),
     },
     {
       key: 'status',
-      title: '状态',
+      title: t('knowledgePage.table.status'),
       width: 100,
       render: (row) => statusTag(row.status),
     },
     {
       key: 'capability_scope',
-      title: '能力范围',
+      title: t('knowledgePage.table.capabilityScope'),
       width: 105,
       render: (row) => <CapabilityScopeBadge value={row.capability_scope} />,
     },
     {
       key: 'creator',
-      title: '创建者',
+      title: t('knowledgePage.table.creator'),
       width: 120,
       render: (row) => (
         <span className="block truncate text-[#858b9c]" title={resourceCreatorName(row)}>
-          {resourceCreatorName(row) || '-'}
+          {resourceCreatorName(row) ? <RawContent value={resourceCreatorName(row)} /> : t('knowledgePage.placeholder.none')}
         </span>
       ),
     },
     {
       key: 'content_stats',
-      title: '版本与内容',
+      title: t('knowledgePage.table.contentStats'),
       width: 260,
       className: 'whitespace-normal',
       render: (row) => (
         <div className="flex min-w-0 flex-wrap items-center gap-[6px]">
-          {row.version ? <KTag>v{row.version}</KTag> : <KTag>无版本</KTag>}
-          <KTag>{row.document_count ?? 0} 文档</KTag>
-          <KTag>{row.bucket_count ?? 0} 目录</KTag>
-          <KTag>{row.chunk_count ?? 0} 引用</KTag>
+          {row.version ? <KTag><RawIdentifier value={`v${row.version}`} /></KTag> : <KTag>{t('knowledgePage.table.noVersion')}</KTag>}
+          <KTag>{t('knowledgePage.table.documents', { count: row.document_count ?? 0 })}</KTag>
+          <KTag>{t('knowledgePage.table.buckets', { count: row.bucket_count ?? 0 })}</KTag>
+          <KTag>{t('knowledgePage.table.citations', { count: row.chunk_count ?? 0 })}</KTag>
         </div>
       ),
     },
     {
       key: 'actions',
-      title: '操作',
+      title: t('knowledgePage.table.actions'),
       width: 70,
       align: 'right',
       render: (row) => renderKnowledgeBaseActions(row),
@@ -1137,15 +1251,20 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
     >
       <div className="flex min-w-0 items-start justify-between gap-[10px]">
         <div className="min-w-0">
-          <strong className="block truncate text-[14px] font-semibold text-[#18181a]">{item.name}</strong>
+          <strong className="block truncate text-[14px] font-semibold text-[#18181a]"><RawContent value={item.name} /></strong>
           <div className="mt-[4px] flex flex-wrap items-center gap-[6px]">
             <KnowledgeTypeBadge mode={item.mode} />
             {item.mode === 'shared' ? (
-              <span className="text-[11px] text-[#858b9c]">{item.bound_team_count || 0} 个团队</span>
+              <span className="text-[11px] text-[#858b9c]">{t('knowledgePage.table.boundTeamsCount', { count: item.bound_team_count || 0 })}</span>
             ) : null}
           </div>
-          <span className="mt-[2px] block truncate text-[12px] text-[#858b9c]">{item.description || '未填写描述'}</span>
-          <span className="mt-[2px] block truncate text-[12px] text-[#858b9c]">创建者：{resourceCreatorName(item) || '-'}</span>
+          <span className="mt-[2px] block truncate text-[12px] text-[#858b9c]">
+            {item.description ? <RawContent value={item.description} /> : t('knowledgePage.placeholder.noDescription')}
+          </span>
+          <span className="mt-[2px] block truncate text-[12px] text-[#858b9c]">
+            {t('knowledgePage.table.creatorInline')}
+            {resourceCreatorName(item) ? <RawContent value={resourceCreatorName(item)} /> : t('knowledgePage.placeholder.none')}
+          </span>
         </div>
         <span onClick={(event) => event.stopPropagation()} onKeyDown={(event) => event.stopPropagation()}>
           {renderKnowledgeBaseActions(item)}
@@ -1154,10 +1273,10 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
       <div className="mt-[10px] flex flex-wrap items-center gap-[6px]">
         {statusTag(item.status)}
         <CapabilityScopeBadge value={item.capability_scope} />
-        {item.version ? <KTag>v{item.version}</KTag> : null}
-        <KTag>{item.document_count} 文档</KTag>
-        <KTag>{item.bucket_count} 目录</KTag>
-        <KTag>{item.chunk_count} 引用</KTag>
+        {item.version ? <KTag><RawIdentifier value={`v${item.version}`} /></KTag> : null}
+        <KTag>{t('knowledgePage.table.documents', { count: item.document_count })}</KTag>
+        <KTag>{t('knowledgePage.table.buckets', { count: item.bucket_count })}</KTag>
+        <KTag>{t('knowledgePage.table.citations', { count: item.chunk_count })}</KTag>
       </div>
     </article>
   );
@@ -1169,10 +1288,12 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
       <AppHeader
         onLogout={onLogout}
         userName={currentUser?.username}
-        title={pageTitle}
-        description={isOverallAgent
-          ? '维护知识库广场中的知识库、知识图谱与检索调试。'
-          : '维护当前数字员工的知识库、知识图谱与检索调试。'}
+        left={(
+          <div className="flex min-h-[40px] flex-col justify-center gap-[4px]">
+            <h1 className="m-0 text-[16px] font-medium leading-[normal] text-[#464c5e]">{pageTitle}</h1>
+            <p className="m-0 text-[14px] leading-[normal] text-[#757f9c]">{pageDescription}</p>
+          </div>
+        )}
       />
 
       <div className="mt-[20px] mb-[16px] flex flex-wrap items-center justify-end gap-[12px]">
@@ -1183,34 +1304,34 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
           className={OUTLINE_ACTION_BUTTON_CLASS}
         >
           <IconRefresh className={cn('size-[14px]', loading && 'animate-spin')} />
-          刷新
+              {t('knowledgePage.actions.refresh')}
         </UIButton>
         {canManageCurrentScope && (
           <DropdownMenu>
             <DropdownMenuTrigger data-guide-target="knowledge-create" className="flex h-[34px] items-center gap-[4px] rounded-[10px] bg-[#18181a] px-[20px] text-[12px] font-normal text-white outline-none transition-colors hover:bg-[#303030]">
               <IconAdd className="size-[14px]" />
-              新增
+              {t('knowledgePage.actions.createKnowledgeBase')}
               <IconChevronDown className="size-[12px]" />
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end" className={MENU_CONTENT_CLASS}>
               <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => handleCreateAction('blank')}>
                 <FileAddOutlined />
-                新建知识库
+                {t('knowledgePage.actions.createKnowledgeBase')}
               </DropdownMenuItem>
               <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => handleCreateAction('okf')}>
                 <FileMarkdownOutlined />
-                导入知识库备份包
+                {t('knowledgePage.actions.importBackup')}
               </DropdownMenuItem>
               {!isOverallAgent && (
                 <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => handleCreateAction('plaza')}>
                   <DownloadOutlined />
-                  从广场复制
+                  {t('knowledgePage.actions.copyMarketplace')}
                 </DropdownMenuItem>
               )}
               {!isOverallAgent && (
                 <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => handleCreateAction('employee')}>
                   <TeamOutlined />
-                  从数字员工复制
+                  {t('knowledgePage.actions.copyEmployee')}
                 </DropdownMenuItem>
               )}
             </DropdownMenuContent>
@@ -1219,11 +1340,11 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
       </div>
 
       <div className="flex flex-col gap-[24px] rounded-[20px_20px_0_0] bg-white p-[18px_18px_24px_18px] shadow-[0_-4px_16px_0_rgba(0,0,0,0.05)]">
-        <div className="flex flex-wrap items-stretch gap-[20px]" aria-label="知识库统计">
-          <StatCard label="知识库总数" value={stats.total} />
-          <StatCard label="已上线" value={stats.active} tone="green" />
-          <StatCard label="已下线" value={stats.archived} />
-          <StatCard label="文档总数" value={stats.documents} />
+        <div className="flex flex-wrap items-stretch gap-[20px]" aria-label={t('knowledgePage.stats.label')}>
+          <StatCard label={t('knowledgePage.stats.total')} value={stats.total} />
+          <StatCard label={t('knowledgePage.stats.active')} value={stats.active} tone="green" />
+          <StatCard label={t('knowledgePage.stats.archived')} value={stats.archived} />
+          <StatCard label={t('knowledgePage.stats.documents')} value={stats.documents} />
         </div>
 
         <div className="flex flex-col gap-[18px]">
@@ -1240,14 +1361,14 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
               data-lpignore="true"
               data-bwignore="true"
               value={documentSearch}
-              placeholder="搜索知识库名称、描述、状态或版本"
+              placeholder={t('knowledgePage.search.placeholder')}
               onChange={(event) => setDocumentSearch(event.target.value)}
               className="h-full min-w-0 flex-1 bg-transparent text-[12px] text-[#17191f] outline-none placeholder:text-[#c0c6d4]"
             />
             {documentSearch && (
               <button
                 type="button"
-                aria-label="清除搜索"
+                aria-label={t('knowledgePage.search.clear')}
                 onClick={() => setDocumentSearch('')}
                 className="grid size-[16px] shrink-0 place-items-center text-[#c0c6d4] hover:text-[#858b9c]"
               >
@@ -1266,7 +1387,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
 
           <div className="hidden md:block">
             <DataTable
-              aria-label="知识库列表"
+              aria-label={listLabel}
               columns={knowledgeBaseColumns}
               data={pagination.pagedItems}
               rowKey={(row) => row.id}
@@ -1287,11 +1408,11 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
       </div>
 
       <div className="mt-[16px] flex flex-col gap-[16px]">
-        <KCard title="知识图谱">
+        <KCard title={t('knowledgePage.cards.overviewTitle')}>
           {!selectedDocument ? (
-            <EmptyState description="选择知识库后查看文档卡片、知识索引和知识图谱" />
+            <EmptyState description={t('knowledgePage.cards.overviewEmpty')} />
           ) : (
-            <目录索引Overview
+            <KnowledgeOverviewPanel
               document={selectedDocument}
               knowledgeBase={selectedKnowledgeBase}
               buckets={buckets}
@@ -1305,7 +1426,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
           )}
         </KCard>
 
-        <KCard title="渐进检索调试">
+        <KCard title={t('knowledgePage.cards.searchDebugTitle')}>
           <div className="flex w-full flex-col gap-[14px]">
             <div className="flex flex-wrap items-center gap-[10px]">
               <label className={cn(SEARCH_COMBO_CLASS, 'min-w-[280px] flex-1 max-w-[560px]')}>
@@ -1323,7 +1444,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
                       void runKnowledgeSearch();
                     }
                   }}
-                  placeholder="输入知识问题"
+                  placeholder={t('knowledgePage.searchDebug.placeholder')}
                 />
                 <button
                   type="button"
@@ -1331,7 +1452,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
                   disabled={searchLoading}
                   onClick={() => void runKnowledgeSearch()}
                 >
-                  {searchLoading ? '检索中…' : '检索'}
+                  {searchLoading ? t('knowledgePage.searchDebug.loading') : t('knowledgePage.searchDebug.submit')}
                 </button>
               </label>
               <ModelConfigDropdown
@@ -1353,29 +1474,29 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
         open={importOpen}
         loading={importLoading}
         icon={<DatabaseOutlined />}
-        title={importMode === 'plaza' ? '从广场复制知识库' : '从数字员工复制知识库'}
-        sourcePlaceholder={importMode === 'plaza' ? '选择开放广场' : '选择来源员工'}
+        title={importMode === 'plaza' ? t('knowledgePage.import.marketplaceTitle') : t('knowledgePage.import.employeeTitle')}
+        sourcePlaceholder={importMode === 'plaza' ? t('knowledgePage.import.marketplacePlaceholder') : t('knowledgePage.import.employeePlaceholder')}
         sources={importMode === 'plaza'
-          ? openGalleryImportSourceOptions(agents, '开放广场')
+          ? openGalleryImportSourceOptions(agents, t('knowledgePage.import.marketplaceSourceLabel'))
           : visibleEmployeeAgents(agents, currentUser, { activeOnly: true, excludeAgentId: agentId })
             .map((item) => ({ value: item.id, label: item.name }))}
         sourceId={importSourceAgentId}
-        itemsLabel="选择知识库"
+        itemsLabel={t('knowledgePage.import.itemsLabel')}
         items={importSourceKnowledgeBases.map((item) => ({
           id: item.id,
           label: (
             <>
-              {item.name}
-              <span className="text-[#858b9c]"> · {item.version || '1.0.0'}</span>
+              <RawContent value={item.name} />
+              <span className="text-[#858b9c]"> · <RawIdentifier value={item.version || '1.0.0'} /></span>
             </>
           ),
         }))}
         selectedIds={importSelectedKnowledgeBaseIds}
-        emptyText="没有可复制的知识库"
+        emptyText={t('knowledgePage.import.empty')}
         note={importMode === 'plaza'
-          ? '从开放广场复制可用知识库；不可复制内容不会出现在列表。'
-          : '从数字员工复制可用知识库；不可见内容不会出现在列表。'}
-        submitText="复制"
+          ? t('knowledgePage.import.marketplaceNote')
+          : t('knowledgePage.import.employeeNote')}
+        submitText={t('knowledgePage.import.submit')}
         onSourceChange={(value) => {
           setImportSourceAgentId(value);
           void loadImportSourceKnowledgeBases(value);
@@ -1384,30 +1505,35 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
         onClose={() => setImportOpen(false)}
         onSubmit={() => void submitImportKnowledgeBases()}
       />
-      <KDialog open={okfImportOpen} title="导入知识库备份包" onClose={() => setOkfImportOpen(false)}>
+      <KDialog open={okfImportOpen} title={t('knowledgePage.importBackupDialog.title')} onClose={() => setOkfImportOpen(false)}>
         <FileDropzone
           accept=".zip,.md,.markdown"
           disabled={okfImporting}
           onFiles={(files) => files[0] && void importOkfFile(files[0])}
         >
           <FileMarkdownOutlined className="mb-[8px] text-[28px] text-[#1a71ff]" />
-          <p className="m-0 text-[14px] font-medium text-foreground">选择或拖入知识库备份包（.zip）</p>
-          <p className="mt-[4px] mb-0 text-[12px] text-[#858b9c]">导入后会生成知识图谱、知识索引和引用来源。</p>
+          <p className="m-0 text-[14px] font-medium text-foreground">{t('knowledgePage.importBackupDialog.prompt')}</p>
+          <p className="mt-[4px] mb-0 text-[12px] text-[#858b9c]">{t('knowledgePage.importBackupDialog.description')}</p>
         </FileDropzone>
       </KDialog>
       <KDialog
         open={okfLintReportOpen}
-        title={okfLintKnowledgeBase ? `知识图谱检查：${okfLintKnowledgeBase.name}` : '知识图谱检查'}
+        title={okfLintKnowledgeBase ? (
+          <>
+            {t('knowledgePage.graphLintDialog.titleWithName')}
+            <RawContent value={okfLintKnowledgeBase.name} />
+          </>
+        ) : t('knowledgePage.graphLintDialog.title')}
         width={820}
         onClose={() => setOkfLintReportOpen(false)}
-        footer={<KDialogCancelButton onClick={() => setOkfLintReportOpen(false)}>关闭</KDialogCancelButton>}
+        footer={<KDialogCancelButton onClick={() => setOkfLintReportOpen(false)}>{t('common.action.close')}</KDialogCancelButton>}
       >
         <div className="flex flex-col gap-[14px]">
           <p className="text-[13px] leading-[1.6] text-[#858b9c]">
-            用于检查当前知识库的知识图谱结构，发现断链、孤立页、重复主题等问题。检查结果仅作参考，不会自动修改数据。
+            {t('knowledgePage.graphLintDialog.description')}
           </p>
           {okfLintIssues.length === 0 ? (
-            <EmptyState description="知识图谱检查通过" />
+            <EmptyState description={t('knowledgePage.graphLintDialog.empty')} />
           ) : (
             <div className="grid gap-[10px] sm:grid-cols-2">
               {okfLintIssues.map((issue, index) => (
@@ -1415,12 +1541,16 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
                   className="flex flex-col gap-[6px] rounded-[12px] border border-[#f4d58a] bg-[#fffaf0] p-[12px]"
                   key={`${issue.issue_type || 'issue'}-${issue.concept_id || index}`}
                 >
-                  <KTag color="gold">{issue.issue_type || 'warning'}</KTag>
+                  <KTag color="gold">
+                    {issue.issue_type ? (
+                      <RawIdentifier value={issue.issue_type} />
+                    ) : t('knowledgePage.graphLintDialog.fallbackType')}
+                  </KTag>
                   <strong className="text-[13px] font-semibold wrap-break-word text-[#18181a]">
-                    {issue.title || issue.concept_id || '知识图谱检查'}
+                    {issue.title ? <RawContent value={issue.title} /> : <RawIdentifier value={issue.concept_id || t('knowledgePage.graphLintDialog.fallbackIssue')} />}
                   </strong>
                   <span className="text-[12px] wrap-break-word text-[#858b9c]">
-                    {issue.message || '待处理'}
+                    {issue.message ? <RawContent value={issue.message} /> : t('knowledgePage.graphLintDialog.pending')}
                   </span>
                   {issue.concept_id ? (
                     <small className="font-mono text-[12px] wrap-break-word text-[#858b9c]">
@@ -1435,15 +1565,15 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
       </KDialog>
       <KDialog
         open={Boolean(viewingConcept)}
-        title={viewingConcept ? <WikiViewerTitle concept={viewingConcept} /> : '知识图谱'}
+        title={viewingConcept ? <WikiViewerTitle concept={viewingConcept} /> : t('knowledgePage.conceptDialog.viewerTitle')}
         width="min(1040px, calc(100vw - 48px))"
         onClose={() => setViewingConcept(null)}
         footer={(
           <>
-            <KDialogCancelButton onClick={() => setViewingConcept(null)}>关闭</KDialogCancelButton>
+            <KDialogCancelButton onClick={() => setViewingConcept(null)}>{t('common.action.close')}</KDialogCancelButton>
             <KDialogPrimaryButton onClick={editViewingConcept}>
               <EditOutlined />
-              编辑知识图谱
+              {t('knowledgePage.conceptDialog.edit')}
             </KDialogPrimaryButton>
           </>
         )}
@@ -1455,13 +1585,13 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
         title={
           editingConcept ? (
             <div className="flex min-w-0 flex-col gap-[4px]">
-              <span className="text-[13px] font-semibold text-[#858b9c]">编辑知识图谱</span>
+              <span className="text-[13px] font-semibold text-[#858b9c]">{t('knowledgePage.conceptEditor.subtitle')}</span>
               <strong className="line-clamp-2 text-[20px] font-semibold leading-[1.35] text-[#18181a]">
-                {conceptEditorTitle || editingConcept.concept_id}
+                {conceptEditorTitle ? <RawContent value={conceptEditorTitle} /> : <RawIdentifier value={editingConcept.concept_id} />}
               </strong>
             </div>
           ) : (
-            '编辑知识图谱'
+            t('knowledgePage.conceptEditor.title')
           )
         }
         width="min(1120px, calc(100vw - 48px))"
@@ -1469,7 +1599,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
         footer={(
           <>
             <KDialogCancelButton onClick={() => setEditingConcept(null)} />
-            <KDialogPrimaryButton onClick={() => void saveConcept()}>保存</KDialogPrimaryButton>
+            <KDialogPrimaryButton onClick={() => void saveConcept()}>{t('common.action.save')}</KDialogPrimaryButton>
           </>
         )}
       >
@@ -1481,33 +1611,33 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
                 <span>{conceptTypeLabel(conceptEditorType)}</span>
               </div>
               <div className="grid grid-cols-[72px_minmax(0,1fr)] gap-x-[12px] gap-y-[10px]">
-                <span className="text-[12px] font-semibold text-[#858b9c]">页面路径</span>
-                <strong className="text-[13px] wrap-break-word text-[#18181a]">{editingConcept.concept_id}</strong>
-                <span className="text-[12px] font-semibold text-[#858b9c]">链接</span>
-                <strong className="text-[13px] text-[#18181a]">{editingConcept.links.length} 个</strong>
-                <span className="text-[12px] font-semibold text-[#858b9c]">引用</span>
-                <strong className="text-[13px] text-[#18181a]">{editingConcept.citations.length} 个</strong>
-                <span className="text-[12px] font-semibold text-[#858b9c]">更新时间</span>
-                <strong className="text-[13px] text-[#18181a]">{formatDateTime(editingConcept.updated_at)}</strong>
+                <span className="text-[12px] font-semibold text-[#858b9c]">{t('knowledgePage.conceptEditor.path')}</span>
+                <strong className="text-[13px] wrap-break-word text-[#18181a]"><RawIdentifier value={editingConcept.concept_id} /></strong>
+                <span className="text-[12px] font-semibold text-[#858b9c]">{t('knowledgePage.conceptEditor.links')}</span>
+                <strong className="text-[13px] text-[#18181a]">{t('knowledgePage.conceptEditor.linkCount', { count: editingConcept.links.length })}</strong>
+                <span className="text-[12px] font-semibold text-[#858b9c]">{t('knowledgePage.conceptEditor.citations')}</span>
+                <strong className="text-[13px] text-[#18181a]">{t('knowledgePage.conceptEditor.citationCount', { count: editingConcept.citations.length })}</strong>
+                <span className="text-[12px] font-semibold text-[#858b9c]">{t('knowledgePage.conceptEditor.updatedAt')}</span>
+                <strong className="text-[13px] text-[#18181a]">{formatDateTime(editingConcept.updated_at, locale, t)}</strong>
               </div>
               <div className="rounded-[12px] border border-[#eceef1] bg-white p-[12px] text-[13px] leading-[1.65] text-[#858b9c]">
-                知识图谱以结构化文本保存，标题和摘要会同步写入内容。
+                {t('knowledgePage.conceptEditor.note')}
               </div>
             </aside>
             <section className="flex min-w-0 flex-col gap-[16px]">
               <div className="grid grid-cols-1 gap-[14px] sm:grid-cols-[minmax(0,1.4fr)_minmax(180px,0.6fr)]">
                 <label className="flex flex-col gap-[8px]">
-                  <span className="text-[13px] font-semibold text-[#464c5e]">页面标题</span>
+                  <span className="text-[13px] font-semibold text-[#464c5e]">{t('knowledgePage.conceptEditor.fieldTitle')}</span>
                   <Input
                     value={conceptEditorTitle}
                     onChange={(event) =>
                       setConceptDraft((prev) => updateOkfFrontmatterValue(prev, 'title', event.target.value))
                     }
-                    placeholder="知识图谱标题"
+                    placeholder={t('knowledgePage.conceptEditor.fieldTitlePlaceholder')}
                   />
                 </label>
                 <label className="flex flex-col gap-[8px]">
-                  <span className="text-[13px] font-semibold text-[#464c5e]">页面类型</span>
+                  <span className="text-[13px] font-semibold text-[#464c5e]">{t('knowledgePage.conceptEditor.fieldType')}</span>
                   <UISelect
                     value={conceptEditorType}
                     onValueChange={(value) => setConceptDraft((prev) => updateOkfFrontmatterValue(prev, 'type', value))}
@@ -1516,26 +1646,26 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
-                      {Array.from(CONCEPT_TYPE_LABELS.entries()).map(([value, label]) => (
-                        <SelectItem key={value} value={value}>{label}</SelectItem>
+                      {['Source Document', 'Source Section', 'Topic', 'Playbook', 'Business Rule', 'Query Analysis'].map((value) => (
+                        <SelectItem key={value} value={value}>{conceptTypeLabel(value)}</SelectItem>
                       ))}
                     </SelectContent>
                   </UISelect>
                 </label>
                 <label className="flex flex-col gap-[8px] sm:col-span-full">
-                  <span className="text-[13px] font-semibold text-[#464c5e]">页面摘要</span>
+                  <span className="text-[13px] font-semibold text-[#464c5e]">{t('knowledgePage.conceptEditor.fieldSummary')}</span>
                   <Textarea
                     value={conceptEditorDescription}
                     rows={3}
                     onChange={(event) =>
                       setConceptDraft((prev) => updateOkfFrontmatterValue(prev, 'description', event.target.value))
                     }
-                    placeholder="说明这个知识图谱沉淀了什么知识"
+                    placeholder={t('knowledgePage.conceptEditor.fieldSummaryPlaceholder')}
                   />
                 </label>
               </div>
               <label className="flex flex-col gap-[8px]">
-                <span className="text-[13px] font-semibold text-[#464c5e]">知识图谱源码</span>
+                <span className="text-[13px] font-semibold text-[#464c5e]">{t('knowledgePage.conceptEditor.source')}</span>
                 <Textarea
                   className="min-h-[420px] resize-y font-mono text-[13px] leading-[1.55]"
                   value={conceptDraft}
@@ -1550,12 +1680,12 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
       </KDialog>
       <KDialog
         open={Boolean(editingKnowledgeBase)}
-        title="知识库详情"
+        title={t('knowledgePage.knowledgeBaseDialog.title')}
         onClose={() => setEditingKnowledgeBase(null)}
         footer={(
           <>
             <KDialogCancelButton onClick={() => setEditingKnowledgeBase(null)} />
-            <KDialogPrimaryButton onClick={() => void saveKnowledgeBase()}>保存</KDialogPrimaryButton>
+            <KDialogPrimaryButton onClick={() => void saveKnowledgeBase()}>{t('common.action.save')}</KDialogPrimaryButton>
           </>
         )}
       >
@@ -1563,13 +1693,13 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
           <Input
             value={knowledgeBaseDraft.name}
             onChange={(event) => setKnowledgeBaseDraft((prev) => ({ ...prev, name: event.target.value }))}
-            placeholder="知识库名称"
+            placeholder={t('knowledgePage.knowledgeBaseDialog.namePlaceholder')}
           />
           <Textarea
             rows={4}
             value={knowledgeBaseDraft.description}
             onChange={(event) => setKnowledgeBaseDraft((prev) => ({ ...prev, description: event.target.value }))}
-            placeholder="知识库描述"
+            placeholder={t('knowledgePage.knowledgeBaseDialog.descriptionPlaceholder')}
           />
           <UISelect
             value={knowledgeBaseDraft.status}
@@ -1579,8 +1709,8 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="active">上线</SelectItem>
-              <SelectItem value="archived">下线</SelectItem>
+              <SelectItem value="active">{t('knowledgePage.actions.publish')}</SelectItem>
+              <SelectItem value="archived">{t('knowledgePage.actions.archive')}</SelectItem>
             </SelectContent>
           </UISelect>
           <CapabilityScopeControl
@@ -1592,30 +1722,35 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
       </KDialog>
       <KDialog
         open={Boolean(versionKnowledgeBase && versionKnowledgeBase.mode !== 'shared')}
-        title={versionKnowledgeBase ? `版本管理：${versionKnowledgeBase.name}` : '版本管理'}
+        title={versionKnowledgeBase ? (
+          <>
+            {t('knowledgePage.versionDialog.titleWithName')}
+            <RawContent value={versionKnowledgeBase.name} />
+          </>
+        ) : t('knowledgePage.versionDialog.title')}
         width={840}
         onClose={() => setVersionKnowledgeBase(null)}
-        footer={<KDialogCancelButton onClick={() => setVersionKnowledgeBase(null)}>关闭</KDialogCancelButton>}
+        footer={<KDialogCancelButton onClick={() => setVersionKnowledgeBase(null)}>{t('common.action.close')}</KDialogCancelButton>}
       >
         <DataTable
-          aria-label="版本列表"
+          aria-label={t('knowledgePage.versionDialog.listAria')}
           rowKey={(row) => row.id}
           data={knowledgeBaseVersions}
-          emptyText="暂无版本记录"
+          emptyText={t('knowledgePage.versionDialog.empty')}
           columns={[
-            { key: 'version', title: '版本', render: (row) => row.version },
-            { key: 'name', title: '名称', render: (row) => row.name },
-            { key: 'status', title: '状态', render: (row) => statusTag(String(row.status)) },
-            { key: 'is_head', title: 'Head', render: (row) => (row.is_head ? <KTag color="green">当前</KTag> : null) },
-            { key: 'updated_at', title: '更新时间', render: (row) => String(row.updated_at).slice(0, 10) },
+            { key: 'version', title: t('knowledgePage.versionDialog.columnVersion'), render: (row) => <RawIdentifier value={row.version} /> },
+            { key: 'name', title: t('knowledgePage.table.name'), render: (row) => <RawContent value={row.name} /> },
+            { key: 'status', title: t('knowledgePage.table.status'), render: (row) => statusTag(String(row.status)) },
+            { key: 'is_head', title: t('knowledgePage.versionDialog.columnHead'), render: (row) => (row.is_head ? <KTag color="green">{t('knowledgePage.versionDialog.current')}</KTag> : null) },
+            { key: 'updated_at', title: t('knowledgePage.versionDialog.columnUpdatedAt'), render: (row) => formatDateTime(String(row.updated_at), locale, t) },
             {
               key: 'actions',
-              title: '操作',
+              title: t('knowledgePage.table.actions'),
               width: 96,
               render: (row) =>
                 !isOverallAgent && !row.is_head ? (
                   <UIButton variant="outline" size="sm" onClick={() => void rollbackKnowledgeBaseVersion(row)}>
-                    回滚
+                    {t('knowledgePage.versionDialog.rollback')}
                   </UIButton>
                 ) : null,
             },
@@ -1641,14 +1776,14 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
       />
       <KDialog
         open={Boolean(editingDocument)}
-        title="在线编辑知识文档"
+        title={t('knowledgePage.documentDialog.title')}
         width="min(1080px, calc(100vw - 48px))"
         onClose={() => setEditingDocument(null)}
         footer={(
           <>
             <KDialogCancelButton disabled={contentSaving} onClick={() => setEditingDocument(null)} />
             <KDialogPrimaryButton disabled={contentSaving} onClick={() => void saveDocument()}>
-              {contentSaving ? '正在重建索引…' : '保存并重建索引'}
+              {contentSaving ? t('knowledgePage.documentDialog.saving') : t('knowledgePage.documentDialog.save')}
             </KDialogPrimaryButton>
           </>
         )}
@@ -1658,7 +1793,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
             <Input
               value={documentDraft.title}
               onChange={(event) => setDocumentDraft((prev) => ({ ...prev, title: event.target.value }))}
-              placeholder="文档标题"
+              placeholder={t('knowledgePage.documentDialog.titlePlaceholder')}
             />
             <UISelect
               value={documentDraft.status}
@@ -1668,59 +1803,59 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="ready">可用</SelectItem>
-                <SelectItem value="processing">处理中</SelectItem>
-                <SelectItem value="failed">失败</SelectItem>
-                <SelectItem value="archived">下线</SelectItem>
+                <SelectItem value="ready">{t('knowledgePage.documentDialog.status.ready')}</SelectItem>
+                <SelectItem value="processing">{t('knowledgePage.documentDialog.status.processing')}</SelectItem>
+                <SelectItem value="failed">{t('knowledgePage.documentDialog.status.failed')}</SelectItem>
+                <SelectItem value="archived">{t('knowledgePage.documentDialog.status.archived')}</SelectItem>
               </SelectContent>
             </UISelect>
           </div>
           <div className="flex items-center justify-between gap-[12px]">
-            <div className="inline-flex rounded-[9px] bg-[#f3f5f8] p-[3px]" aria-label="正文编辑模式">
+            <div className="inline-flex rounded-[9px] bg-[#f3f5f8] p-[3px]" aria-label={t('knowledgePage.documentDialog.editorModeAria')}>
               <button
                 type="button"
                 className={cn('rounded-[7px] px-[14px] py-[6px] text-[12px] text-[#697085]', documentEditorMode === 'edit' && 'bg-white font-medium text-[#17191f] shadow-sm')}
                 onClick={() => setDocumentEditorMode('edit')}
               >
-                Markdown 编辑
+                {t('knowledgePage.documentDialog.editMode')}
               </button>
               <button
                 type="button"
                 className={cn('rounded-[7px] px-[14px] py-[6px] text-[12px] text-[#697085]', documentEditorMode === 'preview' && 'bg-white font-medium text-[#17191f] shadow-sm')}
                 onClick={() => setDocumentEditorMode('preview')}
               >
-                预览
+                {t('knowledgePage.documentDialog.previewMode')}
               </button>
             </div>
-            <span className="text-[12px] tabular-nums text-[#858b9c]">{documentDraft.content_md.length.toLocaleString()} 字符</span>
+            <span className="text-[12px] tabular-nums text-[#858b9c]">{t('knowledgePage.documentDialog.charCount', { count: documentDraft.content_md.length })}</span>
           </div>
           {documentEditorMode === 'edit' ? (
             <Textarea
               rows={22}
               value={documentDraft.content_md}
               onChange={(event) => setDocumentDraft((prev) => ({ ...prev, content_md: event.target.value }))}
-              placeholder="使用 Markdown 编辑知识正文"
+              placeholder={t('knowledgePage.documentDialog.contentPlaceholder')}
               className="min-h-[460px] resize-y font-mono text-[13px] leading-6"
             />
           ) : (
             <div className="min-h-[460px] max-h-[62vh] overflow-auto rounded-[12px] border border-[#e6e9ef] bg-white p-[18px]">
-              <MarkdownPreview markdown={documentDraft.content_md || '暂无正文'} />
+              <MarkdownPreview markdown={documentDraft.content_md || t('knowledgePage.documentDialog.emptyPreview')} />
             </div>
           )}
           <p className="m-0 text-[12px] leading-5 text-[#858b9c]">
-            保存后会自动重建目录索引、引用来源和知识图谱；员工范围的修改会写入员工私有版本，不影响广场原版本。
+            {t('knowledgePage.documentDialog.note')}
           </p>
         </div>
       </KDialog>
       <KDialog
         open={Boolean(editingBucket)}
-        title="编辑内部索引与引用来源"
+        title={t('knowledgePage.bucketDialog.title')}
         width={920}
         onClose={() => setEditingBucket(null)}
         footer={(
           <>
             <KDialogCancelButton disabled={contentSaving} onClick={() => setEditingBucket(null)} />
-            <KDialogPrimaryButton disabled={contentSaving} onClick={() => void saveBucketAndChunks()}>保存</KDialogPrimaryButton>
+            <KDialogPrimaryButton disabled={contentSaving} onClick={() => void saveBucketAndChunks()}>{t('common.action.save')}</KDialogPrimaryButton>
           </>
         )}
       >
@@ -1728,13 +1863,13 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
           <Input
             value={bucketDraft.title}
             onChange={(event) => setBucketDraft((prev) => ({ ...prev, title: event.target.value }))}
-            placeholder="内部索引标题"
+            placeholder={t('knowledgePage.bucketDialog.titlePlaceholder')}
           />
           <Textarea
             rows={4}
             value={bucketDraft.summary}
             onChange={(event) => setBucketDraft((prev) => ({ ...prev, summary: event.target.value }))}
-            placeholder="内部索引摘要"
+            placeholder={t('knowledgePage.bucketDialog.summaryPlaceholder')}
           />
           <div className="flex flex-col gap-[12px]">
             {bucketChunks.map((chunk) => (
@@ -1743,8 +1878,8 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
                 key={chunk.id}
               >
                 <div className="flex items-center justify-between gap-[10px]">
-                  <strong className="text-[13px] font-semibold text-[#18181a]">引用来源 {chunk.chunk_index + 1}</strong>
-                  <KTag>{chunk.source_ref || 'chunk'}</KTag>
+                  <strong className="text-[13px] font-semibold text-[#18181a]">{t('knowledgePage.bucketDialog.chunkTitle', { index: chunk.chunk_index + 1 })}</strong>
+                  <KTag><RawIdentifier value={chunk.source_ref || 'chunk'} /></KTag>
                 </div>
                 <Textarea
                   rows={2}
@@ -1755,7 +1890,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
                       [chunk.id]: { ...(prev[chunk.id] || { content: chunk.content, summary: '' }), summary: event.target.value },
                     }))
                   }
-                  placeholder="引用来源摘要"
+                  placeholder={t('knowledgePage.bucketDialog.chunkSummaryPlaceholder')}
                 />
                 <Textarea
                   rows={6}
@@ -1766,7 +1901,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
                       [chunk.id]: { ...(prev[chunk.id] || { content: '', summary: chunk.summary || '' }), content: event.target.value },
                     }))
                   }
-                  placeholder="引用来源内容"
+                  placeholder={t('knowledgePage.bucketDialog.chunkContentPlaceholder')}
                 />
               </div>
             ))}
@@ -1777,11 +1912,17 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
       <ConfirmDialog
         open={Boolean(deleteKbTarget)}
         onOpenChange={(open) => !open && setDeleteKbTarget(null)}
-        title={deleteKbTarget ? `${isOverallAgent ? '删除' : '移除'}知识库：${deleteKbTarget.name}` : ''}
+        title={deleteKbTarget ? (
+          <>
+            {isOverallAgent ? t('knowledgePage.deleteDialog.titleDelete') : t('knowledgePage.deleteDialog.titleRemove')}
+            <RawContent value={deleteKbTarget.name} />
+          </>
+        ) : ''}
         description={!isOverallAgent
-          ? '这只会在当前数字员工中隐藏该知识库；开放广场和其他数字员工仍然保留。'
-          : '开放广场会永久删除该知识库及其文档、内部索引、引用来源和版本记录。'}
-        confirmText={isOverallAgent ? '删除' : '移除'}
+          ? t('knowledgePage.deleteDialog.removeDescription')
+          : t('knowledgePage.deleteDialog.deleteDescription')}
+        confirmText={isOverallAgent ? t('knowledgePage.actions.delete') : t('knowledgePage.actions.remove')}
+        cancelText={t('common.action.cancel')}
         onConfirm={() => void runDeleteKnowledgeBase()}
       />
     </div>
@@ -1789,6 +1930,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
 }
 
 export function KnowledgeAddPage({ currentUser }: KnowledgePageProps = {}) {
+  const { t } = useAppIntl();
   const navigate = useNavigate();
   const [knowledgeBases, setKnowledgeBases] = useState<KnowledgeBaseRead[]>([]);
   const [capabilityScope, setCapabilityScope] = useState<CapabilityScope>('general');
@@ -1900,7 +2042,7 @@ export function KnowledgeAddPage({ currentUser }: KnowledgePageProps = {}) {
       const rows = await api.get<KnowledgeBaseRead[]>(`/api/enterprise/knowledge-bases?tenant_id=${TENANT_ID}${suffix}`);
       setKnowledgeBases(rows);
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '加载知识库失败');
+      notify.error(apiErrorMessage(error, 'knowledgePage.add.error.loadKnowledgeBases', { t }));
     }
   }
 
@@ -1924,11 +2066,11 @@ export function KnowledgeAddPage({ currentUser }: KnowledgePageProps = {}) {
     /** 创建显式类型的空知识库；共享库后续由团队详情绑定并配置权限。 */
     const name = newBaseName.trim();
     if (!name) {
-      notify.warning('请输入知识库名称');
+      notify.warning(t('knowledgePage.add.toast.enterName'));
       return;
     }
     if (newBaseMode === 'shared' && !isEnterpriseAdmin(currentUser)) {
-      notify.error('只有管理员可以直接创建共享知识库');
+      notify.error(t('knowledgePage.add.error.adminOnlyShared'));
       return;
     }
     setCreatingBase(true);
@@ -1941,10 +2083,10 @@ export function KnowledgeAddPage({ currentUser }: KnowledgePageProps = {}) {
         agent_id: newBaseMode === 'dedicated' && agentId ? agentId : undefined,
         capability_scope: capabilityScope,
       });
-      notify.success(newBaseMode === 'shared' ? '共享知识库已创建' : '专用知识库已创建');
+      notify.success(newBaseMode === 'shared' ? t('knowledgePage.add.toast.createdShared') : t('knowledgePage.add.toast.createdDedicated'));
       navigate('/enterprise/knowledge');
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '创建知识库失败');
+      notify.error(apiErrorMessage(error, 'knowledgePage.add.error.createKnowledgeBase', { t }));
     } finally {
       setCreatingBase(false);
     }
@@ -1952,7 +2094,7 @@ export function KnowledgeAddPage({ currentUser }: KnowledgePageProps = {}) {
 
   async function uploadFile(file: File) {
     if (!isEnterpriseAdmin(currentUser) && !agentId) {
-      notify.warning('请先选择一个数字员工');
+      notify.warning(t('knowledgePage.toast.selectEmployee'));
       return;
     }
     try {
@@ -1967,9 +2109,9 @@ export function KnowledgeAddPage({ currentUser }: KnowledgePageProps = {}) {
       });
       setJobs((prev) => ({ ...prev, [job.id]: job }));
       await refreshKnowledgeBases();
-      notify.success('已创建知识库和入库任务');
+      notify.success(t('knowledgePage.add.toast.createdJob'));
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '上传失败');
+      notify.error(apiErrorMessage(error, 'knowledgePage.add.error.upload', { t }));
     }
   }
 
@@ -1981,9 +2123,9 @@ export function KnowledgeAddPage({ currentUser }: KnowledgePageProps = {}) {
         `/api/enterprise/knowledge/jobs/${job.id}/cancel?tenant_id=${TENANT_ID}`,
       );
       setJobs((prev) => ({ ...prev, [next.id]: next }));
-      notify.success(next.status === 'cancelled' ? '已取消入库任务' : '已发送取消请求');
+      notify.success(next.status === 'cancelled' ? t('knowledgePage.add.toast.cancelledJob') : t('knowledgePage.add.toast.cancelRequested'));
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '取消入库任务失败');
+      notify.error(apiErrorMessage(error, 'knowledgePage.add.error.cancelJob', { t }));
     } finally {
       setCancellingJobIds((current) => current.filter((id) => id !== job.id));
     }
@@ -2008,28 +2150,28 @@ export function KnowledgeAddPage({ currentUser }: KnowledgePageProps = {}) {
       });
       setDiscoveryModalOpen(true);
     } catch (error) {
-      notify.warning(error instanceof Error ? error.message : '加载知识发现建议失败');
+      notify.warning(apiErrorMessage(error, 'knowledgePage.add.error.loadDiscoveries', { t }));
     }
   }
 
   async function confirmDiscovery(item: KnowledgeDiscoveryRead) {
     try {
       await api.post(`/api/enterprise/knowledge/discoveries/${item.id}/confirm?tenant_id=${TENANT_ID}`);
-      notify.success('已确认建议');
+      notify.success(t('knowledgePage.add.toast.confirmedSuggestion'));
       setPendingDiscoveries((current) => current.filter((entry) => entry.id !== item.id));
       await refreshKnowledgeBases();
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '确认失败');
+      notify.error(apiErrorMessage(error, 'knowledgePage.add.error.confirmSuggestion', { t }));
     }
   }
 
   async function rejectDiscovery(item: KnowledgeDiscoveryRead) {
     try {
       await api.post(`/api/enterprise/knowledge/discoveries/${item.id}/reject?tenant_id=${TENANT_ID}`);
-      notify.success('已拒绝建议');
+      notify.success(t('knowledgePage.add.toast.rejectedSuggestion'));
       setPendingDiscoveries((current) => current.filter((entry) => entry.id !== item.id));
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '拒绝失败');
+      notify.error(apiErrorMessage(error, 'knowledgePage.add.error.rejectSuggestion', { t }));
     }
   }
 
@@ -2038,18 +2180,18 @@ export function KnowledgeAddPage({ currentUser }: KnowledgePageProps = {}) {
       <div className="knowledge-floating-shell">
         <div className="knowledge-floating-head">
           <div>
-            <span className="section-kicker">知识库 / 新建</span>
-            <h3 className="my-[4px] text-[20px] font-semibold text-foreground">新建知识库</h3>
-            <span className="text-[13px] text-[#858b9c]">上传业务文档后，系统会先生成知识图谱，再刷新目录索引、引用来源与自发现建议。</span>
+            <span className="section-kicker">{t('knowledgePage.add.kicker')}</span>
+            <h3 className="my-[4px] text-[20px] font-semibold text-foreground">{t('knowledgePage.add.title')}</h3>
+            <span className="text-[13px] text-[#858b9c]">{t('knowledgePage.add.description')}</span>
           </div>
             <UIButton variant="outline" onClick={() => navigate('/enterprise/knowledge')}>
               <RightOutlined />
-              返回
+              {t('common.action.back')}
             </UIButton>
         </div>
 
-        <KCard title="创建空知识库">
-          <section aria-label="新建知识库配置" className="flex flex-col gap-[16px]">
+        <KCard title={t('knowledgePage.add.createEmptyTitle')}>
+          <section aria-label={t('knowledgePage.add.configAria')} className="flex flex-col gap-[16px]">
             <div className="grid gap-[10px] sm:grid-cols-2">
               <label className={cn(
                 'flex cursor-pointer items-start gap-[10px] rounded-[12px] border p-[14px]',
@@ -2063,9 +2205,9 @@ export function KnowledgeAddPage({ currentUser }: KnowledgePageProps = {}) {
                   onChange={() => setNewBaseMode('dedicated')}
                 />
                 <span>
-                  <strong className="block text-[14px] text-foreground">专用知识库</strong>
+                  <strong className="block text-[14px] text-foreground">{t('knowledgePage.add.modeDedicated')}</strong>
                   <small className="mt-[3px] block text-[12px] leading-5 text-[#858b9c]">
-                    员工私聊使用，按员工分支保持隔离。
+                    {t('knowledgePage.add.modeDedicatedDescription')}
                   </small>
                 </span>
               </label>
@@ -2083,30 +2225,30 @@ export function KnowledgeAddPage({ currentUser }: KnowledgePageProps = {}) {
                   onChange={() => setNewBaseMode('shared')}
                 />
                 <span>
-                  <strong className="block text-[14px] text-foreground">共享知识库</strong>
+                  <strong className="block text-[14px] text-foreground">{t('knowledgePage.add.modeShared')}</strong>
                   <small className="mt-[3px] block text-[12px] leading-5 text-[#858b9c]">
-                    绑定到一个或多个团队，并按员工分别授予读取、编辑或发布权限。
+                    {t('knowledgePage.add.modeSharedDescription')}
                   </small>
                 </span>
               </label>
             </div>
             <div className="grid gap-[12px] md:grid-cols-2">
               <label className="flex flex-col gap-[7px] text-[13px] font-medium text-[#464c5e]">
-                知识库名称
+                {t('knowledgePage.add.nameLabel')}
                 <Input
-                  aria-label="知识库名称"
+                  aria-label={t('knowledgePage.add.nameLabel')}
                   value={newBaseName}
                   onChange={(event) => setNewBaseName(event.target.value)}
-                  placeholder="例如：内容团队选题库"
+                  placeholder={t('knowledgePage.add.namePlaceholder')}
                 />
               </label>
               <label className="flex flex-col gap-[7px] text-[13px] font-medium text-[#464c5e]">
-                知识库描述
+                {t('knowledgePage.add.descriptionLabel')}
                 <Input
-                  aria-label="知识库描述"
+                  aria-label={t('knowledgePage.add.descriptionLabel')}
                   value={newBaseDescription}
                   onChange={(event) => setNewBaseDescription(event.target.value)}
-                  placeholder="说明知识范围与维护目的"
+                  placeholder={t('knowledgePage.add.descriptionPlaceholder')}
                 />
               </label>
             </div>
@@ -2117,7 +2259,7 @@ export function KnowledgeAddPage({ currentUser }: KnowledgePageProps = {}) {
             />
             <div className="flex justify-end">
               <UIButton disabled={creatingBase} onClick={() => void createEmptyKnowledgeBase()}>
-                {creatingBase ? '正在创建…' : '创建知识库'}
+                {creatingBase ? t('knowledgePage.add.creating') : t('knowledgePage.add.createSubmit')}
               </UIButton>
             </div>
           </section>
@@ -2126,10 +2268,10 @@ export function KnowledgeAddPage({ currentUser }: KnowledgePageProps = {}) {
         <KCard className="knowledge-upload-card" bodyClassName="flex flex-col gap-[16px]">
           <div className="knowledge-upload-controls">
             <div>
-              <strong className="block text-[14px] font-semibold text-foreground">上传文档即创建知识库</strong>
-              <span className="text-[13px] text-[#858b9c]">一个文件对应一份独立知识库；回到知识库后可查看文档卡片、知识索引和知识图谱。</span>
+              <strong className="block text-[14px] font-semibold text-foreground">{t('knowledgePage.add.uploadTitle')}</strong>
+              <span className="text-[13px] text-[#858b9c]">{t('knowledgePage.add.uploadDescription')}</span>
             </div>
-            <UIButton variant="outline" onClick={() => navigate('/enterprise/knowledge')}>管理已有知识库</UIButton>
+            <UIButton variant="outline" onClick={() => navigate('/enterprise/knowledge')}>{t('knowledgePage.add.manageExisting')}</UIButton>
           </div>
         {visibleKnowledgeBases.length > 0 && (
           <div className="knowledge-base-target-strip">
@@ -2138,9 +2280,13 @@ export function KnowledgeAddPage({ currentUser }: KnowledgePageProps = {}) {
                 key={item.id}
                 className="knowledge-base-target"
               >
-                <span>{item.name}</span>
+                <span><RawContent value={item.name} /></span>
                 <small>
-                  {item.document_count} 文档 / {item.bucket_count} 目录 / {item.chunk_count} 引用
+                  {t('knowledgePage.add.targetSummary', {
+                    documentCount: item.document_count,
+                    bucketCount: item.bucket_count,
+                    chunkCount: item.chunk_count,
+                  })}
                 </small>
                 <CapabilityScopeBadge value={item.capability_scope} />
               </div>
@@ -2160,16 +2306,16 @@ export function KnowledgeAddPage({ currentUser }: KnowledgePageProps = {}) {
           <div className="knowledge-upload-inner">
             <InboxOutlined />
             <div>
-              <strong>拖拽文档到这里，或点击上传</strong>
-              <span>支持 doc/docx/txt/md/html/pdf；旧版 doc 会提示转换为 docx。</span>
+              <strong>{t('knowledgePage.add.dropzoneTitle')}</strong>
+              <span>{t('knowledgePage.add.dropzoneDescription')}</span>
             </div>
           </div>
         </FileDropzone>
         </KCard>
 
-        <KCard title="入库任务">
+        <KCard title={t('knowledgePage.add.jobsTitle')}>
           {sortedJobs.length === 0 ? (
-            <EmptyState description="上传后这里会显示原始资料、知识图谱和引用来源入库进度" />
+            <EmptyState description={t('knowledgePage.add.jobsEmpty')} />
           ) : (
             <div className="knowledge-jobs">
               {sortedJobs.map((job) => (
@@ -2187,14 +2333,14 @@ export function KnowledgeAddPage({ currentUser }: KnowledgePageProps = {}) {
 
       <KDialog
         open={discoveryModalOpen && pendingDiscoveries.length > 0}
-        title="发现可新增资源"
+        title={t('knowledgePage.add.discoveryDialogTitle')}
         width={820}
         className="knowledge-discovery-modal"
         onClose={() => setDiscoveryModalOpen(false)}
       >
         <DiscoveryColumn
-          title="可确认建议"
-          description="模型从本次上传的知识中发现了技能或工具草案，确认后才会写入系统。"
+          title={t('knowledgePage.add.discoveryColumnTitle')}
+          description={t('knowledgePage.add.discoveryColumnDescription')}
           items={pendingDiscoveries}
           onConfirm={confirmDiscovery}
           onReject={rejectDiscovery}
@@ -2213,16 +2359,18 @@ function KnowledgeJobCard({
   cancelling?: boolean;
   onCancel?: (job: KnowledgeIngestJobRead) => void;
 }) {
-  const steps = ingestSteps(job);
+  const { t } = useAppIntl();
+  const steps = ingestSteps(job, t);
   const metadata = job.metadata || {};
-  const stageLabel = stringFromMetadata(metadata.stage_label) || stageLabelFallback(job.stage);
-  const stageDetail = stringFromMetadata(metadata.stage_detail);
+  const stageCode = typeof metadata.stage_code === 'string' ? metadata.stage_code : job.stage;
+  const stageLabel = knowledgeStageLabel(stageCode, t);
+  const stageDetail = knowledgeStageDetailLabel(metadata.stage_detail, t);
   const cancellable = ['queued', 'running'].includes(job.status);
   return (
     <div className="knowledge-job">
       <div className="knowledge-job-head">
         <div>
-          <strong className="text-[14px] font-semibold text-foreground">{job.filename}</strong>
+          <strong className="text-[14px] font-semibold text-foreground"><RawIdentifier value={job.filename} /></strong>
           <span className="text-[13px] text-[#858b9c]"> · {stageLabel}</span>
         </div>
         <div className="flex shrink-0 items-center gap-[8px]">
@@ -2237,7 +2385,7 @@ function KnowledgeJobCard({
               onClick={() => onCancel(job)}
             >
               <CloseOutlined />
-              {cancelling ? '取消中' : '取消'}
+              {cancelling ? t('knowledgePage.add.jobCancelling') : t('common.action.cancel')}
             </UIButton>
           )}
         </div>
@@ -2252,7 +2400,7 @@ function KnowledgeJobCard({
         ))}
       </div>
       {stageDetail && <span className="knowledge-job-detail text-[13px] text-[#858b9c]">{stageDetail}</span>}
-      {job.error && <span className="text-[13px] text-[#d20b0b]">{job.error}</span>}
+      {job.error && <span className="text-[13px] text-[#d20b0b]">{knowledgeErrorLabel(job.error, t)}</span>}
     </div>
   );
 }
@@ -2305,28 +2453,38 @@ function SmoothProgress({ job }: { job: KnowledgeIngestJobRead }) {
   );
 }
 
-function ingestSteps(job: KnowledgeIngestJobRead): IngestStepView[] {
+function ingestSteps(
+  job: KnowledgeIngestJobRead,
+  t: KnowledgeTranslate = currentKnowledgeTranslator().t,
+): IngestStepView[] {
   const raw = (job.metadata || {}).ingest_steps;
   if (Array.isArray(raw)) {
-    return raw.map((item, index) => {
-      const record = item && typeof item === 'object' ? (item as Record<string, unknown>) : {};
-      const status = record.status === 'running' || record.status === 'done' ? record.status : 'pending';
-      return {
-        key: String(record.key || `step_${index}`),
-        label: String(record.label || DEFAULT_INGEST_STEPS[index]?.label || `阶段 ${index + 1}`),
-        progress: Number(record.progress || 0),
+    const parsedSteps = raw.flatMap((item) => {
+      if (!isRecord(item) || typeof item.key !== 'string' || !item.key) return [];
+      const status: IngestStepView['status'] = item.status === 'running' || item.status === 'done'
+        ? item.status
+        : 'pending';
+      const progress = typeof item.progress === 'number' && Number.isFinite(item.progress)
+        ? item.progress
+        : 0;
+      return [{
+        key: item.key,
+        label: knowledgeStageLabel(item.key, t),
+        progress,
         status,
-      };
+      }];
     });
+    if (parsedSteps.length > 0) return parsedSteps;
   }
   const currentProgress = job.progress || 0;
+  const defaultSteps = defaultIngestSteps(t);
   if (job.status === 'cancelled' || job.stage === 'cancelled') {
-    return DEFAULT_INGEST_STEPS.map((step) => ({
+    return defaultSteps.map((step) => ({
       ...step,
       status: step.progress < currentProgress ? 'done' : 'pending',
     }));
   }
-  return DEFAULT_INGEST_STEPS.map((step) => ({
+  return defaultSteps.map((step) => ({
     ...step,
     status:
       job.stage === step.key
@@ -2335,10 +2493,6 @@ function ingestSteps(job: KnowledgeIngestJobRead): IngestStepView[] {
         ? 'done'
         : 'pending',
   }));
-}
-
-function stageLabelFallback(stage: string): string {
-  return DEFAULT_INGEST_STEPS.find((item) => item.key === stage)?.label || stage || '处理中';
 }
 
 function stringFromMetadata(value: unknown): string {
@@ -2392,7 +2546,7 @@ type KnowledgeOverviewItem = {
   bucket?: KnowledgeBucketRead;
 };
 
-function 目录索引Overview({
+function KnowledgeOverviewPanel({
   document,
   knowledgeBase,
   buckets,
@@ -2413,6 +2567,7 @@ function 目录索引Overview({
   onViewConcept: (concept: KnowledgeConceptRead) => void;
   onEditConcept: (concept: KnowledgeConceptRead) => void;
 }) {
+  const { locale, t } = useAppIntl();
   const [detailView, setDetailView] = useState<KnowledgeDetailView | null>(null);
   const [detailFocusKey, setDetailFocusKey] = useState<string | null>(null);
   const [activeContentView, setActiveContentView] = useState<KnowledgeContentView>('evidence');
@@ -2420,12 +2575,15 @@ function 目录索引Overview({
   const [wikiViewMode, setWikiViewMode] = useState<'graph' | 'cards'>('graph');
   const metadata = document.metadata || {};
   const documentCard = isRecord(metadata.document_card) ? metadata.document_card : {};
-  const wikiStructureConcepts = useMemo(() => sortWikiConcepts(okfConcepts), [okfConcepts]);
-  const wikiIndexGroups = useMemo(() => buildWikiIndexGroups(wikiStructureConcepts), [wikiStructureConcepts]);
+  const wikiStructureConcepts = useMemo(() => sortWikiConcepts(okfConcepts, locale), [locale, okfConcepts]);
+  const wikiIndexGroups = useMemo(
+    () => buildWikiIndexGroups(wikiStructureConcepts, locale),
+    [locale, wikiStructureConcepts],
+  );
   const previewWikiStructure = wikiIndexGroups.slice(0, STRUCTURE_PREVIEW_LIMIT);
   const previewConcepts = okfConcepts.slice(0, OKF_PREVIEW_LIMIT);
   const documentTitle = String(documentCard.title || document.title || knowledgeBase?.name || document.filename);
-  const documentSummary = String(documentCard.summary || '暂无文档摘要');
+  const documentSummary = String(documentCard.summary || t('knowledgePage.overview.noDocumentSummary'));
   const sourceMarkdown = useMemo(() => documentSourceMarkdown(document, documentSummary), [document, documentSummary]);
   const totalChunkCount = buckets.reduce((sum, bucket) => sum + (bucket.chunk_count || 0), 0) || document.chunk_count || 0;
   const evidenceBuckets = useMemo(
@@ -2472,10 +2630,10 @@ function 目录索引Overview({
     }
   > = {
     sections: {
-      title: '目录索引',
-      description: '按目录结构组织知识范围，先看主题，再进入知识图谱。',
+      title: t('knowledgePage.overview.sectionsTitle'),
+      description: t('knowledgePage.overview.sectionsDescription'),
       count: wikiIndexGroups.length,
-      emptyText: '暂无目录索引',
+      emptyText: t('knowledgePage.overview.sectionsEmpty'),
       items: previewWikiStructure.map((group) => ({
         key: group.key,
         title: group.title,
@@ -2484,10 +2642,10 @@ function 目录索引Overview({
       })),
     },
     wiki: {
-      title: '知识图谱',
-      description: '可读知识页，用于长期沉淀、跨文档综合和数字员工复制。',
+      title: t('knowledgePage.overview.wikiTitle'),
+      description: t('knowledgePage.overview.wikiDescription'),
       count: okfConcepts.length,
-      emptyText: '暂无知识图谱',
+      emptyText: t('knowledgePage.overview.wikiEmpty'),
       items: previewConcepts.map((concept) => ({
         key: concept.id,
         title: concept.title || concept.concept_id,
@@ -2496,10 +2654,10 @@ function 目录索引Overview({
       })),
     },
     evidence: {
-      title: '引用来源',
-      description: '保留切片内容、原文片段和来源路径，用于回答溯源。',
+      title: t('knowledgePage.overview.evidenceTitle'),
+      description: t('knowledgePage.overview.evidenceDescription'),
       count: totalChunkCount,
-      emptyText: '暂无引用来源',
+      emptyText: t('knowledgePage.overview.evidenceEmpty'),
       items: previewEvidence,
     },
   };
@@ -2509,8 +2667,8 @@ function 目录索引Overview({
     <div className="knowledge-pageindex">
       <div className="knowledge-pageindex-card">
         <div className="knowledge-document-card-body">
-          <span className="text-[13px] text-[#858b9c]">文档卡片</span>
-          <h5 className="my-[4px] text-[15px] font-semibold text-foreground">{documentTitle}</h5>
+          <span className="text-[13px] text-[#858b9c]">{t('knowledgePage.overview.documentCard')}</span>
+          <h5 className="my-[4px] text-[15px] font-semibold text-foreground"><RawContent value={documentTitle} /></h5>
           <div className="knowledge-document-card-markdown is-preview">
             <MarkdownPreview markdown={documentSummary} />
           </div>
@@ -2518,13 +2676,13 @@ function 目录索引Overview({
         <div className="knowledge-pageindex-actions">
           <UIButton variant="outline" className={OUTLINE_ACTION_BUTTON_SM_CLASS} onClick={() => openDetail('document')}>
             <EditOutlined />
-            详情
+            {t('knowledgePage.actions.details')}
           </UIButton>
         </div>
         <div className="knowledge-document-meta">
           <button type="button" className="knowledge-stat-pill" onClick={() => openDetail('document')}>
-            <span>格式</span>
-            <strong>{document.file_type || 'unknown'}</strong>
+            <span>{t('knowledgePage.overview.fileType')}</span>
+            <strong><RawIdentifier value={document.file_type || 'unknown'} /></strong>
           </button>
           <button
             type="button"
@@ -2532,7 +2690,7 @@ function 目录索引Overview({
             aria-pressed={activeContentView === 'sections'}
             onClick={() => setActiveContentView('sections')}
           >
-            <span>目录索引</span>
+            <span>{t('knowledgePage.overview.sectionsTitle')}</span>
             <strong>{wikiIndexGroups.length}</strong>
           </button>
           <button
@@ -2541,7 +2699,7 @@ function 目录索引Overview({
             aria-pressed={activeContentView === 'wiki'}
             onClick={() => setActiveContentView('wiki')}
           >
-            <span>知识图谱</span>
+            <span>{t('knowledgePage.overview.wikiTitle')}</span>
             <strong>{okfConcepts.length}</strong>
           </button>
           <button
@@ -2550,7 +2708,7 @@ function 目录索引Overview({
             aria-pressed={activeContentView === 'evidence'}
             onClick={() => setActiveContentView('evidence')}
           >
-            <span>引用来源</span>
+            <span>{t('knowledgePage.overview.evidenceTitle')}</span>
             <strong>{totalChunkCount}</strong>
           </button>
         </div>
@@ -2564,14 +2722,14 @@ function 目录索引Overview({
           </span>
           <div className="knowledge-overview-panel-actions">
             {activeContentView === 'wiki' && (
-              <div className="knowledge-graph-view-switch" aria-label="知识图谱呈现方式">
+              <div className="knowledge-graph-view-switch" aria-label={t('knowledgePage.overview.wikiPresentationAria')}>
                 <button
                   type="button"
                   className={wikiPresentation === 'graph' ? 'is-active' : ''}
                   aria-pressed={wikiPresentation === 'graph'}
                   onClick={() => setWikiPresentation('graph')}
                 >
-                  图谱
+                  {t('knowledgePage.overview.graphView')}
                 </button>
                 <button
                   type="button"
@@ -2579,7 +2737,7 @@ function 目录索引Overview({
                   aria-pressed={wikiPresentation === 'cards'}
                   onClick={() => setWikiPresentation('cards')}
                 >
-                  卡片
+                  {t('knowledgePage.overview.cardView')}
                 </button>
               </div>
             )}
@@ -2589,12 +2747,12 @@ function 目录索引Overview({
               className="text-[13px] text-[#1a71ff] transition-colors hover:text-[#4a8dff]"
               onClick={() => openContentDetail(activeContentView)}
             >
-              查看全部
+              {t('knowledgePage.overview.viewAll')}
             </button>
           </div>
         </div>
         {activeContentView === 'wiki' && wikiPresentation === 'graph' ? (
-          <Suspense fallback={<div className="kgv-empty">加载中…</div>}>
+          <Suspense fallback={<div className="kgv-empty">{t('knowledgePage.overview.loading')}</div>}>
             <KnowledgeGraphVisualization
               concepts={okfConcepts}
               knowledgeBaseKey={knowledgeBase?.id || document.knowledge_base_id}
@@ -2604,14 +2762,14 @@ function 目录索引Overview({
         ) : (
           <>
             {activeContentView === 'sections' && (
-              <div className="knowledge-layer-explain" aria-label="知识层级说明">
+              <div className="knowledge-layer-explain" aria-label={t('knowledgePage.overview.layerExplainAria')}>
                 <span>
-                  <strong>目录索引</strong>
-                  <small>目录索引，用于按资料、章节、主题逐级展开</small>
+                  <strong>{t('knowledgePage.overview.sectionsTitle')}</strong>
+                  <small>{t('knowledgePage.overview.sectionsExplain')}</small>
                 </span>
                 <span>
-                  <strong>知识图谱</strong>
-                  <small>最底层可读知识页，回答时基于页面内容并追溯引用来源</small>
+                  <strong>{t('knowledgePage.overview.wikiTitle')}</strong>
+                  <small>{t('knowledgePage.overview.wikiExplain')}</small>
                 </span>
               </div>
             )}
@@ -2641,16 +2799,16 @@ function 目录索引Overview({
                     }}
                     title={
                       activeContentView === 'sections' && entry.indexGroup
-                        ? '查看目录下的知识图谱'
+                        ? t('knowledgePage.overview.viewSectionGraph')
                         : (activeContentView === 'sections' || activeContentView === 'wiki') && entry.concept
-                          ? '查看知识图谱'
+                          ? t('knowledgePage.overview.viewWiki')
                           : activeContentView === 'evidence'
-                            ? '查看引用来源'
-                          : '查看详情'
+                            ? t('knowledgePage.overview.viewEvidence')
+                          : t('knowledgePage.actions.details')
                     }
                   >
-                    <strong>{entry.title}</strong>
-                    <small>{entry.summary}</small>
+                    <strong><RawContent value={entry.title} /></strong>
+                    <small><RawContent value={entry.summary} /></small>
                   </button>
                 ))
               )}
@@ -2670,20 +2828,20 @@ function 目录索引Overview({
           <div className="knowledge-detail-stack">
             <div className="knowledge-detail-header">
               <div>
-                <span className="text-[13px] text-[#858b9c]">文档卡片</span>
-                <h4 className="my-[4px] text-[16px] font-semibold text-foreground">{documentTitle}</h4>
+                <span className="text-[13px] text-[#858b9c]">{t('knowledgePage.overview.documentCard')}</span>
+                <h4 className="my-[4px] text-[16px] font-semibold text-foreground"><RawContent value={documentTitle} /></h4>
               </div>
               {canEdit && (
                 <UIButton variant="outline" className={OUTLINE_ACTION_BUTTON_SM_CLASS} onClick={() => onEditDocument(document)}>
                   <EditOutlined />
-                  修改
+                  {t('common.action.edit')}
                 </UIButton>
               )}
             </div>
             <section className="knowledge-document-md-panel">
               <div className="knowledge-document-md-panel-head">
-                <strong>文档卡片</strong>
-                <KTag>{document.file_type || 'unknown'}</KTag>
+                <strong>{t('knowledgePage.overview.documentCard')}</strong>
+                <KTag><RawIdentifier value={document.file_type || 'unknown'} /></KTag>
               </div>
               <div className="knowledge-document-md-scroll is-summary">
                 <MarkdownPreview markdown={documentSummary} />
@@ -2691,28 +2849,28 @@ function 目录索引Overview({
             </section>
             <section className="knowledge-document-md-panel">
               <div className="knowledge-document-md-panel-head">
-                <strong>原始资料</strong>
-                <KTag>{Array.isArray(metadata.section_tree) ? metadata.section_tree.length : 0} 段</KTag>
+                <strong>{t('knowledgePage.overview.sourceMaterial')}</strong>
+                <KTag>{t('knowledgePage.overview.sectionCount', { count: Array.isArray(metadata.section_tree) ? metadata.section_tree.length : 0 })}</KTag>
               </div>
               <div className="knowledge-document-md-scroll is-source">
-                <MarkdownPreview markdown={sourceMarkdown || '暂无原始资料'} />
+                <MarkdownPreview markdown={sourceMarkdown || t('knowledgePage.overview.noSourceMaterial')} />
               </div>
             </section>
             <div className="knowledge-evidence-stat is-inline">
-              <strong>{document.file_type || 'unknown'}</strong>
-              <span>文件格式</span>
+              <strong><RawIdentifier value={document.file_type || 'unknown'} /></strong>
+              <span>{t('knowledgePage.overview.fileType')}</span>
             </div>
             <div className="knowledge-document-meta">
               <button type="button" className="knowledge-stat-pill" onClick={() => openDetail('sections')}>
-                <span>目录索引</span>
+                <span>{t('knowledgePage.overview.sectionsTitle')}</span>
                 <strong>{wikiIndexGroups.length}</strong>
               </button>
               <button type="button" className="knowledge-stat-pill" onClick={() => openDetail('wiki')}>
-                <span>知识图谱</span>
+                <span>{t('knowledgePage.overview.wikiTitle')}</span>
                 <strong>{okfConcepts.length}</strong>
               </button>
               <button type="button" className="knowledge-stat-pill" onClick={() => openDetail('evidence')}>
-                <span>引用来源</span>
+                <span>{t('knowledgePage.overview.evidenceTitle')}</span>
                 <strong>{totalChunkCount}</strong>
               </button>
             </div>
@@ -2722,7 +2880,7 @@ function 目录索引Overview({
         {detailView === 'sections' && (
           <div className="knowledge-wiki-map">
             {wikiIndexGroups.length === 0 ? (
-              <EmptyState description="暂无 目录索引 目录" />
+              <EmptyState description={t('knowledgePage.overview.sectionsDetailEmpty')} />
             ) : (
               wikiIndexGroups.map((group) => (
                 <section
@@ -2732,17 +2890,21 @@ function 目录索引Overview({
                 >
                   <div className="knowledge-index-group-head">
                     <div>
-                      <KTag color="green">目录索引</KTag>
-                      <strong>{group.title}</strong>
-                      <small>{group.description}</small>
+                      <KTag color="green">{t('knowledgePage.overview.sectionsTitle')}</KTag>
+                      <strong><RawContent value={group.title} /></strong>
+                      <small><RawContent value={group.description} /></small>
                     </div>
-                    <KTag>{group.concepts.length} 页</KTag>
+                    <KTag>{t('knowledgePage.overview.pageCount', { count: group.concepts.length })}</KTag>
                   </div>
                   <div className="knowledge-index-page-list">
                     {group.concepts.slice(0, 8).map((concept) => (
                       <button type="button" key={concept.id} onClick={() => onViewConcept(concept)}>
-                        <span>{concept.title || concept.concept_id}</span>
-                        <small>{conceptTypeLabel(concept.concept_type)} · {concept.description || concept.concept_id}</small>
+                        <span>{concept.title ? <RawContent value={concept.title} /> : <RawIdentifier value={concept.concept_id} />}</span>
+                        <small>
+                          {conceptTypeLabel(concept.concept_type)}
+                          {' · '}
+                          {concept.description ? <RawContent value={concept.description} /> : <RawIdentifier value={concept.concept_id} />}
+                        </small>
                       </button>
                     ))}
                   </div>
@@ -2755,7 +2917,7 @@ function 目录索引Overview({
         {detailView === 'evidence' && (
           <div className="knowledge-concept-list">
             {evidenceBuckets.length === 0 ? (
-              <EmptyState description="暂无引用来源" />
+              <EmptyState description={t('knowledgePage.overview.evidenceEmpty')} />
             ) : (
               evidenceBuckets.map((bucket) => {
                 const contentMarkdown = bucketContentMarkdown(bucket);
@@ -2768,12 +2930,14 @@ function 目录索引Overview({
                     <div className="knowledge-concept-card-head">
                       <div>
                         <div className="flex flex-wrap items-center gap-[8px]">
-                          <KTag color="green">引用来源</KTag>
+                          <KTag color="green">{t('knowledgePage.overview.evidenceTitle')}</KTag>
                           {bucketStatusTag(bucket)}
-                          <KTag>{bucket.chunk_count} 个切片</KTag>
+                          <KTag>{t('knowledgePage.overview.chunkCount', { count: bucket.chunk_count })}</KTag>
                         </div>
                         <h5 className="mt-[6px] mb-0 text-[15px] font-semibold text-foreground">
-                          {bucket.title || bucket.bucket_key || '引用来源'}
+                          {bucket.title
+                            ? <RawContent value={bucket.title} />
+                            : <RawIdentifier value={bucket.bucket_key || t('knowledgePage.evidence.defaultTitle')} />}
                         </h5>
                       </div>
                       <UIButton
@@ -2782,15 +2946,15 @@ function 目录索引Overview({
                         onClick={() => onEditBucket(bucket)}
                       >
                         <EditOutlined />
-                        编辑
+                        {t('common.action.edit')}
                       </UIButton>
                     </div>
                     {bucket.summary ? (
-                      <p className="my-[6px] text-[13px] leading-[1.65] text-[#858b9c]">{bucket.summary}</p>
+                      <p className="my-[6px] text-[13px] leading-[1.65] text-[#858b9c]"><RawContent value={bucket.summary} /></p>
                     ) : null}
                     <KnowledgeBucketLinks bucket={bucket} evidenceOnly />
                     <section className="mt-[12px] rounded-[14px] border border-[#eceef1] bg-white p-[14px]">
-                      <MarkdownPreview markdown={contentMarkdown || '暂无可展示的切片正文，可点击编辑加载完整引用来源。'} />
+                      <MarkdownPreview markdown={contentMarkdown || t('knowledgePage.overview.noEvidenceContent')} />
                     </section>
                   </section>
                 );
@@ -2802,7 +2966,7 @@ function 目录索引Overview({
         {detailView === 'wiki' && (
           <div className="knowledge-concept-list">
             {okfConcepts.length === 0 ? (
-              <EmptyState description="暂无知识图谱" />
+              <EmptyState description={t('knowledgePage.overview.wikiEmpty')} />
             ) : (
               <>
                 <div className="knowledge-graph-view-switch">
@@ -2811,14 +2975,14 @@ function 目录索引Overview({
                     className={`knowledge-graph-view-btn${wikiViewMode === 'graph' ? ' is-active' : ''}`}
                     onClick={() => setWikiViewMode('graph')}
                   >
-                    图谱视图
+                    {t('knowledgePage.overview.graphMode')}
                   </button>
                   <button
                     type="button"
                     className={`knowledge-graph-view-btn${wikiViewMode === 'cards' ? ' is-active' : ''}`}
                     onClick={() => setWikiViewMode('cards')}
                   >
-                    卡片视图
+                    {t('knowledgePage.overview.cardMode')}
                   </button>
                 </div>
                 {wikiViewMode === 'graph' ? (
@@ -2845,7 +3009,9 @@ function 目录索引Overview({
                             <KTag color={conceptTypeColor(concept.concept_type)}>{conceptTypeLabel(concept.concept_type)}</KTag>
                             {statusTag(concept.status)}
                           </div>
-                          <h5 className="mt-[6px] mb-0 text-[15px] font-semibold text-foreground">{concept.title || concept.concept_id}</h5>
+                          <h5 className="mt-[6px] mb-0 text-[15px] font-semibold text-foreground">
+                            {concept.title ? <RawContent value={concept.title} /> : <RawIdentifier value={concept.concept_id} />}
+                          </h5>
                         </div>
                         <UIButton
                           variant="outline"
@@ -2856,15 +3022,17 @@ function 目录索引Overview({
                           }}
                         >
                           <EditOutlined />
-                          编辑
+                          {t('common.action.edit')}
                         </UIButton>
                       </div>
-                      <p className="my-[6px] text-[13px] text-[#858b9c]">{concept.description || conceptSummary(concept)}</p>
+                      <p className="my-[6px] text-[13px] text-[#858b9c]">
+                        {concept.description ? <RawContent value={concept.description} /> : conceptSummary(concept)}
+                      </p>
                       <div className="flex flex-wrap items-center gap-[6px]">
-                        <KTag>{concept.concept_id}</KTag>
-                        <KTag>{concept.links.length} 个链接</KTag>
-                        <KTag>{concept.citations.length} 个引用</KTag>
-                        {concept.document_id ? <KTag>来源文档 {concept.document_id}</KTag> : null}
+                        <KTag><RawIdentifier value={concept.concept_id} /></KTag>
+                        <KTag>{t('knowledgePage.wiki.linkCount', { count: concept.links.length })}</KTag>
+                        <KTag>{t('knowledgePage.wiki.citationCount', { count: concept.citations.length })}</KTag>
+                        {concept.document_id ? <KTag>{t('knowledgePage.wiki.sourceDocument')} <RawIdentifier value={concept.document_id} /></KTag> : null}
                       </div>
                     </div>
                   ))
@@ -2880,18 +3048,22 @@ function 目录索引Overview({
 }
 
 function WikiViewerTitle({ concept }: { concept: KnowledgeConceptRead }) {
+  const { t } = useAppIntl();
   return (
     <div className="flex min-w-0 flex-col gap-[4px]">
       <span className="text-[13px] font-semibold text-[#1a71ff]">{conceptTypeLabel(concept.concept_type)}</span>
       <strong className="line-clamp-2 text-[20px] font-semibold leading-[1.35] text-[#18181a]">
-        {concept.title || concept.concept_id}
+        {concept.title ? <RawContent value={concept.title} /> : <RawIdentifier value={concept.concept_id} />}
       </strong>
-      <small className="font-mono text-[12px] wrap-break-word text-[#858b9c]">{concept.concept_id}</small>
+      <small className="font-mono text-[12px] wrap-break-word text-[#858b9c]">
+        {t('knowledgePage.wiki.pathLabel')} <RawIdentifier value={concept.concept_id} />
+      </small>
     </div>
   );
 }
 
 function WikiConceptViewer({ concept }: { concept: KnowledgeConceptRead }) {
+  const { locale, t } = useAppIntl();
   const body = stripOkfFrontmatter(concept.content_md || '');
   const tags = Array.isArray(concept.frontmatter?.tags) ? concept.frontmatter.tags : [];
   const citations = Array.isArray(concept.citations) ? concept.citations : [];
@@ -2904,22 +3076,22 @@ function WikiConceptViewer({ concept }: { concept: KnowledgeConceptRead }) {
           <KTag color={conceptTypeColor(concept.concept_type)}>{conceptTypeLabel(concept.concept_type)}</KTag>
           {statusTag(concept.status)}
           {tags.slice(0, 5).map((tag) => (
-            <KTag key={String(tag)}>{String(tag)}</KTag>
+            <KTag key={String(tag)}><RawContent value={String(tag)} /></KTag>
           ))}
         </div>
-        <h3 className="text-[20px] font-semibold text-[#18181a]">{concept.title || concept.concept_id}</h3>
-        <p className="text-[14px] leading-[1.65] text-[#18181a]">{concept.description || conceptSummary(concept)}</p>
+        <h3 className="text-[20px] font-semibold text-[#18181a]">{concept.title ? <RawContent value={concept.title} /> : <RawIdentifier value={concept.concept_id} />}</h3>
+        <p className="text-[14px] leading-[1.65] text-[#18181a]">{concept.description ? <RawContent value={concept.description} /> : conceptSummary(concept)}</p>
       </section>
 
-      <section className="grid min-w-0 gap-[10px] grid-cols-[repeat(auto-fit,minmax(160px,1fr))]" aria-label="知识图谱元信息">
+      <section className="grid min-w-0 gap-[10px] grid-cols-[repeat(auto-fit,minmax(160px,1fr))]" aria-label={t('knowledgePage.wiki.metaAria')}>
         {[
-          { label: '页面路径', value: concept.concept_id },
-          { label: '链接', value: `${links.length} 个` },
-          { label: '引用', value: `${citations.length} 个` },
-          { label: '更新时间', value: formatDateTime(concept.updated_at) },
+          { key: 'path', label: t('knowledgePage.conceptEditor.path'), value: <RawIdentifier value={concept.concept_id} /> },
+          { key: 'links', label: t('knowledgePage.conceptEditor.links'), value: t('knowledgePage.conceptEditor.linkCount', { count: links.length }) },
+          { key: 'citations', label: t('knowledgePage.conceptEditor.citations'), value: t('knowledgePage.conceptEditor.citationCount', { count: citations.length }) },
+          { key: 'updatedAt', label: t('knowledgePage.conceptEditor.updatedAt'), value: formatDateTime(concept.updated_at, locale, t) },
         ].map((item) => (
           <div
-            key={item.label}
+            key={item.key}
             className="flex min-w-0 flex-col gap-[6px] overflow-hidden rounded-[14px] border border-[#eceef1] bg-white px-[14px] py-[13px]"
           >
             <span className="text-[12px] font-semibold text-[#858b9c]">{item.label}</span>
@@ -2929,37 +3101,37 @@ function WikiConceptViewer({ concept }: { concept: KnowledgeConceptRead }) {
       </section>
 
       <section className="rounded-[16px] border border-[#eceef1] bg-white p-[18px]">
-        <MarkdownPreview markdown={body || '暂无正文'} />
+        <MarkdownPreview markdown={body || t('knowledgePage.wiki.emptyBody')} />
       </section>
 
       {(links.length > 0 || citations.length > 0 || sourceRefs.length > 0) && (
-        <section className="grid min-w-0 grid-cols-1 gap-[10px] xl:grid-cols-3" aria-label="知识链接与引用">
+        <section className="grid min-w-0 grid-cols-1 gap-[10px] xl:grid-cols-3" aria-label={t('knowledgePage.wiki.relationsAria')}>
           {links.length > 0 && (
             <div className="flex min-w-0 flex-col gap-[10px] overflow-hidden rounded-[14px] border border-[#eceef1] bg-white p-[14px]">
-              <strong className="text-[13px] font-semibold text-[#18181a]">关联页面</strong>
+              <strong className="text-[13px] font-semibold text-[#18181a]">{t('knowledgePage.wiki.relatedPages')}</strong>
               <div className="flex max-h-[220px] min-w-0 max-w-full flex-wrap gap-[6px] overflow-x-hidden overflow-y-auto pr-[2px]">
                 {links.slice(0, 12).map((item, index) => (
-                  <KnowledgeRelationChip key={`link-${index}`}>{recordLabel(item, ['target', 'concept_id', 'id'])}</KnowledgeRelationChip>
+                  <KnowledgeRelationChip key={`link-${index}`}><RawIdentifier value={recordLabel(item, ['target', 'concept_id', 'id'])} /></KnowledgeRelationChip>
                 ))}
               </div>
             </div>
           )}
           {citations.length > 0 && (
             <div className="flex min-w-0 flex-col gap-[10px] overflow-hidden rounded-[14px] border border-[#eceef1] bg-white p-[14px]">
-              <strong className="text-[13px] font-semibold text-[#18181a]">引用</strong>
+              <strong className="text-[13px] font-semibold text-[#18181a]">{t('knowledgePage.wiki.citations')}</strong>
               <div className="flex max-h-[220px] min-w-0 max-w-full flex-wrap gap-[6px] overflow-x-hidden overflow-y-auto pr-[2px]">
                 {citations.slice(0, 12).map((item, index) => (
-                  <KnowledgeRelationChip key={`citation-${index}`}>{recordLabel(item, ['label', 'source', 'uri', 'id'])}</KnowledgeRelationChip>
+                  <KnowledgeRelationChip key={`citation-${index}`}><RawIdentifier value={recordLabel(item, ['label', 'source', 'uri', 'id'])} /></KnowledgeRelationChip>
                 ))}
               </div>
             </div>
           )}
           {sourceRefs.length > 0 && (
             <div className="flex min-w-0 flex-col gap-[10px] overflow-hidden rounded-[14px] border border-[#eceef1] bg-white p-[14px]">
-              <strong className="text-[13px] font-semibold text-[#18181a]">来源</strong>
+              <strong className="text-[13px] font-semibold text-[#18181a]">{t('knowledgePage.wiki.sources')}</strong>
               <div className="flex max-h-[220px] min-w-0 max-w-full flex-wrap gap-[6px] overflow-x-hidden overflow-y-auto pr-[2px]">
                 {sourceRefs.slice(0, 12).map((item, index) => (
-                  <KnowledgeRelationChip key={`source-${index}`}>{recordLabel(item, ['document_id', 'section_id', 'source', 'id'])}</KnowledgeRelationChip>
+                  <KnowledgeRelationChip key={`source-${index}`}><RawIdentifier value={recordLabel(item, ['document_id', 'section_id', 'source', 'id'])} /></KnowledgeRelationChip>
                 ))}
               </div>
             </div>
@@ -2971,10 +3143,11 @@ function WikiConceptViewer({ concept }: { concept: KnowledgeConceptRead }) {
 }
 
 function MarkdownPreview({ markdown }: { markdown: string }) {
+  const { t } = useAppIntl();
   const normalized = normalizeMarkdownForDisplay(markdown);
   return (
     <div className="knowledge-markdown-preview">
-      {renderMarkdownBlocks(normalized || '暂无内容')}
+      {renderMarkdownBlocks(normalized || t('knowledgePage.placeholder.noContent'))}
     </div>
   );
 }
@@ -3001,28 +3174,29 @@ function KnowledgeRelationChip({ children }: { children: ReactNode }) {
 }
 
 function KnowledgeBucketLinks({ bucket, evidenceOnly = false }: { bucket: KnowledgeBucketRead; evidenceOnly?: boolean }) {
+  const { t } = useAppIntl();
   const sourceSections = bucketSourceSections(bucket);
   const representativeChunks = bucketRepresentativeChunks(bucket);
   return (
     <div className="knowledge-bucket-link-grid">
       {!evidenceOnly && (
         <>
-          <span className="text-[13px] text-[#858b9c]">覆盖来源</span>
+          <span className="text-[13px] text-[#858b9c]">{t('knowledgePage.bucketLinks.coveredSources')}</span>
           <div>
             {sourceSections.length === 0 ? (
-              <KTag>暂无来源路径</KTag>
+              <KTag>{t('knowledgePage.bucketLinks.noSourcePath')}</KTag>
             ) : (
-              sourceSections.map((section) => <KTag key={String(section)}>{String(section)}</KTag>)
+              sourceSections.map((section) => <KTag key={String(section)}><RawIdentifier value={String(section)} /></KTag>)
             )}
           </div>
         </>
       )}
-      <span className="text-[13px] text-[#858b9c]">{evidenceOnly ? '引用来源' : '代表引用'}</span>
+      <span className="text-[13px] text-[#858b9c]">{evidenceOnly ? t('knowledgePage.bucketLinks.evidenceSources') : t('knowledgePage.bucketLinks.representativeSources')}</span>
       <div className="knowledge-evidence-token-list">
         {representativeChunks.length === 0 ? (
-          bucket.chunk_count > 0 ? <KTag>{bucket.chunk_count} 个引用来源</KTag> : <KTag>暂无可读代表来源</KTag>
+          bucket.chunk_count > 0 ? <KTag>{t('knowledgePage.bucketLinks.evidenceCount', { count: bucket.chunk_count })}</KTag> : <KTag>{t('knowledgePage.bucketLinks.noRepresentativeSource')}</KTag>
         ) : (
-          representativeChunks.map((chunkId) => <KTag key={String(chunkId)}>{String(chunkId)}</KTag>)
+          representativeChunks.map((chunkId) => <KTag key={String(chunkId)}><RawIdentifier value={String(chunkId)} /></KTag>)
         )}
       </div>
     </div>
@@ -3030,11 +3204,12 @@ function KnowledgeBucketLinks({ bucket, evidenceOnly = false }: { bucket: Knowle
 }
 
 function knowledgeDetailTitle(view: KnowledgeDetailView | null) {
-  if (view === 'document') return '文档详情';
-  if (view === 'sections') return '目录索引 目录';
-  if (view === 'wiki') return '知识图谱';
-  if (view === 'evidence') return '引用来源';
-  return '知识详情';
+  const { t } = currentKnowledgeTranslator();
+  if (view === 'document') return t('knowledgePage.detail.document');
+  if (view === 'sections') return t('knowledgePage.detail.sections');
+  if (view === 'wiki') return t('knowledgePage.detail.wiki');
+  if (view === 'evidence') return t('knowledgePage.detail.evidence');
+  return t('knowledgePage.detail.default');
 }
 
 function bucketSourceSections(bucket: KnowledgeBucketRead) {
@@ -3072,6 +3247,7 @@ function previewRepresentativeChunkIds(buckets: KnowledgeBucketRead[]) {
 }
 
 function previewEvidenceItems(buckets: KnowledgeBucketRead[], chunkCount: number, limit: number) {
+  const { t } = currentKnowledgeTranslator();
   const bucketItems = buckets
     .filter((bucket) => bucket.chunk_count > 0)
     .slice(0, limit)
@@ -3083,10 +3259,10 @@ function previewEvidenceItems(buckets: KnowledgeBucketRead[], chunkCount: number
       const contentPreview = bucketContentMarkdown(bucket).replace(/\s+/g, ' ').trim().slice(0, 180);
       return {
         key: bucket.id,
-        title: bucket.title || bucket.bucket_key || '引用来源',
+        title: bucket.title || bucket.bucket_key || t('knowledgePage.evidence.defaultTitle'),
         summary: contentPreview || (sourceSections.length
-          ? `${bucket.chunk_count} 个引用来源，覆盖 ${sourceSections.join(' / ')}`
-          : `${bucket.chunk_count} 个引用来源，已完成桶级映射。`),
+          ? t('knowledgePage.evidence.bucketSummaryWithSources', { count: bucket.chunk_count, sources: sourceSections.join(' / ') })
+          : t('knowledgePage.evidence.bucketSummary', { count: bucket.chunk_count })),
         bucket,
       };
     });
@@ -3097,7 +3273,7 @@ function previewEvidenceItems(buckets: KnowledgeBucketRead[], chunkCount: number
     return representativeChunkIds.map((chunkId) => ({
       key: chunkId,
       title: chunkId,
-      summary: '代表引用来源，可在详情中查看来源映射。',
+      summary: t('knowledgePage.evidence.representativeSummary'),
     }));
   }
 
@@ -3105,8 +3281,8 @@ function previewEvidenceItems(buckets: KnowledgeBucketRead[], chunkCount: number
     return [
       {
         key: 'chunk-total',
-        title: '已入库引用来源',
-        summary: `共 ${chunkCount} 个引用来源，当前暂无可展示的桶级代表来源。`,
+        title: t('knowledgePage.evidence.ingestedTitle'),
+        summary: t('knowledgePage.evidence.ingestedSummary', { count: chunkCount }),
       },
     ];
   }
@@ -3123,11 +3299,12 @@ function KnowledgeSearchDebug({
   loading: boolean;
   compact?: boolean;
 }) {
+  const { t } = useAppIntl();
   if (loading) {
-    return <span className="text-[13px] text-[#858b9c]">正在按目录索引和知识图谱检索，并整理引用来源...</span>;
+    return <span className="text-[13px] text-[#858b9c]">{t('knowledgePage.searchDebug.running')}</span>;
   }
   if (!result) {
-    return <EmptyState description="尚未运行检索" />;
+    return <EmptyState description={t('knowledgePage.searchDebug.notRun')} />;
   }
   const selectedConcepts = result.selected_concepts || [];
   const okfCitations = result.okf_citations || [];
@@ -3138,46 +3315,47 @@ function KnowledgeSearchDebug({
           <div className="knowledge-route-step" key={`${String(item.phase || 'phase')}-${index}`}>
             <span>{index + 1}</span>
             <div>
-              <strong>{routePhaseLabel(String(item.phase || ''))}</strong>
-              <small>{String(item.message || '')}</small>
+              <strong>{knowledgeRouteLabel(item, t)}</strong>
             </div>
           </div>
         ))}
       </div>
       <Accordion type="multiple" className="flex flex-col gap-[6px]">
         <AccordionItem value="concepts">
-          <AccordionTrigger>{`知识图谱 ${selectedConcepts.length}`}</AccordionTrigger>
+          <AccordionTrigger>{t('knowledgePage.searchDebug.concepts', { count: selectedConcepts.length })}</AccordionTrigger>
           <AccordionContent>
             <pre className="knowledge-json">{JSON.stringify(selectedConcepts, null, 2)}</pre>
           </AccordionContent>
         </AccordionItem>
         <AccordionItem value="okf-citations">
-          <AccordionTrigger>{`知识图谱引用 ${okfCitations.length}`}</AccordionTrigger>
+          <AccordionTrigger>{t('knowledgePage.searchDebug.okfCitations', { count: okfCitations.length })}</AccordionTrigger>
           <AccordionContent>
             <pre className="knowledge-json">{JSON.stringify(okfCitations, null, 2)}</pre>
           </AccordionContent>
         </AccordionItem>
         <AccordionItem value="documents">
-          <AccordionTrigger>{`文档 ${result.selected_documents.length}`}</AccordionTrigger>
+          <AccordionTrigger>{t('knowledgePage.searchDebug.documents', { count: result.selected_documents.length })}</AccordionTrigger>
           <AccordionContent>
             <pre className="knowledge-json">{JSON.stringify(result.selected_documents, null, 2)}</pre>
           </AccordionContent>
         </AccordionItem>
         <AccordionItem value="sections">
-          <AccordionTrigger>{`展开来源 ${result.expanded_sections.length}`}</AccordionTrigger>
+          <AccordionTrigger>{t('knowledgePage.searchDebug.sections', { count: result.expanded_sections.length })}</AccordionTrigger>
           <AccordionContent>
             <pre className="knowledge-json">{JSON.stringify(result.expanded_sections, null, 2)}</pre>
           </AccordionContent>
         </AccordionItem>
         <AccordionItem value="evidence">
-          <AccordionTrigger>{`引用来源包 ${result.evidence_pack.length}`}</AccordionTrigger>
+          <AccordionTrigger>{t('knowledgePage.searchDebug.evidence', { count: result.evidence_pack.length })}</AccordionTrigger>
           <AccordionContent>
             <div className="knowledge-evidence-list">
               {result.evidence_pack.map((item) => (
                 <div className="knowledge-evidence-item" key={item.chunk_id}>
-                  <strong className="text-[13px] font-semibold text-foreground">{item.section_path || item.source_path || item.chunk_id}</strong>
-                  <p className="m-0 text-[13px] text-foreground">{item.excerpt}</p>
-                  <span className="text-[13px] text-[#858b9c]">{item.confidence_reason}</span>
+                  <strong className="text-[13px] font-semibold text-foreground"><RawIdentifier value={item.section_path || item.source_path || item.chunk_id} /></strong>
+                  <p className="m-0 text-[13px] text-foreground"><RawContent value={item.excerpt} /></p>
+                  {item.confidence_reason && (
+                    <span className="text-[13px] text-[#858b9c]"><RawContent value={item.confidence_reason} /></span>
+                  )}
                 </div>
               ))}
             </div>
@@ -3203,6 +3381,7 @@ function DiscoveryColumn({
   onConfirm: (item: KnowledgeDiscoveryRead) => Promise<void>;
   onReject: (item: KnowledgeDiscoveryRead) => Promise<void>;
 }) {
+  const { t } = useAppIntl();
   return (
     <div className="knowledge-discovery-column">
       <div className="knowledge-section-heading">
@@ -3213,14 +3392,14 @@ function DiscoveryColumn({
         <KTag>{items.length}</KTag>
       </div>
       {items.length === 0 ? (
-        <EmptyState description="暂无内容" />
+        <EmptyState description={t('knowledgePage.placeholder.noContent')} />
       ) : (
         <div className="knowledge-discovery-list flex flex-col gap-[12px]">
           {items.map((item) => (
             <div className={`knowledge-discovery ${item.suggestion_type}`} key={item.id}>
               <div className="knowledge-discovery-header">
                 <div className="flex flex-wrap items-center gap-[8px]">
-                  <strong className="text-[14px] font-semibold text-foreground">{item.title}</strong>
+                  <strong className="text-[14px] font-semibold text-foreground"><RawContent value={item.title} /></strong>
                   <KTag>{typeLabel(item.suggestion_type)}</KTag>
                   {statusTag(item.status)}
                 </div>
@@ -3235,10 +3414,10 @@ function DiscoveryColumn({
                   </div>
                 )}
               </div>
-              {item.reason && <p className="my-[6px] text-[13px] text-[#858b9c]">{item.reason}</p>}
+              {item.reason && <p className="my-[6px] text-[13px] text-[#858b9c]"><RawContent value={item.reason} /></p>}
               <Accordion type="single" collapsible>
                 <AccordionItem value="payload" className="border-b-0">
-                  <AccordionTrigger className="py-[6px]">查看详情</AccordionTrigger>
+                  <AccordionTrigger className="py-[6px]">{t('knowledgePage.overview.viewAll')}</AccordionTrigger>
                   <AccordionContent>
                     <pre className="knowledge-json">{JSON.stringify(item.payload, null, 2)}</pre>
                   </AccordionContent>
@@ -3252,30 +3431,13 @@ function DiscoveryColumn({
   );
 }
 
-function routePhaseLabel(phase: string) {
-  const map: Record<string, string> = {
-    document_route: '选择知识库文档',
-    document_route_lexical: '按相关性选择知识库文档',
-    okf_concept_route: '选择知识图谱',
-    okf_only: '仅命中知识图谱',
-    bucket_route: '展开内部索引',
-    bucket_route_lexical: '按相关性选择内部索引',
-    section_expand: '读取来源',
-    read_chunks: '读取引用来源',
-    evidence_pack: '整理引用来源包',
-    no_documents: '没有文档',
-    no_buckets: '没有内部索引',
-  };
-  return map[phase] || phase || '检索阶段';
-}
-
 function isEmptyDefaultKnowledgeBase(item: KnowledgeBaseRead) {
   const hasRuntimeKnowledge = item.document_count > 0 || item.bucket_count > 0 || item.chunk_count > 0;
   if (!hasRuntimeKnowledge && item.metadata?.created_from_document_upload && !item.metadata?.source_document_id) {
     return true;
   }
   return (
-    item.name === '默认知识库' &&
+    item.name === '\u9ed8\u8ba4\u77e5\u8bc6\u5e93' &&
     item.document_count === 0 &&
     item.bucket_count === 0 &&
     item.chunk_count === 0
@@ -3287,28 +3449,30 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function statusTag(status: string) {
+  const { t } = currentKnowledgeTranslator();
   const map: Record<string, { color: string; label: string }> = {
-    active: { color: 'green', label: '已上线' },
-    published: { color: 'green', label: '已发布' },
-    archived: { color: 'default', label: '已下线' },
-    draft: { color: 'default', label: '草稿' },
-    succeeded: { color: 'green', label: '已完成' },
-    ready: { color: 'green', label: '达标' },
-    confirmed: { color: 'green', label: '已确认' },
-    failed: { color: 'red', label: '失败' },
-    pending: { color: 'gold', label: '待处理' },
-    running: { color: 'processing', label: '处理中' },
-    queued: { color: 'gold', label: '排队中' },
-    cancel_requested: { color: 'gold', label: '取消中' },
-    cancelled: { color: 'default', label: '已取消' },
+    active: { color: 'green', label: t('knowledgePage.status.active') },
+    published: { color: 'green', label: t('knowledgePage.status.published') },
+    archived: { color: 'default', label: t('knowledgePage.status.archived') },
+    draft: { color: 'default', label: t('knowledgePage.status.draft') },
+    succeeded: { color: 'green', label: t('knowledgePage.status.succeeded') },
+    ready: { color: 'green', label: t('knowledgePage.status.ready') },
+    confirmed: { color: 'green', label: t('knowledgePage.status.confirmed') },
+    failed: { color: 'red', label: t('knowledgePage.status.failed') },
+    pending: { color: 'gold', label: t('knowledgePage.status.pending') },
+    running: { color: 'processing', label: t('knowledgePage.status.running') },
+    queued: { color: 'gold', label: t('knowledgePage.status.queued') },
+    cancel_requested: { color: 'gold', label: t('knowledgePage.status.cancelRequested') },
+    cancelled: { color: 'default', label: t('knowledgePage.status.cancelled') },
   };
   const item = map[status] || { color: 'gold', label: status };
   return <KTag color={item.color}>{item.label}</KTag>;
 }
 
 function bucketStatusTag(bucket: KnowledgeBucketRead) {
-  if (bucket.status === 'ready') return <KTag color="green">达标</KTag>;
-  return <KTag color="gold">待补足</KTag>;
+  const { t } = currentKnowledgeTranslator();
+  if (bucket.status === 'ready') return <KTag color="green">{t('knowledgePage.status.ready')}</KTag>;
+  return <KTag color="gold">{t('knowledgePage.status.needsSupplement')}</KTag>;
 }
 
 const KTAG_TONE_CLASS: Record<string, string> = {
@@ -3371,13 +3535,14 @@ function KCard({
 }
 
 function KDialogCancelButton({
-  children = '取消',
+  children,
   className,
   ...props
 }: React.ComponentProps<typeof UIButton>) {
+  const { t } = useAppIntl();
   return (
     <UIButton variant="outline" className={cn(DIALOG_CANCEL_BUTTON_CLASS, className)} {...props}>
-      {children}
+      {children ?? t('common.action.cancel')}
     </UIButton>
   );
 }
@@ -3513,17 +3678,17 @@ function conceptPath(conceptId: string) {
     .join('/');
 }
 
-const CONCEPT_TYPE_LABELS = new Map<string, string>([
-  ['Source Document', '原始资料'],
-  ['Source Section', '资料页'],
-  ['Topic', '主题'],
-  ['Playbook', '流程知识'],
-  ['Business Rule', '业务规则'],
-  ['Query Analysis', '查询分析'],
-]);
-
 function conceptTypeLabel(type: string) {
-  return CONCEPT_TYPE_LABELS.get(type) || type || '概念';
+  const { t } = currentKnowledgeTranslator();
+  const map: Record<string, string> = {
+    'Source Document': t('knowledgePage.conceptType.sourceDocument'),
+    'Source Section': t('knowledgePage.conceptType.sourceSection'),
+    Topic: t('knowledgePage.conceptType.topic'),
+    Playbook: t('knowledgePage.conceptType.playbook'),
+    'Business Rule': t('knowledgePage.conceptType.businessRule'),
+    'Query Analysis': t('knowledgePage.conceptType.queryAnalysis'),
+  };
+  return map[type] || type || t('knowledgePage.conceptType.default');
 }
 
 function conceptTypeColor(type: string) {
@@ -3538,7 +3703,8 @@ function conceptTypeColor(type: string) {
   return map[type] || 'default';
 }
 
-function sortWikiConcepts(concepts: KnowledgeConceptRead[]) {
+/** Sort knowledge concepts with the active UI locale for stable, user-facing ordering. */
+function sortWikiConcepts(concepts: KnowledgeConceptRead[], locale: AppLocale) {
   const rank: Record<string, number> = {
     'Source Document': 0,
     'Source Section': 1,
@@ -3551,11 +3717,12 @@ function sortWikiConcepts(concepts: KnowledgeConceptRead[]) {
     const leftRank = rank[left.concept_type] ?? 99;
     const rightRank = rank[right.concept_type] ?? 99;
     if (leftRank !== rightRank) return leftRank - rightRank;
-    return (left.title || left.concept_id).localeCompare(right.title || right.concept_id, getDateLocale());
+    return (left.title || left.concept_id).localeCompare(right.title || right.concept_id, locale);
   });
 }
 
-function buildWikiIndexGroups(concepts: KnowledgeConceptRead[]): WikiIndexGroup[] {
+/** Build wiki index groups while preserving the locale used for their concept ordering. */
+function buildWikiIndexGroups(concepts: KnowledgeConceptRead[], locale: AppLocale): WikiIndexGroup[] {
   const groupMap = new Map<string, WikiIndexGroup>();
   concepts.forEach((concept) => {
     const key = wikiIndexGroupKey(concept);
@@ -3574,7 +3741,7 @@ function buildWikiIndexGroups(concepts: KnowledgeConceptRead[]): WikiIndexGroup[
   });
   return Array.from(groupMap.values()).map((group) => ({
     ...group,
-    concepts: sortWikiConcepts(group.concepts),
+    concepts: sortWikiConcepts(group.concepts, locale),
   }));
 }
 
@@ -3586,7 +3753,7 @@ function wikiIndexGroupKey(concept: KnowledgeConceptRead) {
     const label = String(firstSource.source_document || firstSource.document_id || '').trim();
     if (label) return `source:${label}`;
   }
-  return `type:${concept.concept_type || '知识图谱'}`;
+  return `type:${concept.concept_type || 'knowledge-graph'}`;
 }
 
 function wikiIndexGroupTitle(concept: KnowledgeConceptRead) {
@@ -3601,19 +3768,21 @@ function wikiIndexGroupTitle(concept: KnowledgeConceptRead) {
 }
 
 function wikiIndexGroupDescription(concepts: KnowledgeConceptRead[]) {
+  const { t } = currentKnowledgeTranslator();
   const types = Array.from(new Set(concepts.map((concept) => conceptTypeLabel(concept.concept_type)).filter(Boolean))).slice(0, 4);
   const samples = concepts
     .map((concept) => concept.title || concept.concept_id)
     .filter(Boolean)
     .slice(0, 3);
-  const typeText = types.length ? types.join('、') : '知识图谱';
-  const sampleText = samples.length ? `，包含 ${samples.join(' / ')}` : '';
-  return `${concepts.length} 个知识图谱，覆盖 ${typeText}${sampleText}`;
+  const typeText = types.length ? types.join('、') : t('knowledgePage.detail.wiki');
+  const sampleText = samples.length ? t('knowledgePage.wikiGroup.samples', { samples: samples.join(' / ') }) : '';
+  return t('knowledgePage.wikiGroup.description', { count: concepts.length, types: typeText, samples: sampleText });
 }
 
 function conceptSummary(concept: KnowledgeConceptRead) {
+  const { t } = currentKnowledgeTranslator();
   const body = concept.content_md.replace(/^---[\s\S]*?---\s*/m, '').replace(/[#>*_\-[\]()`]/g, ' ').trim();
-  return body.length > 160 ? `${body.slice(0, 160)}...` : body || '暂无摘要';
+  return body.length > 160 ? `${body.slice(0, 160)}...` : body || t('knowledgeGraph.summary.empty');
 }
 
 function okfFrontmatterValue(markdown: string, key: string, fallback = '') {
@@ -3647,11 +3816,12 @@ function updateOkfFrontmatterValue(markdown: string, key: string, value: string)
   return markdown.replace(/^---\n[\s\S]*?\n---/, `---\n${lines.join('\n')}\n---`);
 }
 
-function formatDateTime(value: string) {
-  if (!value) return '未知时间';
+/** Format a knowledge timestamp using the caller's active locale without consulting global state. */
+function formatDateTime(value: string, locale: AppLocale, t: KnowledgeTranslate) {
+  if (!value) return t('knowledgePage.time.unknown');
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return value;
-  return date.toLocaleString(getDateLocale(), {
+  return date.toLocaleString(locale, {
     month: '2-digit',
     day: '2-digit',
     hour: '2-digit',
@@ -3660,15 +3830,17 @@ function formatDateTime(value: string) {
 }
 
 function typeLabel(type: string) {
-  if (type === 'skill') return '技能';
-  if (type === 'tool') return '工具';
-  return '提示';
+  const { t } = currentKnowledgeTranslator();
+  if (type === 'skill') return t('knowledgePage.discoveryType.skill');
+  if (type === 'tool') return t('knowledgePage.discoveryType.tool');
+  return t('knowledgePage.discoveryType.default');
 }
 
 function fileToBase64(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
+    const { t } = currentKnowledgeTranslator();
     const reader = new FileReader();
-    reader.onerror = () => reject(new Error('读取文件失败'));
+    reader.onerror = () => reject(new Error(t('knowledgePage.add.error.readFile')));
     reader.onload = () => {
       const result = String(reader.result || '');
       resolve(result.includes(',') ? result.split(',').pop() || '' : result);

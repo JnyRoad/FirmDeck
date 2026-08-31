@@ -43,6 +43,7 @@ from app.agents.schema import (
     AgentWorkRecordRead,
     AgentWorkRecordReplyStatsRead,
 )
+from app.contracts.domain_http import domain_http_error
 from app.db import get_session
 from app.db.models import (
     AgentKnowledgeBranch,
@@ -98,6 +99,25 @@ scope_router = APIRouter(prefix="/api/enterprise/agent-scope", tags=["enterprise
 STAFFDECK_AGENT_API_CLIENT_NAME = "StaffDeck 员工 API 密钥"
 
 
+def _agent_error(
+    code: str,
+    status_code: int,
+    *,
+    params: dict[str, object] | None = None,
+    retryable: bool | None = None,
+    cause: BaseException | None = None,
+) -> HTTPException:
+    """Return a canonical agent API error; exception text remains private diagnostics."""
+    return domain_http_error(
+        code,
+        source="agents.api",
+        status_code=status_code,
+        params=params,
+        retryable=retryable,
+        cause=cause,
+    )
+
+
 @scope_router.get("", response_model=AgentScopeRead)
 def get_agent_scope(
     tenant_id: str = Query(...),
@@ -144,17 +164,17 @@ def create_agent(
     user = current_user
     _ensure_request_tenant(request.tenant_id, user)
     if request.is_overall and not _is_admin_user(user):
-        raise HTTPException(status_code=403, detail="Only administrator can create overall agent")
+        raise _agent_error("AGENT_OVERALL_CREATE_FORBIDDEN", 403)
     name = str(request.name or "").strip()
     if not name:
-        raise HTTPException(status_code=400, detail="Agent name cannot be empty")
+        raise _agent_error("AGENT_NAME_REQUIRED", 400)
     existing = db.exec(
         select(AgentProfile).where(
             AgentProfile.tenant_id == request.tenant_id, AgentProfile.name == name
         )
     ).first()
     if existing:
-        raise HTTPException(status_code=409, detail="Agent name already exists")
+        raise _agent_error("AGENT_NAME_CONFLICT", 409)
     row = AgentProfile(
         tenant_id=request.tenant_id,
         name=name,
@@ -239,7 +259,7 @@ def create_agent_api_credential(
     agent = _get_agent(db, request.tenant_id, agent_id)
     _ensure_can_manage_agent(agent, current_user)
     if agent.is_overall:
-        raise HTTPException(status_code=400, detail="Open gallery cannot own an employee API key")
+        raise _agent_error("AGENT_OPEN_GALLERY_CREDENTIAL_FORBIDDEN", 400)
     client = _ensure_staffdeck_agent_api_client(db, request.tenant_id, current_user)
     # 再同时持久化认证摘要与不可出现在列表响应中的加密副本。
     token, prefix, digest = generate_api_key()
@@ -314,15 +334,12 @@ def reveal_agent_api_credential(
     row = _get_agent_api_credential(db, tenant_id, agent_id, credential_id)
     # 仅启用中的凭据允许读取，禁用后的值不能被重新复制。
     if row.status != "active":
-        raise HTTPException(status_code=409, detail="API credential is not active")
+        raise _agent_error("AGENT_CREDENTIAL_INACTIVE", 409)
     # 历史凭据没有加密副本，或 APP_SECRET 已变更时，提示轮换而不返回部分值。
     try:
         api_key = decrypt_recoverable_api_key(row.encrypted_key)
     except ValueError as exc:
-        raise HTTPException(
-            status_code=409,
-            detail="API credential cannot be recovered; rotate it to create a new key",
-        ) from exc
+        raise _agent_error("AGENT_CREDENTIAL_RECOVERY_REQUIRED", 409, cause=exc) from exc
     return AgentAPICredentialReveal(api_key=api_key)
 
 
@@ -382,7 +399,7 @@ def get_agent_work_record(
     try:
         local_timezone = ZoneInfo(timezone)
     except (ZoneInfoNotFoundError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail="Invalid timezone") from exc
+        raise _agent_error("AGENT_TIMEZONE_INVALID", 400, cause=exc) from exc
 
     now = utc_now()
     reply_rows = db.exec(
@@ -442,7 +459,7 @@ def update_agent(
     if request.name is not None:
         name = request.name.strip()
         if not name:
-            raise HTTPException(status_code=400, detail="Agent name cannot be empty")
+            raise _agent_error("AGENT_NAME_REQUIRED", 400)
         conflict = db.exec(
             select(AgentProfile).where(
                 AgentProfile.tenant_id == request.tenant_id,
@@ -451,7 +468,7 @@ def update_agent(
             )
         ).first()
         if conflict:
-            raise HTTPException(status_code=409, detail="Agent name already exists")
+            raise _agent_error("AGENT_NAME_CONFLICT", 409)
         row.name = name
     if request.description is not None:
         row.description = request.description
@@ -483,7 +500,7 @@ def unpublish_agent_from_gallery(
     _ensure_admin_user(tenant_id, current_user)
     row = _get_agent(db, tenant_id, agent_id)
     if row.is_overall:
-        raise HTTPException(status_code=400, detail="Overall agent cannot be unpublished")
+        raise _agent_error("AGENT_OVERALL_UNPUBLISH_FORBIDDEN", 400)
 
     metadata = dict(row.metadata_json or {})
     if metadata.get("published_to_gallery") is not True:
@@ -515,7 +532,7 @@ def delete_agent(
     row = _get_agent(db, tenant_id, agent_id)
     _ensure_can_manage_agent(row, current_user)
     if row.is_overall:
-        raise HTTPException(status_code=400, detail="Overall agent cannot be deleted")
+        raise _agent_error("AGENT_OVERALL_DELETE_FORBIDDEN", 400)
     bindings = db.exec(
         select(AgentResourceBinding).where(AgentResourceBinding.agent_id == row.id)
     ).all()
@@ -626,7 +643,7 @@ def update_agent_resources(
     agent = _get_agent(db, request.tenant_id, agent_id)
     _ensure_can_manage_agent(agent, current_user)
     if agent.is_overall:
-        raise HTTPException(status_code=400, detail="Overall agent uses the global resource pool")
+        raise _agent_error("AGENT_GLOBAL_RESOURCE_POOL", 400)
     existing = db.exec(
         select(AgentResourceBinding).where(
             AgentResourceBinding.tenant_id == request.tenant_id,
@@ -676,7 +693,7 @@ def import_agent_resources(
             if not _is_database_locked_error(exc) or attempt >= IMPORT_LOCK_RETRY_ATTEMPTS - 1:
                 raise
             sleep(IMPORT_LOCK_RETRY_DELAY_SECONDS * (attempt + 1))
-    raise HTTPException(status_code=503, detail="Resource import is temporarily busy")
+    raise _agent_error("AGENT_RESOURCE_IMPORT_BUSY", 503, retryable=True)
 
 
 def _import_agent_resources_once(
@@ -691,10 +708,10 @@ def _import_agent_resources_once(
     _ensure_can_import_to_agent(target_agent, user)
     _ensure_can_copy_from_agent(source_agent, user)
     if source_agent.id == target_agent.id:
-        raise HTTPException(status_code=400, detail="Source and target agent cannot be the same")
+        raise _agent_error("AGENT_RESOURCE_SOURCE_TARGET_SAME", 400)
     resource_ids = _dedupe_ids(request.resource_ids)
     if not resource_ids:
-        raise HTTPException(status_code=400, detail="No resources selected")
+        raise _agent_error("AGENT_RESOURCES_REQUIRED", 400)
     imported: list[dict[str, object]] = []
     missing: list[dict[str, str]] = []
     for identifier in resource_ids:
@@ -776,12 +793,10 @@ def sync_agent_skill_from_overall(
     agent = _get_agent(db, tenant_id, agent_id)
     _ensure_can_manage_agent(agent, current_user)
     if agent.is_overall:
-        raise HTTPException(status_code=400, detail="Overall agent is already the trunk")
+        raise _agent_error("AGENT_OVERALL_TRUNK", 400)
     skill = _get_global_skill(db, tenant_id, skill_id)
     if skill.status != "published":
-        raise HTTPException(
-            status_code=400, detail="Disabled SOP cannot be learned from the open gallery"
-        )
+        raise _agent_error("AGENT_SKILL_NOT_PUBLISHED", 400)
     branch = sync_branch_from_overall(db, tenant_id, agent_id, skill)
     db.commit()
     return {"status": "synced", "skill_id": skill_id, "head_version": branch.head_version}
@@ -798,9 +813,7 @@ def promote_agent_skill_to_overall(
     _ensure_admin_user(tenant_id, current_user)
     agent = _get_agent(db, tenant_id, agent_id)
     if agent.is_overall:
-        raise HTTPException(
-            status_code=400, detail="Overall agent does not have a branch to promote"
-        )
+        raise _agent_error("AGENT_OVERALL_BRANCH_UNAVAILABLE", 400)
     branch = db.exec(
         select(AgentSkillBranch).where(
             AgentSkillBranch.tenant_id == tenant_id,
@@ -809,7 +822,7 @@ def promote_agent_skill_to_overall(
         )
     ).first()
     if not branch:
-        raise HTTPException(status_code=404, detail="Branch not found")
+        raise _agent_error("AGENT_SKILL_BRANCH_NOT_FOUND", 404)
     skill = promote_branch_to_overall(db, tenant_id, branch)
     db.commit()
     return {"status": "promoted", "skill_id": skill_id, "version": skill.version}
@@ -826,9 +839,7 @@ def rollback_agent_skill(
     agent = _get_agent(db, request.tenant_id, agent_id)
     _ensure_can_manage_agent(agent, current_user)
     if agent.is_overall:
-        raise HTTPException(
-            status_code=400, detail="Use the global skill rollback endpoint for overall agent"
-        )
+        raise _agent_error("AGENT_GLOBAL_SKILL_ROLLBACK_REQUIRED", 400)
     branch = rollback_branch(db, request.tenant_id, agent_id, skill_id, request.version)
     db.commit()
     return {"status": "rolled_back", "skill_id": skill_id, "head_version": branch.head_version}
@@ -905,7 +916,7 @@ def list_chat_agents(
     db: Session = Depends(get_session),
 ) -> list[AgentProfileRead]:
     if tenant_id != current_user.tenant_id:
-        raise HTTPException(status_code=403, detail="Tenant mismatch")
+        raise _agent_error("TENANT_MISMATCH", 403)
     ensure_tenant(db, tenant_id)
     rows = db.exec(
         select(AgentProfile)
@@ -933,7 +944,7 @@ def use_chat_agent(
     db: Session = Depends(get_session),
 ) -> AgentProfileRead:
     if tenant_id != current_user.tenant_id:
-        raise HTTPException(status_code=403, detail="Tenant mismatch")
+        raise _agent_error("TENANT_MISMATCH", 403)
     ensure_tenant(db, tenant_id)
     row = _get_agent(db, tenant_id, agent_id)
     if (
@@ -941,7 +952,7 @@ def use_chat_agent(
         or row.status != "active"
         or not _chat_agent_visible_to_user(row, current_user)
     ):
-        raise HTTPException(status_code=403, detail="Cannot access this agent")
+        raise _agent_error("AGENT_ACCESS_FORBIDDEN", 403)
     _mark_agent_used(db, tenant_id, current_user, row.id)
     bindings = _bindings_by_agent(db, tenant_id)
     return agent_read(row, bindings.get(row.id, []), True)
@@ -1134,7 +1145,7 @@ def _is_database_locked_error(exc: OperationalError) -> bool:
 
 def _ensure_request_tenant(tenant_id: str, user: User) -> None:
     if user.tenant_id != tenant_id:
-        raise HTTPException(status_code=403, detail="Tenant mismatch")
+        raise _agent_error("TENANT_MISMATCH", 403)
 
 
 def _ensure_staffdeck_agent_api_client(
@@ -1178,7 +1189,7 @@ def _get_agent_api_credential(
 ) -> APICredential:
     row = db.get(APICredential, credential_id)
     if not row or row.tenant_id != tenant_id or row.agent_id != agent_id:
-        raise HTTPException(status_code=404, detail="Employee API credential not found")
+        raise _agent_error("AGENT_CREDENTIAL_NOT_FOUND", 404)
     return row
 
 
@@ -1279,14 +1290,14 @@ def _chat_agent_selectable_to_user(row: AgentProfile, user: User, used_agent_ids
 def _ensure_can_access_agent(row: AgentProfile, user: User) -> None:
     _ensure_request_tenant(row.tenant_id, user)
     if not _agent_visible_to_user(row, user):
-        raise HTTPException(status_code=403, detail="Cannot access this agent")
+        raise _agent_error("AGENT_ACCESS_FORBIDDEN", 403)
 
 
 def _ensure_can_copy_from_agent(row: AgentProfile, user: User) -> None:
     _ensure_request_tenant(row.tenant_id, user)
     if row.is_overall or _agent_visible_to_user(row, user):
         return
-    raise HTTPException(status_code=403, detail="Cannot copy resources from this agent")
+    raise _agent_error("AGENT_RESOURCE_COPY_FORBIDDEN", 403)
 
 
 def _ensure_can_manage_agent(row: AgentProfile, user: User) -> None:
@@ -1294,12 +1305,10 @@ def _ensure_can_manage_agent(row: AgentProfile, user: User) -> None:
     if _is_admin_user(user):
         return
     if row.is_overall:
-        raise HTTPException(status_code=403, detail="Only administrator can manage overall agent")
+        raise _agent_error("AGENT_OVERALL_MANAGE_FORBIDDEN", 403)
     if _agent_owned_by_user(row, user):
         return
-    raise HTTPException(
-        status_code=403, detail="Only the creator or administrator can manage this staff"
-    )
+    raise _agent_error("AGENT_MANAGE_FORBIDDEN", 403)
 
 
 def _ensure_can_import_to_agent(row: AgentProfile, user: User) -> None:
@@ -1312,9 +1321,7 @@ def _ensure_can_import_to_agent(row: AgentProfile, user: User) -> None:
 def _ensure_admin_user(tenant_id: str, user: User) -> None:
     _ensure_request_tenant(tenant_id, user)
     if not _is_admin_user(user):
-        raise HTTPException(
-            status_code=403, detail="Only administrator can update the open gallery"
-        )
+        raise _agent_error("AGENT_GALLERY_UPDATE_FORBIDDEN", 403)
 
 
 def _metadata_with_creator(metadata: dict[str, object], user: User) -> dict[str, object]:
@@ -1926,7 +1933,7 @@ def _get_agent(db: Session, tenant_id: str, agent_id: str) -> AgentProfile:
     ensure_tenant(db, tenant_id)
     row = db.get(AgentProfile, agent_id)
     if not row or row.tenant_id != tenant_id:
-        raise HTTPException(status_code=404, detail="Agent not found")
+        raise _agent_error("AGENT_NOT_FOUND", 404)
     return row
 
 
@@ -2058,9 +2065,7 @@ def _ensure_resource_exists(db: Session, tenant_id: str, item: AgentResourceBind
     }[item.resource_type]
     row = db.get(model, item.resource_id)
     if not row or row.tenant_id != tenant_id:
-        raise HTTPException(
-            status_code=404, detail=f"Resource not found: {item.resource_type}:{item.resource_id}"
-        )
+        raise _agent_error("AGENT_RESOURCE_NOT_FOUND", 404)
 
 
 def _get_global_skill(db: Session, tenant_id: str, skill_id: str) -> Skill:
@@ -2068,7 +2073,7 @@ def _get_global_skill(db: Session, tenant_id: str, skill_id: str) -> Skill:
         select(Skill).where(Skill.tenant_id == tenant_id, Skill.skill_id == skill_id)
     ).first()
     if not row:
-        raise HTTPException(status_code=404, detail="Skill not found")
+        raise _agent_error("SKILL_NOT_FOUND", 404)
     return row
 
 

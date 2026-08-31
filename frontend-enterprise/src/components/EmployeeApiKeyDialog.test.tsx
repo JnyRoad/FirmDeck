@@ -4,9 +4,26 @@ import { cleanup, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { AppIntlProvider, type AppLocale } from '@/i18n';
 import type { AgentProfileRead } from '@/types';
 
 import EmployeeApiKeyDialog from './EmployeeApiKeyDialog';
+
+const EMPLOYEE_CREDENTIAL_CREATED_AT = '2026-08-29T12:34:00Z';
+const semanticEmployeeCopy = {
+  'zh-CN': {
+    created: '创建于',
+    empty: '还没有为这个员工创建 API 密钥',
+    heading: 'API 密钥 · 小艾',
+    permission: '用于外部系统发起对话和任务',
+  },
+  'en-US': {
+    created: 'Created',
+    empty: 'No API key has been created for this employee yet.',
+    heading: 'API keys · 小艾',
+    permission: 'Used by external systems to start conversations and tasks',
+  },
+} as const;
 
 const agent: AgentProfileRead = {
   id: 'agent-1',
@@ -30,10 +47,10 @@ function jsonResponse(body: unknown): Response {
   } as Response;
 }
 
-/** 模拟员工密钥生命周期接口，并让刷新请求返回最新状态。 */
-function stubEmployeeCredentialFetch(canReveal = true) {
+/** 模拟员工密钥生命周期接口，并可从空列表或现有密钥状态开始。 */
+function stubEmployeeCredentialFetch(canReveal = true, hasCredential = true) {
   let status = 'active';
-  let exists = true;
+  let exists = hasCredential;
   const credential = () => ({
     id: 'employee-key-1',
     agent_id: agent.id,
@@ -43,7 +60,7 @@ function stubEmployeeCredentialFetch(canReveal = true) {
     can_reveal: canReveal,
     scopes: ['runs:*'],
     status,
-    created_at: '2026-08-29T00:00:00Z',
+    created_at: EMPLOYEE_CREDENTIAL_CREATED_AT,
   });
   const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
@@ -76,9 +93,30 @@ function stubEmployeeCredentialFetch(canReveal = true) {
   return fetchMock;
 }
 
+/** 仅用语义 Provider 渲染员工密钥对话框，确保员工名与凭据名作为 raw 值保留。 */
+function renderSemanticEmployeeDialog(locale: AppLocale): void {
+  render(
+    <AppIntlProvider locale={locale}>
+      <EmployeeApiKeyDialog agent={agent} open onClose={vi.fn()} />
+    </AppIntlProvider>,
+  );
+}
+
+/** 用明确 locale 格式化员工凭据时间，避免测试继承机器默认语言。 */
+function expectedEmployeeCredentialDate(locale: AppLocale): string {
+  return new Intl.DateTimeFormat(locale, {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  }).format(new Date(EMPLOYEE_CREDENTIAL_CREATED_AT));
+}
+
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
+  window.localStorage.clear();
 });
 
 describe('EmployeeApiKeyDialog', () => {
@@ -86,7 +124,7 @@ describe('EmployeeApiKeyDialog', () => {
     const user = userEvent.setup();
     const fetchMock = stubEmployeeCredentialFetch();
 
-    render(<EmployeeApiKeyDialog agent={agent} open onClose={vi.fn()} />);
+    renderSemanticEmployeeDialog('zh-CN');
 
     await screen.findByText('员工运行密钥');
     await user.click(screen.getByRole('button', { name: '禁用' }));
@@ -106,7 +144,7 @@ describe('EmployeeApiKeyDialog', () => {
     const user = userEvent.setup();
     const fetchMock = stubEmployeeCredentialFetch();
 
-    render(<EmployeeApiKeyDialog agent={agent} open onClose={vi.fn()} />);
+    renderSemanticEmployeeDialog('zh-CN');
 
     await screen.findByText('员工运行密钥');
     await user.click(screen.getByRole('button', { name: '删除' }));
@@ -135,7 +173,7 @@ describe('EmployeeApiKeyDialog', () => {
       value: { writeText },
     });
 
-    render(<EmployeeApiKeyDialog agent={agent} open onClose={vi.fn()} />);
+    renderSemanticEmployeeDialog('zh-CN');
 
     await screen.findByText('员工运行密钥');
     await user.click(screen.getByRole('button', { name: '复制完整密钥' }));
@@ -150,10 +188,34 @@ describe('EmployeeApiKeyDialog', () => {
   it('guides employee managers to rotate legacy keys that cannot be recovered', async () => {
     stubEmployeeCredentialFetch(false);
 
-    render(<EmployeeApiKeyDialog agent={agent} open onClose={vi.fn()} />);
+    renderSemanticEmployeeDialog('zh-CN');
 
     await screen.findByText('员工运行密钥');
     expect(screen.getByText('旧密钥需轮换后复制')).toBeTruthy();
     expect(screen.queryByRole('button', { name: '复制完整密钥' })).toBeNull();
   });
+});
+
+describe('semantic employee API key locale contract', () => {
+  for (const locale of ['zh-CN', 'en-US'] as const) {
+    const copy = semanticEmployeeCopy[locale];
+
+    it(`localizes employee permissions and empty state without translating the employee name in ${locale}`, async () => {
+      stubEmployeeCredentialFetch(true, false);
+      renderSemanticEmployeeDialog(locale);
+
+      expect(await screen.findByText(copy.heading)).toBeTruthy();
+      expect(screen.getByText(copy.permission)).toBeTruthy();
+      expect(await screen.findByText(copy.empty)).toBeTruthy();
+    });
+
+    it(`formats employee credential dates by ${locale} while preserving raw key metadata`, async () => {
+      stubEmployeeCredentialFetch();
+      renderSemanticEmployeeDialog(locale);
+
+      expect(await screen.findByText('员工运行密钥')).toBeTruthy();
+      expect(screen.getByText('sd_live_test…')).toBeTruthy();
+      expect(screen.getByText(`${copy.created} ${expectedEmployeeCredentialDate(locale)}`)).toBeTruthy();
+    });
+  }
 });

@@ -30,6 +30,7 @@ from app.db.models import (
     User,
     utc_now,
 )
+from app.i18n.language_context import LanguageContext, LocaleResolutionSource
 from app.session.session_schema import (
     ChatTurnRequest,
     ChatTurnResponse,
@@ -874,12 +875,13 @@ def test_team_progress_message_updates_after_each_member_result() -> None:
         db.commit()
 
         db.refresh(progress_message)
-        assert progress_message.content == "已收到 1/2 项成员回复。"
+        assert progress_message.content == "已完成 2 个团队任务的拆分与派发。"
         assert progress_message.metadata_json["team_progress"] == {
             "phase": "collecting",
             "completed_tasks": 1,
             "total_tasks": 2,
-            "status_text": "正在等待其他成员完成",
+            "event_code": "team.run.progress.collecting",
+            "params": {"completed_tasks": 1, "total_tasks": 2},
         }
 
 
@@ -1132,12 +1134,13 @@ def test_planner_member_completion_skips_review_and_enqueues_one_synthesis(
         assert task.report_json["full_reply"] == "市场分析完成"
         assert run.status == "synthesizing"
         db.refresh(progress_message)
-        assert progress_message.content == "已收到全部 1 项成员回复。"
+        assert progress_message.content == "已完成 1 个团队任务的拆分与派发。"
         assert progress_message.metadata_json["team_progress"] == {
             "phase": "synthesizing",
             "completed_tasks": 1,
             "total_tasks": 1,
-            "status_text": "正在整理答案",
+            "event_code": "team.run.progress.synthesizing",
+            "params": {"total_tasks": 1},
         }
         assert db.exec(
             select(TeamWakeEvent).where(TeamWakeEvent.trigger_type == "task_report")
@@ -1289,8 +1292,14 @@ def test_team_synthesis_publishes_final_answer_on_original_tl_session(
             citation["title"] for citation in final.metadata_json["knowledge_citations"]
         ] == ["方案 A 成本表", "方案 B 风险表"]
         db.refresh(progress_message)
-        assert progress_message.content == "已收到全部 2 项成员回复，汇总已完成。"
+        assert progress_message.content == "已收到全部 2 项成员回复。"
         assert progress_message.metadata_json["team_progress"]["phase"] == "completed"
+        assert progress_message.metadata_json["team_progress"]["event_code"] == (
+            "team.run.progress.completed"
+        )
+        assert progress_message.metadata_json["team_progress"]["params"] == {
+            "total_tasks": 2
+        }
 
 
 def test_tl_review_verdicts(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1374,7 +1383,8 @@ def test_failed_turn_escalates_task(monkeypatch: pytest.MonkeyPatch) -> None:
         assert task.status == "escalated"
         failed = db.get(TeamWakeEvent, wake.id)
         assert failed.status == "failed"
-        assert "LLM 不可用" in (failed.error or "")
+        assert failed.error == "TEAM_WAKE_EXECUTION_FAILED"
+        assert "LLM 不可用" not in (failed.error or "")
 
 
 # ---------- 人改判(HITL override) ----------
@@ -1681,6 +1691,109 @@ def test_member_execution_serializes_same_agent_without_blocking_other_agents(
         assert started == [queued_wake.id]
 
 
+def test_execute_wake_event_keeps_member_failure_private_in_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Do not expose raw member execution exceptions through wake or task events."""
+    raw_error = "provider token=do-not-publish path=/private/team.sock"
+
+    def fake_execute_member_task(_db, _event, _team, _agent):  # noqa: ANN001
+        """Raise one seeded member execution error from the real wake boundary."""
+        raise RuntimeError(raw_error)
+
+    with _test_session() as db:
+        team = _seed_team(db)
+        task = _make_task(db, team)
+        wake = enqueue_wake_event(
+            db,
+            team=team,
+            target_agent_id="agent_worker",
+            trigger_type="task_assigned",
+            payload={"task_id": task.id},
+        )
+        db.commit()
+        monkeypatch.setattr(wakeup, "_execute_member_task", fake_execute_member_task)
+
+        execute_wake_event(db, db.get(TeamWakeEvent, wake.id))
+
+        stored_wake = db.get(TeamWakeEvent, wake.id)
+        assert stored_wake is not None
+        assert stored_wake.status == "failed"
+        assert stored_wake.error == "TEAM_WAKE_EXECUTION_FAILED"
+        assert raw_error not in stored_wake.error
+
+        events = db.exec(
+            select(TeamTaskEvent)
+            .where(TeamTaskEvent.task_id == task.id)
+            .order_by(TeamTaskEvent.created_at)
+        ).all()
+        escalated = next(event for event in events if event.event_type == "task_escalated")
+        wake_failed = next(event for event in events if event.event_type == "wake_failed")
+
+        assert escalated.payload_json["event_code"] == "team.task.escalated"
+        assert escalated.payload_json["params"] == {"reason_code": "execution_failed"}
+        assert escalated.payload_json["reason"] == {
+            "code": "execution_failed",
+            "params": {},
+        }
+        assert wake_failed.payload_json["error"] == "TEAM_WAKE_EXECUTION_FAILED"
+        assert raw_error not in json.dumps(escalated.payload_json, ensure_ascii=False)
+        assert raw_error not in json.dumps(wake_failed.payload_json, ensure_ascii=False)
+
+
+def test_execute_wake_event_keeps_bid_failure_private_in_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bid failure audit rows should use the safe public code instead of the raw exception."""
+    raw_error = "provider token=do-not-publish path=/private/bid.sock"
+
+    def fake_execute_bid_request(_db, _event, _team, _agent):  # noqa: ANN001
+        """Raise one seeded bid failure from the real wake boundary."""
+        raise RuntimeError(raw_error)
+
+    with _test_session() as db:
+        team = _seed_team(db)
+        task = _make_task(db, team, status="bidding")
+        wake = enqueue_wake_event(
+            db,
+            team=team,
+            target_agent_id="agent_worker",
+            trigger_type="bid_request",
+            payload={"task_id": task.id, "round": 1},
+        )
+        db.commit()
+        monkeypatch.setattr(wakeup, "_execute_bid_request", fake_execute_bid_request)
+        monkeypatch.setattr(wakeup, "_maybe_advance_bidding", lambda *_args, **_kwargs: None)
+
+        execute_wake_event(db, db.get(TeamWakeEvent, wake.id))
+
+        stored_wake = db.get(TeamWakeEvent, wake.id)
+        assert stored_wake is not None
+        assert stored_wake.status == "failed"
+        assert stored_wake.error == "TEAM_WAKE_EXECUTION_FAILED"
+
+        events = db.exec(
+            select(TeamTaskEvent)
+            .where(TeamTaskEvent.task_id == task.id)
+            .order_by(TeamTaskEvent.created_at)
+        ).all()
+        bid_failed = next(event for event in events if event.event_type == "bid_failed")
+        wake_failed = next(event for event in events if event.event_type == "wake_failed")
+
+        assert bid_failed.payload_json["event_code"] == "team.task.bid.failed"
+        assert bid_failed.payload_json["params"] == {
+            "reason_code": "execution_failed",
+            "round": 1,
+        }
+        assert bid_failed.payload_json["reason"] == {
+            "code": "execution_failed",
+            "params": {"round": 1},
+        }
+        assert wake_failed.payload_json["error"] == "TEAM_WAKE_EXECUTION_FAILED"
+        assert raw_error not in json.dumps(bid_failed.payload_json, ensure_ascii=False)
+        assert raw_error not in json.dumps(wake_failed.payload_json, ensure_ascii=False)
+
+
 def test_export_team_log_contains_raw_model_and_tool_records() -> None:
     with _test_session() as db:
         team = _seed_team(db)
@@ -1771,3 +1884,254 @@ def test_list_tasks_filter_by_status() -> None:
         with pytest.raises(HTTPException) as exc_info:
             teams_api.list_team_tasks(team.id, "tenant_demo", "nonsense", db, admin)
         assert exc_info.value.status_code == 400
+
+
+_TEAM_LANGUAGE_MATRIX = (
+    ("zh-CN", "zh-CN"),
+    ("zh-CN", "en-US"),
+    ("en-US", "zh-CN"),
+    ("en-US", "en-US"),
+)
+
+
+def _team_language_context(ui_locale: str, agent_reply_locale: str) -> LanguageContext:
+    """Build one source-turn snapshot for the team execution matrix."""
+    return LanguageContext(
+        ui_locale=ui_locale,
+        agent_reply_locale=agent_reply_locale,
+        ui_locale_source=LocaleResolutionSource.EXPLICIT_REQUEST,
+        agent_reply_locale_source=LocaleResolutionSource.EXPLICIT_REQUEST,
+    )
+
+
+@pytest.mark.parametrize(("ui_locale", "agent_reply_locale"), _TEAM_LANGUAGE_MATRIX)
+def test_team_planner_carries_source_turn_language_context_through_run_task_and_wake(
+    ui_locale: str,
+    agent_reply_locale: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Persist the four UI/reply combinations while leaving source and task data verbatim."""
+    context = _team_language_context(ui_locale, agent_reply_locale)
+    expected_snapshot = context.model_dump(mode="json")
+
+    with _test_session() as db:
+        team = _seed_team(db)
+        session = ChatSession(
+            id="session-team-language-source",
+            tenant_id=team.tenant_id,
+            user_id="user_admin",
+            agent_id="agent_tl",
+            team_id=team.id,
+            agent_reply_locale=agent_reply_locale,
+            agent_reply_locale_source="explicit_request",
+            title=f"团队 {team.name} · TL 对话",
+        )
+        source = Message(
+            id="message-team-language-source",
+            tenant_id=team.tenant_id,
+            session_id=session.id,
+            role="user",
+            content="用户原始输入：请保留 Acme™ 合同的原文",
+            metadata_json={"language_context": expected_snapshot},
+        )
+        db.add_all([session, source])
+        db.commit()
+        started = _stub_start_wakeup(monkeypatch)
+
+        result = wakeup.publish_team_planner_frames(
+            db,
+            team=team,
+            session=session,
+            source_turn_id=source.id,
+            created_by_user_id="user_admin",
+            frames=[
+                PlannedTaskFrame(
+                    task_id="raw-contract-task",
+                    kind="conversation",
+                    user_intent="Acme™ 合同",
+                    requirements=["知识库原文：C-42/原样"],
+                    execution_target="team_member",
+                    assignee_agent_id="agent_worker",
+                )
+            ],
+        )
+
+        assert result is not None
+        run = db.get(TeamRun, result.run_id)
+        assert run is not None
+        task = db.get(TeamTask, result.task_ids[0])
+        assert task is not None
+        wake = db.exec(select(TeamWakeEvent)).one()
+        assert run.language_context_json == expected_snapshot
+        assert task.language_context_json == expected_snapshot
+        assert wake.language_context_json == expected_snapshot
+        assert task.title == "Acme™ 合同"
+        assert task.description == "知识库原文：C-42/原样"
+        assert source.content == "用户原始输入：请保留 Acme™ 合同的原文"
+        assert "Acme™ 合同" in wakeup.build_member_task_message(db, team, task, rework=False)
+        assert "知识库原文：C-42/原样" in wakeup.build_member_task_message(
+            db, team, task, rework=False
+        )
+        assert started == [wake.id]
+
+
+def test_team_member_session_and_synthesis_inherit_source_snapshot_without_translating_raw_reply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep a member run, its new session, and final synthesis on the source locale snapshot."""
+    context = _team_language_context("en-US", "zh-CN")
+    expected_snapshot = context.model_dump(mode="json")
+    raw_member_reply = "原始工具结果：/srv/Acme™/report.md；不要翻译"
+    captured: dict[str, object] = {}
+
+    def fake_run_agent_turn(*_args: object, **kwargs: object) -> wakeup.TeamAgentTurnResult:
+        """Capture the member request boundary without starting a real AgentLoop."""
+        captured.update(kwargs)
+        return wakeup.TeamAgentTurnResult(
+            reply=raw_member_reply,
+            message_id=None,
+            metadata={},
+            citations=[],
+            artifacts=[],
+        )
+
+    with _test_session() as db:
+        team = _seed_team(db)
+        tl_session = ChatSession(
+            id="session-team-member-language",
+            tenant_id=team.tenant_id,
+            user_id="user_admin",
+            agent_id="agent_tl",
+            team_id=team.id,
+            title="团队 TL 原始会话",
+        )
+        source = Message(
+            id="message-team-member-language",
+            tenant_id=team.tenant_id,
+            session_id=tl_session.id,
+            role="user",
+            content="用户请求：保留原始报告",
+            metadata_json={"language_context": expected_snapshot},
+        )
+        run = TeamRun(
+            id="team-run-member-language",
+            team_id=team.id,
+            tenant_id=team.tenant_id,
+            tl_session_id=tl_session.id,
+            source_turn_id=source.id,
+            created_by_user_id="user_admin",
+            status="running",
+            language_context_json=expected_snapshot,
+        )
+        task = TeamTask(
+            id="team-task-member-language",
+            team_id=team.id,
+            tenant_id=team.tenant_id,
+            team_run_id=run.id,
+            source_turn_id=source.id,
+            title="保留原始报告",
+            description="不要改写 /srv/Acme™/report.md",
+            status="pending",
+            created_by_user_id="user_admin",
+            created_by_tl=True,
+            assignee_agent_id="agent_worker",
+            language_context_json=expected_snapshot,
+        )
+        event = TeamWakeEvent(
+            id="team-wake-member-language",
+            team_id=team.id,
+            tenant_id=team.tenant_id,
+            target_agent_id="agent_worker",
+            trigger_type="task_assigned",
+            payload_json={"task_id": task.id, "team_run_id": run.id},
+            language_context_json=expected_snapshot,
+        )
+        db.add_all([tl_session, source, run, task, event])
+        db.commit()
+        monkeypatch.setattr(wakeup, "run_agent_turn", fake_run_agent_turn)
+        monkeypatch.setattr(wakeup, "_team_harness_outcome", lambda *_args, **_kwargs: "completed")
+        started = _stub_start_wakeup(monkeypatch)
+
+        execute_wake_event(db, event)
+
+        stored_task = db.get(TeamTask, task.id)
+        assert stored_task is not None
+        assert stored_task.report_json["full_reply"] == raw_member_reply
+        assert captured.get("language_context") == context
+        assert stored_task.session_id is not None
+        member_session = db.get(ChatSession, stored_task.session_id)
+        assert member_session is not None
+        assert member_session.agent_reply_locale == context.agent_reply_locale.value
+        synthesis_wakes = db.exec(
+            select(TeamWakeEvent).where(TeamWakeEvent.trigger_type == "team_synthesis")
+        ).all()
+        assert len(synthesis_wakes) == 1
+        assert synthesis_wakes[0].language_context_json == expected_snapshot
+        assert started == [synthesis_wakes[0].id]
+
+
+def test_team_rework_wake_reuses_task_snapshot_and_preserves_raw_review_comment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A TL rework decision must not resolve a new locale or rewrite the human comment."""
+    context = _team_language_context("zh-CN", "en-US")
+    expected_snapshot = context.model_dump(mode="json")
+    raw_comment = "请保留 SKU-A/42 与知识库原文，不要翻译。"
+    captured: dict[str, object] = {}
+
+    def fake_run_agent_turn(*_args: object, **kwargs: object) -> wakeup.TeamAgentTurnResult:
+        """Capture the TL review boundary and return one deterministic rework verdict."""
+        captured.update(kwargs)
+        return wakeup.TeamAgentTurnResult(
+            reply=(
+                "```json\n"
+                '{"team_review":{"verdict":"rework","comment":"'
+                f"{raw_comment}"
+                '"}}\n```'
+            ),
+            message_id=None,
+            metadata={},
+            citations=[],
+            artifacts=[],
+        )
+
+    with _test_session() as db:
+        team = _seed_team(db)
+        task = TeamTask(
+            id="team-task-rework-language",
+            team_id=team.id,
+            tenant_id=team.tenant_id,
+            title="原始 SKU 复核",
+            description="保留 SKU-A/42",
+            status="review",
+            assignee_agent_id="agent_worker",
+            language_context_json=expected_snapshot,
+            report_json={"full_reply": "raw report /kb/C-42.md"},
+        )
+        event = TeamWakeEvent(
+            id="team-wake-review-language",
+            team_id=team.id,
+            tenant_id=team.tenant_id,
+            target_agent_id="agent_tl",
+            trigger_type="task_report",
+            payload_json={"task_id": task.id},
+            language_context_json=expected_snapshot,
+        )
+        db.add_all([task, event])
+        db.commit()
+        monkeypatch.setattr(wakeup, "run_agent_turn", fake_run_agent_turn)
+        started = _stub_start_wakeup(monkeypatch)
+
+        execute_wake_event(db, event)
+
+        stored_task = db.get(TeamTask, task.id)
+        assert stored_task is not None
+        assert stored_task.status == "rework"
+        assert stored_task.review_json["comment"] == raw_comment
+        assert captured.get("language_context") == context
+        rework_wakes = db.exec(
+            select(TeamWakeEvent).where(TeamWakeEvent.trigger_type == "task_rework")
+        ).all()
+        assert len(rework_wakes) == 1
+        assert rework_wakes[0].language_context_json == expected_snapshot
+        assert started == [rework_wakes[0].id]

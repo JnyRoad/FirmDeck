@@ -9,18 +9,25 @@ from urllib.parse import urlparse
 
 from app import paths
 from app.db.models import ModelConfig
+from app.i18n.language_context import LanguageContext
+from app.i18n.raw_source import RawSourceKind, RawSourceMarker
 from app.llm import LLMClient, LLMError
+from app.llm.prompts.language import language_prompt_contract, resolve_prompt_language_context
 from app.skills.llm_limits import skill_model_config
-from app.skills.skill_reflection import reflect_skill_response, reflect_skill_response_stream
+from app.skills.skill_reflection import (
+    reflect_skill_response,
+    reflect_skill_response_stream,
+    skill_status_event,
+)
 from app.skills.skill_schema import (
+    SkillCard,
     SkillDistillRequest,
     SkillDistillResponse,
-    SkillCard,
     SkillGraphNode,
     ToolSuggestion,
+    resolve_skill_language_context,
 )
 from app.skills.step_ids import ensure_unique_node_ids, skill_card_with_unique_step_ids
-
 
 PROMPT_PATH = paths.resource_dir() / "app" / "llm" / "prompts" / "skill_distiller_prompt.md"
 STREAM_INTERVAL_SECONDS = 0.035
@@ -52,55 +59,151 @@ ADAPTIVE_STEP_INSTRUCTION_SUFFIX = (
 FINAL_RESPONSE_INSTRUCTION_SUFFIX = "给用户明确最终回复；无法闭环时转人工，不要只说请稍候。"
 
 
+def _skill_language_contract(language_context: LanguageContext | None) -> dict[str, object]:
+    """Describe the generated-prose locale and exact source fields preserved verbatim."""
+    return language_prompt_contract(
+        language_context,
+        [
+            RawSourceMarker(json_pointer="/title", kind=RawSourceKind.USER_INPUT),
+            RawSourceMarker(json_pointer="/raw_content", kind=RawSourceKind.USER_INPUT),
+            RawSourceMarker(
+                json_pointer="/available_tools", kind=RawSourceKind.BUSINESS_RECORD
+            ),
+            RawSourceMarker(
+                json_pointer="/available_general_skills", kind=RawSourceKind.BUSINESS_RECORD
+            ),
+            RawSourceMarker(
+                json_pointer="/available_knowledge_bases", kind=RawSourceKind.BUSINESS_RECORD
+            ),
+        ],
+    )
+
+
+def _localized_skill_text(
+    language_context: LanguageContext | None,
+    *,
+    zh_cn: str,
+    en_us: str,
+) -> str:
+    """Select a deterministic authoring message without translating raw Skill source content."""
+    context = resolve_prompt_language_context(language_context)
+    return en_us if context.agent_reply_locale.value == "en-US" else zh_cn
+
+
+def _model_input_payload(
+    payload: dict[str, Any],
+    model_input: str,
+) -> dict[str, Any]:
+    """Wrap the source summary with a structured locale contract for the initial LLM call."""
+    return {**payload, "input": model_input}
+
+
 class SkillDistiller:
     def distill(
         self, request: SkillDistillRequest, model_config: ModelConfig
     ) -> SkillDistillResponse:
+        """Generate one Skill Card while binding all generated prose to request locale."""
+        request = self._with_language_context(request)
         return self._generate_response(request, model_config)
 
     def distill_stream(
         self, request: SkillDistillRequest, model_config: ModelConfig
     ) -> SkillDistillResponse:
+        """Run the compatibility non-SSE entry point with the same immutable locale contract."""
+        request = self._with_language_context(request)
         return self._generate_response(request, model_config)
 
-    def stream_text(self, request: SkillDistillRequest, model_config: ModelConfig):
+    def stream_text(
+        self, request: SkillDistillRequest, model_config: ModelConfig
+    ):
+        """Yield progress and raw draft output with a locale-bound producer envelope."""
+        request = self._with_language_context(request)
         payload = self._payload(request)
         model_input = self._model_input(request, payload)
         chunks: list[str] = []
         prompt = PROMPT_PATH.read_text(encoding="utf-8")
         client = LLMClient(skill_model_config(model_config))
         try:
-            yield {"event": "status", "data": {"text": "模型正在规划技能结构"}}
-            for chunk in client.generate_text_stream(prompt, model_input):
+            yield skill_status_event(
+                _localized_skill_text(
+                    request.language_context,
+                    zh_cn="模型正在规划技能结构",
+                    en_us="Planning the Skill structure",
+                ),
+                request.language_context,
+            )
+            for chunk in client.generate_text_stream(
+                prompt, _model_input_payload(payload, model_input)
+            ):
                 chunks.append(chunk)
                 yield {"event": "chunk", "data": {"content": chunk}}
-            yield {"event": "status", "data": {"text": "正在校验模型输出结构"}}
+            yield skill_status_event(
+                _localized_skill_text(
+                    request.language_context,
+                    zh_cn="正在校验模型输出结构",
+                    en_us="Validating the model output structure",
+                ),
+                request.language_context,
+            )
             response = self._response_from_text("".join(chunks), request)
         except (LLMError, json.JSONDecodeError, TypeError, ValueError) as exc:
             try:
-                yield {"event": "status", "data": {"text": "模型输出需要修复，正在重试"}}
+                yield skill_status_event(
+                    _localized_skill_text(
+                        request.language_context,
+                        zh_cn="模型输出需要修复，正在重试",
+                        en_us="The model output needs repair; retrying",
+                    ),
+                    request.language_context,
+                )
                 response = self._repair_response(
                     client, prompt, payload, "".join(chunks), str(exc), request
                 )
             except (LLMError, json.JSONDecodeError, TypeError, ValueError) as repair_exc:
                 try:
-                    yield {"event": "status", "data": {"text": "模型修复失败，改用分段生成"}}
+                    yield skill_status_event(
+                        _localized_skill_text(
+                            request.language_context,
+                            zh_cn="模型修复失败，改用分段生成",
+                            en_us="Repair failed; switching to staged generation",
+                        ),
+                        request.language_context,
+                    )
                     response = self._staged_response(
                         client, prompt, payload, request, str(repair_exc)
                     )
-                except (LLMError, json.JSONDecodeError, TypeError, ValueError) as staged_exc:
-                    yield {
-                        "event": "status",
-                        "data": {"text": "模型多轮生成失败，使用最低可运行草稿"},
-                    }
+                except (LLMError, json.JSONDecodeError, TypeError, ValueError):
+                    yield skill_status_event(
+                        _localized_skill_text(
+                            request.language_context,
+                            zh_cn="模型多轮生成失败，使用最低可运行草稿",
+                            en_us="Multi-step generation failed; using a minimal runnable draft",
+                        ),
+                        request.language_context,
+                    )
                     response = self._fallback_response(
-                        request, f"模型多轮生成未能完成，已使用最低可运行草稿：{staged_exc}"
+                        request,
+                        _localized_skill_text(
+                            request.language_context,
+                            zh_cn="模型多轮生成未能完成，已使用最低可运行草稿。",
+                            en_us=(
+                                "Model generation could not complete; a minimal runnable "
+                                "draft was used."
+                            ),
+                        ),
                     )
             yield {"event": "chunk_reset", "data": {}}
             for chunk in _chunk_text(_serialize_response_for_stream(response)):
                 yield {"event": "chunk", "data": {"content": chunk}}
                 sleep(STREAM_INTERVAL_SECONDS)
-        yield {"event": "status", "data": {"text": "正在校验步骤闭环与工具接入"}}
+        yield skill_status_event(
+            _localized_skill_text(
+                request.language_context,
+                zh_cn="正在校验步骤闭环与工具接入",
+                en_us="Validating closed-loop steps and tool integration",
+            ),
+            request.language_context,
+        )
         before_reflection = response.model_dump(mode="json")
         response = yield from reflect_skill_response_stream(
             client=client,
@@ -111,26 +214,50 @@ class SkillDistiller:
             current_warnings=response.warnings,
             tool_suggestions=response.tool_suggestions,
             normalize_response=lambda raw: self._normalize_response(raw, request),
+            language_context=request.language_context,
         )
-        yield {"event": "status", "data": {"text": "正在整理校验后的技能草稿"}}
+        yield skill_status_event(
+            _localized_skill_text(
+                request.language_context,
+                zh_cn="正在整理校验后的技能草稿",
+                en_us="Organizing the validated Skill draft",
+            ),
+            request.language_context,
+        )
         if response.model_dump(mode="json") != before_reflection:
             yield {"event": "chunk_reset", "data": {}}
             for chunk in _chunk_text(_serialize_response_for_stream(response)):
                 yield {"event": "chunk", "data": {"content": chunk}}
                 sleep(STREAM_INTERVAL_SECONDS)
-        yield {"event": "status", "data": {"text": "校验完成，已完成 Skill Card 结构化"}}
+        yield skill_status_event(
+            _localized_skill_text(
+                request.language_context,
+                zh_cn="校验完成，已完成 Skill Card 结构化",
+                en_us="Validation complete; the Skill Card is structured",
+            ),
+            request.language_context,
+        )
         yield {"event": "complete", "data": response.model_dump(mode="json")}
+
+    def _with_language_context(self, request: SkillDistillRequest) -> SkillDistillRequest:
+        """Attach an immutable request snapshot before any model call or stream event is emitted."""
+        context = resolve_skill_language_context(request)
+        if request.language_context == context:
+            return request
+        return request.model_copy(update={"language_context": context})
 
     def _generate_response(
         self, request: SkillDistillRequest, model_config: ModelConfig
     ) -> SkillDistillResponse:
+        """Generate, repair, and reflect a Skill Card without translating source-owned fields."""
+        request = self._with_language_context(request)
         payload = self._payload(request)
         model_input = self._model_input(request, payload)
         prompt = PROMPT_PATH.read_text(encoding="utf-8")
         client = LLMClient(skill_model_config(model_config))
         output = ""
         try:
-            output = client.generate_text(prompt, model_input)
+            output = client.generate_text(prompt, _model_input_payload(payload, model_input))
             response = self._response_from_text(output, request)
         except (LLMError, json.JSONDecodeError, TypeError, ValueError) as exc:
             try:
@@ -140,9 +267,17 @@ class SkillDistiller:
                     response = self._staged_response(
                         client, prompt, payload, request, str(repair_exc)
                     )
-                except (LLMError, json.JSONDecodeError, TypeError, ValueError) as staged_exc:
+                except (LLMError, json.JSONDecodeError, TypeError, ValueError):
                     response = self._fallback_response(
-                        request, f"模型多轮生成未能完成，已使用最低可运行草稿：{staged_exc}"
+                        request,
+                        _localized_skill_text(
+                            request.language_context,
+                            zh_cn="模型多轮生成未能完成，已使用最低可运行草稿。",
+                            en_us=(
+                                "Model generation could not complete; a minimal runnable "
+                                "draft was used."
+                            ),
+                        ),
                     )
         return reflect_skill_response(
             client=client,
@@ -153,6 +288,7 @@ class SkillDistiller:
             current_warnings=response.warnings,
             tool_suggestions=response.tool_suggestions,
             normalize_response=lambda raw: self._normalize_response(raw, request),
+            language_context=request.language_context,
         )
 
     def _response_from_text(self, text: str, request: SkillDistillRequest) -> SkillDistillResponse:
@@ -245,8 +381,8 @@ class SkillDistiller:
                     tool_mentions.extend(
                         item for item in node_raw["tool_mentions"] if isinstance(item, dict)
                     )
-            except (json.JSONDecodeError, TypeError, ValueError) as exc:
-                warnings.append(f"模型未能扩写节点 {index + 1}，已保留大纲节点：{exc}")
+            except (json.JSONDecodeError, TypeError, ValueError):
+                warnings.append(f"模型未能扩写节点 {index + 1}，已保留大纲节点。")
 
         draft_data["nodes"] = nodes
         reviewed = self._normalize_response(
@@ -271,7 +407,8 @@ class SkillDistiller:
             return reviewed
 
     def _payload(self, request: SkillDistillRequest) -> dict[str, Any]:
-        return {
+        """Build the compact model payload and attach exact language/raw-source metadata."""
+        payload = {
             "title": request.title,
             "business_domain": request.business_domain,
             "raw_content": request.raw_content,
@@ -290,6 +427,8 @@ class SkillDistiller:
                 alias_fields=("name",),
             ),
         }
+        payload.update(_skill_language_contract(request.language_context))
+        return payload
 
     def _model_input(
         self,
@@ -312,6 +451,8 @@ class SkillDistiller:
     def _normalize_response(
         self, raw: dict[str, Any], request: SkillDistillRequest
     ) -> SkillDistillResponse:
+        """Normalize model output while carrying the request's immutable language snapshot."""
+        request = self._with_language_context(request)
         draft = raw.get("draft_skill") if isinstance(raw.get("draft_skill"), dict) else raw
         warnings = list(raw.get("warnings") or [])
         fallback = self._fallback_card(request)
@@ -414,6 +555,7 @@ class SkillDistiller:
             draft_skill=draft_skill,
             warnings=_compact_warnings(warnings),
             tool_suggestions=tool_suggestions,
+            language_context=request.language_context,
         )
         return response
 
@@ -549,8 +691,11 @@ class SkillDistiller:
     def _fallback_response(
         self, request: SkillDistillRequest, warning: str
     ) -> SkillDistillResponse:
+        """Return a safe fallback draft without exposing provider or parser diagnostics."""
         return SkillDistillResponse(
-            draft_skill=self._fallback_card(request), warnings=_compact_warnings([warning])
+            draft_skill=self._fallback_card(request),
+            warnings=_compact_warnings([warning]),
+            language_context=request.language_context,
         )
 
     def _fallback_card(self, request: SkillDistillRequest) -> SkillCard:

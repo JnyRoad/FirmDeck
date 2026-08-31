@@ -1,5 +1,8 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { LoaderCircle } from 'lucide-react';
+
+import { createAppTranslator, getStoredLocale } from '@/i18n';
+import { AppIntlContext } from '@/i18n/provider';
 
 export type ModelComboboxOption = { value: string; label: string };
 
@@ -12,6 +15,12 @@ type ModelComboboxProps = {
   placeholder?: string;
 };
 
+/** 为独立测试和受控页面提供一致的翻译入口；缺少 Provider 时回退到存储 locale。 */
+function useModelComboboxIntl() {
+  const context = useContext(AppIntlContext);
+  return useMemo(() => context ?? createAppTranslator(getStoredLocale()), [context]);
+}
+
 export default function ModelCombobox({
   value,
   onChange,
@@ -20,6 +29,7 @@ export default function ModelCombobox({
   disabled = false,
   placeholder,
 }: ModelComboboxProps) {
+  const { t } = useModelComboboxIntl();
   const [open, setOpen] = useState(false);
   // Filtering the dropdown by `value` (the committed selection) means
   // reopening it right after picking a model shows only that one match —
@@ -71,10 +81,10 @@ export default function ModelCombobox({
       {open && !disabled && (
         <div className="absolute top-[calc(100%+4px)] left-0 z-10 max-h-[220px] w-full overflow-y-auto rounded-[10px] border border-[#e3e7f1] bg-white p-[4px] shadow-[0_8px_24px_rgba(20,20,30,0.12)]">
           {loading ? (
-            <p className="px-[10px] py-[10px] text-center text-[12px] text-[#858b9c]">正在获取模型列表…</p>
+            <p className="px-[10px] py-[10px] text-center text-[12px] text-[#858b9c]">{t('modelSetup.models.loading')}</p>
           ) : filtered.length === 0 ? (
             <p className="px-[10px] py-[10px] text-center text-[12px] text-[#858b9c]">
-              {options.length === 0 ? '未获取到模型列表，可直接手动输入' : '没有匹配的模型'}
+              {options.length === 0 ? t('modelSetup.models.empty') : t('modelSetup.models.noMatch')}
             </p>
           ) : (
             filtered.map((option) => (

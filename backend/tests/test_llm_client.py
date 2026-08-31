@@ -642,6 +642,39 @@ def test_generate_text_records_each_empty_response_retry():
     assert [item["retry_count"] for item in finished] == [0, 1, 2]
 
 
+def test_generate_text_failed_span_uses_canonical_error_without_provider_exception_text() -> None:
+    client = object.__new__(LLMClient)
+    client.client = _FakeOpenAIClient()
+    client.driver = ChatCompletionsDriver(client.client)
+    client.model = "demo-model"
+    client.base_url = "https://example.test/v1"
+    client.temperature = 0.2
+    client.max_output_tokens = 256
+    events: list[tuple[str, dict]] = []
+
+    def fail_create(**kwargs):  # noqa: ANN003
+        client.client.chat.completions.calls.append(kwargs)
+        raise RuntimeError("provider timeout secret=/private/provider.sock")
+
+    client.client.chat.completions.create = fail_create
+
+    with bind_span_sink(lambda event_type, payload: events.append((event_type, payload))):
+        with pytest.raises(LLMError):
+            client.generate_text("system prompt", {"hello": "world"})
+
+    failed = next(payload for event_type, payload in events if event_type == "llm_call_failed")
+    assert failed["error"] == {
+        "code": "INTERNAL_ERROR",
+        "params": {},
+        "retryable": False,
+        "request_id": None,
+        "trace_id": None,
+    }
+    assert failed["response_text"] == ""
+    assert "provider timeout" not in str(failed)
+    assert "secret=/private/provider.sock" not in str(failed)
+
+
 def test_generate_text_empty_response_reports_provider_diagnostics():
     client = object.__new__(LLMClient)
     client.client = _FakeOpenAIClient()
@@ -805,6 +838,54 @@ def test_generate_text_stream_records_ttft_and_output_volume():
     assert finished["response_chunks"][1]["choices"][0]["delta"]["tool_calls"][0][
         "function"
     ]["arguments"] == raw_arguments
+
+
+def test_generate_text_stream_failed_span_keeps_partial_output_but_sanitizes_error() -> None:
+    client = object.__new__(LLMClient)
+    client.client = _FakeOpenAIClient()
+    client.driver = ChatCompletionsDriver(client.client)
+    client.model = "demo-model"
+    client.base_url = "https://example.test/v1"
+    client.temperature = 0.2
+    client.max_output_tokens = 256
+    events: list[tuple[str, dict]] = []
+
+    def chunk(content, finish_reason=None, *, reasoning=None):  # noqa: ANN001
+        delta = type(
+            "Delta",
+            (),
+            {
+                "content": content,
+                "reasoning_content": reasoning,
+                "tool_calls": [],
+            },
+        )()
+        choice = type("Choice", (), {"delta": delta, "finish_reason": finish_reason})()
+        return type("Chunk", (), {"id": "chunk_demo", "choices": [choice]})()
+
+    def failing_stream():
+        yield chunk("你", reasoning="先输出一半。")
+        raise RuntimeError("stream aborted secret=/private/stream.sock")
+
+    client.client.chat.completions.create = lambda **_kwargs: failing_stream()
+
+    with bind_span_sink(lambda event_type, payload: events.append((event_type, payload))):
+        with pytest.raises(LLMError):
+            list(client.generate_text_stream("system", {"hello": "world"}))
+
+    failed = next(payload for event_type, payload in events if event_type == "llm_call_failed")
+    assert failed["error"] == {
+        "code": "INTERNAL_ERROR",
+        "params": {},
+        "retryable": False,
+        "request_id": None,
+        "trace_id": None,
+    }
+    assert failed["partial_response_text"] == "你"
+    assert failed["partial_reasoning_content"] == "先输出一半。"
+    assert failed["stream_chunks"] == 1
+    assert "stream aborted" not in str(failed)
+    assert "secret=/private/stream.sock" not in str(failed)
 
 
 def test_generate_text_projects_conversation_context_messages():

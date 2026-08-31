@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import calendar
+import json
+import logging
 import re
 import socket
 import threading
@@ -15,6 +17,9 @@ from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from app.agents.branching import model_for_agent, visible_published_skills
+from app.contracts.domain_http import domain_http_error
+from app.contracts.error_registry import ERROR_REGISTRY, ErrorContractViolation, ErrorVisibility
+from app.contracts.errors import ErrorDescriptor, InternalErrorContext
 from app.core import AgentLoop
 from app.core.harness_turn_store import HarnessTurnConflict
 from app.db import engine
@@ -32,7 +37,15 @@ from app.db.models import (
     new_id,
     utc_now,
 )
+from app.i18n.language_context import (
+    LanguageContext,
+    LanguageContextInputs,
+    resolve_compatible_language_context,
+    resolve_language_context,
+)
+from app.i18n.raw_source import RawSourceKind, RawSourceMarker
 from app.llm import LLMClient, LLMError
+from app.llm.prompts.language import language_prompt_contract
 from app.observability.spans import llm_operation
 from app.scheduled_tasks.schema import (
     ScheduledTaskCreateRequest,
@@ -41,12 +54,12 @@ from app.scheduled_tasks.schema import (
     ScheduledTaskRunRead,
     ScheduledTaskUpdateRequest,
 )
-from app.session.session_schema import ChatTurnRequest, ChatTurnResponse
 from app.security.permissions import agent_owned_by_user as _agent_owned_by_user
 from app.security.permissions import is_admin_user as _is_admin_user
 from app.security.tenant import ensure_tenant
+from app.session.session_kinds import SESSION_KIND_SCHEDULED_TASK
+from app.session.session_schema import ChatTurnRequest, ChatTurnResponse
 from app.skills.nesting import SopNestingError, expand_sop_for_execution
-
 
 DEFAULT_TIMEZONE = "Asia/Shanghai"
 DEFAULT_TASK_TIME = "09:00"
@@ -57,6 +70,26 @@ CONFLICT_RETRY_SECONDS = 15
 SCHEDULE_TYPES = {"once", "daily", "weekly", "monthly"}
 SOP_VERSION_POLICIES = {"latest", "pinned"}
 SOP_SNAPSHOT_METADATA_KEY = "_sop_snapshot"
+logger = logging.getLogger(__name__)
+
+
+def _scheduled_task_error(
+    code: str,
+    status_code: int,
+    *,
+    params: dict[str, object] | None = None,
+    retryable: bool | None = None,
+    cause: BaseException | None = None,
+) -> HTTPException:
+    """Return a canonical scheduled-task error with private diagnostic causes."""
+    return domain_http_error(
+        code,
+        source="scheduled_tasks.service",
+        status_code=status_code,
+        params=params,
+        retryable=retryable,
+        cause=cause,
+    )
 
 
 class ScheduledTaskAgentUnavailable(RuntimeError):
@@ -77,32 +110,31 @@ class _LLMScheduledTaskDraft(BaseModel):
 
 
 SCHEDULE_DRAFT_PROMPT = """
-你是 StaffDeck 数字员工的自动任务配置解析器。
-用户已经在对话框中选择了“创建定时任务”模式。请把用户输入整理成一个可编辑的自动任务草案。
-如果用户没有写清时间计划，默认每天 09:00 执行；如果用户没有写清任务目标，用原始输入作为执行内容。
+You are StaffDeck's scheduled-task configuration parser. The user has already selected
+scheduled-task mode. Convert the source-owned user_message into one editable task draft.
+Follow language_directive for every newly generated value in title, prompt, description,
+and reason. Do not translate or rewrite user_message itself; preserve source identifiers,
+paths, product names, quotations, and literal business values when deriving the draft.
 
-返回一个 JSON object，字段如下：
+Return one JSON object with these fields:
 - should_create: boolean
-- title: 12 到 32 个中文字符，概括自动任务名称
-- prompt: 每次到点后交给数字员工的新会话任务描述，不要包含“帮我设个定时任务”等配置话术
-- description: 可选，解释为什么这样拆解
+- title: a concise 12 to 32 character task name in the requested reply locale
+- prompt: a new-session instruction in the requested reply locale, without scheduling setup chatter
+- description: optional newly generated rationale in the requested reply locale
 - schedule_type: one of "once", "daily", "weekly", "monthly"
 - schedule:
   - once: {"run_at": "YYYY-MM-DDTHH:mm:ss±HH:MM"}
   - daily: {"time": "HH:mm"}
-  - weekly: {"time": "HH:mm", "weekdays": [0-6]}，0=周一，6=周日
+  - weekly: {"time": "HH:mm", "weekdays": [0-6]}, where 0=Monday and 6=Sunday
   - monthly: {"time": "HH:mm", "day_of_month": 1-31}
-- timezone: IANA 时区，默认使用 default_timezone
-- rrule: 可选 RRULE 字符串
-- confidence: 0 到 1
-- reason: 简短说明
+- timezone: an IANA timezone, defaulting to default_timezone
+- rrule: optional RRULE string
+- confidence: number from 0 to 1
+- reason: a concise explanation in the requested reply locale
 
-时间不完整时可以合理补齐：只说“每天”默认 09:00；只说“每周一”默认 09:00。
-调度类型判断规则：
-- 用户只给出一个具体时间点，例如“下午2点10分”“14:10”“今晚8点”，且没有明确“每天/每日/每周/每月/定期/重复”等周期要求时，生成 once。
-- once.run_at 使用 now 所在日期和用户给出的时间；如果该时间已经过去，则顺延到下一天。
-- 只有用户明确说“每天/每日/每晚/每早/每周/每月/工作日/定期/重复”等周期要求时，才生成 daily/weekly/monthly。
-不要输出 Markdown，不要输出解释文本，只输出 JSON。
+When time is incomplete, use 09:00. A single time without explicit repetition is once;
+use today's date or the next day when that time has passed. Use daily, weekly, or monthly
+only when the user explicitly requests repetition. Output JSON only, without Markdown.
 """
 
 
@@ -138,6 +170,7 @@ def scheduled_task_read(row: ScheduledTask) -> ScheduledTaskRead:
 
 
 def scheduled_task_run_read(row: ScheduledTaskRun, task: ScheduledTask | None = None) -> ScheduledTaskRunRead:
+    """Project one scheduled run while failing closed on persisted legacy error text."""
     return ScheduledTaskRunRead(
         id=row.id,
         tenant_id=row.tenant_id,
@@ -152,8 +185,8 @@ def scheduled_task_run_read(row: ScheduledTaskRun, task: ScheduledTask | None = 
         started_at=_dt(row.started_at),
         finished_at=_dt(row.finished_at),
         result_summary=row.result_summary,
-        error=row.error,
-        trace=row.trace_json or {},
+        error=_project_persisted_scheduled_task_error(row.error),
+        trace=_sanitize_scheduled_payload(row.trace_json or {}, event="trace"),
         created_at=row.created_at.isoformat(),
         updated_at=row.updated_at.isoformat(),
     )
@@ -169,12 +202,22 @@ def create_scheduled_task(
     schedule = normalize_schedule(request.schedule_type, request.schedule, request.timezone)
     now = utc_now()
     end_at = parse_user_datetime(request.end_at, request.timezone) if request.end_at else None
+    source_session = db.get(ChatSession, request.source_session_id) if request.source_session_id else None
+    language_context = resolve_language_context(
+        LanguageContextInputs(
+            session_agent_reply_locale=(
+                source_session.agent_reply_locale if source_session is not None else None
+            ),
+            user_ui_locale=current_user.ui_locale,
+            user_agent_reply_locale=current_user.agent_reply_locale,
+        )
+    )
     row = ScheduledTask(
         tenant_id=request.tenant_id,
         agent_id=request.agent_id,
         created_by_user_id=current_user.id,
-        title=_nonempty(request.title, "自动任务名称不能为空", 80),
-        prompt=_nonempty(request.prompt, "自动任务描述不能为空", 10000),
+        title=_nonempty(request.title, "title", 80),
+        prompt=_nonempty(request.prompt, "prompt", 10000),
         description=(request.description or "").strip() or None,
         schedule_type=request.schedule_type,
         schedule_json=schedule,
@@ -192,6 +235,7 @@ def create_scheduled_task(
             request.agent_id,
             request.metadata,
         ),
+        language_context_json=language_context.model_dump(mode="json"),
         created_at=now,
         updated_at=now,
     )
@@ -217,9 +261,9 @@ def update_scheduled_task(
         row.agent_id = request.agent_id
         agent_changed = True
     if request.title is not None:
-        row.title = _nonempty(request.title, "自动任务名称不能为空", 80)
+        row.title = _nonempty(request.title, "title", 80)
     if request.prompt is not None:
-        row.prompt = _nonempty(request.prompt, "自动任务描述不能为空", 10000)
+        row.prompt = _nonempty(request.prompt, "prompt", 10000)
     if request.description is not None:
         row.description = request.description.strip() or None
     if request.timezone is not None:
@@ -272,13 +316,23 @@ def detect_scheduled_task_draft(
     message: str,
     source_session_id: str | None = None,
     timezone: str | None = None,
+    *,
+    language_context: LanguageContext | None = None,
 ) -> ScheduledTaskDraftRead | None:
+    """Detect one localized task draft while retaining the user message as raw source."""
     ensure_tenant(db, tenant_id)
     agent = db.get(AgentProfile, agent_id)
     if not agent or agent.tenant_id != tenant_id or agent.is_overall or agent.status != "active":
         return None
     user_timezone = _safe_timezone(timezone)
-    llm_draft = _detect_with_llm(db, tenant_id, agent_id, message, user_timezone)
+    llm_draft = _detect_with_llm(
+        db,
+        tenant_id,
+        agent_id,
+        message,
+        user_timezone,
+        language_context=language_context,
+    )
     if llm_draft is None or not llm_draft.should_create:
         return None
     draft = llm_draft
@@ -288,9 +342,9 @@ def detect_scheduled_task_draft(
         schedule = normalize_schedule(schedule_type, draft.schedule, draft_timezone)
     except HTTPException:
         return None
-    title = (draft.title or _compact_title(message)).strip()[:80]
-    prompt = (draft.prompt or _execution_goal_from_message(message)).strip()
-    if not prompt:
+    title = draft.title.strip()[:80]
+    prompt = draft.prompt.strip()
+    if not title or not prompt:
         return None
     return ScheduledTaskDraftRead(
         should_create=True,
@@ -419,6 +473,7 @@ def _prepare_scheduled_task_run(
         )
     ).first()
     if existing:
+        language_context = _scheduled_run_language_context(db, task, existing)
         if existing.status == "retrying":
             existing.status = "running"
             existing.error = None
@@ -428,6 +483,12 @@ def _prepare_scheduled_task_run(
             db.add(existing)
             db.commit()
             db.refresh(existing)
+        if existing.session_id:
+            session = db.get(ChatSession, existing.session_id)
+            if session is not None:
+                _bind_scheduled_session_language(db, session, language_context)
+        db.commit()
+        db.refresh(existing)
         return existing
     if task.concurrency_policy == "forbid":
         running = db.exec(
@@ -438,7 +499,9 @@ def _prepare_scheduled_task_run(
         ).first()
         if running:
             run = _create_run(db, task, scheduled_for, "skipped")
-            run.error = "上一轮自动任务仍在执行，已按 forbid 策略跳过本次唤醒。"
+            run.error = _serialize_scheduled_task_error(
+                raw_context="concurrency_policy=forbid"
+            )
             run.finished_at = utc_now()
             _finish_task_schedule(db, task, scheduled_for, "skipped", manual)
             db.add(run)
@@ -461,13 +524,18 @@ def _prepare_scheduled_task_run(
             return existing
         raise
     db.refresh(run)
+    language_context = _scheduled_run_language_context(db, task, run)
     session = ChatSession(
         id=new_id("session"),
         tenant_id=task.tenant_id,
         user_id=task.created_by_user_id,
         agent_id=task.agent_id,
-        title=f"自动任务：{task.title}",
+        title=task.title,
         status="active",
+        channel="scheduled_task",
+        session_kind=SESSION_KIND_SCHEDULED_TASK,
+        agent_reply_locale=language_context.agent_reply_locale.value,
+        agent_reply_locale_source=language_context.agent_reply_locale_source.value,
     )
     db.add(session)
     db.commit()
@@ -499,7 +567,7 @@ def _skip_misfired_run(
     if existing:
         return existing
     run = _create_run(db, task, scheduled_for, "skipped")
-    run.error = "计划执行时间已超过补偿窗口，已按 skip 策略跳过。"
+    run.error = _serialize_scheduled_task_error(raw_context="misfire_policy=skip")
     run.finished_at = utc_now()
     _finish_task_schedule(db, task, scheduled_for, "skipped", manual=False)
     task.lease_owner = None
@@ -527,10 +595,12 @@ def _execute_prepared_scheduled_task(
     *,
     manual: bool,
 ) -> ScheduledTaskRun:
+    """Execute one prepared run and persist only canonical scheduled-task errors."""
     try:
         if not run.session_id:
             raise RuntimeError("自动任务缺少独立会话")
         _ensure_scheduled_execution_agent(db, task)
+        language_context = _scheduled_run_language_context(db, task, run)
         request = ChatTurnRequest(
             tenant_id=task.tenant_id,
             session_id=run.session_id,
@@ -543,6 +613,9 @@ def _execute_prepared_scheduled_task(
             forced_sop_id=_scheduled_task_sop_id(task),
             forced_sop_snapshot=_scheduled_task_sop_snapshot(task),
             client_timezone=task.timezone,
+            ui_locale=language_context.ui_locale,
+            agent_reply_locale=language_context.agent_reply_locale,
+            language_context=language_context,
         )
         result: ChatTurnResponse | None = None
         for seq, item in enumerate(AgentLoop(db).handle_turn_stream(request), start=1):
@@ -554,19 +627,24 @@ def _execute_prepared_scheduled_task(
         outcome = _scheduled_harness_outcome(db, run, result)
         run.status = str(outcome["status"])
         run.result_summary = result.reply[:500]
-        run.error = str(outcome.get("error") or "") or None
+        run.error = _scheduled_outcome_error_json(outcome)
         run.trace_json = dict(outcome["trace"])
         run.finished_at = utc_now()
         _finish_task_schedule(db, task, run.scheduled_for, run.status, manual)
     except HarnessTurnConflict as exc:
         run.status = "retrying"
-        run.error = str(exc)
+        run.error = _serialize_scheduled_task_error(
+            retryable=True,
+            raw_context=exc,
+        )
         run.finished_at = None
         if not manual:
             task.next_run_at = utc_now() + timedelta(seconds=CONFLICT_RETRY_SECONDS)
     except Exception as exc:
+        logger.exception("Scheduled task run %s failed", run.id)
+        public_error = _scheduled_exception_payload(exc)
         run.status = "failed"
-        run.error = str(exc)
+        run.error = json.dumps(public_error, ensure_ascii=False, sort_keys=True)
         run.finished_at = utc_now()
         if run.session_id:
             _record_scheduled_task_stream_event(
@@ -574,7 +652,14 @@ def _execute_prepared_scheduled_task(
                 run,
                 run.session_id,
                 0,
-                {"event": "error", "data": {"message": str(exc), "sessionId": run.session_id}},
+                {
+                    "event": "error",
+                    "data": {
+                        "error": public_error,
+                        "message": str(public_error["code"]),
+                        "sessionId": run.session_id,
+                    },
+                },
             )
         _finish_task_schedule(db, task, run.scheduled_for, "failed", manual)
         if isinstance(exc, ScheduledTaskAgentUnavailable):
@@ -593,6 +678,7 @@ def _execute_prepared_scheduled_task(
 
 
 def _ensure_scheduled_execution_agent(db: Session, task: ScheduledTask) -> AgentProfile:
+    """Require one active non-overall Agent and raise a canonical product error when unavailable."""
     agent = db.get(AgentProfile, task.agent_id)
     if (
         agent is None
@@ -600,9 +686,7 @@ def _ensure_scheduled_execution_agent(db: Session, task: ScheduledTask) -> Agent
         or agent.is_overall
         or agent.status != "active"
     ):
-        raise ScheduledTaskAgentUnavailable(
-            "自动任务绑定的员工已不可用；请重新选择启用中的员工后再运行。"
-        )
+        raise _scheduled_task_error("SCHEDULED_TASK_AGENT_UNAVAILABLE", 404)
     return agent
 
 
@@ -801,11 +885,12 @@ def _record_scheduled_task_stream_event(
     seq: int,
     item: dict[str, Any],
 ) -> None:
+    """Persist one scheduled stream event while preserving any attached canonical error payload."""
     event = str(item.get("event") or "")
     data = item.get("data")
     if not isinstance(data, dict):
         data = {"value": data}
-    payload = dict(data)
+    payload = _sanitize_scheduled_payload(data, event=event)
     payload.setdefault("sessionId", session_id)
     receipt = db.exec(
         select(HarnessTurnRecord).where(
@@ -846,7 +931,168 @@ def _record_scheduled_task_stream_event(
     db.commit()
 
 
+def _scheduled_exception_payload(exc: Exception) -> dict[str, Any]:
+    """Project one scheduled exception to the only replay-safe payload currently allowed."""
+    del exc
+    return _internal_scheduled_error_payload(raw_context=None)
+
+
+def _scheduled_outcome_error_json(outcome: dict[str, Any]) -> str | None:
+    """Collapse non-success scheduled outcomes into a canonical persisted error payload."""
+    status = str(outcome.get("status") or "")
+    if status in {"", "succeeded"}:
+        return None
+    return _serialize_scheduled_task_error(
+        retryable=status == "incomplete",
+        raw_context=outcome.get("error"),
+    )
+
+
+def _serialize_scheduled_task_error(
+    *,
+    retryable: bool = False,
+    raw_context: object | None = None,
+) -> str:
+    """Serialize one safe scheduled-task error payload for durable run replay."""
+    return json.dumps(
+        _internal_scheduled_error_payload(
+            retryable=retryable,
+            raw_context=raw_context,
+        ),
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+
+
+def _project_persisted_scheduled_task_error(error: object) -> dict[str, Any]:
+    """Read one persisted scheduled-task error and fail closed on legacy raw strings."""
+    if not isinstance(error, str) or not error.strip():
+        return {}
+    try:
+        payload = json.loads(error)
+    except json.JSONDecodeError:
+        return _internal_scheduled_error_payload(raw_context=error)
+    return _canonical_scheduled_error_payload(payload, raw_context=payload)
+
+
+def _canonical_scheduled_error_payload(
+    candidate: object,
+    *,
+    retryable: bool | None = None,
+    raw_context: object | None,
+) -> dict[str, Any]:
+    """Validate a scheduled descriptor and return a generic safe fallback when malformed."""
+    code = "INTERNAL_ERROR"
+    params: dict[str, Any] = {}
+    effective_retryable = False if retryable is None else retryable
+    request_id: str | None = None
+    trace_id: str | None = None
+    if isinstance(candidate, dict):
+        raw_code = candidate.get("code")
+        entry = ERROR_REGISTRY.get(raw_code) if isinstance(raw_code, str) else None
+        if entry is not None and entry.visibility is ErrorVisibility.PUBLIC:
+            code = entry.code
+            raw_params = candidate.get("params")
+            params = dict(raw_params) if isinstance(raw_params, dict) else {}
+            candidate_retryable = candidate.get("retryable", entry.retryable_default)
+            if isinstance(candidate_retryable, bool):
+                effective_retryable = (
+                    candidate_retryable if retryable is None else retryable
+                )
+            else:
+                effective_retryable = entry.retryable_default if retryable is None else retryable
+            request_id = candidate.get("request_id") if isinstance(candidate.get("request_id"), str) else None
+            trace_id = candidate.get("trace_id") if isinstance(candidate.get("trace_id"), str) else None
+    entry = ERROR_REGISTRY.get(code)
+    if entry is None or entry.visibility is not ErrorVisibility.PUBLIC:
+        descriptor = ErrorDescriptor(
+            code="INTERNAL_ERROR",
+            params={},
+            retryable=False if retryable is None else retryable,
+        )
+        _retain_private_scheduled_error(raw_context)
+        return descriptor.model_dump(mode="json")
+    descriptor = ErrorDescriptor(
+        code=entry.code,
+        params=params,
+        retryable=effective_retryable,
+        request_id=request_id,
+        trace_id=trace_id,
+    )
+    try:
+        ERROR_REGISTRY.validate(descriptor)
+    except (ErrorContractViolation, TypeError, ValueError):
+        descriptor = ErrorDescriptor(
+            code="INTERNAL_ERROR",
+            params={},
+            retryable=False if retryable is None else retryable,
+        )
+    _retain_private_scheduled_error(raw_context)
+    return descriptor.model_dump(mode="json")
+
+
+def _sanitize_scheduled_payload(candidate: object, *, event: str) -> dict[str, Any]:
+    """Preserve successful stream values while canonicalizing every nested error field."""
+    if not isinstance(candidate, dict):
+        return {"value": candidate}
+    result: dict[str, Any] = {}
+    for key, value in candidate.items():
+        if key in {"error", "error_json", "failure"}:
+            result[str(key)] = _canonical_scheduled_error_payload(
+                value,
+                raw_context=value,
+            )
+        elif isinstance(value, dict):
+            result[str(key)] = _sanitize_scheduled_payload(value, event=event)
+        elif isinstance(value, list):
+            result[str(key)] = [
+                _sanitize_scheduled_payload(item, event=event)
+                if isinstance(item, dict)
+                else item
+                for item in value
+            ]
+        else:
+            result[str(key)] = value
+    if event == "error":
+        # ``message`` is a legacy natural-language field.  The descriptor's code is
+        # the only stable value allowed in an error stream replay.
+        result["message"] = str(result.get("error", {}).get("code", "INTERNAL_ERROR"))
+    return result
+
+
+def _retain_private_scheduled_error(raw_context: object | None) -> None:
+    """Keep legacy scheduled failure context in authorized logs without serializing it."""
+    if raw_context is None:
+        return
+    if isinstance(raw_context, BaseException):
+        context = InternalErrorContext(
+            source="scheduled_tasks.service",
+            exception_type=raw_context.__class__.__name__,
+            raw_message=str(raw_context),
+        )
+    else:
+        context = InternalErrorContext(
+            source="scheduled_tasks.service",
+            raw_message=str(raw_context),
+        )
+    logger.warning("scheduled task failure retained in private diagnostics: %s", context)
+
+
+def _internal_scheduled_error_payload(
+    *,
+    retryable: bool = False,
+    raw_context: object | None,
+) -> dict[str, Any]:
+    """Return the only scheduled-task error payload accepted for public replay today."""
+    return _canonical_scheduled_error_payload(
+        {"code": "INTERNAL_ERROR", "params": {}, "retryable": retryable},
+        retryable=retryable,
+        raw_context=raw_context,
+    )
+
+
 def automatic_task_message(task: ScheduledTask) -> str:
+    """Return the original task prompt used by the scheduled execution request."""
     return task.prompt.strip() or task.title
 
 
@@ -895,7 +1141,7 @@ def _prepare_scheduled_task_sop_metadata(
     available = visible_published_skills(db, tenant_id, agent_id)
     selected = next((skill for skill in available if skill.skill_id == sop_id), None)
     if selected is None:
-        raise HTTPException(status_code=400, detail="指定的 SOP 当前不可用")
+        raise _scheduled_task_error("SCHEDULED_TASK_SOP_UNAVAILABLE", 400)
     if policy == "latest":
         metadata.pop("sop_version", None)
         return metadata
@@ -915,7 +1161,9 @@ def _prepare_scheduled_task_sop_metadata(
     try:
         expanded = expand_sop_for_execution(selected, available)
     except SopNestingError as exc:
-        raise HTTPException(status_code=400, detail=f"指定的 SOP 无法生成版本快照：{exc}") from exc
+        raise _scheduled_task_error(
+            "SCHEDULED_TASK_SOP_SNAPSHOT_FAILED", 400, cause=exc
+        ) from exc
     metadata["sop_version"] = selected.version
     metadata[SOP_SNAPSHOT_METADATA_KEY] = {
         "skill_id": selected.skill_id,
@@ -979,7 +1227,7 @@ def normalize_schedule(schedule_type: str, schedule: dict[str, Any], timezone: s
         run_at = raw.get("run_at") or raw.get("datetime") or raw.get("start_at")
         parsed = parse_user_datetime(str(run_at or ""), timezone)
         if not parsed:
-            raise HTTPException(status_code=400, detail="一次性自动任务需要填写执行时间")
+            raise _scheduled_task_error("SCHEDULED_TASK_RUN_AT_REQUIRED", 400)
         return {"run_at": _to_local(parsed, timezone).isoformat()}
     if schedule_type == "daily":
         return {"time": _format_time(_parse_time(str(raw.get("time") or DEFAULT_TASK_TIME)))}
@@ -993,7 +1241,7 @@ def normalize_schedule(schedule_type: str, schedule: dict[str, Any], timezone: s
             "time": _format_time(_parse_time(str(raw.get("time") or DEFAULT_TASK_TIME))),
             "day_of_month": _normalize_day_of_month(raw.get("day_of_month") or 1),
         }
-    raise HTTPException(status_code=400, detail="不支持的自动任务调度类型")
+    raise _scheduled_task_error("SCHEDULED_TASK_TYPE_UNSUPPORTED", 400)
 
 
 def build_rrule(schedule_type: str, schedule: dict[str, Any]) -> str | None:
@@ -1029,6 +1277,14 @@ def parse_user_datetime(value: str, timezone: str = DEFAULT_TIMEZONE) -> datetim
 
 
 def _create_run(db: Session, task: ScheduledTask, scheduled_for: datetime, status: str) -> ScheduledTaskRun:
+    language_context = resolve_compatible_language_context(
+        snapshot=task.language_context_json,
+        legacy_ui_locale=None,
+        legacy_agent_reply_locale=None,
+    )
+    if task.language_context_json is None:
+        task.language_context_json = language_context.model_dump(mode="json")
+        db.add(task)
     run = ScheduledTaskRun(
         tenant_id=task.tenant_id,
         scheduled_task_id=task.id,
@@ -1037,9 +1293,47 @@ def _create_run(db: Session, task: ScheduledTask, scheduled_for: datetime, statu
         scheduled_for=scheduled_for,
         status=status,
         started_at=utc_now() if status == "running" else None,
+        language_context_json=language_context.model_dump(mode="json"),
     )
     db.add(run)
     return run
+
+
+def _scheduled_run_language_context(
+    db: Session,
+    task: ScheduledTask,
+    run: ScheduledTaskRun,
+) -> LanguageContext:
+    """Return and backfill the immutable run snapshot without consulting mutable preferences."""
+    context = resolve_compatible_language_context(
+        snapshot=run.language_context_json or task.language_context_json,
+        legacy_ui_locale=None,
+        legacy_agent_reply_locale=None,
+    )
+    payload = context.model_dump(mode="json")
+    if run.language_context_json is None:
+        run.language_context_json = payload
+        db.add(run)
+    if task.language_context_json is None:
+        task.language_context_json = payload
+        db.add(task)
+    return context
+
+
+def _bind_scheduled_session_language(
+    db: Session,
+    session: ChatSession,
+    context: LanguageContext,
+) -> None:
+    """Bind a scheduled session to its run reply locale before execution or retry."""
+    if session.agent_reply_locale is not None:
+        if session.agent_reply_locale != context.agent_reply_locale.value:
+            raise ValueError("scheduled session reply locale conflicts with run snapshot")
+        return
+    session.agent_reply_locale = context.agent_reply_locale.value
+    session.agent_reply_locale_source = context.agent_reply_locale_source.value
+    session.updated_at = utc_now()
+    db.add(session)
 
 
 def _finish_task_schedule(db: Session, task: ScheduledTask, scheduled_for: datetime, status: str, manual: bool) -> None:
@@ -1073,7 +1367,10 @@ def _detect_with_llm(
     agent_id: str,
     message: str,
     timezone: str,
+    *,
+    language_context: LanguageContext | None = None,
 ) -> _LLMScheduledTaskDraft | None:
+    """Ask the configured router model for locale-bound prose and preserve raw user input."""
     model_config = model_for_agent(db, tenant_id, agent_id, "router") or model_for_agent(db, tenant_id, agent_id)
     if not model_config:
         return None
@@ -1082,6 +1379,15 @@ def _detect_with_llm(
             raw = LLMClient(model_config).generate_json(
                 SCHEDULE_DRAFT_PROMPT,
                 {
+                    **language_prompt_contract(
+                        language_context,
+                        [
+                            RawSourceMarker(
+                                json_pointer="/user_message",
+                                kind=RawSourceKind.USER_INPUT,
+                            )
+                        ],
+                    ),
                     "now": _to_local(utc_now(), timezone).isoformat(),
                     "default_timezone": timezone,
                     "user_message": message,
@@ -1092,19 +1398,9 @@ def _detect_with_llm(
         return None
 
 
-def _execution_goal_from_message(message: str) -> str:
-    return message.strip()
-
-
-def _compact_title(message: str) -> str:
-    text = _execution_goal_from_message(message)
-    text = re.sub(r"\s+", " ", text).strip(" ，,。")
-    return (text[:28] or "自动任务").strip()
-
-
 def _normalize_schedule_type(value: str) -> str:
     if value not in SCHEDULE_TYPES:
-        raise HTTPException(status_code=400, detail="不支持的自动任务调度类型")
+        raise _scheduled_task_error("SCHEDULED_TASK_TYPE_UNSUPPORTED", 400)
     return value
 
 
@@ -1113,14 +1409,14 @@ def _normalize_weekdays(value: Any) -> list[int]:
         value = [value]
     days = sorted({int(item) for item in value if str(item).strip() != ""})
     if not days or any(day < 0 or day > 6 for day in days):
-        raise HTTPException(status_code=400, detail="每周自动任务需要 0-6 的星期设置")
+        raise _scheduled_task_error("SCHEDULED_TASK_WEEKDAYS_INVALID", 400)
     return days
 
 
 def _normalize_day_of_month(value: Any) -> int:
     day = int(value)
     if day < 1 or day > 31:
-        raise HTTPException(status_code=400, detail="每月执行日需要在 1 到 31 之间")
+        raise _scheduled_task_error("SCHEDULED_TASK_DAY_OF_MONTH_INVALID", 400)
     return day
 
 
@@ -1128,11 +1424,11 @@ def _parse_time(value: str) -> time:
     text = value.strip()
     match = re.fullmatch(r"(\d{1,2})(?::(\d{1,2}))?", text)
     if not match:
-        raise HTTPException(status_code=400, detail="时间格式需要为 HH:mm")
+        raise _scheduled_task_error("SCHEDULED_TASK_TIME_INVALID", 400)
     hour = int(match.group(1))
     minute = int(match.group(2) or 0)
     if hour < 0 or hour > 23 or minute < 0 or minute > 59:
-        raise HTTPException(status_code=400, detail="时间格式需要为 HH:mm")
+        raise _scheduled_task_error("SCHEDULED_TASK_TIME_INVALID", 400)
     return time(hour, minute)
 
 
@@ -1144,7 +1440,7 @@ def _tz(value: str) -> ZoneInfo:
     try:
         return ZoneInfo(value or DEFAULT_TIMEZONE)
     except ZoneInfoNotFoundError as exc:
-        raise HTTPException(status_code=400, detail="无效时区") from exc
+        raise _scheduled_task_error("SCHEDULED_TASK_TIMEZONE_INVALID", 400, cause=exc) from exc
 
 
 def _safe_timezone(value: str | None, fallback: str = DEFAULT_TIMEZONE) -> str:
@@ -1166,10 +1462,13 @@ def _to_utc_naive(value: datetime) -> datetime:
     return value.astimezone(UTC).replace(tzinfo=None)
 
 
-def _nonempty(value: str, message: str, max_length: int) -> str:
+def _nonempty(value: str, field: str, max_length: int) -> str:
     text = (value or "").strip()
     if not text:
-        raise HTTPException(status_code=400, detail=message)
+        safe_field = field if re.fullmatch(r"[a-z][a-z0-9_]{0,63}", field) else "value"
+        raise _scheduled_task_error(
+            "SCHEDULED_TASK_FIELD_REQUIRED", 400, params={"field": safe_field}
+        )
     return text[:max_length]
 
 
@@ -1180,14 +1479,14 @@ def _dt(value: datetime | None) -> str | None:
 def _ensure_agent_access(db: Session, tenant_id: str, agent_id: str, current_user: User) -> AgentProfile:
     agent = db.get(AgentProfile, agent_id)
     if not agent or agent.tenant_id != tenant_id or agent.is_overall or agent.status != "active":
-        raise HTTPException(status_code=404, detail="员工不可用")
+        raise _scheduled_task_error("SCHEDULED_TASK_AGENT_UNAVAILABLE", 404)
     if _is_admin_user(current_user):
         return agent
     metadata = agent.metadata_json or {}
     owns_agent = _agent_owned_by_user(agent, current_user)
     in_gallery = metadata.get("published_to_gallery") is True
     if not (owns_agent or in_gallery):
-        raise HTTPException(status_code=403, detail="无权为该员工设置自动任务")
+        raise _scheduled_task_error("SCHEDULED_TASK_AGENT_ACCESS_FORBIDDEN", 403)
     return agent
 
 
@@ -1195,4 +1494,4 @@ def _ensure_task_access(row: ScheduledTask, current_user: User) -> None:
     if _is_admin_user(current_user):
         return
     if row.created_by_user_id != current_user.id:
-        raise HTTPException(status_code=403, detail="无权访问该自动任务")
+        raise _scheduled_task_error("SCHEDULED_TASK_ACCESS_FORBIDDEN", 403)

@@ -15,6 +15,13 @@ from app.codex_subscription import (
     CodexSubscriptionError,
     get_codex_subscription_service,
 )
+from app.contracts.error_registry import (
+    ERROR_REGISTRY,
+    ErrorContractViolation,
+    ErrorVisibility,
+)
+from app.contracts.errors import ErrorDescriptor, InternalErrorContext
+from app.contracts.http import build_http_exception
 from app.db import get_session
 from app.db.models import AgentModelBinding, ModelConfig, User, utc_now
 from app.llm import LLMClient, LLMError
@@ -89,7 +96,7 @@ def list_provider_models(
         auth_mode = ModelAuthMode.CHATGPT_SUBSCRIPTION
     else:
         if not request.api_key:
-            raise HTTPException(status_code=422, detail="MODEL_API_KEY_REQUIRED")
+            raise build_http_exception("MODEL_API_KEY_REQUIRED")
         validate_model_base_url(request.base_url)
         base_url = request.base_url
         api_key_encrypted = encrypt_secret(request.api_key)
@@ -117,11 +124,26 @@ def list_provider_models(
         return ModelListModelsResponse(
             success=False,
             models=[],
-            error=ModelProviderErrorDetail.model_validate(exc.public_detail()),
+            error=_model_provider_error_detail(exc),
         )
     return ModelListModelsResponse(
         success=True,
         models=[ModelOption(id=item["id"], label=item["label"]) for item in options],
+    )
+
+
+def _model_provider_error_detail(exc: LLMError) -> ModelProviderErrorDetail:
+    """Project an LLM failure to code/params/correlation fields without raw provider text."""
+    code = _verification_error_code(exc)
+    if ERROR_REGISTRY.get(code) is None:
+        code = "MODEL_CONNECTION_FAILED"
+    return ModelProviderErrorDetail(
+        code=code,
+        message=code,
+        message_key=ERROR_REGISTRY.require(code).message_key,
+        params={},
+        request_id=exc.request_id,
+        retryable=exc.retryable,
     )
 
 
@@ -227,6 +249,7 @@ def create_model_config(
     db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ) -> ModelConfigRead:
+    """Create a tenant model configuration with canonical validation errors."""
     ensure_tenant_admin(request.tenant_id, current_user)
     ensure_tenant(db, request.tenant_id)
     auth_mode = resolve_auth_mode(request.auth_mode)
@@ -240,7 +263,7 @@ def create_model_config(
     else:
         protocol = resolve_api_protocol(request.api_protocol, request.provider)
         if not request.api_key:
-            raise HTTPException(status_code=422, detail="MODEL_API_KEY_REQUIRED")
+            raise build_http_exception("MODEL_API_KEY_REQUIRED")
         validate_model_base_url(request.base_url)
         base_url = request.base_url
         api_key_encrypted = encrypt_secret(request.api_key)
@@ -284,6 +307,7 @@ def update_model_config(
     db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ) -> ModelConfigRead:
+    """Update a model configuration while preserving trust and default invariants."""
     ensure_tenant_admin(request.tenant_id, current_user)
     row = _get_model_config(db, request.tenant_id, config_id)
     has_other_available_model = _has_available_model(
@@ -300,7 +324,7 @@ def update_model_config(
             and request.auth_mode is not None
             and not request.api_key
         ):
-            raise HTTPException(status_code=422, detail="MODEL_API_KEY_REQUIRED")
+            raise build_http_exception("MODEL_API_KEY_REQUIRED")
         protocol = (
             resolve_api_protocol(request.api_protocol, request.provider)
             if (request.api_protocol is not None or request.provider is not None)
@@ -391,7 +415,7 @@ def update_model_config(
         if request.is_default is True:
             _require_trusted(row)
             if not row.enabled:
-                raise HTTPException(status_code=409, detail="MODEL_CONFIG_DISABLED")
+                raise build_http_exception("MODEL_CONFIG_DISABLED")
             _clear_default(db, request.tenant_id)
             row.is_default = True
         elif request.is_default is False:
@@ -433,10 +457,11 @@ def delete_model_config(
 def set_default_model_config(
     config_id: str, tenant_id: str = Query(...), db: Session = Depends(get_session)
 ) -> ModelConfigRead:
+    """Make a verified enabled model the tenant default or return a safe model error."""
     row = _get_model_config(db, tenant_id, config_id)
     _require_trusted(row)
     if not row.enabled:
-        raise HTTPException(status_code=409, detail="MODEL_CONFIG_DISABLED")
+        raise build_http_exception("MODEL_CONFIG_DISABLED")
     _clear_default(db, tenant_id)
     row.is_default = True
     row.updated_at = utc_now()
@@ -457,6 +482,7 @@ def test_model_config(
     activate_if_initial: bool = False,
     db: Session = Depends(get_session),
 ) -> ModelConfigTestResponse:
+    """Run verification probes and return a stable result without provider prose leakage."""
     row = _get_model_config(db, tenant_id, config_id)
     initial_activation_candidate = (
         activate_if_initial
@@ -569,19 +595,31 @@ def test_model_config(
             trust_status=row.trust_status,
             attempt_status=row.verification_attempt_status,
             capabilities=capabilities,
-            error=ModelProviderErrorDetail.model_validate(exc.public_detail()),
+            error=_model_provider_error_detail(exc),
         )
     except HTTPException as exc:
-        detail = str(exc.detail)
-        error_code = detail if detail.startswith("MODEL_") else "MODEL_VERIFICATION_FAILED"
+        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        error_code = (
+            detail.get("code")
+            if isinstance(detail.get("code"), str) and detail["code"].startswith("MODEL_")
+            else "MODEL_VERIFICATION_FAILED"
+        )
         _mark_verification_failed(db, row, attempt_id, error_code)
         raise
-    except Exception:
+    except Exception as exc:
         _mark_verification_failed(db, row, attempt_id, "MODEL_VERIFICATION_INTERNAL_ERROR")
-        raise
+        raise build_http_exception(
+            "MODEL_VERIFICATION_INTERNAL_ERROR",
+            internal=InternalErrorContext(
+                source="model_verification",
+                exception_type=type(exc).__name__,
+                raw_message=str(exc),
+            ),
+        ) from exc
 
 
 def _verify_candidate_for_save(row: ModelConfig) -> None:
+    """Verify a candidate model and convert provider failures to the canonical HTTP contract."""
     attempt_id = uuid4().hex
     row.verification_attempt_id = attempt_id
     row.verification_attempt_status = "verifying"
@@ -591,7 +629,38 @@ def _verify_candidate_for_save(row: ModelConfig) -> None:
     try:
         _run_verification_probes(config)
     except LLMError as exc:
-        raise HTTPException(status_code=502, detail=exc.public_detail()) from exc
+        code = _verification_error_code(exc)
+        # Workflow: resolve provider-derived codes through the registry, validate the
+        # empty parameter contract, then fail closed to the model-specific fallback.
+        entry = ERROR_REGISTRY.get(code)
+        safe_retryable = exc.retryable
+        if entry is None or entry.visibility is not ErrorVisibility.PUBLIC:
+            entry = ERROR_REGISTRY.require("MODEL_VERIFICATION_FAILED")
+            safe_retryable = entry.retryable_default
+        else:
+            try:
+                ERROR_REGISTRY.validate(
+                    ErrorDescriptor(
+                        code=entry.code,
+                        params={},
+                        retryable=entry.retryable_default,
+                    )
+                )
+            except ErrorContractViolation:
+                entry = ERROR_REGISTRY.require("MODEL_VERIFICATION_FAILED")
+                safe_retryable = entry.retryable_default
+        raise build_http_exception(
+            entry.code,
+            retryable=safe_retryable,
+            request_id=exc.request_id,
+            internal=InternalErrorContext(
+                source="model_provider",
+                exception_type=type(exc).__name__,
+                raw_message=str(exc),
+                upstream_code=exc.provider_code,
+                upstream_status=exc.status_code,
+            ),
+        ) from exc
     row.trust_status = "verified"
     row.verified_at = utc_now()
     row.verified_fingerprint = _fingerprint(row)
@@ -662,10 +731,11 @@ def _mark_verification_failed(
 
 
 def _get_model_config(db: Session, tenant_id: str, config_id: str) -> ModelConfig:
+    """Load one tenant-owned model configuration through the canonical not-found contract."""
     ensure_tenant(db, tenant_id)
     row = db.get(ModelConfig, config_id)
     if not row or row.tenant_id != tenant_id:
-        raise HTTPException(status_code=404, detail="Model config not found")
+        raise build_http_exception("MODEL_CONFIG_NOT_FOUND", params={"config_id": config_id})
     return row
 
 
@@ -693,21 +763,42 @@ def _clear_default(db: Session, tenant_id: str) -> None:
 
 
 def _validate_subscription_request(request: ModelConfigCreateRequest) -> None:
+    """Reject API-key-only fields on subscription model requests with stable model codes."""
     if request.api_key:
-        raise HTTPException(status_code=422, detail="MODEL_SUBSCRIPTION_API_KEY_FORBIDDEN")
+        raise build_http_exception("MODEL_SUBSCRIPTION_API_KEY_FORBIDDEN")
     if request.base_url or request.provider or request.api_protocol:
-        raise HTTPException(status_code=422, detail="MODEL_SUBSCRIPTION_DIRECT_CONFIG_FORBIDDEN")
+        raise build_http_exception("MODEL_SUBSCRIPTION_DIRECT_CONFIG_FORBIDDEN")
     if request.extra_body or request.protocol_options:
-        raise HTTPException(status_code=422, detail="MODEL_SUBSCRIPTION_DIRECT_CONFIG_FORBIDDEN")
+        raise build_http_exception("MODEL_SUBSCRIPTION_DIRECT_CONFIG_FORBIDDEN")
 
 
 def _subscription_account_response(
     operation: Callable[[], CodexSubscriptionAccount],
 ) -> CodexSubscriptionAccountRead:
+    """Run a subscription operation and project known runtime failures by code and status."""
     try:
         result = operation()
     except CodexSubscriptionError as exc:
-        raise HTTPException(status_code=_subscription_error_status(exc.code), detail=exc.code) from exc
+        # Workflow: accept only a registered subscription code and keep raw process
+        # diagnostics private to the raised exception context.
+        entry = ERROR_REGISTRY.get(exc.code)
+        if entry is None or entry.visibility is not ErrorVisibility.PUBLIC:
+            entry = ERROR_REGISTRY.require("MODEL_SUBSCRIPTION_RUNTIME_FAILED")
+        else:
+            try:
+                ERROR_REGISTRY.validate(
+                    ErrorDescriptor(
+                        code=entry.code,
+                        params={},
+                        retryable=entry.retryable_default,
+                    )
+                )
+            except ErrorContractViolation:
+                entry = ERROR_REGISTRY.require("MODEL_SUBSCRIPTION_RUNTIME_FAILED")
+        raise build_http_exception(
+            entry.code,
+            status_code=_subscription_error_status(entry.code),
+        ) from exc
     return CodexSubscriptionAccountRead(**result.to_dict())
 
 
@@ -729,24 +820,26 @@ def _subscription_error_status(code: str) -> int:
 
 
 def _validate_subscription_update_request(request: ModelConfigUpdateRequest) -> None:
+    """Reject forbidden subscription update fields without returning natural-language detail."""
     if request.api_key:
-        raise HTTPException(status_code=422, detail="MODEL_SUBSCRIPTION_API_KEY_FORBIDDEN")
+        raise build_http_exception("MODEL_SUBSCRIPTION_API_KEY_FORBIDDEN")
     if request.base_url or request.provider or request.api_protocol:
-        raise HTTPException(status_code=422, detail="MODEL_SUBSCRIPTION_DIRECT_CONFIG_FORBIDDEN")
+        raise build_http_exception("MODEL_SUBSCRIPTION_DIRECT_CONFIG_FORBIDDEN")
     if request.extra_body or request.protocol_options:
-        raise HTTPException(status_code=422, detail="MODEL_SUBSCRIPTION_DIRECT_CONFIG_FORBIDDEN")
+        raise build_http_exception("MODEL_SUBSCRIPTION_DIRECT_CONFIG_FORBIDDEN")
 
 
 def _request_protocol_options(
     protocol_options: dict | None,
     protocol: ModelApiProtocol,
 ) -> dict:
+    """Validate protocol options and return a stable code for unsupported combinations."""
     if protocol_options is None:
         return {}
     if protocol is ModelApiProtocol.OPENAI_CHAT_COMPLETIONS:
         return normalize_chat_protocol_options(protocol_options)
     if protocol_options:
-        raise HTTPException(status_code=422, detail="MODEL_PROTOCOL_OPTIONS_INVALID")
+        raise build_http_exception("MODEL_PROTOCOL_OPTIONS_INVALID")
     return {}
 
 
@@ -755,25 +848,27 @@ def _request_extra_body(extra_body: dict | None, protocol: ModelApiProtocol) -> 
     if not extra_body:
         return {}
     if protocol is not ModelApiProtocol.OPENAI_CHAT_COMPLETIONS:
-        raise HTTPException(status_code=422, detail="MODEL_EXTRA_BODY_UNSUPPORTED")
+        raise build_http_exception("MODEL_EXTRA_BODY_UNSUPPORTED")
     return dict(extra_body)
 
 
 def _validate_sampling(
     protocol: ModelApiProtocol, temperature: float, max_output_tokens: int
 ) -> None:
+    """Validate sampling bounds using stable model validation codes."""
     max_temperature = 1 if protocol is ModelApiProtocol.ANTHROPIC_MESSAGES else 2
     if not 0 <= temperature <= max_temperature:
-        raise HTTPException(status_code=422, detail="MODEL_TEMPERATURE_INVALID")
+        raise build_http_exception("MODEL_TEMPERATURE_INVALID")
     if max_output_tokens <= 0:
-        raise HTTPException(status_code=422, detail="MODEL_MAX_OUTPUT_TOKENS_INVALID")
+        raise build_http_exception("MODEL_MAX_OUTPUT_TOKENS_INVALID")
 
 
 def _require_trusted(row: ModelConfig) -> None:
+    """Require a verified model fingerprint before enabling or selecting a configuration."""
     if row.trust_status == "legacy_trusted" and row.api_protocol == "openai_chat_completions":
         return
     if row.trust_status != "verified" or row.verified_fingerprint != _fingerprint(row):
-        raise HTTPException(status_code=409, detail="MODEL_CONFIG_VERIFICATION_REQUIRED")
+        raise build_http_exception("MODEL_CONFIG_VERIFICATION_REQUIRED")
 
 
 def _fingerprint(row: ModelConfig) -> str:
@@ -790,8 +885,9 @@ def _fingerprint(row: ModelConfig) -> str:
 
 
 def _commit_or_conflict(db: Session) -> None:
+    """Commit model changes and convert uniqueness races to a stable conflict response."""
     try:
         db.commit()
     except IntegrityError as exc:
         db.rollback()
-        raise HTTPException(status_code=409, detail="MODEL_DEFAULT_CONFLICT") from exc
+        raise build_http_exception("MODEL_DEFAULT_CONFLICT") from exc

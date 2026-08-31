@@ -5,6 +5,7 @@ from typing import Any, Literal, Optional
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.capability_scope import CapabilityScope
+from app.i18n.language_context import LanguageContext, SupportedLocale
 
 
 class GeneralSkillFile(BaseModel):
@@ -83,6 +84,9 @@ class GeneralSkillRunRequest(BaseModel):
     operation: Literal["read", "execute"] = "execute"
     session_id: Optional[str] = None
     model_config_id: Optional[str] = None
+    ui_locale: SupportedLocale | None = None
+    agent_reply_locale: SupportedLocale | None = None
+    language_context: LanguageContext | None = None
     max_attempts: int = Field(default=10, ge=1, le=10)
 
 
@@ -96,6 +100,7 @@ class GeneralSkillRunResponse(BaseModel):
     structured_result: dict[str, Any] = Field(default_factory=dict)
     artifacts: list[dict[str, Any]] = Field(default_factory=list)
     reply: str
+    language_context: LanguageContext | None = None
 
 
 class GeneralSkillSelection(BaseModel):

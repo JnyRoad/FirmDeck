@@ -3,6 +3,7 @@ import { LoaderCircle, LogIn, LogOut } from 'lucide-react';
 
 import { api, ApiError } from '@/api/client';
 import { TENANT_ID } from '@/api/client';
+import { useAppIntl } from '@/i18n';
 import {
   Dialog,
   DialogContent,
@@ -20,7 +21,7 @@ import { Button as UIButton } from '@/components/ui/button';
 import { notify } from '@/components/ui/app-toast';
 import IconModels from '@/assets/icons/sys-models.svg?react';
 import type { CodexSubscriptionAccountRead, ModelAuthMode, ModelConfigRead } from '@/types';
-import { modelActionError, providerErrorFromApiError, toastContentForProviderError } from '../ModelsPage';
+import { modelActionError, providerErrorFromApiError, subscriptionAccountMessage, toastContentForProviderError } from '../ModelsPage';
 import { CONFIG_NAME_MAX_LENGTH, type ApiKeyProtocol } from './channelPresets';
 
 export type ModelEditDialogProps = {
@@ -64,6 +65,20 @@ const BLANK_FORM: ModelForm = {
   enabled: true,
 };
 
+/** 将 API 协议映射为统一语义名称，避免编辑页复制协议标签字面量。 */
+function protocolLabel(protocol: ApiKeyProtocol, t: ReturnType<typeof useAppIntl>['t']): string {
+  switch (protocol) {
+    case 'openai_chat_completions':
+      return t('chat.modelSetup.protocol.openaiChat');
+    case 'openai_responses':
+      return t('chat.modelSetup.protocol.openaiResponses');
+    case 'anthropic_messages':
+      return t('chat.modelSetup.protocol.anthropicMessages');
+    default:
+      return t('chat.modelSetup.protocol.gemini');
+  }
+}
+
 export default function ModelEditDialog({
   open,
   selected,
@@ -76,6 +91,7 @@ export default function ModelEditDialog({
   onOpenChange,
   onSaved,
 }: ModelEditDialogProps) {
+  const { t } = useAppIntl();
   const [form, setForm] = useState<ModelForm>(BLANK_FORM);
   const [saving, setSaving] = useState(false);
   const [saveStage, setSaveStage] = useState<'saving' | 'testing' | null>(null);
@@ -114,7 +130,7 @@ export default function ModelEditDialog({
     const name = form.name.trim();
     const model = form.model.trim();
     if (!name || !model) {
-      notify.error('请填写名称和 Model');
+      notify.error(t('modelSetup.validation.requiredFields'));
       return;
     }
     const temperature = Number(form.temperature);
@@ -127,7 +143,7 @@ export default function ModelEditDialog({
       Number.isNaN(temperature) ||
       Number.isNaN(maxOutputTokens)
     ) {
-      notify.error('Temperature 与 Max Tokens 必须是数字');
+      notify.error(t('modelSetup.validation.numericFields'));
       return;
     }
     let extraBody: Record<string, unknown> = {};
@@ -139,7 +155,7 @@ export default function ModelEditDialog({
         }
         extraBody = parsed as Record<string, unknown>;
       } catch {
-        notify.error('额外参数必须是合法的 JSON 对象');
+        notify.error(t('modelSetup.validation.extraBodyInvalid'));
         return;
       }
     }
@@ -165,9 +181,9 @@ export default function ModelEditDialog({
       const verifyQuery = form.enabled ? '?verify_before_save=true' : '';
       await api.put<ModelConfigRead>(`/api/enterprise/model-configs/${selected.id}${verifyQuery}`, payload);
       if (form.enabled) {
-        notify.success(form.is_default ? '测试通过，已启用并设为默认模型' : '测试通过，已启用');
+        notify.success(form.is_default ? t('modelSetup.toast.enabledDefault') : t('modelSetup.toast.enabled'));
       } else {
-        notify.success('已保存');
+        notify.success(t('modelSetup.toast.saved'));
       }
       onOpenChange(false);
       onSaved();
@@ -175,8 +191,8 @@ export default function ModelEditDialog({
       const providerError = error instanceof ApiError ? providerErrorFromApiError(error) : null;
       notify.error(
         providerError
-          ? toastContentForProviderError(providerError, '保存失败')
-          : modelActionError(error, '保存失败'),
+          ? toastContentForProviderError(providerError, t('modelSetup.toast.saveFailed'))
+          : modelActionError(error, t('modelSetup.toast.saveFailed')),
       );
     } finally {
       setSaving(false);
@@ -195,47 +211,47 @@ export default function ModelEditDialog({
         <div className="flex items-center gap-[6px] px-[12px] text-[#757f9c]">
           <IconModels className="size-[14px] shrink-0" />
           <DialogTitle className="min-w-0 truncate text-[14px] font-normal leading-none text-[#757f9c]">
-            编辑模型：{selected.name}
+            {t('modelsPage.edit.title', { name: selected.name })}
           </DialogTitle>
         </div>
 
         <div className="min-h-0 flex-1 overflow-y-auto px-[12px]">
           <div className="grid grid-cols-1 gap-[14px] sm:grid-cols-2">
-            <LabeledField label="名称">
+            <LabeledField label={t('chat.modelSetup.name')}>
               <Input
                 value={form.name}
-                placeholder="例如 GPT-4o"
+                placeholder={t('modelSetup.field.configNamePlaceholder')}
                 maxLength={CONFIG_NAME_MAX_LENGTH}
                 onChange={(event) => updateForm('name', event.target.value)}
               />
               {form.name.length >= CONFIG_NAME_MAX_LENGTH && (
                 <p className="text-[11px] text-[#b42318]">
-                  名称最长 {CONFIG_NAME_MAX_LENGTH} 个字符，已达到上限。
+                  {t('modelSetup.validation.nameLength', { count: CONFIG_NAME_MAX_LENGTH })}
                 </p>
               )}
             </LabeledField>
-            <LabeledField label="认证方式">
+            <LabeledField label={t('modelsPage.column.authMode')}>
               <Select
                 value={form.auth_mode}
                 onValueChange={(value) => updateForm('auth_mode', value as ModelAuthMode)}
               >
                 <SelectTrigger><SelectValue /></SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="api_key">API Key</SelectItem>
-                  <SelectItem value="chatgpt_subscription">ChatGPT 订阅（Codex）</SelectItem>
+                  <SelectItem value="api_key">{t('modelsPage.authMode.apiKey')}</SelectItem>
+                  <SelectItem value="chatgpt_subscription">{t('modelsPage.authMode.subscription')}</SelectItem>
                 </SelectContent>
               </Select>
             </LabeledField>
-            <LabeledField label="Model">
-              <Input value={form.model} placeholder="例如 gpt-4o" onChange={(event) => updateForm('model', event.target.value)} />
+            <LabeledField label={t('modelSetup.field.modelLabel')}>
+              <Input value={form.model} placeholder={t('chat.modelSetup.modelPlaceholder')} onChange={(event) => updateForm('model', event.target.value)} />
             </LabeledField>
             {isSubscriptionForm ? (
               <div className="flex flex-col gap-[10px] rounded-[10px] border border-[#dce7ff] bg-[#f6f9ff] p-[12px] sm:col-span-2">
                 <div className="flex flex-wrap items-start justify-between gap-[10px]">
                   <div className="min-w-0">
-                    <p className="text-[12px] font-medium text-[#29466f]">ChatGPT 订阅</p>
+                    <p className="text-[12px] font-medium text-[#29466f]">{t('modelsPage.card.subscription')}</p>
                     <p className="mt-[3px] text-[12px] leading-[18px] text-[#5d6f8c]">
-                      {subscriptionAccount?.message || '正在读取 ChatGPT 订阅状态…'}
+                      {subscriptionAccount ? subscriptionAccount.message ? subscriptionAccountMessage(subscriptionAccount) : subscriptionAccountMessage(subscriptionAccount) : t('modelsPage.subscription.pending')}
                       {subscriptionAccount?.status === 'connected' && subscriptionAccount.plan_type
                         ? `（${subscriptionAccount.plan_type}）`
                         : ''}
@@ -250,7 +266,7 @@ export default function ModelEditDialog({
                       className="h-[30px] gap-[4px] border-[#cbd8f2] bg-white px-[10px] text-[12px] text-[#464c5e]"
                     >
                       <LogOut className="size-[13px]" />
-                      退出本机 Codex
+                      {t('modelsPage.confirm.logout.confirm')}
                     </UIButton>
                   ) : subscriptionAccount?.status === 'pending' ? (
                     <UIButton
@@ -260,7 +276,7 @@ export default function ModelEditDialog({
                       onClick={onCancelSubscriptionLogin}
                       className="h-[30px] border-[#cbd8f2] bg-white px-[10px] text-[12px] text-[#464c5e]"
                     >
-                      取消登录
+                      {t('modelSetup.actions.cancelLogin')}
                     </UIButton>
                   ) : (
                     <UIButton
@@ -270,17 +286,17 @@ export default function ModelEditDialog({
                       className="h-[30px] gap-[4px] bg-[#1a71ff] px-[10px] text-[12px] text-white hover:bg-[#1463df]"
                     >
                       {subscriptionLoading ? <LoaderCircle className="size-[13px] animate-spin" /> : <LogIn className="size-[13px]" />}
-                      连接 ChatGPT 订阅
+                      {t('modelSetup.actions.connectSubscription')}
                     </UIButton>
                   )}
                 </div>
                 <p className="text-[11px] leading-[16px] text-[#7483a0]">
-                  登录由本机 Codex runtime 管理。StaffDeck 不保存 ChatGPT OAuth code、access token 或 refresh token。
+                  {t('modelsPage.subscription.ownershipNotice')}
                 </p>
               </div>
             ) : (
               <>
-                <LabeledField label="API 协议">
+                <LabeledField label={t('chat.modelSetup.protocol')}>
                   <Select
                     value={form.api_protocol}
                     onValueChange={(value) => updateForm('api_protocol', value as ApiKeyProtocol)}
@@ -288,41 +304,41 @@ export default function ModelEditDialog({
                     <SelectTrigger><SelectValue /></SelectTrigger>
                     <SelectContent>
                       {availableProtocols.includes('openai_chat_completions') && (
-                        <SelectItem value="openai_chat_completions">OpenAI Chat Completions</SelectItem>
+                        <SelectItem value="openai_chat_completions">{protocolLabel('openai_chat_completions', t)}</SelectItem>
                       )}
                       {availableProtocols.includes('openai_responses') && (
-                        <SelectItem value="openai_responses">OpenAI Responses API</SelectItem>
+                        <SelectItem value="openai_responses">{protocolLabel('openai_responses', t)}</SelectItem>
                       )}
                       {availableProtocols.includes('anthropic_messages') && (
-                        <SelectItem value="anthropic_messages">Anthropic Messages</SelectItem>
+                        <SelectItem value="anthropic_messages">{protocolLabel('anthropic_messages', t)}</SelectItem>
                       )}
                       {availableProtocols.includes('gemini_generate_content') && (
-                        <SelectItem value="gemini_generate_content">Gemini Generate Content</SelectItem>
+                        <SelectItem value="gemini_generate_content">{protocolLabel('gemini_generate_content', t)}</SelectItem>
                       )}
                     </SelectContent>
                   </Select>
                 </LabeledField>
-                <LabeledField label="Base URL">
+                <LabeledField label={t('chat.modelSetup.baseUrl')}>
                   <Input
                     value={form.base_url}
                     placeholder={form.api_protocol === 'openai_chat_completions' || form.api_protocol === 'openai_responses'
-                      ? 'https://llm-center.modelbest.cn/llm/v1'
-                      : 'https://llm-center.modelbest.cn/llm'}
+                      ? t('chat.modelSetup.baseUrlOpenAI')
+                      : t('chat.modelSetup.baseUrlOther')}
                     onChange={(event) => updateForm('base_url', event.target.value)}
                   />
                 </LabeledField>
-                <LabeledField label="API Key">
+                <LabeledField label={t('chat.modelSetup.apiKey')}>
                   <Input
                     type="password"
                     value={form.api_key}
-                    placeholder="不修改请留空"
+                    placeholder={t('chat.modelSetup.keepExistingKey')}
                     onChange={(event) => updateForm('api_key', event.target.value)}
                   />
                 </LabeledField>
               </>
             )}
             <div className="grid grid-cols-2 gap-[14px]">
-              <LabeledField label="Temperature">
+              <LabeledField label={t('chat.modelSetup.temperature')}>
                 <Input
                   type="number"
                   min={0}
@@ -332,7 +348,7 @@ export default function ModelEditDialog({
                   onChange={(event) => updateForm('temperature', event.target.value)}
                 />
               </LabeledField>
-              <LabeledField label="Max Tokens">
+              <LabeledField label={t('chat.modelSetup.maxTokens')}>
                 <Input
                   type="number"
                   min={128}
@@ -343,11 +359,11 @@ export default function ModelEditDialog({
               </LabeledField>
             </div>
             {!isSubscriptionForm && form.api_protocol === 'openai_chat_completions' && <div className="sm:col-span-2">
-              <LabeledField label="额外请求参数（extra_body JSON）">
+              <LabeledField label={t('modelSetup.custom.extraBodyLabel')}>
                 <Textarea
                   rows={5}
                   value={form.extra_body}
-                  placeholder={'{\n  "thinking": {\n    "type": "disabled"\n  }\n}'}
+                  placeholder={t('modelSetup.custom.extraBodyPlaceholder')}
                   className="min-h-[116px] resize-y font-mono text-[12px]"
                   onChange={(event) => updateForm('extra_body', event.target.value)}
                 />
@@ -357,11 +373,11 @@ export default function ModelEditDialog({
           <div className="mt-[16px] flex flex-wrap items-center gap-[24px]">
             <label className="flex cursor-pointer items-center gap-[8px]">
               <Switch checked={form.is_default} onCheckedChange={(next) => updateForm('is_default', next)} />
-              <span className="text-[12px] font-medium text-[#464c5e]">设为默认</span>
+              <span className="text-[12px] font-medium text-[#464c5e]">{t('modelSetup.toggle.defaultShort')}</span>
             </label>
             <label className="flex cursor-pointer items-center gap-[8px]">
               <Switch checked={form.enabled} onCheckedChange={(next) => updateForm('enabled', next)} />
-              <span className="text-[12px] font-medium text-[#464c5e]">启用</span>
+              <span className="text-[12px] font-medium text-[#464c5e]">{t('modelSetup.toggle.enabled')}</span>
             </label>
           </div>
         </div>
@@ -373,7 +389,7 @@ export default function ModelEditDialog({
             onClick={closeDialog}
             className="h-[32px] w-[80px] rounded-[10px] border-[#e3e7f1] bg-white px-[12px] text-[14px] font-normal text-[#464c5e] hover:border-[#e3e7f1] hover:bg-[#f6f6f6] hover:text-[#18181a]"
           >
-            取消
+            {t('common.action.cancel')}
           </UIButton>
           <UIButton
             disabled={saving}
@@ -381,7 +397,7 @@ export default function ModelEditDialog({
             className="h-[32px] w-[80px] rounded-[10px] bg-[#18181a] px-[12px] text-[14px] font-normal text-white hover:bg-[#303030]"
           >
             {saving && <LoaderCircle className="size-[14px] animate-spin" />}
-            {saveStage === 'testing' ? '测试并保存中' : saving ? '保存中' : '保存'}
+            {saveStage === 'testing' ? t('modelSetup.actions.testAndSave') : saving ? t('modelSetup.actions.saving') : t('common.action.save')}
           </UIButton>
         </div>
       </DialogContent>

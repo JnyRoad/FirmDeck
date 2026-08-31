@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
@@ -24,6 +25,10 @@ from app.agents.branching import (
     visible_knowledge_base_versions,
 )
 from app.async_jobs import enqueue_async_job
+from app.contracts.error_registry import ERROR_REGISTRY
+from app.contracts.errors import InternalErrorContext
+from app.contracts.http import build_http_exception
+from app.contracts.projections import project_public_error_payload
 from app.db import get_session
 from app.db.models import (
     KnowledgeBase,
@@ -55,6 +60,7 @@ from app.knowledge.schema import (
     KnowledgeDocumentRead,
     KnowledgeDocumentUpdateRequest,
     KnowledgeDocumentUploadRequest,
+    KnowledgeErrorDescriptor,
     KnowledgeIngestJobRead,
     KnowledgeOkfImportRequest,
     KnowledgeSearchRequest,
@@ -85,13 +91,181 @@ router = APIRouter(
     dependencies=[Depends(get_current_user)],
 )
 
+_KNOWN_INGEST_STAGE_CODES = frozenset(
+    {
+        "queued",
+        "parsing",
+        "normalizing",
+        "documenting",
+        "bucketing",
+        "bucket_writing",
+        "chunking",
+        "summarizing",
+        "discovering",
+        "done",
+        "failed",
+        "cancel_requested",
+        "cancelled",
+    }
+)
+_SAFE_STAGE_PARAM_NAMES = frozenset(
+    {
+        "bucket_count",
+        "char_count",
+        "chunk_count",
+        "concept_count",
+        "count",
+        "document_id",
+        "file_type",
+        "knowledge_base_id",
+        "paragraph_count",
+        "section_count",
+        "status",
+        "version_id",
+    }
+)
+
 
 def _knowledge_http_error(exc: KnowledgeError) -> HTTPException:
-    """将共享知识写入门禁错误转换为稳定 HTTP 响应。"""
+    """将共享知识错误转换为 canonical 且不含原始诊断文本的 HTTP 载荷。"""
     return HTTPException(
         status_code=exc.status_code,
-        detail={"code": exc.code, "message": exc.message, **exc.details},
+        detail=exc.to_public_payload(),
     )
+
+
+def _knowledge_public_error(
+    code: str,
+    status_code: int,
+    *,
+    params: dict[str, object] | None = None,
+    cause: Exception | None = None,
+) -> HTTPException:
+    """Build a stable knowledge HTTP error while retaining any raw cause privately."""
+    internal = (
+        InternalErrorContext(
+            source="knowledge_api",
+            exception_type=type(cause).__name__,
+            raw_message=str(cause),
+        )
+        if cause is not None
+        else None
+    )
+    return build_http_exception(
+        code,
+        status_code=status_code,
+        params=params,
+        internal=internal,
+    )
+
+
+def _project_persisted_knowledge_error(error: object) -> KnowledgeErrorDescriptor | None:
+    """Project one persisted knowledge error and fail closed on legacy raw strings."""
+    if error is None:
+        return None
+    if isinstance(error, Mapping):
+        payload: object = dict(error)
+    elif isinstance(error, str):
+        if not error.strip():
+            return None
+        try:
+            payload = json.loads(error)
+        except json.JSONDecodeError:
+            payload = error
+    else:
+        payload = error
+    return project_public_error_payload(
+        payload,
+        ERROR_REGISTRY,
+        source="knowledge-api-persisted",
+    )
+
+
+def _safe_stage_params(value: object) -> dict[str, Any]:
+    """Keep only bounded scalar stage parameters so legacy metadata cannot expose prose."""
+    if not isinstance(value, Mapping):
+        return {}
+    safe: dict[str, Any] = {}
+    for key, item in value.items():
+        if (
+            isinstance(key, str)
+            and key in _SAFE_STAGE_PARAM_NAMES
+            and (item is None or isinstance(item, str | bool | int | float))
+            and (not isinstance(item, str) or len(item) <= 128)
+        ):
+            safe[key] = item
+    return safe
+
+
+def _safe_ingest_stage(value: object, fallback: str) -> str:
+    """Keep persisted ingest stages inside the known machine-code vocabulary."""
+    if isinstance(value, str) and value in _KNOWN_INGEST_STAGE_CODES:
+        return value
+    return fallback if fallback in _KNOWN_INGEST_STAGE_CODES else "queued"
+
+
+def _project_ingest_metadata(metadata: object, stage: str) -> dict[str, Any]:
+    """Project persisted ingest metadata while translating legacy stage prose to machine fields."""
+    source = metadata if isinstance(metadata, Mapping) else {}
+    projected = {
+        key: value
+        for key, value in source.items()
+        if key
+        not in {
+            "content_base64",
+            "stage_label",
+            "stage_detail",
+            "stage_code",
+            "stage_params",
+            "stage_stats",
+            "ingest_steps",
+        }
+    }
+    projected["stage_code"] = _safe_ingest_stage(source.get("stage_code"), stage)
+    projected["stage_params"] = _safe_stage_params(source.get("stage_params"))
+
+    stage_detail = source.get("stage_detail")
+    if isinstance(stage_detail, Mapping):
+        detail_code = stage_detail.get("code")
+        if isinstance(detail_code, str) and detail_code in _KNOWN_INGEST_STAGE_CODES:
+            projected["stage_detail"] = {
+                "code": detail_code,
+                "params": _safe_stage_params(stage_detail.get("params")),
+            }
+
+    stage_stats = _safe_stage_params(source.get("stage_stats"))
+    if stage_stats:
+        projected["stage_stats"] = stage_stats
+
+    raw_steps = source.get("ingest_steps")
+    if isinstance(raw_steps, list):
+        safe_steps: list[dict[str, Any]] = []
+        for item in raw_steps:
+            if not isinstance(item, Mapping):
+                continue
+            key = item.get("key")
+            progress = item.get("progress")
+            if (
+                not isinstance(key, str)
+                or key not in _KNOWN_INGEST_STAGE_CODES
+                or isinstance(progress, bool)
+                or not isinstance(progress, (int, float))
+                or not math.isfinite(progress)
+            ):
+                continue
+            status = item.get("status")
+            safe_steps.append(
+                {
+                    "key": key,
+                    "code": _safe_ingest_stage(item.get("code"), key),
+                    "params": _safe_stage_params(item.get("params")),
+                    "progress": float(progress),
+                    "status": status if status in {"pending", "running", "done"} else "pending",
+                }
+            )
+        if safe_steps:
+            projected["ingest_steps"] = safe_steps
+    return projected
 
 
 def _shared_writable_asset_version(
@@ -105,7 +279,7 @@ def _shared_writable_asset_version(
     """专用库沿用旧写入；共享资产只允许写入其来源团队的活动草稿。"""
     base = db.get(KnowledgeBase, knowledge_base_id)
     if base is None or base.tenant_id != tenant_id:
-        raise HTTPException(status_code=404, detail="Knowledge base not found")
+        raise _knowledge_public_error("KNOWLEDGE_BASE_NOT_FOUND", 404)
     if base.mode != "shared":
         return None
     if not version_id:
@@ -203,11 +377,13 @@ def import_okf_bundle(
         content = base64.b64decode(request.content_base64)
         parsed_docs = parse_okf_bundle(request.filename, content)
     except Exception as exc:  # noqa: BLE001 - surface stable import failures.
-        raise HTTPException(status_code=400, detail=f"OKF import failed: {exc}") from exc
+        raise _knowledge_public_error(
+            "KNOWLEDGE_OKF_IMPORT_FAILED",
+            400,
+            cause=exc,
+        ) from exc
     if not parsed_docs:
-        raise HTTPException(
-            status_code=400, detail="OKF bundle does not contain concept markdown files"
-        )
+        raise _knowledge_public_error("KNOWLEDGE_OKF_IMPORT_EMPTY", 400)
 
     upload_request = KnowledgeDocumentUploadRequest(
         tenant_id=request.tenant_id,
@@ -324,7 +500,7 @@ def _resolve_upload_knowledge_base(
             or knowledge_base.tenant_id != request.tenant_id
             or knowledge_base.status == "archived"
         ):
-            raise HTTPException(status_code=404, detail="Knowledge base not found")
+            raise _knowledge_public_error("KNOWLEDGE_BASE_NOT_FOUND", 404)
         if knowledge_base.mode != "shared" and not (agent and not agent.is_overall):
             _ensure_open_gallery_knowledge_admin(
                 db, request.tenant_id, knowledge_base.id, current_user
@@ -444,7 +620,7 @@ def get_job(
     ensure_tenant(db, tenant_id)
     job = db.get(KnowledgeIngestJob, job_id)
     if not job or job.tenant_id != tenant_id:
-        raise HTTPException(status_code=404, detail="Knowledge ingest job not found")
+        raise _knowledge_public_error("KNOWLEDGE_INGEST_JOB_NOT_FOUND", 404)
     _ensure_knowledge_version_visible(db, tenant_id, job.knowledge_base_version_id, agent_id)
     KnowledgeService(db).finalize_stale_cancel_requested_job(job)
     return job_read(job)
@@ -466,7 +642,7 @@ def cancel_job(
         )
     job = KnowledgeService(db).cancel_ingest_job(job_id, tenant_id)
     if not job:
-        raise HTTPException(status_code=404, detail="Knowledge ingest job not found")
+        raise _knowledge_public_error("KNOWLEDGE_INGEST_JOB_NOT_FOUND", 404)
     return job_read(job)
 
 
@@ -534,10 +710,7 @@ def update_document(
     """更新专用文档或共享草稿文档，正式共享快照保持只读。"""
     source_row = _get_document(db, request.tenant_id, document_id)
     if request.expected_updated_at and source_row.updated_at.isoformat() != request.expected_updated_at:
-        raise HTTPException(
-            status_code=409,
-            detail="文档已被其他人修改，请刷新后再保存。",
-        )
+        raise _knowledge_public_error("KNOWLEDGE_DOCUMENT_CONFLICT", 409)
     shared_version = _shared_writable_asset_version(
         db,
         tenant_id=request.tenant_id,
@@ -587,7 +760,11 @@ def update_document(
                 status=request.status,
             )
         except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
+            raise _knowledge_public_error(
+                "KNOWLEDGE_DOCUMENT_VALIDATION_FAILED",
+                422,
+                cause=exc,
+            ) from exc
         return document_read(row)
 
     metadata = dict(row.metadata_json or {})
@@ -630,7 +807,7 @@ def _document_for_version(
         .order_by(KnowledgeDocument.created_at.asc())
     ).all()
     if not rows:
-        raise HTTPException(status_code=404, detail="Knowledge document branch copy not found")
+        raise _knowledge_public_error("KNOWLEDGE_DOCUMENT_BRANCH_COPY_NOT_FOUND", 404)
     exact = [row for row in rows if row.title == source.title and row.created_at == source.created_at]
     return exact[0] if exact else rows[0]
 
@@ -673,7 +850,7 @@ def update_bucket(
     ensure_tenant(db, request.tenant_id)
     row = db.get(KnowledgeBucket, bucket_id)
     if not row or row.tenant_id != request.tenant_id:
-        raise HTTPException(status_code=404, detail="Knowledge bucket not found")
+        raise _knowledge_public_error("KNOWLEDGE_BUCKET_NOT_FOUND", 404)
     shared_version = _shared_writable_asset_version(
         db,
         tenant_id=request.tenant_id,
@@ -727,7 +904,7 @@ def get_bucket_chunks(
     ensure_tenant(db, tenant_id)
     bucket = db.get(KnowledgeBucket, bucket_id)
     if not bucket or bucket.tenant_id != tenant_id:
-        raise HTTPException(status_code=404, detail="Knowledge bucket not found")
+        raise _knowledge_public_error("KNOWLEDGE_BUCKET_NOT_FOUND", 404)
     _ensure_knowledge_version_visible(db, tenant_id, bucket.knowledge_base_version_id, agent_id)
     rows = _safe_bucket_chunk_rows(db, tenant_id, bucket_id)
     return [_chunk_read_mapping(row) for row in rows]
@@ -744,7 +921,7 @@ def update_chunk(
     ensure_tenant(db, request.tenant_id)
     row = db.get(KnowledgeChunk, chunk_id)
     if not row or row.tenant_id != request.tenant_id:
-        raise HTTPException(status_code=404, detail="Knowledge chunk not found")
+        raise _knowledge_public_error("KNOWLEDGE_CHUNK_NOT_FOUND", 404)
     shared_version = _shared_writable_asset_version(
         db,
         tenant_id=request.tenant_id,
@@ -796,7 +973,13 @@ def search_knowledge(
         request.agent_id,
     )
     if not visible_version_ids:
-        trace = [{"phase": "no_visible_knowledge", "message": "当前范围没有可见知识"}]
+        trace = [
+            {
+                "phase": "no_visible_knowledge",
+                "code": "no_visible_knowledge",
+                "params": {},
+            }
+        ]
         return KnowledgeSearchResponse(trace=trace, route_trace=trace)
     if request.knowledge_base_version_ids:
         allowed_ids = set(visible_version_ids)
@@ -828,7 +1011,9 @@ def _get_request_model(
         return _get_default_model(db, tenant_id)
     model_config = db.get(ModelConfig, model_config_id)
     if not model_config or model_config.tenant_id != tenant_id or not model_config.enabled:
-        raise HTTPException(status_code=404, detail="Model config not found")
+        raise _knowledge_public_error(
+            "MODEL_CONFIG_NOT_FOUND", 404, params={"config_id": model_config_id}
+        )
     return _runtime_model(db, tenant_id, model_config)
 
 
@@ -907,9 +1092,17 @@ def confirm_discovery(
     try:
         result = KnowledgeService(db).confirm_discovery(row)
     except KnowledgeDiscoveryValidationError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+        raise _knowledge_public_error(
+            "KNOWLEDGE_DISCOVERY_VALIDATION_FAILED",
+            422,
+            cause=exc,
+        ) from exc
     except KnowledgeDiscoveryConflictError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise _knowledge_public_error(
+            "KNOWLEDGE_DISCOVERY_CONFLICT",
+            409,
+            cause=exc,
+        ) from exc
     return {"status": "confirmed", "result": result}
 
 
@@ -939,7 +1132,11 @@ def reject_discovery(
     try:
         KnowledgeService(db).reject_discovery(row)
     except KnowledgeDiscoveryConflictError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise _knowledge_public_error(
+            "KNOWLEDGE_DISCOVERY_CONFLICT",
+            409,
+            cause=exc,
+        ) from exc
     return {"status": "rejected"}
 
 
@@ -1005,6 +1202,7 @@ def _sync_bucket_content_from_chunks(
 
 
 def job_read(row: KnowledgeIngestJob) -> KnowledgeIngestJobRead:
+    """Project one ingest job row while redacting any legacy raw error text."""
     return KnowledgeIngestJobRead(
         id=row.id,
         tenant_id=row.tenant_id,
@@ -1014,12 +1212,8 @@ def job_read(row: KnowledgeIngestJob) -> KnowledgeIngestJobRead:
         status=row.status,
         stage=row.stage,
         progress=row.progress,
-        error=row.error,
-        metadata={
-            key: value
-            for key, value in (row.metadata_json or {}).items()
-            if key != "content_base64"
-        },
+        error=_project_persisted_knowledge_error(row.error),
+        metadata=_project_ingest_metadata(row.metadata_json, row.stage),
         created_at=row.created_at.isoformat(),
         started_at=row.started_at.isoformat() if row.started_at else None,
         finished_at=row.finished_at.isoformat() if row.finished_at else None,
@@ -1028,6 +1222,7 @@ def job_read(row: KnowledgeIngestJob) -> KnowledgeIngestJobRead:
 
 
 def document_read(row: KnowledgeDocument) -> KnowledgeDocumentRead:
+    """Project one knowledge document row while failing closed on persisted raw errors."""
     return KnowledgeDocumentRead(
         id=row.id,
         tenant_id=row.tenant_id,
@@ -1040,7 +1235,7 @@ def document_read(row: KnowledgeDocument) -> KnowledgeDocumentRead:
         bucket_count=row.bucket_count,
         chunk_count=row.chunk_count,
         metadata=row.metadata_json or {},
-        error=row.error,
+        error=_project_persisted_knowledge_error(row.error),
         created_at=row.created_at.isoformat(),
         updated_at=row.updated_at.isoformat(),
     )
@@ -1227,7 +1422,7 @@ def _get_document(db: Session, tenant_id: str, document_id: str) -> KnowledgeDoc
     ensure_tenant(db, tenant_id)
     row = db.get(KnowledgeDocument, document_id)
     if not row or row.tenant_id != tenant_id:
-        raise HTTPException(status_code=404, detail="Knowledge document not found")
+        raise _knowledge_public_error("KNOWLEDGE_DOCUMENT_NOT_FOUND", 404)
     return row
 
 
@@ -1238,27 +1433,27 @@ def _ensure_knowledge_version_visible(
     agent_id: str | None,
 ) -> None:
     if not knowledge_base_version_id:
-        raise HTTPException(
-            status_code=404,
-            detail="Knowledge resource has no version binding; re-ingest the document or restore its knowledge-base version",
-        )
+        raise _knowledge_public_error("KNOWLEDGE_VERSION_BINDING_MISSING", 404)
     version = db.get(KnowledgeBaseVersion, knowledge_base_version_id)
     if not version or version.tenant_id != tenant_id:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Knowledge-base version {knowledge_base_version_id} does not exist in tenant {tenant_id}",
+        raise _knowledge_public_error(
+            "KNOWLEDGE_VERSION_NOT_FOUND",
+            404,
+            params={"version_id": knowledge_base_version_id},
         )
     visible_base_ids = set(
         visible_knowledge_base_versions(db, tenant_id, agent_id, include_inactive=True)
     )
     if version.knowledge_base_id not in visible_base_ids:
         scope = agent_id or "open-gallery"
-        raise HTTPException(
-            status_code=404,
-            detail=(
-                f"Knowledge-base version {knowledge_base_version_id} belongs to resource "
-                f"{version.knowledge_base_id}, which is not visible in scope {scope}"
-            ),
+        raise _knowledge_public_error(
+            "KNOWLEDGE_VERSION_NOT_VISIBLE",
+            404,
+            params={
+                "version_id": knowledge_base_version_id,
+                "knowledge_base_id": version.knowledge_base_id,
+                "scope": scope,
+            },
         )
 
 
@@ -1266,7 +1461,7 @@ def _get_discovery(db: Session, tenant_id: str, suggestion_id: str) -> Knowledge
     ensure_tenant(db, tenant_id)
     row = db.get(KnowledgeDiscoverySuggestion, suggestion_id)
     if not row or row.tenant_id != tenant_id:
-        raise HTTPException(status_code=404, detail="Knowledge discovery not found")
+        raise _knowledge_public_error("KNOWLEDGE_DISCOVERY_NOT_FOUND", 404)
     return row
 
 

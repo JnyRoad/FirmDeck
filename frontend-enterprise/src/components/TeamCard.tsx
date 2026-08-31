@@ -1,4 +1,6 @@
 import { Badge } from '@/components/ui';
+import { useAppIntl } from '@/i18n/useAppIntl';
+import { RawContent, RawIdentifier } from '@/i18n/RawContent';
 
 import type { AgentProfileRead, TeamMemberRead, TeamRead } from '../types';
 import EmployeeAvatar from './EmployeeAvatar';
@@ -15,7 +17,9 @@ export function teamLeader(team: TeamRead): TeamMemberRead | null {
   return (team.members || []).find((member) => member.role === 'leader') || null;
 }
 
+/** Render a localized team card while marking team-owned names and descriptions as raw. */
 export default function TeamCard({ team, agents, busy = false, onOpen }: TeamCardProps) {
+  const { t } = useAppIntl();
   const members = team.members || [];
   const leader = teamLeader(team);
   const stacked = members.slice(0, 3);
@@ -26,7 +30,7 @@ export default function TeamCard({ team, agents, busy = false, onOpen }: TeamCar
     <div
       role="button"
       tabIndex={0}
-      aria-label={team.name}
+      aria-label={t('teamCard.ariaLabel')}
       aria-busy={busy}
       onClick={() => {
         if (!busy) onOpen();
@@ -41,24 +45,29 @@ export default function TeamCard({ team, agents, busy = false, onOpen }: TeamCar
     >
       <div className="flex items-start justify-between gap-[8px]">
         <span className="min-w-0 truncate text-[16px] font-medium text-[#18181a]" title={team.name}>
-          {team.name}
+          <RawIdentifier value={team.name} />
         </span>
         <Badge
           variant="secondary"
           className="shrink-0 rounded-full bg-[#f2f3f7] text-[12px] font-normal text-[#464c5e]"
         >
-          {`${members.length} 名成员`}
+          {t('teamCard.memberCount', { count: members.length })}
         </Badge>
       </div>
       <p className="line-clamp-2 min-h-[34px] text-[12px] leading-[17px] text-[#757f9c]">
-        {team.description || '暂无描述'}
+        {team.description ? <RawContent value={team.description} /> : t('teamCard.description.empty')}
       </p>
       <div className="flex items-center justify-between gap-[8px]">
         <span className="flex min-w-0 items-center gap-[6px] text-[12px] text-[#757f9c]">
           {leader && (
             <EmployeeAvatar agent={agentById(leader.agent_id)} size={20} className="shrink-0" />
           )}
-          <span className="truncate">{`项目领导：${leader?.agent_name || '未设置'}`}</span>
+          <span className="truncate">
+            {t('teamCard.leaderPrefix')}{t('teamCard.leaderSeparator')}
+            {leader?.agent_name
+              ? <RawIdentifier value={leader.agent_name} />
+              : t('teamCard.leaderMissing')}
+          </span>
         </span>
         <span className="flex shrink-0 items-center">
           {stacked.map((member) => (
@@ -71,7 +80,7 @@ export default function TeamCard({ team, agents, busy = false, onOpen }: TeamCar
           ))}
           {extraCount > 0 && (
             <span className="-ml-[6px] grid size-[24px] place-items-center rounded-full bg-[#eef1f6] text-[10px] text-[#464c5e] ring-2 ring-white">
-              {`+${extraCount}`}
+              {t('teamCard.moreMembers', { count: extraCount })}
             </span>
           )}
         </span>

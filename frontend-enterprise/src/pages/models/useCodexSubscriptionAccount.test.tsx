@@ -5,7 +5,7 @@ import { act, renderHook, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { api } from '@/api/client';
-import { I18nProvider, useI18n } from '@/i18n';
+import { I18nProvider, useAppIntl } from '@/i18n';
 import type { CodexSubscriptionAccountRead } from '@/types';
 import { useCodexSubscriptionAccount } from './useCodexSubscriptionAccount';
 
@@ -198,7 +198,7 @@ describe('useCodexSubscriptionAccount', () => {
     const { result } = renderHook(
       () => {
         const subscription = useCodexSubscriptionAccount({ tenantId: 'tenant-isolated' });
-        const { setLocale } = useI18n();
+        const { setLocale } = useAppIntl();
         return { ...subscription, setLocale };
       },
       { wrapper: Wrapper },

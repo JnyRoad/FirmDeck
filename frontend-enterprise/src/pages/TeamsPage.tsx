@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { ChevronDown, ChevronRight, MessageCircle } from 'lucide-react';
 
@@ -11,7 +11,10 @@ import {
   Input,
   Textarea,
 } from '@/components/ui';
-import { notify } from '@/components/ui/app-toast';
+import { createToastNotifier } from '@/components/ui/app-toast';
+import { createAppTranslator, useAppIntl, type AppLocale, type AppTranslator, type MessageId, type MessageValues } from '@/i18n';
+import { createMessageDescriptor } from '@/i18n/descriptors';
+import { RawContent, RawIdentifier } from '@/i18n/RawContent';
 
 import IconPlus from '../assets/icons/plus.svg?react';
 import IconTrash from '../assets/icons/trash.svg?react';
@@ -22,42 +25,64 @@ import AppHeader from '../components/AppHeader';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import EmployeeAvatar from '../components/EmployeeAvatar';
 import { EnterpriseRoute } from '../enums/routes';
-import { parseBackendDateTime } from '../lib/timezone';
+import { getClientTimeZone, parseBackendDateTime } from '../lib/timezone';
 import type { AgentProfileRead, KnowledgeBaseRead, TeamRead, TeamThreadRead } from '../types';
 
-export function teamStatusLabel(status: string): string {
-  if (status === 'active') return '正常';
-  if (status === 'archived') return '已归档';
+type TeamMessageId = MessageId;
+
+export type TeamTranslate = (id: TeamMessageId, values?: MessageValues) => string;
+
+/** 将受控 AppTranslator 扩展为本页面待补目录键的类型安全适配器；不改变 locale 状态。 */
+function createTeamTranslator(translator: Pick<AppTranslator, 't'>): TeamTranslate {
+  return (id, values) => translator.t(id, values);
+}
+
+/** 为页面外的纯格式化函数提供中文兼容 translator；组件内调用方应显式传入当前 locale。 */
+function defaultTeamTranslator(): TeamTranslate {
+  return createTeamTranslator(createAppTranslator('zh-CN'));
+}
+
+/** 将团队状态码投影为本地化产品文案；未知状态保持后端原始枚举以便诊断。 */
+export function teamStatusLabel(status: string, translate: TeamTranslate = defaultTeamTranslator()): string {
+  if (status === 'active') return translate('teamsPage.status.active');
+  if (status === 'archived') return translate('teamsPage.status.archived');
   return status;
 }
 
-export function taskStatusLabel(status: string): string {
-  if (status === 'bidding') return '竞标中';
-  if (status === 'pending') return '待认领';
-  if (status === 'in_progress') return '进行中';
-  if (status === 'review') return '待验收';
-  if (status === 'done') return '已完成';
-  if (status === 'rework') return '已退回';
-  if (status === 'escalated') return '已升级';
+/** 将任务状态码投影为本地化产品文案；未知状态保持原始枚举而不猜测含义。 */
+export function taskStatusLabel(status: string, translate: TeamTranslate = defaultTeamTranslator()): string {
+  if (status === 'bidding') return translate('teamsPage.taskStatus.bidding');
+  if (status === 'pending') return translate('teamsPage.taskStatus.pending');
+  if (status === 'in_progress') return translate('teamsPage.taskStatus.inProgress');
+  if (status === 'review') return translate('teamsPage.taskStatus.review');
+  if (status === 'done') return translate('teamsPage.taskStatus.done');
+  if (status === 'rework') return translate('teamsPage.taskStatus.rework');
+  if (status === 'escalated') return translate('teamsPage.taskStatus.escalated');
   return status;
 }
 
-export function relativeTimeLabel(iso: string): string {
+/** 按当前语言、客户端时区和注册消息格式化相对时间；无效输入返回空字符串。 */
+export function relativeTimeLabel(
+  iso: string,
+  locale: AppLocale = 'zh-CN',
+  translate: TeamTranslate = createTeamTranslator(createAppTranslator(locale)),
+): string {
   const time = parseBackendDateTime(iso).getTime();
   if (Number.isNaN(time)) return '';
   const minutes = Math.floor((Date.now() - time) / 60000);
-  if (minutes < 1) return '刚刚';
-  if (minutes < 60) return `${minutes} 分钟前`;
+  if (minutes < 1) return translate('teamsPage.time.justNow');
+  if (minutes < 60) return translate('teamsPage.time.minutesAgo', { count: minutes });
   const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours} 小时前`;
+  if (hours < 24) return translate('teamsPage.time.hoursAgo', { count: hours });
   const days = Math.floor(hours / 24);
-  if (days < 7) return `${days} 天前`;
-  return parseBackendDateTime(iso).toLocaleDateString();
+  if (days < 7) return translate('teamsPage.time.daysAgo', { count: days });
+  return new Intl.DateTimeFormat(locale, { timeZone: getClientTimeZone() }).format(parseBackendDateTime(iso));
 }
 
+/** 读取团队项目领导的原始员工名；缺失时返回空值，由渲染层本地化占位文案。 */
 export function teamLeaderName(team: TeamRead): string {
   const leader = (team.members || []).find((member) => member.role === 'leader');
-  return leader?.agent_name || '未设置';
+  return leader?.agent_name || '';
 }
 
 export type TeamThreadTaskGroup = {
@@ -164,8 +189,12 @@ export default function TeamsPage({
   const [startingTeamId, setStartingTeamId] = useState('');
   const [expandedTeams, setExpandedTeams] = useState<Set<string> | null>(null);
   const navigate = useNavigate();
+  const { t: appT, locale } = useAppIntl();
+  const t = useMemo(() => createTeamTranslator({ t: appT }), [appT]);
+  const toast = useMemo(() => createToastNotifier({ t: appT }), [appT]);
 
   const threadTree = buildThreadTree(threads);
+  const numberFormatter = useMemo(() => new Intl.NumberFormat(locale), [locale]);
   // 每个团队的实时任务概况（threads 按 updated_at 倒序，同任务首次出现即最新状态）
   const teamTaskCounts = new Map<string, { active: number; attention: number }>();
   {
@@ -184,6 +213,7 @@ export default function TeamsPage({
   // 默认只展开最新动态的团队，避免动态刷屏
   const expanded = expandedTeams ?? new Set(threadTree.slice(0, 1).map((node) => node.teamId));
 
+  /** 切换团队动态树节点的展开状态；只修改本地折叠状态。 */
   function toggleTeamExpand(teamId: string) {
     const next = new Set(expanded);
     if (next.has(teamId)) next.delete(teamId);
@@ -191,6 +221,7 @@ export default function TeamsPage({
     setExpandedTeams(next);
   }
 
+  /** 渲染线程树中的一行；线程标题和团队数据保持原始内容。 */
   function renderThreadRow(thread: TeamThreadRead) {
     return (
       <button
@@ -207,12 +238,12 @@ export default function TeamsPage({
               : 'shrink-0 rounded-full bg-[#f2f3f7] text-[12px] font-normal text-[#464c5e]'
           }
         >
-          {thread.kind === 'tl_chat' ? '项目领导对话' : '任务'}
+          {thread.kind === 'tl_chat' ? t('teamsPage.activity.leaderChat') : t('teamsPage.activity.task')}
         </Badge>
         <span className="min-w-0 flex-1 truncate text-[13px] text-[#18181a]" title={thread.title}>
-          {thread.title}
+          <RawContent value={thread.title} />
         </span>
-        <span className="shrink-0 text-[12px] text-[#a7adbb]">{relativeTimeLabel(thread.updated_at)}</span>
+        <span className="shrink-0 text-[12px] text-[#a7adbb]">{relativeTimeLabel(thread.updated_at, locale, t)}</span>
       </button>
     );
   }
@@ -223,7 +254,7 @@ export default function TeamsPage({
       const rows = await api.get<TeamRead[]>(`/api/enterprise/teams?tenant_id=${TENANT_ID}`);
       setTeams(rows);
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '加载团队失败');
+      toast.error(createMessageDescriptor('teamsPage.toast.loadFailed'));
     } finally {
       setLoading(false);
     }
@@ -241,7 +272,7 @@ export default function TeamsPage({
       .get<KnowledgeBaseRead[]>(`/api/enterprise/knowledge-bases?tenant_id=${TENANT_ID}`)
       .then((rows) => setSharedKnowledgeBases(rows.filter((row) => row.mode === 'shared')))
       .catch(() => setSharedKnowledgeBases([]));
-  }, []);
+  }, [toast]);
 
   async function loadThreads() {
     try {
@@ -269,10 +300,10 @@ export default function TeamsPage({
         `/api/enterprise/teams/${team.id}/tl/session`,
         { tenant_id: TENANT_ID },
       );
-      if (!result.session_id) throw new Error('未返回团队群聊');
+      if (!result.session_id) throw new Error('TEAM_SESSION_MISSING');
       navigate(`${EnterpriseRoute.Chat}/${result.session_id}`);
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '开始团队对话失败');
+      toast.error(createMessageDescriptor('teamsPage.toast.startFailed'));
     } finally {
       setStartingTeamId('');
     }
@@ -281,7 +312,7 @@ export default function TeamsPage({
   async function createTeam() {
     const trimmed = name.trim();
     if (!trimmed) {
-      notify.error('请输入团队名称');
+      toast.error(createMessageDescriptor('teamsPage.toast.createRequired'));
       return;
     }
     setCreating(true);
@@ -307,7 +338,7 @@ export default function TeamsPage({
         description: description.trim() || undefined,
         knowledge_bases: knowledgeBases,
       });
-      notify.success('团队已创建');
+      toast.success(createMessageDescriptor('teamsPage.toast.created'));
       setCreateOpen(false);
       setName('');
       setDescription('');
@@ -316,7 +347,7 @@ export default function TeamsPage({
       setNewSharedKnowledgeName('');
       await load();
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '创建团队失败');
+      toast.error(createMessageDescriptor('teamsPage.toast.createFailed'));
     } finally {
       setCreating(false);
     }
@@ -328,11 +359,11 @@ export default function TeamsPage({
     setDeleting(true);
     try {
       await api.delete(`/api/enterprise/teams/${target.id}?tenant_id=${TENANT_ID}`);
-      notify.success('团队已删除');
+      toast.success(createMessageDescriptor('teamsPage.toast.deleted'));
       setDeleteTarget(null);
       await load();
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '删除团队失败');
+      toast.error(createMessageDescriptor('teamsPage.toast.deleteFailed'));
     } finally {
       setDeleting(false);
     }
@@ -343,8 +374,8 @@ export default function TeamsPage({
       <AppHeader
         onLogout={onLogout}
         userName={currentUser?.username}
-        title="我的团队"
-        description="在管理端组建团队、设置项目领导并跟踪任务"
+        title={t('teamsPage.title')}
+        description={t('teamsPage.description')}
       />
 
       {(() => {
@@ -362,15 +393,15 @@ export default function TeamsPage({
         const summaryCardClass =
           'flex h-[100px] flex-1 basis-[220px] items-center gap-[16px] rounded-[20px] bg-[#f6f6f6] px-[32px] py-[20px] text-left transition-shadow';
         const summaryStats = [
-          { key: 'all', value: teams.length, label: '团队总数', sub: `${totalMembers} 名成员` },
-          { key: 'active', value: activeTasks, label: '进行中任务', sub: '正在推进' },
-          { key: 'attention', value: attentionTasks, label: '待处理', sub: '需要人工介入' },
+          { key: 'all', value: teams.length, label: t('teamsPage.stats.total'), sub: t('teamsPage.stats.totalMembers', { count: totalMembers }) },
+          { key: 'active', value: activeTasks, label: t('teamsPage.stats.activeTasks'), sub: t('teamsPage.stats.activeSubtitle') },
+          { key: 'attention', value: attentionTasks, label: t('teamsPage.stats.attention'), sub: t('teamsPage.stats.attentionSubtitle') },
         ];
         return (
-          <div className="my-[36px] flex flex-wrap items-stretch gap-[20px]" aria-label="团队统计">
+          <div className="my-[36px] flex flex-wrap items-stretch gap-[20px]" aria-label={t('teamsPage.statistics')}>
             {summaryStats.map((stat) => (
               <div key={stat.key} className={summaryCardClass}>
-                <span className="shrink-0 text-[34px] font-semibold leading-none text-[#18181A]">{stat.value}</span>
+                <span className="shrink-0 text-[34px] font-semibold leading-none text-[#18181A]">{numberFormatter.format(stat.value)}</span>
                 <span className="flex min-w-0 flex-col gap-[4px]">
                   <span className="whitespace-nowrap text-[14px] text-[#464C5E]">{stat.label}</span>
                   <span className="whitespace-nowrap text-[12px] text-[#757F9C]">{stat.sub}</span>
@@ -387,8 +418,8 @@ export default function TeamsPage({
                 <IconPlus className="size-[38px]" />
               </span>
               <span className="flex min-w-0 flex-col gap-[4px]">
-                <span className="whitespace-nowrap text-[14px] text-[#464C5E]">创建新团队</span>
-                <span className="whitespace-nowrap text-[12px] text-[#757F9C]">几步搭好你的团队</span>
+                <span className="whitespace-nowrap text-[14px] text-[#464C5E]">{t('teamsPage.createCard.title')}</span>
+                <span className="whitespace-nowrap text-[12px] text-[#757F9C]">{t('teamsPage.createCard.subtitle')}</span>
               </span>
             </button>
           </div>
@@ -432,7 +463,7 @@ export default function TeamsPage({
                           <EmployeeAvatar agent={memberAgent} size={isLeader ? 64 : 44} />
                           {isLeader && (
                             <span className="absolute bottom-[2px] right-[2px] inline-flex h-[18px] items-center rounded-full bg-[#fff3d6] px-[5px] text-[10px] font-medium leading-none text-[#a16a00] ring-2 ring-white">
-                              项目领导
+                              {t('teamsPage.role.leader')}
                             </span>
                           )}
                         </span>
@@ -449,40 +480,43 @@ export default function TeamsPage({
                   variant="secondary"
                   className="shrink-0 rounded-full bg-[#f2f3f7] text-[12px] font-normal text-[#464c5e]"
                 >
-                  {teamStatusLabel(team.status)}
+                  {teamStatusLabel(team.status, t)}
                 </Badge>
               </div>
 
               <div className="mt-[14px] flex flex-col gap-[10px]">
                 <span className="min-w-0 truncate text-[16px] font-medium tracking-[-0.01em] text-[#18181a]" title={team.name}>
-                  {team.name}
+                  <RawIdentifier value={team.name} />
                 </span>
                 <p className="line-clamp-2 min-h-[34px] text-[12px] leading-[17px] text-[#757f9c]">
-                  {team.description || '暂无描述'}
+                  {team.description ? <RawContent value={team.description} /> : t('teamsPage.card.noDescription')}
                 </p>
                 <div className="flex flex-wrap items-center gap-[6px]">
                   <span className="rounded-full bg-[#f2f3f7] px-[8px] py-[3px] text-[11px] leading-none text-[#464c5e]">
-                    {`${members.length} 名成员`}
+                    {t('teamsPage.card.memberCount', { count: members.length })}
                   </span>
                   {counts.active > 0 && (
                     <span className="rounded-full bg-[#e8f0ff] px-[8px] py-[3px] text-[11px] leading-none text-[#1a71ff]">
-                      {`${counts.active} 进行中`}
+                      {t('teamsPage.card.activeCount', { count: counts.active })}
                     </span>
                   )}
                   {counts.attention > 0 && (
                     <span className="rounded-full bg-[#fff3d6] px-[8px] py-[3px] text-[11px] leading-none text-[#a16a00]">
-                      {`${counts.attention} 待处理`}
+                      {t('teamsPage.card.attentionCount', { count: counts.attention })}
                     </span>
                   )}
                 </div>
                 <div className="flex items-center justify-between gap-[10px] border-t border-[#f2f4f8] pt-[10px]">
                   <span className="min-w-0 truncate text-[12px] text-[#757f9c]">
-                    {`项目领导：${leader?.agent_name || '未设置'}`}
+                    <span>
+                      {t('teamsPage.card.leaderPrefix')}
+                      {leader?.agent_name ? <RawIdentifier value={leader.agent_name} /> : t('teamsPage.card.noLeader')}
+                    </span>
                   </span>
                   <div className="flex shrink-0 items-center gap-[4px]">
                     <button
                       type="button"
-                      aria-label={`开始与团队 ${team.name} 对话`}
+                      aria-label={t('teamsPage.action.startChatAria', { teamName: team.name })}
                       disabled={Boolean(startingTeamId)}
                       onClick={(event) => {
                         event.stopPropagation();
@@ -491,11 +525,11 @@ export default function TeamsPage({
                       className="inline-flex h-[30px] items-center gap-[5px] rounded-[9px] bg-[#18181a] px-[10px] text-[11px] text-white transition-colors hover:bg-[#303030] disabled:cursor-wait disabled:opacity-50"
                     >
                       <MessageCircle className="size-[13px]" />
-                      {startingTeamId === team.id ? '进入中…' : '开始对话'}
+                      {startingTeamId === team.id ? t('teamsPage.action.startingChat') : t('teamsPage.action.startChat')}
                     </button>
                     <button
                       type="button"
-                      aria-label={`删除团队 ${team.name}`}
+                      aria-label={t('teamsPage.action.deleteAria', { teamName: team.name })}
                       onClick={(event) => {
                         event.stopPropagation();
                         setDeleteTarget(team);
@@ -512,13 +546,13 @@ export default function TeamsPage({
         })}
         {!loading && teams.length === 0 && (
           <div className="col-span-full flex h-[200px] items-center justify-center rounded-[20px] border border-dashed border-[#e4e9f2] bg-[#fbfcfe] text-[14px] text-[#7f879a]">
-            暂无团队，点击上方「创建新团队」开始
+            {t('teamsPage.empty')}
           </div>
         )}
       </div>
 
-      <section aria-label="团队动态" className="mt-[24px] rounded-[20px] bg-white p-[20px] shadow-[0_0_6px_rgba(0,0,0,0.05)]">
-        <h2 className="mb-[12px] text-[16px] font-medium text-[#18181a]">团队动态</h2>
+      <section aria-label={t('teamsPage.activity.title')} className="mt-[24px] rounded-[20px] bg-white p-[20px] shadow-[0_0_6px_rgba(0,0,0,0.05)]">
+        <h2 className="mb-[12px] text-[16px] font-medium text-[#18181a]">{t('teamsPage.activity.title')}</h2>
         <div className="flex flex-col gap-[8px]">
           {threadTree.map((node) => {
             const isExpanded = expanded.has(node.teamId);
@@ -528,7 +562,9 @@ export default function TeamsPage({
                 <div className="flex items-center gap-[8px] px-[12px] py-[10px]">
                   <button
                     type="button"
-                    aria-label={isExpanded ? `收起团队 ${node.teamName}` : `展开团队 ${node.teamName}`}
+                    aria-label={isExpanded
+                      ? t('teamsPage.activity.collapse', { teamName: node.teamName })
+                      : t('teamsPage.activity.expand', { teamName: node.teamName })}
                     onClick={() => toggleTeamExpand(node.teamId)}
                     className="inline-grid size-[24px] shrink-0 place-items-center rounded-[8px] text-[#858b9c] transition-colors hover:bg-[#eef1f6]"
                   >
@@ -540,12 +576,12 @@ export default function TeamsPage({
                     className="min-w-0 flex-1 truncate text-left text-[14px] font-medium text-[#18181a] hover:text-[#1a71ff]"
                     title={node.teamName}
                   >
-                    {node.teamName}
+                    <RawIdentifier value={node.teamName} />
                   </button>
                   <Badge variant="secondary" className="shrink-0 rounded-full bg-[#f2f3f7] text-[12px] font-normal text-[#464c5e]">
-                    {node.tasks.length} 任务 · {threadCount} 线程
+                    {t('teamsPage.activity.counts', { taskCount: node.tasks.length, threadCount })}
                   </Badge>
-                  <span className="shrink-0 text-[12px] text-[#a7adbb]">{relativeTimeLabel(node.latestAt)}</span>
+                  <span className="shrink-0 text-[12px] text-[#a7adbb]">{relativeTimeLabel(node.latestAt, locale, t)}</span>
                 </div>
                 {isExpanded && (
                   <div className="flex flex-col gap-[4px] border-t border-[#f2f4f8] px-[12px] py-[8px]">
@@ -558,14 +594,14 @@ export default function TeamsPage({
                           className="flex w-full items-center gap-[8px] rounded-[10px] bg-[#fafbfd] px-[10px] py-[8px] text-left transition-colors hover:bg-[#f2f4f9]"
                         >
                           <span className="min-w-0 flex-1 truncate text-[13px] font-medium text-[#464c5e]" title={task.title}>
-                            {task.title}
+                            <RawContent value={task.title} />
                           </span>
                           {task.status && (
                             <Badge variant="secondary" className="shrink-0 rounded-full bg-[#f2f3f7] text-[12px] font-normal text-[#464c5e]">
-                              {taskStatusLabel(task.status)}
+                              {taskStatusLabel(task.status, t)}
                             </Badge>
                           )}
-                          <span className="shrink-0 text-[12px] text-[#a7adbb]">{relativeTimeLabel(task.latestAt)}</span>
+                          <span className="shrink-0 text-[12px] text-[#a7adbb]">{relativeTimeLabel(task.latestAt, locale, t)}</span>
                         </button>
                         <div className="ml-[16px] flex flex-col gap-[2px] border-l border-[#eef1f6] pl-[8px]">
                           {task.threads.map((thread) => renderThreadRow(thread))}
@@ -578,7 +614,7 @@ export default function TeamsPage({
             );
           })}
           {threadTree.length === 0 && (
-            <p className="py-[12px] text-center text-[12px] text-[#a7adbb]">暂无团队动态</p>
+            <p className="py-[12px] text-center text-[12px] text-[#a7adbb]">{t('teamsPage.activity.empty')}</p>
           )}
         </div>
       </section>
@@ -586,26 +622,26 @@ export default function TeamsPage({
       <Dialog open={createOpen} onOpenChange={setCreateOpen}>
         <DialogContent className="flex max-h-[calc(100dvh-32px)] w-[calc(100%-32px)] flex-col gap-0 overflow-hidden rounded-[16px] p-0 sm:max-w-[480px]">
           <DialogTitle className="shrink-0 px-[24px] py-[16px] text-[16px] font-semibold text-foreground">
-            新建团队
+            {t('teamsPage.dialog.createTitle')}
           </DialogTitle>
           <div className="flex min-h-0 flex-1 flex-col gap-[12px] overflow-y-auto px-[24px] pb-[16px]">
             <label className="flex flex-col gap-[6px] text-[12px] text-[#464c5e]">
-              团队名称
+              {t('teamsPage.dialog.teamNameLabel')}
               <Input
                 value={name}
                 onChange={(event) => setName(event.target.value)}
-                placeholder="请输入团队名称"
-                aria-label="团队名称"
+                placeholder={t('teamsPage.dialog.teamNamePlaceholder')}
+                aria-label={t('teamsPage.dialog.teamNameLabel')}
               />
             </label>
             <section
-              aria-label="团队知识库配置"
+              aria-label={t('teamsPage.dialog.knowledgeLabel')}
               className="rounded-[12px] border border-[#e7eaf1] bg-[#fafbfd] p-[12px]"
             >
               <div>
-                <h3 className="text-[13px] font-medium text-[#18181a]">团队知识库</h3>
+                <h3 className="text-[13px] font-medium text-[#18181a]">{t('teamsPage.dialog.knowledgeTitle')}</h3>
                 <p className="mt-[2px] text-[11px] leading-[17px] text-[#858b9c]">
-                  可绑定多个共享知识库，并任选一个作为默认写入目标；成员权限在团队详情中配置。
+                  {t('teamsPage.dialog.knowledgeDescription')}
                 </p>
               </div>
               <div className="mt-[10px] flex flex-col gap-[7px]">
@@ -619,7 +655,7 @@ export default function TeamsPage({
                       <label className="flex min-w-0 items-center gap-[7px] text-[12px] text-[#464c5e]">
                         <input
                           type="checkbox"
-                          aria-label={`选择${knowledgeBase.name}`}
+                          aria-label={t('teamsPage.dialog.selectKnowledge', { knowledgeBaseName: knowledgeBase.name })}
                           checked={selected}
                           onChange={(event) => {
                             setSelectedKnowledgeBaseIds((current) => (
@@ -632,24 +668,24 @@ export default function TeamsPage({
                             }
                           }}
                         />
-                        <span className="truncate">{knowledgeBase.name}</span>
+                        <span className="truncate"><RawIdentifier value={knowledgeBase.name} /></span>
                       </label>
                       <label className="flex shrink-0 items-center gap-[5px] text-[11px] text-[#858b9c]">
                         <input
                           type="radio"
                           name="team-default-knowledge"
-                          aria-label={`设为默认 ${knowledgeBase.name}`}
+                          aria-label={t('teamsPage.dialog.defaultKnowledge', { knowledgeBaseName: knowledgeBase.name })}
                           checked={defaultKnowledgeSelection === `existing:${knowledgeBase.id}`}
                           disabled={!selected}
                           onChange={() => setDefaultKnowledgeSelection(`existing:${knowledgeBase.id}`)}
                         />
-                        默认
+                        {t('teamsPage.dialog.default')}
                       </label>
                     </div>
                   );
                 })}
                 {sharedKnowledgeBases.length === 0 && (
-                  <p className="py-[4px] text-center text-[11px] text-[#a7adbb]">暂无可绑定的共享知识库</p>
+                  <p className="py-[4px] text-center text-[11px] text-[#a7adbb]">{t('teamsPage.dialog.noKnowledge')}</p>
                 )}
               </div>
               <div className="mt-[10px] flex items-center gap-[8px]">
@@ -661,30 +697,30 @@ export default function TeamsPage({
                       setDefaultKnowledgeSelection('');
                     }
                   }}
-                  placeholder="新建并绑定共享知识库（可选）"
-                  aria-label="新建共享知识库名称"
+                  placeholder={t('teamsPage.dialog.newKnowledgePlaceholder')}
+                  aria-label={t('teamsPage.dialog.newKnowledgeName')}
                   className="h-[32px] flex-1 text-[12px]"
                 />
                 <label className="flex shrink-0 items-center gap-[5px] text-[11px] text-[#858b9c]">
                   <input
                     type="radio"
                     name="team-default-knowledge"
-                    aria-label="将新建共享知识库设为默认"
+                    aria-label={t('teamsPage.dialog.defaultNewKnowledge')}
                     checked={defaultKnowledgeSelection === 'new'}
                     disabled={!newSharedKnowledgeName.trim()}
                     onChange={() => setDefaultKnowledgeSelection('new')}
                   />
-                  默认
+                  {t('teamsPage.dialog.default')}
                 </label>
               </div>
             </section>
             <label className="flex flex-col gap-[6px] text-[12px] text-[#464c5e]">
-              团队描述
+              {t('teamsPage.dialog.descriptionLabel')}
               <Textarea
                 value={description}
                 onChange={(event) => setDescription(event.target.value)}
-                placeholder="请输入团队描述（可选）"
-                aria-label="团队描述"
+                placeholder={t('teamsPage.dialog.descriptionPlaceholder')}
+                aria-label={t('teamsPage.dialog.descriptionLabel')}
                 rows={3}
               />
             </label>
@@ -697,7 +733,7 @@ export default function TeamsPage({
               onClick={() => setCreateOpen(false)}
               className="h-[32px] rounded-[10px] border-[#e3e7f1] px-[16px] text-[14px] font-normal text-[#464c5e]"
             >
-              取消
+              {t('teamsPage.dialog.cancel')}
             </Button>
             <Button
               type="button"
@@ -705,7 +741,7 @@ export default function TeamsPage({
               onClick={() => void createTeam()}
               className="h-[32px] rounded-[10px] bg-[#18181a] px-[16px] text-[14px] font-normal text-white hover:bg-[#303030]"
             >
-              {creating ? '创建中…' : '创建'}
+              {creating ? t('teamsPage.dialog.creating') : t('teamsPage.dialog.create')}
             </Button>
           </div>
         </DialogContent>
@@ -717,8 +753,10 @@ export default function TeamsPage({
           if (!open) setDeleteTarget(null);
         }}
         loading={deleting}
-        title={`删除团队「${deleteTarget?.name || ''}」？`}
-        description="删除后团队及其任务将一并移除，操作不可撤销。"
+        title={t('teamsPage.confirm.deleteTitle', { teamName: deleteTarget?.name || '' })}
+        description={t('teamsPage.confirm.deleteDescription')}
+        cancelText={t('common.action.cancel')}
+        confirmText={t('teamsPage.confirm.delete')}
         onConfirm={() => void confirmDelete()}
       />
     </div>

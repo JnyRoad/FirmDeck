@@ -4,6 +4,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from app.db.models import ChannelBinding, ChatSession, User, new_id, utc_now
+from app.session.session_kinds import SESSION_KIND_TEAM_TL
 
 _CHANNEL_TITLE_LIMIT = 20
 
@@ -100,8 +101,8 @@ def find_or_create_channel_session(
 ) -> ChatSession:
     """按 (agent_id, channel, external_conv_id) 锚定渠道会话，无则创建。
 
-    团队绑定传 team_id/team_title:创建时落 team_id 并以「团队 X · TL 对话」为题,
-    命中 api/chat 的 TL 会话三条件识别;TL 换帅后按新 agent_id 锚定自然另起会话。
+    团队绑定传 team_id/team_title:创建时落稳定机器类型，team_title 仅保留
+    原始团队名;TL 换帅后按新 agent_id 锚定自然另起会话。
     """
     chat_session = find_channel_session(db, binding, agent_id, external_conv_id)
     if chat_session:
@@ -135,6 +136,7 @@ def find_or_create_channel_session(
         channel_binding_id=binding.id,
         channel_account_key=binding.external_account_key,
         team_id=team_id,
+        session_kind=SESSION_KIND_TEAM_TL if team_id else None,
     )
     db.add(chat_session)
     try:

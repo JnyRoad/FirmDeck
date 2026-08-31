@@ -1,33 +1,48 @@
 import { InfoCircleOutlined } from '@/icons';
 import { Switch } from '@/components/ui/switch';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
+import type { MessageId } from '@/i18n/types';
+import { useAppIntl } from '@/i18n/useAppIntl';
 import { cn } from '@/lib/utils';
 import type { CapabilityScope } from '@/types';
 
 export type CapabilityScopeResourceType = 'tool' | 'skill' | 'sop' | 'knowledge_base';
 
-const SOP_SPECIFIC_SCOPE_DESCRIPTIONS: Record<CapabilityScopeResourceType, string> = {
-  tool: '仅限SOP：只有在SOP步骤中指定相关工具时方可调用',
-  skill: '仅限SOP：只有在SOP步骤中指定相关技能时方可调用',
-  sop: '仅限 SOP：不参与普通意图匹配和斜杠发现，只能被其他 SOP 节点明确调用。',
-  knowledge_base: '仅限SOP：只有在SOP步骤中指定相关知识库时方可调用',
-};
+const SCOPE_TOOLTIP_IDS = {
+  tool: 'capabilityScope.tooltip.tool',
+  skill: 'capabilityScope.tooltip.skill',
+  sop: 'capabilityScope.tooltip.sop',
+  knowledge_base: 'capabilityScope.tooltip.knowledgeBase',
+} as const satisfies Record<CapabilityScopeResourceType, MessageId>;
 
-const SOP_SPECIFIC_INLINE_DESCRIPTIONS: Record<CapabilityScopeResourceType, string> = {
-  tool: '仅在 SOP 步骤指定相关工具时可用。',
-  skill: '仅在 SOP 步骤指定相关技能时可用。',
-  sop: '仅能作为子 SOP 被明确调用，不会自动触发。',
-  knowledge_base: '仅在 SOP 步骤指定相关知识库时可用。',
-};
+const SCOPE_INLINE_IDS = {
+  tool: 'capabilityScope.description.tool',
+  skill: 'capabilityScope.description.skill',
+  sop: 'capabilityScope.description.sop',
+  knowledge_base: 'capabilityScope.description.knowledgeBase',
+} as const satisfies Record<CapabilityScopeResourceType, MessageId>;
 
+const SCOPE_LABEL_IDS = {
+  general: 'capabilityScope.option.general',
+  sop_specific: 'capabilityScope.option.sopOnly',
+} as const;
+
+/** Return the stable message ID for a normalized capability scope. */
+export function capabilityScopeLabelId(value: unknown) {
+  return SCOPE_LABEL_IDS[normalizeCapabilityScope(value)];
+}
+
+/** Normalize legacy and canonical wire values without localizing the scope token. */
 export function normalizeCapabilityScope(value: unknown): CapabilityScope {
   return value === 'sop_specific' || value === 'sop-specific' ? 'sop_specific' : 'general';
 }
 
-export function capabilityScopeLabel(value: unknown): string {
-  return normalizeCapabilityScope(value) === 'sop_specific' ? '仅限 SOP' : '通用';
+/** Return the semantic label ID for the normalized scope; callers resolve it in their locale. */
+export function capabilityScopeLabel(value: unknown): typeof SCOPE_LABEL_IDS[keyof typeof SCOPE_LABEL_IDS] {
+  return capabilityScopeLabelId(value);
 }
 
+/** Render a compact localized capability-scope badge. */
 export function CapabilityScopeBadge({
   value,
   className,
@@ -36,6 +51,7 @@ export function CapabilityScopeBadge({
   className?: string;
 }) {
   const scope = normalizeCapabilityScope(value);
+  const { t } = useAppIntl();
   return (
     <span
       className={cn(
@@ -46,11 +62,12 @@ export function CapabilityScopeBadge({
         className,
       )}
     >
-      {capabilityScopeLabel(scope)}
+      {t(capabilityScopeLabel(scope))}
     </span>
   );
 }
 
+/** Render the localized scope switch while keeping resource-specific guidance explicit. */
 export function CapabilityScopeControl({
   value,
   onChange,
@@ -67,6 +84,7 @@ export function CapabilityScopeControl({
   resourceType: CapabilityScopeResourceType;
 }) {
   const isSopSpecific = normalizeCapabilityScope(value) === 'sop_specific';
+  const { t } = useAppIntl();
   return (
     <div
       className={cn(
@@ -77,40 +95,40 @@ export function CapabilityScopeControl({
     >
       <div className="min-w-0">
         <div className="flex items-center gap-[6px]">
-          <span className="text-[13px] font-medium text-[#18181a]">能力范围</span>
+          <span className="text-[13px] font-medium text-[#18181a]">{t('capabilityScope.title')}</span>
           <Tooltip>
             <TooltipTrigger asChild>
               <button
                 type="button"
-                aria-label="查看仅限 SOP 说明"
+                aria-label={t('capabilityScope.action.viewDescription')}
                 className="inline-flex size-[18px] shrink-0 items-center justify-center rounded-full text-[#8b93a7] outline-none transition-colors hover:text-[#18181a] focus-visible:ring-2 focus-visible:ring-[#1a71ff]/40"
               >
                 <InfoCircleOutlined className="size-[14px]" />
               </button>
             </TooltipTrigger>
             <TooltipContent side="top" align="start" className="max-w-[360px] leading-[1.55]">
-              {SOP_SPECIFIC_SCOPE_DESCRIPTIONS[resourceType]}
+              {t(SCOPE_TOOLTIP_IDS[resourceType])}
             </TooltipContent>
           </Tooltip>
         </div>
         {!compact && (
           <p className="mt-[2px] text-[12px] leading-[1.55] text-[#858b9c]">
-            {isSopSpecific ? SOP_SPECIFIC_INLINE_DESCRIPTIONS[resourceType] : '闲聊与 SOP 执行中均可自主调用。'}
+            {isSopSpecific ? t(SCOPE_INLINE_IDS[resourceType]) : t('capabilityScope.description.general')}
           </p>
         )}
       </div>
       <div className="flex shrink-0 items-center gap-[8px]">
         <span className={cn('text-[12px]', !isSopSpecific ? 'font-medium text-[#18181a]' : 'text-[#858b9c]')}>
-          通用
+          {t('capabilityScope.option.general')}
         </span>
         <Switch
           checked={isSopSpecific}
           disabled={disabled}
-          aria-label="切换能力范围"
+          aria-label={t('capabilityScope.action.toggle')}
           onCheckedChange={(checked) => onChange(checked ? 'sop_specific' : 'general')}
         />
         <span className={cn('text-[12px]', isSopSpecific ? 'font-medium text-[#18181a]' : 'text-[#858b9c]')}>
-          仅限 SOP
+          {t('capabilityScope.option.sopOnly')}
         </span>
       </div>
     </div>

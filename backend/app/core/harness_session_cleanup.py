@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -8,6 +9,8 @@ from pathlib import Path
 from sqlmodel import Session, select
 
 from app import paths
+from app.contracts.error_registry import ERROR_REGISTRY
+from app.contracts.errors import ErrorDescriptor, InternalErrorContext
 from app.db.models import (
     HarnessInvocationRecord,
     HarnessRunRecord,
@@ -22,6 +25,21 @@ from app.harness.artifacts import (
     OpenedHarnessArtifact,
     open_harness_artifact,
 )
+
+logger = logging.getLogger(__name__)
+
+
+def _session_reset_error_payload() -> dict[str, object]:
+    """Return the canonical persisted reset descriptor and keep its legacy reason private."""
+    context = InternalErrorContext(
+        source="harness_session_cleanup",
+        raw_message="session reset cancelled active Harness turns",
+        upstream_code="SESSION_RESET",
+    )
+    logger.info("Harness session reset retained in private diagnostics: %s", context)
+    descriptor = ErrorDescriptor(code="INTERNAL_ERROR", params={}, retryable=False)
+    ERROR_REGISTRY.validate(descriptor)
+    return descriptor.model_dump(mode="json")
 
 
 @dataclass(frozen=True)
@@ -87,10 +105,7 @@ def stage_harness_session_execution_reset(
     now = utc_now()
     for turn in turns:
         turn.status = "cancelled"
-        turn.error_json = {
-            "code": "SESSION_RESET",
-            "message": "会话已重置，原 Harness turn 已取消。",
-        }
+        turn.error_json = _session_reset_error_payload()
         turn.finished_at = now
         turn.updated_at = now
         db.add(turn)

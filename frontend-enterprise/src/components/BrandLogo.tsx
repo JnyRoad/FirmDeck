@@ -1,4 +1,5 @@
 import { cn } from '@/lib/utils';
+import { RawIdentifier } from '@/i18n/RawContent';
 import logoMark from '../assets/LOGO.svg';
 
 export type BrandLogoProps = {
@@ -22,7 +23,7 @@ export default function BrandLogo({
     <span className={cn('flex items-center gap-[8px] overflow-hidden p-[4px]', className)}>
       <img
         src={logoMark}
-        alt="StaffDeck"
+        alt=""
         className="shrink-0"
         style={{ width: markSize, height: markSize }}
       />
@@ -32,10 +33,11 @@ export default function BrandLogo({
             OpenBMB
           </span> */}
           <strong className="text-[17px] font-semibold leading-none text-[#18181a]">
-            StaffDeck
+            <RawIdentifier value="StaffDeck" />
           </strong>
         </span>
       )}
+      {markOnly && <RawIdentifier className="sr-only" value="StaffDeck" />}
     </span>
   );
 }

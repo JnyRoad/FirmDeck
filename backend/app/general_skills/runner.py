@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import logging
 import os
 import queue
 import selectors
@@ -31,8 +32,15 @@ from app.general_skills.schema import (
 from app.harness.artifacts import HarnessArtifactAccessError, normalize_harness_artifact_path
 from app.harness.command import run_sandboxed_process
 from app.harness.errors import HarnessExecutionError
+from app.i18n.language_context import LanguageContext
+from app.i18n.raw_source import RawSourceKind, RawSourceMarker
 from app.llm import LLMClient, LLMError
 from app.llm.model_config_resolver import snapshot_model_config
+from app.llm.prompts.language import (
+    language_prompt_contract,
+    localized_compat_text,
+    resolve_prompt_language_context,
+)
 from app.llm.stage_protocol import stage_payload, unified_system_prompt
 from app.observability.spans import llm_operation
 
@@ -78,6 +86,171 @@ GENERAL_SKILL_REVIEW_OUTPUT = {
     "repair_hint": "string?",
 }
 GENERAL_SKILL_REPLY_OUTPUT = {"reply": "string"}
+logger = logging.getLogger(__name__)
+
+GENERAL_SKILL_TRACE_EVENT_CODE = "run.skill.trace"
+"""Stable public event code used by both legacy and structured Skill traces."""
+
+_GENERAL_SKILL_TRACE_CODE_PREFIX = "general_skill.trace"
+_GENERAL_SKILL_TRACE_PARAM_FIELDS: dict[str, frozenset[str]] = {
+    "skill_loaded": frozenset({"skill_slug", "skill_name"}),
+    "read_started": frozenset(),
+    "read_failed": frozenset(),
+    "read_created": frozenset(),
+    "reply_created": frozenset(),
+    "plan_failed": frozenset({"attempt"}),
+    "attempt_started": frozenset({"attempt"}),
+    "reflection_stopped": frozenset({"attempt"}),
+    "reflection_passed": frozenset({"attempt"}),
+    "reflection_retrying": frozenset({"attempt"}),
+    "repair_failed": frozenset({"attempt"}),
+    "reply_failed": frozenset(),
+    "planning": frozenset(),
+    "plan_created": frozenset({"attempt", "runtime"}),
+    "repair_planning": frozenset({"attempt"}),
+    "running_code": frozenset({"attempt", "runtime", "run_id"}),
+    "runtime_environment_failed": frozenset({"attempt", "runtime"}),
+    "stdout_chunk": frozenset({"attempt"}),
+    "stderr_chunk": frozenset({"attempt"}),
+    "code_timeout": frozenset({"attempt", "runtime"}),
+    "code_finished": frozenset({"attempt", "runtime", "return_code"}),
+    "replying": frozenset(),
+    "reflection_reviewing": frozenset({"attempt"}),
+    "reflection_reviewed": frozenset({"attempt"}),
+    "instructions_loaded": frozenset(
+        {"skill_slug", "skill_name", "operation", "requested_operation"}
+    ),
+    "unknown": frozenset(),
+}
+_GENERAL_SKILL_TRACE_PARAM_KINDS = {
+    "skill_slug": "string",
+    "skill_name": "string",
+    "operation": "string",
+    "requested_operation": "string",
+    "runtime": "string",
+    "run_id": "string",
+    "attempt": "integer",
+    "return_code": "integer",
+}
+_GENERAL_SKILL_TRACE_RAW_FIELDS = frozenset(
+    {
+        "raw_code",
+        "raw_error",
+        "raw_error_code",
+        "raw_stdout",
+        "raw_stderr",
+        "raw_structured_result",
+        "raw_review",
+        "raw_rationale",
+        "raw_expected_output",
+    }
+)
+
+
+def _is_trace_param_value(field_name: str, value: object) -> bool:
+    """Return whether one trace param has the exact primitive type assigned to its field."""
+    expected_kind = _GENERAL_SKILL_TRACE_PARAM_KINDS.get(field_name)
+    if expected_kind == "string":
+        return isinstance(value, str)
+    if expected_kind == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    return False
+
+
+def canonical_general_skill_trace_payload(item: Mapping[str, Any]) -> dict[str, Any]:
+    """Project one Skill trace item to stable descriptors and explicitly marked raw fields.
+
+    The outer ``run.skill.trace`` event is registered separately.  Its registry entry
+    intentionally has an empty parameter schema; the phase-specific ``params`` below
+    are validated by this local allowlist and are not claimed as registry validation.
+    """
+    source = dict(item) if isinstance(item, Mapping) else {}
+    raw_phase = str(source.pop("phase", "unknown") or "unknown").strip()
+    phase = raw_phase if raw_phase in _GENERAL_SKILL_TRACE_PARAM_FIELDS else "unknown"
+    expected_code = f"{_GENERAL_SKILL_TRACE_CODE_PREFIX}.{phase}"
+    supplied_params = source.pop("params", {})
+    params_source = dict(supplied_params) if isinstance(supplied_params, Mapping) else {}
+    if "skill_slug" not in params_source and "slug" in source:
+        params_source["skill_slug"] = source["slug"]
+    for field_name in _GENERAL_SKILL_TRACE_PARAM_FIELDS.get(phase, frozenset()):
+        if field_name in source and field_name not in params_source:
+            params_source[field_name] = source[field_name]
+    allowed_params = _GENERAL_SKILL_TRACE_PARAM_FIELDS.get(phase, frozenset())
+    params = {
+        field_name: params_source[field_name]
+        for field_name in sorted(allowed_params)
+        if field_name in params_source
+        and _is_trace_param_value(field_name, params_source[field_name])
+    }
+    payload: dict[str, Any] = {
+        "phase": phase,
+        "code": expected_code,
+        "event_code": GENERAL_SKILL_TRACE_EVENT_CODE,
+        "params": params,
+    }
+    for field_name in sorted(_GENERAL_SKILL_TRACE_RAW_FIELDS):
+        if field_name in source:
+            payload[field_name] = source[field_name]
+    raw_aliases = {
+        "code": "raw_code",
+        "error": "raw_error",
+        "error_code": "raw_error_code",
+        "stdout_preview": "raw_stdout",
+        "stderr_preview": "raw_stderr",
+        "structured_result": "raw_structured_result",
+        "review": "raw_review",
+        "rationale": "raw_rationale",
+        "expected_output": "raw_expected_output",
+    }
+    for source_name, target_name in raw_aliases.items():
+        if (
+            target_name not in payload
+            and source_name in source
+            and (source_name != "code" or source[source_name] != expected_code)
+        ):
+            payload[target_name] = source[source_name]
+    if phase == "stdout_chunk" and "raw_stdout" not in payload and "text" in source:
+        payload["raw_stdout"] = source["text"]
+    if phase == "stderr_chunk" and "raw_stderr" not in payload and "text" in source:
+        payload["raw_stderr"] = source["text"]
+    return payload
+
+
+def build_general_skill_trace_payload(
+    phase: str,
+    *,
+    params: Mapping[str, Any] | None = None,
+    **raw_fields: Any,
+) -> dict[str, Any]:
+    """Build a canonical Skill trace descriptor without allowing product prose fields."""
+    return canonical_general_skill_trace_payload(
+        {"phase": phase, "params": dict(params or {}), **raw_fields}
+    )
+
+
+def _general_skill_language_contract(
+    language_context: LanguageContext | None,
+    *extra_markers: RawSourceMarker,
+) -> dict[str, object]:
+    """Build the common Skill query/history/source contract plus stage-specific raw markers."""
+    return language_prompt_contract(
+        language_context,
+        [
+            RawSourceMarker(
+                json_pointer="/user_message",
+                kind=RawSourceKind.USER_INPUT,
+            ),
+            RawSourceMarker(
+                json_pointer="/conversation_context",
+                kind=RawSourceKind.HISTORY,
+            ),
+            RawSourceMarker(
+                json_pointer="/skill",
+                kind=RawSourceKind.BUSINESS_RECORD,
+            ),
+            *extra_markers,
+        ],
+    )
 
 
 class GeneralSkillExecutionCancelled(RuntimeError):
@@ -92,7 +265,9 @@ class GeneralSkillSelector:
         model_config: ModelConfig,
         conversation_context: dict[str, object] | None = None,
         memory_context: list[dict[str, object]] | None = None,
+        language_context: LanguageContext | None = None,
     ) -> GeneralSkillSelection:
+        """Select a skill operation while preserving query/history and constraining generated fields."""
         payload = stage_payload(
             phase="Router / General Skill Selector",
             user_message=query,
@@ -100,6 +275,23 @@ class GeneralSkillSelector:
             memory_context=memory_context,
             instructions=SELECTOR_PROMPT.read_text(encoding="utf-8"),
             stage_data={
+                **language_prompt_contract(
+                    language_context,
+                    [
+                        RawSourceMarker(
+                            json_pointer="/user_message",
+                            kind=RawSourceKind.USER_INPUT,
+                        ),
+                        RawSourceMarker(
+                            json_pointer="/conversation_context",
+                            kind=RawSourceKind.HISTORY,
+                        ),
+                        RawSourceMarker(
+                            json_pointer="/general_skills",
+                            kind=RawSourceKind.BUSINESS_RECORD,
+                        ),
+                    ],
+                ),
                 "general_skills": [
                     {
                         "slug": skill.slug,
@@ -135,10 +327,16 @@ class GeneralSkillReader:
         model_config: ModelConfig,
         conversation_context: dict[str, object] | None = None,
         memory_context: list[dict[str, object]] | None = None,
+        language_context: LanguageContext | None = None,
     ) -> GeneralSkillRunResponse:
+        """Generate a read-only Skill explanation in reply locale without rewriting Skill sources."""
+        language_context = resolve_prompt_language_context(language_context)
         trace: list[dict[str, Any]] = [
-            {"phase": "skill_loaded", "message": f"已加载通用技能 {skill.name}", "slug": skill.slug},
-            {"phase": "read_started", "message": "正在阅读 Skill 内容"},
+            build_general_skill_trace_payload(
+                "skill_loaded",
+                params={"skill_slug": skill.slug, "skill_name": skill.name},
+            ),
+            build_general_skill_trace_payload("read_started"),
         ]
         payload = stage_payload(
             phase="Step Agent / General Skill Read",
@@ -147,6 +345,23 @@ class GeneralSkillReader:
             memory_context=memory_context,
             instructions=READ_PROMPT.read_text(encoding="utf-8"),
             stage_data={
+                **language_prompt_contract(
+                    language_context,
+                    [
+                        RawSourceMarker(
+                            json_pointer="/user_message",
+                            kind=RawSourceKind.USER_INPUT,
+                        ),
+                        RawSourceMarker(
+                            json_pointer="/conversation_context",
+                            kind=RawSourceKind.HISTORY,
+                        ),
+                        RawSourceMarker(
+                            json_pointer="/skill",
+                            kind=RawSourceKind.BUSINESS_RECORD,
+                        ),
+                    ],
+                ),
                 "skill": {
                     "slug": skill.slug,
                     "name": skill.name,
@@ -164,26 +379,31 @@ class GeneralSkillReader:
             reply = str(raw.get("reply") or "").strip()
             if not reply:
                 raise LLMError("General skill read reply is empty")
-        except LLMError as exc:
+        except LLMError:
+            logger.exception("general skill read failed")
             trace.append(
-                {
-                    "phase": "read_failed",
-                    "message": "Skill 内容读取失败",
-                    "error": str(exc),
-                }
+                build_general_skill_trace_payload(
+                    "read_failed",
+                    raw_error_code="GENERAL_SKILL_READ_FAILED",
+                )
             )
             return GeneralSkillRunResponse(
                 skill_slug=skill.slug,
                 operation="read",
                 execution_trace=trace,
-                stderr=str(exc),
+                stderr="",
                 structured_result={
                     "success": False,
                     "operation": "read",
                     "error": "skill_read_failed",
-                    "message": str(exc),
+                    "error_code": "GENERAL_SKILL_READ_FAILED",
                 },
-                reply="抱歉，当前无法完成这个 Skill 的只读说明。",
+                reply=localized_compat_text(
+                    language_context,
+                    zh_cn="抱歉，当前无法完成这个 Skill 的只读说明。",
+                    en_us="Sorry, this Skill cannot be described right now.",
+                ),
+                language_context=language_context,
             )
         structured = {
             "success": True,
@@ -196,8 +416,8 @@ class GeneralSkillReader:
         }
         trace.extend(
             [
-                {"phase": "read_created", "message": "已完成 Skill 内容说明"},
-                {"phase": "reply_created", "message": "已生成只读说明"},
+                build_general_skill_trace_payload("read_created"),
+                build_general_skill_trace_payload("reply_created"),
             ]
         )
         return GeneralSkillRunResponse(
@@ -206,6 +426,7 @@ class GeneralSkillReader:
             execution_trace=trace,
             structured_result=structured,
             reply=reply,
+            language_context=language_context,
         )
 
 
@@ -225,11 +446,22 @@ class GeneralSkillRunner:
         sandbox_network_mode: str = "all",
         sandbox_allowed_domains: tuple[str, ...] = (),
         sandbox_enabled: bool = True,
+        language_context: LanguageContext | None = None,
     ) -> GeneralSkillRunResponse:
+        """Plan, execute, review, and answer under one immutable reply-locale snapshot."""
+        # Workflow: generate a bounded executable plan before any sandbox side effect occurs.
+        language_context = resolve_prompt_language_context(language_context)
         trace: list[dict[str, Any]] = []
         max_attempts = max(1, min(max_attempts, GENERAL_SKILL_MAX_ATTEMPTS))
         _raise_if_cancelled(is_cancelled)
-        _emit(trace, {"phase": "skill_loaded", "message": f"已加载通用技能 {skill.name}", "slug": skill.slug}, event_sink)
+        _emit(
+            trace,
+            build_general_skill_trace_payload(
+                "skill_loaded",
+                params={"skill_slug": skill.slug, "skill_name": skill.name},
+            ),
+            event_sink,
+        )
         try:
             plan, planning_attempts = self._generate_plan_with_reflection(
                 skill,
@@ -240,18 +472,36 @@ class GeneralSkillRunner:
                 max_attempts,
                 conversation_context,
                 memory_context,
+                language_context,
             )
             _raise_if_cancelled(is_cancelled)
-        except LLMError as exc:
-            _emit(trace, {"phase": "plan_failed", "message": "模型生成 runner 失败", "error": str(exc)}, event_sink)
+        except LLMError:
+            logger.exception("general skill runner plan failed")
+            _emit(
+                trace,
+                build_general_skill_trace_payload(
+                    "plan_failed",
+                    raw_error_code="GENERAL_SKILL_PLAN_FAILED",
+                ),
+                event_sink,
+            )
             return GeneralSkillRunResponse(
                 skill_slug=skill.slug,
                 execution_trace=trace,
                 generated_code="",
                 stdout="",
-                stderr=str(exc),
-                structured_result={"success": False, "error": "runner_plan_failed", "message": str(exc)},
-                reply="抱歉，当前通用技能执行代码生成失败，暂时无法完成这次运行。",
+                stderr="",
+                structured_result={
+                    "success": False,
+                    "error": "runner_plan_failed",
+                    "error_code": "GENERAL_SKILL_PLAN_FAILED",
+                },
+                reply=localized_compat_text(
+                    language_context,
+                    zh_cn="抱歉，当前通用技能执行代码生成失败，暂时无法完成这次运行。",
+                    en_us="Sorry, the Skill runner plan could not be generated for this run.",
+                ),
+                language_context=language_context,
             )
 
         attempts: list[dict[str, Any]] = planning_attempts
@@ -259,10 +509,14 @@ class GeneralSkillRunner:
         stderr = ""
         structured_result: dict[str, Any] = {}
         for attempt in range(1, max_attempts + 1):
+            # Workflow: execute and review each attempt before deciding whether repair is safe.
             _raise_if_cancelled(is_cancelled)
             _emit(
                 trace,
-                {"phase": "attempt_started", "message": f"开始第 {attempt} 次运行", "attempt": attempt},
+                build_general_skill_trace_payload(
+                    "attempt_started",
+                    params={"attempt": attempt},
+                ),
                 event_sink,
             )
             supported = inspect.signature(self._execute_plan).parameters
@@ -294,6 +548,7 @@ class GeneralSkillRunner:
                 attempt,
                 conversation_context,
                 memory_context,
+                language_context,
             )
             if (
                 structured_result.get("retryable") is False
@@ -317,44 +572,44 @@ class GeneralSkillRunner:
                 if structured_result.get("success") is False or review.get("result_sufficient") is False:
                     _emit(
                         trace,
-                        {
-                            "phase": "reflection_stopped",
-                            "message": f"第 {attempt} 次运行结果不足，但模型判断不可继续自动修复",
-                            "attempt": attempt,
-                            "structured_result": structured_result,
-                            "review": review,
-                        },
+                        build_general_skill_trace_payload(
+                            "reflection_stopped",
+                            params={"attempt": attempt},
+                            raw_structured_result=structured_result,
+                            raw_review=review,
+                        ),
                         event_sink,
                     )
                 else:
                     _emit(
                         trace,
-                        {"phase": "reflection_passed", "message": f"第 {attempt} 次运行结果可用", "attempt": attempt},
+                        build_general_skill_trace_payload(
+                            "reflection_passed",
+                            params={"attempt": attempt},
+                        ),
                         event_sink,
                     )
                 break
             if attempt >= max_attempts:
                 _emit(
                     trace,
-                    {
-                        "phase": "reflection_stopped",
-                        "message": f"已达到最多 {max_attempts} 次尝试，停止自动修复",
-                        "attempt": attempt,
-                    },
+                    build_general_skill_trace_payload(
+                        "reflection_stopped",
+                        params={"attempt": attempt},
+                    ),
                     event_sink,
                 )
                 break
             _emit(
                 trace,
-                {
-                    "phase": "reflection_retrying",
-                    "message": f"第 {attempt} 次运行未达预期，模型正在根据结果反思修复",
-                    "attempt": attempt,
-                    "stdout_preview": stdout[:600],
-                    "stderr_preview": stderr[:600],
-                    "structured_result": structured_result,
-                    "review": review,
-                },
+                build_general_skill_trace_payload(
+                    "reflection_retrying",
+                    params={"attempt": attempt},
+                    raw_stdout=stdout[:600],
+                    raw_stderr=stderr[:600],
+                    raw_structured_result=structured_result,
+                    raw_review=review,
+                ),
                 event_sink,
             )
             try:
@@ -368,12 +623,17 @@ class GeneralSkillRunner:
                     attempt + 1,
                     conversation_context,
                     memory_context,
+                    language_context,
                 )
                 _raise_if_cancelled(is_cancelled)
             except LLMError as exc:
                 _emit(
                     trace,
-                    {"phase": "repair_failed", "message": "模型反思修复代码失败", "attempt": attempt, "error": str(exc)},
+                    build_general_skill_trace_payload(
+                        "repair_failed",
+                        params={"attempt": attempt},
+                        raw_error=str(exc),
+                    ),
                     event_sink,
                 )
                 break
@@ -391,11 +651,16 @@ class GeneralSkillRunner:
                 event_sink,
                 conversation_context,
                 memory_context,
+                language_context,
             )
             _raise_if_cancelled(is_cancelled)
         except LLMError as exc:
-            _emit(trace, {"phase": "reply_failed", "message": "模型生成最终回复失败", "error": str(exc)}, event_sink)
-            reply = _fallback_reply(structured_result)
+            _emit(
+                trace,
+                build_general_skill_trace_payload("reply_failed", raw_error=str(exc)),
+                event_sink,
+            )
+            reply = _fallback_reply(structured_result, language_context)
         return GeneralSkillRunResponse(
             skill_slug=skill.slug,
             execution_trace=trace,
@@ -409,6 +674,7 @@ class GeneralSkillRunner:
                 else []
             ),
             reply=reply,
+            language_context=language_context,
         )
 
     def _generate_plan(
@@ -420,9 +686,12 @@ class GeneralSkillRunner:
         event_sink: TraceSink | None = None,
         conversation_context: dict[str, object] | None = None,
         memory_context: list[dict[str, object]] | None = None,
+        language_context: LanguageContext | None = None,
     ) -> GeneralSkillExecutionPlan:
-        _emit(trace, {"phase": "planning", "message": "正在根据 SKILL.md 生成 runner"}, event_sink)
+        """Generate one sandbox runner plan without rewriting the Skill package or user query."""
+        _emit(trace, build_general_skill_trace_payload("planning"), event_sink)
         stage_data = {
+            **_general_skill_language_contract(language_context),
             "skill": {
                 "slug": skill.slug,
                 "name": skill.name,
@@ -462,17 +731,15 @@ class GeneralSkillRunner:
         plan.runtime = _plan_runtime(plan)
         if not plan.code.strip():
             raise LLMError("General skill runner code is empty")
-        runtime_label = _runtime_label(plan.runtime)
         _emit(
             trace,
-            {
-                "phase": "plan_created",
-                "message": f"已生成 {runtime_label} runner",
-                "runtime": plan.runtime,
-                "rationale": plan.rationale,
-                "code": plan.code,
-                "expected_output": plan.expected_output,
-            },
+            build_general_skill_trace_payload(
+                "plan_created",
+                params={"runtime": plan.runtime},
+                raw_rationale=plan.rationale,
+                raw_code=plan.code,
+                raw_expected_output=plan.expected_output,
+            ),
             event_sink,
         )
         return plan
@@ -487,7 +754,9 @@ class GeneralSkillRunner:
         max_attempts: int,
         conversation_context: dict[str, object] | None,
         memory_context: list[dict[str, object]] | None,
+        language_context: LanguageContext | None,
     ) -> tuple[GeneralSkillExecutionPlan, list[dict[str, Any]]]:
+        """Retry plan generation while reusing the same language snapshot and source inputs."""
         planning_failures: list[dict[str, Any]] = []
         last_error: LLMError | None = None
         for plan_attempt in range(1, max_attempts + 1):
@@ -502,6 +771,7 @@ class GeneralSkillRunner:
                             event_sink,
                             conversation_context,
                             memory_context,
+                            language_context,
                         ),
                         planning_failures,
                     )
@@ -516,6 +786,7 @@ class GeneralSkillRunner:
                         plan_attempt,
                         conversation_context,
                         memory_context,
+                        language_context,
                     ),
                     planning_failures,
                 )
@@ -525,11 +796,11 @@ class GeneralSkillRunner:
                     "attempt": f"planning-{plan_attempt}",
                     "code": "",
                     "stdout": "",
-                    "stderr": str(exc),
+                    "stderr": "",
                     "structured_result": {
                         "success": False,
                         "error": "plan_generation_failed",
-                        "message": str(exc),
+                        "error_code": "GENERAL_SKILL_PLAN_FAILED",
                         "retryable": True,
                     },
                     "execution_review": {
@@ -543,25 +814,23 @@ class GeneralSkillRunner:
                 planning_failures.append(failure)
                 _emit(
                     trace,
-                    {
-                        "phase": "plan_failed",
-                        "message": f"第 {plan_attempt} 次 runner 计划生成失败",
-                        "attempt": plan_attempt,
-                        "error": str(exc),
-                    },
+                    build_general_skill_trace_payload(
+                        "plan_failed",
+                        params={"attempt": plan_attempt},
+                        raw_error_code="GENERAL_SKILL_PLAN_FAILED",
+                    ),
                     event_sink,
                 )
                 if plan_attempt >= max_attempts:
                     break
                 _emit(
                     trace,
-                    {
-                        "phase": "reflection_retrying",
-                        "message": f"第 {plan_attempt} 次计划生成失败，模型正在反思并重新输出代码",
-                        "attempt": plan_attempt,
-                        "structured_result": failure["structured_result"],
-                        "review": failure["execution_review"],
-                    },
+                    build_general_skill_trace_payload(
+                        "reflection_retrying",
+                        params={"attempt": plan_attempt},
+                        raw_structured_result=failure["structured_result"],
+                        raw_review=failure["execution_review"],
+                    ),
                     event_sink,
                 )
         raise LLMError(str(last_error) if last_error else "General skill runner plan generation failed")
@@ -577,13 +846,25 @@ class GeneralSkillRunner:
         next_attempt: int,
         conversation_context: dict[str, object] | None = None,
         memory_context: list[dict[str, object]] | None = None,
+        language_context: LanguageContext | None = None,
     ) -> GeneralSkillExecutionPlan:
+        """Repair a failed runner plan while preserving prior raw diagnostics verbatim."""
         _emit(
             trace,
-            {"phase": "repair_planning", "message": f"正在生成第 {next_attempt} 次运行代码", "attempt": next_attempt},
+            build_general_skill_trace_payload(
+                "repair_planning",
+                params={"attempt": next_attempt},
+            ),
             event_sink,
         )
         stage_data = {
+            **_general_skill_language_contract(
+                language_context,
+                RawSourceMarker(
+                    json_pointer="/previous_attempts",
+                    kind=RawSourceKind.DIAGNOSTIC,
+                ),
+            ),
             "skill": {
                 "slug": skill.slug,
                 "name": skill.name,
@@ -624,18 +905,15 @@ class GeneralSkillRunner:
         plan.runtime = _plan_runtime(plan)
         if not plan.code.strip():
             raise LLMError("General skill repaired runner code is empty")
-        runtime_label = _runtime_label(plan.runtime)
         _emit(
             trace,
-            {
-                "phase": "plan_created",
-                "message": f"已生成第 {next_attempt} 次 {runtime_label} runner",
-                "attempt": next_attempt,
-                "runtime": plan.runtime,
-                "rationale": plan.rationale,
-                "code": plan.code,
-                "expected_output": plan.expected_output,
-            },
+            build_general_skill_trace_payload(
+                "plan_created",
+                params={"attempt": next_attempt, "runtime": plan.runtime},
+                raw_rationale=plan.rationale,
+                raw_code=plan.code,
+                raw_expected_output=plan.expected_output,
+            ),
             event_sink,
         )
         return plan
@@ -684,13 +962,14 @@ class GeneralSkillRunner:
         }
         _emit(
             trace,
-            {
-                "phase": "running_code",
-                "message": f"正在运行第 {attempt} 次 {_runtime_label(runtime)} runner",
-                "run_id": run_dir.name,
-                "attempt": attempt,
-                "runtime": runtime,
-            },
+            build_general_skill_trace_payload(
+                "running_code",
+                params={
+                    "attempt": attempt,
+                    "runtime": runtime,
+                    "run_id": run_dir.name,
+                },
+            ),
             event_sink,
         )
         try:
@@ -705,13 +984,11 @@ class GeneralSkillRunner:
             }
             _emit(
                 trace,
-                {
-                    "phase": "runtime_environment_failed",
-                    "message": "通用技能运行环境准备失败",
-                    "attempt": attempt,
-                    "runtime": runtime,
-                    "structured_result": structured,
-                },
+                build_general_skill_trace_payload(
+                    "runtime_environment_failed",
+                    params={"attempt": attempt, "runtime": runtime},
+                    raw_structured_result=structured,
+                ),
                 event_sink,
             )
             return "", str(exc), structured
@@ -734,9 +1011,15 @@ class GeneralSkillRunner:
                 "message": "当前运行环境不支持 bash 技能（Windows 或打包版），请改用 Python 技能。",
                 "retryable": False,
             }
-            _emit(trace, {"phase": "runtime_environment_failed",
-                          "message": "bash runtime 不受支持", "attempt": attempt,
-                          "runtime": runtime, "structured_result": structured}, event_sink)
+            _emit(
+                trace,
+                build_general_skill_trace_payload(
+                    "runtime_environment_failed",
+                    params={"attempt": attempt, "runtime": runtime},
+                    raw_structured_result=structured,
+                ),
+                event_sink,
+            )
             return "", structured["message"], structured
         command = ["/bin/bash", str(runner_path)] if runtime == "bash" else [str(runtime_python), str(runner_path)]
         cwd = str(skill_dir if runtime == "bash" else run_dir)
@@ -769,13 +1052,21 @@ class GeneralSkillRunner:
         if stdout:
             _emit(
                 trace,
-                {"phase": "stdout_chunk", "message": "收到运行输出", "attempt": attempt, "text": stdout},
+                build_general_skill_trace_payload(
+                    "stdout_chunk",
+                    params={"attempt": attempt},
+                    raw_stdout=stdout,
+                ),
                 event_sink,
             )
         if stderr:
             _emit(
                 trace,
-                {"phase": "stderr_chunk", "message": "收到错误输出", "attempt": attempt, "text": stderr},
+                build_general_skill_trace_payload(
+                    "stderr_chunk",
+                    params={"attempt": attempt},
+                    raw_stderr=stderr,
+                ),
                 event_sink,
             )
 
@@ -785,15 +1076,13 @@ class GeneralSkillRunner:
             structured = {"success": False, "error": "runner_timeout", "message": "通用技能运行超时"}
             _emit(
                 trace,
-                {
-                    "phase": "code_timeout",
-                    "message": f"{_runtime_label(runtime)} runner 执行超时",
-                    "attempt": attempt,
-                    "runtime": runtime,
-                    "stdout_preview": stdout[:600],
-                    "stderr_preview": stderr[:600],
-                    "structured_result": structured,
-                },
+                build_general_skill_trace_payload(
+                    "code_timeout",
+                    params={"attempt": attempt, "runtime": runtime},
+                    raw_stdout=stdout[:600],
+                    raw_stderr=stderr[:600],
+                    raw_structured_result=structured,
+                ),
                 event_sink,
             )
             return stdout, stderr, structured
@@ -816,16 +1105,17 @@ class GeneralSkillRunner:
             structured.setdefault("error", f"runner exited with code {return_code}")
         _emit(
             trace,
-            {
-                "phase": "code_finished",
-                "message": f"{_runtime_label(runtime)} runner 执行完成",
-                "attempt": attempt,
-                "runtime": runtime,
-                "return_code": return_code,
-                "stdout_preview": stdout[:600],
-                "stderr_preview": stderr[:600],
-                "structured_result": structured,
-            },
+            build_general_skill_trace_payload(
+                "code_finished",
+                params={
+                    "attempt": attempt,
+                    "runtime": runtime,
+                    "return_code": return_code,
+                },
+                raw_stdout=stdout[:600],
+                raw_stderr=stderr[:600],
+                raw_structured_result=structured,
+            ),
             event_sink,
         )
         return stdout, stderr, structured
@@ -842,9 +1132,30 @@ class GeneralSkillRunner:
         event_sink: TraceSink | None = None,
         conversation_context: dict[str, object] | None = None,
         memory_context: list[dict[str, object]] | None = None,
+        language_context: LanguageContext | None = None,
     ) -> str:
-        _emit(trace, {"phase": "replying", "message": "正在根据运行结果生成回复"}, event_sink)
+        """Generate final Skill prose in reply locale while retaining execution output verbatim."""
+        _emit(trace, build_general_skill_trace_payload("replying"), event_sink)
         stage_data = {
+            **_general_skill_language_contract(
+                language_context,
+                RawSourceMarker(
+                    json_pointer="/execution_trace",
+                    kind=RawSourceKind.DIAGNOSTIC,
+                ),
+                RawSourceMarker(
+                    json_pointer="/stdout",
+                    kind=RawSourceKind.TOOL_PROVIDER_OUTPUT,
+                ),
+                RawSourceMarker(
+                    json_pointer="/stderr",
+                    kind=RawSourceKind.DIAGNOSTIC,
+                ),
+                RawSourceMarker(
+                    json_pointer="/structured_result",
+                    kind=RawSourceKind.TOOL_PROVIDER_OUTPUT,
+                ),
+            ),
             "skill": {
                 "slug": skill.slug,
                 "name": skill.name,
@@ -876,7 +1187,7 @@ class GeneralSkillRunner:
             raise LLMError(f"General skill reply returned invalid JSON schema: {exc}") from exc
         if not reply:
             raise LLMError("General skill reply is empty")
-        _emit(trace, {"phase": "reply_created", "message": "已生成最终回复"}, event_sink)
+        _emit(trace, build_general_skill_trace_payload("reply_created"), event_sink)
         return reply
 
     def _review_execution_result(
@@ -893,17 +1204,37 @@ class GeneralSkillRunner:
         attempt: int,
         conversation_context: dict[str, object] | None = None,
         memory_context: list[dict[str, object]] | None = None,
+        language_context: LanguageContext | None = None,
     ) -> dict[str, Any]:
+        """Review raw execution evidence under the same immutable language snapshot."""
         _emit(
             trace,
-            {
-                "phase": "reflection_reviewing",
-                "message": f"正在校验第 {attempt} 次运行结果",
-                "attempt": attempt,
-            },
+            build_general_skill_trace_payload(
+                "reflection_reviewing",
+                params={"attempt": attempt},
+            ),
             event_sink,
         )
         stage_data = {
+            **_general_skill_language_contract(
+                language_context,
+                RawSourceMarker(
+                    json_pointer="/runner",
+                    kind=RawSourceKind.DIAGNOSTIC,
+                ),
+                RawSourceMarker(
+                    json_pointer="/stdout",
+                    kind=RawSourceKind.TOOL_PROVIDER_OUTPUT,
+                ),
+                RawSourceMarker(
+                    json_pointer="/stderr",
+                    kind=RawSourceKind.DIAGNOSTIC,
+                ),
+                RawSourceMarker(
+                    json_pointer="/structured_result",
+                    kind=RawSourceKind.TOOL_PROVIDER_OUTPUT,
+                ),
+            ),
             "skill": {
                 "slug": skill.slug,
                 "name": skill.name,
@@ -950,12 +1281,11 @@ class GeneralSkillRunner:
             review["needs_retry"] = False
         _emit(
             trace,
-            {
-                "phase": "reflection_reviewed",
-                "message": "已完成运行结果校验",
-                "attempt": attempt,
-                "review": review,
-            },
+            build_general_skill_trace_payload(
+                "reflection_reviewed",
+                params={"attempt": attempt},
+                raw_review=review,
+            ),
             event_sink,
         )
         return review
@@ -1205,14 +1535,18 @@ def _stream_process_output_selectors(
                 if name == "stdout":
                     stdout_parts.append(text)
                     phase = "stdout_chunk"
-                    message = "收到运行输出"
                 else:
                     stderr_parts.append(text)
                     phase = "stderr_chunk"
-                    message = "收到错误输出"
                 _emit(
                     trace,
-                    {"phase": phase, "message": message, "attempt": attempt, "text": text},
+                    build_general_skill_trace_payload(
+                        phase,
+                        params={"attempt": attempt},
+                        **{"raw_stdout": text}
+                        if phase == "stdout_chunk"
+                        else {"raw_stderr": text},
+                    ),
                     event_sink,
                 )
     finally:
@@ -1299,11 +1633,21 @@ def _stream_process_output_threaded(
         text = chunk.decode("utf-8", errors="replace")
         if name == "stdout":
             stdout_parts.append(text)
-            phase, message = "stdout_chunk", "收到运行输出"
+            phase = "stdout_chunk"
         else:
             stderr_parts.append(text)
-            phase, message = "stderr_chunk", "收到错误输出"
-        _emit(trace, {"phase": phase, "message": message, "attempt": attempt, "text": text}, event_sink)
+            phase = "stderr_chunk"
+        _emit(
+            trace,
+            build_general_skill_trace_payload(
+                phase,
+                params={"attempt": attempt},
+                **{"raw_stdout": text}
+                if phase == "stdout_chunk"
+                else {"raw_stderr": text},
+            ),
+            event_sink,
+        )
 
     for t in threads:
         t.join(timeout=1.0)
@@ -1318,10 +1662,16 @@ def _bash_supported() -> bool:
     return Path("/bin/bash").exists()
 
 
-def _emit(trace: list[dict[str, Any]], item: dict[str, Any], event_sink: TraceSink | None = None) -> None:
-    trace.append(item)
+def _emit(
+    trace: list[dict[str, Any]],
+    item: Mapping[str, Any],
+    event_sink: TraceSink | None = None,
+) -> None:
+    """Append and stream one canonical Skill trace descriptor."""
+    payload = canonical_general_skill_trace_payload(item)
+    trace.append(payload)
     if event_sink:
-        event_sink(item)
+        event_sink(payload)
 
 
 def _execution_needs_retry(stdout: str, stderr: str, structured_result: dict[str, Any]) -> bool:
@@ -1367,8 +1717,19 @@ def _normalize_failure_diagnostics(structured_result: dict[str, Any]) -> None:
     )
 
 
-def _fallback_reply(structured_result: dict[str, Any]) -> str:
+def _fallback_reply(
+    structured_result: dict[str, Any],
+    language_context: LanguageContext | None = None,
+) -> str:
+    """Return a locale-bound safe fallback without projecting raw runner diagnostics."""
     if structured_result.get("success") is False:
-        message = str(structured_result.get("message") or structured_result.get("error") or "").strip()
-        return f"抱歉，通用技能运行失败。{message}" if message else "抱歉，通用技能运行失败。"
-    return "通用技能已运行完成，结果已展示在运行输出中。"
+        return localized_compat_text(
+            language_context,
+            zh_cn="抱歉，通用技能运行失败。",
+            en_us="Sorry, the Skill run failed.",
+        )
+    return localized_compat_text(
+        language_context,
+        zh_cn="通用技能已运行完成，结果已展示在运行输出中。",
+        en_us="The Skill run completed and its result is available in the run output.",
+    )

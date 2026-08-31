@@ -15,6 +15,7 @@ import {
 import {
   forwardRef,
   useCallback,
+  useContext,
   useEffect,
   useImperativeHandle,
   useMemo,
@@ -24,6 +25,8 @@ import {
 
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog';
+import { createAppTranslator, getStoredLocale } from '@/i18n';
+import { AppIntlContext } from '@/i18n/provider';
 import { cn } from '@/lib/utils';
 import { renderMarkdownBlocks } from '@/pages/chat/chatHelpers';
 import type { KnowledgeConceptRead } from '@/types';
@@ -51,13 +54,6 @@ type GraphCanvasHandle = {
   relayout: () => void;
 };
 
-const GRAPH_LAYOUTS: Array<{ value: GraphLayout; label: string }> = [
-  { value: 'cose', label: '力导向' },
-  { value: 'breadthfirst', label: '层级' },
-  { value: 'circle', label: '环形' },
-  { value: 'grid', label: '网格' },
-];
-
 const TYPE_COLORS: Record<string, string> = {
   'Source Document': '#1a71ff',
   'Source Section': '#5b8ff9',
@@ -69,11 +65,27 @@ const TYPE_COLORS: Record<string, string> = {
   Metric: '#d14c8b',
 };
 
+/** 为知识图谱组件提供稳定翻译入口；无 Provider 时回退当前持久化 locale。 */
+function useKnowledgeGraphIntl() {
+  const context = useContext(AppIntlContext);
+  return useMemo(() => context ?? createAppTranslator(getStoredLocale()), [context]);
+}
+
 export function KnowledgeGraphVisualization({
   concepts,
   knowledgeBaseKey,
   onViewConcept,
 }: KnowledgeGraphVisualizationProps) {
+  const { t } = useKnowledgeGraphIntl();
+  const graphLayouts = useMemo<Array<{ value: GraphLayout; label: string }>>(
+    () => [
+      { value: 'cose', label: t('knowledgeGraph.layout.cose') },
+      { value: 'breadthfirst', label: t('knowledgeGraph.layout.breadthfirst') },
+      { value: 'circle', label: t('knowledgeGraph.layout.circle') },
+      { value: 'grid', label: t('knowledgeGraph.layout.grid') },
+    ],
+    [t],
+  );
   const [query, setQuery] = useState('');
   const [selectedTypes, setSelectedTypes] = useState<string[]>([]);
   const [showArchived, setShowArchived] = useState(false);
@@ -172,8 +184,8 @@ export function KnowledgeGraphVisualization({
     return (
       <div className="kgv-empty">
         <Network aria-hidden="true" />
-        <strong>暂无可视化知识</strong>
-        <span>当前知识库还没有可展示的知识概念。</span>
+        <strong>{t('knowledgeGraph.empty.title')}</strong>
+        <span>{t('knowledgeGraph.empty.description')}</span>
       </div>
     );
   }
@@ -203,11 +215,11 @@ export function KnowledgeGraphVisualization({
               type="search"
               value={query}
               onChange={(event) => setQuery(event.target.value)}
-              placeholder="搜索标题、路径或标签"
-              aria-label="搜索知识图谱"
+              placeholder={t('knowledgeGraph.search.placeholder')}
+              aria-label={t('knowledgeGraph.search.label')}
             />
             {searchResults.length > 0 && !needsScopeSelection && (
-              <div className="kgv-search-results" role="listbox" aria-label="知识图谱搜索结果">
+              <div className="kgv-search-results" role="listbox" aria-label={t('knowledgeGraph.search.results')}>
                 {searchResults.map((node) => (
                   <button
                     type="button"
@@ -228,10 +240,10 @@ export function KnowledgeGraphVisualization({
           <select
             className="kgv-layout-select"
             value={layout}
-            aria-label="图谱布局"
+            aria-label={t('knowledgeGraph.layout.label')}
             onChange={(event) => setLayout(event.target.value as GraphLayout)}
           >
-            {GRAPH_LAYOUTS.map((item) => (
+            {graphLayouts.map((item) => (
               <option value={item.value} key={item.value}>{item.label}</option>
             ))}
           </select>
@@ -245,7 +257,7 @@ export function KnowledgeGraphVisualization({
               setScopedConceptIds(null);
             }}
           >
-            显示已归档
+            {t('knowledgeGraph.actions.showArchived')}
           </button>
 
           <div className="kgv-toolbar-actions">
@@ -253,8 +265,8 @@ export function KnowledgeGraphVisualization({
               type="button"
               variant="ghost"
               size="icon-sm"
-              title="重新布局"
-              aria-label="重新布局"
+              title={t('knowledgeGraph.actions.relayout')}
+              aria-label={t('knowledgeGraph.actions.relayout')}
               disabled={needsScopeSelection}
               onClick={() => activeCanvasRef(expanded, inlineCanvasRef, expandedCanvasRef).current?.relayout()}
             >
@@ -264,8 +276,8 @@ export function KnowledgeGraphVisualization({
               type="button"
               variant="ghost"
               size="icon-sm"
-              title="适应画布"
-              aria-label="适应画布"
+              title={t('knowledgeGraph.actions.fitCanvas')}
+              aria-label={t('knowledgeGraph.actions.fitCanvas')}
               disabled={needsScopeSelection}
               onClick={() => activeCanvasRef(expanded, inlineCanvasRef, expandedCanvasRef).current?.fit()}
             >
@@ -275,8 +287,8 @@ export function KnowledgeGraphVisualization({
               type="button"
               variant="ghost"
               size="icon-sm"
-              title="重置视图"
-              aria-label="重置视图"
+              title={t('knowledgeGraph.actions.resetView')}
+              aria-label={t('knowledgeGraph.actions.resetView')}
               disabled={needsScopeSelection}
               onClick={resetView}
             >
@@ -286,8 +298,8 @@ export function KnowledgeGraphVisualization({
               type="button"
               variant="ghost"
               size="icon-sm"
-              title="展开图谱"
-              aria-label="展开图谱"
+              title={t('knowledgeGraph.actions.expand')}
+              aria-label={t('knowledgeGraph.actions.expand')}
               disabled={needsScopeSelection}
               onClick={() => setExpanded(true)}
             >
@@ -296,7 +308,7 @@ export function KnowledgeGraphVisualization({
           </div>
         </div>
 
-        <div className="kgv-type-legend" aria-label="按知识类型筛选">
+        <div className="kgv-type-legend" aria-label={t('knowledgeGraph.filter.types')}>
           {conceptTypes.map((type) => {
             const active = selectedTypes.length === 0 || selectedTypes.includes(type);
             const count = availableConcepts.filter((concept) => concept.concept_type === type).length;
@@ -327,8 +339,8 @@ export function KnowledgeGraphVisualization({
         <>
           {scopedConceptIds && (
             <div className="kgv-scope-note">
-              <span>当前绘制筛选后的 {model.stats.nodeCount} 个节点，不代表整库全貌。</span>
-              <button type="button" onClick={resetScope}>重新选择范围</button>
+              <span>{t('knowledgeGraph.scope.note', { count: model.stats.nodeCount })}</span>
+              <button type="button" onClick={resetScope}>{t('knowledgeGraph.scope.reset')}</button>
             </div>
           )}
           {!expanded && workspace(false)}
@@ -344,7 +356,7 @@ export function KnowledgeGraphVisualization({
           <div className="kgv-expanded-header">
             <DialogTitle className="kgv-expanded-title">
               <Network aria-hidden="true" />
-              知识图谱可视化
+              {t('knowledgeGraph.dialog.title')}
             </DialogTitle>
             <div className="kgv-expanded-controls">
               <div className="kgv-search">
@@ -353,17 +365,17 @@ export function KnowledgeGraphVisualization({
                   type="search"
                   value={query}
                   onChange={(event) => setQuery(event.target.value)}
-                  placeholder="搜索标题、路径或标签"
-                  aria-label="在展开图谱中搜索"
+                  placeholder={t('knowledgeGraph.search.placeholder')}
+                  aria-label={t('knowledgeGraph.search.expanded')}
                 />
               </div>
               <select
                 className="kgv-layout-select"
                 value={layout}
-                aria-label="展开图谱布局"
+                aria-label={t('knowledgeGraph.layout.expanded')}
                 onChange={(event) => setLayout(event.target.value as GraphLayout)}
               >
-                {GRAPH_LAYOUTS.map((item) => (
+                {graphLayouts.map((item) => (
                   <option value={item.value} key={item.value}>{item.label}</option>
                 ))}
               </select>
@@ -371,8 +383,8 @@ export function KnowledgeGraphVisualization({
                 type="button"
                 variant="ghost"
                 size="icon-sm"
-                title="重新布局"
-                aria-label="在展开图谱中重新布局"
+                title={t('knowledgeGraph.actions.relayout')}
+                aria-label={t('knowledgeGraph.actions.relayoutExpanded')}
                 onClick={() => expandedCanvasRef.current?.relayout()}
               >
                 <RotateCcw />
@@ -381,8 +393,8 @@ export function KnowledgeGraphVisualization({
                 type="button"
                 variant="ghost"
                 size="icon-sm"
-                title="适应画布"
-                aria-label="在展开图谱中适应画布"
+                title={t('knowledgeGraph.actions.fitCanvas')}
+                aria-label={t('knowledgeGraph.actions.fitCanvasExpanded')}
                 onClick={() => expandedCanvasRef.current?.fit()}
               >
                 <Focus />
@@ -419,6 +431,7 @@ const GraphWorkspace = forwardRef<GraphCanvasHandle, {
   showDetail,
   expanded,
 }, ref) {
+  const { t } = useKnowledgeGraphIntl();
   const canvasRef = useRef<GraphCanvasHandle>(null);
   useImperativeHandle(ref, () => ({
     fit: () => canvasRef.current?.fit(),
@@ -437,7 +450,7 @@ const GraphWorkspace = forwardRef<GraphCanvasHandle, {
         onSelectNode={onSelectNode}
       />
       {showDetail && (
-        <aside className="kgv-detail" aria-label="知识节点详情">
+        <aside className="kgv-detail" aria-label={t('knowledgeGraph.detail.label')}>
           {selectedNode ? (
             <NodeDetail
               node={selectedNode}
@@ -448,8 +461,8 @@ const GraphWorkspace = forwardRef<GraphCanvasHandle, {
           ) : (
             <div className="kgv-detail-empty">
               <Expand aria-hidden="true" />
-              <strong>选择一个知识节点</strong>
-              <span>查看摘要、上下游关系和未解析链接。</span>
+              <strong>{t('knowledgeGraph.detail.emptyTitle')}</strong>
+              <span>{t('knowledgeGraph.detail.emptyDescription')}</span>
             </div>
           )}
         </aside>
@@ -613,7 +626,8 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, {
     updateSemanticLabels(cy);
   }, [model, query, selectedNodeId, selectedTypes]);
 
-  return <div ref={containerRef} className="kgv-canvas" role="img" aria-label="知识概念关系图" />;
+  const { t } = useKnowledgeGraphIntl();
+  return <div ref={containerRef} className="kgv-canvas" role="img" aria-label={t('knowledgeGraph.canvas.label')} />;
 });
 
 function NodeDetail({
@@ -627,6 +641,7 @@ function NodeDetail({
   onSelectNode: (id: string) => void;
   onViewConcept: (concept: KnowledgeConceptRead) => void;
 }) {
+  const { t } = useKnowledgeGraphIntl();
   const tags = Array.isArray(node.concept.frontmatter?.tags) ? node.concept.frontmatter.tags : [];
   return (
     <div className="kgv-detail-content">
@@ -635,7 +650,7 @@ function NodeDetail({
           <span className="kgv-type-badge" style={{ '--kgv-type-color': typeColor(node.concept.concept_type) } as React.CSSProperties}>
             {node.concept.concept_type}
           </span>
-          {node.concept.status === 'archived' && <span className="kgv-status-badge">已归档</span>}
+          {node.concept.status === 'archived' && <span className="kgv-status-badge">{t('knowledgeGraph.status.archived')}</span>}
         </div>
         <h4>{node.concept.title || node.id}</h4>
         <code>{node.id}</code>
@@ -647,24 +662,24 @@ function NodeDetail({
         </div>
       )}
       <div className="kgv-relation-summary">
-        <span><ArrowDownLeft aria-hidden="true" />{node.inbound.length} 个上游</span>
-        <span><ArrowUpRight aria-hidden="true" />{node.outbound.length} 个下游</span>
+        <span><ArrowDownLeft aria-hidden="true" />{t('knowledgeGraph.relations.inboundCount', { count: node.inbound.length })}</span>
+        <span><ArrowUpRight aria-hidden="true" />{t('knowledgeGraph.relations.outboundCount', { count: node.outbound.length })}</span>
       </div>
       <RelationList
-        title="引用此节点"
+        title={t('knowledgeGraph.relations.inbound')}
         ids={node.inbound}
         model={model}
         onSelectNode={onSelectNode}
       />
       <RelationList
-        title="此节点关联"
+        title={t('knowledgeGraph.relations.outbound')}
         ids={node.outbound}
         model={model}
         onSelectNode={onSelectNode}
       />
       {node.unresolvedLinks.length > 0 && (
         <section className="kgv-unresolved">
-          <strong>外部或未解析链接</strong>
+          <strong>{t('knowledgeGraph.relations.unresolved')}</strong>
           <ul>
             {node.unresolvedLinks.slice(0, 8).map((link, index) => (
               <li key={`${link.target}-${index}`}>
@@ -676,7 +691,7 @@ function NodeDetail({
         </section>
       )}
       <Button type="button" className="kgv-view-button" onClick={() => onViewConcept(node.concept)}>
-        查看完整内容
+        {t('knowledgeGraph.actions.viewFull')}
       </Button>
     </div>
   );
@@ -691,7 +706,8 @@ function KnowledgeMarkdownSummary({
   model: KnowledgeGraphModel;
   onSelectNode: (id: string) => void;
 }) {
-  const markdown = knowledgeConceptPreviewMarkdown(node.concept) || '暂无摘要';
+  const { t } = useKnowledgeGraphIntl();
+  const markdown = knowledgeConceptPreviewMarkdown(node.concept) || t('knowledgeGraph.summary.empty');
   const [expanded, setExpanded] = useState(false);
   const [overflowing, setOverflowing] = useState(false);
   const previewRef = useRef<HTMLDivElement | null>(null);
@@ -715,7 +731,7 @@ function KnowledgeMarkdownSummary({
   }, [expanded, markdown]);
 
   return (
-    <section className="kgv-markdown-summary" aria-label="知识摘要">
+    <section className="kgv-markdown-summary" aria-label={t('knowledgeGraph.summary.label')}>
       <div
         ref={previewRef}
         className={cn('kgv-markdown-preview', !expanded && 'is-collapsed', overflowing && !expanded && 'has-overflow')}
@@ -749,7 +765,7 @@ function KnowledgeMarkdownSummary({
           onClick={() => setExpanded((current) => !current)}
         >
           {expanded ? <ChevronUp aria-hidden="true" /> : <ChevronDown aria-hidden="true" />}
-          {expanded ? '收起摘要' : '展开摘要'}
+          {expanded ? t('knowledgeGraph.summary.collapse') : t('knowledgeGraph.summary.expand')}
         </button>
       )}
     </section>
@@ -792,27 +808,29 @@ function GraphScopeGate({
   candidateCount: number;
   onConfirm: () => void;
 }) {
+  const { t } = useKnowledgeGraphIntl();
   const canDraw = candidateCount > 0 && candidateCount <= KNOWLEDGE_GRAPH_NODE_LIMIT;
   return (
     <div className="kgv-scope-gate">
       <Network aria-hidden="true" />
-      <strong>知识库包含 {total} 个节点</strong>
-      <p>为保证交互流畅，请先通过搜索或类型筛选，将范围缩小到 {KNOWLEDGE_GRAPH_NODE_LIMIT} 个节点以内。</p>
-      <span className={cn(canDraw && 'is-ready')}>当前匹配 {candidateCount} 个节点</span>
+      <strong>{t('knowledgeGraph.scope.title', { count: total })}</strong>
+      <p>{t('knowledgeGraph.scope.description', { limit: KNOWLEDGE_GRAPH_NODE_LIMIT })}</p>
+      <span className={cn(canDraw && 'is-ready')}>{t('knowledgeGraph.scope.matchCount', { count: candidateCount })}</span>
       <Button type="button" disabled={!canDraw} onClick={onConfirm}>
-        绘制这 {candidateCount} 个节点
+        {t('knowledgeGraph.scope.draw', { count: candidateCount })}
       </Button>
     </div>
   );
 }
 
 function GraphStats({ model }: { model: KnowledgeGraphModel }) {
+  const { t } = useKnowledgeGraphIntl();
   return (
-    <div className="kgv-stats" aria-label="知识图谱统计">
-      <span><strong>{model.stats.nodeCount}</strong> 节点</span>
-      <span><strong>{model.stats.edgeCount}</strong> 关系</span>
-      <span><strong>{model.stats.isolatedCount}</strong> 孤立节点</span>
-      <span><strong>{model.stats.unresolvedCount}</strong> 未解析链接</span>
+    <div className="kgv-stats" aria-label={t('knowledgeGraph.stats.label')}>
+      <span>{t('knowledgeGraph.stats.nodes', { count: model.stats.nodeCount })}</span>
+      <span>{t('knowledgeGraph.stats.edges', { count: model.stats.edgeCount })}</span>
+      <span>{t('knowledgeGraph.stats.isolated', { count: model.stats.isolatedCount })}</span>
+      <span>{t('knowledgeGraph.stats.unresolved', { count: model.stats.unresolvedCount })}</span>
     </div>
   );
 }

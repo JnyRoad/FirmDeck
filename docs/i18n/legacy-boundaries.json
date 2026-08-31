@@ -1,0 +1,128 @@
+{
+  "schema_version": 1,
+  "baseline_commit": "a22231d00770ba6958f2a2bf1b0d65008bd858c3",
+  "policy": {
+    "new_consumers_allowed": false,
+    "required_fields": [
+      "id",
+      "owner",
+      "scope",
+      "reason",
+      "fingerprint",
+      "first_allowed_version",
+      "last_allowed_version",
+      "expires",
+      "telemetry",
+      "rollback_boundary",
+      "removal_conditions"
+    ],
+    "broad_globs_allowed": false,
+    "natural_language_translation_keys_allowed": false,
+    "stale_entries_fail": true
+  },
+  "boundaries": [
+    {
+      "id": "LEGACY-BE-NATURAL-ERROR",
+      "owner": "backend-platform",
+      "scope": [
+        "scripts/i18n/check_python.py#check_python_files",
+        "scripts/i18n/legacy-allowlist.json"
+      ],
+      "reason": "Existing handlers and domain error types expose natural-language detail/message while clients migrate to descriptors.",
+      "fingerprint": "sha256:c3c353b72fc0666e62f1f07d9f3fff09218c88afde784586754e358e198819a2",
+      "first_allowed_version": "0.5.2",
+      "last_allowed_version": "0.6.0",
+      "expires": "2027-02-28",
+      "telemetry": "Exact AST-fingerprint baseline reports remaining public natural-language error sites and fails additions.",
+      "rollback_boundary": "Registered descriptors are additive; old fields remain deprecated projections until the compatibility gate closes.",
+      "removal_conditions": [
+        "All public product errors resolve through the registry.",
+        "No raw exception or provider message reaches a product/public field.",
+        "Legacy projection reads are zero for the declared compatibility window."
+      ]
+    },
+    {
+      "id": "LEGACY-BE-TEXT-EVENT",
+      "owner": "backend-platform",
+      "scope": [
+        "backend/app/core/harness_v2_engine.py#HarnessV2Engine.run",
+        "backend/app/teams/wakeup.py#_update_team_run_progress_message"
+      ],
+      "reason": "Existing consumers read text and status_text fields from stored or streamed events.",
+      "fingerprint": "sha256:22d75ccf9732048f325c6417a87c4ca6537f7e409ade90afb0700f2f9b3f071e",
+      "first_allowed_version": "0.5.2",
+      "last_allowed_version": "0.6.0",
+      "expires": "2027-02-28",
+      "telemetry": "Versioned boundary-level counts only; event codes and raw text are excluded.",
+      "rollback_boundary": "Stable code/params and deprecated text projections are dual-written during the compatibility window.",
+      "removal_conditions": [
+        "All first-party consumers localize event code/params.",
+        "Replays and retries retain descriptor and language snapshots.",
+        "Legacy text projection reads are zero."
+      ]
+    },
+    {
+      "id": "LEGACY-LANGUAGE-DEFAULT",
+      "owner": "agent-runtime",
+      "scope": [
+        "backend/app/i18n/language_context.py#resolve_compatible_language_context",
+        "backend/app/db/database.py#_migrate_i18n_language_schema"
+      ],
+      "reason": "Old persisted data and clients have no language snapshot.",
+      "fingerprint": "sha256:3e5867316227ab66c9d64977fc557a9bd7bc98e1cf2cb48eeb6e3e14d39321e0",
+      "first_allowed_version": "0.5.2",
+      "last_allowed_version": "0.6.0",
+      "expires": "2027-02-28",
+      "telemetry": "Versioned process-local count for the exact fallback boundary; no ingress, entity, locale payload or business content.",
+      "rollback_boundary": "LanguageContext columns and JSON snapshots are additive and remain readable when enforcement is disabled.",
+      "removal_conditions": [
+        "Every active ingress writes a normalized immutable snapshot.",
+        "No new empty snapshot is written.",
+        "Legacy-default use is zero for the retention window."
+      ]
+    },
+    {
+      "id": "LEGACY-PUBLIC-TEXT-PROJECTION",
+      "owner": "public-api",
+      "scope": [
+        "backend/app/contracts/projections.py#project_problem_details",
+        "backend/app/public_api/errors.py#problem_response"
+      ],
+      "reason": "Public API v1 clients may still read detail, message, text, or status_text.",
+      "fingerprint": "sha256:70078e3aeaff1fa528313680c97faa21add398dc785ccadb58662f26b400bd24",
+      "first_allowed_version": "0.5.2",
+      "last_allowed_version": "0.6.0",
+      "expires": "2027-02-28",
+      "telemetry": "Versioned process-local count for the exact projection boundary; no code params, raw cause, field values or business content.",
+      "rollback_boundary": "The stable descriptor is canonical; compatibility fields are generated only from registered safe defaults, never internal causes.",
+      "removal_conditions": [
+        "The documented client compatibility window has ended.",
+        "First-party and observed legacy reads are zero.",
+        "Unknown-code safe fallback tests remain green without the projections."
+      ]
+    },
+    {
+      "id": "LEGACY-SESSION-TITLE-KIND",
+      "owner": "team-runtime",
+      "scope": [
+        "backend/app/session/session_kinds.py#is_team_tl_session",
+        "backend/app/session/session_kinds.py#team_tl_session_filter",
+        "backend/app/session/session_kinds.py#team_conversation_kind",
+        "backend/app/db/database.py#_migrate_sqlite_skill_schema"
+      ],
+      "reason": "Old rows encoded team, scheduled-task, and skill-test machine kinds in product-owned Chinese title prefixes.",
+      "fingerprint": "sha256:4f742965f5265b9ea16976c7e429608a79512adfea75f15e57b375d96fb5970c",
+      "first_allowed_version": "0.5.2",
+      "last_allowed_version": "0.6.0",
+      "expires": "2027-02-28",
+      "telemetry": "Static fingerprint plus exact migration/read tests guard this boundary; removal audits may count only row IDs and stable/null session kinds, never titles or other business content.",
+      "rollback_boundary": "The session_kind column and index are additive; legacy titles remain byte-for-byte unchanged and the exact read fallback can be restored independently.",
+      "removal_conditions": [
+        "Every supported database has the additive session_kind schema and backfill.",
+        "No null-kind row matches an exact legacy title shape during the retention window.",
+        "Every first-party writer stores a stable kind without constructing a product-language title prefix.",
+        "The exact read fallback and legacy-title migration predicates are removed together."
+      ]
+    }
+  ]
+}

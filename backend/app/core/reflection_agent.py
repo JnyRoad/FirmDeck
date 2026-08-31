@@ -10,7 +10,10 @@ from app.core.context_projection import (
     compact_step_result,
 )
 from app.db.models import ChatSession, ModelConfig, Skill, Tool
+from app.i18n.language_context import LanguageContext
+from app.i18n.raw_source import RawSourceKind, RawSourceMarker
 from app.llm import LLMClient, LLMError
+from app.llm.prompts.language import language_prompt_contract
 from app.llm.stage_protocol import (
     REFLECTION_OUTPUT_SCHEMA,
     stage_payload,
@@ -19,7 +22,6 @@ from app.llm.stage_protocol import (
 from app.observability.spans import llm_operation
 from app.session.session_schema import RouterDecision, StepAgentResult
 from app.tools.tool_schema import ToolResult
-
 
 PROMPT_PATH = paths.resource_dir() / "app" / "llm" / "prompts" / "reflection_prompt.md"
 
@@ -47,11 +49,47 @@ class ReflectionAgent:
         model_config: ModelConfig,
         conversation_context: dict[str, object] | None = None,
         memory_context: list[dict[str, object]] | None = None,
+        language_context: LanguageContext | None = None,
     ) -> ReflectionDecision:
+        """Review one action with locale-bound generated reasoning and verbatim raw evidence."""
         if not action_needs_reflection(router_decision, step_result, tool_result):
             return ReflectionDecision()
 
+        # Workflow: project current policy and raw execution evidence into one reflection stage.
         stage_data = {
+            **language_prompt_contract(
+                language_context,
+                [
+                    RawSourceMarker(
+                        json_pointer="/user_message",
+                        kind=RawSourceKind.USER_INPUT,
+                    ),
+                    RawSourceMarker(
+                        json_pointer="/conversation_context",
+                        kind=RawSourceKind.HISTORY,
+                    ),
+                    RawSourceMarker(
+                        json_pointer="/_agent_stage/memory",
+                        kind=RawSourceKind.HISTORY,
+                    ),
+                    RawSourceMarker(
+                        json_pointer="/current_step",
+                        kind=RawSourceKind.BUSINESS_RECORD,
+                    ),
+                    RawSourceMarker(
+                        json_pointer="/slots",
+                        kind=RawSourceKind.BUSINESS_RECORD,
+                    ),
+                    RawSourceMarker(
+                        json_pointer="/step_result",
+                        kind=RawSourceKind.TOOL_PROVIDER_OUTPUT,
+                    ),
+                    RawSourceMarker(
+                        json_pointer="/tool_result",
+                        kind=RawSourceKind.TOOL_PROVIDER_OUTPUT,
+                    ),
+                ],
+            ),
             "current_step": compact_current_step(
                 active_skill.content_json if active_skill else None,
                 session.active_step_id,
@@ -78,6 +116,7 @@ class ReflectionAgent:
             output_contract=REFLECTION_OUTPUT_SCHEMA,
         )
         try:
+            # Workflow: validate the provider decision before returning it to the control loop.
             with llm_operation("reflection.review"):
                 raw = LLMClient(model_config).generate_json(
                     unified_system_prompt(), payload

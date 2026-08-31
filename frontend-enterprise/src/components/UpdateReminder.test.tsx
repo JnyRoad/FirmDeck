@@ -4,6 +4,8 @@ import { cleanup, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { AppIntlProvider, type AppLocale } from '@/i18n';
+
 import UpdateReminder, { REMINDED_VERSION_KEY } from './UpdateReminder';
 
 const mocks = vi.hoisted(() => ({
@@ -23,18 +25,18 @@ vi.mock('sonner', () => ({
   },
 }));
 
-vi.mock('@/i18n', () => ({
-  useI18n: () => ({
-    t: (key: string, values?: Record<number, string>) => (
-      values
-        ? Object.entries(values).reduce(
-          (text, [index, value]) => text.replace(`{${index}}`, value),
-          key,
-        )
-        : key
-    ),
-  }),
-}));
+const updateCopy = {
+  'zh-CN': {
+    close: '关闭更新提醒',
+    link: '查看更新',
+    title: 'StaffDeck 有新版本',
+  },
+  'en-US': {
+    close: 'Close update reminder',
+    link: 'View update',
+    title: 'A new StaffDeck version is available',
+  },
+} as const satisfies Record<AppLocale, Record<string, string>>;
 
 const update = {
   current_version: '0.2.0',
@@ -60,26 +62,33 @@ describe('UpdateReminder', () => {
     expect(mocks.apiGet).not.toHaveBeenCalled();
   });
 
-  it('shows a release link and remembers the announced version', async () => {
+  it.each(['zh-CN', 'en-US'] as const)(
+    'shows localized release chrome and remembers the announced version in %s',
+    async (locale) => {
     mocks.apiGet.mockResolvedValue(update);
-    render(<UpdateReminder enabled />);
+    render(
+      <AppIntlProvider locale={locale}>
+        <UpdateReminder enabled />
+      </AppIntlProvider>,
+    );
 
     await waitFor(() => expect(mocks.toastCustom).toHaveBeenCalledOnce());
     expect(mocks.apiGet).toHaveBeenCalledWith('/api/app/version');
     expect(window.localStorage.getItem(REMINDED_VERSION_KEY)).toBe('0.3.0');
 
     const renderToast = mocks.toastCustom.mock.calls[0][0];
-    render(renderToast('toast-id'));
-    expect(screen.getByText('StaffDeck 有新版本')).toBeTruthy();
+    render(<AppIntlProvider locale={locale}>{renderToast('toast-id')}</AppIntlProvider>);
+    expect(screen.getByText(updateCopy[locale].title)).toBeTruthy();
     expect(document.body.textContent).toContain(update.latest_version);
     expect(document.body.textContent).toContain(update.current_version);
-    expect(screen.getByRole('link', { name: /查看更新/ }).getAttribute('href')).toBe(
+    expect(screen.getByRole('link', { name: updateCopy[locale].link }).getAttribute('href')).toBe(
       update.release_url,
     );
 
-    await userEvent.click(screen.getByRole('button', { name: '关闭更新提醒' }));
+    await userEvent.click(screen.getByRole('button', { name: updateCopy[locale].close }));
     expect(mocks.dismiss).toHaveBeenCalledWith('toast-id');
-  });
+    },
+  );
 
   it('does not repeat a version already announced in this browser', async () => {
     window.localStorage.setItem(REMINDED_VERSION_KEY, '0.3.0');

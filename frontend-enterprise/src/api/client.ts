@@ -17,14 +17,24 @@ export class ApiError extends Error {
   status: number;
   body: string;
   code?: string;
+  params: Record<string, unknown>;
+  retryable?: boolean;
+  request_id?: string;
+  trace_id?: string;
 
+  /** 解析机器可读错误描述并把原始响应仅保留在诊断 body，不将上游文本暴露为 Error.message。 */
   constructor(status: number, body: string, statusText: string) {
     const parsed = parseErrorPayload(body);
-    super(parsed.message || statusText || `HTTP ${status}`);
+    super(GENERIC_ERROR_MESSAGE);
     this.name = 'ApiError';
     this.status = status;
-    this.body = body;
+    this.body = diagnosticResponseBody(body);
     this.code = parsed.code;
+    this.params = parsed.params;
+    this.retryable = parsed.retryable;
+    this.request_id = parsed.request_id;
+    this.trace_id = parsed.trace_id;
+    void statusText;
   }
 }
 
@@ -237,8 +247,11 @@ function parseSseBlock(block: string): StreamEvent | null {
 }
 
 type ParsedApiError = {
-  message: string;
   code?: string;
+  params: Record<string, unknown>;
+  retryable?: boolean;
+  request_id?: string;
+  trace_id?: string;
 };
 
 const STABLE_ERROR_CODE_PATTERN = /^[A-Z][A-Z0-9_]+$/;
@@ -266,55 +279,77 @@ function stableErrorCode(value: unknown): string | undefined {
     : undefined;
 }
 
-function parseErrorPayload(text: string): ParsedApiError {
-  if (!text) return { message: '' };
-  try {
-    const payload = JSON.parse(text) as {
-      code?: unknown;
-      detail?: unknown;
-      message?: unknown;
-      error?: unknown;
-    };
-    const detail = payload.detail ?? payload.message ?? payload.error;
-    const topLevelCode = stableErrorCode(payload.code);
-    if (typeof detail === 'string') {
-      return { message: detail, code: topLevelCode ?? stableErrorCode(detail) };
-    }
-    if (Array.isArray(detail)) {
-      return {
-        message: detail
-          .map(formatValidationDetail)
-          .filter(Boolean)
-          .join('；'),
-        code: topLevelCode,
-      };
-    }
-    if (detail && typeof detail === 'object') {
-      const structured = detail as { code?: unknown; message?: unknown; detail?: unknown };
-      const message = typeof structured.message === 'string'
-        ? structured.message
-        : typeof structured.detail === 'string'
-          ? structured.detail
-          : '';
-      const code = stableErrorCode(structured.code) ?? topLevelCode;
-      if (message || code) return { message: message || String(code), code };
-    }
-  } catch {
-    return { message: plausibleShortMessage(text) ?? GENERIC_ERROR_MESSAGE };
-  }
-  return { message: plausibleShortMessage(text) ?? GENERIC_ERROR_MESSAGE };
+/** 判断 JSON 值是否为普通键值对象，拒绝数组等不符合 canonical params 契约的形状。 */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === 'object' && !Array.isArray(value));
 }
 
-function formatValidationDetail(item: unknown): string {
-  if (typeof item === 'string') return item;
-  if (!item || typeof item !== 'object') return '';
+/** 读取有界关联 ID；非法值不影响错误 fail-closed，也不会拼入最终用户文案。 */
+function correlationId(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const normalized = value.trim();
+  return normalized && normalized.length <= 256 ? normalized : undefined;
+}
 
-  const detail = item as { loc?: unknown; msg?: unknown };
-  const message = typeof detail.msg === 'string' ? detail.msg : '';
-  const location = Array.isArray(detail.loc)
-    ? detail.loc.map((part) => String(part)).filter(Boolean).join('.')
-    : '';
+/** 收集 JSON 诊断树中的原始字符串，使转义后的 stack/detail 仍可由受控诊断入口检索。 */
+function collectDiagnosticStrings(value: unknown, output: string[], depth = 0): void {
+  if (depth > 8) return;
+  if (typeof value === 'string') {
+    output.push(value);
+    return;
+  }
+  if (Array.isArray(value)) {
+    value.forEach((item) => collectDiagnosticStrings(item, output, depth + 1));
+    return;
+  }
+  if (!isRecord(value)) return;
+  Object.values(value).forEach((item) => collectDiagnosticStrings(item, output, depth + 1));
+}
 
-  if (location && message) return `${location}: ${message}`;
-  return message;
+/** 保留原始响应，并附加已解码诊断字符串；该结果仅存于 ApiError.body，不进入 message/UI。 */
+function diagnosticResponseBody(body: string): string {
+  try {
+    const parsed = JSON.parse(body) as unknown;
+    const strings: string[] = [];
+    collectDiagnosticStrings(parsed, strings);
+    return strings.length > 0 ? `${body}\n${strings.join('\n')}` : body;
+  } catch {
+    return body;
+  }
+}
+
+/** 解析 canonical 或精确 legacy code 投影；任何自然语言字段只留在原始 body 中。 */
+function parseErrorPayload(text: string): ParsedApiError {
+  const empty: ParsedApiError = { params: {} };
+  if (!text) return empty;
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    if (!isRecord(parsed)) return empty;
+
+    const request_id = correlationId(parsed.request_id);
+    const trace_id = correlationId(parsed.trace_id);
+    const diagnostic = { params: {}, request_id, trace_id } satisfies ParsedApiError;
+    const topLevelCode = stableErrorCode(parsed.code);
+    if (parsed.code !== undefined) {
+      if (!topLevelCode || !isRecord(parsed.params) || typeof parsed.retryable !== 'boolean') {
+        return diagnostic;
+      }
+      return {
+        code: topLevelCode,
+        params: { ...parsed.params },
+        retryable: parsed.retryable,
+        request_id,
+        trace_id,
+      };
+    }
+
+    const detailCode = typeof parsed.detail === 'string'
+      ? stableErrorCode(parsed.detail)
+      : isRecord(parsed.detail)
+        ? stableErrorCode(parsed.detail.code)
+        : undefined;
+    return detailCode ? { ...diagnostic, code: detailCode } : diagnostic;
+  } catch {
+    return empty;
+  }
 }

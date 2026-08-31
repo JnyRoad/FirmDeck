@@ -4,7 +4,7 @@ import { cleanup, render, screen, waitFor, within } from '@testing-library/react
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 
-import { I18nProvider } from '@/i18n';
+import { AppIntlProvider, I18nProvider } from '@/i18n';
 import type { KnowledgeBaseRead, KnowledgeBaseVersionRead, TeamRead } from '@/types';
 
 import { SharedKnowledgeConversionDialog } from './SharedKnowledgeConversionDialog';
@@ -144,6 +144,23 @@ function renderDialog(onConverted = vi.fn()) {
   return { onClose, onConverted };
 }
 
+function renderLocalizedDialog(locale: 'zh-CN' | 'en-US', onConverted = vi.fn()) {
+  /** 使用纯语义 Provider 渲染转换流程；不安装 legacy observer，并返回可观察回调。 */
+  const onClose = vi.fn();
+  render(
+    <AppIntlProvider locale={locale}>
+      <SharedKnowledgeConversionDialog
+        open
+        knowledgeBase={sourceKnowledgeBase}
+        agentId="agent-source"
+        onClose={onClose}
+        onConverted={onConverted}
+      />
+    </AppIntlProvider>,
+  );
+  return { onClose, onConverted };
+}
+
 beforeAll(() => {
   // Radix Dialog 和 Checkbox 在 jsdom 中需要这些浏览器 API。
   window.HTMLElement.prototype.scrollIntoView = vi.fn();
@@ -232,5 +249,45 @@ describe('SharedKnowledgeConversionDialog', () => {
     expect(alert.textContent).toContain('来源专用知识库仍保持可用，尚未归档');
     expect(alert.textContent).toContain('不会显示未完成的共享知识库');
     expect(onConverted).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['zh-CN', '转换为共享知识库：个人素材库', '转换来源预览', '确认转换'],
+    ['en-US', 'Convert to shared knowledge: 个人素材库', 'Conversion source preview', 'Confirm conversion'],
+  ] as const)('localizes conversion controls and ARIA in %s while preserving raw names', async (
+    locale,
+    dialogName,
+    previewLabel,
+    submitLabel,
+  ) => {
+    /** 转换产品文案随 locale 变化，来源知识库和团队名称继续按服务端原文展示。 */
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => (
+      String(input).includes('/versions?') ? jsonResponse(sourceVersions) : jsonResponse(teams)
+    )));
+    renderLocalizedDialog(locale);
+
+    const dialog = await screen.findByRole('dialog', { name: dialogName });
+    expect(within(dialog).getByLabelText(previewLabel).textContent).toContain('个人素材库');
+    expect(within(dialog).getByText('内容团队')).toBeTruthy();
+    expect(within(dialog).getByRole('button', { name: submitLabel })).toBeTruthy();
+  });
+
+  it('localizes the English conversion error without exposing raw API detail', async () => {
+    /** 失败态应显示语义英文保护提示，同时隐藏后端返回的中文 detail。 */
+    const user = userEvent.setup();
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === 'POST') return errorResponse();
+      return String(input).includes('/versions?') ? jsonResponse(sourceVersions) : jsonResponse(teams);
+    }));
+    renderLocalizedDialog('en-US');
+
+    const dialog = await screen.findByRole('dialog', { name: /Convert to shared knowledge/ });
+    await user.type(within(dialog).getByLabelText('Conversion reason'), 'Keep the source safe');
+    await user.click(within(dialog).getByRole('button', { name: 'Confirm conversion' }));
+
+    const alert = await within(dialog).findByRole('alert');
+    expect(alert.textContent).toContain('Conversion failed');
+    expect(alert.textContent).toContain('The dedicated source remains available');
+    expect(alert.textContent).not.toContain('目标资产数量校验失败');
   });
 });

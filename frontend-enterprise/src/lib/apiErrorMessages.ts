@@ -1,66 +1,125 @@
-import { ApiError, GENERIC_ERROR_MESSAGE, plausibleShortMessage } from '@/api/client';
+import { ApiError } from '@/api/client';
+import {
+  getBackendErrorContract,
+  type BackendErrorContractEntry,
+  type BackendParamKind,
+} from '@/i18n/generated/backendContract';
+import { createAppTranslator, type AppTranslator, type MessageValues } from '@/i18n/imperative';
+import { LOCALE_STORAGE_KEY, normalizeAppLocale } from '@/i18n/locales';
+import englishMessages from '@/i18n/messages/en-US.json';
+import chineseMessages from '@/i18n/messages/zh-CN.json';
+import type { MessageId } from '@/i18n/types';
 
-const STABLE_ERROR_CODE_PATTERN = /^[A-Z][A-Z0-9_]+$/;
+const STABLE_ERROR_CODE_PATTERN = /^[A-Z][A-Z0-9_.-]{2,127}$/;
+const GENERIC_MESSAGE_ID = 'common.error.generic' satisfies MessageId;
 
-const API_ERROR_MESSAGES: Record<string, string> = {
-  HARNESS_WORKSPACE_PATH_ABSOLUTE: 'Harness 工作区目录必须是绝对路径',
-  HARNESS_WORKSPACE_PATH_CREATE_FAILED: '无法创建 Harness 工作区目录，请检查路径和权限',
-  HARNESS_WORKSPACE_PATH_NOT_WRITABLE: 'Harness 工作区目录不可写，请检查权限',
-  HARNESS_WORKSPACE_PATH_ROOT_FORBIDDEN: 'Harness 工作区目录不能是文件系统根目录',
-  KNOWLEDGE_BINDING_REVISION_CONFLICT: '权限配置已被其他管理员更新，请刷新后重新确认。',
-  KNOWLEDGE_CONTEXT_MISMATCH: '当前团队、知识库或会话范围不匹配，请刷新后重试。',
-  KNOWLEDGE_DEFAULT_NOT_CONFIGURED: '团队尚未设置默认写入知识库，请先选择目标知识库。',
-  KNOWLEDGE_GRANT_REQUIRED: '当前员工没有执行此知识库操作所需的权限。',
-  KNOWLEDGE_MODE_INVALID: '当前知识库类型不支持此操作。',
-  KNOWLEDGE_PUBLISH_CONFLICT: '正式版本已变化，请基于最新版本重新操作。',
-  KNOWLEDGE_VERSION_NOT_READY: '知识版本尚未处理完成，暂不能发布。',
-  MODEL_API_KEY_REQUIRED: '请填写模型 API Key',
-  MODEL_CONFIG_DISABLED: '请先启用该模型，再设为默认',
-  MODEL_CONFIG_VERIFICATION_REQUIRED: '请先完成模型测试，再启用或设为默认',
-  MODEL_DEFAULT_CONFLICT: '默认模型状态已变化，请刷新后重试',
-  MODEL_EXTRA_BODY_UNSUPPORTED: '当前 API 协议不支持额外请求参数',
-  MODEL_MAX_OUTPUT_TOKENS_INVALID: 'Max Tokens 必须大于 0',
-  MODEL_PROTOCOL_CONFLICT: '模型协议参数与额外请求参数冲突，请分别配置',
-  MODEL_PROTOCOL_OPTIONS_INVALID: '模型协议选项无效，请检查 API 协议与协议参数',
-  MODEL_PROTOCOL_UNSUPPORTED: '当前 API 协议不受支持',
-  MODEL_SUBSCRIPTION_ACCESS_DENIED: '当前 ChatGPT 订阅无权使用此模型，请检查订阅权益或模型名称。',
-  MODEL_SUBSCRIPTION_API_KEY_FORBIDDEN: 'ChatGPT 订阅模型不能配置 API Key。',
-  MODEL_SUBSCRIPTION_AUTH_FAILED: '本机 Codex 登录未完成，请重新连接 ChatGPT 订阅。',
-  MODEL_SUBSCRIPTION_AUTH_REQUIRED: '请先在本机 Codex 中登录 ChatGPT 订阅。',
-  MODEL_SUBSCRIPTION_BROWSER_UNAVAILABLE: '无法打开本机 Codex 登录页面，请检查桌面浏览器后重试。',
-  MODEL_SUBSCRIPTION_DIRECT_CONFIG_FORBIDDEN: 'ChatGPT 订阅模型不能配置 Base URL 或 API 协议。',
-  MODEL_SUBSCRIPTION_NETWORK_UNAVAILABLE: '暂时无法连接 ChatGPT 订阅服务，请检查网络后重试。',
-  MODEL_SUBSCRIPTION_QUOTA_EXCEEDED: 'ChatGPT 订阅额度暂不可用，请稍后重试。',
-  MODEL_SUBSCRIPTION_REFRESH_FAILED: 'ChatGPT 授权已失效，请在浏览器中重新连接订阅。',
-  MODEL_SUBSCRIPTION_RUNTIME_FAILED: '本机 Codex runtime 未能完成模型请求，请检查登录状态和模型名称后重试。',
-  MODEL_SUBSCRIPTION_RUNTIME_PROTOCOL_ERROR: '本机 Codex runtime 返回了无法识别的结果，请升级 Codex 后重试。',
-  MODEL_SUBSCRIPTION_RUNTIME_TIMEOUT: '本机 Codex runtime 请求超时，请稍后重试。',
-  MODEL_SUBSCRIPTION_RUNTIME_UNAVAILABLE: '未找到可用的本机 Codex runtime，请安装并登录 Codex 后重试。',
-  MODEL_TEMPERATURE_INVALID: 'Temperature 超出当前协议允许范围',
-  MODEL_VERIFICATION_STALE: '模型测试状态已变化，请重新测试',
-};
+type Translator = Pick<AppTranslator, 't'>;
 
+/** 判断未知输入是否为普通对象；数组、null 和原始 provider 数据不能成为错误契约。 */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** 将外部值收窄为稳定错误码；自然语言、路径和 provider 文本均返回 undefined。 */
 function stableErrorCode(value: unknown): string | undefined {
-  return typeof value === 'string' && STABLE_ERROR_CODE_PATTERN.test(value)
-    ? value
+  return typeof value === 'string' && STABLE_ERROR_CODE_PATTERN.test(value.trim())
+    ? value.trim()
     : undefined;
 }
 
-function errorMessage(error: unknown): string {
-  if (typeof error === 'string') return error;
-  return error instanceof Error ? error.message : '';
+/** 读取当前兼容 locale 并创建组件外 translator；存储不可用时确定性回退到中文。 */
+function currentTranslator(): Translator {
+  let storedLocale: string | null = null;
+  try {
+    storedLocale = typeof window === 'undefined' ? null : window.localStorage.getItem(LOCALE_STORAGE_KEY);
+  } catch {
+    storedLocale = null;
+  }
+  return createAppTranslator(normalizeAppLocale(storedLocale));
 }
 
+/** 从 ApiError、canonical 对象或精确 legacy code 字符串读取稳定代码。 */
 export function apiErrorCode(error: unknown): string | undefined {
-  if (error instanceof ApiError && error.code) return stableErrorCode(error.code);
-  return stableErrorCode(errorMessage(error));
+  if (error instanceof ApiError) return stableErrorCode(error.code);
+  if (typeof error === 'string') return stableErrorCode(error);
+  if (isRecord(error)) return stableErrorCode(error.code);
+  return error instanceof Error ? stableErrorCode(error.message) : undefined;
 }
 
-export function apiErrorMessage(error: unknown, fallback: string): string {
-  const code = apiErrorCode(error);
-  if (code && API_ERROR_MESSAGES[code]) return API_ERROR_MESSAGES[code];
+/** 只读取 canonical params，不解析 detail、message、stack 或 provider 原始正文。 */
+function apiErrorParams(error: unknown): Record<string, unknown> {
+  if (error instanceof ApiError) return error.params;
+  if (isRecord(error) && isRecord(error.params)) return error.params;
+  return {};
+}
 
-  const message = errorMessage(error);
-  if (code && message === code) return `操作失败（错误码：${code}）`;
-  return plausibleShortMessage(message) ?? plausibleShortMessage(fallback) ?? GENERIC_ERROR_MESSAGE;
+/** 检查一个参数是否符合后端 registry 声明的 JSON primitive 类型。 */
+function matchesParamKind(value: unknown, kind: BackendParamKind): boolean {
+  if (kind === 'string') return typeof value === 'string';
+  if (kind === 'boolean') return typeof value === 'boolean';
+  if (kind === 'integer') return typeof value === 'number' && Number.isInteger(value);
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
+/** 严格投影 registry 允许的具名参数，拒绝缺失、额外、对象和非有限数值。 */
+function safeMessageValues(
+  entry: BackendErrorContractEntry,
+  params: Record<string, unknown>,
+): MessageValues | undefined {
+  const expectedNames = Object.keys(entry.params);
+  const actualNames = Object.keys(params);
+  if (expectedNames.length !== actualNames.length || actualNames.some((name) => !(name in entry.params))) {
+    return undefined;
+  }
+
+  const values: MessageValues = {};
+  for (const name of expectedNames) {
+    const value = params[name];
+    if (!matchesParamKind(value, entry.params[name])) return undefined;
+    values[name] = value as MessageValues[string];
+  }
+  return values;
+}
+
+/** Resolve a canonical backend key only when every supported catalog declares it. */
+function resolveCatalogMessageKey(messageKey: string): MessageId | null {
+  const catalogs = [englishMessages as Record<string, string>, chineseMessages as Record<string, string>];
+  if (catalogs.every((catalog) => Object.prototype.hasOwnProperty.call(catalog, messageKey))) {
+    return messageKey as MessageId;
+  }
+  return null;
+}
+
+/** 将稳定错误契约投影为语义 message ID 与安全插值参数；未知数据返回 null。 */
+export function backendErrorMessageDescriptor(
+  error: unknown,
+): { entry: BackendErrorContractEntry; messageId: MessageId; values?: MessageValues } | null {
+  const code = apiErrorCode(error);
+  if (!code) return null;
+  const entry = getBackendErrorContract(code);
+  if (!entry || entry.visibility !== 'public') return null;
+  const messageId = resolveCatalogMessageKey(entry.message_key);
+  if (!messageId) return null;
+  const params = safeMessageValues(entry, apiErrorParams(error));
+  if (params === undefined && Object.keys(entry.params).length > 0) return null;
+  return { entry, messageId, ...(params && Object.keys(params).length ? { values: params } : {}) };
+}
+
+/**
+ * 将机器错误描述投影为当前 locale 的语义消息；未知、畸形或 raw 输入始终使用安全通用文案。
+ * 两参数签名保留旧调用兼容，但旧自然语言 fallback 不再成为最终 UI。
+ */
+export function apiErrorMessage(
+  error: unknown,
+  fallbackMessageId: string,
+  translator: Translator = currentTranslator(),
+): string {
+  void fallbackMessageId;
+  const descriptor = backendErrorMessageDescriptor(error);
+  if (!descriptor) return translator.t(GENERIC_MESSAGE_ID);
+  try {
+    return translator.t(descriptor.messageId, descriptor.values);
+  } catch {
+    return translator.t(GENERIC_MESSAGE_ID);
+  }
 }

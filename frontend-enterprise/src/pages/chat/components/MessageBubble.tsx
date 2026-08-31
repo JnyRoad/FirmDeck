@@ -7,6 +7,9 @@ import IconThumbUp from '@/assets/icons/thumb-up.svg?react';
 import IconThumbDown from '@/assets/icons/thumb-down.svg?react';
 import { notify } from '@/components/ui/app-toast';
 import { employeeDisplayName } from '@/employee';
+import { RawContent, RawIdentifier } from '@/i18n/RawContent';
+import { useAppIntl } from '@/i18n/useAppIntl';
+import { backendEventMessage } from '@/lib/backendEventMessages';
 import { copyTextToClipboard } from '@/lib/clipboard';
 import { cn } from '@/lib/utils';
 import type {
@@ -84,19 +87,38 @@ type MessageBubbleProps = {
   render: MessageRender;
 };
 
-function activeTeamProgress(item: ChatMessage): { phase: string; statusText: string } | null {
+/** 按 canonical event_code/params 本地化团队进度；legacy metadata 只按精确 phase/count 投影。 */
+function activeTeamProgress(
+  item: ChatMessage,
+  translate: ReturnType<typeof useAppIntl>['t'],
+): { phase: string; statusText: string } | null {
   const progress = item.metadata?.team_progress;
   if (!progress || typeof progress !== 'object' || Array.isArray(progress)) return null;
   const progressRecord = progress as Record<string, unknown>;
   const phase = typeof progressRecord.phase === 'string' ? progressRecord.phase : '';
   if (phase !== 'collecting' && phase !== 'synthesizing') return null;
-  const statusText = typeof progressRecord.status_text === 'string'
-    ? progressRecord.status_text.trim()
-    : '';
-  return statusText ? { phase, statusText } : null;
+  const canonicalCode = typeof progressRecord.event_code === 'string'
+    ? progressRecord.event_code
+    : phase === 'collecting'
+      ? 'team.run.progress.collecting'
+      : 'team.run.progress.synthesizing';
+  const legacyParams = phase === 'collecting'
+    ? {
+      completed_tasks: progressRecord.completed_tasks,
+      total_tasks: progressRecord.total_tasks,
+    }
+    : { total_tasks: progressRecord.total_tasks };
+  const params = Object.prototype.hasOwnProperty.call(progressRecord, 'event_code')
+    ? progressRecord.params
+    : legacyParams;
+  return {
+    phase,
+    statusText: backendEventMessage(canonicalCode, params, translate, 'chat.trace.thinking'),
+  };
 }
 
 export default function MessageBubble({ chat, item, render }: MessageBubbleProps) {
+  const { locale, t } = useAppIntl();
   const {
     toggleTrace,
     rateMessage,
@@ -127,8 +149,8 @@ export default function MessageBubble({ chat, item, render }: MessageBubbleProps
   const groupAssistantMessage = item.role === 'assistant' && Boolean(chat.displayedTeam);
   const groupSenderName = chat.displayedAgent
     ? employeeDisplayName(chat.displayedAgent)
-    : '项目领导';
-  const teamProgress = item.role === 'assistant' ? activeTeamProgress(item) : null;
+    : t('chat.message.groupLeader');
+  const teamProgress = item.role === 'assistant' ? activeTeamProgress(item, t) : null;
 
   const [copied, setCopied] = useState(false);
   const copyResetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -155,7 +177,7 @@ export default function MessageBubble({ chat, item, render }: MessageBubbleProps
       copyResetTimerRef.current = setTimeout(() => setCopied(false), 1500);
     } catch {
       if (!mountedRef.current) return;
-      notify.error('复制失败，请手动选择文本复制');
+      notify.error(t('chat.message.copyFailed'));
     }
   }
 
@@ -172,9 +194,9 @@ export default function MessageBubble({ chat, item, render }: MessageBubbleProps
         )}
         <div className={groupAssistantMessage ? CHAT_GROUP_MESSAGE_CONTENT_CLASS : 'contents'}>
           {groupAssistantMessage && (
-            <span className={CHAT_GROUP_MESSAGE_SENDER_CLASS} data-i18n-ignore>
-              {groupSenderName}
-              <span className={CHAT_GROUP_MESSAGE_LEADER_BADGE_CLASS}>项目领导</span>
+            <span className={CHAT_GROUP_MESSAGE_SENDER_CLASS}>
+              <RawIdentifier value={groupSenderName} />
+              <span className={CHAT_GROUP_MESSAGE_LEADER_BADGE_CLASS}>{t('chat.message.groupLeader')}</span>
             </span>
           )}
           <div
@@ -187,8 +209,8 @@ export default function MessageBubble({ chat, item, render }: MessageBubbleProps
             <button
               type="button"
               className={CHAT_QUEUED_DELETE_BTN_CLASS}
-              aria-label="删除排队消息"
-              title="删除排队消息"
+              aria-label={t('chat.message.deleteQueued')}
+              title={t('chat.message.deleteQueued')}
               onClick={() => removeQueuedTurn(item.turnId || '')}
             >
               <StaffdeckIcon name="trash" size={14} />
@@ -208,8 +230,10 @@ export default function MessageBubble({ chat, item, render }: MessageBubbleProps
 
           {!statusOnly && visibleContent ? (
             item.role === 'assistant' ? (
-              <div aria-live={teamProgress ? 'polite' : undefined} data-i18n-ignore>
-                <MarkdownMessage content={visibleContent} />
+              <div aria-live={teamProgress ? 'polite' : undefined}>
+                <div translate="no" data-i18n-raw-kind="content">
+                  <MarkdownMessage content={visibleContent} />
+                </div>
                 {teamProgress && (
                   <div
                     role="status"
@@ -233,20 +257,24 @@ export default function MessageBubble({ chat, item, render }: MessageBubbleProps
                 {scheduledTaskPrompt && (
                   <span className={CHAT_MESSAGE_MODE_CHIP_CLASS}>
                     <StaffdeckIcon name="clock" size={13} />
-                    定时任务
+                    {t('chat.message.scheduleMode')}
                   </span>
                 )}
                 {sentSlashCommand ? (
                   <>
                     <SlashCommandChip command={sentSlashCommand.command} />
                     {sentSlashCommand.requestText && (
-                      <span className={CHAT_SLASH_COMMAND_REQUEST_CLASS} data-i18n-ignore>
+                      <span
+                        className={CHAT_SLASH_COMMAND_REQUEST_CLASS}
+                        translate="no"
+                        data-i18n-raw-kind="content"
+                      >
                         {sentSlashCommand.requestText}
                       </span>
                     )}
                   </>
                 ) : (
-                  <span data-i18n-ignore>{visibleContent}</span>
+                  <span translate="no" data-i18n-raw-kind="content">{visibleContent}</span>
                 )}
               </div>
             )
@@ -254,13 +282,13 @@ export default function MessageBubble({ chat, item, render }: MessageBubbleProps
 
           {!statusOnly && visibleContent && item.role === 'user' && (
             <div className={CHAT_FEEDBACK_CLASS}>
-              <button
-                type="button"
-                className={CHAT_FEEDBACK_BTN_CLASS}
-                aria-label={copied ? '已复制' : '复制'}
-                title={copied ? '已复制' : '复制'}
-                onClick={() => void handleCopy()}
-              >
+                <button
+                  type="button"
+                  className={CHAT_FEEDBACK_BTN_CLASS}
+                  aria-label={copied ? t('chat.message.copied') : t('chat.message.copy')}
+                  title={copied ? t('chat.message.copied') : t('chat.message.copy')}
+                  onClick={() => void handleCopy()}
+                >
                 {copied ? <Check size={15} /> : <Copy size={15} />}
               </button>
             </div>
@@ -278,10 +306,15 @@ export default function MessageBubble({ chat, item, render }: MessageBubbleProps
                     </span>
                   )}
                   <span className={CHAT_ATTACHMENT_COPY_CLASS}>
-                    <span className={CHAT_ATTACHMENT_NAME_CLASS} data-i18n-ignore>{attachment.filename}</span>
-                    <span className={CHAT_ATTACHMENT_META_CLASS} data-i18n-ignore>
-                      {attachmentTypeLabel(attachment)}
-                      {attachment.error ? ` · ${attachment.error}` : ''}
+                    <RawIdentifier className={CHAT_ATTACHMENT_NAME_CLASS} value={attachment.filename} />
+                    <span className={CHAT_ATTACHMENT_META_CLASS}>
+                      {attachmentTypeLabel(attachment, locale, t)}
+                      {attachment.error ? (
+                        <>
+                          {' · '}
+                          <RawContent value={attachment.error} />
+                        </>
+                      ) : ''}
                     </span>
                   </span>
                 </div>
@@ -317,7 +350,7 @@ export default function MessageBubble({ chat, item, render }: MessageBubbleProps
                   <button
                     type="button"
                     className={cn(CHAT_FEEDBACK_BTN_CLASS, item.feedback_rating === 'up' && CHAT_FEEDBACK_BTN_ACTIVE_CLASS)}
-                    aria-label="点赞"
+                    aria-label={t('chat.message.thumbsUp')}
                     onClick={() => rateMessage(item, 'up')}
                   >
                     <IconThumbUp width={15} height={15} />
@@ -328,7 +361,7 @@ export default function MessageBubble({ chat, item, render }: MessageBubbleProps
                       CHAT_FEEDBACK_BTN_CLASS,
                       item.feedback_rating === 'down' && CHAT_FEEDBACK_BTN_DISLIKE_ACTIVE_CLASS,
                     )}
-                    aria-label="点踩"
+                    aria-label={t('chat.message.thumbsDown')}
                     onClick={() => rateMessage(item, 'down')}
                   >
                     <IconThumbDown width={15} height={15} />
@@ -338,8 +371,8 @@ export default function MessageBubble({ chat, item, render }: MessageBubbleProps
               <button
                 type="button"
                 className={CHAT_FEEDBACK_BTN_CLASS}
-                aria-label={copied ? '已复制' : '复制'}
-                title={copied ? '已复制' : '复制'}
+                aria-label={copied ? t('chat.message.copied') : t('chat.message.copy')}
+                title={copied ? t('chat.message.copied') : t('chat.message.copy')}
                 onClick={() => void handleCopy()}
               >
                 {copied ? <Check size={15} /> : <Copy size={15} />}
@@ -353,7 +386,7 @@ export default function MessageBubble({ chat, item, render }: MessageBubbleProps
         <div className={CHAT_QUEUED_STATUS_ROW_CLASS}>
           <span className={CHAT_QUEUED_STATUS_CLASS} role="status">
             <StaffdeckIcon name="clock" size={12} />
-            排队中
+            {t('chat.message.queueStatus')}
           </span>
         </div>
       )}

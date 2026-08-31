@@ -6,8 +6,62 @@ import type { EnterpriseAuthUser } from '../auth';
 import AccountApiKeyDialog from '../components/AccountApiKeyDialog';
 import { apiErrorMessage } from '../lib/apiErrorMessages';
 import { copyTextToClipboard } from '../lib/clipboard';
+import { createAppTranslator, getStoredLocale, useAppIntl } from '../i18n';
+import { RawContent, RawIdentifier } from '../i18n/RawContent';
 import type { NetworkSettingsRead, UIConfigRead } from '../types';
 import { BrainCircuit, Copy, KeyRound, Network, RotateCcw, ShieldCheck } from 'lucide-react';
+
+type RuntimeSettingsUIConfigRead = UIConfigRead & {
+  sandbox_status: NonNullable<UIConfigRead['sandbox_status']>;
+};
+
+type RuntimeSettingsTranslator = ReturnType<typeof createAppTranslator>['t'];
+
+/** Maps the backend's finite sandbox status vocabulary to localized product labels. */
+function sandboxStatusLabel(status: string, t: RuntimeSettingsTranslator): string {
+  switch (status) {
+    case 'ready':
+      return t('runtimeSettings.sandbox.status.ready');
+    case 'degraded':
+      return t('runtimeSettings.sandbox.status.degraded');
+    case 'disabled':
+      return t('runtimeSettings.sandbox.status.disabled');
+    default:
+      return t('runtimeSettings.sandbox.status.unavailable');
+  }
+}
+
+/** Maps a known sandbox diagnostic code to localized remediation prose; unknown codes fail closed. */
+function sandboxRemediationMessage(
+  code: string | null | undefined,
+  t: RuntimeSettingsTranslator,
+): string | null {
+  switch (code) {
+    case 'SANDBOX_UNAVAILABLE':
+      return t('runtimeSettings.sandbox.remediation.runtimeUnavailable');
+    case 'SANDBOX_ROOT_USER':
+      return t('runtimeSettings.sandbox.remediation.rootUser');
+    case 'SANDBOX_USERNS_DISABLED':
+      return t('runtimeSettings.sandbox.remediation.userNamespacesDisabled');
+    case 'SANDBOX_WINDOWS_SETUP_REQUIRED':
+      return t('runtimeSettings.sandbox.remediation.windowsSetupRequired');
+    case 'SANDBOX_UNSANDBOXED_FALLBACK':
+      return t('runtimeSettings.sandbox.remediation.unsandboxedFallback');
+    default:
+      return null;
+  }
+}
+
+/** Maps a known setup code to localized instructions while leaving its command as raw content. */
+function sandboxSetupMessage(
+  code: string | null | undefined,
+  t: RuntimeSettingsTranslator,
+): string | null {
+  if (code === 'SANDBOX_WINDOWS_SETUP_REQUIRED') {
+    return t('runtimeSettings.sandbox.setup.windowsRequired');
+  }
+  return null;
+}
 
 type UiConfigForm = {
   show_thinking_trace: boolean;
@@ -64,26 +118,52 @@ const DEFAULT_NETWORK_SETTINGS: NetworkSettingsForm = {
 function formatDateOnly(value: string): string {
   const normalized = /(?:z|[+-]\d{2}:?\d{2})$/i.test(value) ? value : `${value}Z`;
   const date = new Date(normalized);
-  return Number.isNaN(date.getTime()) ? value.slice(0, 10) : date.toISOString().slice(0, 10);
+  if (Number.isNaN(date.getTime())) return value.slice(0, 10);
+  return new Intl.DateTimeFormat(getStoredLocale(), {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(date);
+}
+
+/** 为运行设置页的导出校验与辅助函数提供稳定翻译器。 */
+function currentRuntimeSettingsTranslator() {
+  return createAppTranslator(getStoredLocale());
+}
+
+/** 将错误映射到稳定语义文案；未知错误不展示原始异常正文。 */
+function runtimeSettingsErrorMessage(
+  error: unknown,
+  fallbackId:
+    | 'runtimeSettings.error.uiLoad'
+    | 'runtimeSettings.error.networkLoad'
+    | 'runtimeSettings.toast.saveFailed'
+    | 'runtimeSettings.toast.networkSaveFailed'
+    | 'runtimeSettings.toast.copyFailed',
+): string {
+  const { t } = currentRuntimeSettingsTranslator();
+  const message = apiErrorMessage(error, fallbackId, { t });
+  return message === t('common.error.generic') ? t(fallbackId) : message;
 }
 
 /** Renders tenant runtime controls, including the Harness-only workspace setting and effective root. */
 export default function RuntimeSettingsPage({ currentUser }: { currentUser: EnterpriseAuthUser }) {
+  const { t } = useAppIntl();
   const [form, setForm] = useState<UiConfigForm>(DEFAULT_UI_CONFIG);
   const [loading, setLoading] = useState(false);
   const [updatedAt, setUpdatedAt] = useState('');
-  const [setupMessage, setSetupMessage] = useState('');
+  const [sandboxSetup, setSandboxSetup] = useState<Pick<RuntimeSettingsUIConfigRead, 'sandbox_setup_code' | 'sandbox_setup_params'>>({});
   const [effectiveStoragePath, setEffectiveStoragePath] = useState('');
   const [apiKeyOpen, setApiKeyOpen] = useState(false);
   const [restarting, setRestarting] = useState(false);
   const [networkSettings, setNetworkSettings] = useState<NetworkSettingsRead | null>(null);
   const [networkForm, setNetworkForm] = useState<NetworkSettingsForm>(DEFAULT_NETWORK_SETTINGS);
   const [networkLoading, setNetworkLoading] = useState(false);
-  const [sandboxStatus, setSandboxStatus] = useState<Pick<UIConfigRead, 'sandbox_status' | 'sandbox_status_message' | 'sandbox_status_remediation'>>({});
+  const [sandboxStatus, setSandboxStatus] = useState<Pick<RuntimeSettingsUIConfigRead, 'sandbox_status' | 'sandbox_status_code' | 'sandbox_status_params' | 'sandbox_remediation_code' | 'sandbox_remediation_params'>>({ sandbox_status: 'unavailable' });
   const update = (patch: Partial<UiConfigForm>) => setForm((prev) => ({ ...prev, ...patch }));
 
   useEffect(() => {
-    api.get<UIConfigRead>(`/api/enterprise/ui-config?tenant_id=${TENANT_ID}`)
+    api.get<RuntimeSettingsUIConfigRead>(`/api/enterprise/ui-config?tenant_id=${TENANT_ID}`)
       .then((row) => {
         setForm({
           show_thinking_trace: row.show_thinking_trace,
@@ -106,11 +186,17 @@ export default function RuntimeSettingsPage({ currentUser }: { currentUser: Ente
         });
         setUpdatedAt(row.updated_at);
         setEffectiveStoragePath(row.effective_harness_storage_path || '');
-        setSetupMessage(row.sandbox_setup_instructions || '');
-        setSandboxStatus({ sandbox_status: row.sandbox_status, sandbox_status_message: row.sandbox_status_message, sandbox_status_remediation: row.sandbox_status_remediation });
+        setSandboxSetup({ sandbox_setup_code: row.sandbox_setup_code, sandbox_setup_params: row.sandbox_setup_params });
+        setSandboxStatus({
+          sandbox_status: row.sandbox_status,
+          sandbox_status_code: row.sandbox_status_code,
+          sandbox_status_params: row.sandbox_status_params,
+          sandbox_remediation_code: row.sandbox_remediation_code,
+          sandbox_remediation_params: row.sandbox_remediation_params,
+        });
       })
-      .catch((error) => notify.error(error.message));
-  }, []);
+      .catch(() => notify.error(t('runtimeSettings.error.uiLoad')));
+  }, [t]);
 
   useEffect(() => {
     api.get<NetworkSettingsRead>(`/api/enterprise/network-settings?tenant_id=${TENANT_ID}`)
@@ -118,8 +204,8 @@ export default function RuntimeSettingsPage({ currentUser }: { currentUser: Ente
         setNetworkSettings(row);
         setNetworkForm({ mode: row.mode, port: String(row.port), public_url: row.public_url || '' });
       })
-      .catch((error) => notify.error(error instanceof Error ? error.message : '无法读取网络与 API 设置'));
-  }, []);
+      .catch(() => notify.error(t('runtimeSettings.error.networkLoad')));
+  }, [t]);
 
   async function save() {
     /** Saves runtime controls while preserving the compatible Harness workspace API field. */
@@ -127,7 +213,7 @@ export default function RuntimeSettingsPage({ currentUser }: { currentUser: Ente
     const reflectionMaxRounds = Number(form.reflection_max_rounds);
     const agentLoopMaxActions = Number(form.agent_loop_max_actions);
     if (Number.isNaN(reflectionMaxRounds) || Number.isNaN(agentLoopMaxActions)) {
-      notify.error('反思轮数与单轮最大动作数必须是数字');
+      notify.error(t('runtimeSettings.validation.agentLoopNumeric'));
       return;
     }
     const contextError = validateContextSettings(form);
@@ -137,7 +223,7 @@ export default function RuntimeSettingsPage({ currentUser }: { currentUser: Ente
     }
     setLoading(true);
     try {
-      const row = await api.put<UIConfigRead>('/api/enterprise/ui-config', {
+      const row = await api.put<RuntimeSettingsUIConfigRead>('/api/enterprise/ui-config', {
         tenant_id: TENANT_ID,
         show_thinking_trace: form.show_thinking_trace,
         show_skill_trace: form.show_skill_trace,
@@ -159,16 +245,24 @@ export default function RuntimeSettingsPage({ currentUser }: { currentUser: Ente
       });
       setUpdatedAt(row.updated_at);
       setEffectiveStoragePath(row.effective_harness_storage_path || '');
+      setSandboxSetup({ sandbox_setup_code: row.sandbox_setup_code, sandbox_setup_params: row.sandbox_setup_params });
+      setSandboxStatus({
+        sandbox_status: row.sandbox_status,
+        sandbox_status_code: row.sandbox_status_code,
+        sandbox_status_params: row.sandbox_status_params,
+        sandbox_remediation_code: row.sandbox_remediation_code,
+        sandbox_remediation_params: row.sandbox_remediation_params,
+      });
       if (row.restart_scheduled) {
         setRestarting(true);
-        notify.success('沙盒设置已保存，StaffDeck 正在重启');
+        notify.success(t('runtimeSettings.toast.restartScheduled'));
         await waitForApplicationRestart();
         window.location.reload();
         return;
       }
-      notify.success('运行设置已保存');
+      notify.success(t('runtimeSettings.toast.saved'));
     } catch (error) {
-      notify.error(apiErrorMessage(error, '保存失败'));
+      notify.error(runtimeSettingsErrorMessage(error, 'runtimeSettings.toast.saveFailed'));
     } finally {
       setLoading(false);
     }
@@ -190,31 +284,47 @@ export default function RuntimeSettingsPage({ currentUser }: { currentUser: Ente
       });
       setNetworkSettings(row);
       setNetworkForm({ mode: row.mode, port: String(row.port), public_url: row.public_url || '' });
-      notify.success(row.restart_required ? '网络配置已保存，请完全退出并重新启动 StaffDeck 后生效' : '网络配置已保存');
+      notify.success(
+        row.restart_required
+          ? t('runtimeSettings.toast.networkSavedRestartRequired')
+          : t('runtimeSettings.toast.networkSaved'),
+      );
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '网络配置保存失败');
+      notify.error(runtimeSettingsErrorMessage(error, 'runtimeSettings.toast.networkSaveFailed'));
     } finally {
       setNetworkLoading(false);
     }
   }
 
+  const localizedSandboxRemediation = sandboxRemediationMessage(
+    sandboxStatus.sandbox_remediation_code,
+    t,
+  );
+  const localizedSandboxSetup = sandboxSetupMessage(sandboxSetup.sandbox_setup_code, t);
+  const rawSandboxBackend = typeof sandboxStatus.sandbox_status_params?.backend === 'string'
+    ? sandboxStatus.sandbox_status_params.backend
+    : null;
+  const rawSandboxSetupCommand = typeof sandboxSetup.sandbox_setup_params?.command === 'string'
+    ? sandboxSetup.sandbox_setup_params.command
+    : null;
+
   return (
     <>
       <div className="page-title">
-        <div><h3>运行设置</h3><p className="text-[12px] text-muted-foreground">统一影响当前租户下所有数字员工的执行行为。</p></div>
+        <div><h3>{t('runtimeSettings.heading')}</h3><p className="text-[12px] text-muted-foreground">{t('runtimeSettings.description')}</p></div>
         <UIButton disabled={loading || restarting} onClick={() => void save()}>
           {restarting ? <RotateCcw className="size-[15px] animate-spin" /> : <SaveOutlined />}
-          {restarting ? '等待应用重启' : '保存设置'}
+          {restarting ? t('runtimeSettings.actions.waitRestart') : t('runtimeSettings.save')}
         </UIButton>
       </div>
       <Card className="editor-card settings-card">
-        <CardHeader><CardTitle>执行记录与 Agent Loop</CardTitle></CardHeader>
+        <CardHeader><CardTitle>{t('runtimeSettings.section.agentLoop')}</CardTitle></CardHeader>
         <CardContent className="flex flex-col gap-[16px]">
-          <SwitchRow label="展示思考状态" checked={form.show_thinking_trace} onChange={(next) => update({ show_thinking_trace: next })} />
-          <SwitchRow label="展示执行技能" checked={form.show_skill_trace} onChange={(next) => update({ show_skill_trace: next })} />
-          <SwitchRow label="展示工具调用" checked={form.show_tool_trace} onChange={(next) => update({ show_tool_trace: next })} />
-          <LabeledField label="反思轮数" hint="设为 0 时关闭反思；每轮允许模型检查当前技能和工具结果。"><Input type="number" min={0} max={5} step={1} value={form.reflection_max_rounds} onChange={(e) => update({ reflection_max_rounds: e.target.value })} /></LabeledField>
-          <LabeledField label="单轮最大动作数" hint="限制一次用户输入内连续决策和工具调用的次数，避免无限循环。"><Input type="number" min={1} max={100} step={1} value={form.agent_loop_max_actions} onChange={(e) => update({ agent_loop_max_actions: e.target.value })} /></LabeledField>
+          <SwitchRow label={t('runtimeSettings.field.showThinkingTrace')} checked={form.show_thinking_trace} onChange={(next) => update({ show_thinking_trace: next })} />
+          <SwitchRow label={t('runtimeSettings.field.showSkillTrace')} checked={form.show_skill_trace} onChange={(next) => update({ show_skill_trace: next })} />
+          <SwitchRow label={t('runtimeSettings.field.showToolTrace')} checked={form.show_tool_trace} onChange={(next) => update({ show_tool_trace: next })} />
+          <LabeledField label={t('runtimeSettings.field.reflectionMaxRounds')} hint={t('runtimeSettings.hint.reflectionMaxRounds')}><Input type="number" min={0} max={5} step={1} value={form.reflection_max_rounds} onChange={(e) => update({ reflection_max_rounds: e.target.value })} /></LabeledField>
+          <LabeledField label={t('runtimeSettings.field.agentLoopMaxActions')} hint={t('runtimeSettings.hint.agentLoopMaxActions')}><Input type="number" min={1} max={100} step={1} value={form.agent_loop_max_actions} onChange={(e) => update({ agent_loop_max_actions: e.target.value })} /></LabeledField>
         </CardContent>
       </Card>
       <Card className="editor-card settings-card overflow-hidden">
@@ -225,10 +335,10 @@ export default function RuntimeSettingsPage({ currentUser }: { currentUser: Ente
                 <span className="flex size-[28px] items-center justify-center rounded-[9px] bg-[#eaf2ff] text-[#1a71ff]">
                   <BrainCircuit className="size-[15px]" />
                 </span>
-                对话上下文与自动压缩
+                {t('runtimeSettings.section.context')}
               </CardTitle>
               <p className="mt-[7px] text-[11px] leading-[17px] text-muted-foreground">
-                租户级即时生效；单员工会话和团队成员任务共享这套参数。
+                {t('runtimeSettings.context.description')}
               </p>
             </div>
             <UIButton
@@ -247,111 +357,111 @@ export default function RuntimeSettingsPage({ currentUser }: { currentUser: Ente
               })}
             >
               <RotateCcw className="size-[13px]" />
-              恢复上下文默认值
+              {t('runtimeSettings.actions.resetContextDefaults')}
             </UIButton>
           </div>
         </CardHeader>
         <CardContent className="flex flex-col gap-[18px] pt-[18px]">
           <div className="rounded-[11px] border border-[#dce8fb] bg-[#f7faff] px-[13px] py-[11px] text-[11px] leading-[18px] text-[#52637d]">
-            当估算上下文达到预算 × 触发比例时，系统会把较早对话压缩为长期与近期摘要，并保留指定的最近轮次。数值越大，历史保留越完整，但模型输入成本也越高。
+            {t('runtimeSettings.context.summary')}
           </div>
           <div className="grid gap-[14px] md:grid-cols-2">
-            <LabeledField label="上下文 Token 预算" hint="完整会话上下文的目标上限，范围 512–262144。">
+            <LabeledField label={t('runtimeSettings.field.contextTokenBudget')} hint={t('runtimeSettings.hint.contextTokenBudget')}>
               <Input type="number" min={512} max={262144} step={512} value={form.context_token_budget} onChange={(event) => update({ context_token_budget: event.target.value })} />
             </LabeledField>
-            <LabeledField label="压缩触发比例" hint="达到预算的这个比例后开始压缩，范围 0.10–0.95。">
+            <LabeledField label={t('runtimeSettings.field.contextCompactionRatio')} hint={t('runtimeSettings.hint.contextCompactionRatio')}>
               <Input type="number" min={0.1} max={0.95} step={0.05} value={form.context_compaction_trigger_ratio} onChange={(event) => update({ context_compaction_trigger_ratio: event.target.value })} />
             </LabeledField>
-            <LabeledField label="保留最近对话轮数" hint="压缩时不进入摘要的最近用户轮次，范围 1–50。">
+            <LabeledField label={t('runtimeSettings.field.contextRecentRounds')} hint={t('runtimeSettings.hint.contextRecentRounds')}>
               <Input type="number" min={1} max={50} step={1} value={form.context_recent_round_limit} onChange={(event) => update({ context_recent_round_limit: event.target.value })} />
             </LabeledField>
             <div className="grid grid-cols-2 gap-[10px]">
-              <LabeledField label="长期摘要预算" hint="Token">
+              <LabeledField label={t('runtimeSettings.field.contextLongSummaryBudget')} hint={t('runtimeSettings.hint.tokenUnit')}>
                 <Input type="number" min={128} max={32768} step={128} value={form.context_long_summary_token_budget} onChange={(event) => update({ context_long_summary_token_budget: event.target.value })} />
               </LabeledField>
-              <LabeledField label="近期摘要预算" hint="Token">
+              <LabeledField label={t('runtimeSettings.field.contextMediumSummaryBudget')} hint={t('runtimeSettings.hint.tokenUnit')}>
                 <Input type="number" min={128} max={32768} step={128} value={form.context_medium_summary_token_budget} onChange={(event) => update({ context_medium_summary_token_budget: event.target.value })} />
               </LabeledField>
             </div>
           </div>
           <div className="rounded-[11px] border border-[#e6e9f0] bg-[#fbfbfc] px-[13px] py-[12px]">
-            <p className="text-[12px] font-medium text-[#464c5e]">纳入历史上下文的角色</p>
-            <p className="mt-[3px] text-[11px] leading-[16px] text-muted-foreground">至少保留一种角色；图片只随用户消息进入上下文。</p>
+            <p className="text-[12px] font-medium text-[#464c5e]">{t('runtimeSettings.context.rolesTitle')}</p>
+            <p className="mt-[3px] text-[11px] leading-[16px] text-muted-foreground">{t('runtimeSettings.context.rolesHint')}</p>
             <div className="mt-[10px] grid gap-[8px] sm:grid-cols-2">
-              <SwitchRow label="用户消息" checked={form.context_allowed_roles.includes('user')} onChange={(checked) => update({ context_allowed_roles: toggleContextRole(form.context_allowed_roles, 'user', checked) })} />
-              <SwitchRow label="数字员工回复" checked={form.context_allowed_roles.includes('assistant')} onChange={(checked) => update({ context_allowed_roles: toggleContextRole(form.context_allowed_roles, 'assistant', checked) })} />
+              <SwitchRow label={t('runtimeSettings.context.role.user')} checked={form.context_allowed_roles.includes('user')} onChange={(checked) => update({ context_allowed_roles: toggleContextRole(form.context_allowed_roles, 'user', checked) })} />
+              <SwitchRow label={t('runtimeSettings.context.role.assistant')} checked={form.context_allowed_roles.includes('assistant')} onChange={(checked) => update({ context_allowed_roles: toggleContextRole(form.context_allowed_roles, 'assistant', checked) })} />
             </div>
           </div>
           <div className="grid gap-[14px] md:grid-cols-2">
-            <LabeledField label="长期摘要前缀" hint="注入长期摘要消息时使用，最多 200 字。">
+            <LabeledField label={t('runtimeSettings.field.contextLongSummaryPrefix')} hint={t('runtimeSettings.hint.contextLongSummaryPrefix')}>
               <Textarea rows={3} maxLength={200} value={form.context_long_summary_prefix} onChange={(event) => update({ context_long_summary_prefix: event.target.value })} />
             </LabeledField>
-            <LabeledField label="近期摘要前缀" hint="注入近期摘要消息时使用，最多 200 字。">
+            <LabeledField label={t('runtimeSettings.field.contextMediumSummaryPrefix')} hint={t('runtimeSettings.hint.contextMediumSummaryPrefix')}>
               <Textarea rows={3} maxLength={200} value={form.context_medium_summary_prefix} onChange={(event) => update({ context_medium_summary_prefix: event.target.value })} />
             </LabeledField>
           </div>
         </CardContent>
       </Card>
       <Card className="editor-card settings-card">
-        <CardHeader><CardTitle className="flex items-center gap-[8px]"><Network className="size-[16px]" />网络与 API</CardTitle></CardHeader>
+        <CardHeader><CardTitle className="flex items-center gap-[8px]"><Network className="size-[16px]" />{t('runtimeSettings.section.network')}</CardTitle></CardHeader>
         <CardContent className="flex flex-col gap-[16px]">
           {networkSettings && <NetworkEndpointDetails settings={networkSettings} />}
           <div className="grid gap-[14px] md:grid-cols-2">
-            <LabeledField label="下次启动访问范围" hint="保存后不改变当前服务；端口或访问范围变更需完全退出并重启 StaffDeck。">
+            <LabeledField label={t('runtimeSettings.field.networkMode')} hint={t('runtimeSettings.hint.networkMode')}>
               <select
                 className="h-[36px] rounded-md border border-input bg-background px-[10px] text-[13px]"
                 value={networkForm.mode}
                 onChange={(event) => setNetworkForm((current) => ({ ...current, mode: event.target.value as NetworkSettingsForm['mode'] }))}
               >
-                <option value="local">仅本机</option><option value="lan">局域网</option><option value="public">外部发布</option>
+                <option value="local">{t('runtimeSettings.networkMode.local')}</option><option value="lan">{t('runtimeSettings.networkMode.lan')}</option><option value="public">{t('runtimeSettings.networkMode.public')}</option>
               </select>
             </LabeledField>
-            <LabeledField label="下次启动监听端口" hint="范围 1–65535。若端口被其他进程占用，保存会被拒绝。">
+            <LabeledField label={t('runtimeSettings.field.networkPort')} hint={t('runtimeSettings.hint.networkPort')}>
               <Input type="number" min={1} max={65535} step={1} value={networkForm.port} onChange={(event) => setNetworkForm((current) => ({ ...current, port: event.target.value }))} />
             </LabeledField>
           </div>
-          {networkForm.mode === 'lan' && <p className="rounded-md border border-amber-200 bg-amber-50 px-[12px] py-[10px] text-[12px] leading-[18px] text-amber-900">局域网模式会在重启后允许局域网访问；当前本机调用仍使用上方的 127.0.0.1 地址。请从局域网设备实际访问的地址配置远端调用方。</p>}
+          {networkForm.mode === 'lan' && <p className="rounded-md border border-amber-200 bg-amber-50 px-[12px] py-[10px] text-[12px] leading-[18px] text-amber-900">{t('runtimeSettings.network.lanNotice')}</p>}
           {networkForm.mode === 'public' && <>
-            <LabeledField label="外部发布 URL" hint="填写由你维护的 HTTP(S) 站点根地址，例如 https://staff.example.com。">
-              <Input value={networkForm.public_url} onChange={(event) => setNetworkForm((current) => ({ ...current, public_url: event.target.value }))} placeholder="https://staff.example.com" />
+            <LabeledField label={t('runtimeSettings.field.publicUrl')} hint={t('runtimeSettings.hint.publicUrl')}>
+              <Input value={networkForm.public_url} onChange={(event) => setNetworkForm((current) => ({ ...current, public_url: event.target.value }))} placeholder={t('runtimeSettings.placeholder.publicUrl')} />
             </LabeledField>
-            <p className="rounded-md border border-amber-200 bg-amber-50 px-[12px] py-[10px] text-[12px] leading-[18px] text-amber-900">StaffDeck 不会创建 DNS、TLS 证书、反向代理或防火墙规则。请优先使用 HTTPS，并独立验证外部访问后再提供给远端调用方。</p>
+            <p className="rounded-md border border-amber-200 bg-amber-50 px-[12px] py-[10px] text-[12px] leading-[18px] text-amber-900">{t('runtimeSettings.network.publicNotice')}</p>
           </>}
-          {networkSettings?.restart_required && <p className="rounded-md border border-[#dce8fb] bg-[#f7faff] px-[12px] py-[10px] text-[12px] leading-[18px] text-[#52637d]">已保存的下次启动地址：{networkSettings.pending_base_url}。当前服务仍运行在上方地址，完全退出并重新启动后才会切换。</p>}
-          <div><UIButton variant="outline" disabled={networkLoading} onClick={() => void saveNetworkSettings()}>{networkLoading ? <RotateCcw className="size-[15px] animate-spin" /> : <SaveOutlined />}{networkLoading ? '正在保存网络配置' : '保存下次启动配置'}</UIButton></div>
+          {networkSettings?.restart_required && <p className="rounded-md border border-[#dce8fb] bg-[#f7faff] px-[12px] py-[10px] text-[12px] leading-[18px] text-[#52637d]">{t('runtimeSettings.network.pendingBaseUrl', { value: networkSettings.pending_base_url || '' })}</p>}
+          <div><UIButton variant="outline" disabled={networkLoading} onClick={() => void saveNetworkSettings()}>{networkLoading ? <RotateCcw className="size-[15px] animate-spin" /> : <SaveOutlined />}{networkLoading ? t('runtimeSettings.actions.savingNetwork') : t('runtimeSettings.actions.saveNetwork')}</UIButton></div>
         </CardContent>
       </Card>
       <Card className="editor-card settings-card">
-        <CardHeader><CardTitle className="flex items-center gap-[8px]"><ShieldCheck className="size-[16px]" />执行隔离与 Harness 工作区</CardTitle></CardHeader>
+        <CardHeader><CardTitle className="flex items-center gap-[8px]"><ShieldCheck className="size-[16px]" />{t('runtimeSettings.section.sandbox')}</CardTitle></CardHeader>
         <CardContent className="flex flex-col gap-[16px]">
-          <SwitchRow label="启用 SRT 沙盒" checked={form.sandbox_enabled} onChange={(next) => update({ sandbox_enabled: next })} hint="仅管理员可修改。打开或关闭后保存将自动重启 StaffDeck。默认关闭。" />
+          <SwitchRow label={t('runtimeSettings.field.sandboxEnabled')} checked={form.sandbox_enabled} onChange={(next) => update({ sandbox_enabled: next })} hint={t('runtimeSettings.adminHint')} />
           <div className={`whitespace-pre-line rounded-md border px-[12px] py-[10px] text-[12px] leading-[18px] ${sandboxStatus.sandbox_status === 'ready' ? 'border-emerald-200 bg-emerald-50 text-emerald-900' : sandboxStatus.sandbox_status === 'degraded' ? 'border-red-300 bg-red-50 text-red-900' : sandboxStatus.sandbox_status === 'disabled' ? 'border-slate-200 bg-slate-50 text-slate-700' : 'border-amber-200 bg-amber-50 text-amber-900'}`}>
-            <div className="font-medium">沙盒状态：{sandboxStatus.sandbox_status === 'ready' ? '可用' : sandboxStatus.sandbox_status === 'degraded' ? '已降级为无沙盒（高风险）' : sandboxStatus.sandbox_status === 'disabled' ? '未启用' : '不可用'}</div>
-            {sandboxStatus.sandbox_status_message && <div>{sandboxStatus.sandbox_status_message}</div>}
-            {sandboxStatus.sandbox_status_remediation && <div>{sandboxStatus.sandbox_status_remediation}</div>}
+            <div className="font-medium">{t('runtimeSettings.sandbox.statusLine', { status: sandboxStatusLabel(sandboxStatus.sandbox_status, t) })}</div>
+            {rawSandboxBackend && rawSandboxBackend !== 'disabled' && <div><span>{t('runtimeSettings.sandbox.backendLabel')}</span> <RawIdentifier value={rawSandboxBackend} /></div>}
+            {localizedSandboxRemediation && <div>{localizedSandboxRemediation}</div>}
           </div>
-          {setupMessage && <div className="whitespace-pre-line rounded-md border border-amber-200 bg-amber-50 px-[12px] py-[10px] text-[12px] leading-[18px] text-amber-900">{setupMessage}</div>}
+          {localizedSandboxSetup && <div className="whitespace-pre-line rounded-md border border-amber-200 bg-amber-50 px-[12px] py-[10px] text-[12px] leading-[18px] text-amber-900"><div>{localizedSandboxSetup}</div>{rawSandboxSetupCommand && <><div className="mt-[6px]">{t('runtimeSettings.sandbox.setup.commandLabel')}</div><code className="mt-[3px] block break-all"><RawContent value={rawSandboxSetupCommand} /></code></>}</div>}
           <div className="rounded-md border border-[#dce8fb] bg-[#f7faff] px-[12px] py-[10px] text-[12px] leading-[18px] text-[#52637d]">
-            <div className="font-medium text-[#2f3442]">当前生效的 Harness 工作区</div>
-            <code className="mt-[4px] block break-all text-[11px]">{effectiveStoragePath || '—'}</code>
+            <div className="font-medium text-[#2f3442]">{t('runtimeSettings.sandbox.effectiveWorkspace')}</div>
+            <code className="mt-[4px] block break-all text-[11px]"><RawContent value={effectiveStoragePath || '—'} /></code>
           </div>
-          {!form.sandbox_enabled && <LabeledField label="Harness 工作区目录" hint="仅用于 Harness 的任务文件和生成产物；不会配置、迁移或改变数据库、日志、上传附件和运行配置。留空使用默认工作区。"><Input value={form.harness_storage_path} onChange={(e) => update({ harness_storage_path: e.target.value })} placeholder={effectiveStoragePath || '~/.staffdeck/workspaces'} /></LabeledField>}
-          {form.sandbox_enabled && <p className="rounded-md border border-amber-200 bg-amber-50 px-[12px] py-[10px] text-[12px] leading-[18px] text-amber-900">启用沙盒时，当前实际工作区以沙盒策略为准；上方路径仅显示当前生效位置。</p>}
-          {form.sandbox_enabled && <LabeledField label="网络访问" hint="统一影响所有 Harness/SRT 执行。默认联网按运行环境放行；白名单只允许列出的域名；全拒绝禁止外网。">
+          {!form.sandbox_enabled && <LabeledField label={t('runtimeSettings.field.harnessWorkspacePath')} hint={t('runtimeSettings.hint.harnessWorkspacePath')}><Input value={form.harness_storage_path} onChange={(e) => update({ harness_storage_path: e.target.value })} placeholder={effectiveStoragePath || t('runtimeSettings.placeholder.harnessWorkspacePath')} /></LabeledField>}
+          {form.sandbox_enabled && <p className="rounded-md border border-amber-200 bg-amber-50 px-[12px] py-[10px] text-[12px] leading-[18px] text-amber-900">{t('runtimeSettings.sandbox.workspaceNotice')}</p>}
+          {form.sandbox_enabled && <LabeledField label={t('runtimeSettings.field.sandboxNetworkMode')} hint={t('runtimeSettings.hint.sandboxNetworkMode')}>
             <select className="h-[36px] rounded-md border border-input bg-background px-[10px] text-[13px]" value={form.sandbox_network_mode} onChange={(e) => update({ sandbox_network_mode: e.target.value as UiConfigForm['sandbox_network_mode'] })}>
-              <option value="all">默认联网</option><option value="allowlist">白名单</option><option value="deny">全拒绝</option>
+              <option value="all">{t('runtimeSettings.sandboxNetworkMode.all')}</option><option value="allowlist">{t('runtimeSettings.sandboxNetworkMode.allowlist')}</option><option value="deny">{t('runtimeSettings.sandboxNetworkMode.deny')}</option>
             </select>
           </LabeledField>}
-          {form.sandbox_enabled && form.sandbox_network_mode === 'allowlist' && <LabeledField label="允许的域名" hint="每行一个域名，也支持 *.example.com。"><Textarea rows={4} value={form.sandbox_allowed_domains} onChange={(e) => update({ sandbox_allowed_domains: e.target.value })} placeholder="api.example.com\n*.internal.example.com" /></LabeledField>}
-          <p className="text-[11px] leading-[16px] text-muted-foreground">关闭沙盒时，命令仍受 TaskFrame 工作区、运行时长和输出大小限制，但不再使用操作系统级 SRT 隔离。</p>
-          {updatedAt && <span className="text-[12px] text-muted-foreground">最后更新：{formatDateOnly(updatedAt)}</span>}
+          {form.sandbox_enabled && form.sandbox_network_mode === 'allowlist' && <LabeledField label={t('runtimeSettings.field.sandboxAllowedDomains')} hint={t('runtimeSettings.hint.sandboxAllowedDomains')}><Textarea rows={4} value={form.sandbox_allowed_domains} onChange={(e) => update({ sandbox_allowed_domains: e.target.value })} placeholder={t('runtimeSettings.placeholder.sandboxAllowedDomains')} /></LabeledField>}
+          <p className="text-[11px] leading-[16px] text-muted-foreground">{t('runtimeSettings.sandbox.disabledHint')}</p>
+          {updatedAt && <span className="text-[12px] text-muted-foreground">{t('runtimeSettings.updatedAt', { value: formatDateOnly(updatedAt) })}</span>}
         </CardContent>
       </Card>
       <Card className="editor-card settings-card">
-        <CardHeader><CardTitle className="flex items-center gap-[8px]"><KeyRound className="size-[16px]" />API 全量密钥</CardTitle></CardHeader>
+        <CardHeader><CardTitle className="flex items-center gap-[8px]"><KeyRound className="size-[16px]" />{t('runtimeSettings.section.apiKey')}</CardTitle></CardHeader>
         <CardContent className="flex items-center justify-between gap-[20px]">
-          <div><p className="text-[13px] font-medium text-[#2f3442]">管理员账号全量访问</p><p className="mt-[4px] text-[11px] leading-[17px] text-muted-foreground">用于 API 查询当前账号可访问的数字员工与资源。明文密钥只在创建或轮换时展示一次。</p></div>
-          <UIButton variant="outline" onClick={() => setApiKeyOpen(true)}><KeyRound className="size-[15px]" />管理密钥</UIButton>
+          <div><p className="text-[13px] font-medium text-[#2f3442]">{t('runtimeSettings.apiKey.title')}</p><p className="mt-[4px] text-[11px] leading-[17px] text-muted-foreground">{t('runtimeSettings.apiKey.description')}</p></div>
+          <UIButton variant="outline" onClick={() => setApiKeyOpen(true)}><KeyRound className="size-[15px]" />{t('runtimeSettings.actions.manageApiKeys')}</UIButton>
         </CardContent>
       </Card>
       <AccountApiKeyDialog account={currentUser} open={apiKeyOpen} onClose={() => setApiKeyOpen(false)} />
@@ -360,6 +470,7 @@ export default function RuntimeSettingsPage({ currentUser }: { currentUser: Ente
 }
 
 export function validateContextSettings(form: UiConfigForm): string | null {
+  const { t } = currentRuntimeSettingsTranslator();
   const tokenBudget = Number(form.context_token_budget);
   const triggerRatio = Number(form.context_compaction_trigger_ratio);
   const recentRoundLimit = Number(form.context_recent_round_limit);
@@ -367,19 +478,19 @@ export function validateContextSettings(form: UiConfigForm): string | null {
   const mediumSummaryBudget = Number(form.context_medium_summary_token_budget);
   const integerValues = [tokenBudget, recentRoundLimit, longSummaryBudget, mediumSummaryBudget];
   if (![...integerValues, triggerRatio].every(Number.isFinite)) {
-    return '上下文压缩参数必须是数字';
+    return t('runtimeSettings.validation.contextNumeric');
   }
   if (!integerValues.every(Number.isInteger)) {
-    return 'Token 预算和保留轮数必须是整数';
+    return t('runtimeSettings.validation.contextInteger');
   }
   if (tokenBudget < 512 || tokenBudget > 262_144) {
-    return '上下文 Token 预算必须在 512–262144 之间';
+    return t('runtimeSettings.validation.contextTokenBudgetRange');
   }
   if (triggerRatio < 0.1 || triggerRatio > 0.95) {
-    return '压缩触发比例必须在 0.10–0.95 之间';
+    return t('runtimeSettings.validation.contextRatioRange');
   }
   if (recentRoundLimit < 1 || recentRoundLimit > 50) {
-    return '保留最近对话轮数必须在 1–50 之间';
+    return t('runtimeSettings.validation.contextRecentRoundsRange');
   }
   if (
     longSummaryBudget < 128
@@ -387,16 +498,16 @@ export function validateContextSettings(form: UiConfigForm): string | null {
     || mediumSummaryBudget < 128
     || mediumSummaryBudget > 32_768
   ) {
-    return '长期与近期摘要预算必须在 128–32768 之间';
+    return t('runtimeSettings.validation.contextSummaryBudgetRange');
   }
   if (longSummaryBudget + mediumSummaryBudget > tokenBudget) {
-    return '长期与近期摘要预算之和不能超过上下文预算';
+    return t('runtimeSettings.validation.contextSummaryBudgetTotal');
   }
   if (form.context_allowed_roles.length === 0) {
-    return '至少保留一种历史消息角色';
+    return t('runtimeSettings.validation.contextRolesRequired');
   }
   if (!form.context_long_summary_prefix.trim() || !form.context_medium_summary_prefix.trim()) {
-    return '摘要前缀不能为空';
+    return t('runtimeSettings.validation.contextPrefixRequired');
   }
   return null;
 }
@@ -409,12 +520,13 @@ export function buildApiEndpointLinks(activeBaseUrl: string): { baseUrl: string 
 
 /** Validates next-launch browser input before the backend repeats the authoritative validation. */
 export function validateNetworkSettings(form: NetworkSettingsForm): string | null {
+  const { t } = currentRuntimeSettingsTranslator();
   const port = Number(form.port);
   if (!Number.isInteger(port) || port < 1 || port > 65_535) {
-    return '端口必须是 1 到 65535 之间的整数';
+    return t('runtimeSettings.validation.networkPortRange');
   }
   if (form.mode !== 'public') return null;
-  if (!form.public_url.trim()) return '公网访问需要填写完整的 HTTP(S) URL';
+  if (!form.public_url.trim()) return t('runtimeSettings.validation.publicUrlRequired');
   try {
     const parsed = new URL(form.public_url.trim());
     if (
@@ -426,37 +538,39 @@ export function validateNetworkSettings(form: NetworkSettingsForm): string | nul
       || parsed.hash
       || !['', '/'].includes(parsed.pathname)
     ) {
-      return '公网 URL 不能包含用户名、密码、查询参数、片段或路径';
+      return t('runtimeSettings.validation.publicUrlFormat');
     }
   } catch {
-    return '公网访问需要填写完整的 HTTP(S) URL';
+    return t('runtimeSettings.validation.publicUrlRequired');
   }
   return null;
 }
 
 function NetworkEndpointDetails({ settings }: { settings: NetworkSettingsRead }) {
+  const { t } = currentRuntimeSettingsTranslator();
   /** Copies only a caller-safe integration value and informs the administrator of the result. */
   async function copyApiValue(value: string, label: string): Promise<void> {
     try {
       await copyTextToClipboard(value);
-      notify.success(`已复制${label}`);
+      notify.success(t('runtimeSettings.toast.copiedValue', { label }));
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '复制失败');
+      notify.error(runtimeSettingsErrorMessage(error, 'runtimeSettings.toast.copyFailed'));
     }
   }
 
   const links = buildApiEndpointLinks(settings.active_base_url);
   return <div className="flex flex-col gap-[10px] rounded-[11px] border border-[#e6e9f0] bg-[#fbfbfc] px-[13px] py-[12px]">
-    <EndpointRow label="当前本机 API Base URL" value={links.baseUrl} onCopy={() => void copyApiValue(links.baseUrl, 'Base URL')} />
+    <EndpointRow label={t('runtimeSettings.endpoint.baseUrl')} value={links.baseUrl} onCopy={() => void copyApiValue(links.baseUrl, t('runtimeSettings.endpoint.baseUrlLabel'))} />
   </div>;
 }
 
 function EndpointRow({ label, value, onCopy }: { label: string; value: string; onCopy: () => void }) {
+  const { t } = currentRuntimeSettingsTranslator();
   /** Renders the one read-only API Base URL and its explicit copy action. */
   return <div className="flex flex-wrap items-center justify-between gap-[8px] border-b border-[#e8ebf0] pb-[10px] last:border-0 last:pb-0">
-    <div className="min-w-0"><p className="text-[11px] font-medium text-[#464c5e]">{label}</p><code className="mt-[3px] block break-all text-[11px] text-[#52637d]">{value}</code></div>
+    <div className="min-w-0"><p className="text-[11px] font-medium text-[#464c5e]">{label}</p><code className="mt-[3px] block break-all text-[11px] text-[#52637d]"><RawContent value={value} /></code></div>
     <div className="flex shrink-0 gap-[6px]">
-      <UIButton type="button" variant="outline" size="sm" onClick={onCopy}><Copy className="size-[13px]" />复制</UIButton>
+      <UIButton type="button" variant="outline" size="sm" onClick={onCopy}><Copy className="size-[13px]" />{t('runtimeSettings.actions.copy')}</UIButton>
     </div>
   </div>;
 }
@@ -479,6 +593,7 @@ function SwitchRow({ label, hint, checked, onChange }: { label: string; hint?: s
 }
 
 async function waitForApplicationRestart(): Promise<void> {
+  const { t } = currentRuntimeSettingsTranslator();
   await new Promise((resolve) => window.setTimeout(resolve, 1800));
   for (let attempt = 0; attempt < 60; attempt += 1) {
     try {
@@ -488,5 +603,5 @@ async function waitForApplicationRestart(): Promise<void> {
       await new Promise((resolve) => window.setTimeout(resolve, 1000));
     }
   }
-  throw new Error('StaffDeck 重启超时，请稍后手动刷新页面');
+  throw new Error(t('runtimeSettings.validation.restartTimeout'));
 }

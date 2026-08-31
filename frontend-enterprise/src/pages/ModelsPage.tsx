@@ -18,7 +18,7 @@ import { notify } from '@/components/ui/app-toast';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
 import { cn } from '@/lib/utils';
 import { MENU_CONTENT_CLASS, MENU_ITEM_CLASS, MENU_ITEM_DANGER_CLASS } from '@/lib/enterprise-ui';
-import { apiErrorMessage } from '@/lib/apiErrorMessages';
+import { apiErrorCode, apiErrorMessage } from '@/lib/apiErrorMessages';
 import IconAdd from '../assets/icons/add.svg?react';
 import IconClear from '../assets/icons/field-clear.svg?react';
 import IconEdit from '../assets/icons/edit.svg?react';
@@ -28,15 +28,18 @@ import IconRefresh from '../assets/icons/refresh.svg?react';
 import IconSearch from '../assets/icons/search.svg?react';
 import { StatusBadge } from './scheduled-tasks/StatusBadge';
 import { useClientPagination } from '../hooks/useClientPagination';
-import type { ModelAuthMode, ModelConfigRead } from '../types';
+import type { CodexSubscriptionAccountRead, ModelAuthMode, ModelConfigRead } from '../types';
 import { OPEN_MODEL_CREATE_EVENT } from '@/components/QuickStartGuide';
+import { createAppTranslator, useAppIntl } from '@/i18n';
+import { LOCALE_STORAGE_KEY, normalizeAppLocale } from '@/i18n/locales';
 import ModelSetupWizard from './models/ModelSetupWizard';
 import ModelEditDialog from './models/ModelEditDialog';
-import type { ApiKeyProtocol } from './models/channelPresets';
+import { ModelPayloadValidationError, type ApiKeyProtocol } from './models/channelPresets';
 import { useCodexSubscriptionAccount } from './models/useCodexSubscriptionAccount';
 
 const MODEL_PAGE_SIZE = 8;
 const MODEL_TEST_UI_TIMEOUT_MS = 100_000;
+const STABLE_MODEL_ERROR_CODE_PATTERN = /^[A-Z][A-Z0-9_]+$/;
 
 export type ModelProviderErrorDetail = {
   code: string;
@@ -59,56 +62,73 @@ type ModelTestResponse = {
 
 // 调用/验证模型时可能出现的错误码的用户提示；配置校验类错误码已在 apiErrorMessages.ts
 // 的 API_ERROR_MESSAGES 里有文案，不在此重复。
-const MODEL_PROVIDER_USER_MESSAGES: Record<string, string> = {
-  MODEL_AUTHENTICATION_FAILED: 'API Key 无效或未通过身份验证，请检查密钥配置。',
-  MODEL_BASE_URL_INVALID: 'Base URL 格式不正确，请检查后重试。',
-  MODEL_CANCELLED: '请求已取消。',
-  MODEL_CONFIG_NOT_FOUND: '未找到该模型配置，请刷新后重试。',
-  MODEL_CONNECTION_FAILED: '无法连接到模型服务，请检查网络或 Base URL 配置。',
-  MODEL_EMPTY_OUTPUT: '模型未返回任何内容，请检查配置或稍后重试。',
-  MODEL_ENDPOINT_NOT_FOUND: '未找到指定的模型或接口地址，请检查 Base URL 与模型名称。',
-  MODEL_IMAGE_DATA_URL_INVALID: '图片数据格式不正确，请重新上传。',
-  MODEL_IMAGE_TOO_LARGE: '图片体积过大，请压缩后重试。',
-  MODEL_INVALID_JSON: '请求参数不是合法的 JSON，请检查配置。',
-  MODEL_INVALID_PROVIDER_RESPONSE: '模型服务返回了无法识别的响应，请稍后重试或联系管理员。',
-  MODEL_INVALID_REQUEST: '请求参数不合法，请检查配置后重试。',
-  MODEL_PERMISSION_DENIED: '模型服务拒绝了此次请求，可能是网络中间设备拦截或权限不足，请检查配置或稍后重试。',
-  MODEL_PROVIDER_UNSUPPORTED: '当前模型服务商暂不受支持。',
-  MODEL_RATE_LIMITED: '请求过于频繁，已被限流，请稍后重试。',
-  MODEL_REQUEST_TOO_LARGE: '请求内容过大，请精简后重试。',
-  MODEL_SUBSCRIPTION_ACCESS_DENIED: '当前 ChatGPT 订阅无权使用此模型，请检查订阅权益或模型名称。',
-  MODEL_SUBSCRIPTION_AUTH_FAILED: '本机 Codex 登录未完成，请重新连接 ChatGPT 订阅。',
-  MODEL_SUBSCRIPTION_AUTH_REQUIRED: '请先在本机 Codex 中登录 ChatGPT 订阅，再测试或启用此模型。',
-  MODEL_SUBSCRIPTION_BROWSER_UNAVAILABLE: '无法打开本机 Codex 登录页面，请检查桌面浏览器后重试。',
-  MODEL_SUBSCRIPTION_NETWORK_UNAVAILABLE: '暂时无法连接 ChatGPT 订阅服务，请检查网络后重试。',
-  MODEL_SUBSCRIPTION_QUOTA_EXCEEDED: 'ChatGPT 订阅额度暂不可用，请稍后重试。',
-  MODEL_SUBSCRIPTION_REFRESH_FAILED: 'ChatGPT 授权已失效，请在浏览器中重新连接订阅。',
-  MODEL_SUBSCRIPTION_RUNTIME_FAILED: '本机 Codex runtime 未能完成模型请求，请检查登录状态和模型名称后重试。',
-  MODEL_SUBSCRIPTION_RUNTIME_PROTOCOL_ERROR: '本机 Codex runtime 返回了无法识别的结果，请升级 Codex 后重试。',
-  MODEL_SUBSCRIPTION_RUNTIME_TIMEOUT: '本机 Codex runtime 请求超时，请稍后重试。',
-  MODEL_SUBSCRIPTION_RUNTIME_UNAVAILABLE: '未找到可用的本机 Codex runtime，请安装并登录 Codex 后重试。',
-  MODEL_TIMEOUT: '连接模型服务超时，请检查网络后重试。',
-  MODEL_TOO_MANY_IMAGES: '图片数量超出限制，请减少图片数量后重试。',
-  MODEL_UPSTREAM_CONFLICT: '模型服务状态发生冲突，请稍后重试。',
-  MODEL_UPSTREAM_ERROR: '模型服务返回了错误，请稍后重试或联系管理员。',
-  MODEL_UPSTREAM_UNAVAILABLE: '模型服务暂时不可用，请稍后重试。',
-  MODEL_VERIFICATION_DEADLINE_EXCEEDED: '模型测试超时，请检查网络后重试。',
-  MODEL_VERIFICATION_FAILED: '模型测试未通过，请检查配置。',
-  MODEL_VERIFICATION_INTERNAL_ERROR: '模型测试过程中发生内部错误，请稍后重试或联系管理员。',
-};
+/** 读取当前 locale 的组件外 translator；存储缺失时回退到兼容默认值。 */
+function currentModelsTranslator() {
+  let storedLocale: string | null = null;
+  try {
+    storedLocale = typeof window === 'undefined' ? null : window.localStorage.getItem(LOCALE_STORAGE_KEY);
+  } catch {
+    storedLocale = null;
+  }
+  return createAppTranslator(normalizeAppLocale(storedLocale));
+}
 
-const MODEL_PROVIDER_GENERIC_MESSAGE = '连接模型服务失败，请稍后重试或联系管理员。';
+/** 将值收窄为稳定模型错误码，避免把原始 provider 文本误当作 catalog key。 */
+function stableModelErrorCode(value: unknown): string | null {
+  return typeof value === 'string' && STABLE_MODEL_ERROR_CODE_PATTERN.test(value) ? value : null;
+}
+
+/** 解析 ApiError.body 的首段 JSON；诊断附加文本存在时只读取第一段结构化载荷。 */
+function parseApiErrorBody(body: string): { detail?: unknown } | null {
+  try {
+    return JSON.parse(body) as { detail?: unknown };
+  } catch {
+    const [firstLine] = body.split('\n');
+    if (!firstLine) return null;
+    try {
+      return JSON.parse(firstLine) as { detail?: unknown };
+    } catch {
+      return null;
+    }
+  }
+}
+
+/** 将订阅状态投影为稳定 UI 文案，不直接展示后端返回的自然语言 message。 */
+export function subscriptionAccountMessage(
+  account: CodexSubscriptionAccountRead | null | undefined,
+): string {
+  const { t } = currentModelsTranslator();
+  switch (account?.status) {
+    case 'connected':
+      return t('modelsPage.subscription.connected');
+    case 'pending':
+      return t('modelsPage.subscription.pending');
+    case 'requires_login':
+      return t('modelsPage.subscription.requiresLogin');
+    default:
+      return t('modelsPage.subscription.unavailable');
+  }
+}
 
 export function modelAuthModeLabel(authMode: ModelAuthMode | string | null | undefined): string {
-  return authMode === 'chatgpt_subscription' ? 'ChatGPT 订阅（Codex）' : 'API Key';
+  const { t } = currentModelsTranslator();
+  return authMode === 'chatgpt_subscription'
+    ? t('modelsPage.authMode.subscription')
+    : t('modelsPage.authMode.apiKey');
 }
 
 export function modelProviderErrorMessage(
   error: ModelProviderErrorDetail | null | undefined,
   fallback: string,
 ): string {
+  const { t } = currentModelsTranslator();
   if (!error) return fallback;
-  return MODEL_PROVIDER_USER_MESSAGES[error.code] || MODEL_PROVIDER_GENERIC_MESSAGE;
+  if (error.code === 'MODEL_UPSTREAM_ERROR') return t('modelsPage.error.upstream');
+  if (error.code === 'MODEL_SUBSCRIPTION_AUTH_REQUIRED') {
+    return t('modelsPage.error.subscriptionAuthRequired');
+  }
+  const message = apiErrorMessage(error.code, fallback, { t });
+  return message === t('common.error.generic') ? t('modelsPage.error.genericProvider') : message;
 }
 
 // 把上游诊断字段（HTTP 状态、上游错误码/消息、原始响应体、Request ID）整理成一段纯文本，
@@ -117,18 +137,24 @@ export function modelProviderDiagnosticText(
   error: ModelProviderErrorDetail | null | undefined,
 ): string | null {
   if (!error) return null;
+  const { t } = currentModelsTranslator();
   const parts: string[] = [];
-  if (typeof error.upstream_status === 'number') parts.push(`HTTP 状态码：${error.upstream_status}`);
-  if (error.provider_code) parts.push(`上游错误码：${error.provider_code}`);
-  if (error.provider_message) parts.push(`上游消息：${error.provider_message}`);
-  if (error.upstream_body) parts.push(`上游响应：${error.upstream_body}`);
-  if (error.request_id) parts.push(`Request ID：${error.request_id}`);
+  if (typeof error.upstream_status === 'number') {
+    parts.push(t('modelsPage.diagnostic.httpStatus', { value: error.upstream_status }));
+  }
+  if (error.provider_code) parts.push(t('modelsPage.diagnostic.providerCode', { value: error.provider_code }));
+  if (error.provider_message) {
+    parts.push(t('modelsPage.diagnostic.providerMessage', { value: error.provider_message }));
+  }
+  if (error.upstream_body) parts.push(t('modelsPage.diagnostic.upstreamBody', { value: error.upstream_body }));
+  if (error.request_id) parts.push(t('modelsPage.diagnostic.requestId', { value: error.request_id }));
   return parts.length ? parts.join('\n') : null;
 }
 
 // 折叠的诊断详情展示：默认只显示友好文案，点击「查看详情」才展开原始诊断文本；
 // 诊断文本按纯文本渲染（React children 天然转义），不使用 dangerouslySetInnerHTML。
 function ModelErrorToast({ message, diagnostic }: { message: string; diagnostic: string }) {
+  const { t } = currentModelsTranslator();
   const [expanded, setExpanded] = useState(false);
   return (
     <span className="flex flex-col items-start gap-[6px]">
@@ -138,7 +164,7 @@ function ModelErrorToast({ message, diagnostic }: { message: string; diagnostic:
         onClick={() => setExpanded((prev) => !prev)}
         className="text-[12px] underline underline-offset-2 opacity-80 hover:opacity-100"
       >
-        {expanded ? '收起详情' : '查看详情'}
+        {expanded ? t('modelsPage.detail.hide') : t('modelsPage.detail.show')}
       </button>
       {expanded && (
         <pre className="max-h-[160px] w-full max-w-[420px] overflow-auto whitespace-pre-wrap break-all rounded-[8px] bg-black/5 p-[8px] text-[11px] text-[#464c5e]">
@@ -160,23 +186,33 @@ export function toastContentForProviderError(
 }
 
 export function providerErrorFromApiError(error: ApiError): ModelProviderErrorDetail | null {
-  try {
-    const payload = JSON.parse(error.body) as { detail?: unknown };
-    if (!payload.detail || typeof payload.detail !== 'object' || Array.isArray(payload.detail)) return null;
-    const detail = payload.detail as Partial<ModelProviderErrorDetail>;
-    if (typeof detail.code !== 'string' || typeof detail.message !== 'string') return null;
-    return detail as ModelProviderErrorDetail;
-  } catch {
-    return null;
-  }
+  const payload = parseApiErrorBody(error.body);
+  if (!payload?.detail || typeof payload.detail !== 'object' || Array.isArray(payload.detail)) return null;
+  const detail = payload.detail as Partial<ModelProviderErrorDetail>;
+  if (typeof detail.code !== 'string' || typeof detail.message !== 'string') return null;
+  return detail as ModelProviderErrorDetail;
 }
 
 export function modelActionError(error: unknown, fallback: string): string {
+  const { t } = currentModelsTranslator();
+  if (error instanceof ModelPayloadValidationError) {
+    return error.code === 'MODEL_CLIENT_EXTRA_BODY_INVALID'
+      ? t('modelSetup.validation.extraBodyInvalid')
+      : t('modelSetup.validation.numericFields');
+  }
   if (error instanceof ApiError) {
     const providerError = providerErrorFromApiError(error);
     if (providerError) return modelProviderErrorMessage(providerError, fallback);
+    const knownMessage = apiErrorMessage(error, fallback);
+    if (knownMessage !== t('common.error.generic')) return knownMessage;
+    const code = stableModelErrorCode(apiErrorCode(error));
+    if (code) return t('modelsPage.error.withCode', { code });
+    return fallback;
   }
-  return apiErrorMessage(error, fallback);
+  if (error instanceof Error && stableModelErrorCode(error.message)) {
+    return t('modelsPage.error.withCode', { code: error.message });
+  }
+  return fallback;
 }
 const MODEL_CONFIGS_UPDATED_EVENT = 'ultrarag-enterprise-model-configs-updated';
 
@@ -188,6 +224,7 @@ export default function ModelsPage({
   currentUser?: EnterpriseAuthUser;
   onLogout?: () => void;
 } = {}) {
+  const { t } = useAppIntl();
   const [rows, setRows] = useState<ModelConfigRead[]>([]);
   const [loading, setLoading] = useState(false);
   const [searchText, setSearchText] = useState('');
@@ -215,7 +252,7 @@ export default function ModelsPage({
         setRows(items);
         window.dispatchEvent(new CustomEvent(MODEL_CONFIGS_UPDATED_EVENT, { detail: { models: items } }));
       })
-      .catch((error) => notify.error(error instanceof Error ? error.message : '加载模型失败'))
+      .catch((error) => notify.error(modelActionError(error, t('modelsPage.toast.loadFailed'))))
       .finally(() => {
         if (showLoading) setLoading(false);
       });
@@ -267,11 +304,11 @@ export default function ModelsPage({
     setDeleting(true);
     try {
       await api.delete(`/api/enterprise/model-configs/${row.id}?tenant_id=${TENANT_ID}`);
-      notify.success('已删除模型');
+      notify.success(t('modelsPage.toast.deleted'));
       setDeleteTarget(null);
       await load();
     } catch (error) {
-      notify.error(modelActionError(error, '删除失败'));
+      notify.error(modelActionError(error, t('modelsPage.toast.deleteFailed')));
     } finally {
       setDeleting(false);
     }
@@ -280,10 +317,10 @@ export default function ModelsPage({
   async function setDefault(row: ModelConfigRead) {
     try {
       await api.post(`/api/enterprise/model-configs/${row.id}/set-default?tenant_id=${TENANT_ID}`);
-      notify.success('已设为默认');
+      notify.success(t('modelsPage.toast.setDefault'));
       await load();
     } catch (error) {
-      notify.error(modelActionError(error, '设为默认失败'));
+      notify.error(modelActionError(error, t('modelsPage.toast.setDefaultFailed')));
     }
   }
 
@@ -303,7 +340,7 @@ export default function ModelsPage({
         if (!result.activated) notify.success(result.output || result.message);
         return true;
       } else if (result.message === 'MODEL_VERIFICATION_STALE') {
-        notify.warning('模型配置或测试状态已发生变化，本次结果未生效，请刷新后重新测试');
+        notify.warning(t('modelsPage.toast.stale'));
       } else {
         notify.error(toastContentForProviderError(result.error, result.message));
       }
@@ -311,8 +348,8 @@ export default function ModelsPage({
     } catch (error) {
       notify.error(
         error instanceof DOMException && error.name === 'AbortError'
-          ? '模型连接测试超时，请检查本地模型服务地址和网络后重试'
-          : modelActionError(error, '测试失败'),
+          ? t('modelsPage.error.testTimeout')
+          : modelActionError(error, t('modelsPage.toast.testFailed')),
       );
       return false;
     } finally {
@@ -328,7 +365,7 @@ export default function ModelsPage({
     return (
       <DropdownMenu>
         <DropdownMenuTrigger
-          aria-label={isTesting ? `${row.name} 正在测试` : '模型操作'}
+          aria-label={isTesting ? `${row.name} ${t('modelsPage.actions.testing')}` : t('modelsPage.actions.menu')}
           className="ml-auto grid size-7 place-items-center rounded-[8px] text-[#1a71ff] transition-colors outline-none hover:bg-black/5 hover:text-[#4a8dff] focus-visible:bg-black/5"
         >
           {isTesting ? <LoaderCircle className="size-3.5 animate-spin" /> : <IconMore className="size-3.5" />}
@@ -336,7 +373,7 @@ export default function ModelsPage({
         <DropdownMenuContent align="end" className={MENU_CONTENT_CLASS}>
           <DropdownMenuItem className={MENU_ITEM_CLASS} disabled={isTesting} onSelect={() => setEditingModel(row)}>
             <IconEdit />
-            编辑
+            {t('modelsPage.actions.edit')}
           </DropdownMenuItem>
           <DropdownMenuItem
             className={MENU_ITEM_CLASS}
@@ -344,11 +381,11 @@ export default function ModelsPage({
             onSelect={() => void setDefault(row)}
           >
             <Check />
-            {row.is_default ? '已默认' : '设为默认'}
+            {row.is_default ? t('modelsPage.actions.default') : t('modelsPage.actions.setDefault')}
           </DropdownMenuItem>
           <DropdownMenuItem className={MENU_ITEM_CLASS} disabled={isTesting} onSelect={() => void test(row)}>
             {isTesting ? <LoaderCircle className="animate-spin" /> : <FlaskConical />}
-            {isTesting ? '正在测试' : '测试'}
+            {isTesting ? t('modelsPage.actions.testing') : t('modelsPage.actions.test')}
           </DropdownMenuItem>
           <DropdownMenuItem
             variant="destructive"
@@ -357,7 +394,7 @@ export default function ModelsPage({
             onSelect={() => setDeleteTarget(row)}
           >
             <Trash2 />
-            删除
+            {t('modelsPage.actions.delete')}
           </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
@@ -367,46 +404,46 @@ export default function ModelsPage({
   const columns: DataTableColumn<ModelConfigRead>[] = [
     {
       key: 'name',
-      title: '名称',
+      title: t('modelsPage.column.name'),
       width: 240,
       className: 'text-[#18181a]',
       render: (row) => (
         <div className="flex min-w-0 flex-col gap-[2px]">
           <span className="flex min-w-0 items-center gap-[6px]">
             <span className="truncate font-medium leading-[18px] text-[#18181a]">{row.name}</span>
-            {row.is_default && <StatusBadge tone="green">默认</StatusBadge>}
+            {row.is_default && <StatusBadge tone="green">{t('modelsPage.actions.default')}</StatusBadge>}
           </span>
           <span className="truncate text-[#858b9c]">
-            {row.enabled ? '已启用' : '已停用'} · {modelAuthModeLabel(row.auth_mode)}
+            {row.enabled ? t('modelsPage.mobile.enabled') : t('modelsPage.mobile.disabled')} · {modelAuthModeLabel(row.auth_mode)}
           </span>
         </div>
       ),
     },
-    { key: 'model', title: '模型', width: 180, render: (row) => <span className="block truncate">{row.model}</span> },
+    { key: 'model', title: t('modelsPage.column.model'), width: 180, render: (row) => <span className="block truncate">{row.model}</span> },
     {
       key: 'auth_mode',
-      title: '认证方式',
+      title: t('modelsPage.column.authMode'),
       className: 'whitespace-normal',
       render: (row) => (
         <div className="flex min-w-0 flex-col gap-[2px]">
           <span className="line-clamp-1 wrap-break-word text-[#464c5e]">{modelAuthModeLabel(row.auth_mode)}</span>
           <span className="line-clamp-1 wrap-break-word text-[#858b9c]">
-            {row.auth_mode === 'chatgpt_subscription' ? '本机 Codex runtime' : row.base_url || '未设置 Base URL'}
+            {row.auth_mode === 'chatgpt_subscription' ? t('modelsPage.authHint.subscriptionRuntime') : row.base_url || t('modelsPage.authHint.baseUrlMissing')}
           </span>
         </div>
       ),
     },
     {
       key: 'api_key',
-      title: 'API Key',
+      title: t('modelsPage.column.apiKey'),
       width: 180,
       render: (row) => <span className="block truncate font-mono text-[#858b9c]">
-        {row.auth_mode === 'chatgpt_subscription' ? '无需 API Key' : row.api_key_masked || '-'}
+        {row.auth_mode === 'chatgpt_subscription' ? t('modelsPage.authMode.subscription') : row.api_key_masked || '-'}
       </span>,
     },
     {
       key: 'actions',
-      title: '操作',
+      title: t('modelsPage.column.actions'),
       width: 70,
       align: 'right',
       render: (row) => renderActions(row),
@@ -422,24 +459,24 @@ export default function ModelsPage({
         <div className="min-w-0">
           <span className="flex min-w-0 items-center gap-[6px]">
             <strong className="truncate text-[14px] font-semibold text-[#18181a]">{row.name}</strong>
-            {row.is_default && <StatusBadge tone="green">默认</StatusBadge>}
+            {row.is_default && <StatusBadge tone="green">{t('modelsPage.actions.default')}</StatusBadge>}
           </span>
           <span className="mt-[2px] block truncate text-[12px] text-[#858b9c]">
-            {row.enabled ? '已启用' : '已停用'} · {modelAuthModeLabel(row.auth_mode)}
+            {row.enabled ? t('modelsPage.mobile.enabled') : t('modelsPage.mobile.disabled')} · {modelAuthModeLabel(row.auth_mode)}
           </span>
         </div>
         {renderActions(row)}
       </div>
       <p className="mt-[8px] line-clamp-1 wrap-break-word text-[12px] text-[#858b9c]">{row.model}</p>
       <p className="mt-[4px] line-clamp-1 wrap-break-word font-mono text-[12px] text-[#858b9c]">
-        {row.auth_mode === 'chatgpt_subscription' ? 'ChatGPT 订阅' : row.api_key_masked || '-'}
+        {row.auth_mode === 'chatgpt_subscription' ? t('modelsPage.card.subscription') : row.api_key_masked || '-'}
       </p>
     </article>
   );
 
   return (
     <div className="min-h-full box-border px-[48px] pt-[32px] pb-[43px] max-[900px]:px-[16px]">
-      <AppHeader className="items-center" onLogout={onLogout} userName={currentUser?.username} title="模型" />
+      <AppHeader className="items-center" onLogout={onLogout} userName={currentUser?.username} title={t('modelsPage.stats.models')} />
 
       <div className="mt-[20px] mb-[16px] flex items-center justify-end gap-[12px]">
         <UIButton
@@ -449,7 +486,7 @@ export default function ModelsPage({
           className="h-[34px] gap-[4px] rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[20px] text-[12px] font-normal text-[#757f9c] hover:border-[#cbd3e6] hover:bg-white hover:text-[#18181a]"
         >
           <IconRefresh className={cn('size-[14px]', loading && 'animate-spin')} />
-          刷新
+          {t('modelsPage.actions.refresh')}
         </UIButton>
         <UIButton
           data-guide-target="models-create"
@@ -457,26 +494,26 @@ export default function ModelsPage({
           className="h-[34px] gap-[4px] rounded-[10px] bg-[#18181a] px-[20px] text-[12px] font-normal text-white hover:bg-[#303030]"
         >
           <IconAdd className="size-[14px]" />
-          新建模型
+          {t('modelsPage.actions.create')}
         </UIButton>
       </div>
 
       <div className="flex flex-col gap-[24px] rounded-[20px_20px_0_0] bg-white p-[18px_18px_24px_18px] shadow-[0_-4px_16px_0_rgba(0,0,0,0.05)]">
-        <div className="flex flex-wrap items-stretch gap-[20px]" aria-label="模型统计">
-          <StatCard label="模型" value={rows.length} />
-          <StatCard label="已启用" value={enabledCount} tone="green" />
+        <div className="flex flex-wrap items-stretch gap-[20px]" aria-label={t('modelsPage.stats.aria')}>
+          <StatCard label={t('modelsPage.stats.models')} value={rows.length} />
+          <StatCard label={t('modelsPage.stats.active')} value={enabledCount} tone="green" />
           <StatCard
-            label="默认模型"
+            label={t('modelsPage.stats.default')}
             value={<span title={defaultRow?.name || undefined}>{defaultRow?.name || '-'}</span>}
             valueClassName="min-w-0 flex-1 shrink truncate text-[18px] leading-[26px]"
           />
-          <StatCard label="API 协议" value={providerCount} />
+          <StatCard label={t('modelsPage.stats.protocols')} value={providerCount} />
         </div>
 
         <div className="flex flex-col gap-[18px]">
           <div className="flex items-center gap-[6px] px-[12px] text-[#757f9c]">
             <IconModels className="size-[14px] shrink-0" />
-            <span className="text-[14px] font-normal leading-none">模型列表</span>
+            <span className="text-[14px] font-normal leading-none">{t('modelsPage.list.title')}</span>
           </div>
 
           <label className="flex h-[34px] w-[300px] items-center gap-[8px] overflow-hidden rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[12px] transition-colors focus-within:border-[#18181a] max-[900px]:w-full">
@@ -487,14 +524,14 @@ export default function ModelsPage({
               data-lpignore="true"
               data-bwignore="true"
               value={searchText}
-              placeholder="搜索名称、模型、API 协议或 Base URL"
+              placeholder={t('modelsPage.search.placeholder')}
               onChange={(event) => setSearchText(event.target.value)}
               className="h-full min-w-0 flex-1 bg-transparent text-[12px] text-[#17191f] outline-none placeholder:text-[#c0c6d4]"
             />
             {searchText && (
               <button
                 type="button"
-                aria-label="清除搜索"
+                aria-label={t('modelsPage.search.clear')}
                 onClick={() => setSearchText('')}
                 className="grid size-[16px] shrink-0 place-items-center text-[#c0c6d4] hover:text-[#858b9c]"
               >
@@ -506,25 +543,23 @@ export default function ModelsPage({
           <div className="grid gap-[10px] md:hidden">
             {filteredRows.length ? (
               pagination.pagedItems.map(renderMobileCard)
-            ) : (
-              <div className="py-[40px] text-center text-[13px] text-[#858b9c]">暂无模型</div>
-            )}
+            ) : null}
           </div>
 
           <div className="hidden md:block">
             <DataTable
-              aria-label="模型列表"
+              aria-label={t('modelsPage.list.aria')}
               columns={columns}
               data={pagination.pagedItems}
               rowKey={(row) => row.id}
               loading={loading}
-              emptyText="暂无模型，点击「新建模型」添加一个吧"
+              emptyText={t('modelsPage.empty')}
             />
           </div>
 
           {filteredRows.length > 0 && (
             <Paginator
-              aria-label="模型分页"
+              aria-label={t('modelsPage.pagination.aria')}
               className="mt-0 mb-[6px]"
               page={pagination.page}
               pageCount={pagination.pageCount}
@@ -542,8 +577,8 @@ export default function ModelsPage({
           void load();
           notify.success(
             options?.tested
-              ? `模型「${model.name}」已创建并通过测试`
-              : `模型「${model.name}」已保存为草稿，点击「测试」后即可启用`,
+              ? t('modelsPage.toast.createdTested', { name: model.name })
+              : t('modelsPage.toast.createdDraft', { name: model.name }),
           );
         }}
         availableProtocols={availableProtocols}
@@ -571,11 +606,11 @@ export default function ModelsPage({
         open={Boolean(deleteTarget)}
         onOpenChange={(open) => !open && setDeleteTarget(null)}
         loading={deleting}
-        title={deleteTarget ? `删除模型「${deleteTarget.name}」？` : ''}
+        title={deleteTarget ? t('modelsPage.confirm.delete.title', { name: deleteTarget.name }) : ''}
         description={deleteTarget?.is_default
-          ? '这是当前默认模型。删除后需要重新设置默认模型，相关数字员工中的模型绑定也会一并移除。'
-          : '删除后，相关数字员工中的模型绑定也会一并移除，操作不可撤销。'}
-        confirmText="删除"
+          ? t('modelsPage.confirm.delete.descriptionDefault')
+          : t('modelsPage.confirm.delete.description')}
+        confirmText={t('modelsPage.actions.delete')}
         onConfirm={() => void confirmDelete()}
       />
 
@@ -584,9 +619,9 @@ export default function ModelsPage({
         onOpenChange={setSubscriptionLogoutConfirmOpen}
         loading={subscriptionLoading}
         destructive={false}
-        title="退出本机 Codex？"
-        description="这会让本机 Codex 退出 ChatGPT。所有采用“ChatGPT 订阅（Codex）”的模型都会失去授权；同一台电脑上使用该 Codex 登录的其他应用也可能受影响。API Key 模型不受影响。"
-        confirmText="退出本机 Codex"
+        title={t('modelsPage.confirm.logout.title')}
+        description={t('modelsPage.confirm.logout.description')}
+        confirmText={t('modelsPage.confirm.logout.confirm')}
         onConfirm={confirmSubscriptionLogout}
       />
     </div>

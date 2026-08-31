@@ -4,7 +4,7 @@ import { cleanup, render, screen } from '@testing-library/react';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { employeeProfile } from '@/employee';
-import { I18nProvider } from '@/i18n';
+import { AppIntlProvider } from '@/i18n';
 import type { AgentProfileRead, ChatSession, TeamRead } from '@/types';
 
 import type { UseChatSession } from '../useChatSession';
@@ -55,9 +55,9 @@ function buildChat(session: Partial<ChatSession>, extra: Record<string, unknown>
 
 function renderEmptyState(chat: UseChatSession) {
   return render(
-    <I18nProvider>
+    <AppIntlProvider initialLocale="zh-CN">
       <ChatEmptyState chat={chat} />
-    </I18nProvider>,
+    </AppIntlProvider>,
   );
 }
 
@@ -76,7 +76,8 @@ describe('ChatEmptyState team card', () => {
     expect(screen.getByText('我们来做什么？')).toBeTruthy();
     expect(screen.getByText('负责增长实验与内容投放')).toBeTruthy();
     // 成员名标签，项目领导带后缀标识
-    expect(screen.getByText(/小艾 · 项目领导/)).toBeTruthy();
+    expect(screen.getByText('小艾')).toBeTruthy();
+    expect(screen.getByText((_, element) => element?.textContent === '小艾 · 项目领导')).toBeTruthy();
     expect(screen.getByText(/小北/)).toBeTruthy();
     // 统计格：成员数 / 任务数 / 黑板条目数
     expect(screen.getByText('成员数')).toBeTruthy();

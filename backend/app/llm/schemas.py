@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_serializer
 
 
 class ModelConfigCreateRequest(BaseModel):
@@ -81,12 +81,24 @@ class ModelCapabilityTestResult(BaseModel):
 class ModelProviderErrorDetail(BaseModel):
     code: str
     message: str
+    message_key: Optional[str] = None
+    params: dict[str, Any] = Field(default_factory=dict)
     upstream_status: Optional[int] = None
     provider_code: Optional[str] = None
     provider_message: Optional[str] = None
     upstream_body: Optional[str] = None
     request_id: Optional[str] = None
+    trace_id: Optional[str] = None
     retryable: bool = False
+
+    @model_serializer(mode="wrap")
+    def serialize_public(self, handler: Any) -> dict[str, Any]:
+        """Strip provider prose and expose only canonical model error metadata on the wire."""
+        payload = handler(self)
+        payload["message"] = self.code
+        for field in ("provider_code", "provider_message", "upstream_body"):
+            payload.pop(field, None)
+        return payload
 
 
 class ModelConfigTestResponse(BaseModel):

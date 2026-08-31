@@ -38,6 +38,7 @@ from app.capabilities.local_general_skill import (
     local_runtime_snapshot,
 )
 from app.capability_scope import normalize_capability_scope
+from app.contracts.domain_http import domain_http_error
 from app.core import AgentLoop
 from app.db import engine, get_session
 from app.db.models import (
@@ -61,6 +62,11 @@ from app.general_skills import (
 )
 from app.general_skills.runner import GeneralSkillReader, GeneralSkillRunner
 from app.general_skills.schema import GeneralSkillFile
+from app.i18n.language_context import (
+    LanguageContext,
+    LanguageContextInputs,
+    resolve_language_context,
+)
 from app.llm.model_config_resolver import resolve_model_config_for_runtime
 from app.security.auth import get_current_user
 from app.security.permissions import (
@@ -69,6 +75,7 @@ from app.security.permissions import (
     require_agent_scope_viewer,
 )
 from app.security.tenant import ensure_tenant
+from app.session.session_kinds import SESSION_KIND_SKILL_TEST
 from app.session.session_schema import ChatTurnRequest, ChatTurnResponse
 
 router = APIRouter(
@@ -90,6 +97,25 @@ SKILLHUB_HOSTS = {"skillhub.ai", "www.skillhub.ai"}
 REMOTE_SKILLHUB_HOSTS = CLAWHUB_HOSTS | SKILLHUB_HOSTS
 CLAWHUB_DOWNLOAD_ENDPOINT = "https://wry-manatee-359.convex.site/api/v1/download"
 LOCAL_REFERENCE_PATTERN = re.compile(r"(?<![\w./-])(?:\./)?references/[^\s`'\"<>|]+")
+
+
+def _general_skill_error(
+    code: str,
+    status_code: int,
+    *,
+    params: dict[str, object] | None = None,
+    retryable: bool | None = None,
+    cause: BaseException | None = None,
+) -> HTTPException:
+    """Return a canonical Skill API error without exposing source or provider prose."""
+    return domain_http_error(
+        code,
+        source="general_skills.api",
+        status_code=status_code,
+        params=params,
+        retryable=retryable,
+        cause=cause,
+    )
 
 
 def _agent_id_or_none(agent_id: object | None) -> str | None:
@@ -160,19 +186,17 @@ def import_general_skill(
             )
         ).first()
         if not row:
-            raise HTTPException(status_code=404, detail="General skill to update was not found")
+            raise _general_skill_error("GENERAL_SKILL_NOT_FOUND", 404)
         inherited_capability_scope = normalize_capability_scope(row.capability_scope)
         if slug != row.slug:
-            raise HTTPException(status_code=400, detail="General skill slug cannot be modified")
+            raise _general_skill_error("GENERAL_SKILL_SLUG_IMMUTABLE", 400)
         if is_private_agent_scope:
             if is_open_gallery_resource(db, request.tenant_id, "general_skill", row):
                 package_source_row = row
                 row = None
                 slug = _unique_slug(db, request.tenant_id, slug)
             elif not _general_skill_editable_by_agent(db, request.tenant_id, agent.id, row):
-                raise HTTPException(
-                    status_code=404, detail="General skill not visible to this agent"
-                )
+                raise _general_skill_error("GENERAL_SKILL_NOT_VISIBLE", 404)
             elif not _private_skill_owned_by_agent(
                 db, request.tenant_id, row, agent.id
             ):
@@ -201,7 +225,7 @@ def import_general_skill(
                 # other references remain stable; re-import should restore it.
                 row = conflict
             else:
-                raise HTTPException(status_code=409, detail="General skill slug already exists")
+                raise _general_skill_error("GENERAL_SKILL_SLUG_CONFLICT", 409)
     package_source = row or package_source_row
     if package_source is not None and not request.files and request.markdown is not None:
         files = _replace_skill_markdown_in_package(package_source, request.markdown)
@@ -240,7 +264,7 @@ def import_general_skill(
                 ):
                     slug = _unique_slug(db, request.tenant_id, slug)
                 else:
-                    raise HTTPException(status_code=409, detail="General skill slug already exists")
+                    raise _general_skill_error("GENERAL_SKILL_SLUG_CONFLICT", 409)
         row.slug = slug
         row.name = name
         row.description = description
@@ -374,9 +398,7 @@ def import_general_skill_package(
             )
         ]
     else:
-        raise HTTPException(
-            status_code=400, detail="Uploaded skill package must be a .zip or Markdown file"
-        )
+        raise _general_skill_error("GENERAL_SKILL_UPLOAD_FORMAT_INVALID", 400)
     files = _normalize_skill_files(raw_files, None)
     return _create_imported_general_skill(
         db,
@@ -646,11 +668,11 @@ def publish_general_skill_to_gallery(
     row = _get_general_skill(db, tenant_id, slug)
     agent = ensure_agent_scope_manager(db, tenant_id, agent_id, current_user)
     if agent is None or agent.is_overall:
-        raise HTTPException(status_code=400, detail="A non-overall agent is required")
+        raise _general_skill_error("GENERAL_SKILL_AGENT_SCOPE_REQUIRED", 400)
     if is_open_gallery_resource(db, tenant_id, "general_skill", row):
         return general_skill_read(row)
     if not _private_skill_owned_by_agent(db, tenant_id, row, agent.id):
-        raise HTTPException(status_code=403, detail="Only the skill owner can publish it")
+        raise _general_skill_error("GENERAL_SKILL_PUBLISH_FORBIDDEN", 403)
 
     row.status = "published"
     mark_resource_open_gallery(row, row.metadata_json or {})
@@ -691,7 +713,7 @@ def delete_general_skill(
         return {"status": "hidden", "slug": slug}
     if agent and agent.is_overall:
         if not is_open_gallery_resource(db, tenant_id, "general_skill", row):
-            raise HTTPException(status_code=404, detail="General skill not visible in open gallery")
+            raise _general_skill_error("GENERAL_SKILL_NOT_VISIBLE", 404)
         ensure_open_gallery_admin(tenant_id, current_user)
         hide_open_gallery_binding(db, tenant_id, "general_skill", row.id)
         db.commit()
@@ -711,9 +733,11 @@ def run_general_skill(
     db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ) -> GeneralSkillRunResponse:
+    """Run one published General Skill with the request's immutable language snapshot."""
+    request = _general_skill_request_with_language_context(request)
     skill = _get_general_skill(db, request.tenant_id, slug)
     if skill.status != "published":
-        raise HTTPException(status_code=400, detail="General skill is not published")
+        raise _general_skill_error("GENERAL_SKILL_NOT_PUBLISHED", 400)
     require_agent_scope_viewer(request.tenant_id, request.agent_id, current_user, db)
     _ensure_general_skill_visible(db, request.tenant_id, skill, request.agent_id)
     model_config = _get_request_model(db, request.tenant_id, request.model_config_id)
@@ -733,9 +757,11 @@ def run_general_skill_stream(
     db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ) -> StreamingResponse:
+    """Stream one General Skill test run while fail-closing worker failures to a safe error payload."""
+    request = _general_skill_request_with_language_context(request)
     skill = _get_general_skill(db, request.tenant_id, slug)
     if skill.status != "published":
-        raise HTTPException(status_code=400, detail="General skill is not published")
+        raise _general_skill_error("GENERAL_SKILL_NOT_PUBLISHED", 400)
     require_agent_scope_viewer(request.tenant_id, request.agent_id, current_user, db)
     _ensure_general_skill_visible(db, request.tenant_id, skill, request.agent_id)
     skill_snapshot = _general_skill_snapshot(skill)
@@ -763,8 +789,19 @@ def run_general_skill_stream(
         tenant_id=request.tenant_id,
         user_id=current_user.id,
         agent_id=request.agent_id,
-        title=f"技能测试 · {skill.name}",
+        title=skill.name,
         channel=GENERAL_SKILL_DEBUG_CHANNEL,
+        session_kind=SESSION_KIND_SKILL_TEST,
+        agent_reply_locale=(
+            request.language_context.agent_reply_locale.value
+            if request.language_context is not None
+            else None
+        ),
+        agent_reply_locale_source=(
+            request.language_context.agent_reply_locale_source.value
+            if request.language_context is not None
+            else None
+        ),
     )
     db.add(debug_session)
     db.commit()
@@ -777,6 +814,13 @@ def run_general_skill_stream(
         client_turn_id=client_turn_id,
         user_id=current_user.id,
         message=f"/skill {skill.slug} {request.query.strip()}",
+        ui_locale=(request.language_context.ui_locale if request.language_context else None),
+        agent_reply_locale=(
+            request.language_context.agent_reply_locale
+            if request.language_context
+            else None
+        ),
+        language_context=request.language_context,
         channel=GENERAL_SKILL_DEBUG_CHANNEL,
         message_visibility="internal",
         debug=True,
@@ -784,6 +828,19 @@ def run_general_skill_stream(
 
     def stream_events() -> Iterator[str]:
         terminal: queue.Queue[tuple[str, object]] = queue.Queue(maxsize=1)
+
+        def safe_stream_error_payload(*, retryable: bool) -> dict[str, object]:
+            """Return one stable stream error payload without exposing worker exception text."""
+            payload: dict[str, object] = {
+                "code": "INTERNAL_ERROR",
+                "params": {},
+                "retryable": retryable,
+                "session_id": session_id,
+                "client_turn_id": client_turn_id,
+            }
+            if request.language_context is not None:
+                payload["language_context"] = request.language_context.model_dump(mode="json")
+            return payload
 
         def worker() -> None:
             try:
@@ -805,24 +862,27 @@ def run_general_skill_stream(
                                 skill.slug,
                                 response,
                                 dict(assistant.metadata_json or {}) if assistant else {},
+                                language_context=request.language_context,
                             ),
                         )
                     )
-            except Exception as exc:  # pragma: no cover - defensive stream boundary
-                terminal.put(("error", {"message": str(exc)}))
+            except Exception:  # noqa: BLE001 - defensive stream boundary
+                terminal.put(("error", safe_stream_error_payload(retryable=True)))
 
         threading.Thread(target=worker, daemon=True).start()
-        yield _sse(
-            "stream_started",
-            {
-                "skill_slug": skill_snapshot.slug,
-                "operation": request.operation,
-                "execution_engine": "harness_v2",
-                "session_id": session_id,
-                "client_turn_id": client_turn_id,
-                "idle_timeout_seconds": GENERAL_SKILL_STREAM_IDLE_TIMEOUT_SECONDS,
-            },
-        )
+        stream_started_payload: dict[str, object] = {
+            "skill_slug": skill_snapshot.slug,
+            "operation": request.operation,
+            "execution_engine": "harness_v2",
+            "session_id": session_id,
+            "client_turn_id": client_turn_id,
+            "idle_timeout_seconds": GENERAL_SKILL_STREAM_IDLE_TIMEOUT_SECONDS,
+        }
+        if request.language_context is not None:
+            stream_started_payload["language_context"] = request.language_context.model_dump(
+                mode="json"
+            )
+        yield _sse("stream_started", stream_started_payload)
         last_event_at = time.monotonic()
         last_heartbeat_at = 0.0
         cursor: tuple[object, str] | None = None
@@ -857,12 +917,7 @@ def run_general_skill_stream(
                 if now - last_event_at > GENERAL_SKILL_STREAM_IDLE_TIMEOUT_SECONDS:
                     yield _sse(
                         "error",
-                        {
-                            "message": "技能测试 10 分钟内未收到新的执行事件，请检查模型配置或稍后重试。",
-                            "code": "general_skill_stream_timeout",
-                            "session_id": session_id,
-                            "client_turn_id": client_turn_id,
-                        },
+                        safe_stream_error_payload(retryable=True),
                     )
                     return
                 if now - last_heartbeat_at >= 5:
@@ -920,10 +975,14 @@ def _harness_skill_run_response(
     slug: str,
     response: ChatTurnResponse,
     assistant_metadata: dict[str, object],
+    *,
+    language_context: LanguageContext | None = None,
 ) -> GeneralSkillRunResponse:
+    """Project a Harness response while retaining the immutable locale snapshot."""
     citations = assistant_metadata.get("knowledge_citations")
     artifacts = assistant_metadata.get("harness_artifacts")
     success = not bool(response.runtime_error_code)
+    response_language_context = response.language_context or language_context
     return GeneralSkillRunResponse(
         skill_slug=slug,
         operation="execute",
@@ -942,6 +1001,32 @@ def _harness_skill_run_response(
         artifacts=artifacts if isinstance(artifacts, list) else [],
         stderr=response.reply if response.runtime_error_code else "",
         reply=response.reply,
+        language_context=response_language_context,
+    )
+
+
+def _general_skill_request_with_language_context(
+    request: GeneralSkillRunRequest,
+) -> GeneralSkillRunRequest:
+    """Resolve explicit General Skill locales once and copy them to every execution boundary."""
+    language_context = request.language_context
+    if language_context is None and (
+        request.ui_locale is not None or request.agent_reply_locale is not None
+    ):
+        language_context = resolve_language_context(
+            LanguageContextInputs(
+                explicit_ui_locale=request.ui_locale,
+                explicit_agent_reply_locale=request.agent_reply_locale,
+            )
+        )
+    if language_context is None:
+        return request
+    return request.model_copy(
+        update={
+            "language_context": language_context,
+            "ui_locale": language_context.ui_locale,
+            "agent_reply_locale": language_context.agent_reply_locale,
+        }
     )
 
 
@@ -952,20 +1037,51 @@ def _run_general_skill_operation(
     user_id: str,
     event_sink: Callable[[dict[str, object]], None] | None = None,
 ) -> GeneralSkillRunResponse:
+    """Dispatch one Skill operation with the immutable request language snapshot."""
+    language_context = request.language_context
     if request.operation == "read":
-        response = GeneralSkillReader().read(skill, request.query, model_config)
+        reader_kwargs = (
+            {"language_context": language_context}
+            if language_context is not None
+            else {}
+        )
+        response = GeneralSkillReader().read(
+            skill,
+            request.query,
+            model_config,
+            **reader_kwargs,
+        )
         if event_sink is not None:
             for trace_item in response.execution_trace:
                 event_sink(trace_item)
+        if (
+            language_context is not None
+            and isinstance(response, GeneralSkillRunResponse)
+            and response.language_context is None
+        ):
+            response = response.model_copy(update={"language_context": language_context})
         return response
-    return GeneralSkillRunner().run(
+    runner_kwargs = (
+        {"language_context": language_context}
+        if language_context is not None
+        else {}
+    )
+    response = GeneralSkillRunner().run(
         skill,
         request.query,
         model_config,
         user_id,
         request.max_attempts,
         event_sink,
+        **runner_kwargs,
     )
+    if (
+        language_context is not None
+        and isinstance(response, GeneralSkillRunResponse)
+        and response.language_context is None
+    ):
+        response = response.model_copy(update={"language_context": language_context})
+    return response
 
 
 def _get_general_skill(db: Session, tenant_id: str, slug: str) -> GeneralSkill:
@@ -974,7 +1090,7 @@ def _get_general_skill(db: Session, tenant_id: str, slug: str) -> GeneralSkill:
         select(GeneralSkill).where(GeneralSkill.tenant_id == tenant_id, GeneralSkill.slug == slug)
     ).first()
     if not row:
-        raise HTTPException(status_code=404, detail="General skill not found")
+        raise _general_skill_error("GENERAL_SKILL_NOT_FOUND", 404)
     return row
 
 
@@ -1010,7 +1126,7 @@ def _ensure_general_skill_visible(
     if not agent or agent.is_overall:
         if is_open_gallery_resource(db, tenant_id, "general_skill", row):
             return
-        raise HTTPException(status_code=404, detail="General skill not visible in open gallery")
+        raise _general_skill_error("GENERAL_SKILL_NOT_VISIBLE", 404)
     binding = db.exec(
         select(AgentResourceBinding).where(
             AgentResourceBinding.tenant_id == tenant_id,
@@ -1022,7 +1138,7 @@ def _ensure_general_skill_visible(
     if not binding or not is_bound_resource_visible_for_agent(
         db, tenant_id, "general_skill", row, binding
     ):
-        raise HTTPException(status_code=404, detail="General skill not visible to this agent")
+        raise _general_skill_error("GENERAL_SKILL_NOT_VISIBLE", 404)
 
 
 def _ensure_general_skill_binding(
@@ -1101,7 +1217,7 @@ def _get_default_model(db: Session, tenant_id: str) -> ModelConfig:
         )
     ).first()
     if not model_config:
-        raise HTTPException(status_code=400, detail="No default model config")
+        raise _general_skill_error("MODEL_CONFIG_DEFAULT_MISSING", 400)
     return _model_runtime_config(db, tenant_id, model_config)
 
 
@@ -1112,7 +1228,9 @@ def _get_request_model(
         return _get_default_model(db, tenant_id)
     model_config = db.get(ModelConfig, model_config_id)
     if not model_config or model_config.tenant_id != tenant_id or not model_config.enabled:
-        raise HTTPException(status_code=404, detail="Model config not found")
+        raise _general_skill_error(
+            "MODEL_CONFIG_NOT_FOUND", 404, params={"config_id": model_config_id}
+        )
     return _model_runtime_config(db, tenant_id, model_config)
 
 
@@ -1127,7 +1245,10 @@ def _model_runtime_config(db: Session, tenant_id: str, row: ModelConfig):
 def _required_text(value: str | None, field: str) -> str:
     cleaned = (value or "").strip()
     if not cleaned:
-        raise HTTPException(status_code=400, detail=f"General skill {field} cannot be empty")
+        safe_field = field if re.fullmatch(r"[a-z][a-z0-9_]{0,63}", field) else "value"
+        raise _general_skill_error(
+            "GENERAL_SKILL_FIELD_REQUIRED", 400, params={"field": safe_field}
+        )
     return cleaned
 
 
@@ -1159,7 +1280,7 @@ def _normalize_skill_files(
         )
     skill_file = _find_skill_file(cleaned_files)
     if not skill_file:
-        raise HTTPException(status_code=400, detail="General skill folder must contain SKILL.md")
+        raise _general_skill_error("GENERAL_SKILL_SKILL_FILE_REQUIRED", 400)
     base_dir = skill_file.path.rsplit("/", 1)[0] if "/" in skill_file.path else ""
     if not base_dir:
         return cleaned_files
@@ -1215,13 +1336,7 @@ def _validate_skill_package_references(files: list[GeneralSkillFile]) -> None:
             referenced_paths.add(normalized)
     missing = sorted(referenced_paths - package_paths)
     if missing:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "General skill package is missing files referenced by SKILL.md: "
-                + ", ".join(missing)
-            ),
-        )
+        raise _general_skill_error("GENERAL_SKILL_REFERENCED_FILE_MISSING", 400)
 
 
 def _skill_directories_from_values(
@@ -1234,10 +1349,7 @@ def _skill_directories_from_values(
     for value in values:
         path = _clean_package_path(value)
         if path in file_paths or any(path.startswith(f"{file_path}/") for file_path in file_paths):
-            raise HTTPException(
-                status_code=400,
-                detail=f"General skill directory conflicts with a file path: {value}",
-            )
+            raise _general_skill_error("GENERAL_SKILL_DIRECTORY_CONFLICT", 400)
         if path not in seen:
             seen.add(path)
             directories.append(path)
@@ -1261,7 +1373,7 @@ def _clean_package_path(path: str) -> str:
     cleaned = str(path or "").replace("\\", "/").strip().strip("/")
     parts = [part for part in cleaned.split("/") if part not in {"", "."}]
     if not parts or any(part == ".." for part in parts):
-        raise HTTPException(status_code=400, detail=f"Invalid general skill file path: {path}")
+        raise _general_skill_error("GENERAL_SKILL_FILE_PATH_INVALID", 400)
     return "/".join(parts)
 
 
@@ -1274,7 +1386,7 @@ def _find_skill_file(files: list[GeneralSkillFile]) -> GeneralSkillFile | None:
 def _skill_markdown_from_files(files: list[GeneralSkillFile]) -> str:
     skill_file = _find_skill_file(files)
     if not skill_file or not skill_file.content.strip():
-        raise HTTPException(status_code=400, detail="General skill SKILL.md cannot be empty")
+        raise _general_skill_error("GENERAL_SKILL_SKILL_FILE_EMPTY", 400)
     return skill_file.content
 
 
@@ -1356,26 +1468,24 @@ def _source_name(source: str) -> str:
 def _clean_source_filename(filename: str) -> str:
     cleaned = str(filename or "").replace("\\", "/").strip().rsplit("/", 1)[-1]
     if not cleaned:
-        raise HTTPException(status_code=400, detail="Uploaded skill package filename is required")
+        raise _general_skill_error("GENERAL_SKILL_FILENAME_REQUIRED", 400)
     return cleaned
 
 
 def _decode_base64_payload(value: str) -> bytes:
     cleaned = str(value or "").strip()
     if not cleaned:
-        raise HTTPException(status_code=400, detail="Uploaded skill package content is required")
+        raise _general_skill_error("GENERAL_SKILL_CONTENT_REQUIRED", 400)
     if "," in cleaned and cleaned[:80].lower().startswith("data:"):
         cleaned = cleaned.split(",", 1)[1]
     try:
         data = base64.b64decode(cleaned, validate=True)
     except (binascii.Error, ValueError) as exc:
-        raise HTTPException(
-            status_code=400, detail="Uploaded skill package content is not valid base64"
-        ) from exc
+        raise _general_skill_error("GENERAL_SKILL_CONTENT_INVALID_BASE64", 400, cause=exc) from exc
     if not data:
-        raise HTTPException(status_code=400, detail="Uploaded skill package is empty")
+        raise _general_skill_error("GENERAL_SKILL_PACKAGE_EMPTY", 400)
     if len(data) > MAX_CLAWHUB_PACKAGE_BYTES:
-        raise HTTPException(status_code=400, detail="Uploaded skill package is too large")
+        raise _general_skill_error("GENERAL_SKILL_PACKAGE_TOO_LARGE", 400)
     return data
 
 
@@ -1389,10 +1499,7 @@ def _load_clawhub_source(source: str) -> list[GeneralSkillFile]:
         return _load_remote_skill_source(cleaned)
     if _looks_like_github_shorthand(cleaned):
         return _load_remote_skill_source(f"https://github.com/{cleaned}")
-    raise HTTPException(
-        status_code=400,
-        detail="开源平台来源必须是开源平台 slug、GitHub URL、raw SKILL.md URL、zip URL 或 owner/repo 路径",
-    )
+    raise _general_skill_error("GENERAL_SKILL_SOURCE_INVALID", 400)
 
 
 def _clawhub_slug_from_source(source: str) -> str | None:
@@ -1459,14 +1566,12 @@ def _load_remote_skill_source(url: str, visited: set[str] | None = None) -> list
     normalized_url = url.strip()
     parsed = urlparse(normalized_url)
     if not parsed.scheme or not parsed.netloc:
-        raise HTTPException(status_code=400, detail="Remote skill source must be a valid URL")
+        raise _general_skill_error("GENERAL_SKILL_SOURCE_INVALID", 400)
     visited = visited or set()
     if normalized_url in visited:
-        raise HTTPException(status_code=400, detail="Remote skill source redirects to itself")
+        raise _general_skill_error("GENERAL_SKILL_SOURCE_REDIRECT", 400)
     if len(visited) >= 5:
-        raise HTTPException(
-            status_code=400, detail="Remote skill source contains too many indirections"
-        )
+        raise _general_skill_error("GENERAL_SKILL_SOURCE_INDIRECTION_LIMIT", 400)
     visited.add(normalized_url)
     if parsed.netloc in GITHUB_HOSTS or parsed.netloc == RAW_GITHUB_HOST:
         return _load_github_skill_source(parsed)
@@ -1479,13 +1584,7 @@ def _load_remote_skill_source(url: str, visited: set[str] | None = None) -> list
         linked_source = _extract_skill_source_from_html(text, normalized_url)
         if linked_source:
             return _load_remote_skill_source(linked_source, visited)
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "开源平台页面没有暴露可下载的技能包或 GitHub 目录。"
-                "HTML 页面不会被当作 SKILL.md 导入。"
-            ),
-        )
+        raise _general_skill_error("GENERAL_SKILL_SOURCE_HTML_UNAVAILABLE", 400)
     if _looks_like_markdown_source(parsed.path, lower_content_type):
         file_name = unquote(parsed.path.rstrip("/").rsplit("/", 1)[-1]) or "SKILL.md"
         if not file_name.lower().endswith(".md"):
@@ -1498,20 +1597,14 @@ def _load_remote_skill_source(url: str, visited: set[str] | None = None) -> list
                 mime_type=content_type or "text/markdown",
             )
         ]
-    raise HTTPException(
-        status_code=400,
-        detail="Remote source must be a zip package, GitHub skill directory, or raw Markdown skill file",
-    )
+    raise _general_skill_error("GENERAL_SKILL_SOURCE_UNSUPPORTED", 400)
 
 
 def _load_github_skill_source(parsed) -> list[GeneralSkillFile]:
     parts = [part for part in parsed.path.strip("/").split("/") if part]
     if parsed.netloc == RAW_GITHUB_HOST:
         if len(parts) < 4:
-            raise HTTPException(
-                status_code=400,
-                detail="Raw GitHub source must include owner, repo, branch and path",
-            )
+            raise _general_skill_error("GENERAL_SKILL_RAW_SOURCE_INVALID", 400)
         owner, repo, branch = parts[0], parts[1], parts[2]
         file_path = "/".join(parts[3:])
         data, content_type = _download_url(parsed.geturl())
@@ -1524,9 +1617,7 @@ def _load_github_skill_source(parsed) -> list[GeneralSkillFile]:
             )
         ]
     if len(parts) < 2:
-        raise HTTPException(
-            status_code=400, detail="GitHub source must include owner and repository"
-        )
+        raise _general_skill_error("GENERAL_SKILL_GITHUB_SOURCE_INVALID", 400)
     owner, repo = parts[0], parts[1].removesuffix(".git")
     if len(parts) >= 3 and parts[2] == "archive":
         data, _ = _download_url(parsed.geturl())
@@ -1627,7 +1718,7 @@ def _download_github_directory_contents(
 
     walk(normalized_subtree)
     if not _find_skill_file(files):
-        raise HTTPException(status_code=400, detail="GitHub directory does not contain SKILL.md")
+        raise _general_skill_error("GENERAL_SKILL_SKILL_FILE_REQUIRED", 400)
     return files
 
 
@@ -1642,9 +1733,8 @@ def _download_github_archive(
             return _files_from_zip(data, subtree=subtree)
         except HTTPException as exc:
             errors.append(str(exc.detail))
-    raise HTTPException(
-        status_code=400, detail=f"Unable to download GitHub skill package: {'; '.join(errors)}"
-    )
+    cause = RuntimeError("; ".join(errors)) if errors else RuntimeError("download failed")
+    raise _general_skill_error("GENERAL_SKILL_GITHUB_DOWNLOAD_FAILED", 400, cause=cause)
 
 
 def _download_json(url: str) -> object:
@@ -1652,9 +1742,7 @@ def _download_json(url: str) -> object:
     try:
         return json.loads(_decode_text(data))
     except json.JSONDecodeError as exc:
-        raise HTTPException(
-            status_code=400, detail="Remote GitHub API returned invalid JSON"
-        ) from exc
+        raise _general_skill_error("GENERAL_SKILL_REMOTE_JSON_INVALID", 400, cause=exc) from exc
 
 
 def _looks_like_markdown_source(path: str, content_type: str) -> bool:
@@ -1723,15 +1811,13 @@ def _download_url(url: str) -> tuple[bytes, str]:
             content_type = response.headers.get("content-type", "")
             data = response.read(MAX_CLAWHUB_PACKAGE_BYTES + 1)
     except HTTPError as exc:
-        raise HTTPException(
-            status_code=400, detail=f"Download failed with HTTP {exc.code}"
-        ) from exc
+        raise _general_skill_error("GENERAL_SKILL_DOWNLOAD_FAILED", 400, cause=exc) from exc
     except URLError as exc:
-        raise HTTPException(status_code=400, detail=f"Download failed: {exc.reason}") from exc
+        raise _general_skill_error("GENERAL_SKILL_DOWNLOAD_FAILED", 400, cause=exc) from exc
     except TimeoutError as exc:
-        raise HTTPException(status_code=400, detail="Download timed out") from exc
+        raise _general_skill_error("GENERAL_SKILL_DOWNLOAD_TIMEOUT", 400, cause=exc) from exc
     if len(data) > MAX_CLAWHUB_PACKAGE_BYTES:
-        raise HTTPException(status_code=400, detail="General skill package is too large")
+        raise _general_skill_error("GENERAL_SKILL_PACKAGE_TOO_LARGE", 400)
     return data, content_type
 
 
@@ -1751,7 +1837,7 @@ def _files_from_zip(data: bytes, subtree: str = "") -> list[GeneralSkillFile]:
                 if _zip_relative_path(name, normalized_subtree) is not None
             ]
         if not skill_candidates:
-            raise HTTPException(status_code=400, detail="Package does not contain SKILL.md")
+            raise _general_skill_error("GENERAL_SKILL_SKILL_FILE_REQUIRED", 400)
         base = skill_candidates[0].rsplit("/", 1)[0] if "/" in skill_candidates[0] else ""
         files: list[GeneralSkillFile] = []
         for name in names:
@@ -1814,9 +1900,7 @@ def _guess_mime_type(path: str) -> str:
 
 def _validate_slug(value: str) -> None:
     if any(char.isspace() for char in value) or "/" in value:
-        raise HTTPException(
-            status_code=400, detail="General skill slug cannot contain spaces or slashes"
-        )
+        raise _general_skill_error("GENERAL_SKILL_SLUG_INVALID", 400)
 
 
 def _sse(event: object, data: object) -> str:

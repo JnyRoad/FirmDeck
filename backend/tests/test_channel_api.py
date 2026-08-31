@@ -13,8 +13,8 @@ from app.db import get_session
 from app.db.models import (
     AgentProfile,
     ChannelBinding,
-    ChannelIdentity,
     ChannelDelivery,
+    ChannelIdentity,
     ChannelInboundEvent,
     Message,
     Tenant,
@@ -197,7 +197,7 @@ def test_create_binding_rejects_long_name() -> None:
         headers=_auth(users["owner"]),
     )
     assert response.status_code == 400
-    assert "接入名称" in response.json()["detail"]
+    assert response.json()["detail"]["code"] == "CHANNEL_BAD_REQUEST"
 
 
 def test_tenant_mismatch_forbidden() -> None:
@@ -563,6 +563,48 @@ def test_deliveries_listing(monkeypatch) -> None:
         headers=_auth(users["other"]),
     )
     assert forbidden.status_code == 403
+
+
+def test_delivery_audit_sanitizes_last_error_but_keeps_raw_message_text() -> None:
+    engine = _test_engine()
+    users = _seed_users(engine)
+    binding_id = _seed_binding(engine, status="active")
+    with Session(engine) as db:
+        db.add(
+            ChannelDelivery(
+                tenant_id="tenant_demo",
+                binding_id=binding_id,
+                session_id="session_1",
+                message_id="msg_sensitive",
+                target_json={"to_user_id": "u1", "context_token": "ctx"},
+                kind="reply",
+                text="已生成回复《保留 /kb/C-42.md 原文》",
+                status="failed",
+                last_error="provider timeout secret=/private/wechat.sock",
+                idempotency_key="msg_sensitive",
+                next_attempt_at=None,
+            )
+        )
+        db.commit()
+
+    client = _make_client(engine)
+    response = client.get(
+        "/api/enterprise/channels/delivery-audit",
+        params={"tenant_id": "tenant_demo", "binding_id": binding_id},
+        headers=_auth(users["admin"]),
+    )
+    assert response.status_code == 200
+    row = response.json()["items"][0]
+    assert row["text"] == "已生成回复《保留 /kb/C-42.md 原文》"
+    assert row["last_error"] == "CHANNEL_UPSTREAM_ERROR"
+    assert row["error"] == {
+        "code": "CHANNEL_UPSTREAM_ERROR",
+        "params": {},
+        "retryable": False,
+        "request_id": None,
+        "trace_id": None,
+    }
+    assert "secret=/private/wechat.sock" not in str(row)
 
 
 def test_qrcode_passes_existing_credentials_in_local_token_list(monkeypatch) -> None:
@@ -1590,7 +1632,7 @@ def test_put_non_feishu_default_handoff_assignee_channel_rejected() -> None:
         headers=_auth(users["owner"]),
     )
     assert response.status_code == 400
-    assert "暂不支持私聊通知" in response.json()["detail"]
+    assert response.json()["detail"]["code"] == "CHANNEL_BAD_REQUEST"
 
     # 网页端选项不受影响
     web_variant = client.put(

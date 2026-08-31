@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import time
 from copy import deepcopy
 from typing import Any
@@ -9,6 +10,11 @@ from typing import Any
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import select
 
+from app.contracts.error_registry import ERROR_REGISTRY
+from app.contracts.projections import (
+    project_public_error_payload,
+    project_public_result_payload,
+)
 from app.core.cancellation import is_chat_turn_cancelled
 from app.core.capability_discovery import project_capability_manifest
 from app.core.capability_manifest import CapabilityManifestBuilder
@@ -62,8 +68,10 @@ from app.db.models import (
     Skill,
     Team,
 )
+from app.i18n.language_context import LanguageContext
 from app.knowledge.access import KnowledgeAccessService
 from app.knowledge.citations import compact_knowledge_citation_labels
+from app.llm.prompts.language import localized_compat_text
 from app.memory.service import memory_read
 from app.session.helpers import public_session
 from app.session.session_schema import (
@@ -73,6 +81,46 @@ from app.session.session_schema import (
     TurnPlan,
 )
 from app.skills.nesting import discoverable_sops, expand_visible_sops
+
+logger = logging.getLogger(__name__)
+
+
+def _public_harness_error(value: object) -> object:
+    """Project a Harness error for durable/event boundaries while preserving empty success values."""
+    if value is None or value == {}:
+        return value
+    return project_public_error_payload(
+        value,
+        ERROR_REGISTRY,
+        source="harness-v2-error-boundary",
+    )
+
+
+def _project_harness_trace(value: object) -> dict[str, Any]:
+    """Project known error-bearing trace children without altering successful trace content."""
+    return project_public_result_payload(
+        value,
+        ERROR_REGISTRY,
+        source="harness-v2-trace-boundary",
+    )
+
+
+def _team_progress_metadata(
+    *,
+    completed_tasks: int,
+    total_tasks: int,
+) -> dict[str, object]:
+    """Build locale-independent team progress metadata for the public reply projection."""
+    params = {
+        "completed_tasks": completed_tasks,
+        "total_tasks": total_tasks,
+    }
+    return {
+        "phase": "collecting",
+        "code": "team.run.progress.collecting",
+        "event_code": "team.run.progress.collecting",
+        "params": params,
+    }
 
 
 def _turn_skill_projection(
@@ -148,7 +196,7 @@ def _apply_forced_sop_snapshot(
         updated_at=current.updated_at,
     )
     if hasattr(current, "agent_branch_meta"):
-        object.__setattr__(pinned, "agent_branch_meta", getattr(current, "agent_branch_meta"))
+        object.__setattr__(pinned, "agent_branch_meta", current.agent_branch_meta)
     return [pinned if skill.skill_id == target else skill for skill in source_skills]
 
 
@@ -203,6 +251,7 @@ class HarnessV2Engine:
         self.active_run_id: str | None = None
         self.slash_command: SlashCommandSelection | None = None
         self.turn_knowledge_versions: dict[str, str] | None = None
+        self.language_context: LanguageContext | None = None
         self._session_lock: Any | None = None
         self._session_lock_id: str | None = None
 
@@ -216,6 +265,7 @@ class HarnessV2Engine:
             )
         session = self._get_or_create_session(session_request)
         self.session = session
+        self.language_context = request.language_context
         if self._session_lock is None:
             self._session_lock_id = session.id
             self._session_lock = acquire_harness_session(session.id)
@@ -245,7 +295,7 @@ class HarnessV2Engine:
         bind_turn = getattr(self.events, "bind_turn", None)
         if callable(bind_turn):
             bind_turn(user_message.id, request.client_turn_id)
-        self.events.record(
+        self.events.record_legacy_event(
             request.tenant_id,
             session.id,
             "user_message_received",
@@ -309,7 +359,7 @@ class HarnessV2Engine:
             )
         ]
         if memory_context:
-            self.events.record(
+            self.events.record_legacy_event(
                 request.tenant_id,
                 session.id,
                 "memory_recalled",
@@ -364,6 +414,7 @@ class HarnessV2Engine:
                 planner_state,
                 interaction_mode=request.interaction_mode,
                 team_context=team_context,
+                language_context=request.language_context,
             )
         self._renew_session_lease()
         self._raise_if_cancelled(request, session)
@@ -374,7 +425,7 @@ class HarnessV2Engine:
             memory_context,
         )
         if slot_hydration:
-            self.events.record(
+            self.events.record_legacy_event(
                 request.tenant_id,
                 session.id,
                 "slots_hydrated",
@@ -386,7 +437,7 @@ class HarnessV2Engine:
                 },
             )
         router_decision = turn_plan_router_decision(plan)
-        self.events.record(
+        self.events.record_legacy_event(
             request.tenant_id,
             session.id,
             "turn_plan_created",
@@ -397,7 +448,7 @@ class HarnessV2Engine:
             },
         )
         # Keep the old public trace event while making the new planner explicit.
-        self.events.record(
+        self.events.record_legacy_event(
             request.tenant_id,
             session.id,
             "router_decision_created",
@@ -450,7 +501,7 @@ class HarnessV2Engine:
                 )
             ):
                 self.owner.runtime.complete_current_skill(session)
-            self.events.record(
+            self.events.record_legacy_event(
                 request.tenant_id,
                 session.id,
                 "task_frame_completed",
@@ -462,7 +513,12 @@ class HarnessV2Engine:
             )
 
         pre_turn_state = _session_state(session)
-        records = self.store.persist_plan(session, user_message.id, plan)
+        records = self.store.persist_plan(
+            session,
+            user_message.id,
+            plan,
+            language_context=request.language_context,
+        )
         known_record_ids = {row.task_id for row in records}
         records.extend(
             self.store.ready_dependency_frames(
@@ -493,7 +549,7 @@ class HarnessV2Engine:
             if remaining_turn_actions <= 0:
                 deferred_rows = records[record_index:]
                 self.store.defer_for_action_budget(deferred_rows)
-                self.events.record(
+                self.events.record_legacy_event(
                     request.tenant_id,
                     session.id,
                     "turn_action_budget_exhausted",
@@ -512,11 +568,19 @@ class HarnessV2Engine:
                 waiting = TaskExecutionResult(
                     task_frame_id=row.task_id,
                     status="blocked",
-                    reply_fragment="前置任务完成后将自动继续该任务。",
-                    task_summary="TaskFrame 正在等待前置任务完成。",
+                    reply_fragment=localized_compat_text(
+                        request.language_context,
+                        zh_cn="前置任务完成后将自动继续该任务。",
+                        en_us="This task will continue automatically after its dependency completes.",
+                    ),
+                    task_summary=localized_compat_text(
+                        request.language_context,
+                        zh_cn="TaskFrame 正在等待前置任务完成。",
+                        en_us="The TaskFrame is waiting for its dependency.",
+                    ),
                     error={"code": "DEPENDENCY_WAITING"},
                 )
-                self.events.record(
+                self.events.record_legacy_event(
                     request.tenant_id,
                     session.id,
                     "task_frame_dependency_waiting",
@@ -543,8 +607,16 @@ class HarnessV2Engine:
                 failed = TaskExecutionResult(
                     task_frame_id=row.task_id,
                     status="failed",
-                    reply_fragment="对应的 SOP 当前不可用。",
-                    task_summary="SOP 在执行前已下线或解绑。",
+                    reply_fragment=localized_compat_text(
+                        request.language_context,
+                        zh_cn="对应的 SOP 当前不可用。",
+                        en_us="The corresponding SOP is currently unavailable.",
+                    ),
+                    task_summary=localized_compat_text(
+                        request.language_context,
+                        zh_cn="SOP 在执行前已下线或解绑。",
+                        en_us="The SOP was unpublished or unbound before execution.",
+                    ),
                     error={"code": "SOP_NOT_AVAILABLE"},
                 )
                 self.store.finish_frame(
@@ -604,7 +676,7 @@ class HarnessV2Engine:
                     known_record_ids.update(
                         item.task_id for item in released
                     )
-                    self.events.record(
+                    self.events.record_legacy_event(
                         request.tenant_id,
                         session.id,
                         "task_frame_dependencies_released",
@@ -646,8 +718,10 @@ class HarnessV2Engine:
         reply = _single_task_reply(execution_results)
         if team_publish_result is not None and not execution_results:
             task_count = len(team_publish_result.task_ids)
-            reply = (
-                f"已完成 {task_count} 个团队任务的拆分与派发。"
+            reply = localized_compat_text(
+                request.language_context,
+                zh_cn=f"已完成 {task_count} 个团队任务的拆分与派发。",
+                en_us=f"Split and dispatched {task_count} team tasks.",
             )
         if reply is None:
             reply = self.owner.response_generator.generate(
@@ -662,6 +736,7 @@ class HarnessV2Engine:
                 memory_context,
                 conversation_context,
                 execution_payloads,
+                language_context=request.language_context,
             )
         self._renew_session_lease()
         reply, citations = compact_knowledge_citation_labels(reply, citations)
@@ -673,12 +748,10 @@ class HarnessV2Engine:
         if team_publish_result is not None:
             assistant_metadata["team_run_id"] = team_publish_result.run_id
             assistant_metadata["team_task_ids"] = list(team_publish_result.task_ids)
-            assistant_metadata["team_progress"] = {
-                "phase": "collecting",
-                "completed_tasks": 0,
-                "total_tasks": len(team_publish_result.task_ids),
-                "status_text": "正在等待成员回复",
-            }
+            assistant_metadata["team_progress"] = _team_progress_metadata(
+                completed_tasks=0,
+                total_tasks=len(team_publish_result.task_ids),
+            )
         if request.client_turn_id:
             assistant_metadata["client_turn_id"] = request.client_turn_id
         if request.message_visibility != "visible":
@@ -825,7 +898,7 @@ class HarnessV2Engine:
             if frame.kind == "sop"
             else None
         )
-        self.events.record(
+        self.events.record_legacy_event(
             request.tenant_id,
             session.id,
             "task_frame_started",
@@ -885,6 +958,7 @@ class HarnessV2Engine:
                     else _source_user_message(self.db, row)
                 ),
                 out_of_scope_task_intents=_sibling_task_intents(self.db, row),
+                language_context=request.language_context,
             )
             if (
                 self.slash_command
@@ -911,6 +985,7 @@ class HarnessV2Engine:
                     capability_snapshot=manifest.model_dump(mode="json"),
                     lease_owner=self.active_frame_lease_owner,
                     attempt_no=self.active_frame_attempt_no,
+                    language_context=request.language_context,
                 )
                 self.store.save_agent_loop_checkpoint(
                     agent_loop,
@@ -926,17 +1001,26 @@ class HarnessV2Engine:
                 )
             self.active_run_id = run.id
             self.db.commit()
+            harness_run_id = run.id
 
-            def trace(event_type: str, payload: dict[str, Any]) -> None:
-                self.events.record(
+            def trace(
+                event_type: str,
+                payload: dict[str, Any],
+                *,
+                _harness_run_id: str = harness_run_id,
+                _task_frame_id: str = row.task_id,
+                _agent_loop_id: str = agent_loop.id,
+            ) -> None:
+                projected_payload = _project_harness_trace(payload)
+                self.events.record_legacy_event(
                     request.tenant_id,
                     session.id,
                     event_type,
                     {
-                        **payload,
-                        "task_frame_id": row.task_id,
-                        "harness_run_id": run.id,
-                        "agent_loop_id": agent_loop.id,
+                        **projected_payload,
+                        "task_frame_id": _task_frame_id,
+                        "harness_run_id": _harness_run_id,
+                        "agent_loop_id": _agent_loop_id,
                         "execution_engine": "harness_v2",
                     },
                 )
@@ -965,6 +1049,7 @@ class HarnessV2Engine:
                 ),
                 trace_sink=trace,
                 step_deadline_monotonic=step_deadline_monotonic,
+                language_context=request.language_context,
             )
 
             result = self.task_agent.run(
@@ -978,6 +1063,7 @@ class HarnessV2Engine:
                 step_deadline_monotonic=step_deadline_monotonic,
                 step_timeout_seconds=step_timeout_seconds,
                 checkpoint=loop_checkpoint,
+                language_context=request.language_context,
             )
             deferred_continuation = False
             if frame.kind == "sop":
@@ -1040,7 +1126,12 @@ class HarnessV2Engine:
                     last_step_result = _step_result(result)
                 break
 
-            result = _enforce_required_slots(result, requirement, session)
+            result = _enforce_required_slots(
+                result,
+                requirement,
+                session,
+                language_context=request.language_context,
+            )
             results[-1] = result
             if (
                 result.status == "completed"
@@ -1109,7 +1200,11 @@ class HarnessV2Engine:
             if not continue_frame:
                 break
 
-        combined = _combine_results(row.task_id, results)
+        combined = _combine_results(
+            row.task_id,
+            results,
+            language_context=request.language_context,
+        )
         if run is not None:
             self.store.finish_run(
                 run,
@@ -1139,7 +1234,7 @@ class HarnessV2Engine:
             checkpoint=loop_checkpoint,
             last_run_id=run.id if run is not None else None,
         )
-        self.events.record(
+        self.events.record_legacy_event(
             request.tenant_id,
             session.id,
             "task_frame_finished",
@@ -1151,7 +1246,7 @@ class HarnessV2Engine:
                 "status": combined.status,
                 "step_id": row.step_id,
                 "action_count": combined.action_count,
-                "error": combined.error,
+                "error": _public_harness_error(combined.error),
                 "agent_loop_id": agent_loop.id,
                 "agent_loop_status": agent_loop.status,
                 "execution_engine": "harness_v2",
@@ -1196,7 +1291,11 @@ class HarnessV2Engine:
                         result={
                             "task_frame_id": row.task_id,
                             "status": "cancelled",
-                            "task_summary": "用户取消了当前 Harness 执行。",
+                            "task_summary": localized_compat_text(
+                                self.language_context,
+                                zh_cn="用户取消了当前 Harness 执行。",
+                                en_us="The user cancelled the current Harness run.",
+                            ),
                         },
                     )
                     self.store.finish_agent_loop_for_frame(
@@ -1212,7 +1311,11 @@ class HarnessV2Engine:
                 getattr(self, "turn_record", None),
                 status="cancelled",
                 code="CANCELLED",
-                message="用户取消了当前 Harness 执行。",
+                message=localized_compat_text(
+                    self.language_context,
+                    zh_cn="用户取消了当前 Harness 执行。",
+                    en_us="The user cancelled the current Harness run.",
+                ),
             )
         self.active_run_id = None
         self.active_frame_id = None
@@ -1223,6 +1326,12 @@ class HarnessV2Engine:
         """Fail the attempt and requeue its frame after an unexpected crash."""
 
         self.db.rollback()
+        safe_error = _public_harness_error(
+            {"code": code, "message": message}
+        )
+        if not isinstance(safe_error, dict):
+            safe_error = {"code": "INTERNAL_ERROR"}
+        safe_code = str(safe_error.get("code") or "INTERNAL_ERROR")
         source_turn_id = str(self.current_source_turn_id or "").strip()
         if (
             self.session is not None
@@ -1236,7 +1345,7 @@ class HarnessV2Engine:
                 status="failed",
                 result={
                     "status": "failed",
-                    "error": {"code": code, "message": message},
+                    "error": safe_error,
                 },
                 lease_owner=self.active_frame_lease_owner,
                 attempt_no=self.active_frame_attempt_no,
@@ -1250,7 +1359,7 @@ class HarnessV2Engine:
                     action_count=run.action_count,
                     result={
                         "status": "failed",
-                        "error": {"code": code, "message": message},
+                        "error": safe_error,
                     },
                 )
         if self.active_frame_id:
@@ -1269,8 +1378,12 @@ class HarnessV2Engine:
                     result={
                         "task_frame_id": row.task_id,
                         "status": "failed",
-                        "error": {"code": code, "message": message},
-                        "task_summary": "Harness 执行中断，TaskFrame 已重新排队。",
+                        "error": safe_error,
+                        "task_summary": localized_compat_text(
+                            self.language_context,
+                            zh_cn="Harness 执行中断，TaskFrame 已重新排队。",
+                            en_us="The Harness run was interrupted and the TaskFrame was requeued.",
+                        ),
                     },
                 )
                 self.store.finish_agent_loop_for_frame(
@@ -1285,8 +1398,8 @@ class HarnessV2Engine:
             turn_store.finish_with_error(
                 getattr(self, "turn_record", None),
                 status="failed",
-                code=code,
-                message=message,
+                code=safe_code,
+                message=safe_code,
             )
         self.active_run_id = None
         self.active_frame_id = None
@@ -1387,7 +1500,7 @@ class HarnessV2Engine:
             "execution_engine": "harness_v2",
             "task_frame_id": row.task_id,
         }
-        self.events.record(
+        self.events.record_legacy_event(
             session.tenant_id,
             session.id,
             event_type,
@@ -1474,10 +1587,10 @@ class HarnessV2Engine:
             self.store.set_active_task_frame(
                 session,
                 (
-                    sorted(
+                    min(
                         conversation_candidates,
                         key=lambda item: item.sequence,
-                    )[0]
+                    )
                     if conversation_candidates
                     else None
                 ),
@@ -1537,7 +1650,7 @@ def _is_recoverable_action_protocol_failure(result: TaskExecutionResult) -> bool
 
     error = result.error if isinstance(result.error, dict) else {}
     return result.status == "failed" and str(error.get("code") or "") == (
-        "HARNESS_ACTION_INVALID"
+        "MODEL_INVALID_PROVIDER_RESPONSE"
     )
 
 
@@ -1587,7 +1700,10 @@ def _enforce_required_slots(
     result: TaskExecutionResult,
     requirement: Any,
     session: ChatSession,
+    *,
+    language_context: LanguageContext | None = None,
 ) -> TaskExecutionResult:
+    """Turn missing required slots into a reply-locale-aware Agent question."""
     if result.status != "completed" or not requirement.required_slots:
         return result
     merged = {
@@ -1603,7 +1719,12 @@ def _enforce_required_slots(
         return result
     result.status = "awaiting_user"
     if not result.reply_fragment:
-        result.reply_fragment = "还需要您补充：" + "、".join(missing) + "。"
+        missing_fields = "、".join(str(field) for field in missing)
+        result.reply_fragment = localized_compat_text(
+            language_context,
+            zh_cn=f"还需要您补充：{missing_fields}。",
+            en_us=f"Please provide: {missing_fields}.",
+        )
     result.next_step_id = None
     return result
 
@@ -1611,13 +1732,20 @@ def _enforce_required_slots(
 def _combine_results(
     task_frame_id: str,
     results: list[TaskExecutionResult],
+    *,
+    language_context: LanguageContext | None = None,
 ) -> TaskExecutionResult:
+    """Combine TaskFrame results while localizing only the empty-result fallback shell."""
     if not results:
         return TaskExecutionResult(
             task_frame_id=task_frame_id,
             status="failed",
-            reply_fragment="当前 TaskFrame 未产生执行结果。",
-            error={"code": "EMPTY_TASK_RESULT"},
+            reply_fragment=localized_compat_text(
+                language_context,
+                zh_cn="当前 TaskFrame 未产生执行结果。",
+                en_us="This TaskFrame produced no execution result.",
+            ),
+            error={"code": "INTERNAL_ERROR"},
         )
     last = results[-1]
     terminal_reply = next(

@@ -1,6 +1,8 @@
 import EmployeeAvatar from '@/components/EmployeeAvatar';
 import { teamLeader } from '@/components/TeamCard';
 import { employeeDisplayName } from '@/employee';
+import { RawContent, RawIdentifier } from '@/i18n/RawContent';
+import { useAppIntl } from '@/i18n/useAppIntl';
 
 import {
   CHAT_EMPTY_CARD_CLASS,
@@ -26,8 +28,10 @@ export default function ChatEmptyState({ chat }: { chat: UseChatSession }) {
   return <EmployeeEmptyCard chat={chat} />;
 }
 
+/** 渲染员工会话空状态；员工资料与标签属于 raw 业务数据。 */
 function EmployeeEmptyCard({ chat }: { chat: UseChatSession }) {
   const { displayedAgent, displayedProfile, emptyRoleSummary, emptyProfileTags, emptyStats } = chat;
+  const { t } = useAppIntl();
   const displayName = displayedAgent ? employeeDisplayName(displayedAgent) : '';
 
   return (
@@ -54,9 +58,9 @@ function EmployeeEmptyCard({ chat }: { chat: UseChatSession }) {
               style={{ fontSize: `${greetingFontSize(displayName)}px` }}
               title={displayName}
             >
-              Hello 我是{displayName}！
+              {t('chat.empty.greetingEmployee', { name: displayName })}
             </strong>
-            <span className={CHAT_EMPTY_SUBTITLE_CLASS}>我们来做什么？</span>
+            <span className={CHAT_EMPTY_SUBTITLE_CLASS}>{t('chat.empty.prompt')}</span>
           </div>
         </div>
       </div>
@@ -66,7 +70,9 @@ function EmployeeEmptyCard({ chat }: { chat: UseChatSession }) {
           <p className={CHAT_EMPTY_ROLE_CLASS}>{emptyRoleSummary}</p>
           <div className={CHAT_EMPTY_TAGS_CLASS}>
             {emptyProfileTags.map((tag, index) => (
-              <span key={`${tag}-${index}`}>{tag}</span>
+              <span key={`${tag}-${index}`} translate="no" data-i18n-raw-kind="content">
+                <RawContent value={tag} />
+              </span>
             ))}
           </div>
         </div>
@@ -83,23 +89,26 @@ function EmployeeEmptyCard({ chat }: { chat: UseChatSession }) {
   );
 }
 
+/** 渲染团队会话空状态；团队名称、成员名和描述均保持原始业务内容。 */
 function TeamEmptyCard({ chat }: { chat: UseChatSession }) {
   const { displayedTeam, currentSession, agents, teamEmptyStats } = chat;
+  const { t } = useAppIntl();
   const members = displayedTeam?.members || [];
   const leader = displayedTeam ? teamLeader(displayedTeam) : null;
   const teamName = displayedTeam?.name || currentSession?.team_name || '';
   const agentById = (agentId: string) => agents.find((agent) => agent.id === agentId) || null;
-  const summary = displayedTeam?.description?.trim()
-    || `团队由 ${members.length} 名成员组成，项目领导是 ${leader?.agent_name || '未设置'}`;
-  const memberTags = members.slice(0, 5).map((member) => (
-    member.role === 'leader'
-      ? `${member.agent_name || '未设置'} · 项目领导`
-      : member.agent_name || '未设置'
-  ));
+  const summary = displayedTeam?.description?.trim() || t('chat.empty.teamSummary', {
+    count: members.length,
+    leader: leader?.agent_name || t('chat.empty.unset'),
+  });
+  const memberTags = members.slice(0, 5).map((member) => ({
+    name: member.agent_name || t('chat.empty.unset'),
+    isLeader: member.role === 'leader',
+  }));
   const stats = [
-    { label: '成员数', value: members.length },
-    { label: '任务数', value: teamEmptyStats.tasks },
-    { label: '黑板条目数', value: teamEmptyStats.blackboard },
+    { label: t('chat.empty.memberCount'), value: members.length },
+    { label: t('chat.empty.taskCount'), value: teamEmptyStats.tasks },
+    { label: t('chat.empty.blackboardCount'), value: teamEmptyStats.blackboard },
   ];
 
   return (
@@ -124,19 +133,32 @@ function TeamEmptyCard({ chat }: { chat: UseChatSession }) {
               style={{ fontSize: `${greetingFontSize(teamName)}px` }}
               title={teamName}
             >
-              Hello 我们是{teamName}！
+              {t('chat.empty.greetingTeam', { name: teamName })}
             </strong>
-            <span className={CHAT_EMPTY_SUBTITLE_CLASS}>我们来做什么？</span>
+            <span className={CHAT_EMPTY_SUBTITLE_CLASS}>{t('chat.empty.prompt')}</span>
           </div>
         </div>
       </div>
 
       <div className={CHAT_EMPTY_CARD_CLASS}>
         <div className="flex min-w-0 flex-1 flex-col justify-center gap-[8px] px-[4px]">
-          <p className={CHAT_EMPTY_ROLE_CLASS}>{summary}</p>
+            {displayedTeam?.description ? (
+              <p
+                className={CHAT_EMPTY_ROLE_CLASS}
+                translate="no"
+                data-i18n-raw-kind="content"
+              >
+                <RawContent value={summary} />
+              </p>
+            ) : (
+              <p className={CHAT_EMPTY_ROLE_CLASS}>{summary}</p>
+            )}
           <div className={CHAT_EMPTY_TAGS_CLASS}>
             {memberTags.map((tag, index) => (
-              <span key={`${tag}-${index}`}>{tag}</span>
+              <span key={`${tag.name}-${index}`}>
+                <RawIdentifier value={tag.name} />
+                {tag.isLeader ? ` · ${t('chat.empty.projectLead')}` : null}
+              </span>
             ))}
           </div>
         </div>

@@ -3,6 +3,7 @@
 import { cleanup, render, screen } from '@testing-library/react';
 import { afterEach, describe, expect, it } from 'vitest';
 
+import { AppIntlProvider, type AppLocale } from '@/i18n';
 import type { TeamTaskBidRead } from '@/types';
 
 import BiddingArena, { computeBidHp } from './BiddingArena';
@@ -24,6 +25,15 @@ function makeBid(overrides: Partial<TeamTaskBidRead>): TeamTaskBidRead {
 }
 
 afterEach(cleanup);
+
+/** Render the arena under an explicit product locale while keeping bid data untouched. */
+function renderArena(locale: AppLocale, bids: TeamTaskBidRead[], winnerId?: string) {
+  return render(
+    <AppIntlProvider locale={locale}>
+      <BiddingArena bids={bids} winnerId={winnerId} />
+    </AppIntlProvider>,
+  );
+}
 
 describe('computeBidHp', () => {
   it('starts at 100 and deducts (10 - score) * 3 per scored round', () => {
@@ -62,7 +72,7 @@ describe('BiddingArena', () => {
       makeBid({ id: 'bid-4', agent_id: 'agent-2', agent_name: '小北', round: 3, score: 1 }),
       makeBid({ id: 'bid-5', agent_id: 'agent-2', agent_name: '小北', round: 4, score: 0 }),
     ];
-    render(<BiddingArena bids={bids} winnerId="agent-1" />);
+    renderArena('zh-CN', bids, 'agent-1');
 
     expect(screen.getByText('胜者为王')).toBeTruthy();
     expect(screen.getByText('淘汰')).toBeTruthy();
@@ -73,5 +83,26 @@ describe('BiddingArena', () => {
     expect(screen.getAllByText('陈述内容').length).toBeGreaterThan(0);
     expect(screen.getByText('反驳内容')).toBeTruthy();
     expect(screen.getByText('反驳')).toBeTruthy();
+  });
+
+  it('localizes arena chrome without translating employee names or bid content', () => {
+    const bids = [
+      makeBid({
+        agent_id: 'agent-en',
+        agent_name: 'North Star',
+        kind: 'statement',
+        content: 'Keep this source text',
+        score: 8,
+      }),
+    ];
+    renderArena('en-US', bids, 'agent-en');
+
+    expect(screen.getByText('Winner')).toBeTruthy();
+    expect(screen.getByText('Statement')).toBeTruthy();
+    expect(screen.getByText('HP 94')).toBeTruthy();
+    expect(screen.getByText('Round 1')).toBeTruthy();
+    expect(screen.getByText('Score: 8')).toBeTruthy();
+    expect(screen.getByText('North Star')).toBeTruthy();
+    expect(screen.getByText('Keep this source text')).toBeTruthy();
   });
 });

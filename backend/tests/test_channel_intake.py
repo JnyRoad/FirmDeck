@@ -63,6 +63,28 @@ def _group_message(event_id: str = "evt_g1", text: str = "群里问一句") -> d
     return msg
 
 
+def _channel_language_snapshot() -> dict[str, object]:
+    """Return one mixed snapshot resolved independently from channel defaults."""
+    return {
+        "version": 1,
+        "ui_locale": "en-US",
+        "agent_reply_locale": "zh-CN",
+        "ui_locale_source": "channel_default",
+        "agent_reply_locale_source": "channel_default",
+    }
+
+
+def _legacy_language_snapshot() -> dict[str, object]:
+    """Return the controlled compatibility snapshot for a binding without locale hints."""
+    return {
+        "version": 1,
+        "ui_locale": "zh-CN",
+        "agent_reply_locale": "zh-CN",
+        "ui_locale_source": "legacy_default",
+        "agent_reply_locale_source": "legacy_default",
+    }
+
+
 def _seed_binding(engine, **overrides) -> str:
     with Session(engine) as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
@@ -214,6 +236,135 @@ def test_event_id_replay_is_idempotent() -> None:
         assert events[0].status == "done"
 
 
+def test_channel_ingress_and_replay_reuse_one_language_snapshot() -> None:
+    """Snapshot channel defaults once and keep replay plus external content byte-for-byte stable."""
+    engine = _test_engine()
+    binding_id = _seed_binding(
+        engine,
+        config_json={
+            "ilink_bot_id": "bot_1@im.bot",
+            "ui_locale": "en-US",
+            "agent_reply_locale": "zh-CN",
+        },
+    )
+    binding = _load_binding(engine, binding_id)
+    payload = _p2p_message("evt_language_replay", "原始渠道内容《不要翻译》")
+
+    assert process_inbound(binding, payload, db_engine=engine) is True
+    assert len(RecordingAgentLoop.calls) == 1
+    request = RecordingAgentLoop.calls[0]
+    assert request.message == "原始渠道内容《不要翻译》"
+    assert request.language_context is not None
+    assert request.language_context.model_dump(mode="json") == _channel_language_snapshot()
+    assert request.ui_locale == "en-US"
+    assert request.agent_reply_locale == "zh-CN"
+
+    with Session(engine) as db:
+        event = db.exec(select(ChannelInboundEvent)).one()
+        assert event.language_context_json == _channel_language_snapshot()
+        chat_session = db.get(ChatSession, request.session_id)
+        assert chat_session is not None
+        assert chat_session.agent_reply_locale == "zh-CN"
+        assert chat_session.agent_reply_locale_source == "channel_default"
+        stored_binding = db.get(ChannelBinding, binding_id)
+        assert stored_binding is not None
+        stored_binding.config_json = {
+            **stored_binding.config_json,
+            "ui_locale": "zh-CN",
+            "agent_reply_locale": "en-US",
+        }
+        db.add(stored_binding)
+        db.commit()
+
+    changed_binding = _load_binding(engine, binding_id)
+    assert process_inbound(changed_binding, payload, db_engine=engine) is False
+    assert len(RecordingAgentLoop.calls) == 1
+    with Session(engine) as db:
+        replayed = db.exec(select(ChannelInboundEvent)).one()
+        assert replayed.language_context_json == _channel_language_snapshot()
+        assert replayed.payload_json["item_list"][0]["text_item"]["text"] == (
+            "原始渠道内容《不要翻译》"
+        )
+
+
+def test_channel_ingress_without_locale_uses_controlled_legacy_snapshot() -> None:
+    """Resolve a versioned compatibility snapshot when an old binding has no locale settings."""
+    engine = _test_engine()
+    binding_id = _seed_binding(engine)
+    binding = _load_binding(engine, binding_id)
+
+    assert (
+        process_inbound(
+            binding,
+            _p2p_message("evt_language_default", "原始旧渠道内容"),
+            db_engine=engine,
+        )
+        is True
+    )
+
+    request = RecordingAgentLoop.calls[0]
+    assert request.language_context is not None
+    assert request.language_context.model_dump(mode="json") == _legacy_language_snapshot()
+    assert request.message == "原始旧渠道内容"
+    with Session(engine) as db:
+        event = db.exec(select(ChannelInboundEvent)).one()
+        assert event.language_context_json == _legacy_language_snapshot()
+
+
+def test_recovered_channel_event_executes_with_its_persisted_language_snapshot() -> None:
+    """Ignore changed binding defaults when resuming an already-snapshotted inbound event."""
+    engine = _test_engine()
+    binding_id = _seed_binding(
+        engine,
+        config_json={
+            "ilink_bot_id": "bot_1@im.bot",
+            "ui_locale": "zh-CN",
+            "agent_reply_locale": "en-US",
+        },
+    )
+    payload = _p2p_message("evt_language_recovery", "恢复的原始外部内容")
+    with Session(engine) as db:
+        event = ChannelInboundEvent(
+            tenant_id="tenant_demo",
+            binding_id=binding_id,
+            channel="wechat",
+            event_id="evt_language_recovery",
+            payload_json=payload,
+            target_json={
+                "to_user_id": "user_ab12cd34@im.wechat",
+                "context_token": "ctx_evt_language_recovery",
+            },
+            status="processing",
+            processor_run_id=intake_module.current_processor_run_id(),
+            language_context_json=_channel_language_snapshot(),
+        )
+        db.add(event)
+        db.commit()
+        event_id = event.id
+
+    binding = _load_binding(engine, binding_id)
+    assert (
+        process_inbound(
+            binding,
+            payload,
+            db_engine=engine,
+            staged_event_pk=event_id,
+        )
+        is True
+    )
+
+    assert len(RecordingAgentLoop.calls) == 1
+    request = RecordingAgentLoop.calls[0]
+    assert request.language_context is not None
+    assert request.language_context.model_dump(mode="json") == _channel_language_snapshot()
+    assert request.message == "恢复的原始外部内容"
+    with Session(engine) as db:
+        recovered = db.get(ChannelInboundEvent, event_id)
+        assert recovered is not None
+        assert recovered.status == "done"
+        assert recovered.language_context_json == _channel_language_snapshot()
+
+
 def test_crash_recovery_dedup_marks_done_without_rerun() -> None:
     engine = _test_engine()
     binding_id = _seed_binding(engine)
@@ -264,9 +415,7 @@ def test_sweep_finds_turn_in_migration_isolated_session() -> None:
                 user_id="old_shared_user",
                 agent_id="agent_1",
                 channel="wechat",
-                external_conv_id=(
-                    f"legacy_ambiguous_identity:session_isolated:{original_conv}"
-                ),
+                external_conv_id=(f"legacy_ambiguous_identity:session_isolated:{original_conv}"),
                 channel_binding_id=binding_id,
             )
         )
@@ -295,9 +444,7 @@ def test_sweep_finds_turn_in_migration_isolated_session() -> None:
     assert RecordingAgentLoop.calls == []
     with Session(engine) as db:
         event = db.exec(
-            select(ChannelInboundEvent).where(
-                ChannelInboundEvent.event_id == "evt_isolated"
-            )
+            select(ChannelInboundEvent).where(ChannelInboundEvent.event_id == "evt_isolated")
         ).one()
         assert event.status == "failed"
         assert event.error == "process_exit_incomplete_turn"
@@ -370,9 +517,7 @@ def test_harness_conflict_keeps_inbound_retryable_and_stages_terminal_notice(mon
         event = db.exec(select(ChannelInboundEvent)).one()
         assert event.status == "received"
         assert event.processor_run_id is None
-        notices = db.exec(
-            select(ChannelDelivery).where(ChannelDelivery.kind == "notice")
-        ).all()
+        notices = db.exec(select(ChannelDelivery).where(ChannelDelivery.kind == "notice")).all()
         assert len(notices) == 1
         assert notices[0].target_json["reaction_final"] is True
         assert notices[0].idempotency_key.endswith(":evt_conflict")
@@ -522,8 +667,12 @@ def test_typing_fetches_and_caches_ticket() -> None:
     client = FakeTypingClient()
 
     _real_send_wechat_typing(
-        binding, "user_ab12cd34@im.wechat", "ctx_1", 1,
-        db_engine=engine, client_factory=lambda row: client,
+        binding,
+        "user_ab12cd34@im.wechat",
+        "ctx_1",
+        1,
+        db_engine=engine,
+        client_factory=lambda row: client,
     )
 
     assert client.get_config_calls == [("user_ab12cd34@im.wechat", "ctx_1")]
@@ -540,8 +689,12 @@ def test_typing_reuses_cached_ticket_without_get_config() -> None:
     client = FakeTypingClient()
 
     _real_send_wechat_typing(
-        binding, "user_1", "ctx_1", 1,
-        db_engine=engine, client_factory=lambda row: client,
+        binding,
+        "user_1",
+        "ctx_1",
+        1,
+        db_engine=engine,
+        client_factory=lambda row: client,
     )
 
     assert client.get_config_calls == []
@@ -556,8 +709,12 @@ def test_typing_skips_silently_when_get_config_fails() -> None:
 
     # 不抛异常、不发送、不写缓存
     _real_send_wechat_typing(
-        binding, "user_1", "ctx_1", 1,
-        db_engine=engine, client_factory=lambda row: client,
+        binding,
+        "user_1",
+        "ctx_1",
+        1,
+        db_engine=engine,
+        client_factory=lambda row: client,
     )
 
     assert client.send_calls == []
@@ -573,8 +730,12 @@ def test_typing_send_failure_clears_cached_ticket() -> None:
     client = FakeTypingClient(send_error=RuntimeError("ticket 失效"))
 
     _real_send_wechat_typing(
-        binding, "user_1", "ctx_1", 1,
-        db_engine=engine, client_factory=lambda row: client,
+        binding,
+        "user_1",
+        "ctx_1",
+        1,
+        db_engine=engine,
+        client_factory=lambda row: client,
     )
 
     assert client.send_calls == [("user_1", "stale_ticket", 1)]
@@ -590,8 +751,12 @@ def test_typing_cancel_without_ticket_is_noop() -> None:
     client = FakeTypingClient()
 
     _real_send_wechat_typing(
-        binding, "user_1", "ctx_1", 2,
-        db_engine=engine, client_factory=lambda row: client,
+        binding,
+        "user_1",
+        "ctx_1",
+        2,
+        db_engine=engine,
+        client_factory=lambda row: client,
     )
 
     # cancel 不触发 get_config,无 ticket 直接跳过
@@ -606,8 +771,12 @@ def test_typing_noop_for_inactive_binding() -> None:
     client = FakeTypingClient()
 
     _real_send_wechat_typing(
-        binding, "user_1", "ctx_1", 1,
-        db_engine=engine, client_factory=lambda row: client,
+        binding,
+        "user_1",
+        "ctx_1",
+        1,
+        db_engine=engine,
+        client_factory=lambda row: client,
     )
 
     assert client.get_config_calls == []
@@ -779,9 +948,7 @@ def test_stale_claim_is_released_when_recovery_logic_raises(monkeypatch) -> None
     monkeypatch.setattr(
         intake_module,
         "resolve_or_provision_user",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            RuntimeError("recovery db failure")
-        ),
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("recovery db failure")),
     )
     with pytest.raises(RuntimeError, match="recovery db failure"):
         process_inbound(binding, _p2p_message("evt_recovery_error"), db_engine=engine)
@@ -908,7 +1075,15 @@ def test_startup_sweep_takes_over_stale_events() -> None:
 # ---------- 崩溃恢复:turn 未完成窗口 ----------
 
 
-def _seed_incomplete_turn(engine, binding_id: str, event_id: str, *, with_reply: bool) -> None:
+def _seed_incomplete_turn(
+    engine,
+    binding_id: str,
+    event_id: str,
+    *,
+    with_reply: bool,
+    language_context_json: dict[str, object] | None = None,
+) -> None:
+    """Seed a recoverable durable turn with an optional immutable locale snapshot."""
     from datetime import timedelta
 
     with Session(engine) as db:
@@ -952,6 +1127,7 @@ def _seed_incomplete_turn(engine, binding_id: str, event_id: str, *, with_reply:
                 event_id=event_id,
                 payload_json={},
                 status="processing",
+                language_context_json=language_context_json,
                 updated_at=utc_now() - timedelta(seconds=300),
             )
         )
@@ -1002,6 +1178,66 @@ def test_repeated_incomplete_turn_recovery_stages_one_notice() -> None:
         ).all()
         assert len(notices) == 1
         assert notices[0].idempotency_key == f"channel-interrupted:{binding_id}:evt_gap_repeat"
+
+
+def test_error_notice_uses_persisted_reply_locale_without_exposing_raw_exception() -> None:
+    """Render a safe English error notice while retaining the raw cause only on the inbound row."""
+    engine = _test_engine()
+    snapshot = {
+        "version": 1,
+        "ui_locale": "zh-CN",
+        "agent_reply_locale": "en-US",
+        "ui_locale_source": "channel_default",
+        "agent_reply_locale_source": "channel_default",
+    }
+    binding_id = _seed_binding(
+        engine,
+        config_json={
+            "ilink_bot_id": "bot_1@im.bot",
+            "ui_locale": "zh-CN",
+            "agent_reply_locale": "en-US",
+        },
+    )
+    binding = _load_binding(engine, binding_id)
+    RecordingAgentLoop.error = RuntimeError("provider secret SKU-A/42")
+
+    assert process_inbound(binding, _p2p_message("evt_error_en"), db_engine=engine) is False
+
+    with Session(engine) as db:
+        event = db.exec(select(ChannelInboundEvent)).one()
+        delivery = db.exec(select(ChannelDelivery)).one()
+        assert "provider secret SKU-A/42" in (event.error or "")
+        assert delivery.text == "Something went wrong. Please try again later."
+        assert "provider secret" not in delivery.text
+        assert delivery.language_context_json == snapshot
+
+
+def test_interrupted_recovery_reuses_event_reply_locale() -> None:
+    """Recover an interrupted turn using its durable locale instead of changed binding defaults."""
+    engine = _test_engine()
+    snapshot = {
+        "version": 1,
+        "ui_locale": "zh-CN",
+        "agent_reply_locale": "en-US",
+        "ui_locale_source": "explicit_request",
+        "agent_reply_locale_source": "explicit_request",
+    }
+    binding_id = _seed_binding(engine)
+    _seed_incomplete_turn(
+        engine,
+        binding_id,
+        "evt_gap_en",
+        with_reply=False,
+        language_context_json=snapshot,
+    )
+    binding = _load_binding(engine, binding_id)
+
+    assert process_inbound(binding, _p2p_message("evt_gap_en"), db_engine=engine) is False
+
+    with Session(engine) as db:
+        delivery = db.exec(select(ChannelDelivery)).one()
+        assert delivery.text == "The previous message was interrupted. Please send it again."
+        assert delivery.language_context_json == snapshot
 
 
 def test_completed_turn_is_not_misflagged() -> None:

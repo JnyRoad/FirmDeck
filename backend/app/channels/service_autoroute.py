@@ -16,6 +16,7 @@ from app.channels.service_routing import (
     set_current_agent,
 )
 from app.channels.service_session import find_channel_session
+from app.contracts.events import EventVisibility, SystemEvent
 from app.db.models import AgentProfile, ChannelBinding, ChatSession, Message
 from app.llm import LLMClient
 from app.observability import EventLog
@@ -28,6 +29,9 @@ AUTO_ROUTE_CONFIDENCE_THRESHOLD = 0.75
 SOP_ACTIVE_CONFIDENCE_THRESHOLD = 0.9
 RECENT_MESSAGE_LIMIT = 2
 RECENT_MESSAGE_CHAR_LIMIT = 200
+AUTO_ROUTE_EVENT_CODE = "internal.channel.autoroute.decision"
+AUTO_ROUTE_CLASSIFICATION_ERROR_CODE = "AUTO_ROUTE_CLASSIFICATION_FAILED"
+AUTO_ROUTE_REVISION_ERROR_CODE = "ROUTE_CHANGED_DURING_CLASSIFICATION"
 
 SYSTEM_PROMPT = (
     "你是企业数字员工调度员。根据用户消息与候选员工名单，选择最合适的员工应答。\n"
@@ -93,7 +97,7 @@ def classify_intent(
         target = str(data.get("agent_id") or "").strip()
         confidence = float(data.get("confidence") or 0.0)
         reason = str(data.get("reason") or "")[:200]
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - heterogeneous provider failures must fall back safely.
         logger.warning("智能分发分类失败，保持当前员工: %s", exc)
         stay.error = str(exc)[:200]
         return stay
@@ -220,19 +224,32 @@ def record_auto_route_event(
     decision: RouteDecision,
     current_agent_id: str,
 ) -> None:
-    """决策落会话事件流,便于观测与复盘。"""
-    EventLog(db).record(
-        binding.tenant_id,
-        session_id,
-        "auto_route_decision",
-        {
-            "current_agent_id": current_agent_id,
-            "agent_id": decision.agent_id,
-            "target_agent_id": decision.target_agent_id,
-            "switched": decision.switched,
-            "confidence": decision.confidence,
-            "threshold": decision.threshold,
-            "reason": decision.reason,
-            "error": decision.error,
-        },
+    """Persist routing telemetry as a private canonical event without classifier prose."""
+    EventLog(db).record_system_event(
+        SystemEvent(
+            event_code=AUTO_ROUTE_EVENT_CODE,
+            params={
+                "current_agent_id": current_agent_id,
+                "agent_id": decision.agent_id,
+                "target_agent_id": decision.target_agent_id or "",
+                "switched": decision.switched,
+                "confidence": decision.confidence,
+                "threshold": decision.threshold,
+                "error_code": _auto_route_error_code(decision.error),
+            },
+            tenant_id=binding.tenant_id,
+            aggregate_type="chat_session",
+            aggregate_id=session_id,
+            visibility=EventVisibility.INTERNAL,
+        )
     )
+
+
+def _auto_route_error_code(raw_error: str) -> str:
+    """Map private routing failures to stable codes without persisting their diagnostic prose."""
+    error = str(raw_error or "").strip()
+    if not error:
+        return ""
+    if error == "route_changed_during_classification":
+        return AUTO_ROUTE_REVISION_ERROR_CODE
+    return AUTO_ROUTE_CLASSIFICATION_ERROR_CODE

@@ -5,13 +5,13 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Literal, Mapping
 
-from fastapi import HTTPException
 from sqlmodel import Session
 
+from app.contracts.http import build_http_exception
 from app.db.models import ModelConfig
 from app.llm.model_protocols import (
-    ModelAuthMode,
     ModelApiProtocol,
+    ModelAuthMode,
     current_protocol_options,
     model_config_fingerprint,
     resolve_auth_mode,
@@ -40,44 +40,48 @@ class ResolvedModelConfig:
 def resolve_model_config_for_runtime(
     db: Session, tenant_id: str, config_id: str
 ) -> ResolvedModelConfig:
+    """Resolve an enabled and trusted model snapshot or raise a stable model contract error."""
     row = _current_model_config(db, tenant_id, config_id)
     if not row.enabled:
-        raise HTTPException(status_code=409, detail="MODEL_CONFIG_DISABLED")
+        raise build_http_exception("MODEL_CONFIG_DISABLED")
     protocol = _protocol(row)
     if row.trust_status == "legacy_trusted" or _is_implicit_legacy_openai(row, protocol):
         if protocol is not ModelApiProtocol.OPENAI_CHAT_COMPLETIONS:
-            raise HTTPException(status_code=409, detail="MODEL_CONFIG_VERIFICATION_REQUIRED")
+            raise build_http_exception("MODEL_CONFIG_VERIFICATION_REQUIRED")
     elif row.trust_status != "verified" or row.verified_fingerprint != _fingerprint(row):
-        raise HTTPException(status_code=409, detail="MODEL_CONFIG_VERIFICATION_REQUIRED")
+        raise build_http_exception("MODEL_CONFIG_VERIFICATION_REQUIRED")
     return _snapshot(row, protocol, purpose="runtime")
 
 
 def resolve_model_config_for_verification(
     db: Session, tenant_id: str, config_id: str, attempt_id: str
 ) -> ResolvedModelConfig:
+    """Resolve the model snapshot owned by the active verification attempt."""
     row = _current_model_config(db, tenant_id, config_id)
     if (
         row.verification_attempt_id != attempt_id
         or row.verification_attempt_status != "verifying"
     ):
-        raise HTTPException(status_code=409, detail="MODEL_VERIFICATION_STALE")
+        raise build_http_exception("MODEL_VERIFICATION_STALE")
     protocol = _protocol(row)
     return _snapshot(row, protocol, purpose="verification")
 
 
 def _current_model_config(db: Session, tenant_id: str, config_id: str) -> ModelConfig:
+    """Load one tenant-owned model config without inferring or exposing database details."""
     row = db.get(ModelConfig, config_id)
     if row is None or row.tenant_id != tenant_id:
-        raise HTTPException(status_code=404, detail="MODEL_CONFIG_NOT_FOUND")
+        raise build_http_exception("MODEL_CONFIG_NOT_FOUND", params={"config_id": config_id})
     db.refresh(row)
     return row
 
 
 def _protocol(row: ModelConfig) -> ModelApiProtocol:
+    """Parse a persisted protocol and return a localized-boundary-safe model error on corruption."""
     try:
         return ModelApiProtocol(row.api_protocol)
     except ValueError as exc:
-        raise HTTPException(status_code=422, detail="MODEL_PROTOCOL_UNSUPPORTED") from exc
+        raise build_http_exception("MODEL_PROTOCOL_UNSUPPORTED") from exc
 
 
 def _snapshot(

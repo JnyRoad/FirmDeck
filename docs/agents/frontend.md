@@ -12,6 +12,48 @@
   `npm --prefix frontend-enterprise run config:check`。
 - 修改可见 UI 时，在浏览器中验证受影响的路由和用户角色。
 
+## 国际化与 raw 内容边界
+
+所有前端产品消息遵循根 `CONTEXT.md` 和
+`docs/adr/ADR-001-i18n-runtime-and-catalog.md`。当前正式语言为 `zh-CN`、`en-US`：
+`en-US` 是 canonical catalog，`zh-CN` 是兼容默认；语言值使用 BCP 47，不能在业务代码中
+散落 locale 或时区常量。
+
+- 新增 JSX、页面标题、路由标题、表单、校验、帮助、Toast、弹窗、状态、空/加载/错误、表格、
+  图表、筛选、分页、`aria-*`、`title`、`alt`、剪贴板提示、下载前缀、iframe/postMessage
+  外壳文案时，必须使用稳定英文语义 `MessageId`/`MessageDescriptor`。文案本身不是键；禁止
+  中文/英文自然语言作键、动态键和字符串拼接。
+- React 组件内使用 `useAppIntl()`（且只能在 `AppIntlProvider` 子树中）或传入 descriptor；
+  组件外使用显式注入的 `createAppTranslator(locale)`。不得在组件外调用 Hook，不得在新代码
+  使用 legacy `useI18n` source-key facade。
+- `Input`/`Textarea` 的 placeholder、title、`aria-label` 等只有 `MessageDescriptor` 才进入
+  翻译；普通字符串保持原样。`createToastNotifier`、`createUiSinks` 等 non-DOM sink 只接受
+  descriptor。legacy `notify` 只能在登记的兼容边界使用。
+- 用户输入、员工/团队/知识库/文档名称和正文、引用、Agent/工具/provider 原文、密钥、路径、
+  文件名 raw 部分和技术日志不得翻译。用 `RawContent`/`RawIdentifier` 标记精确值，不能给父
+  容器加宽泛 `data-i18n-ignore` 或依赖 observer 覆盖相邻产品消息。
+- 日期/时间/数字/百分比/货币/相对时间/列表/排序使用 `Intl`/共享 formatter，并显式处理时区
+  和单位；复数/选择/插值使用 ICU 具名变量，不能使用数字占位符、`${}` 文案拼接或固定 locale。
+- 后端错误/事件只消费稳定 code/event_code、message key 和具名 params；raw `detail`、异常、
+  provider body 只用于诊断，不得直接展示。Agent reply locale 与 UI locale 分离，前端不得因
+  UI 切换而改写历史消息或业务内容。
+
+## 前端变更验收
+
+每次新增产品消息或 locale-sensitive behavior 先写回归测试，再运行：
+
+```bash
+npm --prefix frontend-enterprise run i18n:check
+npm --prefix frontend-enterprise test
+npm --prefix frontend-enterprise run build
+```
+
+可用时补充 `npm --prefix frontend-enterprise run test:e2e:i18n`，至少切换 `zh-CN`、`en-US`，
+并覆盖关键路由、角色、权限、正常/空/加载/错误、无障碍属性、响应式视口、原生对话框、Toast、
+iframe/postMessage、剪贴板、下载和伪本地化。无法真实运行的浏览器、第三方嵌入或 provider 路径
+必须标记 `UNVERIFIED`。提交前检查 catalog 键/ICU/参数一致性、精确 legacy allowlist 的 owner、
+fingerprint、reason、ISO `expires`，以及 `git diff --check`。
+
 ## 前端组件规范（frontend-enterprise）
 
 新页面或重构时，**优先使用 shadcn/ui 组件**，而非新增 Ant Design 组件。

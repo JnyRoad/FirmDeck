@@ -14,7 +14,19 @@ from app.db.models import (
     User,
     utc_now,
 )
+from app.i18n.language_context import LanguageContext, resolve_compatible_language_context
 from app.session.session_schema import StepAgentResult
+
+
+def _legacy_event_recorder(events: Any) -> Callable[..., Any]:
+    """Return the named compatibility writer, retaining an exact old-sink fallback."""
+    adapter = getattr(events, "record_legacy_event", None)
+    if callable(adapter):
+        return adapter
+    fallback = getattr(events, "record", None)
+    if callable(fallback):
+        return fallback
+    raise TypeError("event sink does not implement the legacy event contract")
 
 
 class HumanHandoffService:
@@ -36,7 +48,14 @@ class HumanHandoffService:
         binding_default_assignee_user_id: str | None = None,
         step_notify_channel: str | None = None,
         binding_default_notify_channel: str | None = None,
+        language_context: LanguageContext | dict | None = None,
     ) -> HumanHandoffRequest:
+        """Create a handoff bound to the source turn's immutable language context."""
+        context = resolve_compatible_language_context(
+            snapshot=language_context,
+            legacy_ui_locale=None,
+            legacy_agent_reply_locale=chat_session.agent_reply_locale,
+        )
         existing = self.db.exec(
             select(HumanHandoffRequest)
             .where(HumanHandoffRequest.tenant_id == tenant_id)
@@ -44,6 +63,19 @@ class HumanHandoffService:
             .where(HumanHandoffRequest.status == "pending")
         ).first()
         if existing:
+            # Do not mutate a legacy duplicate unless the caller already has an
+            # explicit source snapshot; the compatibility path stays observable.
+            if language_context is not None:
+                existing_context = resolve_compatible_language_context(
+                    snapshot=existing.language_context_json,
+                    legacy_ui_locale=None,
+                    legacy_agent_reply_locale=chat_session.agent_reply_locale,
+                )
+                if existing_context != context:
+                    raise RuntimeError("人工转接语言快照冲突")
+                if existing.language_context_json is None:
+                    existing.language_context_json = context.model_dump(mode="json")
+                    self.db.add(existing)
             chat_session.status = "handoff"
             chat_session.awaiting_input_json = {
                 "type": "human_handoff",
@@ -101,6 +133,7 @@ class HumanHandoffService:
                 "step_handoff": step_result.handoff,
                 "assignee_notify_channel": assignee_notify_channel,
             },
+            language_context_json=context.model_dump(mode="json"),
         )
         self.db.add(handoff)
         chat_session.status = "handoff"
@@ -110,7 +143,7 @@ class HumanHandoffService:
             "pending_question": handoff.pending_question,
         }
         chat_session.updated_at = utc_now()
-        self.events.record(
+        _legacy_event_recorder(self.events)(
             tenant_id,
             chat_session.id,
             "human_handoff_requested",
@@ -121,6 +154,7 @@ class HumanHandoffService:
                 "trigger_skill_id": handoff.trigger_skill_id,
                 "trigger_step_id": handoff.trigger_step_id,
                 "pending_question": handoff.pending_question,
+                "language_context": context.model_dump(mode="json"),
             },
         )
         return handoff

@@ -9,6 +9,9 @@ from fastapi import HTTPException
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
+from app.contracts.domain_http import domain_http_error
+from app.contracts.error_registry import ERROR_REGISTRY, ErrorContractViolation, ErrorVisibility
+from app.contracts.errors import ErrorDescriptor
 from app.db.models import (
     AgentProfile,
     ChatSession,
@@ -26,6 +29,7 @@ from app.db.models import (
     TeamWakeEvent,
     utc_now,
 )
+from app.i18n.raw_source import RawSourceKind, RawSourceMarker
 from app.knowledge.audit import KnowledgeAuditService
 from app.knowledge.errors import (
     KNOWLEDGE_BINDING_REVISION_CONFLICT,
@@ -68,6 +72,86 @@ TASK_TRANSITIONS: dict[str, set[str]] = {
 VERDICT_TARGET_STATUS = {"approve": "done", "rework": "rework", "escalate": "escalated"}
 
 _JSON_BLOCK_RE = re.compile(r"```json\s*\n?(.*?)```", re.DOTALL)
+
+
+def _team_error(
+    code: str,
+    status_code: int,
+    *,
+    params: dict[str, object] | None = None,
+    retryable: bool | None = None,
+    cause: BaseException | None = None,
+) -> HTTPException:
+    """Return a canonical team error without exposing member or database details."""
+    return domain_http_error(
+        code,
+        source="teams.service",
+        status_code=status_code,
+        params=params,
+        retryable=retryable,
+        cause=cause,
+    )
+
+
+def _project_team_error(candidate: object) -> dict[str, object]:
+    """Convert persisted team failure metadata to a public-safe descriptor."""
+    code = "INTERNAL_ERROR"
+    params: dict[str, Any] = {}
+    retryable = False
+    request_id: str | None = None
+    trace_id: str | None = None
+    if isinstance(candidate, Mapping):
+        raw_code = candidate.get("code")
+        entry = ERROR_REGISTRY.get(raw_code) if isinstance(raw_code, str) else None
+        if entry is not None and entry.visibility is ErrorVisibility.PUBLIC:
+            code = entry.code
+            raw_params = candidate.get("params")
+            params = dict(raw_params) if isinstance(raw_params, Mapping) else {}
+            raw_retryable = candidate.get("retryable", entry.retryable_default)
+            retryable = raw_retryable if isinstance(raw_retryable, bool) else entry.retryable_default
+            request_id = candidate.get("request_id") if isinstance(candidate.get("request_id"), str) else None
+            trace_id = candidate.get("trace_id") if isinstance(candidate.get("trace_id"), str) else None
+    entry = ERROR_REGISTRY.get(code)
+    if entry is None or entry.visibility is not ErrorVisibility.PUBLIC:
+        return ErrorDescriptor(code="INTERNAL_ERROR", params={}, retryable=False).model_dump(mode="json")
+    descriptor = ErrorDescriptor(
+        code=entry.code,
+        params=params,
+        retryable=retryable,
+        request_id=request_id,
+        trace_id=trace_id,
+    )
+    try:
+        ERROR_REGISTRY.validate(descriptor)
+    except (ErrorContractViolation, TypeError, ValueError):
+        descriptor = ErrorDescriptor(code="INTERNAL_ERROR", params={}, retryable=False)
+    return descriptor.model_dump(mode="json")
+
+
+def _sanitize_team_payload(candidate: object) -> dict[str, Any]:
+    """Persist raw business values unchanged while replacing nested error objects."""
+    if not isinstance(candidate, Mapping):
+        return {}
+    result: dict[str, Any] = {}
+    for key, value in candidate.items():
+        if key in {"error", "error_json", "failure"}:
+            # Existing wakeup producers already persist a code-only string.  Keep that
+            # exact compatibility value until their typed event migration lands; prose
+            # or structured-but-invalid errors still fail closed to INTERNAL_ERROR.
+            if isinstance(value, str) and re.fullmatch(r"[A-Z][A-Z0-9_.-]{2,127}", value):
+                result[str(key)] = value
+            else:
+                result[str(key)] = _project_team_error(value)
+        elif isinstance(value, Mapping):
+            result[str(key)] = _sanitize_team_payload(value)
+        elif isinstance(value, list):
+            result[str(key)] = [
+                _sanitize_team_payload(item) if isinstance(item, Mapping) else item
+                for item in value
+            ]
+        else:
+            result[str(key)] = value
+    return result
 
 
 class TeamTaskTransitionError(ValueError):
@@ -342,7 +426,7 @@ def parse_blackboard_suggestions(reply: str) -> list[dict[str, Any]]:
 def get_team(db: Session, tenant_id: str, team_id: str) -> Team:
     team = db.get(Team, team_id)
     if team is None or team.tenant_id != tenant_id:
-        raise HTTPException(status_code=404, detail="Team not found")
+        raise _team_error("TEAM_NOT_FOUND", 404)
     return team
 
 
@@ -369,12 +453,12 @@ def create_team(
     """原子创建团队及其初始共享知识库、绑定和默认写入目标。"""
     name = name.strip()
     if not name:
-        raise HTTPException(status_code=400, detail="Team name cannot be empty")
+        raise _team_error("TEAM_NAME_REQUIRED", 400)
     existing = db.exec(
         select(Team).where(Team.tenant_id == tenant_id, Team.name == name)
     ).first()
     if existing:
-        raise HTTPException(status_code=409, detail="Team name already exists")
+        raise _team_error("TEAM_NAME_CONFLICT", 409)
     team = Team(
         tenant_id=tenant_id,
         name=name,
@@ -396,7 +480,7 @@ def create_team(
         db.commit()
     except IntegrityError as exc:
         db.rollback()
-        raise HTTPException(status_code=409, detail="Team name already exists") from exc
+        raise _team_error("TEAM_NAME_CONFLICT", 409, cause=exc) from exc
     except Exception:
         db.rollback()
         raise
@@ -942,15 +1026,16 @@ def delete_team(db: Session, team: Team) -> None:
 def _ensure_team_agent(db: Session, team: Team, agent_id: str) -> AgentProfile:
     agent = db.get(AgentProfile, agent_id)
     if agent is None or agent.tenant_id != team.tenant_id:
-        raise HTTPException(status_code=404, detail="Agent not found in this tenant")
+        raise _team_error("TEAM_AGENT_NOT_FOUND", 404)
     if agent.status != "active":
-        raise HTTPException(status_code=400, detail="Agent is not active")
+        raise _team_error("TEAM_AGENT_INACTIVE", 400)
     return agent
 
 
 def add_member(db: Session, team: Team, *, agent_id: str, role: str = "member") -> TeamMember:
     if role not in TEAM_MEMBER_ROLES:
-        raise HTTPException(status_code=400, detail=f"Invalid team member role: {role}")
+        safe_role = role if role in {"leader", "member"} else "unknown"
+        raise _team_error("TEAM_MEMBER_ROLE_INVALID", 400, params={"role": safe_role})
     _ensure_team_agent(db, team, agent_id)
     existing = db.exec(
         select(TeamMember).where(
@@ -958,14 +1043,14 @@ def add_member(db: Session, team: Team, *, agent_id: str, role: str = "member") 
         )
     ).first()
     if existing:
-        raise HTTPException(status_code=409, detail="Agent is already a team member")
+        raise _team_error("TEAM_MEMBER_DUPLICATE", 409)
     member = TeamMember(team_id=team.id, agent_id=agent_id, role="member")
     db.add(member)
     try:
         db.commit()
     except IntegrityError as exc:
         db.rollback()
-        raise HTTPException(status_code=409, detail="Agent is already a team member") from exc
+        raise _team_error("TEAM_MEMBER_DUPLICATE", 409, cause=exc) from exc
     db.refresh(member)
     if role == "leader":
         # 一个团队至多一名 TL:新 leader 上任即换任
@@ -988,7 +1073,7 @@ def remove_member(
         )
     ).first()
     if member is None:
-        raise HTTPException(status_code=404, detail="Team member not found")
+        raise _team_error("TEAM_MEMBER_NOT_FOUND", 404)
     now = utc_now()
     grants = db.exec(
         select(TeamKnowledgeBaseGrant).where(
@@ -1075,7 +1160,7 @@ def set_leader(db: Session, team: Team, agent_id: str) -> TeamMember:
         )
     ).first()
     if member is None:
-        raise HTTPException(status_code=404, detail="Agent is not a team member")
+        raise _team_error("TEAM_AGENT_NOT_MEMBER", 404)
     current = get_team_leader(db, team.id)
     if current and current.agent_id != agent_id:
         current.role = "member"
@@ -1097,13 +1182,14 @@ def record_task_event(
     event_type: str,
     payload: dict[str, Any] | None = None,
 ) -> TeamTaskEvent:
+    """Persist a team audit event with canonical nested errors and raw success fields intact."""
     event = TeamTaskEvent(
         task_id=task_id,
         team_id=team_id,
         actor_type=actor_type,
         actor_id=actor_id,
         event_type=event_type,
-        payload_json=dict(payload or {}),
+        payload_json=_sanitize_team_payload(payload or {}),
     )
     db.add(event)
     return event
@@ -1193,6 +1279,72 @@ BLACKBOARD_SOURCE_TYPES = {"member", "leader", "human"}
 BLACKBOARD_STATUSES = {"active", "archived"}
 BLACKBOARD_INJECTION_LIMIT = 10
 
+# TeamTaskEvent is a legacy audit table, but its public reason fields now carry
+# the same locale-independent shape as SystemEvent.  The canonical registry
+# entries are kept here as a narrow producer contract until the event registry
+# migration is complete; callers must not add free-form params to these events.
+TEAM_EVENT_PARAM_SCHEMAS: dict[str, dict[str, str]] = {
+    "team.blackboard.entry.skipped": {"reason_code": "string"},
+    "team.task.bid.failed": {"reason_code": "string", "round": "integer"},
+    "team.task.review.failed": {"reason_code": "string"},
+    "team.task.escalated": {"reason_code": "string"},
+}
+
+
+def team_reason_payload(
+    event_code: str,
+    *,
+    reason_code: str,
+    params: Mapping[str, object] | None = None,
+    raw: Mapping[str, object] | None = None,
+) -> dict[str, Any]:
+    """Build a typed team reason envelope while marking business excerpts as raw source.
+
+    ``event_code`` and the exact primitive ``params`` are the machine contract.
+    ``raw`` is deliberately outside ``params`` so task names, bid/report text,
+    and bounded business excerpts never become localization arguments.
+    """
+    schema = TEAM_EVENT_PARAM_SCHEMAS.get(event_code)
+    if schema is None:
+        raise ValueError(f"unregistered team event code: {event_code}")
+    event_params: dict[str, object] = {"reason_code": reason_code, **dict(params or {})}
+    if set(event_params) != set(schema):
+        raise ValueError(f"{event_code} params do not match the team event contract")
+    for name, kind in schema.items():
+        value = event_params[name]
+        valid = (
+            isinstance(value, str)
+            if kind == "string"
+            else isinstance(value, int) and not isinstance(value, bool)
+        )
+        if not valid:
+            raise TypeError(f"{event_code} param {name} must be {kind}")
+    payload: dict[str, Any] = {
+        "event_code": event_code,
+        "params": event_params,
+        "reason": {"code": reason_code, "params": dict(params or {})},
+    }
+    if raw:
+        payload["raw"] = dict(raw)
+        payload["raw_source_markers"] = [
+            RawSourceMarker(
+                json_pointer=f"/raw/{key.replace('~', '~0').replace('/', '~1')}",
+                kind=RawSourceKind.BUSINESS_RECORD,
+            ).model_dump(mode="json")
+            for key in raw
+        ]
+    return payload
+
+
+def blackboard_skip_reason(reason_code: str, content: str = "") -> dict[str, Any]:
+    """Return one blackboard skip envelope with a bounded, verbatim source excerpt."""
+    excerpt = str(content or "")[:50]
+    return team_reason_payload(
+        "team.blackboard.entry.skipped",
+        reason_code=reason_code,
+        raw={"content_excerpt": excerpt} if excerpt else None,
+    )
+
 
 def normalize_blackboard_content(content: Any) -> str:
     """黑板内容规范化:压缩全部空白,供去重/合并比较。"""
@@ -1221,12 +1373,12 @@ def write_blackboard_entries(
     source_type: str,
     source_agent_id: str | None = None,
     source_task_id: str | None = None,
-) -> tuple[list[TeamBlackboardEntry], list[str]]:
+) -> tuple[list[TeamBlackboardEntry], list[dict[str, Any]]]:
     """轻量黑板写入流水线:规范化 -> 去重合并 -> 结构化写入(带引用)。
 
     黑板是活文档:与同团队既有 active 条目完全相同或为其子串时不新增;
     新内容是既有条目超集时合并更新既有条目(content/tags/citation/updated_at)。
-    调用方负责 commit。返回 (写入/更新的条目列表, 跳过原因列表)。
+    调用方负责 commit。返回 (写入/更新的条目列表, 结构化跳过原因列表)。
     """
     if source_type not in BLACKBOARD_SOURCE_TYPES:
         raise ValueError(f"未知黑板来源类型: {source_type}")
@@ -1246,28 +1398,30 @@ def write_blackboard_entries(
     )
     existing_by_norm = {normalize_blackboard_content(row.content): row for row in existing_rows}
     written: list[TeamBlackboardEntry] = []
-    skipped: list[str] = []
+    skipped: list[dict[str, Any]] = []
     seen_in_batch: set[str] = set()
     for raw in entries:
         if not isinstance(raw, dict):
-            skipped.append("条目结构非法,已跳过")
+            skipped.append(blackboard_skip_reason("invalid_shape", str(raw)))
             continue
+        source_content = str(raw.get("content") or "")
+        source_excerpt = source_content[:50]
         content = normalize_blackboard_content(raw.get("content"))
         if not content:
-            skipped.append("内容为空,已跳过")
+            skipped.append(blackboard_skip_reason("empty_content"))
             continue
         if content in seen_in_batch:
-            skipped.append(f"与本批次内其他条目重复: {content[:50]}")
+            skipped.append(blackboard_skip_reason("duplicate_batch", source_excerpt))
             continue
         seen_in_batch.add(content)
         tags = normalize_blackboard_tags(raw.get("tags"))
         if content in existing_by_norm:
-            skipped.append(f"与黑板既有条目重复: {content[:50]}")
+            skipped.append(blackboard_skip_reason("duplicate_existing", source_excerpt))
             continue
         # 子串关系:新内容是既有条目的子串 -> 跳过;既有条目是新内容的子串 -> 合并更新
         is_substring = any(content in norm for norm in existing_by_norm)
         if is_substring:
-            skipped.append(f"黑板已有更完整条目: {content[:50]}")
+            skipped.append(blackboard_skip_reason("covered_by_existing", source_excerpt))
             continue
         superseded: TeamBlackboardEntry | None = None
         superseded_norm = ""

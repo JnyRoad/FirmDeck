@@ -1,0 +1,1980 @@
+{
+  "schema_version": 1,
+  "task": "T026",
+  "owner": "frontend-enterprise/ToolsPage",
+  "catalogs": [
+    "en-US",
+    "zh-CN"
+  ],
+  "status": "pending-catalog-unlock",
+  "notes": "Proposed semantic messages for ToolsPage and its directly rendered tool/MCP/A2A/editor/test surfaces. Raw tool names, employee names, URLs, commands, paths, protocol values, test arguments, and provider responses remain data and are not catalog entries.",
+  "entries": [
+    {
+      "id": "toolsPage.title.marketplace",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Tool Marketplace",
+      "zh-CN": "工具广场",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.title.scoped",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Tools",
+      "zh-CN": "工具",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.list.tools",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Tool list",
+      "zh-CN": "工具广场列表",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.list.employeeTools",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Employee tools",
+      "zh-CN": "员工工具",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.action.refresh",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Refresh",
+      "zh-CN": "刷新",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.action.create",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Create",
+      "zh-CN": "新建",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.action.menu",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Tool actions",
+      "zh-CN": "工具操作",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.action.edit",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Edit",
+      "zh-CN": "编辑",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.action.test",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Test",
+      "zh-CN": "测试",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.action.delete",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Delete",
+      "zh-CN": "删除",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.action.remove",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Remove",
+      "zh-CN": "移除",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.action.back",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Back to tools",
+      "zh-CN": "返回工具",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.action.openTest",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Open test page",
+      "zh-CN": "打开测试页",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.action.save",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Save",
+      "zh-CN": "保存",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.action.discover",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Discover tools",
+      "zh-CN": "发现工具",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.action.sync",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Import / sync",
+      "zh-CN": "导入/同步",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.action.cancel",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Cancel",
+      "zh-CN": "取消",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.action.probe",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Probe connection",
+      "zh-CN": "探测",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.stats.total",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Total tools",
+      "zh-CN": "工具总数",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.stats.enabled",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Enabled",
+      "zh-CN": "已启用",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.stats.buckets",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Buckets",
+      "zh-CN": "分桶",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.stats.aria",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Tool statistics",
+      "zh-CN": "工具统计",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.list.aria",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Tool list",
+      "zh-CN": "工具列表",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.list.pagination",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Tool pagination",
+      "zh-CN": "工具分页",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.search.label",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Search tools",
+      "zh-CN": "搜索工具",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.search.placeholder",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Search by name, description, URL, or bucket",
+      "zh-CN": "搜索工具名称、描述、URL 或分桶",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.search.clear",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Clear search",
+      "zh-CN": "清除搜索",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.search.bucketFilter",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Bucket filter",
+      "zh-CN": "分桶筛选",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.search.bucketFilterAll",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "All buckets",
+      "zh-CN": "全部分桶",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.accessibility.selectTool",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Select {name}",
+      "zh-CN": "选择 {name}",
+      "params": {
+        "name": "string"
+      }
+    },
+    {
+      "id": "toolsPage.status.unbucketed",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Unbucketed",
+      "zh-CN": "未分桶",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.status.toolGroup",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Tool group",
+      "zh-CN": "工具集",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.status.enabled",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Enabled",
+      "zh-CN": "已启用",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.status.disabled",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Disabled",
+      "zh-CN": "已停用",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.status.mcpNegotiated",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Negotiated",
+      "zh-CN": "已协商",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.status.mcpPending",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Pending negotiation",
+      "zh-CN": "待协商",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.status.mcpDisabled",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Disabled",
+      "zh-CN": "未启用",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.status.connected",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Connected",
+      "zh-CN": "已连接",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.status.notEnabled",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Not enabled",
+      "zh-CN": "未启用",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.status.credentialConfigured",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Credentials configured",
+      "zh-CN": "已配置凭证",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.status.credentialMissing",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "No credentials",
+      "zh-CN": "无凭证",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.status.imported",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Imported",
+      "zh-CN": "已导入",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.status.notImported",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Not imported",
+      "zh-CN": "未导入",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.server.heading",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "MCP servers (tool groups)",
+      "zh-CN": "MCP 服务器（工具集）",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.server.list",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "MCP server list",
+      "zh-CN": "MCP 服务器列表",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.server.name",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Name",
+      "zh-CN": "名称",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.server.transport",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Connection",
+      "zh-CN": "连接方式",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.server.appsMode",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "MCP Apps",
+      "zh-CN": "MCP Apps",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.server.endpoint",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Endpoint",
+      "zh-CN": "端点",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.server.toolCount",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "{count, plural, =0 {No tools} one {# tool} other {# tools}}",
+      "zh-CN": "{count, plural, =0 {没有工具} other {# 个工具}}",
+      "params": {
+        "count": "integer"
+      }
+    },
+    {
+      "id": "toolsPage.server.empty",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "No MCP servers",
+      "zh-CN": "暂无 MCP 服务器",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.confirm.deleteServerTitle",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "{action} MCP server “{name}”?",
+      "zh-CN": "{action} MCP 服务器「{name}」？",
+      "params": {
+        "action": "string",
+        "name": "string"
+      }
+    },
+    {
+      "id": "toolsPage.confirm.deleteServerDescription",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "{count, plural, =0 {No imported tools will be deleted.} one {# imported tool will be deleted with it; this cannot be undone.} other {# imported tools will be deleted with it; this cannot be undone.}}",
+      "zh-CN": "{count, plural, =0 {没有已导入工具会被删除。} other {其下 # 个已导入工具将一并删除，操作不可撤销。}}",
+      "params": {
+        "count": "integer"
+      }
+    },
+    {
+      "id": "toolsPage.confirm.removeServerDescription",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "{count, plural, =0 {No tools will be removed from this employee.} one {# tool will be removed from this employee; the server and other employees are unchanged.} other {# tools will be removed from this employee; the server and other employees are unchanged.}}",
+      "zh-CN": "{count, plural, =0 {当前员工没有工具会被移除。} other {将从当前员工移除该工具集的 # 个工具，工具集本身和其他员工不受影响。}}",
+      "params": {
+        "count": "integer"
+      }
+    },
+    {
+      "id": "toolsPage.table.toolName",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Tool name",
+      "zh-CN": "工具名称",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.table.bucket",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Bucket",
+      "zh-CN": "分桶",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.table.type",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Type",
+      "zh-CN": "类型",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.table.capabilityScope",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Capability scope",
+      "zh-CN": "能力范围",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.table.creator",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Creator",
+      "zh-CN": "创建者",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.table.method",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Method",
+      "zh-CN": "方法",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.table.url",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "URL",
+      "zh-CN": "URL",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.table.enabled",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Enabled",
+      "zh-CN": "启用",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.table.actions",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Actions",
+      "zh-CN": "操作",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.import.title.plaza",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Copy tools from plaza",
+      "zh-CN": "从广场复制工具",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.import.title.employee",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Copy tools from employee",
+      "zh-CN": "从数字员工复制工具",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.import.targetLabel",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Target employee",
+      "zh-CN": "目标员工",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.import.targetPlaceholder",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Select target employee",
+      "zh-CN": "选择目标员工",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.import.sourcePlazaPlaceholder",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Select open plaza",
+      "zh-CN": "选择开放广场",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.import.sourceEmployeePlaceholder",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Select source employee",
+      "zh-CN": "选择复制来源",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.import.itemsLabel",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Select tools",
+      "zh-CN": "选择工具",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.import.empty",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "No tools available to copy",
+      "zh-CN": "没有可复制的工具",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.import.note.plaza",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Copy available tools from the open plaza; copied tools become local bindings for the current employee.",
+      "zh-CN": "从开放广场复制可用工具；复制后会成为当前员工的本地工具绑定。",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.import.note.employee",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Copy available tools from an employee; inaccessible content is omitted.",
+      "zh-CN": "从数字员工复制可用工具；不可见内容不会出现在列表。",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.import.sourceGallery",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Open plaza",
+      "zh-CN": "开放广场",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.import.newBlank",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "New blank tool",
+      "zh-CN": "新建空白工具",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.import.fromPlaza",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Copy from plaza",
+      "zh-CN": "从广场复制",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.import.fromEmployee",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Copy from employee",
+      "zh-CN": "从数字员工复制",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.confirm.deleteToolTitle",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Delete tool “{name}”?",
+      "zh-CN": "删除工具「{name}」？",
+      "params": {
+        "name": "string"
+      }
+    },
+    {
+      "id": "toolsPage.confirm.removeToolTitle",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Remove tool “{name}”?",
+      "zh-CN": "移除工具「{name}」？",
+      "params": {
+        "name": "string"
+      }
+    },
+    {
+      "id": "toolsPage.confirm.deleteToolDescription",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Deleting it prevents skills that reference this tool from calling it. This action cannot be undone.",
+      "zh-CN": "删除后，引用该工具的技能将无法继续调用它，操作不可撤销。",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.confirm.removeToolDescription",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Removing it from this employee does not delete the original tool in the plaza.",
+      "zh-CN": "从当前员工移除后，工具广场中的原始工具不会被删除。",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.empty.toolsAdmin",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "No tools yet. Select “Create” to add one.",
+      "zh-CN": "暂无工具，点击「新建」创建一个吧",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.empty.tools",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "No tools",
+      "zh-CN": "暂无工具",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.empty.employeeTools",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "No tools for this employee",
+      "zh-CN": "当前员工暂无工具",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.editor.newTitle",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "New tool",
+      "zh-CN": "新建工具",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.editor.editTitle",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Edit tool",
+      "zh-CN": "编辑工具",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.editor.newMcpTitle",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "New MCP server",
+      "zh-CN": "新建 MCP 服务器",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.editor.editMcpTitle",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Edit MCP server",
+      "zh-CN": "编辑 MCP 服务器",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.editor.description.new",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Choose a tool type and fill in its definition. You can test requests and responses in the probe panel.",
+      "zh-CN": "选择工具类型并填写定义，可先用右侧探测区测试请求与返回结构。",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.editor.description.edit",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Update the tool definition and validate the current or saved configuration in the side panel.",
+      "zh-CN": "修改工具定义，并在右侧验证当前配置或已保存版本。",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.editor.description.test",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Invoke a saved tool with test parameters to inspect the response available to employees.",
+      "zh-CN": "用测试参数直接调用已保存工具，检查员工后续调用时的实际返回。",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.editor.description.mcp",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Configure an MCP Server, discover its tools, and sync them into a tool group.",
+      "zh-CN": "配置 MCP Server 连接后，可发现其提供的工具并同步为工具集。",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.section.definition",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Tool definition",
+      "zh-CN": "工具定义",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.section.info",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Tool information",
+      "zh-CN": "工具信息",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.section.connection",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Connection configuration",
+      "zh-CN": "连接配置",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.section.discovery",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Tool discovery (tools/list)",
+      "zh-CN": "工具发现（tools/list）",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.section.probe",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Connection probe",
+      "zh-CN": "配置探测",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.section.callTest",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Call test",
+      "zh-CN": "调用测试",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.status.loading",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Loading…",
+      "zh-CN": "加载中…",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.field.toolType",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Tool type",
+      "zh-CN": "工具类型",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.field.name",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Tool name",
+      "zh-CN": "工具名称",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.field.displayName",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Display name",
+      "zh-CN": "显示名称",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.field.description",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Description",
+      "zh-CN": "描述",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.field.bucket",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Bucket",
+      "zh-CN": "分桶",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.field.httpMethod",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "HTTP method",
+      "zh-CN": "HTTP Method",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.field.url",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "URL",
+      "zh-CN": "URL",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.field.a2aEndpoint",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "A2A Endpoint URL",
+      "zh-CN": "A2A Endpoint URL",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.field.timeout",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Timeout (seconds)",
+      "zh-CN": "调用超时上限（秒）",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.field.headers",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Headers",
+      "zh-CN": "Headers",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.field.auth",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Auth",
+      "zh-CN": "Auth",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.field.inputSchema",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Input schema",
+      "zh-CN": "输入 Schema",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.field.outputSchema",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Output schema",
+      "zh-CN": "输出 Schema",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.field.allowedSkills",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Allowed Skills",
+      "zh-CN": "Allowed Skills",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.field.toolId",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Tool ID",
+      "zh-CN": "工具 ID",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.field.inputCount",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Input fields",
+      "zh-CN": "输入字段",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.field.outputCount",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Output fields",
+      "zh-CN": "输出字段",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.field.lastUpdated",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Last updated",
+      "zh-CN": "最近更新",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.field.mcpName",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "MCP server name",
+      "zh-CN": "MCP 服务器名称",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.field.mcpDisplayName",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Display name",
+      "zh-CN": "显示名称",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.field.mcpDescription",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Description",
+      "zh-CN": "描述",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.field.mcpBucket",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Tool bucket",
+      "zh-CN": "工具分桶",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.field.mcpUrl",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Server URL",
+      "zh-CN": "服务器 URL",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.field.mcpHeaders",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Headers",
+      "zh-CN": "Headers",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.field.command",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Command",
+      "zh-CN": "命令",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.field.args",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Arguments",
+      "zh-CN": "Args",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.field.env",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Environment",
+      "zh-CN": "Environment",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.field.cwd",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Working directory",
+      "zh-CN": "工作目录",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.field.transport",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Transport",
+      "zh-CN": "连接方式",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.field.enabledTool",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Enable tool",
+      "zh-CN": "启用工具",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.field.enabledToolGroup",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Enable tool group",
+      "zh-CN": "启用工具集",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.field.invocationAddress",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Invocation address",
+      "zh-CN": "调用地址",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.field.inputSchemaPanel",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Input schema",
+      "zh-CN": "输入 Schema",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.field.outputSchemaPanel",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Output schema",
+      "zh-CN": "输出 Schema",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.hint.mcpNameLocked",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "The name cannot be changed after saving.",
+      "zh-CN": "保存后不可修改名称。",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.hint.mcpNameRules",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Unique identifier: letters, numbers, and underscores only; non-Latin input is transliterated; maximum 15 characters.",
+      "zh-CN": "作为唯一标识，仅支持字母/数字/下划线；中文将自动转拼音，最长 15 字符。",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.hint.mcpArgs",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "One argument per line.",
+      "zh-CN": "每行一个参数。",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.hint.mcpCwd",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Working directory for the process.",
+      "zh-CN": "进程工作目录。",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.hint.enabledToolGroup",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Disabled tools in this group cannot be called by employees.",
+      "zh-CN": "停用后其下工具将无法被员工调用。",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.hint.enabledTool",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Disabled tools cannot be called by employees.",
+      "zh-CN": "停用后员工将无法调用该工具。",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.hint.a2aAgentCard",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Read /.well-known/agent-card.json",
+      "zh-CN": "读取 /.well-known/agent-card.json",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.hint.a2aForceAgentCard",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Stop if discovery fails instead of continuing.",
+      "zh-CN": "发现失败时终止而非继续尝试",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.hint.a2aStreaming",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Prefer streaming subscription when supported.",
+      "zh-CN": "优先使用流式订阅",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.hint.a2aSubscribe",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Keep long-task updates subscribed.",
+      "zh-CN": "保持长任务事件订阅",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.hint.advancedConfig",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Keep protocol extension fields; structured options are mirrored here.",
+      "zh-CN": "保留协议扩展字段；结构化选项会同步写入这里。",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.type.http",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "HTTP tool",
+      "zh-CN": "HTTP 工具",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.type.a2a",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "A2A Agent",
+      "zh-CN": "A2A Agent",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.type.mcp",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "MCP server",
+      "zh-CN": "MCP 服务器",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.typeDescription.http",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Configure a single HTTP endpoint as a tool.",
+      "zh-CN": "配置单个 HTTP 接口作为工具",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.typeDescription.a2a",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Call a remote agent through A2A SendMessage.",
+      "zh-CN": "通过 A2A SendMessage 调用远程智能体",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.typeDescription.mcp",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Connect an MCP Server, discover its tools, and sync its tool set.",
+      "zh-CN": "连接 MCP Server，自动发现并同步其工具集",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.transport.streamableHttp",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Streamable HTTP",
+      "zh-CN": "Streamable HTTP",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.transport.sse",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "SSE",
+      "zh-CN": "SSE",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.transport.stdio",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Stdio (local command)",
+      "zh-CN": "Stdio（本地命令）",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.transport.builtin",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Built-in Demo",
+      "zh-CN": "内置 Demo",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.transportHint.streamableHttp",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Connect to a remote MCP Server through HTTP(S).",
+      "zh-CN": "通过 HTTP(S) 连接远程 MCP Server",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.transportHint.sse",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Connect to a remote MCP Server through Server-Sent Events.",
+      "zh-CN": "通过 Server-Sent Events 连接远程 MCP Server",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.transportHint.stdio",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Start a local process and communicate through standard input/output.",
+      "zh-CN": "启动本地进程并通过标准输入输出通信",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.transportHint.builtin",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Use the built-in builtin.demo MCP for demonstration only.",
+      "zh-CN": "使用内置的 builtin.demo MCP，仅用于演示",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.apps.enabled",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Enabled",
+      "zh-CN": "已开启",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.apps.disabled",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Disabled",
+      "zh-CN": "未开启",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.apps.toggleAria",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Enable MCP Apps extension protocol",
+      "zh-CN": "开启 MCP Apps 扩展协议",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.apps.protocol",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "MCP Apps extension protocol",
+      "zh-CN": "MCP Apps 扩展协议",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.apps.protocolHint",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Enables negotiation of io.modelcontextprotocol/ui and MCP App rendering; 10 MiB maximum per App.",
+      "zh-CN": "开启后协商 io.modelcontextprotocol/ui，并允许渲染 MCP App；单个 App 资源最大 10 MiB。",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.apps.valueOn",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Enabled",
+      "zh-CN": "已开启",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.apps.valueOff",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Disabled",
+      "zh-CN": "未开启",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.apps.only",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "MCP App",
+      "zh-CN": "MCP App",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.apps.modelAndApp",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Model and MCP App",
+      "zh-CN": "模型和 MCP App",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.a2a.heading",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Persistent A2A tasks",
+      "zh-CN": "A2A 持久化任务",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.a2a.codexAdapter",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Codex CLI Adapter",
+      "zh-CN": "Codex CLI Adapter",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.a2a.standardAgent",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Standard A2A Agent",
+      "zh-CN": "标准 A2A Agent",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.a2a.adapterSummary",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Command {command} · max {timeoutSeconds, number} s · {credentialStatus}",
+      "zh-CN": "命令 {command} · 最长 {timeoutSeconds, number} 秒 · {credentialStatus}",
+      "params": {
+        "command": "string",
+        "timeoutSeconds": "number",
+        "credentialStatus": "string"
+      }
+    },
+    {
+      "id": "toolsPage.a2a.persistenceHint",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Tasks, events, artifacts, and state are persisted.",
+      "zh-CN": "任务、事件、产物和状态会持久化。",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.a2a.empty",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "No A2A call records. Test or invoke the tool to retain long-task state here.",
+      "zh-CN": "尚无 A2A 调用记录。测试或正式调用后，长任务状态会保留在这里。",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.a2a.runSummary",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "{updatedAt} · {eventCount, number} events · {artifactCount, number} artifacts",
+      "zh-CN": "{updatedAt} · {eventCount, number} 个事件 · {artifactCount, number} 个产物",
+      "params": {
+        "updatedAt": "string",
+        "eventCount": "integer",
+        "artifactCount": "integer"
+      }
+    },
+    {
+      "id": "toolsPage.a2a.recoveryCount",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "{count, plural, one {# recovery} other {# recoveries}}",
+      "zh-CN": "{count, plural, =0 {0 次恢复} other {# 次恢复}}",
+      "params": {
+        "count": "integer"
+      }
+    },
+    {
+      "id": "toolsPage.a2a.timeline",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Timeline",
+      "zh-CN": "时间线",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.a2a.persistedState",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Persisted state",
+      "zh-CN": "持久化状态",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.a2a.status.submitted",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Submitted",
+      "zh-CN": "已提交",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.a2a.status.working",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Working",
+      "zh-CN": "执行中",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.a2a.status.completed",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Completed",
+      "zh-CN": "已完成",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.a2a.status.failed",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Failed",
+      "zh-CN": "失败",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.a2a.status.canceled",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Canceled",
+      "zh-CN": "已取消",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.a2a.status.rejected",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Rejected",
+      "zh-CN": "已拒绝",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.a2a.status.inputRequired",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Input required",
+      "zh-CN": "等待输入",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.a2a.discoverAgentCard",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Discover Agent Card",
+      "zh-CN": "发现 Agent Card",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.a2a.requireAgentCard",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Require Agent Card",
+      "zh-CN": "强制 Agent Card",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.a2a.streaming",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Streaming",
+      "zh-CN": "流式订阅",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.a2a.subscribe",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Subscribe updates",
+      "zh-CN": "订阅更新",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.a2a.agentCardOptional",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Agent Card URL (optional)",
+      "zh-CN": "Agent Card URL（可选）",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.a2a.pollInterval",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Poll interval (seconds)",
+      "zh-CN": "轮询间隔（秒）",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.a2a.advancedConfig",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Advanced config JSON",
+      "zh-CN": "高级配置 JSON",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.discovery.description",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Click “Discover tools” to fetch tools/list, then select and “Import / sync” to create tool rows.",
+      "zh-CN": "点击「发现工具」拉取 tools/list，勾选后「导入/同步」即可生成工具行。",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.discovery.descriptionSaved",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Save the MCP server before importing and syncing tools.",
+      "zh-CN": "请先保存 MCP 服务器，才能导入并同步工具。",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.discovery.empty",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "No tools discovered",
+      "zh-CN": "未发现工具",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.discovery.listAria",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Discovered tools",
+      "zh-CN": "发现的工具",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.discovery.tool",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Tool",
+      "zh-CN": "工具",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.discovery.descriptionColumn",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Description",
+      "zh-CN": "描述",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.discovery.app",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "MCP App",
+      "zh-CN": "MCP App",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.discovery.status",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Status",
+      "zh-CN": "状态",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.toast.loadToolsFailed",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Failed to load tools",
+      "zh-CN": "加载工具失败",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.toast.deleteTool",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Tool deleted",
+      "zh-CN": "已删除工具",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.toast.removeTool",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Tool removed from current employee",
+      "zh-CN": "已从当前员工移除",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.toast.deleteFailed",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Delete failed",
+      "zh-CN": "删除失败",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.toast.removeFailed",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Remove failed",
+      "zh-CN": "移除失败",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.toast.noTargetAgent",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Create or select an employee before copying tools",
+      "zh-CN": "请先创建或选择一个数字员工，再复制工具",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.toast.loadAgentsFailed",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Failed to load employees",
+      "zh-CN": "加载员工失败",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.toast.loadSourceToolsFailed",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Failed to load source tools",
+      "zh-CN": "加载来源工具失败",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.toast.targetRequired",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Select a target employee",
+      "zh-CN": "请选择要复制到的数字员工",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.toast.sourcePlazaRequired",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Select an open plaza",
+      "zh-CN": "请选择开放广场",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.toast.sourceEmployeeRequired",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Select a source employee",
+      "zh-CN": "请选择复制来源员工",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.toast.itemsRequired",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Select at least one tool",
+      "zh-CN": "请选择要复制的工具",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.toast.importComplete",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "{importedCount, plural, one {Copied # tool} other {Copied # tools}}{missingCount, plural, =0 {} other {; # not copied}}",
+      "zh-CN": "{importedCount, plural, one {已复制 # 个工具} other {已复制 # 个工具}}{missingCount, plural, =0 {} other {；未复制 # 个}}",
+      "params": {
+        "importedCount": "integer",
+        "missingCount": "integer"
+      }
+    },
+    {
+      "id": "toolsPage.toast.importFailed",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Failed to copy tools",
+      "zh-CN": "复制工具失败",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.toast.toolNameRequired",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Enter a tool name",
+      "zh-CN": "请填写工具名称",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.toast.urlRequired",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Enter a URL",
+      "zh-CN": "请输入 URL",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.toast.saved",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Saved",
+      "zh-CN": "已保存",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.toast.saveFailed",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Save failed",
+      "zh-CN": "保存失败",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.toast.loadA2ARunsFailed",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Failed to load A2A task records",
+      "zh-CN": "加载 A2A 任务记录失败",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.toast.cancelSubmitted",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Cancellation requested",
+      "zh-CN": "已提交取消请求",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.toast.cancelFailed",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Failed to cancel A2A task",
+      "zh-CN": "取消 A2A 任务失败",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.toast.loadServerFailed",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Failed to load MCP server",
+      "zh-CN": "加载 MCP 服务器失败",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.toast.mcpNameRequired",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Enter an MCP server name",
+      "zh-CN": "请填写 MCP 服务器名称",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.toast.discoverFailed",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Tool discovery failed",
+      "zh-CN": "发现工具失败",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.toast.discovered",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Discovered {count, number} tools",
+      "zh-CN": "发现 {count, number} 个工具",
+      "params": {
+        "count": "integer"
+      }
+    },
+    {
+      "id": "toolsPage.toast.saveBeforeSync",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Save the MCP server before syncing tools",
+      "zh-CN": "请先保存 MCP 服务器，再同步工具",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.toast.selectToolToSync",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Select at least one tool to sync",
+      "zh-CN": "请至少选择一个要导入的工具",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.toast.syncFailed",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Sync failed",
+      "zh-CN": "同步失败",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.toast.synced",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Sync complete: {importedCount, number} imported, {updatedCount, number} updated",
+      "zh-CN": "同步完成：新增 {importedCount, number}，更新 {updatedCount, number}",
+      "params": {
+        "importedCount": "integer",
+        "updatedCount": "integer"
+      }
+    },
+    {
+      "id": "toolsPage.toast.probeFailed",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Probe failed",
+      "zh-CN": "探测失败",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.toast.invalidProbeArguments",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Test arguments are not valid JSON",
+      "zh-CN": "测试参数不是合法 JSON",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.toast.queryArgumentRule",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "When the URL already has query parameters, switch HTTP Method to GET; POST sends test parameters as a JSON body.",
+      "zh-CN": "URL 已包含查询参数时请把 HTTP Method 切换为 GET；POST 会把测试参数作为 JSON Body 发送。",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.toast.callFailed",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Call failed",
+      "zh-CN": "调用失败",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.toast.jsonConfigInvalid",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "JSON configuration is invalid; check Headers, Auth, Schema, or protocol options.",
+      "zh-CN": "JSON 配置格式不正确，请检查 Headers、Auth、Schema 或协议配置",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.toast.headersEnvInvalid",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Headers and environment variables must be valid JSON",
+      "zh-CN": "Headers 或环境变量必须是合法 JSON",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.placeholder.mcpDisplayName",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "My tool group",
+      "zh-CN": "我的工具集",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.placeholder.mcpName",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "my_mcp_server",
+      "zh-CN": "my_mcp_server",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.placeholder.mcpUrl",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "https://example.com/mcp",
+      "zh-CN": "https://example.com/mcp",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.placeholder.mcpCommand",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "python",
+      "zh-CN": "python",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.placeholder.mcpArgs",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "-m\nmy_mcp.server\n--port\n8000",
+      "zh-CN": "-m\nmy_mcp.server\n--port\n8000",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.placeholder.mcpCwd",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "/opt/mcp/server",
+      "zh-CN": "/opt/mcp/server",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.placeholder.a2aCardUrl",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "https://agent.example.com/.well-known/agent-card.json",
+      "zh-CN": "https://agent.example.com/.well-known/agent-card.json",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.placeholder.a2aConfig",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "{\"discover_agent_card\":true,\"streaming\":true}",
+      "zh-CN": "{\"discover_agent_card\":true,\"streaming\":true}",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.placeholder.mcpDescription",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Briefly describe this tool group",
+      "zh-CN": "简单说明这个工具集的用途",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.placeholder.mcpBucket",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "MCP tools",
+      "zh-CN": "MCP 工具",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.placeholder.toolName",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "order_query",
+      "zh-CN": "order_query",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.placeholder.toolUrl",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "/api/mock/order/query",
+      "zh-CN": "/api/mock/order/query",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.placeholder.toolA2AUrl",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "https://agent.example.com/a2a",
+      "zh-CN": "https://agent.example.com/a2a",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.placeholder.allowedSkills",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "skill_id_1,skill_id_2",
+      "zh-CN": "skill_id_1,skill_id_2",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.placeholder.toolDisplayName",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Order query",
+      "zh-CN": "订单查询",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.placeholder.toolBucket",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Select or enter a bucket",
+      "zh-CN": "选择或输入分桶",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.placeholder.toolDescription",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Briefly describe this tool",
+      "zh-CN": "简单说明这个工具的用途",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.hint.timeout",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Each tool supports 1–3600 seconds; A2A long tasks remain subscribed or polled within this timeout.",
+      "zh-CN": "每个工具独立生效，支持 1–3600 秒；A2A 长任务会在此时间内持续订阅或轮询。",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.hint.allowedSkills",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Leave blank to allow all skills; separate multiple skills with English commas.",
+      "zh-CN": "留空表示所有技能可调用，多个技能用英文逗号分隔。",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.mcp.noDescription",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "No description",
+      "zh-CN": "暂无描述",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.a2a.connectionTitle",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "A2A long-task connection",
+      "zh-CN": "A2A 长任务连接",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.a2a.connectionDescription",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Automatically discover the Agent Card; prefer streaming subscription and fall back to polling after disconnect. StaffDeck persists tasks, events, and artifacts.",
+      "zh-CN": "自动发现 Agent Card；优先流式订阅，断线后回退轮询。任务、事件和产物由 StaffDeck 持久化。",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.a2a.codexConnect",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Connect local Codex",
+      "zh-CN": "连接本机 Codex",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.a2a.codexDisabled",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Codex Adapter not enabled",
+      "zh-CN": "Codex Adapter 未启用",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.probe.description",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Test the current connection without saving.",
+      "zh-CN": "无需保存，直接用当前配置测试连接。",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.probe.argumentsGet",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Test arguments JSON (appended to URL query)",
+      "zh-CN": "测试参数 JSON（拼到 URL Query）",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.probe.argumentsBody",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Test arguments JSON (sent as request body)",
+      "zh-CN": "测试参数 JSON（作为请求 Body）",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.probe.getHint",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "GET appends fields as query parameters; enter unencoded values, for example timezone as Asia/Shanghai.",
+      "zh-CN": "GET 会把这里的字段作为查询参数追加到 URL；参数值填写未编码原文，例如 timezone 用 Asia/Shanghai。",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.probe.bodyHint",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "POST sends these fields as a JSON body.",
+      "zh-CN": "POST 会把这些字段作为 JSON Body 发送。",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.probe.result",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Probe result",
+      "zh-CN": "探测结果",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.savedTest.title",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Saved tool test",
+      "zh-CN": "已保存工具测试",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.savedTest.description",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Invoke saved “{name}” to verify the response available to employees.",
+      "zh-CN": "调用已保存的「{name}」，用于验证员工实际可用的工具返回。",
+      "params": {
+        "name": "string"
+      }
+    },
+    {
+      "id": "toolsPage.savedTest.arguments",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Test arguments",
+      "zh-CN": "测试参数",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.savedTest.result",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Call result",
+      "zh-CN": "调用结果",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.savedTest.returned",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Returned",
+      "zh-CN": "已返回",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.savedTest.waiting",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Waiting to call",
+      "zh-CN": "等待调用",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.savedTest.empty",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "After invoking, the tool response, error information, and raw data will appear here.",
+      "zh-CN": "点击调用后，这里会显示工具返回、错误信息和原始 data。",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.savedTest.invoke",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "Invoke",
+      "zh-CN": "调用",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.protocol.http",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "HTTP",
+      "zh-CN": "HTTP",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.protocol.a2a",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "A2A",
+      "zh-CN": "A2A",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.protocol.mcp",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "MCP",
+      "zh-CN": "MCP",
+      "params": {}
+    },
+    {
+      "id": "toolsPage.raw.description",
+      "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
+      "en-US": "No description",
+      "zh-CN": "暂无描述",
+      "params": {}
+    }
+  ]
+}

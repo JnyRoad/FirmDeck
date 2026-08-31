@@ -1,5 +1,8 @@
 import { UnderlineTabs, type UnderlineTabItem } from '@/components/ui';
 import { notify } from '@/components/ui/app-toast';
+import { RawContent } from '@/i18n/RawContent';
+import { useAppIntl } from '@/i18n/useAppIntl';
+import { apiErrorMessage } from '@/lib/apiErrorMessages';
 
 import IconSearch from '../assets/icons/search.svg?react';
 
@@ -29,6 +32,14 @@ const ENTERPRISE_AGENT_STORAGE_KEY = 'ultrarag_enterprise_agent_scope';
 
 type GalleryScope = 'all' | 'mine' | 'teams' | 'gallery';
 
+/** 统一把未知异常折叠为安全语义文案，避免把 Error.message 直接暴露到最终 UI。 */
+function galleryErrorMessage(error: unknown, fallback: string): string {
+  const message = apiErrorMessage(error, 'common.error.generic');
+  return message === '发生错误，请稍后重试' || message === 'Something went wrong. Please try again later.'
+    ? fallback
+    : message;
+}
+
 export default function EmployeeGalleryPage({
   currentUser,
   isAdmin = false,
@@ -40,6 +51,7 @@ export default function EmployeeGalleryPage({
   onStartChat?: (agent: AgentProfileRead) => void | Promise<void>;
   onLogout?: () => void;
 }) {
+  const { t } = useAppIntl();
   const [agents, setAgents] = useState<AgentProfileRead[]>([]);
   const [teams, setTeams] = useState<TeamRead[]>([]);
   const [teamsLoadFailed, setTeamsLoadFailed] = useState(false);
@@ -60,7 +72,7 @@ export default function EmployeeGalleryPage({
       const rows = await api.get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${TENANT_ID}`);
       setAgents(rows);
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '加载员工失败');
+      notify.error(galleryErrorMessage(error, t('employeeGalleryPage.toast.loadEmployeesFailed')));
     } finally {
       setLoading(false);
     }
@@ -73,7 +85,7 @@ export default function EmployeeGalleryPage({
       setTeamsLoadFailed(false);
     } catch (error) {
       setTeamsLoadFailed(true);
-      notify.error(error instanceof Error ? error.message : '加载团队失败');
+      notify.error(galleryErrorMessage(error, t('employeeGalleryPage.toast.loadTeamsFailed')));
     }
   }
 
@@ -140,7 +152,7 @@ export default function EmployeeGalleryPage({
       }
       navigate(`/workspace/chat/draft/${row.id}`);
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '发起对话失败');
+      notify.error(galleryErrorMessage(error, t('employeeGalleryPage.toast.startChatFailed')));
     } finally {
       setStartingAgentId(null);
     }
@@ -154,10 +166,10 @@ export default function EmployeeGalleryPage({
         `/api/enterprise/teams/${team.id}/tl/session`,
         { tenant_id: TENANT_ID },
       );
-      if (!result.session_id) throw new Error('未返回团队群聊');
+      if (!result.session_id) throw new Error(t('employeeGalleryPage.error.missingTeamSession'));
       navigate(`/workspace/chat/${result.session_id}`);
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '发起团队对话失败');
+      notify.error(galleryErrorMessage(error, t('employeeGalleryPage.toast.startTeamChatFailed')));
     } finally {
       setStartingTeamId(null);
     }
@@ -170,11 +182,15 @@ export default function EmployeeGalleryPage({
         status,
         metadata: row.metadata || {},
       });
-      notify.success(status === 'active' ? '员工已上线' : '员工已下线');
+      notify.success(
+        status === 'active'
+          ? t('employeeGalleryPage.toast.published')
+          : t('employeeGalleryPage.toast.archived'),
+      );
       await load();
       window.dispatchEvent(new Event('ultrarag-enterprise-agent-scope-refresh'));
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '更新员工状态失败');
+      notify.error(galleryErrorMessage(error, t('employeeGalleryPage.toast.updateStatusFailed')));
     }
   }
 
@@ -194,11 +210,15 @@ export default function EmployeeGalleryPage({
         tenant_id: TENANT_ID,
         metadata,
       });
-      notify.success(published ? '已发布到广场' : '已从广场下架');
+      notify.success(
+        published
+          ? t('employeeGalleryPage.toast.marketplacePublished')
+          : t('employeeGalleryPage.toast.marketplaceUnpublished'),
+      );
       await load();
       window.dispatchEvent(new Event('ultrarag-enterprise-agent-scope-refresh'));
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '更新广场状态失败');
+      notify.error(galleryErrorMessage(error, t('employeeGalleryPage.toast.updateGalleryFailed')));
     }
   }
 
@@ -219,12 +239,12 @@ export default function EmployeeGalleryPage({
           window.dispatchEvent(new CustomEvent('ultrarag-enterprise-agent-scope-change', { detail: { agentId: '' } }));
         }
       }
-      notify.success('员工已删除');
+      notify.success(t('employeeGalleryPage.toast.deleted'));
       setDeleteTarget(null);
       await load();
       window.dispatchEvent(new Event('ultrarag-enterprise-agent-scope-refresh'));
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '删除员工失败');
+      notify.error(galleryErrorMessage(error, t('employeeGalleryPage.toast.deleteFailed')));
     } finally {
       setDeleting(false);
     }
@@ -235,10 +255,10 @@ export default function EmployeeGalleryPage({
   }
 
   const galleryTabs: UnderlineTabItem<GalleryScope>[] = [
-    { value: 'all', label: '所有员工' },
-    { value: 'mine', label: '我的数字员工' },
-    { value: 'teams', label: '团队对话' },
-    { value: 'gallery', label: '数字员工广场' },
+    { value: 'all', label: t('employeeGalleryPage.tabs.all') },
+    { value: 'mine', label: t('employeeGalleryPage.tabs.mine') },
+    { value: 'teams', label: t('employeeGalleryPage.tabs.teams') },
+    { value: 'gallery', label: t('employeeGalleryPage.tabs.gallery') },
   ];
 
   function changeScope(nextScope: GalleryScope) {
@@ -249,14 +269,18 @@ export default function EmployeeGalleryPage({
   }
 
   const hasSearchTerm = Boolean(searchTerm.trim());
-  const emptyText = hasSearchTerm ? '没有匹配的数字员工' : '暂无数字员工';
+  const emptyText = hasSearchTerm
+    ? t('employeeGalleryPage.empty.filtered.title')
+    : t('employeeGalleryPage.empty.default.title');
   const emptyDescription = hasSearchTerm
-    ? '换个关键词，或切换员工分类再试试'
-    : '当前分类还没有可用员工';
-  const teamsEmptyText = hasSearchTerm ? '没有匹配的团队' : '暂无团队';
+    ? t('employeeGalleryPage.empty.filtered.description')
+    : t('employeeGalleryPage.empty.default.description');
+  const teamsEmptyText = hasSearchTerm
+    ? t('employeeGalleryPage.empty.teamsFiltered.title')
+    : t('employeeGalleryPage.empty.teams.title');
   const teamsEmptyDescription = hasSearchTerm
-    ? '换个关键词再试试'
-    : '请先在管理端创建团队并设置项目领导';
+    ? t('employeeGalleryPage.empty.teamsFiltered.description')
+    : t('employeeGalleryPage.empty.teams.description');
 
   return (
     <div className="min-h-full box-border px-[48px] pt-[32px] pb-[43px] max-[900px]:px-[16px]" aria-busy={loading}>
@@ -273,8 +297,8 @@ export default function EmployeeGalleryPage({
               data-bwignore="true"
               value={searchTerm}
               onChange={(event) => setSearchTerm(event.target.value)}
-              placeholder="搜索"
-              aria-label="搜索数字员工"
+              placeholder={t('employeeGalleryPage.search.placeholder')}
+              aria-label={t('employeeGalleryPage.search.label')}
               className="min-w-0 flex-1 border-0 bg-transparent text-[14px] text-[#18181A] outline-none placeholder:text-[#757F9C]"
             />
           </div>
@@ -282,16 +306,16 @@ export default function EmployeeGalleryPage({
       />
 
       <UnderlineTabs
-        className="mt-[36px] mb-[16px] max-[560px]:w-full"
-        aria-label="数字员工分类"
+        className="mt-[36px] mb-[16px] w-full max-w-[680px]"
+        aria-label={t('employeeGalleryPage.tabs.ariaLabel')}
         value={scope}
         onChange={changeScope}
         items={galleryTabs}
-        tabClassName="max-[560px]:min-h-[54px] max-[560px]:w-auto max-[560px]:flex-1 max-[560px]:px-[6px] max-[560px]:text-[12px] max-[560px]:leading-[16px]"
+        tabClassName="min-w-max flex-1 px-[12px] max-[560px]:px-[8px] max-[560px]:text-[12px]"
       />
 
       {scope === 'teams' ? (
-        <section aria-label="团队">
+        <section aria-label={t('employeeGalleryPage.teams.sectionLabel')}>
           <div className="grid grid-cols-1 content-start gap-[32px] sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4 max-[900px]:gap-[18px]">
             {filteredTeams.map((team) => (
               <TeamCard
@@ -350,8 +374,14 @@ export default function EmployeeGalleryPage({
           if (!open) setDeleteTarget(null);
         }}
         loading={deleting}
-        title={`删除员工「${deleteTarget ? employeeDisplayName(deleteTarget) : ''}」？`}
-        description="删除后该员工的所有配置将一并移除，操作不可撤销。"
+        title={deleteTarget ? (
+          <>
+            {t('employeeGalleryPage.dialog.delete.titlePrefix')}
+            <RawContent value={employeeDisplayName(deleteTarget)} />
+            {t('employeeGalleryPage.dialog.delete.titleSuffix')}
+          </>
+        ) : ''}
+        description={t('employeeGalleryPage.dialog.delete.description')}
         onConfirm={() => void confirmDelete()}
       />
     </div>

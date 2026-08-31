@@ -1,8 +1,13 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
+
 import { Button, notify } from '@/components/ui';
 import StaffdeckIcon from '@/components/StaffdeckIcon';
-import { api, ApiError, TENANT_ID } from '@/api/client';
-import { useI18n } from '@/i18n';
+import { api, TENANT_ID } from '@/api/client';
+import { RawContent, RawIdentifier } from '@/i18n/RawContent';
+import type { AppTranslator } from '@/i18n/imperative';
+import { useAppIntl } from '@/i18n/useAppIntl';
+import { apiErrorMessage } from '@/lib/apiErrorMessages';
+import type { MessageId } from '@/i18n/types';
 
 type EvolutionProposal = {
   id: string;
@@ -22,47 +27,78 @@ type EvolutionProposal = {
   created_at: string;
 };
 
-const STATUS_LABELS: Record<string, string> = {
-  ready_for_review: '待审核',
-  evaluation_failed: '校验未通过',
-  published: '已批准',
-  rejected: '已拒绝',
-  rolled_back: '已回滚',
-};
+const EVOLUTION_STATUS_IDS = {
+  ready_for_review: 'dashboard.evolution.status.readyForReview',
+  evaluation_failed: 'dashboard.evolution.status.evaluationFailed',
+  published: 'dashboard.evolution.status.published',
+  rejected: 'dashboard.evolution.status.rejected',
+  rolled_back: 'dashboard.evolution.status.rolledBack',
+} as const satisfies Partial<Record<string, MessageId>>;
 
-const RISK_LABELS: Record<string, string> = {
-  low: '低风险',
-  medium: '中风险',
-  high: '高风险',
-};
+const EVOLUTION_RISK_IDS = {
+  low: 'dashboard.evolution.risk.low',
+  medium: 'dashboard.evolution.risk.medium',
+  high: 'dashboard.evolution.risk.high',
+} as const satisfies Partial<Record<string, MessageId>>;
 
-const EVOLUTION_ERROR_MESSAGES: Record<string, string> = {
-  EVOLUTION_FEEDBACK_NOT_FOUND: '未找到可用于改进的 Skill 或 SOP 反馈',
-  EVOLUTION_SOP_FEEDBACK_NOT_FOUND: '未找到与该 SOP 匹配的反馈',
-  EVOLUTION_PROPOSAL_NOT_FOUND: '未找到自进化候选',
-  EVOLUTION_PROPOSAL_NOT_REVIEWABLE: '当前自进化候选不可审核',
-  EVOLUTION_PROPOSAL_VALIDATION_FAILED: '自进化候选未通过校验',
-  EVOLUTION_SOP_NOT_FOUND: '未找到对应的 SOP',
-  EVOLUTION_GENERAL_SKILL_NOT_FOUND: '未找到对应的通用技能',
-  EVOLUTION_PUBLISHED_PROPOSAL_REQUIRES_ROLLBACK: '已应用的自进化候选只能通过回滚撤销',
-  EVOLUTION_ROLLBACK_UNAVAILABLE: '该候选没有可回滚的已应用版本',
-  EVOLUTION_MODEL_NOT_CONFIGURED: '没有可用于自进化的默认模型',
-};
+const EVOLUTION_ACTION_SUCCESS_IDS = {
+  analyze: 'dashboard.evolution.toast.analyzeSuccess',
+  evaluate: 'dashboard.evolution.toast.evaluateSuccess',
+  approve: 'dashboard.evolution.toast.approveSuccess',
+  reject: 'dashboard.evolution.toast.rejectSuccess',
+  rollback: 'dashboard.evolution.toast.rollbackSuccess',
+} as const satisfies Record<'analyze' | 'evaluate' | 'approve' | 'reject' | 'rollback', MessageId>;
 
-const LEGACY_EVOLUTION_ERRORS: Record<string, string> = {
-  'No evolvable Skill or SOP feedback was found': EVOLUTION_ERROR_MESSAGES.EVOLUTION_FEEDBACK_NOT_FOUND,
-  'No matching SOP feedback was found': EVOLUTION_ERROR_MESSAGES.EVOLUTION_SOP_FEEDBACK_NOT_FOUND,
-  'Evolution proposal not found': EVOLUTION_ERROR_MESSAGES.EVOLUTION_PROPOSAL_NOT_FOUND,
-  'Evolution proposal is not reviewable': EVOLUTION_ERROR_MESSAGES.EVOLUTION_PROPOSAL_NOT_REVIEWABLE,
-  'Evolution proposal did not pass validation': EVOLUTION_ERROR_MESSAGES.EVOLUTION_PROPOSAL_VALIDATION_FAILED,
-  'SOP not found': EVOLUTION_ERROR_MESSAGES.EVOLUTION_SOP_NOT_FOUND,
-  'General skill not found': EVOLUTION_ERROR_MESSAGES.EVOLUTION_GENERAL_SKILL_NOT_FOUND,
-  'Published proposal must be rolled back': EVOLUTION_ERROR_MESSAGES.EVOLUTION_PUBLISHED_PROPOSAL_REQUIRES_ROLLBACK,
-  'Proposal has no published version to roll back': EVOLUTION_ERROR_MESSAGES.EVOLUTION_ROLLBACK_UNAVAILABLE,
-};
+const EVOLUTION_ACTION_ERROR_IDS = {
+  load: 'dashboard.evolution.error.load',
+  analyze: 'dashboard.evolution.error.analyze',
+  evaluate: 'dashboard.evolution.error.evaluate',
+  approve: 'dashboard.evolution.error.approve',
+  reject: 'dashboard.evolution.error.reject',
+  rollback: 'dashboard.evolution.error.rollback',
+} as const satisfies Record<'load' | 'analyze' | 'evaluate' | 'approve' | 'reject' | 'rollback', MessageId>;
+
+const REJECT_REASON = 'Rejected in employee dashboard review';
+
+/** 将错误收敛到 catalog 语义文案；未知错误不展示原始 message。 */
+function evolutionErrorMessage(
+  error: unknown,
+  fallbackId: MessageId,
+  translate: AppTranslator['t'],
+): string {
+  const genericMessage = translate('common.error.generic');
+  const message = apiErrorMessage(error, fallbackId, { t: translate });
+  return message === genericMessage ? translate(fallbackId) : message;
+}
+
+/** 返回提案状态的语义标签，未知状态精确落到 raw identifier。 */
+function evolutionStatusLabel(
+  status: string,
+  translate: AppTranslator['t'],
+): string {
+  const messageId = EVOLUTION_STATUS_IDS[status as keyof typeof EVOLUTION_STATUS_IDS];
+  return messageId ? translate(messageId) : status;
+}
+
+/** 返回风险等级的语义标签，未知等级保持原始值。 */
+function evolutionRiskLabel(
+  risk: string,
+  translate: AppTranslator['t'],
+): string {
+  const messageId = EVOLUTION_RISK_IDS[risk as keyof typeof EVOLUTION_RISK_IDS];
+  return messageId ? translate(messageId) : risk;
+}
+
+/** 将候选资源类型投影为当前 locale 的产品文案。 */
+function evolutionResourceTypeLabel(
+  type: EvolutionProposal['resource_type'],
+  translate: AppTranslator['t'],
+): string {
+  return translate(type === 'sop' ? 'dashboard.evolution.resourceType.sop' : 'dashboard.evolution.resourceType.skill');
+}
 
 export default function EvolutionPanel({ agentId }: { agentId: string }) {
-  const { t } = useI18n();
+  const { t } = useAppIntl();
   const [rows, setRows] = useState<EvolutionProposal[]>([]);
   const [instruction, setInstruction] = useState('');
   const [loading, setLoading] = useState(true);
@@ -76,7 +112,7 @@ export default function EvolutionPanel({ agentId }: { agentId: string }) {
       );
       setRows(result);
     } catch (error) {
-      notify.error(localizeEvolutionError(error, '加载自进化候选失败', t));
+      notify.error(evolutionErrorMessage(error, EVOLUTION_ACTION_ERROR_IDS.load, t));
     } finally {
       setLoading(false);
     }
@@ -91,6 +127,7 @@ export default function EvolutionPanel({ agentId }: { agentId: string }) {
     [rows],
   );
 
+  /** 从真实反馈生成候选，并在成功后刷新列表。 */
   async function analyze() {
     setBusyAction('analyze');
     try {
@@ -99,32 +136,28 @@ export default function EvolutionPanel({ agentId }: { agentId: string }) {
         { tenant_id: TENANT_ID, instruction: instruction.trim() || undefined },
       );
       setInstruction('');
-      notify.success(t('已从真实反馈生成候选草稿'));
+      notify.success(t(EVOLUTION_ACTION_SUCCESS_IDS.analyze));
       await load();
     } catch (error) {
-      notify.error(localizeEvolutionError(error, '生成自进化候选失败', t));
+      notify.error(evolutionErrorMessage(error, EVOLUTION_ACTION_ERROR_IDS.analyze, t));
     } finally {
       setBusyAction('');
     }
   }
 
+  /** 对候选执行审核动作；拒绝原因使用稳定英文诊断值，不进入本地化目录。 */
   async function act(proposal: EvolutionProposal, action: 'evaluate' | 'approve' | 'reject' | 'rollback') {
     const key = `${proposal.id}:${action}`;
     setBusyAction(key);
     try {
       const body = action === 'reject'
-        ? { tenant_id: TENANT_ID, reason: '管理员在员工档案中拒绝该候选' }
+        ? { tenant_id: TENANT_ID, reason: REJECT_REASON }
         : { tenant_id: TENANT_ID };
       await api.post(`/api/enterprise/evolution/proposals/${encodeURIComponent(proposal.id)}:${action}`, body);
-      notify.success(t({
-        evaluate: '候选校验完成',
-        approve: '候选已批准并应用到员工私有版本',
-        reject: '候选已拒绝',
-        rollback: '已回滚本次自进化修改',
-      }[action]));
+      notify.success(t(EVOLUTION_ACTION_SUCCESS_IDS[action]));
       await load();
     } catch (error) {
-      notify.error(localizeEvolutionError(error, '操作失败', t));
+      notify.error(evolutionErrorMessage(error, EVOLUTION_ACTION_ERROR_IDS[action], t));
     } finally {
       setBusyAction('');
     }
@@ -138,33 +171,42 @@ export default function EvolutionPanel({ agentId }: { agentId: string }) {
             <span className="flex size-8 items-center justify-center rounded-xl bg-[#ecfbf5] text-[#168760]">
               <StaffdeckIcon name="spark" />
             </span>
-            <h3 className="m-0 text-[16px] font-semibold text-[#202226]">反馈自进化</h3>
+            <h3 className="m-0 text-[16px] font-semibold text-[#202226]">
+              {t('dashboard.evolution.title')}
+            </h3>
             {activeCount > 0 && (
               <span className="rounded-full bg-[#fff4da] px-2 py-0.5 text-[11px] text-[#9a6a08]">
-                {activeCount} 个待审核
+                {t('dashboard.evolution.pendingCount', { count: activeCount })}
               </span>
             )}
           </div>
           <p className="mt-2 mb-0 max-w-[760px] text-[13px] leading-5 text-[#7b8499]">
-            从点踩归因和执行轨迹生成最小修改候选。候选不会自动进入运行链路，只有管理员批准后才写入员工私有 Skill/SOP 版本。
+            {t('dashboard.evolution.description')}
           </p>
         </div>
-        <Button disabled={busyAction !== ''} onClick={() => void analyze()}>
-          {busyAction === 'analyze' ? '正在分析反馈…' : '扫描反馈并生成候选'}
+        <Button
+          disabled={busyAction !== ''}
+          onClick={() => void analyze()}
+          aria-label={t('dashboard.evolution.actions.analyze')}
+        >
+          {busyAction === 'analyze'
+            ? t('dashboard.evolution.actions.analyzing')
+            : t('dashboard.evolution.actions.analyze')}
         </Button>
       </div>
 
       <textarea
         value={instruction}
         onChange={(event) => setInstruction(event.target.value)}
-        placeholder="可选：补充本次改进目标，例如“只修复确认节点，不修改工具绑定”"
+        placeholder={t('dashboard.evolution.instructionPlaceholder')}
+        aria-label={t('dashboard.evolution.instructionLabel')}
         className="mt-4 min-h-[66px] w-full resize-y rounded-xl border border-[#e4e8f0] bg-[#fafbfc] px-3 py-2 text-[13px] leading-5 text-[#313642] outline-none focus:border-[#8fd6bb]"
       />
 
       <div className="mt-4 grid gap-3">
         {!loading && rows.length === 0 && (
           <div className="rounded-xl border border-dashed border-[#dfe4ec] px-4 py-5 text-center text-[13px] text-[#8b94a8]">
-            暂无候选。产生真实反馈后可扫描生成；上方补充目标用于约束本次修改范围。
+            {t('dashboard.evolution.empty')}
           </div>
         )}
         {rows.map((proposal) => {
@@ -174,21 +216,34 @@ export default function EvolutionPanel({ agentId }: { agentId: string }) {
               <div className="flex flex-wrap items-start justify-between gap-3">
                 <div className="min-w-0">
                   <div className="flex flex-wrap items-center gap-2">
-                    <strong className="text-[14px] text-[#202226]">{proposal.resource_name}</strong>
+                    <strong className="text-[14px] text-[#202226]">
+                      <RawContent value={proposal.resource_name} />
+                    </strong>
                     <span className="rounded-full bg-[#eef2f8] px-2 py-0.5 text-[11px] text-[#657087]">
-                      {proposal.resource_type === 'sop' ? 'SOP' : 'Skill'}
+                      {evolutionResourceTypeLabel(proposal.resource_type, t)}
                     </span>
                     <span className={`rounded-full px-2 py-0.5 text-[11px] ${riskClass(proposal.risk_level)}`}>
-                      {RISK_LABELS[proposal.risk_level] || proposal.risk_level}
+                      {EVOLUTION_RISK_IDS[proposal.risk_level as keyof typeof EVOLUTION_RISK_IDS]
+                        ? evolutionRiskLabel(proposal.risk_level, t)
+                        : <RawIdentifier value={proposal.risk_level} />}
                     </span>
                     <span className="rounded-full bg-white px-2 py-0.5 text-[11px] text-[#657087] ring-1 ring-[#e1e5ec]">
-                      {STATUS_LABELS[proposal.status] || proposal.status}
+                      {EVOLUTION_STATUS_IDS[proposal.status as keyof typeof EVOLUTION_STATUS_IDS]
+                        ? evolutionStatusLabel(proposal.status, t)
+                        : <RawIdentifier value={proposal.status} />}
                     </span>
                   </div>
-                  <p className="mt-2 mb-0 text-[13px] font-medium text-[#444b59]">{proposal.hypothesis}</p>
+                  <p className="mt-2 mb-0 text-[13px] font-medium text-[#444b59]">
+                    <RawContent value={proposal.hypothesis} />
+                  </p>
                   <p className="mt-1 mb-0 text-[12px] leading-5 text-[#7b8499]">
-                    {(proposal.source_feedback_ids ?? []).length} 条反馈证据 · {(proposal.diff ?? []).length} 项修改 ·
-                    {passed ? ' 静态校验通过' : ' 等待或未通过校验'}
+                    {t('dashboard.evolution.summary', {
+                      feedbackCount: (proposal.source_feedback_ids ?? []).length,
+                      diffCount: (proposal.diff ?? []).length,
+                      validation: passed
+                        ? t('dashboard.evolution.validation.passed')
+                        : t('dashboard.evolution.validation.pending'),
+                    })}
                   </p>
                 </div>
                 <div className="flex flex-wrap gap-2">
@@ -199,20 +254,20 @@ export default function EvolutionPanel({ agentId }: { agentId: string }) {
                         disabled={busyAction !== ''}
                         onClick={() => void act(proposal, 'evaluate')}
                       >
-                        重新校验
+                        {t('dashboard.evolution.actions.evaluate')}
                       </Button>
                       <Button
                         disabled={busyAction !== ''}
                         onClick={() => void act(proposal, 'approve')}
                       >
-                        批准应用
+                        {t('dashboard.evolution.actions.approve')}
                       </Button>
                       <Button
                         variant="outline"
                         disabled={busyAction !== ''}
                         onClick={() => void act(proposal, 'reject')}
                       >
-                        拒绝
+                        {t('dashboard.evolution.actions.reject')}
                       </Button>
                     </>
                   )}
@@ -222,31 +277,39 @@ export default function EvolutionPanel({ agentId }: { agentId: string }) {
                       disabled={busyAction !== ''}
                       onClick={() => void act(proposal, 'rollback')}
                     >
-                      回滚
+                      {t('dashboard.evolution.actions.rollback')}
                     </Button>
                   )}
                 </div>
               </div>
               <details className="mt-3 rounded-xl bg-white px-3 py-2 ring-1 ring-[#edf0f4]">
                 <summary className="cursor-pointer text-[12px] text-[#5f6b80]">
-                  查看证据与修改明细
+                  {t('dashboard.evolution.details.toggle')}
                 </summary>
                 <div className="mt-3 grid gap-3 text-[12px] leading-5 text-[#667085]">
                   <div>
-                    <strong className="text-[#394150]">改进依据</strong>
-                    <p className="mt-1 mb-0 whitespace-pre-wrap">{proposal.rationale || '无'}</p>
+                    <strong className="text-[#394150]">{t('dashboard.evolution.details.rationale')}</strong>
+                    <p className="mt-1 mb-0 whitespace-pre-wrap">
+                      {proposal.rationale ? <RawContent value={proposal.rationale} /> : t('dashboard.evolution.none')}
+                    </p>
                   </div>
                   <div>
-                    <strong className="text-[#394150]">预期结果</strong>
-                    <p className="mt-1 mb-0">{proposal.expected_outcome || '无'}</p>
+                    <strong className="text-[#394150]">{t('dashboard.evolution.details.expectedOutcome')}</strong>
+                    <p className="mt-1 mb-0">
+                      {proposal.expected_outcome
+                        ? <RawContent value={proposal.expected_outcome} />
+                        : t('dashboard.evolution.none')}
+                    </p>
                   </div>
                   <div>
-                    <strong className="text-[#394150]">结构化 Diff</strong>
+                    <strong className="text-[#394150]">{t('dashboard.evolution.details.diff')}</strong>
                     <div className="mt-1 max-h-[240px] overflow-auto rounded-lg bg-[#f7f8fa] p-2 font-mono text-[11px]">
-                      {(proposal.diff ?? []).length === 0 ? '无修改' : (proposal.diff ?? []).map((item, index) => (
+                      {(proposal.diff ?? []).length === 0 ? t('dashboard.evolution.details.noDiff') : (proposal.diff ?? []).map((item, index) => (
                         <div key={`${item.path}-${index}`} className="border-b border-[#e9edf3] py-1 last:border-0">
-                          <span className="mr-2 text-[#12805c]">{item.op || 'change'}</span>
-                          <span>{item.path || '/'}</span>
+                          <span className="mr-2 text-[#12805c]">
+                            <RawIdentifier value={item.op || 'change'} />
+                          </span>
+                          <span>{item.path ? <RawIdentifier value={item.path} /> : <RawIdentifier value="/" />}</span>
                         </div>
                       ))}
                     </div>
@@ -261,22 +324,9 @@ export default function EvolutionPanel({ agentId }: { agentId: string }) {
   );
 }
 
+/** 为风险标签返回当前设计系统约定的视觉样式。 */
 function riskClass(risk: string): string {
   if (risk === 'high') return 'bg-[#ffe8e8] text-[#c13d3d]';
   if (risk === 'medium') return 'bg-[#fff4da] text-[#9a6a08]';
   return 'bg-[#e8f8f0] text-[#168760]';
-}
-
-function localizeEvolutionError(
-  error: unknown,
-  fallback: string,
-  t: (source: string) => string,
-): string {
-  if (error instanceof ApiError && error.code && EVOLUTION_ERROR_MESSAGES[error.code]) {
-    return t(EVOLUTION_ERROR_MESSAGES[error.code]);
-  }
-  if (error instanceof Error) {
-    return t(LEGACY_EVOLUTION_ERRORS[error.message] || error.message);
-  }
-  return t(fallback);
 }

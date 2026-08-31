@@ -6,6 +6,7 @@ from typing import Annotated, Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
 from app.capability_scope import CapabilityScope
+from app.i18n.raw_source import RawSourceMarker
 
 TeamRole = Literal["leader", "member"]
 ReviewVerdict = Literal["approve", "rework", "escalate"]
@@ -289,9 +290,19 @@ class TeamBlackboardEntryRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class TeamBlackboardSkipRead(BaseModel):
+    """Expose a locale-independent blackboard skip reason and raw source excerpt."""
+
+    event_code: str
+    params: dict[str, Any] = Field(default_factory=dict)
+    reason: dict[str, Any] = Field(default_factory=dict)
+    raw: dict[str, Any] = Field(default_factory=dict)
+    raw_source_markers: list[RawSourceMarker] = Field(default_factory=list)
+
+
 class TeamBlackboardWriteResponse(BaseModel):
     entries: list[TeamBlackboardEntryRead] = Field(default_factory=list)
-    skipped: list[str] = Field(default_factory=list)
+    skipped: list[TeamBlackboardSkipRead] = Field(default_factory=list)
 
 
 class TeamEventRead(BaseModel):

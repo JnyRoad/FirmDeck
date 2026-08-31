@@ -10,6 +10,8 @@ from sqlmodel import Session, SQLModel, create_engine, select
 
 from app.agents.branching import ensure_open_gallery_binding, ensure_private_resource_binding
 from app.api.tools import (
+    _a2a_task_run_read,
+    _discover_response,
     _ensure_tool_visible,
     _normalize_probe_url,
     _read_execution_policy,
@@ -34,7 +36,7 @@ from app.db.models import (
     User,
 )
 from app.security.internal_service import INTERNAL_SERVICE_HEADER, internal_service_token
-from app.tools.tool_schema import ToolExecutionPolicy, ToolProbeRequest
+from app.tools.tool_schema import MCPServerConnection, ToolExecutionPolicy, ToolProbeRequest
 
 
 def _admin_user() -> User:
@@ -711,6 +713,156 @@ def test_probe_tool_http_error_returns_stable_error(monkeypatch: pytest.MonkeyPa
         assert result.status_code == 404
         assert result.error is not None
         assert result.error.code == "HTTP_ERROR"
+
+
+def test_probe_tool_exception_does_not_publish_raw_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep an unexpected probe exception private while returning a canonical ToolError."""
+    raw_provider_error = "connection failed with Authorization: Bearer do-not-publish"
+
+    class FakeClient:
+        """Raise one seeded provider failure from the real probe boundary."""
+
+        def __init__(self, *args, **kwargs):
+            """Accept the production client's constructor arguments."""
+
+        def __enter__(self):
+            """Return the fake context-managed client."""
+            return self
+
+        def __exit__(self, *args):
+            """Leave the fake client without suppressing exceptions."""
+            return None
+
+        def request(self, method, url, headers=None, json=None, params=None):
+            """Raise the seeded remote diagnostic before any response exists."""
+            raise RuntimeError(raw_provider_error)
+
+    monkeypatch.setattr(httpx, "Client", FakeClient)
+    with _test_session() as db:
+        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.commit()
+
+        result = probe_tool(
+            ToolProbeRequest(
+                tenant_id="tenant_demo",
+                name="broken.tool",
+                method="POST",
+                url="http://example.invalid/broken",
+                sample_arguments={"query": "raw-success-input"},
+            ),
+            db,
+        )
+
+    assert result.error is not None
+    assert result.error.code == "PROBE_ERROR"
+    assert result.error.params == {}
+    assert result.error.retryable is False
+    assert result.error.deprecated_fields == ["message"]
+    assert result.error.internal_context is not None
+    assert result.error.internal_context.raw_message == raw_provider_error
+    assert raw_provider_error not in repr(result.model_dump(mode="json"))
+
+
+def test_mcp_discovery_typed_error_keeps_provider_exception_private(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Require the typed discovery response to validate a stable code and exclude provider prose."""
+    raw_provider_error = "MCP discovery leaked Authorization: Bearer do-not-publish"
+
+    def fail_discovery(*_args, **_kwargs):
+        """Raise the seeded provider exception from the real typed-response boundary."""
+        raise RuntimeError(raw_provider_error)
+
+    monkeypatch.setattr("app.api.tools.discover_mcp_server", fail_discovery)
+    result = _discover_response(MCPServerConnection(transport="builtin"))
+
+    assert result.error is not None
+    assert result.error.code == "MCP_DISCOVER_UNEXPECTED"
+    assert result.error.internal_context is not None
+    assert result.error.internal_context.raw_message == raw_provider_error
+    assert raw_provider_error not in repr(result.model_dump(mode="json"))
+
+
+def test_a2a_run_read_projects_error_json_without_raw_message() -> None:
+    """Never copy the persisted remote A2A message into the typed Tool API response."""
+    raw_provider_error = "remote task failed token=do-not-publish"
+    run = A2ATaskRun(
+        tenant_id="tenant_demo",
+        direction="client",
+        endpoint_url="https://agent.example/a2a",
+        status="failed",
+        error_json={
+            "code": "A2A_TASK_FAILED",
+            "message": raw_provider_error,
+            "request_id": "req-a2a-failed",
+            "trace_id": "trace-a2a-failed",
+        },
+    )
+
+    projected = _a2a_task_run_read(run, [])
+
+    assert projected.error == {
+        "code": "A2A_TASK_FAILED",
+        "params": {},
+        "retryable": True,
+        "request_id": "req-a2a-failed",
+        "trace_id": "trace-a2a-failed",
+    }
+    assert raw_provider_error not in repr(projected.model_dump(mode="json"))
+
+
+def test_a2a_run_read_projects_locale_snapshot_and_legacy_default() -> None:
+    """Expose the durable locale snapshot while backfilling legacy rows deterministically."""
+    explicit = A2ATaskRun(
+        tenant_id="tenant_demo",
+        direction="client",
+        endpoint_url="https://agent.example/a2a",
+        language_context_json={
+            "version": 1,
+            "ui_locale": "en-US",
+            "agent_reply_locale": "en-US",
+            "ui_locale_source": "explicit_request",
+            "agent_reply_locale_source": "explicit_request",
+        },
+    )
+    legacy = A2ATaskRun(
+        tenant_id="tenant_demo",
+        direction="client",
+        endpoint_url="https://agent.example/a2a",
+        language_context_json=None,
+    )
+
+    assert _a2a_task_run_read(explicit, []).language_context["agent_reply_locale"] == "en-US"
+    assert _a2a_task_run_read(legacy, []).language_context == {
+        "version": 1,
+        "ui_locale": "zh-CN",
+        "agent_reply_locale": "zh-CN",
+        "ui_locale_source": "legacy_default",
+        "agent_reply_locale_source": "legacy_default",
+    }
+
+
+def test_a2a_run_read_fails_closed_for_malformed_registered_error() -> None:
+    """Reject unexpected persisted params instead of widening the public Tool contract."""
+    raw_provider_error = "remote task leaked credential=do-not-publish"
+    run = A2ATaskRun(
+        tenant_id="tenant_demo",
+        direction="client",
+        endpoint_url="https://agent.example/a2a",
+        status="failed",
+        error_json={
+            "code": "A2A_TASK_FAILED",
+            "params": {"credential": raw_provider_error},
+            "retryable": True,
+        },
+    )
+
+    projected = _a2a_task_run_read(run, [])
+
+    assert projected.error["code"] == "INTERNAL_ERROR"
+    assert raw_provider_error not in repr(projected.model_dump(mode="json"))
 
 
 def _test_session():

@@ -8,14 +8,15 @@ checkpoint for a later turn, and publishes one durable failure reply.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import logging
 import threading
+from dataclasses import dataclass
 from datetime import datetime
 
 from sqlalchemy import delete
 from sqlmodel import Session, select
 
+from app.contracts.events import EventVisibility
 from app.db import engine
 from app.db.models import (
     AgentEvent,
@@ -28,16 +29,56 @@ from app.db.models import (
     Message,
     utc_now,
 )
-
+from app.i18n.language_context import (
+    LanguageContext,
+    resolve_compatible_language_context,
+)
+from app.llm.prompts.language import localized_recovery_reply
+from app.observability.event_log import EventLog
+from app.observability.product_events import record_product_event
 
 logger = logging.getLogger(__name__)
 
 SWEEP_INTERVAL_SECONDS = 60.0
 ACTIVE_TURN_STATUSES = {"started", "finalizing"}
-RECOVERY_REPLY = (
-    "本轮执行因服务重启或执行协程中断而终止。已保留当前 SOP 步骤和已填写信息，"
-    "请重新发送上一条消息以继续。"
-)
+# Compatibility export for older internal readers; persisted replies use the
+# immutable snapshot through ``localized_recovery_reply`` below.
+RECOVERY_REPLY = localized_recovery_reply(None)
+
+
+def _recovery_language_context(
+    db: Session,
+    session: ChatSession,
+    turn: HarnessTurnRecord,
+    runs: list[HarnessRunRecord],
+    frames: list[HarnessTaskFrameRecord],
+) -> LanguageContext:
+    """Resolve a recovery turn from durable rows, with one observable legacy fallback."""
+    candidates: list[object] = [turn.language_context_json]
+    related_frame_ids: set[str] = set()
+    for frame in frames:
+        if frame.tenant_id != turn.tenant_id or frame.session_id != turn.session_id:
+            continue
+        if frame.source_turn_id == turn.user_message_id:
+            related_frame_ids.add(frame.id)
+            candidates.append(frame.language_context_json)
+    for run in runs:
+        if run.tenant_id != turn.tenant_id or run.session_id != turn.session_id:
+            continue
+        if run.source_turn_id == turn.user_message_id or run.task_frame_record_id in related_frame_ids:
+            candidates.append(run.language_context_json)
+    for candidate in candidates:
+        if candidate is not None:
+            return resolve_compatible_language_context(
+                snapshot=candidate,
+                legacy_ui_locale=None,
+                legacy_agent_reply_locale=session.agent_reply_locale,
+            )
+    return resolve_compatible_language_context(
+        snapshot=None,
+        legacy_ui_locale=None,
+        legacy_agent_reply_locale=session.agent_reply_locale,
+    )
 
 
 @dataclass(frozen=True)
@@ -118,10 +159,10 @@ def recover_orphan_harness_runs(
     if not affected_session_keys:
         return HarnessRecoveryResult()
 
-    code = "SERVICE_RESTARTED" if startup else "HARNESS_EXECUTION_LOST"
+    code = "INTERNAL_ERROR"
     reason = {
         "code": code,
-        "message": RECOVERY_REPLY,
+        "message": code,
         "retryable": True,
         "outcome_unknown": True,
     }
@@ -130,7 +171,7 @@ def recover_orphan_harness_runs(
         run.status = "abandoned"
         run.result_json = {
             "status": "abandoned",
-            "task_summary": RECOVERY_REPLY,
+            "task_summary": code,
             "error": dict(reason),
         }
         run.finished_at = now
@@ -153,7 +194,7 @@ def recover_orphan_harness_runs(
         frame.result_json = {
             "task_frame_id": frame.task_id,
             "status": "interrupted",
-            "task_summary": RECOVERY_REPLY,
+            "task_summary": code,
             "error": dict(reason),
         }
         frame.error_json = dict(reason)
@@ -184,9 +225,57 @@ def recover_orphan_harness_runs(
             continue
         session.status = "active"
         session.updated_at = now
-        session.summary = f"最近回复：{RECOVERY_REPLY[:120]}"
         db.add(session)
-        if _append_recovery_message(db, session, turn, code=code, now=now):
+        language_context = _recovery_language_context(
+            db,
+            session,
+            turn,
+            active_runs,
+            active_frames,
+        )
+        source_turn_id = turn.user_message_id
+        related_frame_ids = {
+            row.id
+            for row in active_frames
+            if (
+                source_turn_id
+                and row.tenant_id == turn.tenant_id
+                and row.session_id == turn.session_id
+                and row.source_turn_id == source_turn_id
+            )
+        }
+        related_rows = [
+            row
+            for row in active_frames
+            if row.id in related_frame_ids
+        ]
+        related_rows.extend(
+            row
+            for row in active_runs
+            if (
+                source_turn_id
+                and row.tenant_id == turn.tenant_id
+                and row.session_id == turn.session_id
+                and (
+                    row.source_turn_id == source_turn_id
+                    or row.task_frame_record_id in related_frame_ids
+                )
+            )
+        )
+        for row in [*related_rows, turn]:
+            if getattr(row, "language_context_json", None) is None:
+                row.language_context_json = language_context.model_dump(mode="json")
+                db.add(row)
+        session.summary = localized_recovery_reply(language_context)[:120]
+        db.add(session)
+        if _append_recovery_message(
+            db,
+            session,
+            turn,
+            code=code,
+            now=now,
+            language_context=language_context,
+        ):
             message_count += 1
 
     # A corrupt or partially persisted execution may have a Run/TaskFrame but
@@ -224,7 +313,9 @@ def _append_recovery_message(
     *,
     code: str,
     now: datetime,
+    language_context: LanguageContext,
 ) -> bool:
+    """Append one locale-bound recovery reply without persisting raw worker diagnostics."""
     user_message_id = str(turn.user_message_id or "").strip()
     existing = list(
         db.exec(
@@ -257,34 +348,32 @@ def _append_recovery_message(
         "status": "failed",
         "error_code": code,
         "retryable": True,
+        "language_context": language_context.model_dump(mode="json"),
     }
     if visibility != "visible":
         metadata["message_visibility"] = visibility
+    recovery_reply = localized_recovery_reply(language_context)
     message = Message(
         tenant_id=session.tenant_id,
         session_id=session.id,
         role="assistant",
-        content=RECOVERY_REPLY,
+        content=recovery_reply,
         metadata_json=metadata,
         created_at=now,
     )
     db.add(message)
-    db.add(
-        AgentEvent(
-            tenant_id=session.tenant_id,
-            session_id=session.id,
-            event_type="harness_execution_recovered",
-            payload_json={
-                "message_id": message.id,
-                "assistant_message_id": message.id,
-                "user_message_id": user_message_id or None,
-                "client_turn_id": turn.client_turn_id,
-                "harness_turn_id": turn.id,
-                "code": code,
-                "reply": RECOVERY_REPLY,
-            },
-            created_at=now,
-        )
+    record_product_event(
+        EventLog(db),
+        event_code="harness.execution.recovered",
+        tenant_id=session.tenant_id,
+        aggregate_type="chat_session",
+        aggregate_id=session.id,
+        params={"error_code": code},
+        language_context=language_context,
+        visibility=EventVisibility.PUBLIC,
+        trace_id=turn.id,
+        turn_id=user_message_id or turn.id,
+        client_turn_id=turn.client_turn_id,
     )
     db.add(
         AgentEvent(
@@ -297,7 +386,8 @@ def _append_recovery_message(
                 "client_turn_id": turn.client_turn_id,
                 "status": "failed",
                 "error_code": code,
-                "reply": RECOVERY_REPLY,
+                "reply": recovery_reply,
+                "language_context": language_context.model_dump(mode="json"),
             },
             created_at=now,
         )

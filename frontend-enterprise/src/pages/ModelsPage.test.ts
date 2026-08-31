@@ -1,19 +1,52 @@
 // @vitest-environment jsdom
 
-import { createElement } from 'react';
+import { createElement, type InputHTMLAttributes, type TextareaHTMLAttributes } from 'react';
 import { cleanup, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { ApiError } from '../api/client';
-import { I18nProvider } from '../i18n';
+import { AppIntlProvider, I18nProvider, type AppLocale } from '../i18n';
 import { OPEN_MODEL_CREATE_EVENT } from '@/components/QuickStartGuide';
+import type { ModelConfigRead } from '@/types';
 import ModelsPage, {
   modelActionError,
   modelAuthModeLabel,
   modelProviderDiagnosticText,
   modelProviderErrorMessage,
+  providerErrorFromApiError,
 } from './ModelsPage';
+
+vi.mock('@/components/ui/input', async () => {
+  const { createElement: renderElement } = await import('react');
+
+  /** 用无翻译原生控件隔离早期 shared-input legacy 依赖。 */
+  function SemanticTestInput(props: InputHTMLAttributes<HTMLInputElement>) {
+    return renderElement('input', props);
+  }
+
+  return { Input: SemanticTestInput };
+});
+
+vi.mock('@/components/ui/textarea', async () => {
+  const { createElement: renderElement } = await import('react');
+
+  /** 用无翻译原生控件隔离早期 shared-textarea legacy 依赖。 */
+  function SemanticTestTextarea(props: TextareaHTMLAttributes<HTMLTextAreaElement>) {
+    return renderElement('textarea', props);
+  }
+
+  return { Textarea: SemanticTestTextarea };
+});
+
+vi.mock('@/components/LanguageSwitcher', () => {
+  /** 模型页 locale 用例不测试全局切换器，避免其尚未迁移的 legacy hook 干扰页面契约。 */
+  function SemanticTestLanguageSwitcher() {
+    return null;
+  }
+
+  return { default: SemanticTestLanguageSwitcher };
+});
 
 const subscriptionStatusCopy = {
   '已连接本机 Codex 管理的 ChatGPT 订阅。': {
@@ -30,6 +63,47 @@ const subscriptionStatusCopy = {
   },
 } as const;
 
+const semanticModelRow = {
+  id: 'raw-model-id/opaque_01',
+  tenant_id: 'tenant_demo',
+  name: 'Raw Provider 模型',
+  provider: 'custom',
+  auth_mode: 'api_key',
+  api_protocol: 'openai_chat_completions',
+  base_url: 'https://raw-provider.example.test/v1',
+  api_key_masked: 'sk-raw…9x',
+  model: 'vendor/raw-model-id_01',
+  temperature: 0.2,
+  max_output_tokens: 4096,
+  extra_body: {},
+  protocol_options: {},
+  legacy_unmapped_options: {},
+  trust_status: 'verified',
+  verification_attempt_status: 'succeeded',
+  config_revision: 3,
+  security_revision: 2,
+  is_default: false,
+  enabled: true,
+  updated_at: '2026-08-29T12:34:00Z',
+} satisfies ModelConfigRead;
+
+const semanticModelCopy = {
+  'zh-CN': {
+    actions: '模型操作',
+    create: '新建模型',
+    edit: '编辑',
+    editTitle: '编辑模型：Raw Provider 模型',
+    empty: '暂无模型，点击「新建模型」添加一个吧',
+  },
+  'en-US': {
+    actions: 'Model actions',
+    create: 'New model',
+    edit: 'Edit',
+    editTitle: 'Edit model: Raw Provider 模型',
+    empty: 'No models yet. Select “New model” to add one.',
+  },
+} as const;
+
 // 构造满足前端请求封装的成功响应，避免测试依赖真实网络。
 function jsonResponse(body: unknown): Response {
   return {
@@ -40,22 +114,36 @@ function jsonResponse(body: unknown): Response {
   } as Response;
 }
 
-// 模拟模型页初始化请求，并把订阅状态交给真实页面渲染。
+/** 模拟模型页初始化请求，并把订阅状态与可选模型行交给真实页面渲染。 */
 function stubModelsPageFetch(subscriptionAccount: {
   status: 'connected' | 'pending' | 'requires_login' | 'unavailable';
   plan_type: null;
   message: string;
-}) {
+}, models: ModelConfigRead[] = []) {
   const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input);
     if (url.includes('/codex-subscription/account')) return jsonResponse(subscriptionAccount);
     if (url.includes('/model-configs/protocols')) {
       return jsonResponse({ protocols: ['openai_chat_completions'] });
     }
-    if (url.includes('/model-configs')) return jsonResponse([]);
+    if (url.includes('/model-configs')) return jsonResponse(models);
     return jsonResponse({});
   });
   vi.stubGlobal('fetch', fetchMock);
+  return fetchMock;
+}
+
+/** 仅用语义 Provider 渲染模型页，防止 legacy observer 掩盖未迁移文案。 */
+function renderSemanticModels(locale: AppLocale, models: ModelConfigRead[] = []) {
+  const fetchMock = stubModelsPageFetch({
+    status: 'connected',
+    plan_type: null,
+    message: 'RAW_SUBSCRIPTION_STATUS',
+  }, models);
+  render(createElement(AppIntlProvider, {
+    children: createElement(ModelsPage),
+    locale,
+  }));
   return fetchMock;
 }
 
@@ -124,13 +212,12 @@ describe('model provider diagnostics', () => {
     expect(message).not.toContain('<');
     expect(message).not.toContain('上游');
 
-    const payload = JSON.parse(error.body) as {
-      detail: { code: string; message: string; upstream_status: number; provider_code: string; upstream_body: string };
-    };
-    const diagnostic = modelProviderDiagnosticText(payload.detail);
+    const providerDetail = providerErrorFromApiError(error);
+    expect(providerDetail).toBeTruthy();
+    const diagnostic = modelProviderDiagnosticText(providerDetail);
     expect(diagnostic).toContain('HTTP 状态码：400');
     expect(diagnostic).toContain('上游错误码：invalid_request');
-    expect(diagnostic).toContain(payload.detail.upstream_body);
+    expect(diagnostic).toContain('<html><body>blocked by WAF from 203.0.113.7</body></html>');
   });
 
   it('falls back to the generic provider message for an unmapped provider error code', () => {
@@ -219,4 +306,33 @@ describe('model provider diagnostics', () => {
     )).toBeTruthy();
     expect(screen.queryByText(/加密保存必要订阅凭据/)).toBeNull();
   });
+});
+
+describe('semantic model locale contract', () => {
+  for (const locale of ['zh-CN', 'en-US'] as const) {
+    const copy = semanticModelCopy[locale];
+
+    it(`localizes the empty state and model creation entry in ${locale}`, async () => {
+      const user = userEvent.setup();
+      renderSemanticModels(locale);
+
+      const createButton = await screen.findByRole('button', { name: copy.create });
+      expect(await screen.findByText(copy.empty)).toBeTruthy();
+      await user.click(createButton);
+      expect(await screen.findByRole('dialog', { name: copy.create })).toBeTruthy();
+    });
+
+    it(`localizes model editing while preserving the raw model identifier in ${locale}`, async () => {
+      const user = userEvent.setup();
+      renderSemanticModels(locale, [semanticModelRow]);
+
+      expect((await screen.findAllByText(semanticModelRow.model)).length).toBeGreaterThanOrEqual(2);
+      const actionButtons = await screen.findAllByRole('button', { name: copy.actions });
+      await user.click(actionButtons[0]);
+      await user.click(await screen.findByRole('menuitem', { name: copy.edit }));
+
+      expect(await screen.findByRole('dialog', { name: copy.editTitle })).toBeTruthy();
+      expect(screen.getByDisplayValue(semanticModelRow.model)).toBeTruthy();
+    });
+  }
 });

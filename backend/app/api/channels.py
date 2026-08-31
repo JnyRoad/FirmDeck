@@ -40,7 +40,6 @@ from app.channels.schema import (
     ChannelBindingManagerCreate,
     ChannelBindingManagerRead,
     ChannelBindingRead,
-    ChannelIdentityBindCodeCreate,
     ChannelConversationAttachmentRead,
     ChannelConversationMessageRead,
     ChannelConversationPage,
@@ -48,6 +47,7 @@ from app.channels.schema import (
     ChannelDeliveryDay,
     ChannelDeliveryDayPage,
     ChannelDeliveryPage,
+    ChannelIdentityBindCodeCreate,
     ChannelMetaRead,
     ChannelQRCodeRead,
     ChannelQRCodeStatusRead,
@@ -72,6 +72,9 @@ from app.channels.service_session import (
     migrate_binding_session_account_key,
 )
 from app.config import get_settings
+from app.contracts.error_registry import ERROR_REGISTRY, ErrorVisibility
+from app.contracts.errors import InternalErrorContext
+from app.contracts.http import build_http_exception
 from app.db import get_session
 from app.db.models import (
     AgentProfile,
@@ -100,6 +103,43 @@ from app.security.permissions import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/enterprise/channels", tags=["enterprise:channels"])
+
+_CHANNEL_HTTP_CODES = {
+    400: "CHANNEL_BAD_REQUEST",
+    403: "CHANNEL_FORBIDDEN",
+    404: "CHANNEL_NOT_FOUND",
+    409: "CHANNEL_CONFLICT",
+    429: "CHANNEL_RATE_LIMITED",
+    502: "CHANNEL_UPSTREAM_ERROR",
+}
+
+
+def _channel_http_error(status_code: int, detail: object | None = None) -> HTTPException:
+    """Return canonical channel detail while retaining legacy/provider prose privately."""
+    code = _CHANNEL_HTTP_CODES.get(status_code, "INTERNAL_ERROR")
+    entry = ERROR_REGISTRY.get(code)
+    if entry is None or entry.visibility is not ErrorVisibility.PUBLIC:
+        return build_http_exception(
+            "INTERNAL_ERROR",
+            status_code=status_code,
+            internal=InternalErrorContext(
+                source="channel-api",
+                raw_message=str(detail) if detail is not None else None,
+                upstream_code=code,
+                upstream_status=status_code,
+            ),
+        )
+    code = entry.code
+    return build_http_exception(
+        code,
+        status_code=status_code,
+        internal=InternalErrorContext(
+            source="channel-api",
+            raw_message=str(detail) if detail is not None else None,
+            upstream_code=code,
+            upstream_status=status_code,
+        ),
+    )
 
 
 def _channel_attachment_metadata(metadata: object) -> list[ChannelConversationAttachmentRead]:
@@ -143,7 +183,7 @@ def _patch_binding_config_key(
         },
     )
     if result.rowcount != 1:
-        raise HTTPException(status_code=404, detail="渠道绑定不存在")
+        raise _channel_http_error(status_code=404, detail="渠道绑定不存在")
 
 SUPPORTED_CHANNELS = {"wechat", "wecom", "feishu", "dingtalk"}
 INGRESS_QUIESCE_TIMEOUT_SECONDS = 5.0
@@ -165,7 +205,7 @@ def _validated_binding_name(raw: str | None, *, default: str | None = None) -> s
     if not name:
         return default
     if len(name) > BINDING_NAME_MAX_LENGTH:
-        raise HTTPException(
+        raise _channel_http_error(
             status_code=400,
             detail=f"接入名称不能超过 {BINDING_NAME_MAX_LENGTH} 个字符",
         )
@@ -223,7 +263,7 @@ CHANNEL_META = [
 def _get_binding(db: Session, tenant_id: str, binding_id: str) -> ChannelBinding:
     binding = db.get(ChannelBinding, binding_id)
     if not binding or binding.tenant_id != tenant_id:
-        raise HTTPException(status_code=404, detail="Channel binding not found")
+        raise _channel_http_error(status_code=404, detail="Channel binding not found")
     return binding
 
 
@@ -266,7 +306,7 @@ def _ensure_binding_manager(
         return
     if action in _COLLABORATOR_ACTIONS and _is_active_collaborator(db, binding, current_user):
         return
-    raise HTTPException(status_code=403, detail="Only the creator or administrator can manage this channel binding")
+    raise _channel_http_error(status_code=403, detail="Only the creator or administrator can manage this channel binding")
 
 
 def _ensure_external_account_available(
@@ -283,7 +323,7 @@ def _ensure_external_account_available(
         )
     ).first()
     if conflict:
-        raise HTTPException(status_code=409, detail="该外部机器人已被其他渠道绑定使用")
+        raise _channel_http_error(status_code=409, detail="该外部机器人已被其他渠道绑定使用")
 
 
 def _quiesce_binding_or_409(
@@ -304,7 +344,7 @@ def _quiesce_binding_or_409(
         return
     # 旧 worker 仍在收敛,解除 pause 后由 reconcile 按数据库旧配置恢复
     resume_binding_ingress(channel, binding_id, start=False)
-    raise HTTPException(status_code=409, detail="渠道仍有消息正在处理，请稍后重试")
+    raise _channel_http_error(status_code=409, detail="渠道仍有消息正在处理，请稍后重试")
 
 
 def _resume_binding(channel: str, binding_id: str, *, start: bool) -> None:
@@ -314,7 +354,7 @@ def _resume_binding(channel: str, binding_id: str, *, start: bool) -> None:
 
 def _ensure_revision(binding: ChannelBinding, expected_revision: int) -> None:
     if binding.config_revision != expected_revision:
-        raise HTTPException(status_code=409, detail="渠道配置已被其他请求修改，请重试")
+        raise _channel_http_error(status_code=409, detail="渠道配置已被其他请求修改，请重试")
 
 
 @router.get("/meta", response_model=list[ChannelMetaRead])
@@ -366,19 +406,19 @@ def create_channel_binding(
 ) -> ChannelBindingRead:
     ensure_current_user_tenant(request.tenant_id, current_user)
     if request.channel not in SUPPORTED_CHANNELS:
-        raise HTTPException(status_code=400, detail=f"v1 仅支持渠道: {sorted(SUPPORTED_CHANNELS)}")
+        raise _channel_http_error(status_code=400, detail=f"v1 仅支持渠道: {sorted(SUPPORTED_CHANNELS)}")
     # 挂员工集或绑团队二选一:都给/都不给均拒绝
     if bool(request.agent_id) == bool(request.team_id):
-        raise HTTPException(status_code=400, detail="agent_id 与 team_id 必须且只能提供一个")
+        raise _channel_http_error(status_code=400, detail="agent_id 与 team_id 必须且只能提供一个")
     if request.team_id:
         team = db.get(Team, request.team_id)
         if team is None or team.tenant_id != request.tenant_id:
-            raise HTTPException(status_code=404, detail="Team not found")
+            raise _channel_http_error(status_code=404, detail="Team not found")
         from app.teams.service import get_team_leader
 
         leader = get_team_leader(db, team.id)
         if leader is None:
-            raise HTTPException(status_code=400, detail="团队暂未设置 TL，请先设置 TL 后再绑定渠道")
+            raise _channel_http_error(status_code=400, detail="团队暂未设置 TL，请先设置 TL 后再绑定渠道")
         # 复用员工绑定同款守卫:创建者须能管理现任 TL 员工
         ensure_agent_scope_manager(db, request.tenant_id, leader.agent_id, current_user)
         # agent_id 为非空遗留列(列表过滤/挂载回退仍在用):团队绑定回写现任 TL,
@@ -472,7 +512,7 @@ def _issue_bind_code(db: Session, tenant_id: str, user_id: str) -> ChannelBindCo
             db.rollback()
             continue
         return ChannelBindCodeRead(code=record.code, expires_at=record.expires_at.isoformat())
-    raise HTTPException(status_code=409, detail="绑定码生成冲突，请重试")
+    raise _channel_http_error(status_code=409, detail="绑定码生成冲突，请重试")
 
 
 @router.post("/bind-code", response_model=ChannelBindCodeRead)
@@ -484,7 +524,7 @@ def create_bind_code(
     """为当前用户生成渠道身份绑定码(6 位数字,10 分钟有效,旧码作废)。"""
     ensure_current_user_tenant(tenant_id, current_user)
     if not _check_bind_code_rate(current_user.id):
-        raise HTTPException(status_code=429, detail="绑定码生成过于频繁，请稍后再试")
+        raise _channel_http_error(status_code=429, detail="绑定码生成过于频繁，请稍后再试")
     return _issue_bind_code(db, tenant_id, current_user.id)
 
 
@@ -502,11 +542,11 @@ def create_identity_bind_code(
     _ensure_binding_manager(db, tenant_id, binding, current_user, action=_MANAGER_ACTION_AGENTS)
     target = db.get(User, request.user_id)
     if not target or target.tenant_id != tenant_id or target.source != "web":
-        raise HTTPException(status_code=400, detail="身份绑定对象必须是当前租户的内部成员")
+        raise _channel_http_error(status_code=400, detail="身份绑定对象必须是当前租户的内部成员")
     if binding.channel == "feishu" and not binding.credentials_enc:
-        raise HTTPException(status_code=409, detail="请先完成飞书应用接入，再邀请成员绑定身份")
+        raise _channel_http_error(status_code=409, detail="请先完成飞书应用接入，再邀请成员绑定身份")
     if not _check_bind_code_rate(current_user.id):
-        raise HTTPException(status_code=429, detail="绑定码生成过于频繁，请稍后再试")
+        raise _channel_http_error(status_code=429, detail="绑定码生成过于频繁，请稍后再试")
     return _issue_bind_code(db, tenant_id, target.id)
 
 
@@ -579,11 +619,11 @@ def delete_my_identity_binding(
             )
     identities = db.exec(statement).all()
     if not identities:
-        raise HTTPException(status_code=404, detail="Identity binding not found")
+        raise _channel_http_error(status_code=404, detail="Identity binding not found")
     if external_user_id and external_account_scope is None:
         scopes = {identity.external_account_scope for identity in identities}
         if len(scopes) > 1:
-            raise HTTPException(
+            raise _channel_http_error(
                 status_code=400,
                 detail="该外部身份在多个企业账号下均有绑定，请指定 external_account_scope 后再解绑",
             )
@@ -626,16 +666,16 @@ def update_channel_binding_agents(
         and request.default_handoff_assignee_user_id == "unchanged"
         and request.default_handoff_assignee_channel == "unchanged"
     ):
-        raise HTTPException(status_code=400, detail="无有效更新内容")
+        raise _channel_http_error(status_code=400, detail="无有效更新内容")
     # 重命名:传了就要求非空(清洗后),空值视为非法输入而非清空
     new_name: str | None = None
     if request.name is not None:
         new_name = _validated_binding_name(request.name)
         if not new_name:
-            raise HTTPException(status_code=400, detail="接入名称不能为空")
+            raise _channel_http_error(status_code=400, detail="接入名称不能为空")
     if request.agents is not None and binding.team_id:
         # 团队绑定的接待员工由团队现任 TL 决定,不允许整表替换员工挂载
-        raise HTTPException(status_code=400, detail="团队绑定的渠道不支持修改员工挂载")
+        raise _channel_http_error(status_code=400, detail="团队绑定的渠道不支持修改员工挂载")
     # 校验默认人工处理人:传入非 None 且非空时,用户必须存在且属于当前租户的内部成员。
     # 通知渠道为 None/"web" 时仅走网页端收件箱;指定绑定渠道时,要求该渠道支持
     # 私聊通知(当前飞书/企微),且该成员必须已在当前绑定作用域绑定非群聊渠道身份,
@@ -645,7 +685,7 @@ def update_channel_binding_agents(
     if handoff_assignee != "unchanged" and handoff_assignee:
         user = db.get(User, handoff_assignee)
         if not user or user.tenant_id != tenant_id or user.source != "web":
-            raise HTTPException(
+            raise _channel_http_error(
                 status_code=400,
                 detail="默认人工处理人必须是当前租户的内部成员",
             )
@@ -657,7 +697,7 @@ def update_channel_binding_agents(
             )
 
             if handoff_channel != binding.channel:
-                raise HTTPException(
+                raise _channel_http_error(
                     status_code=400,
                     detail="默认人工处理人的转接渠道必须是当前绑定渠道",
                 )
@@ -665,7 +705,7 @@ def update_channel_binding_agents(
                 supported = "、".join(
                     _CHANNEL_LABELS.get(name, name) for name in sorted(HANDOFF_NOTIFY_CHANNELS)
                 )
-                raise HTTPException(
+                raise _channel_http_error(
                     status_code=400,
                     detail=f"人工转接通知暂不支持私聊通知(当前支持{supported}),请选择网页端或支持的渠道",
                 )
@@ -673,18 +713,18 @@ def update_channel_binding_agents(
             reachable = resolve_assignee_channel_identity(db, binding, handoff_assignee)
             if not reachable:
                 channel_label = _CHANNEL_LABELS.get(binding.channel, binding.channel)
-                raise HTTPException(
+                raise _channel_http_error(
                     status_code=400,
                     detail=f"默认人工处理人必须已绑定当前{channel_label}账号",
                 )
     default_agent_id: str | None = None
     if request.agents is not None:
         if not request.agents:
-            raise HTTPException(status_code=400, detail="挂载员工列表不能为空")
+            raise _channel_http_error(status_code=400, detail="挂载员工列表不能为空")
         seen: set[str] = set()
         for item in request.agents:
             if item.agent_id in seen:
-                raise HTTPException(status_code=400, detail="挂载员工列表存在重复")
+                raise _channel_http_error(status_code=400, detail="挂载员工列表存在重复")
             seen.add(item.agent_id)
             # 逐员工作 manager 校验;未知员工由该校验抛 404
             ensure_agent_scope_manager(db, tenant_id, item.agent_id, current_user)
@@ -778,7 +818,7 @@ def delete_channel_binding(
         if not pause_binding_intake(binding_id, INGRESS_QUIESCE_TIMEOUT_SECONDS):
             resume_binding_intake(binding_id)
             _resume_binding(channel, binding_id, start=should_run)
-            raise HTTPException(status_code=409, detail="渠道消息仍在处理中，请稍后重试删除")
+            raise _channel_http_error(status_code=409, detail="渠道消息仍在处理中，请稍后重试删除")
         try:
             binding = _get_binding(db, tenant_id, binding_id)
             _ensure_revision(binding, expected_revision)
@@ -796,7 +836,7 @@ def delete_channel_binding(
                     binding.id,
                     exc,
                 )
-                raise HTTPException(
+                raise _channel_http_error(
                     status_code=409,
                     detail="渠道消息确认尚未清理，请稍后重试删除",
                 ) from exc
@@ -918,11 +958,11 @@ def add_channel_binding_manager(
     _ensure_binding_manager(db, tenant_id, binding, current_user)
     target = db.get(User, request.user_id)
     if not target or target.tenant_id != tenant_id or target.source != "web":
-        raise HTTPException(status_code=400, detail="协作者必须是当前租户的内部成员")
+        raise _channel_http_error(status_code=400, detail="协作者必须是当前租户的内部成员")
     if target.id == binding.created_by_user_id:
-        raise HTTPException(status_code=400, detail="创建者已是该渠道拥有者,无需添加")
+        raise _channel_http_error(status_code=400, detail="创建者已是该渠道拥有者,无需添加")
     if is_admin_user(target):
-        raise HTTPException(status_code=400, detail="管理员默认拥有全部渠道权限,无需添加")
+        raise _channel_http_error(status_code=400, detail="管理员默认拥有全部渠道权限,无需添加")
     existing = db.exec(
         select(ChannelBindingManager).where(
             ChannelBindingManager.binding_id == binding.id,
@@ -930,7 +970,7 @@ def add_channel_binding_manager(
         )
     ).first()
     if existing and existing.revoked_at is None:
-        raise HTTPException(status_code=409, detail="该用户已是协作者")
+        raise _channel_http_error(status_code=409, detail="该用户已是协作者")
     try:
         if existing:
             existing.revoked_at = None
@@ -950,7 +990,7 @@ def add_channel_binding_manager(
         db.refresh(manager)
     except IntegrityError as exc:
         db.rollback()
-        raise HTTPException(status_code=409, detail="该用户已是协作者") from exc
+        raise _channel_http_error(status_code=409, detail="该用户已是协作者") from exc
     return ChannelBindingManagerRead(
         user_id=manager.user_id,
         name=_user_display_name(db, manager.user_id, tenant_id),
@@ -980,7 +1020,7 @@ def remove_channel_binding_manager(
         )
     ).first()
     if not row:
-        raise HTTPException(status_code=404, detail="协作者不存在或已移除")
+        raise _channel_http_error(status_code=404, detail="协作者不存在或已移除")
     row.revoked_at = utc_now()
     db.add(row)
     db.commit()
@@ -1057,10 +1097,10 @@ def create_wechat_qrcode(
         data = client.get_bot_qrcode(local_token_list=local_tokens)
     except Exception as exc:
         logger.warning("获取微信二维码失败 binding=%s: %s", binding_id, exc)
-        raise HTTPException(status_code=502, detail="获取微信二维码失败，请稍后重试") from exc
+        raise _channel_http_error(status_code=502, detail="获取微信二维码失败，请稍后重试") from exc
     qrcode = str(data.get("qrcode") or "")
     if not qrcode:
-        raise HTTPException(status_code=502, detail="微信二维码接口返回异常")
+        raise _channel_http_error(status_code=502, detail="微信二维码接口返回异常")
     return ChannelQRCodeRead(qrcode=qrcode, qrcode_img_content=data.get("qrcode_img_content"))
 
 
@@ -1079,7 +1119,7 @@ def _activate_binding_with_existing_credentials(
         config = dict(binding.config_json or {})
         account_key = external_account_key(binding.channel, config)
         if not account_key:
-            raise HTTPException(status_code=409, detail="已有渠道凭证缺少外部机器人标识")
+            raise _channel_http_error(status_code=409, detail="已有渠道凭证缺少外部机器人标识")
         _ensure_external_account_available(db, account_key, binding.id)
         db.rollback()
         _quiesce_binding_or_409(channel, binding_id, should_run=should_run)
@@ -1103,7 +1143,7 @@ def _activate_binding_with_existing_credentials(
         except IntegrityError as exc:
             db.rollback()
             _resume_binding(channel, binding_id, start=should_run)
-            raise HTTPException(status_code=409, detail="该外部机器人已被其他渠道绑定使用") from exc
+            raise _channel_http_error(status_code=409, detail="该外部机器人已被其他渠道绑定使用") from exc
         except Exception:
             db.rollback()
             _resume_binding(channel, binding_id, start=should_run)
@@ -1137,14 +1177,14 @@ def poll_wechat_qrcode_status(
         data = client.get_qrcode_status(qrcode, verify_code=verify_code)
     except Exception as exc:
         logger.warning("轮询微信扫码状态失败 binding=%s: %s", binding_id, exc)
-        raise HTTPException(status_code=502, detail="轮询微信扫码状态失败，请重试") from exc
+        raise _channel_http_error(status_code=502, detail="轮询微信扫码状态失败，请重试") from exc
     status = str(data.get("status") or "wait")
     if status == "scaned_but_redirect":
         # 扫码后被要求切换接入域名:域名必须属于腾讯官方域,否则不存不用(防凭证外发)
         redirect_host = str(data.get("redirect_host") or "").strip()
         if not redirect_host or not validate_wechat_host(redirect_host):
             logger.warning("微信 redirect_host 不受信任,拒绝使用 binding=%s host=%s", binding_id, redirect_host)
-            raise HTTPException(status_code=502, detail="微信返回的接入域名不受信任，请刷新二维码重试")
+            raise _channel_http_error(status_code=502, detail="微信返回的接入域名不受信任，请刷新二维码重试")
         db.rollback()
         with binding_lifecycle_lock(binding_id):
             _get_binding(db, tenant_id, binding_id)
@@ -1171,10 +1211,10 @@ def poll_wechat_qrcode_status(
 
     bot_token = str(data.get("bot_token") or "")
     if not bot_token:
-        raise HTTPException(status_code=502, detail="微信扫码确认返回缺少凭证")
+        raise _channel_http_error(status_code=502, detail="微信扫码确认返回缺少凭证")
     ilink_bot_id = str(data.get("ilink_bot_id") or "").strip()
     if not ilink_bot_id:
-        raise HTTPException(status_code=502, detail="微信扫码确认返回缺少机器人标识")
+        raise _channel_http_error(status_code=502, detail="微信扫码确认返回缺少机器人标识")
     db.rollback()
     with binding_lifecycle_lock(binding_id):
         binding = _get_binding(db, tenant_id, binding_id)
@@ -1200,9 +1240,9 @@ def poll_wechat_qrcode_status(
         )
         account_key = external_account_key(binding.channel, config)
         if not account_key:
-            raise HTTPException(status_code=502, detail="微信扫码确认返回缺少机器人标识")
+            raise _channel_http_error(status_code=502, detail="微信扫码确认返回缺少机器人标识")
         if old_account_key and old_account_key != account_key:
-            raise HTTPException(
+            raise _channel_http_error(
                 status_code=400,
                 detail="机器人变更不允许直接修改，请删除后重新创建绑定",
             )
@@ -1228,7 +1268,7 @@ def poll_wechat_qrcode_status(
         except IntegrityError as exc:
             db.rollback()
             _resume_binding(channel, binding_id, start=should_run)
-            raise HTTPException(status_code=409, detail="该外部机器人已被其他渠道绑定使用") from exc
+            raise _channel_http_error(status_code=409, detail="该外部机器人已被其他渠道绑定使用") from exc
         except Exception:
             db.rollback()
             _resume_binding(channel, binding_id, start=should_run)
@@ -1249,12 +1289,12 @@ def save_wecom_credentials(
     binding = _get_binding(db, request.tenant_id, binding_id)
     _ensure_binding_manager(db, request.tenant_id, binding, current_user, action=_MANAGER_ACTION_CREDENTIALS)
     if binding.channel != "wecom":
-        raise HTTPException(status_code=400, detail="该绑定不是企业微信渠道")
+        raise _channel_http_error(status_code=400, detail="该绑定不是企业微信渠道")
     bot_id = request.bot_id.strip()
     secret = request.secret.strip()
     corp_id = request.corp_id.strip()
     if not bot_id or not secret or not corp_id:
-        raise HTTPException(status_code=400, detail="corp_id、bot_id 与 secret 均不能为空")
+        raise _channel_http_error(status_code=400, detail="corp_id、bot_id 与 secret 均不能为空")
     db.rollback()
     with binding_lifecycle_lock(binding_id):
         binding = _get_binding(db, request.tenant_id, binding_id)
@@ -1267,12 +1307,12 @@ def save_wecom_credentials(
         old_scope = scope_from_config(old_config, binding)
         old_account_key = binding.external_account_key or external_account_key(channel, old_config)
         if old_corp_id and old_corp_id != corp_id:
-            raise HTTPException(
+            raise _channel_http_error(
                 status_code=400,
                 detail="企业变更不允许直接修改，请删除后重新创建绑定",
             )
         if old_bot_id and old_bot_id != bot_id:
-            raise HTTPException(
+            raise _channel_http_error(
                 status_code=400,
                 detail="机器人变更不允许直接修改，请删除后重新创建绑定",
             )
@@ -1286,7 +1326,7 @@ def save_wecom_credentials(
         )
         account_key = external_account_key(binding.channel, config)
         if not account_key:
-            raise HTTPException(status_code=400, detail="机器人 ID 无效")
+            raise _channel_http_error(status_code=400, detail="机器人 ID 无效")
         legacy_account_keys = legacy_external_account_keys(binding.channel, config)
         _ensure_external_account_available(
             db, account_key, binding.id, aliases=legacy_account_keys
@@ -1298,9 +1338,9 @@ def save_wecom_credentials(
             _ensure_revision(binding, expected_revision)
             current_config = dict(binding.config_json or {})
             if str(current_config.get("bot_id") or "").strip() != old_bot_id:
-                raise HTTPException(status_code=409, detail="渠道配置已被其他请求修改，请重试")
+                raise _channel_http_error(status_code=409, detail="渠道配置已被其他请求修改，请重试")
             if str(current_config.get("corp_id") or "").strip() != old_corp_id:
-                raise HTTPException(status_code=409, detail="渠道配置已被其他请求修改，请重试")
+                raise _channel_http_error(status_code=409, detail="渠道配置已被其他请求修改，请重试")
             _ensure_external_account_available(
                 db, account_key, binding_id, aliases=legacy_account_keys
             )
@@ -1327,11 +1367,11 @@ def save_wecom_credentials(
         except IdentityScopeConflict as exc:
             db.rollback()
             _resume_binding(channel, binding_id, start=should_run)
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise _channel_http_error(status_code=409, detail=str(exc)) from exc
         except IntegrityError as exc:
             db.rollback()
             _resume_binding(channel, binding_id, start=should_run)
-            raise HTTPException(status_code=409, detail="该外部机器人已被其他渠道绑定使用") from exc
+            raise _channel_http_error(status_code=409, detail="该外部机器人已被其他渠道绑定使用") from exc
         except Exception:
             db.rollback()
             _resume_binding(channel, binding_id, start=should_run)
@@ -1352,25 +1392,25 @@ def save_feishu_credentials(
     binding = _get_binding(db, request.tenant_id, binding_id)
     _ensure_binding_manager(db, request.tenant_id, binding, current_user, action=_MANAGER_ACTION_CREDENTIALS)
     if binding.channel != "feishu":
-        raise HTTPException(status_code=400, detail="该绑定不是飞书渠道")
+        raise _channel_http_error(status_code=400, detail="该绑定不是飞书渠道")
     app_id = request.app_id.strip()
     app_secret = request.app_secret.strip()
     if not app_id or not app_secret:
-        raise HTTPException(status_code=400, detail="App ID 与 App Secret 均不能为空")
+        raise _channel_http_error(status_code=400, detail="App ID 与 App Secret 均不能为空")
     old_app_id = str((binding.config_json or {}).get("app_id") or "").strip()
     if old_app_id and old_app_id != app_id:
-        raise HTTPException(status_code=400, detail="应用变更不允许直接修改，请删除后重新创建绑定")
+        raise _channel_http_error(status_code=400, detail="应用变更不允许直接修改，请删除后重新创建绑定")
     try:
         bot_info = validate_feishu_credentials(app_id, app_secret)
     except FeishuPermanentError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise _channel_http_error(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         logger.warning("验证飞书凭证失败 binding=%s", binding_id, exc_info=True)
-        raise HTTPException(status_code=502, detail="飞书凭证验证暂时失败，请稍后重试") from exc
+        raise _channel_http_error(status_code=502, detail="飞书凭证验证暂时失败，请稍后重试") from exc
 
     account_key = external_account_key("feishu", {"app_id": app_id})
     if not account_key:
-        raise HTTPException(status_code=400, detail="App ID 无效")
+        raise _channel_http_error(status_code=400, detail="App ID 无效")
     _ensure_external_account_available(db, account_key, binding_id)
     db.rollback()
     with binding_lifecycle_lock(binding_id):
@@ -1380,7 +1420,7 @@ def save_feishu_credentials(
         should_run = bool(binding.status == "active" and binding.credentials_enc)
         current_app_id = str((binding.config_json or {}).get("app_id") or "").strip()
         if current_app_id and current_app_id != app_id:
-            raise HTTPException(status_code=409, detail="渠道配置已被其他请求修改，请重试")
+            raise _channel_http_error(status_code=409, detail="渠道配置已被其他请求修改，请重试")
         db.rollback()
         _quiesce_binding_or_409(channel, binding_id, should_run=should_run)
         try:
@@ -1388,7 +1428,7 @@ def save_feishu_credentials(
             _ensure_revision(binding, expected_revision)
             latest_app_id = str((binding.config_json or {}).get("app_id") or "").strip()
             if latest_app_id and latest_app_id != app_id:
-                raise HTTPException(status_code=409, detail="渠道配置已被其他请求修改，请重试")
+                raise _channel_http_error(status_code=409, detail="渠道配置已被其他请求修改，请重试")
             _ensure_external_account_available(db, account_key, binding_id)
             config = dict(binding.config_json or {})
             config.update(
@@ -1413,7 +1453,7 @@ def save_feishu_credentials(
         except IntegrityError as exc:
             db.rollback()
             _resume_binding(channel, binding_id, start=should_run)
-            raise HTTPException(status_code=409, detail="该飞书应用已被其他渠道绑定使用") from exc
+            raise _channel_http_error(status_code=409, detail="该飞书应用已被其他渠道绑定使用") from exc
         except Exception:
             db.rollback()
             _resume_binding(channel, binding_id, start=should_run)
@@ -1434,24 +1474,24 @@ def save_dingtalk_credentials(
     binding = _get_binding(db, request.tenant_id, binding_id)
     _ensure_binding_manager(db, request.tenant_id, binding, current_user, action=_MANAGER_ACTION_CREDENTIALS)
     if binding.channel != "dingtalk":
-        raise HTTPException(status_code=400, detail="该绑定不是钉钉渠道")
+        raise _channel_http_error(status_code=400, detail="该绑定不是钉钉渠道")
     client_id = request.client_id.strip()
     client_secret = request.client_secret.strip()
     if not client_id or not client_secret:
-        raise HTTPException(status_code=400, detail="Client ID 与 Client Secret 均不能为空")
+        raise _channel_http_error(status_code=400, detail="Client ID 与 Client Secret 均不能为空")
     old_client_id = str((binding.config_json or {}).get("client_id") or "").strip()
     if old_client_id and old_client_id != client_id:
-        raise HTTPException(status_code=400, detail="应用变更不允许直接修改，请删除后重新创建绑定")
+        raise _channel_http_error(status_code=400, detail="应用变更不允许直接修改，请删除后重新创建绑定")
     try:
         validate_dingtalk_credentials(client_id, client_secret)
     except DingTalkPermanentError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise _channel_http_error(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         logger.warning("验证钉钉凭证失败 binding=%s", binding_id, exc_info=True)
-        raise HTTPException(status_code=502, detail="钉钉凭证验证暂时失败，请稍后重试") from exc
+        raise _channel_http_error(status_code=502, detail="钉钉凭证验证暂时失败，请稍后重试") from exc
     account_key = external_account_key("dingtalk", {"client_id": client_id})
     if not account_key:
-        raise HTTPException(status_code=400, detail="Client ID 无效")
+        raise _channel_http_error(status_code=400, detail="Client ID 无效")
     _ensure_external_account_available(db, account_key, binding_id)
     db.rollback()
     with binding_lifecycle_lock(binding_id):
@@ -1460,7 +1500,7 @@ def save_dingtalk_credentials(
         should_run = bool(binding.status == "active" and binding.credentials_enc)
         current_client_id = str((binding.config_json or {}).get("client_id") or "").strip()
         if current_client_id and current_client_id != client_id:
-            raise HTTPException(status_code=409, detail="渠道配置已被其他请求修改，请重试")
+            raise _channel_http_error(status_code=409, detail="渠道配置已被其他请求修改，请重试")
         db.rollback()
         _quiesce_binding_or_409(binding.channel, binding_id, should_run=should_run)
         try:
@@ -1468,7 +1508,7 @@ def save_dingtalk_credentials(
             _ensure_revision(binding, expected_revision)
             latest_client_id = str((binding.config_json or {}).get("client_id") or "").strip()
             if latest_client_id and latest_client_id != client_id:
-                raise HTTPException(status_code=409, detail="渠道配置已被其他请求修改，请重试")
+                raise _channel_http_error(status_code=409, detail="渠道配置已被其他请求修改，请重试")
             _ensure_external_account_available(db, account_key, binding_id)
             config = dict(binding.config_json or {})
             config.update({"client_id": client_id, "bot_name": "钉钉机器人", "bound_at": utc_now().isoformat()})
@@ -1486,7 +1526,7 @@ def save_dingtalk_credentials(
         except IntegrityError as exc:
             db.rollback()
             _resume_binding(binding.channel, binding_id, start=should_run)
-            raise HTTPException(status_code=409, detail="该钉钉应用已被其他渠道绑定使用") from exc
+            raise _channel_http_error(status_code=409, detail="该钉钉应用已被其他渠道绑定使用") from exc
         except Exception:
             db.rollback()
             _resume_binding(binding.channel, binding_id, start=should_run)
@@ -1509,7 +1549,7 @@ def list_tenant_delivery_audit(
     """Tenant-admin audit that remains available after a binding is deleted."""
     ensure_current_user_tenant(tenant_id, current_user)
     if not is_admin_user(current_user):
-        raise HTTPException(status_code=403, detail="Only administrators can audit channel deliveries")
+        raise _channel_http_error(status_code=403, detail="Only administrators can audit channel deliveries")
     from sqlalchemy import func
 
     filters = [ChannelDelivery.tenant_id == tenant_id]
@@ -1519,7 +1559,7 @@ def list_tenant_delivery_audit(
         filters.append(ChannelDelivery.session_id == session_id)
     if status:
         if status not in {"pending", "sending", "delivered", "failed"}:
-            raise HTTPException(status_code=400, detail="Invalid delivery status")
+            raise _channel_http_error(status_code=400, detail="Invalid delivery status")
         filters.append(ChannelDelivery.status == status)
     total = db.exec(
         select(func.count()).select_from(ChannelDelivery).where(*filters)
@@ -1729,7 +1769,7 @@ def list_channel_conversation_messages(
     _ensure_binding_manager(db, tenant_id, binding, current_user)
     session_ids = {row.id for row in _binding_channel_sessions(db, binding)}
     if session_id not in session_ids:
-        raise HTTPException(status_code=404, detail="Channel conversation not found")
+        raise _channel_http_error(status_code=404, detail="Channel conversation not found")
     rows = db.exec(
         select(Message)
         .where(Message.session_id == session_id)
@@ -1766,31 +1806,31 @@ def get_channel_conversation_attachment(
     _ensure_binding_manager(db, tenant_id, binding, current_user)
     session_ids = {row.id for row in _binding_channel_sessions(db, binding)}
     if session_id not in session_ids:
-        raise HTTPException(status_code=404, detail="Channel conversation not found")
+        raise _channel_http_error(status_code=404, detail="Channel conversation not found")
     message = db.get(Message, message_id)
     if not message or message.tenant_id != tenant_id or message.session_id != session_id:
-        raise HTTPException(status_code=404, detail="Channel message not found")
+        raise _channel_http_error(status_code=404, detail="Channel message not found")
     raw_attachments = (message.metadata_json or {}).get("attachments")
     if not isinstance(raw_attachments, list):
-        raise HTTPException(status_code=404, detail="Attachment not found")
+        raise _channel_http_error(status_code=404, detail="Attachment not found")
     raw = next(
         (item for item in raw_attachments if isinstance(item, dict) and item.get("id") == attachment_id),
         None,
     )
     session = db.get(ChatSession, session_id)
     if raw is None or not session or not session.user_id:
-        raise HTTPException(status_code=404, detail="Attachment not found")
+        raise _channel_http_error(status_code=404, detail="Attachment not found")
     try:
         attachment = ChatAttachmentRead.model_validate(raw)
     except ValueError as exc:
-        raise HTTPException(status_code=404, detail="Attachment not found") from exc
+        raise _channel_http_error(status_code=404, detail="Attachment not found") from exc
     data = read_staged_chat_attachment(
         attachment,
         tenant_id=tenant_id,
         user_id=session.user_id,
     )
     if data is None:
-        raise HTTPException(status_code=404, detail="Attachment content not found")
+        raise _channel_http_error(status_code=404, detail="Attachment content not found")
     filename = attachment.filename or "attachment"
     ascii_filename = re.sub(r"[^\x20-\x7e]", "_", filename).replace('"', "'")
     encoded_filename = quote(filename, safe="")

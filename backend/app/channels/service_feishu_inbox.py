@@ -9,7 +9,11 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlmodel import Session, select
 
 from app.channels.adapters.base import ChannelInbound, ChannelInboundAttachment
-from app.channels.service_durable_inbox import StageDisposition, StageResult
+from app.channels.service_durable_inbox import (
+    StageDisposition,
+    StageResult,
+    channel_ingress_language_context,
+)
 from app.db.models import ChannelBinding, ChannelInboundEvent, new_id, utc_now
 
 FEISHU_ENVELOPE_VERSION = 1
@@ -174,6 +178,9 @@ def stage_feishu_inbound(
                 config_revision=expected_revision,
                 target_json=dict(target),
                 status="received",
+                language_context_json=channel_ingress_language_context(binding).model_dump(
+                    mode="json"
+                ),
             )
             db.add(event)
             try:

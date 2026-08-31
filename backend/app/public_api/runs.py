@@ -11,6 +11,11 @@ from fastapi.responses import StreamingResponse
 from sqlmodel import Session, select
 from starlette.background import BackgroundTask
 
+from app.contracts.error_registry import ERROR_REGISTRY, ErrorVisibility
+from app.contracts.projections import (
+    project_public_error_payload,
+    project_public_result_payload,
+)
 from app.core import AgentLoop
 from app.core.cancellation import cancel_chat_turn
 from app.core.harness_session_cleanup import (
@@ -23,16 +28,25 @@ from app.db.models import (
     APIClient,
     APICredential,
     APIJob,
+    ChatSession,
     HarnessInvocationRecord,
     HarnessTaskFrameRecord,
     HarnessTurnRecord,
     Message,
 )
 from app.harness import HarnessArtifactAccessError, normalize_harness_artifact_path
+from app.i18n.language_context import (
+    LanguageContext,
+    LanguageContextInputs,
+    ReplyLocaleConflict,
+    resolve_compatible_language_context,
+    resolve_language_context,
+)
 from app.public_api.auth import PublicPrincipal, enforce_agent_access, require_scopes
 from app.public_api.errors import PublicAPIError
 from app.public_api.idempotency import replay_idempotent_response, store_idempotent_response
 from app.public_api.jobs import (
+    _project_source_event_data,
     create_job,
     ensure_not_cancelled,
     job_read,
@@ -104,6 +118,64 @@ def _redact(value: Any) -> Any:
     if isinstance(value, str) and len(value) > 8000:
         return value[:8000] + "…"
     return value
+
+
+def _job_event_context(job: APIJob) -> tuple[str | None, str | None]:
+    """Read request/trace linkage from the immutable public job snapshot."""
+    correlation = dict((job.request_json or {}).get("_event_context") or {})
+    request_id = correlation.get("request_id")
+    trace_id = correlation.get("trace_id")
+    return (
+        request_id if isinstance(request_id, str) and request_id else None,
+        trace_id if isinstance(trace_id, str) and trace_id else None,
+    )
+
+
+def _project_run_error(value: object, job: APIJob) -> dict[str, Any]:
+    """Project one persisted run error and retain only canonical linkage fields."""
+    if value is None or value == {}:
+        return {}
+    request_id, trace_id = _job_event_context(job)
+    return project_public_error_payload(
+        value,
+        ERROR_REGISTRY,
+        source="public-api-run-result",
+        request_id=request_id,
+        trace_id=trace_id,
+    )
+
+
+def _project_run_result(value: object, job: APIJob) -> dict[str, Any]:
+    """Project known nested run errors while retaining raw successful business output."""
+    request_id, trace_id = _job_event_context(job)
+    return project_public_result_payload(
+        value,
+        ERROR_REGISTRY,
+        source="public-api-run-result",
+        request_id=request_id,
+        trace_id=trace_id,
+    )
+
+
+def _project_relay_failure(payload: dict[str, Any], job: APIJob) -> dict[str, Any]:
+    """Map one AgentLoop failure code to the exact public run.failed parameter contract."""
+    request_id, trace_id = _job_event_context(job)
+    candidate: dict[str, Any] = {}
+    for field_name in ("code", "params"):
+        if field_name in payload:
+            candidate[field_name] = payload[field_name]
+    descriptor = project_public_error_payload(
+        candidate,
+        ERROR_REGISTRY,
+        source="public-api-run-event-relay",
+        request_id=request_id,
+        trace_id=trace_id,
+    )
+    return {
+        "job_id": job.id,
+        "error_code": descriptor["code"],
+        "retryable": descriptor["retryable"],
+    }
 
 
 def _job_actor(db: Session, job: APIJob):
@@ -179,8 +251,16 @@ def _artifacts_for_run(db: Session, job: APIJob) -> list[dict[str, Any]]:
 
 @register_job_handler("run")
 def execute_run(db: Session, job: APIJob) -> dict[str, Any]:
+    """Execute one public run and persist only safe nested error projections."""
     credential, actor = _job_actor(db, job)
     payload = dict(job.request_json or {})
+    language_context = resolve_compatible_language_context(
+        snapshot=job.language_context_json,
+        legacy_ui_locale=None,
+        legacy_agent_reply_locale=None,
+    )
+    if job.language_context_json is None:
+        job.language_context_json = language_context.model_dump(mode="json")
     session_id = str(payload.get("session_id") or "").strip() or None
     stateless = payload.get("session_mode") == "stateless"
     if not session_id:
@@ -204,6 +284,18 @@ def execute_run(db: Session, job: APIJob) -> dict[str, Any]:
             ),
         )
         session_id = session.id
+    session = db.get(ChatSession, session_id)
+    if session is None:
+        raise RuntimeError("public run session is unavailable")
+    if (
+        session.agent_reply_locale is not None
+        and session.agent_reply_locale != language_context.agent_reply_locale.value
+    ):
+        raise RuntimeError("public run session reply locale conflicts with durable snapshot")
+    if session.agent_reply_locale is None:
+        session.agent_reply_locale = language_context.agent_reply_locale.value
+        session.agent_reply_locale_source = language_context.agent_reply_locale_source.value
+        db.add(session)
     job.session_id = session_id
     db.add(job)
     update_job(
@@ -224,6 +316,9 @@ def execute_run(db: Session, job: APIJob) -> dict[str, Any]:
         message=str(payload.get("input") or ""),
         attachments=attachments,
         channel="public_api",
+        ui_locale=language_context.ui_locale,
+        agent_reply_locale=language_context.agent_reply_locale,
+        language_context=language_context,
     )
     seen_event_ids: set[str] = set()
     worker_done = threading.Event()
@@ -240,7 +335,7 @@ def execute_run(db: Session, job: APIJob) -> dict[str, Any]:
                         worker_result["response"] = ChatTurnResponse.model_validate(data)
                 if "response" not in worker_result:
                     raise RuntimeError("Harness stream ended without a complete response")
-        except Exception as exc:  # noqa: BLE001 - re-raised at persistent job boundary.
+        except Exception as exc:
             worker_result["error"] = exc
         finally:
             worker_done.set()
@@ -302,6 +397,7 @@ def execute_run(db: Session, job: APIJob) -> dict[str, Any]:
         None,
     )
     assistant_metadata = dict(assistant.metadata_json or {}) if assistant else {}
+    request_id, trace_id = _job_event_context(job)
     return {
         "run_id": job.id,
         "agent_id": job.agent_id,
@@ -315,7 +411,10 @@ def execute_run(db: Session, job: APIJob) -> dict[str, Any]:
                 "name": invocation.tool_name,
                 "status": invocation.status,
                 "arguments": _redact(dict(invocation.arguments_json or {})),
-                "result": _redact(dict(invocation.result_json or {})),
+                "result": _project_run_result(
+                    dict(invocation.result_json or {}),
+                    job,
+                ),
             }
             for invocation in invocations
         ],
@@ -326,8 +425,14 @@ def execute_run(db: Session, job: APIJob) -> dict[str, Any]:
                 "status": frame.status,
                 "sop_id": frame.skill_id,
                 "step_id": frame.step_id,
-                "result": _redact(dict(frame.result_json or {})),
-                "error": _redact(dict(frame.error_json or {})),
+                "result": project_public_result_payload(
+                    dict(frame.result_json or {}),
+                    ERROR_REGISTRY,
+                    source="public-api-run-task-result",
+                    request_id=request_id,
+                    trace_id=trace_id,
+                ),
+                "error": _project_run_error(frame.error_json, job),
             }
             for frame in frames
         ],
@@ -349,6 +454,7 @@ def _relay_agent_events(
     session_id: str,
     seen_event_ids: set[str],
 ) -> None:
+    """Relay durable AgentEvents after redaction and canonical error projection."""
     rows = db.exec(
         select(AgentEvent)
         .where(
@@ -380,7 +486,14 @@ def _relay_agent_events(
             continue
         public_type = _TRACE_EVENT_MAP.get(event.event_type)
         if public_type:
-            event_data = _redact(payload)
+            # Workflow: failure relays consume only structured error fields; all
+            # other trace events retain the existing source/raw projection path.
+            if public_type == "run.failed":
+                event_data = _project_relay_failure(payload, job)
+            else:
+                event_data = _project_source_event_data(
+                    _project_run_result(_redact(payload), job)
+                )
             if public_type == "run.output.completed":
                 assistants = db.exec(
                     select(Message)
@@ -414,6 +527,42 @@ def _relay_agent_events(
             )
 
 
+def _resolve_run_language_context(
+    principal: PublicPrincipal,
+    body: AgentRunCreate,
+    session: ChatSession | None,
+) -> LanguageContext:
+    """Resolve one public run snapshot before the durable job is created."""
+    try:
+        return resolve_language_context(
+            LanguageContextInputs(
+                explicit_ui_locale=body.ui_locale,
+                explicit_agent_reply_locale=body.agent_reply_locale,
+                session_agent_reply_locale=(
+                    session.agent_reply_locale if session is not None else None
+                ),
+                user_ui_locale=principal.actor_user.ui_locale,
+                user_agent_reply_locale=principal.actor_user.agent_reply_locale,
+            )
+        )
+    except ReplyLocaleConflict as exc:
+        # Workflow: bind only a registered conflict code to the public API error;
+        # a malformed locale conflict fails closed while retaining no raw prose.
+        entry = ERROR_REGISTRY.get(exc.code)
+        safe_params = exc.params
+        safe_status_code = 409
+        if entry is None or entry.visibility is not ErrorVisibility.PUBLIC:
+            entry = ERROR_REGISTRY.require("INTERNAL_ERROR")
+            safe_params = {}
+            safe_status_code = 500
+        raise PublicAPIError(
+            safe_status_code,
+            entry.code,
+            "The requested reply locale conflicts with the session snapshot.",
+            params=safe_params,
+        ) from exc
+
+
 @router.post("/agents/{agent_id}/runs", response_model=dict, status_code=202)
 def create_run_route(
     agent_id: str,
@@ -425,18 +574,23 @@ def create_run_route(
 ) -> dict:
     enforce_agent_access(principal, agent_id)
     ensure_public_agent(db, principal, agent_id)
+    session = None
     if body.session_id:
-        owned_public_session(db, principal, agent_id, body.session_id)
+        session, _ = owned_public_session(db, principal, agent_id, body.session_id)
     replay = replay_idempotent_response(db, principal, request, body.model_dump(mode="json"))
     if replay:
         response.status_code = replay[0]
         return replay[1]
+    language_context = _resolve_run_language_context(principal, body, session)
     job = create_job(
         db,
         principal,
         kind="run",
         request_payload=body.model_dump(mode="json"),
         agent_id=agent_id,
+        language_context=language_context,
+        request_id=str(getattr(request.state, "request_id", "")) or None,
+        trace_id=request.headers.get("X-Trace-ID"),
     )
     payload = job_read(job).model_dump(mode="json")
     store_idempotent_response(
@@ -462,20 +616,25 @@ def create_run_stream_route(
     """Create a durable run and stream its public events in the same request."""
     enforce_agent_access(principal, agent_id)
     ensure_public_agent(db, principal, agent_id)
+    session = None
     if body.session_id:
-        owned_public_session(db, principal, agent_id, body.session_id)
+        session, _ = owned_public_session(db, principal, agent_id, body.session_id)
     request_payload = body.model_dump(mode="json")
     replay = replay_idempotent_response(db, principal, request, request_payload)
     if replay:
         run_id = str(replay[1].get("id") or "")
         job = _owned_run(db, principal, run_id)
     else:
+        language_context = _resolve_run_language_context(principal, body, session)
         job = create_job(
             db,
             principal,
             kind="run",
             request_payload=request_payload,
             agent_id=agent_id,
+            language_context=language_context,
+            request_id=str(getattr(request.state, "request_id", "")) or None,
+            trace_id=request.headers.get("X-Trace-ID"),
         )
         payload = job_read(job).model_dump(mode="json")
         store_idempotent_response(
@@ -518,10 +677,11 @@ def get_run_result(
     principal: PublicPrincipal = Depends(require_scopes("runs:read")),
     db: Session = Depends(get_session),
 ) -> dict:
+    """Return a successful run result with legacy nested errors projected fail-closed."""
     row = _owned_run(db, principal, run_id)
     if row.status != "succeeded":
         raise PublicAPIError(409, "RUN_NOT_SUCCEEDED", "The run has not succeeded.")
-    return dict(row.result_json or {})
+    return _project_run_result(row.result_json, row)
 
 
 @router.get("/runs/{run_id}/events")

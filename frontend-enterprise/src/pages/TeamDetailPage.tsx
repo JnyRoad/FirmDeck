@@ -16,7 +16,12 @@ import {
   SelectValue,
   Textarea,
 } from '@/components/ui';
-import { notify } from '@/components/ui/app-toast';
+import { createToastNotifier } from '@/components/ui/app-toast';
+import { createMessageDescriptor } from '@/i18n/descriptors';
+import { createAppTranslator, useAppIntl, type AppLocale, type AppTranslator, type MessageId, type MessageValues } from '@/i18n';
+import { RawContent, RawIdentifier } from '@/i18n/RawContent';
+import { createUiSinks } from '@/i18n/sinks';
+import { backendEventMessageDescriptor } from '@/lib/backendEventMessages';
 import { cn } from '@/lib/utils';
 
 import { api, TENANT_ID } from '../api/client';
@@ -27,8 +32,8 @@ import EmployeeAvatar from '../components/EmployeeAvatar';
 import TeamKnowledgePermissionMatrix from '../components/knowledge/TeamKnowledgePermissionMatrix';
 import { employeeDisplayName } from '../employee';
 import { EnterpriseRoute } from '../enums/routes';
-import { apiErrorCode, apiErrorMessage } from '../lib/apiErrorMessages';
-import { formatClientDateTime, parseBackendDateTime } from '../lib/timezone';
+import { apiErrorCode } from '../lib/apiErrorMessages';
+import { getClientTimeZone, parseBackendDateTime } from '../lib/timezone';
 import { MarkdownMessage } from './chat/chatHelpers';
 import type {
   AgentProfileRead,
@@ -44,52 +49,141 @@ import type {
   TeamTaskRead,
 } from '../types';
 
-import { relativeTimeLabel, teamStatusLabel } from './TeamsPage';
 
-const TEAM_EVENT_TYPE_LABELS: Record<string, string> = {
-  task_created: '任务创建',
-  task_started: '任务开始',
-  task_rework_started: '退回重做',
-  task_reported: '提交报告',
-  task_escalated: '任务升级',
-  task_needs_input: '需要补充信息',
-  task_bidding_started: '竞标开始',
-  task_awarded: '竞标定标',
-  bid_submitted: '提交竞标',
-  bid_skipped: '跳过竞标',
-  bid_failed: '竞标失败',
-  bid_award_unparsed: '定标解析失败',
-  tl_review_skipped: '项目领导免验收',
-  tl_review_unparsed: '项目领导验收解析失败',
-  tl_review_repair_failed: '项目领导验收修复失败',
-  tl_review_approve: '项目领导验收通过',
-  tl_review_rework: '项目领导退回重做',
-  tl_review_escalate: '项目领导升级',
-  review_override_approve: '人工改判通过',
-  review_override_rework: '人工改判退回',
-  review_override_escalate: '人工改判升级',
-  blackboard_written: '写入黑板',
-  wake_claimed: '任务唤醒已认领',
-  wake_completed: '任务唤醒已完成',
-  wake_failed: '任务唤醒失败',
-  wake_recovered: '恢复中断的任务唤醒',
-  member_execution_resumed: '恢复成员执行',
-  member_execution_skipped: '跳过重复成员执行',
-};
+type TeamDetailMessageId = MessageId;
 
-export function teamEventTypeLabel(eventType: string): string {
-  return TEAM_EVENT_TYPE_LABELS[eventType] || eventType;
+type TeamDetailTranslate = (id: TeamDetailMessageId, values?: MessageValues) => string;
+
+/** 将语义目录的受控 translator 适配到本页的补迁移键集合；业务原文不经过翻译。 */
+function createTeamDetailTranslator(translator: Pick<AppTranslator, 't'>): TeamDetailTranslate {
+  return (id, values) => translator.t(id, values);
 }
 
-const TASK_STATUS_COLUMNS: { status: string; label: string }[] = [
-  { status: 'bidding', label: '竞标中' },
-  { status: 'pending', label: '待认领' },
-  { status: 'in_progress', label: '进行中' },
-  { status: 'review', label: '待验收' },
-  { status: 'done', label: '已完成' },
-  { status: 'rework', label: '已退回' },
-  { status: 'escalated', label: '已升级' },
+/** 提供测试、导出 helper 和非 React 边界使用的中文默认 translator。 */
+function defaultTeamDetailTranslator(): TeamDetailTranslate {
+  return createTeamDetailTranslator(createAppTranslator('zh-CN'));
+}
+
+const TEAM_EVENT_TYPE_MESSAGE_IDS: Record<string, TeamDetailMessageId> = {
+  task_created: 'teamDetailPage.event.taskCreated',
+  task_started: 'teamDetailPage.event.taskStarted',
+  task_rework_started: 'teamDetailPage.event.taskReworkStarted',
+  task_reported: 'teamDetailPage.event.taskReported',
+  task_escalated: 'teamDetailPage.event.taskEscalated',
+  task_needs_input: 'teamDetailPage.event.taskNeedsInput',
+  task_bidding_started: 'teamDetailPage.event.taskBiddingStarted',
+  task_awarded: 'teamDetailPage.event.taskAwarded',
+  bid_submitted: 'teamDetailPage.event.bidSubmitted',
+  bid_skipped: 'teamDetailPage.event.bidSkipped',
+  bid_failed: 'teamDetailPage.event.bidFailed',
+  bid_award_unparsed: 'teamDetailPage.event.bidAwardUnparsed',
+  tl_review_skipped: 'teamDetailPage.event.tlReviewSkipped',
+  tl_review_unparsed: 'teamDetailPage.event.tlReviewUnparsed',
+  tl_review_repair_failed: 'teamDetailPage.event.tlReviewRepairFailed',
+  tl_review_approve: 'teamDetailPage.event.tlReviewApprove',
+  tl_review_rework: 'teamDetailPage.event.tlReviewRework',
+  tl_review_escalate: 'teamDetailPage.event.tlReviewEscalate',
+  review_override_approve: 'teamDetailPage.event.reviewOverrideApprove',
+  review_override_rework: 'teamDetailPage.event.reviewOverrideRework',
+  review_override_escalate: 'teamDetailPage.event.reviewOverrideEscalate',
+  blackboard_written: 'teamDetailPage.event.blackboardWritten',
+  wake_claimed: 'teamDetailPage.event.wakeClaimed',
+  wake_completed: 'teamDetailPage.event.wakeCompleted',
+  wake_failed: 'teamDetailPage.event.wakeFailed',
+  wake_recovered: 'teamDetailPage.event.wakeRecovered',
+  member_execution_resumed: 'teamDetailPage.event.memberExecutionResumed',
+  member_execution_skipped: 'teamDetailPage.event.memberExecutionSkipped',
+};
+
+/** 将后端事件枚举映射为语义消息；未知协议值原样保留以便诊断。 */
+export function teamEventTypeLabel(eventType: string, translate = defaultTeamDetailTranslator()): string {
+  const messageId = TEAM_EVENT_TYPE_MESSAGE_IDS[eventType];
+  return messageId ? translate(messageId) : eventType;
+}
+
+/**
+ * Project one team audit event from its canonical code/params, with legacy event type as fallback.
+ * Event payload text is deliberately ignored so backend-rendered product prose cannot leak into UI.
+ */
+export function teamEventLabel(
+  eventType: string,
+  payload: Record<string, unknown> | null | undefined,
+  translate = defaultTeamDetailTranslator(),
+): string {
+  const eventCode = typeof payload?.event_code === 'string' ? payload.event_code : '';
+  const params = payload?.params;
+  const descriptor = backendEventMessageDescriptor(eventCode, params);
+  if (descriptor) return translate(descriptor.messageId, descriptor.values);
+  return teamEventTypeLabel(eventType, translate);
+}
+
+const TASK_STATUS_COLUMNS: { status: string }[] = [
+  { status: 'bidding' },
+  { status: 'pending' },
+  { status: 'in_progress' },
+  { status: 'review' },
+  { status: 'done' },
+  { status: 'rework' },
+  { status: 'escalated' },
 ];
+
+const TASK_STATUS_MESSAGE_IDS: Record<string, TeamDetailMessageId> = {
+  bidding: 'teamDetailPage.status.bidding',
+  pending: 'teamDetailPage.status.pending',
+  in_progress: 'teamDetailPage.status.inProgress',
+  review: 'teamDetailPage.status.review',
+  done: 'teamDetailPage.status.done',
+  rework: 'teamDetailPage.status.rework',
+  escalated: 'teamDetailPage.status.escalated',
+};
+
+/** 将任务状态码转为当前页面的本地化标签；未注册值原样保留。 */
+function teamTaskStatusLabel(status: string, translate: TeamDetailTranslate): string {
+  const messageId = TASK_STATUS_MESSAGE_IDS[status];
+  return messageId ? translate(messageId) : status;
+}
+
+/** 将团队状态码转为当前页面的本地化标签；未注册状态原样保留。 */
+function teamStatusLabelForDetail(status: string, translate: TeamDetailTranslate): string {
+  if (status === 'active') return translate('teamDetailPage.status.active');
+  if (status === 'archived') return translate('teamDetailPage.status.archived');
+  return status;
+}
+
+/** 按当前语言、客户端时区和受控消息格式化相对时间，避免业务代码固定地区参数。 */
+function teamRelativeTimeLabel(
+  iso: string,
+  locale: AppLocale,
+  translate: TeamDetailTranslate,
+): string {
+  const time = parseBackendDateTime(iso).getTime();
+  if (Number.isNaN(time)) return '';
+  const minutes = Math.floor((Date.now() - time) / 60000);
+  if (minutes < 1) return translate('teamsPage.time.justNow');
+  if (minutes < 60) return translate('teamsPage.time.minutesAgo', { count: minutes });
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return translate('teamsPage.time.hoursAgo', { count: hours });
+  const days = Math.floor(hours / 24);
+  if (days < 7) return translate('teamsPage.time.daysAgo', { count: days });
+  return new Intl.DateTimeFormat(locale, { timeZone: getClientTimeZone() }).format(parseBackendDateTime(iso));
+}
+
+/** 按当前 UI locale 与客户端时区格式化绝对时间；非法日期降级为受控占位文案。 */
+function formatTeamDateTime(
+  iso: string | undefined,
+  locale: AppLocale,
+  translate: TeamDetailTranslate,
+): string {
+  if (!iso) return translate('teamDetailPage.value.none');
+  const date = parseBackendDateTime(iso);
+  if (Number.isNaN(date.getTime())) return translate('teamDetailPage.value.none');
+  return new Intl.DateTimeFormat(locale, {
+    dateStyle: 'short',
+    timeStyle: 'short',
+    hour12: false,
+    timeZone: getClientTimeZone(),
+  }).format(date);
+}
 
 const OVERRIDABLE_STATUSES = new Set(['review', 'escalated']);
 
@@ -129,36 +223,47 @@ type TeamLogPayload = {
   sessions?: TeamLogSession[];
 };
 
-export function taskPriorityLabel(priority: string): string {
-  if (priority === 'high' || priority === 'urgent') return '高';
-  if (priority === 'medium' || priority === 'normal') return '中';
-  if (priority === 'low') return '低';
+/** 将业务优先级枚举映射为本地化产品标签；未知值原样保留以避免翻译业务数据。 */
+export function taskPriorityLabel(
+  priority: string,
+  translate = defaultTeamDetailTranslator(),
+): string {
+  if (priority === 'high' || priority === 'urgent') return translate('teamDetailPage.priority.high');
+  if (priority === 'medium' || priority === 'normal') return translate('teamDetailPage.priority.medium');
+  if (priority === 'low') return translate('teamDetailPage.priority.low');
   return priority;
 }
 
-const REVIEW_BANNERS: Record<string, { label: string; bannerClass: string; quoteClass: string }> = {
+const REVIEW_BANNERS: Record<string, { bannerClass: string; quoteClass: string }> = {
   approve: {
-    label: '验收通过',
     bannerClass: 'border-[#bfe6cf] bg-[#eefaf3] text-[#1e7a4c]',
     quoteClass: 'border-[#35b26f]',
   },
   rework: {
-    label: '退回重做',
     bannerClass: 'border-[#f5ddba] bg-[#fdf6ea] text-[#a3620a]',
     quoteClass: 'border-[#f5a83b]',
   },
   escalate: {
-    label: '已升级',
     bannerClass: 'border-[#f6c8c4] bg-[#fdeeec] text-[#c0342b]',
     quoteClass: 'border-[#f5483b]',
   },
 };
 
 const DEFAULT_REVIEW_BANNER = {
-  label: '',
   bannerClass: 'border-[#e3e7f1] bg-[#f8f9fb] text-[#464c5e]',
   quoteClass: 'border-[#a7adbb]',
 };
+
+/** 将验收结论映射为本地化标签；未知结论作为协议值保留，避免丢失诊断信息。 */
+function reviewVerdictLabel(
+  verdict: string,
+  translate = defaultTeamDetailTranslator(),
+): string {
+  if (verdict === 'approve') return translate('teamDetailPage.review.approve');
+  if (verdict === 'rework') return translate('teamDetailPage.review.rework');
+  if (verdict === 'escalate') return translate('teamDetailPage.review.escalate');
+  return verdict;
+}
 
 function textField(source: Record<string, unknown> | undefined, key: string): string {
   const value = source?.[key];
@@ -172,6 +277,7 @@ function parseTags(raw: string): string[] {
     .filter(Boolean);
 }
 
+/** 渲染团队详情及协作控制面板；仅产品 chrome 本地化，团队与执行内容保持 raw。 */
 export default function TeamDetailPage({
   currentUser,
   onLogout,
@@ -183,6 +289,10 @@ export default function TeamDetailPage({
   const { teamId = '' } = useParams<{ teamId: string }>();
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
+  const { locale, t: appT } = useAppIntl();
+  const t = useMemo(() => createTeamDetailTranslator({ t: appT }), [appT]);
+  const toast = useMemo(() => createToastNotifier({ t: appT }), [appT]);
+  const uiSinks = useMemo(() => createUiSinks({ t: appT }), [appT]);
   const [team, setTeam] = useState<TeamRead | null>(null);
   const [tasks, setTasks] = useState<TeamTaskRead[]>([]);
   const [agents, setAgents] = useState<AgentProfileRead[]>([]);
@@ -278,34 +388,37 @@ export default function TeamDetailPage({
     };
   }, [teamMemberKey, updateMemberScrollEdges]);
 
+  /** 加载团队概要；错误只展示受控产品消息，不把异常正文作为 UI 文案。 */
   const loadTeam = useCallback(async () => {
     try {
       const detail = await api.get<TeamRead>(`/api/enterprise/teams/${teamId}?tenant_id=${TENANT_ID}`);
       setTeam(detail);
-    } catch (error) {
-      notify.error(error instanceof Error ? error.message : '加载团队详情失败');
+    } catch {
+      toast.error(createMessageDescriptor('teamDetailPage.toast.loadTeam'));
     }
-  }, [teamId]);
+  }, [teamId, toast]);
 
+  /** 加载任务看板数据；后端任务标题和描述仍作为业务原文保留。 */
   const loadTasks = useCallback(async () => {
     try {
       const rows = await api.get<TeamTaskRead[]>(`/api/enterprise/teams/${teamId}/tasks?tenant_id=${TENANT_ID}`);
       setTasks(rows);
-    } catch (error) {
-      notify.error(error instanceof Error ? error.message : '加载任务失败');
+    } catch {
+      toast.error(createMessageDescriptor('teamDetailPage.toast.loadTasks'));
     }
-  }, [teamId]);
+  }, [teamId, toast]);
 
+  /** 加载团队黑板；网络或服务端错误采用稳定 fallback。 */
   const loadBoard = useCallback(async () => {
     try {
       const rows = await api.get<TeamBlackboardEntryRead[]>(
         `/api/enterprise/teams/${teamId}/blackboard?tenant_id=${TENANT_ID}&status=active`,
       );
       setBoardEntries(rows);
-    } catch (error) {
-      notify.error(error instanceof Error ? error.message : '加载黑板失败');
+    } catch {
+      toast.error(createMessageDescriptor('teamDetailPage.toast.loadBlackboard'));
     }
-  }, [teamId]);
+  }, [teamId, toast]);
 
   const loadEvents = useCallback(async () => {
     try {
@@ -318,6 +431,7 @@ export default function TeamDetailPage({
     }
   }, [teamId]);
 
+  /** 加载团队知识库绑定；权限矩阵只接收服务器数据，不翻译知识库名称。 */
   const loadKnowledgeBindings = useCallback(async () => {
     /** Load team-local binding revisions and permission matrices. */
     try {
@@ -325,11 +439,11 @@ export default function TeamDetailPage({
         `/api/enterprise/teams/${teamId}/knowledge-bases?tenant_id=${TENANT_ID}`,
       );
       setKnowledgeBindings(rows.filter((row) => row.status === 'active'));
-    } catch (error) {
-      notify.error(apiErrorMessage(error, '加载团队知识库失败'));
+    } catch {
+      toast.error(createMessageDescriptor('teamDetailPage.toast.loadKnowledge'));
       setKnowledgeBindings([]);
     }
-  }, [teamId]);
+  }, [teamId, toast]);
 
   const loadAvailableSharedKnowledge = useCallback(async () => {
     /** Load reusable shared bases that may be added to this team. */
@@ -393,8 +507,9 @@ export default function TeamDetailPage({
     return map;
   }, [team, agents]);
 
+  /** 解析任务负责人显示值；未分配是产品状态，已有姓名/ID 保留为业务标识。 */
   function assigneeName(task: TeamTaskRead): string {
-    if (!task.assignee_agent_id) return '未分配';
+    if (!task.assignee_agent_id) return t('teamDetailPage.value.unassigned');
     return memberNameByAgentId.get(task.assignee_agent_id) || task.assignee_agent_id;
   }
 
@@ -403,9 +518,10 @@ export default function TeamDetailPage({
     return agents.filter((agent) => !agent.is_overall && !memberIds.has(agent.id));
   }, [agents, team]);
 
+  /** 添加员工到团队；输入的员工身份来自选择控件，失败仅显示稳定产品消息。 */
   async function addMember() {
     if (!addAgentId) {
-      notify.error('请选择要添加的员工');
+      toast.error(createMessageDescriptor('teamDetailPage.toast.addMemberRequired'));
       return;
     }
     setAddingMember(true);
@@ -414,43 +530,46 @@ export default function TeamDetailPage({
         tenant_id: TENANT_ID,
         agent_id: addAgentId,
       });
-      notify.success('成员已添加');
+      toast.success(createMessageDescriptor('teamDetailPage.toast.memberAdded'));
       setAddAgentId('');
       await Promise.all([loadTeam(), loadKnowledgeBindings()]);
-    } catch (error) {
-      notify.error(error instanceof Error ? error.message : '添加成员失败');
+    } catch {
+      toast.error(createMessageDescriptor('teamDetailPage.toast.addMemberFailed'));
     } finally {
       setAddingMember(false);
     }
   }
 
+  /** 从团队移除员工；agentId 是业务标识，不作为产品文本翻译。 */
   async function removeMember(agentId: string) {
     try {
       await api.delete(`/api/enterprise/teams/${teamId}/members/${agentId}?tenant_id=${TENANT_ID}`);
-      notify.success('成员已移除');
+      toast.success(createMessageDescriptor('teamDetailPage.toast.memberRemoved'));
       await Promise.all([loadTeam(), loadKnowledgeBindings()]);
-    } catch (error) {
-      notify.error(error instanceof Error ? error.message : '移除成员失败');
+    } catch {
+      toast.error(createMessageDescriptor('teamDetailPage.toast.removeMemberFailed'));
     }
   }
 
+  /** 将指定成员提升为项目领导；保留员工名称等原始业务数据。 */
   async function promoteLeader(agentId: string) {
     try {
       await api.put(`/api/enterprise/teams/${teamId}/leader`, {
         tenant_id: TENANT_ID,
         agent_id: agentId,
       });
-      notify.success('已更换项目领导');
+      toast.success(createMessageDescriptor('teamDetailPage.toast.leaderChanged'));
       await loadTeam();
-    } catch (error) {
-      notify.error(error instanceof Error ? error.message : '更换项目领导失败');
+    } catch {
+      toast.error(createMessageDescriptor('teamDetailPage.toast.changeLeaderFailed'));
     }
   }
 
+  /** 创建团队任务；标题和描述是用户业务输入，原样提交且不进入翻译资源。 */
   async function createTask() {
     const title = newTaskTitle.trim();
     if (!title) {
-      notify.error('请输入任务标题');
+      toast.error(createMessageDescriptor('teamDetailPage.toast.taskTitleRequired'));
       return;
     }
     if (creatingTask) return;
@@ -463,20 +582,21 @@ export default function TeamDetailPage({
         priority: newTaskPriority,
         assignee_agent_id: newTaskAssignee === POOL_ASSIGNEE_VALUE ? undefined : newTaskAssignee,
       });
-      notify.success('任务已创建');
+      toast.success(createMessageDescriptor('teamDetailPage.toast.taskCreated'));
       setTaskDialogOpen(false);
       setNewTaskTitle('');
       setNewTaskDescription('');
       setNewTaskPriority('medium');
       setNewTaskAssignee(POOL_ASSIGNEE_VALUE);
       await loadTasks();
-    } catch (error) {
-      notify.error(error instanceof Error ? error.message : '创建任务失败');
+    } catch {
+      toast.error(createMessageDescriptor('teamDetailPage.toast.createTaskFailed'));
     } finally {
       setCreatingTask(false);
     }
   }
 
+  /** 创建团队领导会话并跳转到群聊；异常正文不会直接展示给用户。 */
   async function startTeamChat() {
     if (!teamId || startingChat) return;
     setStartingChat(true);
@@ -485,15 +605,16 @@ export default function TeamDetailPage({
         `/api/enterprise/teams/${teamId}/tl/session`,
         { tenant_id: TENANT_ID },
       );
-      if (!result.session_id) throw new Error('未返回团队群聊');
+      if (!result.session_id) throw new Error('TEAM_SESSION_MISSING');
       navigate(`${EnterpriseRoute.Chat}/${result.session_id}`);
-    } catch (error) {
-      notify.error(error instanceof Error ? error.message : '开始团队对话失败');
+    } catch {
+      toast.error(createMessageDescriptor('teamDetailPage.toast.startChatFailed'));
     } finally {
       setStartingChat(false);
     }
   }
 
+  /** 打开完整团队日志对话框；日志内容保持 raw 诊断数据，仅状态文本本地化。 */
   async function openTeamLog() {
     if (!teamId || loadingTeamLog) return;
     setTeamLogOpen(true);
@@ -503,33 +624,33 @@ export default function TeamDetailPage({
         `/api/enterprise/teams/${teamId}/export?tenant_id=${encodeURIComponent(TENANT_ID)}`,
       );
       setTeamLog(payload);
-    } catch (error) {
+    } catch {
       setTeamLogOpen(false);
-      notify.error(error instanceof Error ? error.message : '加载完整日志失败');
+      toast.error(createMessageDescriptor('teamDetailPage.toast.logLoadFailed'));
     } finally {
       setLoadingTeamLog(false);
     }
   }
 
+  /** 下载团队日志；产品前缀本地化，团队名称作为 raw 文件名片段保留。 */
   function downloadTeamLog() {
     if (!teamLog) return;
     const blob = new Blob([JSON.stringify(teamLog, null, 2)], { type: 'application/json;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement('a');
     const safeName = (team?.name || teamId).replace(/[^\w\-\u4e00-\u9fff]+/g, '-');
-    anchor.href = url;
-    anchor.download = `staffdeck-team-log-${safeName || teamId}.json`;
-    document.body.appendChild(anchor);
-    anchor.click();
-    anchor.remove();
-    URL.revokeObjectURL(url);
-    notify.success('群聊完整日志已下载');
+    uiSinks.download(
+      blob,
+      createMessageDescriptor('teamDetailPage.download.teamLog'),
+      `staffdeck-${safeName || teamId}`,
+      'json',
+    );
+    toast.success(createMessageDescriptor('teamDetailPage.toast.logDownloaded'));
   }
 
+  /** 创建黑板条目；黑板正文与标签属于用户业务输入，不翻译。 */
   async function addBoardEntry() {
     const content = boardContent.trim();
     if (!content) {
-      notify.error('请输入黑板内容');
+      toast.error(createMessageDescriptor('teamDetailPage.toast.boardContentRequired'));
       return;
     }
     if (postingEntry) return;
@@ -540,27 +661,30 @@ export default function TeamDetailPage({
         content,
         tags: parseTags(boardTags),
       });
-      notify.success('黑板条目已添加');
+      toast.success(createMessageDescriptor('teamDetailPage.toast.boardAdded'));
       setBoardContent('');
       setBoardTags('');
       await loadBoard();
-    } catch (error) {
-      notify.error(error instanceof Error ? error.message : '添加黑板条目失败');
+    } catch {
+      toast.error(createMessageDescriptor('teamDetailPage.toast.boardAddFailed'));
     } finally {
       setPostingEntry(false);
     }
   }
 
+  /** 切换黑板条目置顶状态；仅状态动作文本使用当前 UI locale。 */
   async function togglePinEntry(entry: TeamBlackboardEntryRead) {
     try {
       await api.put(`/api/enterprise/teams/${teamId}/blackboard/${entry.id}`, {
         tenant_id: TENANT_ID,
         pinned: !entry.pinned,
       });
-      notify.success(entry.pinned ? '已取消置顶' : '已置顶');
+      toast.success(createMessageDescriptor(
+        (entry.pinned ? 'teamDetailPage.toast.boardUnpinned' : 'teamDetailPage.toast.boardPinned'),
+      ));
       await loadBoard();
-    } catch (error) {
-      notify.error(error instanceof Error ? error.message : '更新黑板条目失败');
+    } catch {
+      toast.error(createMessageDescriptor('teamDetailPage.toast.boardUpdateFailed'));
     }
   }
 
@@ -570,12 +694,13 @@ export default function TeamDetailPage({
     setEditTags(entry.tags.join(', '));
   }
 
+  /** 保存黑板正文和标签；编辑内容保持用户原文。 */
   async function saveEditEntry() {
     const entry = editingEntry;
     if (!entry || savingEntry) return;
     const content = editContent.trim();
     if (!content) {
-      notify.error('请输入黑板内容');
+      toast.error(createMessageDescriptor('teamDetailPage.toast.boardContentRequired'));
       return;
     }
     setSavingEntry(true);
@@ -585,38 +710,41 @@ export default function TeamDetailPage({
         content,
         tags: parseTags(editTags),
       });
-      notify.success('黑板条目已保存');
+      toast.success(createMessageDescriptor('teamDetailPage.toast.boardUpdated'));
       setEditingEntry(null);
       await loadBoard();
-    } catch (error) {
-      notify.error(error instanceof Error ? error.message : '保存黑板条目失败');
+    } catch {
+      toast.error(createMessageDescriptor('teamDetailPage.toast.boardUpdateFailed'));
     } finally {
       setSavingEntry(false);
     }
   }
 
+  /** 归档黑板条目；确认对话框文案通过 descriptor 本地化。 */
   async function archiveBoardEntry(entry: TeamBlackboardEntryRead) {
-    if (!window.confirm('确认归档该黑板条目？归档后不再展示。')) return;
+    if (!uiSinks.confirm(createMessageDescriptor('teamDetailPage.confirm.archiveDescription'))) return;
     try {
       await api.post(`/api/enterprise/teams/${teamId}/blackboard/${entry.id}/archive`, {
         tenant_id: TENANT_ID,
       });
-      notify.success('黑板条目已归档');
+      toast.success(createMessageDescriptor('teamDetailPage.toast.boardArchived'));
       await loadBoard();
-    } catch (error) {
-      notify.error(error instanceof Error ? error.message : '归档黑板条目失败');
+    } catch {
+      toast.error(createMessageDescriptor('teamDetailPage.toast.boardArchiveFailed'));
     }
   }
 
+  /** 解析黑板来源；产品角色使用 locale 文案，员工标识保持原始业务值。 */
   function boardSourceLabel(entry: TeamBlackboardEntryRead): string {
-    if (entry.source_type === 'human') return '人';
-    if (entry.source_type === 'leader') return '项目领导';
+    if (entry.source_type === 'human') return t('teamDetailPage.role.human');
+    if (entry.source_type === 'leader') return t('teamDetailPage.role.tl');
     if (entry.source_agent_id) {
       return memberNameByAgentId.get(entry.source_agent_id) || entry.source_agent_id;
     }
-    return '成员';
+    return t('teamDetailPage.role.member');
   }
 
+  /** 将黑板条目沉淀到知识库；服务端错误正文不透传至产品 toast。 */
   async function promoteBoardEntry(entry: TeamBlackboardEntryRead) {
     if (promotingEntryId) return;
     setPromotingEntryId(entry.id);
@@ -624,15 +752,16 @@ export default function TeamDetailPage({
       await api.post(`/api/enterprise/teams/${teamId}/blackboard/${entry.id}/promote`, {
         tenant_id: TENANT_ID,
       });
-      notify.success('已沉淀到知识库');
+      toast.success(createMessageDescriptor('teamDetailPage.toast.boardPromoted'));
       await loadBoard();
-    } catch (error) {
-      notify.error(error instanceof Error ? error.message : '沉淀到知识库失败');
+    } catch {
+      toast.error(createMessageDescriptor('teamDetailPage.toast.boardPromoteFailed'));
     } finally {
       setPromotingEntryId(null);
     }
   }
 
+  /** 保存一个共享知识库的成员权限矩阵；权限数据是结构化业务值。 */
   async function saveKnowledgeGrants(
     binding: TeamKnowledgeBindingRead,
     grants: TeamKnowledgeGrantInput[],
@@ -651,9 +780,12 @@ export default function TeamDetailPage({
       setKnowledgeBindings((current) => current.map((row) => (
         row.id === updated.id ? updated : row
       )));
-      notify.success('知识库权限已保存');
+      toast.success(createMessageDescriptor('teamDetailPage.toast.knowledgeSaved'));
     } catch (error) {
-      notify.error(apiErrorMessage(error, '保存知识库权限失败'));
+      const errorMessageId = apiErrorCode(error) === 'KNOWLEDGE_BINDING_REVISION_CONFLICT'
+        ? 'teamDetailPage.toast.knowledgeRevisionConflict'
+        : 'teamDetailPage.toast.knowledgeSaveFailed';
+      toast.error(createMessageDescriptor(errorMessageId));
       if (apiErrorCode(error) === 'KNOWLEDGE_BINDING_REVISION_CONFLICT') {
         await loadKnowledgeBindings();
       }
@@ -666,6 +798,7 @@ export default function TeamDetailPage({
     }
   }
 
+  /** 将团队默认写入目标切换到指定共享知识库。 */
   async function setDefaultKnowledgeBase(binding: TeamKnowledgeBindingRead) {
     /** Select one bound shared base as the team's default write target. */
     setKnowledgeBusyIds((current) => new Set(current).add(binding.id));
@@ -678,10 +811,10 @@ export default function TeamDetailPage({
           is_default: true,
         },
       );
-      notify.success('默认写入知识库已更新');
+      toast.success(createMessageDescriptor('teamDetailPage.toast.defaultKnowledgeUpdated'));
       await Promise.all([loadTeam(), loadKnowledgeBindings()]);
     } catch (error) {
-      notify.error(apiErrorMessage(error, '设置默认知识库失败'));
+      toast.error(createMessageDescriptor('teamDetailPage.toast.defaultKnowledgeFailed'));
       if (apiErrorCode(error) === 'KNOWLEDGE_BINDING_REVISION_CONFLICT') {
         await loadKnowledgeBindings();
       }
@@ -694,11 +827,12 @@ export default function TeamDetailPage({
     }
   }
 
+  /** 撤销团队共享知识库绑定；确认描述保留原始知识库名称作为参数。 */
   async function removeKnowledgeBase(binding: TeamKnowledgeBindingRead) {
     /** Revoke only this team's binding and grants after explicit confirmation. */
-    if (!window.confirm(
-      `确认从团队移除「${binding.knowledge_base_name}」？团队权限会被撤销，但共享知识库本身不会删除。`,
-    )) return;
+    if (!uiSinks.confirm(createMessageDescriptor('teamDetailPage.confirm.removeKnowledge', {
+      knowledgeBaseName: binding.knowledge_base_name,
+    }))) return;
     setKnowledgeBusyIds((current) => new Set(current).add(binding.id));
     try {
       await api.delete(
@@ -708,10 +842,10 @@ export default function TeamDetailPage({
           expected_revision: binding.revision,
         },
       );
-      notify.success('团队知识库绑定已移除');
+      toast.success(createMessageDescriptor('teamDetailPage.toast.knowledgeRemoved'));
       await Promise.all([loadTeam(), loadKnowledgeBindings()]);
     } catch (error) {
-      notify.error(apiErrorMessage(error, '移除团队知识库失败'));
+      toast.error(createMessageDescriptor('teamDetailPage.toast.removeKnowledgeFailed'));
       if (apiErrorCode(error) === 'KNOWLEDGE_BINDING_REVISION_CONFLICT') {
         await loadKnowledgeBindings();
       }
@@ -724,6 +858,7 @@ export default function TeamDetailPage({
     }
   }
 
+  /** 绑定已存在的共享知识库；知识库名称和 ID 均保持业务原值。 */
   async function bindExistingKnowledgeBase() {
     /** Bind one reusable shared base selected from the tenant management list. */
     if (!addKnowledgeBaseId) return;
@@ -738,10 +873,10 @@ export default function TeamDetailPage({
         },
       );
       setAddKnowledgeBaseId('');
-      notify.success('共享知识库已绑定');
+      toast.success(createMessageDescriptor('teamDetailPage.toast.knowledgeBound'));
       await loadKnowledgeBindings();
-    } catch (error) {
-      notify.error(apiErrorMessage(error, '绑定共享知识库失败'));
+    } catch {
+      toast.error(createMessageDescriptor('teamDetailPage.toast.bindKnowledgeFailed'));
     } finally {
       setKnowledgeBusyIds((current) => {
         const next = new Set(current);
@@ -751,6 +886,7 @@ export default function TeamDetailPage({
     }
   }
 
+  /** 创建并绑定共享知识库；用户输入的知识库名称不翻译。 */
   async function createAndBindSharedKnowledgeBase() {
     /** Create a generic shared base and bind it to this team in one request. */
     const name = newSharedKnowledgeName.trim();
@@ -766,10 +902,10 @@ export default function TeamDetailPage({
         },
       );
       setNewSharedKnowledgeName('');
-      notify.success('共享知识库已创建并绑定');
+      toast.success(createMessageDescriptor('teamDetailPage.toast.knowledgeCreated'));
       await Promise.all([loadKnowledgeBindings(), loadAvailableSharedKnowledge()]);
-    } catch (error) {
-      notify.error(apiErrorMessage(error, '创建共享知识库失败'));
+    } catch {
+      toast.error(createMessageDescriptor('teamDetailPage.toast.createKnowledgeFailed'));
     } finally {
       setKnowledgeBusyIds((current) => {
         const next = new Set(current);
@@ -779,17 +915,19 @@ export default function TeamDetailPage({
     }
   }
 
+  /** 解析事件操作者标签；成员名称保留 raw，系统角色使用语义消息。 */
   function eventActorLabel(event: TeamEventRead): string {
     if (event.actor_id) {
       const name = memberNameByAgentId.get(event.actor_id);
       if (name) return name;
     }
-    if (event.actor_type === 'user') return '用户';
-    if (event.actor_type === 'system') return '系统';
-    if (event.actor_type === 'tl') return '项目领导';
+    if (event.actor_type === 'user') return t('teamDetailPage.role.user');
+    if (event.actor_type === 'system') return t('teamDetailPage.role.system');
+    if (event.actor_type === 'tl') return t('teamDetailPage.role.tl');
     return event.actor_type;
   }
 
+  /** 保存团队运行参数；数字字段由业务校验后提交，不依赖固定地区格式。 */
   async function saveTeamConfig() {
     if (!team || savingConfig) return;
     const concurrency = Number(configConcurrency);
@@ -800,7 +938,7 @@ export default function TeamDetailPage({
       Number.isInteger(timeoutMinutes) && timeoutMinutes >= 1 &&
       Number.isInteger(rebuttalRounds) && rebuttalRounds >= 0;
     if (!valid) {
-      notify.error('请输入有效的数字');
+      toast.error(createMessageDescriptor('teamDetailPage.toast.invalidNumber'));
       return;
     }
     setSavingConfig(true);
@@ -814,15 +952,16 @@ export default function TeamDetailPage({
           bid_rebuttal_rounds: rebuttalRounds,
         },
       });
-      notify.success('团队设置已保存');
+      toast.success(createMessageDescriptor('teamDetailPage.toast.settingsSaved'));
       await loadTeam();
-    } catch (error) {
-      notify.error(error instanceof Error ? error.message : '保存团队设置失败');
+    } catch {
+      toast.error(createMessageDescriptor('teamDetailPage.toast.settingsFailed'));
     } finally {
       setSavingConfig(false);
     }
   }
 
+  /** 打开任务详情并刷新完整任务记录；标题、报告与评论保持 raw。 */
   async function openTask(task: TeamTaskRead) {
     setActiveTask(task);
     setOverrideComment('');
@@ -838,11 +977,12 @@ export default function TeamDetailPage({
     }
   }
 
+  /** 为竞标任务指定执行者；评论是用户业务输入，不翻译。 */
   async function awardOverride() {
     const task = activeTask;
     if (!task || awarding) return;
     if (!awardAgentId) {
-      notify.error('请选择执行者');
+      toast.error(createMessageDescriptor('teamDetailPage.toast.executorRequired'));
       return;
     }
     setAwarding(true);
@@ -855,16 +995,17 @@ export default function TeamDetailPage({
           comment: awardComment.trim() || undefined,
         },
       );
-      notify.success('已提交改判');
+      toast.success(createMessageDescriptor('teamDetailPage.toast.overrideSubmitted'));
       setActiveTask(null);
       await loadTasks();
-    } catch (error) {
-      notify.error(error instanceof Error ? error.message : '改判失败');
+    } catch {
+      toast.error(createMessageDescriptor('teamDetailPage.toast.overrideFailed'));
     } finally {
       setAwarding(false);
     }
   }
 
+  /** 提交人工验收改判；结论为稳定协议枚举，说明文本保持用户原文。 */
   async function overrideTask(verdict: TeamReviewVerdict) {
     const task = activeTask;
     if (!task || overriding) return;
@@ -878,11 +1019,11 @@ export default function TeamDetailPage({
           comment: overrideComment.trim() || undefined,
         },
       );
-      notify.success('已提交改判');
+      toast.success(createMessageDescriptor('teamDetailPage.toast.overrideSubmitted'));
       setActiveTask(null);
       await loadTasks();
-    } catch (error) {
-      notify.error(error instanceof Error ? error.message : '改判失败');
+    } catch {
+      toast.error(createMessageDescriptor('teamDetailPage.toast.overrideFailed'));
     } finally {
       setOverriding(false);
     }
@@ -928,7 +1069,7 @@ export default function TeamDetailPage({
         group = {
           key,
           task,
-          title: event.task_id ? event.task_title || task?.title || '未命名任务' : '其他',
+          title: event.task_id ? event.task_title || task?.title || '' : '',
           events: [],
           latest: 0,
         };
@@ -987,7 +1128,7 @@ export default function TeamDetailPage({
       <AppHeader
         onLogout={onLogout}
         userName={currentUser?.username}
-        title={team?.name || '团队详情'}
+        title={team?.name || t('teamDetailPage.fallback.title')}
         description={team?.description || undefined}
       />
 
@@ -998,7 +1139,7 @@ export default function TeamDetailPage({
           onClick={() => navigate(EnterpriseRoute.Teams)}
           className="h-[32px] rounded-[10px] border-[#e3e7f1] px-[12px] text-[12px] font-normal text-[#464c5e]"
         >
-          返回团队列表
+          {t('teamDetailPage.action.backToTeams')}
         </Button>
         <div className="flex items-center gap-[8px]">
           <Button
@@ -1009,7 +1150,7 @@ export default function TeamDetailPage({
             className="h-[34px] gap-[6px] rounded-[10px] border-[#e3e7f1] px-[14px] text-[12px] font-normal text-[#464c5e]"
           >
             {loadingTeamLog ? <LoaderCircle className="size-[14px] animate-spin" /> : <Eye className="size-[14px]" />}
-            {loadingTeamLog ? '加载中…' : '查看完整日志'}
+            {loadingTeamLog ? t('teamDetailPage.action.loading') : t('teamDetailPage.action.viewLog')}
           </Button>
           <Button
             type="button"
@@ -1018,17 +1159,17 @@ export default function TeamDetailPage({
             className="h-[34px] gap-[6px] rounded-[10px] bg-[#18181a] px-[14px] text-[12px] font-normal text-white hover:bg-[#303030]"
           >
             <MessageCircle className="size-[14px]" />
-            {startingChat ? '进入中…' : '开始对话'}
+            {startingChat ? t('teamDetailPage.action.startingChat') : t('teamDetailPage.action.startChat')}
           </Button>
         </div>
       </div>
 
       <div className="mt-[16px] grid grid-cols-1 gap-[20px] lg:grid-cols-2">
-        <section aria-label="成员管理" className="rounded-[20px] bg-white p-[20px] shadow-[0_0_6px_rgba(0,0,0,0.05)]">
+        <section aria-label={t('teamDetailPage.section.members')} className="rounded-[20px] bg-white p-[20px] shadow-[0_0_6px_rgba(0,0,0,0.05)]">
           <div className="mb-[12px] flex items-center justify-between">
-            <h2 className="text-[16px] font-medium text-[#18181a]">成员管理</h2>
+            <h2 className="text-[16px] font-medium text-[#18181a]">{t('teamDetailPage.section.members')}</h2>
             <Badge variant="secondary" className="rounded-full bg-[#f2f3f7] text-[12px] font-normal text-[#464c5e]">
-              {team ? teamStatusLabel(team.status) : ''}
+              {team ? teamStatusLabelForDetail(team.status, t) : ''}
             </Badge>
           </div>
           <div className="flex flex-col gap-[8px]">
@@ -1037,6 +1178,7 @@ export default function TeamDetailPage({
               const leader = members.find((member) => member.role === 'leader');
               const others = members.filter((member) => member.role !== 'leader');
 
+              /** 渲染单个成员节点；姓名和身份 ID 是 raw 业务数据。 */
               function memberNode(member: TeamMemberRead, isLeader: boolean) {
                 return (
                   <div className={cn(
@@ -1046,7 +1188,7 @@ export default function TeamDetailPage({
                     {isLeader && (
                       <span className="absolute -top-[12px] inline-flex h-[24px] items-center gap-[4px] rounded-full border border-[#cfe0ff] bg-[#f2f6ff] px-[9px] text-[11px] font-medium text-[#1a71ff] shadow-[0_2px_7px_rgba(26,113,255,0.12)]">
                         <Crown className="size-[12px]" />
-                        项目领导
+                        {t('teamDetailPage.status.leader')}
                       </span>
                     )}
                     <EmployeeAvatar agent={agentById.get(member.agent_id)} size={48} radius={14} />
@@ -1054,14 +1196,14 @@ export default function TeamDetailPage({
                       className="max-w-full truncate text-[13px] font-medium text-[#18181a]"
                       title={member.agent_name || member.agent_id}
                     >
-                      {member.agent_name || member.agent_id}
+                      <RawIdentifier value={member.agent_name || member.agent_id} />
                     </span>
                     {!isLeader && (
                       <Badge
                         variant="secondary"
                         className="shrink-0 rounded-full bg-[#f2f3f7] text-[12px] font-normal text-[#858b9c]"
                       >
-                        成员
+                        {t('teamDetailPage.status.member')}
                       </Badge>
                     )}
                     <div className="flex min-h-[28px] w-full items-center justify-center gap-[4px]">
@@ -1071,16 +1213,18 @@ export default function TeamDetailPage({
                           onClick={() => void promoteLeader(member.agent_id)}
                           className="shrink-0 whitespace-nowrap rounded-[8px] px-[6px] py-[4px] text-[12px] text-[#464c5e] transition-colors hover:bg-[#f6f6f6]"
                         >
-                          设为项目领导
+                          {t('teamDetailPage.action.promoteLeader')}
                         </button>
                       )}
                       <button
                         type="button"
-                        aria-label={`移除成员 ${member.agent_name || member.agent_id}`}
+                        aria-label={t('teamDetailPage.action.removeMember', {
+                          memberName: member.agent_name || member.agent_id,
+                        })}
                         onClick={() => void removeMember(member.agent_id)}
                         className="shrink-0 whitespace-nowrap rounded-[8px] px-[6px] py-[4px] text-[12px] text-[#858b9c] transition-colors hover:bg-[#fce7e7] hover:text-[#f5483b]"
                       >
-                        移除
+                        {t('teamDetailPage.action.removeMemberButton')}
                       </button>
                     </div>
                   </div>
@@ -1110,7 +1254,7 @@ export default function TeamDetailPage({
                       <div
                         ref={memberScrollRef}
                         role="region"
-                        aria-label="团队成员列表"
+                        aria-label={t('teamDetailPage.section.memberList')}
                         aria-describedby={memberScrollEdges.overflow ? 'team-member-scroll-hint' : undefined}
                         tabIndex={0}
                         className="max-w-full overflow-x-auto overscroll-x-contain pb-[8px] outline-none [scrollbar-color:#cfd5e2_transparent] [scrollbar-width:thin] focus-visible:ring-2 focus-visible:ring-[#a9c7ff] focus-visible:ring-offset-2 [&::-webkit-scrollbar]:h-[6px] [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-[#cfd5e2] [&::-webkit-scrollbar-track]:bg-transparent"
@@ -1148,14 +1292,14 @@ export default function TeamDetailPage({
                           className="mt-[5px] flex items-center justify-center gap-[5px] text-[11px] text-[#858b9c]"
                         >
                           <ChevronLeft className="size-[12px]" aria-hidden="true" />
-                          横向滑动查看更多成员
+                          {t('teamDetailPage.value.horizontalScrollHint')}
                           <ChevronRight className="size-[12px]" aria-hidden="true" />
                         </p>
                       )}
                     </div>
                   )}
                   {team && members.length === 0 && (
-                    <p className="py-[12px] text-center text-[12px] text-[#a7adbb]">暂无成员</p>
+                    <p className="py-[12px] text-center text-[12px] text-[#a7adbb]">{t('teamDetailPage.value.noMembers')}</p>
                   )}
                 </div>
               );
@@ -1163,8 +1307,8 @@ export default function TeamDetailPage({
           </div>
           <div className="mt-[12px] flex items-center gap-[8px]">
             <Select value={addAgentId} onValueChange={setAddAgentId}>
-              <SelectTrigger aria-label="选择员工" className="h-[36px] flex-1 rounded-[10px] border-[#e3e7f1] text-[14px]">
-                <SelectValue placeholder="选择员工" />
+              <SelectTrigger aria-label={t('teamDetailPage.members.selectEmployee')} className="h-[36px] flex-1 rounded-[10px] border-[#e3e7f1] text-[14px]">
+                <SelectValue placeholder={t('teamDetailPage.members.selectEmployee')} />
               </SelectTrigger>
               <SelectContent>
                 {candidateAgents.map((agent) => (
@@ -1180,47 +1324,47 @@ export default function TeamDetailPage({
               onClick={() => void addMember()}
               className="h-[36px] shrink-0 rounded-[10px] bg-[#18181a] px-[16px] text-[14px] font-normal text-white hover:bg-[#303030]"
             >
-              添加成员
+              {t('teamDetailPage.members.add')}
             </Button>
           </div>
         </section>
 
-        <section aria-label="团队设置" className="rounded-[20px] bg-white p-[20px] shadow-[0_0_6px_rgba(0,0,0,0.05)]">
-          <h2 className="mb-[12px] text-[16px] font-medium text-[#18181a]">团队设置</h2>
+        <section aria-label={t('teamDetailPage.section.settings')} className="rounded-[20px] bg-white p-[20px] shadow-[0_0_6px_rgba(0,0,0,0.05)]">
+          <h2 className="mb-[12px] text-[16px] font-medium text-[#18181a]">{t('teamDetailPage.section.settings')}</h2>
           <div className="grid grid-cols-1 gap-[12px] sm:grid-cols-3">
             <label className="flex flex-col gap-[6px] text-[12px] text-[#464c5e]">
-              成员并发上限
+              {t('teamDetailPage.settings.memberConcurrency')}
               <Input
                 type="number"
                 min={1}
                 step={1}
                 value={configConcurrency}
                 onChange={(event) => setConfigConcurrency(event.target.value)}
-                aria-label="成员并发上限"
+                aria-label={t('teamDetailPage.settings.memberConcurrency')}
                 className="h-[36px] rounded-[10px] border-[#e3e7f1] text-[14px]"
               />
             </label>
             <label className="flex flex-col gap-[6px] text-[12px] text-[#464c5e]">
-              任务超时分钟
+              {t('teamDetailPage.settings.taskTimeout')}
               <Input
                 type="number"
                 min={1}
                 step={1}
                 value={configTaskTimeout}
                 onChange={(event) => setConfigTaskTimeout(event.target.value)}
-                aria-label="任务超时分钟"
+                aria-label={t('teamDetailPage.settings.taskTimeout')}
                 className="h-[36px] rounded-[10px] border-[#e3e7f1] text-[14px]"
               />
             </label>
             <label className="flex flex-col gap-[6px] text-[12px] text-[#464c5e]">
-              竞标反驳轮数
+              {t('teamDetailPage.settings.bidRebuttalRounds')}
               <Input
                 type="number"
                 min={0}
                 step={1}
                 value={configBidRounds}
                 onChange={(event) => setConfigBidRounds(event.target.value)}
-                aria-label="竞标反驳轮数"
+                aria-label={t('teamDetailPage.settings.bidRebuttalRounds')}
                 className="h-[36px] rounded-[10px] border-[#e3e7f1] text-[14px]"
               />
             </label>
@@ -1232,25 +1376,25 @@ export default function TeamDetailPage({
               onClick={() => void saveTeamConfig()}
               className="h-[32px] rounded-[10px] bg-[#18181a] px-[16px] text-[13px] font-normal text-white hover:bg-[#303030]"
             >
-              {savingConfig ? '保存中…' : '保存设置'}
+              {savingConfig ? t('teamDetailPage.settings.saving') : t('teamDetailPage.settings.save')}
             </Button>
           </div>
         </section>
       </div>
 
       <section
-        aria-label="团队知识库"
+        aria-label={t('teamDetailPage.section.knowledge')}
         className="mt-[20px] rounded-[20px] bg-white p-[20px] shadow-[0_0_6px_rgba(0,0,0,0.05)]"
       >
         <div className="flex flex-wrap items-start justify-between gap-[12px]">
           <div>
-            <h2 className="text-[16px] font-medium text-[#18181a]">团队知识库</h2>
+            <h2 className="text-[16px] font-medium text-[#18181a]">{t('teamDetailPage.section.knowledge')}</h2>
             <p className="mt-[3px] text-[12px] text-[#858b9c]">
-              团队群聊会读取当前执行员工自己的专用知识库，以及这里绑定并授予该员工的共享知识库；不会读取其他员工的专用知识库。员工私聊只读取自己的专用知识库，不读取团队共享知识库。团队默认写入目标仍只能是共享知识库。
+              {t('teamDetailPage.knowledge.description')}
             </p>
           </div>
           <Badge className="rounded-full bg-[#f2f3f7] text-[11px] font-normal text-[#464c5e]">
-            {`${knowledgeBindings.length} 个绑定`}
+            {t('teamDetailPage.value.bindingCount', { count: knowledgeBindings.length })}
           </Badge>
         </div>
 
@@ -1268,7 +1412,7 @@ export default function TeamDetailPage({
           ))}
           {knowledgeBindings.length === 0 && (
             <p className="rounded-[12px] bg-[#fafbfd] py-[18px] text-center text-[12px] text-[#a7adbb]">
-              尚未绑定共享知识库
+              {t('teamDetailPage.value.noKnowledge')}
             </p>
           )}
         </div>
@@ -1276,12 +1420,12 @@ export default function TeamDetailPage({
         <div className="mt-[14px] grid gap-[10px] border-t border-[#eef1f6] pt-[14px] lg:grid-cols-2">
           <div className="flex items-center gap-[8px]">
             <select
-              aria-label="选择要绑定的共享知识库"
+              aria-label={t('teamDetailPage.knowledge.selectExisting')}
               value={addKnowledgeBaseId}
               onChange={(event) => setAddKnowledgeBaseId(event.target.value)}
               className="h-[34px] min-w-0 flex-1 rounded-[9px] border border-[#dfe4ed] bg-white px-[9px] text-[12px] text-[#464c5e]"
             >
-              <option value="">选择现有共享知识库</option>
+              <option value="">{t('teamDetailPage.knowledge.selectExisting')}</option>
               {availableSharedKnowledge
                 .filter((knowledgeBase) => !knowledgeBindings.some(
                   (binding) => binding.knowledge_base_id === knowledgeBase.id,
@@ -1296,15 +1440,15 @@ export default function TeamDetailPage({
               onClick={() => void bindExistingKnowledgeBase()}
               className="h-[34px] shrink-0 rounded-[9px] bg-[#18181a] px-[12px] text-[12px] text-white"
             >
-              绑定
+              {t('teamDetailPage.knowledge.bind')}
             </Button>
           </div>
           <div className="flex items-center gap-[8px]">
             <Input
               value={newSharedKnowledgeName}
               onChange={(event) => setNewSharedKnowledgeName(event.target.value)}
-              aria-label="新建团队共享知识库名称"
-              placeholder="新建共享知识库"
+              aria-label={t('teamDetailPage.knowledge.createNameAria')}
+              placeholder={t('teamDetailPage.knowledge.createName')}
               className="h-[34px] min-w-0 flex-1 text-[12px]"
             />
             <Button
@@ -1313,14 +1457,14 @@ export default function TeamDetailPage({
               onClick={() => void createAndBindSharedKnowledgeBase()}
               className="h-[34px] shrink-0 rounded-[9px] bg-[#18181a] px-[12px] text-[12px] text-white"
             >
-              新建并绑定
+              {t('teamDetailPage.knowledge.createAndBind')}
             </Button>
           </div>
         </div>
       </section>
 
-      <section aria-label="团队黑板" className="mt-[20px] rounded-[20px] bg-white p-[20px] shadow-[0_0_6px_rgba(0,0,0,0.05)]">
-        <h2 className="mb-[12px] text-[16px] font-medium text-[#18181a]">团队黑板</h2>
+      <section aria-label={t('teamDetailPage.section.blackboard')} className="mt-[20px] rounded-[20px] bg-white p-[20px] shadow-[0_0_6px_rgba(0,0,0,0.05)]">
+        <h2 className="mb-[12px] text-[16px] font-medium text-[#18181a]">{t('teamDetailPage.section.blackboard')}</h2>
         <div className="flex flex-col gap-[8px]">
           {sortedBoardEntries.map((entry) => {
             const taskTitle = textField(entry.citation, 'task_title');
@@ -1332,11 +1476,11 @@ export default function TeamDetailPage({
               >
                 <div className="flex items-start gap-[8px]">
                   <p className="min-w-0 flex-1 text-[14px] leading-[20px] whitespace-pre-wrap text-[#18181a]">
-                    {entry.content}
+                    <RawContent value={entry.content} />
                   </p>
                   {entry.pinned && (
                     <Badge variant="secondary" className="shrink-0 rounded-full bg-[#e8f0ff] text-[12px] font-normal text-[#1a71ff]">
-                      置顶
+                      {t('teamDetailPage.blackboard.pinned')}
                     </Badge>
                   )}
                 </div>
@@ -1348,7 +1492,7 @@ export default function TeamDetailPage({
                         variant="secondary"
                         className="rounded-full bg-[#f2f3f7] text-[12px] font-normal text-[#464c5e]"
                       >
-                        {tag}
+                        <RawContent value={tag} />
                       </Badge>
                     ))}
                   </div>
@@ -1356,8 +1500,17 @@ export default function TeamDetailPage({
                 <div className="mt-[8px] flex flex-wrap items-center justify-between gap-[8px]">
                   <span className="text-[12px] text-[#a7adbb]">
                     {boardSourceLabel(entry)}
-                    {taskTitle ? ` · 关联任务：${taskTitle}` : ''}
-                    {` · ${formatClientDateTime(entry.updated_at)}`}
+                    {taskTitle ? (
+                      <>
+                        {' · '}
+                        <span>
+                          {t('teamDetailPage.value.relatedTask')}
+                          <RawContent value={taskTitle} />
+                        </span>
+                      </>
+                    ) : null}
+                    {' · '}
+                    {formatTeamDateTime(entry.updated_at, locale, t)}
                   </span>
                   <span className="flex items-center gap-[4px]">
                     <button
@@ -1366,28 +1519,32 @@ export default function TeamDetailPage({
                       onClick={() => void promoteBoardEntry(entry)}
                       className="rounded-[8px] px-[8px] py-[4px] text-[12px] text-[#464c5e] transition-colors hover:bg-[#f6f6f6] disabled:cursor-not-allowed disabled:text-[#a7adbb]"
                     >
-                      {promoted ? '已沉淀' : promotingEntryId === entry.id ? '沉淀中…' : '沉淀到知识库'}
+                      {promoted
+                        ? t('teamDetailPage.status.promoted')
+                        : promotingEntryId === entry.id
+                          ? t('teamDetailPage.status.promoting')
+                          : t('teamDetailPage.blackboard.promote')}
                     </button>
                     <button
                       type="button"
                       onClick={() => void togglePinEntry(entry)}
                       className="rounded-[8px] px-[8px] py-[4px] text-[12px] text-[#464c5e] transition-colors hover:bg-[#f6f6f6]"
                     >
-                      {entry.pinned ? '取消置顶' : '置顶'}
+                      {entry.pinned ? t('teamDetailPage.blackboard.unpin') : t('teamDetailPage.blackboard.pinned')}
                     </button>
                     <button
                       type="button"
                       onClick={() => openEditEntry(entry)}
                       className="rounded-[8px] px-[8px] py-[4px] text-[12px] text-[#464c5e] transition-colors hover:bg-[#f6f6f6]"
                     >
-                      编辑
+                      {t('teamDetailPage.blackboard.edit')}
                     </button>
                     <button
                       type="button"
                       onClick={() => void archiveBoardEntry(entry)}
                       className="rounded-[8px] px-[8px] py-[4px] text-[12px] text-[#858b9c] transition-colors hover:bg-[#fce7e7] hover:text-[#f5483b]"
                     >
-                      归档
+                      {t('teamDetailPage.blackboard.archive')}
                     </button>
                   </span>
                 </div>
@@ -1395,23 +1552,23 @@ export default function TeamDetailPage({
             );
           })}
           {sortedBoardEntries.length === 0 && (
-            <p className="py-[12px] text-center text-[12px] text-[#a7adbb]">暂无黑板条目</p>
+            <p className="py-[12px] text-center text-[12px] text-[#a7adbb]">{t('teamDetailPage.value.noBlackboardEntries')}</p>
           )}
         </div>
         <div className="mt-[12px] flex items-center gap-[8px]">
           <Input
             value={boardContent}
             onChange={(event) => setBoardContent(event.target.value)}
-            placeholder="输入黑板内容"
-            aria-label="输入黑板内容"
+            placeholder={t('teamDetailPage.blackboard.contentPlaceholder')}
+            aria-label={t('teamDetailPage.blackboard.contentPlaceholder')}
             disabled={postingEntry}
             className="h-[36px] flex-1 rounded-[10px] border-[#e3e7f1] text-[14px]"
           />
           <Input
             value={boardTags}
             onChange={(event) => setBoardTags(event.target.value)}
-            placeholder="标签（逗号分隔，可选）"
-            aria-label="标签（逗号分隔，可选）"
+            placeholder={t('teamDetailPage.blackboard.tagsPlaceholder')}
+            aria-label={t('teamDetailPage.blackboard.tagsAria')}
             disabled={postingEntry}
             className="h-[36px] w-[200px] shrink-0 rounded-[10px] border-[#e3e7f1] text-[14px]"
           />
@@ -1421,20 +1578,20 @@ export default function TeamDetailPage({
             onClick={() => void addBoardEntry()}
             className="h-[36px] shrink-0 rounded-[10px] bg-[#18181a] px-[16px] text-[14px] font-normal text-white hover:bg-[#303030]"
           >
-            {postingEntry ? '添加中…' : '添加'}
+            {postingEntry ? t('teamDetailPage.blackboard.adding') : t('teamDetailPage.blackboard.add')}
           </Button>
         </div>
       </section>
 
-      <section aria-label="任务看板" className="mt-[20px] rounded-[20px] bg-white p-[20px] shadow-[0_0_6px_rgba(0,0,0,0.05)]">
+      <section aria-label={t('teamDetailPage.section.taskBoard')} className="mt-[20px] rounded-[20px] bg-white p-[20px] shadow-[0_0_6px_rgba(0,0,0,0.05)]">
         <div className="mb-[12px] flex items-center justify-between">
-          <h2 className="text-[16px] font-medium text-[#18181a]">任务看板</h2>
+          <h2 className="text-[16px] font-medium text-[#18181a]">{t('teamDetailPage.section.taskBoard')}</h2>
           <Button
             type="button"
             onClick={() => setTaskDialogOpen(true)}
             className="h-[32px] rounded-[10px] bg-[#18181a] px-[16px] text-[13px] font-normal text-white hover:bg-[#303030]"
           >
-            新建任务
+            {t('teamDetailPage.task.create')}
           </Button>
         </div>
         <div className="grid grid-cols-1 gap-[12px] sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-7">
@@ -1443,7 +1600,9 @@ export default function TeamDetailPage({
             return (
               <div key={column.status} className="flex min-h-[120px] flex-col gap-[8px] rounded-[12px] bg-[#f8f9fb] p-[8px]">
                 <div className="flex items-center justify-between px-[4px]">
-                  <span className="text-[12px] font-medium text-[#464c5e]">{column.label}</span>
+                  <span className="text-[12px] font-medium text-[#464c5e]">
+                    {teamTaskStatusLabel(column.status, t)}
+                  </span>
                   <span className="text-[12px] text-[#a7adbb]">{columnTasks.length}</span>
                 </div>
                 {columnTasks.map((task) => (
@@ -1453,18 +1612,24 @@ export default function TeamDetailPage({
                     onClick={() => void openTask(task)}
                     className="flex flex-col gap-[6px] rounded-[10px] bg-white p-[10px] text-left shadow-[0_0_4px_rgba(0,0,0,0.04)] transition-shadow hover:shadow-[0_8px_16px_rgba(0,0,0,0.08)]"
                   >
-                    <span className="text-[13px] font-medium leading-[18px] text-[#18181a]">{task.title}</span>
+                    <span className="text-[13px] font-medium leading-[18px] text-[#18181a]">
+                      <RawContent value={task.title} />
+                    </span>
                     <span className="flex items-center justify-between text-[11px] text-[#858b9c]">
-                      <span className="truncate">{assigneeName(task)}</span>
+                      <span className="truncate"><RawIdentifier value={assigneeName(task)} /></span>
                       <Badge variant="secondary" className="shrink-0 rounded-full bg-[#f2f3f7] text-[10px] font-normal text-[#464c5e]">
-                        {taskPriorityLabel(task.priority)}
+                        {taskPriorityLabel(task.priority, t)}
                       </Badge>
                     </span>
-                    <span className="text-[10px] text-[#a7adbb]">{`创建于 ${relativeTimeLabel(task.created_at)}`}</span>
+                    <span className="text-[10px] text-[#a7adbb]">
+                      {t('teamDetailPage.value.createdAt', {
+                        time: teamRelativeTimeLabel(task.created_at, locale, t),
+                      })}
+                    </span>
                   </button>
                 ))}
                 {columnTasks.length === 0 && (
-                  <p className="py-[12px] text-center text-[11px] text-[#c3c8d4]">暂无任务</p>
+                  <p className="py-[12px] text-center text-[11px] text-[#c3c8d4]">{t('teamDetailPage.value.noTasks')}</p>
                 )}
               </div>
             );
@@ -1472,10 +1637,10 @@ export default function TeamDetailPage({
         </div>
       </section>
 
-      <section aria-label="团队动态" className="mt-[20px] rounded-[20px] bg-white p-[20px] shadow-[0_0_6px_rgba(0,0,0,0.05)]">
-        <h2 className="mb-[12px] text-[16px] font-medium text-[#18181a]">团队动态</h2>
+      <section aria-label={t('teamDetailPage.section.activity')} className="mt-[20px] rounded-[20px] bg-white p-[20px] shadow-[0_0_6px_rgba(0,0,0,0.05)]">
+        <h2 className="mb-[12px] text-[16px] font-medium text-[#18181a]">{t('teamDetailPage.section.activity')}</h2>
         {teamEvents.length === 0 ? (
-          <p className="py-[12px] text-center text-[12px] text-[#a7adbb]">暂无团队动态</p>
+          <p className="py-[12px] text-center text-[12px] text-[#a7adbb]">{t('teamDetailPage.value.noActivity')}</p>
         ) : (
           <div className="flex flex-col gap-[10px]">
             {eventGroups.map((group) => (
@@ -1490,10 +1655,12 @@ export default function TeamDetailPage({
                     className="mb-[6px] max-w-full truncate rounded-[8px] text-left text-[13px] font-medium text-[#18181a] transition-colors hover:text-[#1a71ff]"
                     title={group.title}
                   >
-                    {group.title}
+                    <RawContent value={group.title} />
                   </button>
                 ) : (
-                  <p className="mb-[6px] text-[13px] font-medium text-[#464c5e]">{group.title}</p>
+                  <p className="mb-[6px] text-[13px] font-medium text-[#464c5e]">
+                    {group.key === '__other__' ? t('teamDetailPage.value.other') : t('teamDetailPage.value.unnamedTask')}
+                  </p>
                 )}
                 <ol className="flex flex-col gap-[4px]">
                   {group.events.map((event) => (
@@ -1501,10 +1668,10 @@ export default function TeamDetailPage({
                       key={event.id}
                       className="flex items-baseline gap-[8px] px-[2px] text-[12px] leading-[18px]"
                     >
-                      <span className="shrink-0 text-[#464c5e]">{teamEventTypeLabel(event.event_type)}</span>
+                      <span className="shrink-0 text-[#464c5e]">{teamEventLabel(event.event_type, event.payload, t)}</span>
                       <span className="shrink-0 text-[#a7adbb]">{eventActorLabel(event)}</span>
                       <span className="ml-auto shrink-0 text-[#a7adbb]">
-                        {relativeTimeLabel(event.created_at)}
+                        {teamRelativeTimeLabel(event.created_at, locale, t)}
                       </span>
                     </li>
                   ))}
@@ -1523,58 +1690,55 @@ export default function TeamDetailPage({
       >
         <DialogContent className="flex max-h-[calc(100dvh-32px)] w-[calc(100%-32px)] flex-col gap-0 overflow-hidden rounded-[16px] p-0 sm:max-w-[640px]">
           <DialogTitle className="shrink-0 px-[24px] py-[16px] text-[16px] font-semibold text-foreground">
-            {activeTask?.title || '任务详情'}
+            {activeTask ? <RawContent value={activeTask.title} /> : t('teamDetailPage.fallback.taskDetail')}
           </DialogTitle>
           {activeTask && (
             <div className="flex min-h-0 flex-1 flex-col gap-[16px] overflow-y-auto px-[24px] pb-[16px]">
               <div className="flex flex-wrap items-center gap-[8px] text-[12px] text-[#757f9c]">
                 <Badge variant="secondary" className="rounded-full bg-[#f2f3f7] font-normal text-[#464c5e]">
-                  {TASK_STATUS_COLUMNS.find((column) => column.status === activeTask.status)?.label || activeTask.status}
+                  {teamTaskStatusLabel(activeTask.status, t)}
                 </Badge>
-                <span>{`负责人：${assigneeName(activeTask)}`}</span>
+                <span>{t('teamDetailPage.value.assignee', { name: assigneeName(activeTask) })}</span>
                 {biddingWinnerId && (
                   <Badge variant="secondary" className="rounded-full bg-[#e8f0ff] font-normal text-[#1a71ff]">
-                    竞标胜出
+                    {t('teamDetailPage.status.awarded')}
                   </Badge>
                 )}
-                <span>{`优先级：${taskPriorityLabel(activeTask.priority)}`}</span>
+                <span>{t('teamDetailPage.value.priority', { priority: taskPriorityLabel(activeTask.priority, t) })}</span>
                 {activeTask.session_id && (
                   <span className="rounded-full bg-[#f2f3f7] px-[8px] py-[3px] text-[11px] text-[#646b7c]">
-                    内部执行记录已归档
+                    {t('teamDetailPage.value.sessionArchived')}
                   </span>
                 )}
               </div>
 
               {activeTask.description && (
-                <section aria-label="任务描述">
-                  <h3 className="mb-[4px] text-[13px] font-medium text-[#464c5e]">描述</h3>
-                  <p className="text-[13px] leading-[20px] whitespace-pre-wrap text-[#18181a]">{activeTask.description}</p>
+                <section aria-label={t('teamDetailPage.section.taskDescription')}>
+                  <h3 className="mb-[4px] text-[13px] font-medium text-[#464c5e]">{t('teamDetailPage.section.taskDescription')}</h3>
+                  <p className="text-[13px] leading-[20px] whitespace-pre-wrap text-[#18181a]"><RawContent value={activeTask.description} /></p>
                 </section>
               )}
 
               {(reportSummary || reportFullReply) && (
-                <section aria-label="执行报告">
-                  <h3 className="mb-[4px] text-[13px] font-medium text-[#464c5e]">执行报告</h3>
+                <section aria-label={t('teamDetailPage.section.executionReport')}>
+                  <h3 className="mb-[4px] text-[13px] font-medium text-[#464c5e]">{t('teamDetailPage.section.executionReport')}</h3>
                   {reportSummary && (
-                    <p className="text-[13px] leading-[20px] whitespace-pre-wrap text-[#18181a]">{reportSummary}</p>
+                    <p className="text-[13px] leading-[20px] whitespace-pre-wrap text-[#18181a]"><RawContent value={reportSummary} /></p>
                   )}
                   {reportFullReply && (
                     <pre className="mt-[6px] max-h-[200px] overflow-y-auto rounded-[10px] bg-[#f8f9fb] p-[10px] text-[12px] leading-[18px] whitespace-pre-wrap text-[#464c5e]">
-                      {reportFullReply}
+                      <RawContent value={reportFullReply} />
                     </pre>
                   )}
                 </section>
               )}
 
               {reviewVerdict && (() => {
-                const banner = REVIEW_BANNERS[reviewVerdict] || {
-                  ...DEFAULT_REVIEW_BANNER,
-                  label: reviewVerdict,
-                };
+                const banner = REVIEW_BANNERS[reviewVerdict] || DEFAULT_REVIEW_BANNER;
                 return (
-                  <section aria-label="验收结论">
+                  <section aria-label={t('teamDetailPage.section.reviewConclusion')}>
                     <div className={cn('rounded-[12px] border px-[14px] py-[12px]', banner.bannerClass)}>
-                      <p className="text-[15px] font-semibold">{banner.label}</p>
+                      <p className="text-[15px] font-semibold">{reviewVerdictLabel(reviewVerdict, t)}</p>
                       {reviewComment && (
                         <blockquote
                           className={cn(
@@ -1582,7 +1746,7 @@ export default function TeamDetailPage({
                             banner.quoteClass,
                           )}
                         >
-                          {reviewComment}
+                          <RawContent value={reviewComment} />
                         </blockquote>
                       )}
                     </div>
@@ -1591,8 +1755,8 @@ export default function TeamDetailPage({
               })()}
 
               {bidRounds.length > 0 && (
-                <section aria-label="竞标竞技场">
-                  <h3 className="mb-[4px] text-[13px] font-medium text-[#464c5e]">竞标竞技场</h3>
+                <section aria-label={t('teamDetailPage.section.biddingArena')}>
+                  <h3 className="mb-[4px] text-[13px] font-medium text-[#464c5e]">{t('teamDetailPage.section.biddingArena')}</h3>
                   <BiddingArena
                     bids={activeTask.bids || []}
                     winnerId={biddingWinnerId}
@@ -1603,15 +1767,15 @@ export default function TeamDetailPage({
               )}
 
               {AWARD_OVERRIDABLE_STATUSES.has(activeTask.status) && (
-                <section aria-label="改判执行者" className="rounded-[12px] border border-[#eef1f6] p-[12px]">
-                  <h3 className="mb-[8px] text-[13px] font-medium text-[#464c5e]">改判执行者</h3>
+                <section aria-label={t('teamDetailPage.section.awardOverride')} className="rounded-[12px] border border-[#eef1f6] p-[12px]">
+                  <h3 className="mb-[8px] text-[13px] font-medium text-[#464c5e]">{t('teamDetailPage.section.awardOverride')}</h3>
                   <div className="flex flex-col gap-[8px]">
                     <Select value={awardAgentId} onValueChange={setAwardAgentId}>
                       <SelectTrigger
-                        aria-label="选择执行者"
+                        aria-label={t('teamDetailPage.task.selectExecutor')}
                         className="h-[36px] rounded-[10px] border-[#e3e7f1] text-[13px]"
                       >
-                        <SelectValue placeholder="选择执行者" />
+                        <SelectValue placeholder={t('teamDetailPage.task.selectExecutor')} />
                       </SelectTrigger>
                       <SelectContent>
                         {awardCandidates.map((member) => (
@@ -1624,8 +1788,8 @@ export default function TeamDetailPage({
                     <Textarea
                       value={awardComment}
                       onChange={(event) => setAwardComment(event.target.value)}
-                      placeholder="改判说明（可选）"
-                      aria-label="改判说明（可选）"
+                      placeholder={t('teamDetailPage.task.overrideComment')}
+                      aria-label={t('teamDetailPage.task.overrideComment')}
                       rows={2}
                       className="text-[13px]"
                     />
@@ -1636,25 +1800,25 @@ export default function TeamDetailPage({
                         onClick={() => void awardOverride()}
                         className="h-[32px] rounded-[10px] bg-[#18181a] px-[16px] text-[13px] font-normal text-white hover:bg-[#303030]"
                       >
-                        {awarding ? '提交中…' : '确认改判'}
+                        {awarding ? t('teamDetailPage.task.submitting') : t('teamDetailPage.task.confirmOverride')}
                       </Button>
                     </div>
                   </div>
                 </section>
               )}
 
-              <section aria-label="事件时间线">
-                <h3 className="mb-[4px] text-[13px] font-medium text-[#464c5e]">事件时间线</h3>
+              <section aria-label={t('teamDetailPage.section.eventTimeline')}>
+                <h3 className="mb-[4px] text-[13px] font-medium text-[#464c5e]">{t('teamDetailPage.section.eventTimeline')}</h3>
                 {(activeTask.events || []).length === 0 ? (
-                  <p className="text-[12px] text-[#a7adbb]">暂无事件</p>
+                  <p className="text-[12px] text-[#a7adbb]">{t('teamDetailPage.value.noEvents')}</p>
                 ) : (
                   <ol className="flex flex-col gap-[6px]">
                     {(activeTask.events || []).map((event) => (
                       <li key={event.id} className="flex items-baseline gap-[8px] text-[12px] leading-[18px]">
                         <span className="shrink-0 text-[#a7adbb]">
-                          {formatClientDateTime(event.created_at)}
+                          {formatTeamDateTime(event.created_at, locale, t)}
                         </span>
-                        <span className="text-[#464c5e]">{event.event_type}</span>
+                        <span className="text-[#464c5e]">{teamEventLabel(event.event_type, event.payload, t)}</span>
                         <span className="text-[#a7adbb]">{event.actor_type}</span>
                       </li>
                     ))}
@@ -1663,13 +1827,13 @@ export default function TeamDetailPage({
               </section>
 
               {OVERRIDABLE_STATUSES.has(activeTask.status) && (
-                <section aria-label="人工改判" className="rounded-[12px] border border-[#eef1f6] p-[12px]">
-                  <h3 className="mb-[8px] text-[13px] font-medium text-[#464c5e]">人工改判</h3>
+                <section aria-label={t('teamDetailPage.section.manualReview')} className="rounded-[12px] border border-[#eef1f6] p-[12px]">
+                  <h3 className="mb-[8px] text-[13px] font-medium text-[#464c5e]">{t('teamDetailPage.section.manualReview')}</h3>
                   <Textarea
                     value={overrideComment}
                     onChange={(event) => setOverrideComment(event.target.value)}
-                    placeholder="改判意见（可选）"
-                    aria-label="改判意见（可选）"
+                    placeholder={t('teamDetailPage.review.overrideComment')}
+                    aria-label={t('teamDetailPage.review.overrideComment')}
                     rows={2}
                     className="mb-[8px] text-[13px]"
                   />
@@ -1680,7 +1844,7 @@ export default function TeamDetailPage({
                       onClick={() => void overrideTask('approve')}
                       className="h-[32px] rounded-[10px] bg-[#18181a] px-[16px] text-[13px] font-normal text-white hover:bg-[#303030]"
                     >
-                      通过
+                      {t('teamDetailPage.review.approveButton')}
                     </Button>
                     <Button
                       type="button"
@@ -1689,7 +1853,7 @@ export default function TeamDetailPage({
                       onClick={() => void overrideTask('rework')}
                       className="h-[32px] rounded-[10px] border-[#e3e7f1] px-[16px] text-[13px] font-normal text-[#464c5e]"
                     >
-                      退回重做
+                      {t('teamDetailPage.review.reworkButton')}
                     </Button>
                     <Button
                       type="button"
@@ -1698,7 +1862,7 @@ export default function TeamDetailPage({
                       onClick={() => void overrideTask('escalate')}
                       className="h-[32px] rounded-[10px] border-[#e3e7f1] px-[16px] text-[13px] font-normal text-[#464c5e]"
                     >
-                      升级
+                      {t('teamDetailPage.review.escalateButton')}
                     </Button>
                   </div>
                 </section>
@@ -1723,39 +1887,39 @@ export default function TeamDetailPage({
         }}
       >
         <DialogContent className="w-[calc(100%-32px)] rounded-[16px] sm:max-w-[480px]">
-          <DialogTitle className="text-[16px] font-semibold text-foreground">新建任务</DialogTitle>
+          <DialogTitle className="text-[16px] font-semibold text-foreground">{t('teamDetailPage.task.createTitle')}</DialogTitle>
           <div className="flex flex-col gap-[12px]">
             <Input
               value={newTaskTitle}
               onChange={(event) => setNewTaskTitle(event.target.value)}
-              placeholder="任务标题"
-              aria-label="任务标题"
+              placeholder={t('teamDetailPage.task.titlePlaceholder')}
+              aria-label={t('teamDetailPage.task.titlePlaceholder')}
               className="h-[36px] rounded-[10px] border-[#e3e7f1] text-[14px]"
             />
             <Textarea
               value={newTaskDescription}
               onChange={(event) => setNewTaskDescription(event.target.value)}
-              placeholder="任务描述（可选）"
-              aria-label="任务描述（可选）"
+              placeholder={t('teamDetailPage.task.descriptionPlaceholder')}
+              aria-label={t('teamDetailPage.task.descriptionPlaceholder')}
               rows={3}
               className="text-[14px]"
             />
             <Select value={newTaskPriority} onValueChange={setNewTaskPriority}>
-              <SelectTrigger aria-label="优先级" className="h-[36px] rounded-[10px] border-[#e3e7f1] text-[14px]">
-                <SelectValue placeholder="优先级" />
+              <SelectTrigger aria-label={t('teamDetailPage.task.priority')} className="h-[36px] rounded-[10px] border-[#e3e7f1] text-[14px]">
+                <SelectValue placeholder={t('teamDetailPage.task.priority')} />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="high">高</SelectItem>
-                <SelectItem value="medium">中</SelectItem>
-                <SelectItem value="low">低</SelectItem>
+                <SelectItem value="high">{t('teamDetailPage.priority.high')}</SelectItem>
+                <SelectItem value="medium">{t('teamDetailPage.priority.medium')}</SelectItem>
+                <SelectItem value="low">{t('teamDetailPage.priority.low')}</SelectItem>
               </SelectContent>
             </Select>
             <Select value={newTaskAssignee} onValueChange={setNewTaskAssignee}>
-              <SelectTrigger aria-label="执行者" className="h-[36px] rounded-[10px] border-[#e3e7f1] text-[14px]">
-                <SelectValue placeholder="执行者" />
+              <SelectTrigger aria-label={t('teamDetailPage.task.assignee')} className="h-[36px] rounded-[10px] border-[#e3e7f1] text-[14px]">
+                <SelectValue placeholder={t('teamDetailPage.task.assignee')} />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value={POOL_ASSIGNEE_VALUE}>投入任务池竞标</SelectItem>
+                <SelectItem value={POOL_ASSIGNEE_VALUE}>{t('teamDetailPage.task.pool')}</SelectItem>
                 {(team?.members || []).map((member) => (
                   <SelectItem key={member.agent_id} value={member.agent_id}>
                     {member.agent_name || member.agent_id}
@@ -1771,7 +1935,7 @@ export default function TeamDetailPage({
                 onClick={() => setTaskDialogOpen(false)}
                 className="h-[32px] rounded-[10px] border-[#e3e7f1] px-[16px] text-[13px] font-normal text-[#464c5e]"
               >
-                取消
+                {t('teamDetailPage.task.cancel')}
               </Button>
               <Button
                 type="button"
@@ -1779,7 +1943,7 @@ export default function TeamDetailPage({
                 onClick={() => void createTask()}
                 className="h-[32px] rounded-[10px] bg-[#18181a] px-[16px] text-[13px] font-normal text-white hover:bg-[#303030]"
               >
-                {creatingTask ? '创建中…' : '创建'}
+                {creatingTask ? t('teamDetailPage.task.creating') : t('teamDetailPage.task.createSubmit')}
               </Button>
             </div>
           </div>
@@ -1793,21 +1957,21 @@ export default function TeamDetailPage({
         }}
       >
         <DialogContent className="w-[calc(100%-32px)] rounded-[16px] sm:max-w-[480px]">
-          <DialogTitle className="text-[16px] font-semibold text-foreground">编辑黑板条目</DialogTitle>
+          <DialogTitle className="text-[16px] font-semibold text-foreground">{t('teamDetailPage.dialog.editBlackboard')}</DialogTitle>
           <div className="flex flex-col gap-[12px]">
             <Textarea
               value={editContent}
               onChange={(event) => setEditContent(event.target.value)}
-              placeholder="黑板内容"
-              aria-label="黑板内容"
+              placeholder={t('teamDetailPage.dialog.editContent')}
+              aria-label={t('teamDetailPage.dialog.editContent')}
               rows={3}
               className="text-[14px]"
             />
             <Input
               value={editTags}
               onChange={(event) => setEditTags(event.target.value)}
-              placeholder="标签（逗号分隔，可选）"
-              aria-label="编辑标签（逗号分隔，可选）"
+              placeholder={t('teamDetailPage.blackboard.tagsPlaceholder')}
+              aria-label={t('teamDetailPage.dialog.editTags')}
               className="h-[36px] rounded-[10px] border-[#e3e7f1] text-[14px]"
             />
             <div className="flex items-center justify-end gap-[8px]">
@@ -1818,7 +1982,7 @@ export default function TeamDetailPage({
                 onClick={() => setEditingEntry(null)}
                 className="h-[32px] rounded-[10px] border-[#e3e7f1] px-[16px] text-[13px] font-normal text-[#464c5e]"
               >
-                取消
+                {t('teamDetailPage.dialog.cancel')}
               </Button>
               <Button
                 type="button"
@@ -1826,7 +1990,7 @@ export default function TeamDetailPage({
                 onClick={() => void saveEditEntry()}
                 className="h-[32px] rounded-[10px] bg-[#18181a] px-[16px] text-[13px] font-normal text-white hover:bg-[#303030]"
               >
-                {savingEntry ? '保存中…' : '保存'}
+                {savingEntry ? t('teamDetailPage.dialog.saving') : t('teamDetailPage.dialog.save')}
               </Button>
             </div>
           </div>
@@ -1836,6 +2000,7 @@ export default function TeamDetailPage({
   );
 }
 
+/** 展示团队导出日志；产品 chrome 本地化，消息、事件和原始 JSON 作为诊断/业务原文保留。 */
 function TeamLogDialog({
   open,
   loading,
@@ -1849,6 +2014,8 @@ function TeamLogDialog({
   onClose: () => void;
   onDownload: () => void;
 }) {
+  const { locale, t: appT } = useAppIntl();
+  const t = useMemo(() => createTeamDetailTranslator({ t: appT }), [appT]);
   const sessions = log?.sessions || [];
   const summary = log?.summary || {};
   const teamName = String(log?.team?.name || '');
@@ -1867,10 +2034,12 @@ function TeamLogDialog({
             </span>
             <div className="min-w-0">
               <DialogTitle className="truncate text-[15px] font-semibold text-[#18181a]">
-                团队完整日志
+                {t('teamDetailPage.section.teamLog')}
               </DialogTitle>
               <p className="mt-[2px] truncate text-[11px] text-[#858b9c]">
-                {teamName || '团队'} · 在线查看任务调度、成员会话、模型事件和工具调用
+                {teamName ? <RawIdentifier value={teamName} /> : t('teamDetailPage.value.team')}
+                {' · '}
+                {t('teamDetailPage.dialog.logDescription')}
               </p>
             </div>
           </div>
@@ -1882,23 +2051,23 @@ function TeamLogDialog({
             className="h-[32px] shrink-0 gap-[6px] rounded-[9px] border-[#e3e7f1] px-[12px] text-[12px] font-normal text-[#464c5e]"
           >
             <Download className="size-[13px]" />
-            下载 JSON
+            {t('teamDetailPage.dialog.downloadJson')}
           </Button>
         </div>
 
         {loading ? (
           <div className="flex min-h-[360px] flex-1 items-center justify-center gap-[8px] text-[13px] text-[#858b9c]">
             <LoaderCircle className="size-[18px] animate-spin text-[#1a71ff]" />
-            正在加载完整日志…
+            {t('teamDetailPage.dialog.loadingLog')}
           </div>
         ) : log ? (
           <div className="min-h-0 flex-1 overflow-y-auto bg-[#fafbfc] px-[24px] py-[20px]">
             <div className="grid grid-cols-2 gap-[10px] sm:grid-cols-4">
               {[
-                ['任务数', summary.task_count ?? log.tasks?.length ?? 0],
-                ['唤醒事件', summary.wake_event_count ?? log.wake_events?.length ?? 0],
-                ['黑板条目', summary.blackboard_entry_count ?? log.blackboard_entries?.length ?? 0],
-                ['成员会话', summary.session_count ?? sessions.length],
+                [t('teamDetailPage.dialog.summaryTasks'), summary.task_count ?? log.tasks?.length ?? 0],
+                [t('teamDetailPage.dialog.summaryWakeEvents'), summary.wake_event_count ?? log.wake_events?.length ?? 0],
+                [t('teamDetailPage.dialog.summaryBlackboard'), summary.blackboard_entry_count ?? log.blackboard_entries?.length ?? 0],
+                [t('teamDetailPage.dialog.summarySessions'), summary.session_count ?? sessions.length],
               ].map(([label, value]) => (
                 <div key={String(label)} className="rounded-[12px] border border-[#e7eaf0] bg-white px-[14px] py-[12px]">
                   <p className="text-[11px] text-[#858b9c]">{label}</p>
@@ -1910,8 +2079,8 @@ function TeamLogDialog({
             <section className="mt-[16px] rounded-[14px] border border-[#e3e7f1] bg-white p-[14px]">
               <div className="mb-[10px] flex items-center justify-between gap-[8px]">
                 <div>
-                  <h3 className="text-[13px] font-semibold text-[#18181a]">成员会话</h3>
-                  <p className="mt-[2px] text-[11px] text-[#858b9c]">逐个查看成员消息、模型事件和工具调用</p>
+                  <h3 className="text-[13px] font-semibold text-[#18181a]">{t('teamDetailPage.section.memberSessions')}</h3>
+                  <p className="mt-[2px] text-[11px] text-[#858b9c]">{t('teamDetailPage.dialog.memberSessionsDescription')}</p>
                 </div>
                 <span className="rounded-full bg-[#eef4ff] px-[9px] py-[3px] text-[11px] text-[#1a71ff]">
                   {sessions.length}
@@ -1944,17 +2113,30 @@ function TeamLogDialog({
                           <div className="flex items-center justify-between gap-[12px]">
                             <div className="min-w-0">
                               <p className="truncate text-[12px] font-medium text-[#303442]">
-                                {String(session.title || sessionId)}
+                                <RawIdentifier value={String(session.title || sessionId)} />
                               </p>
                               <p className="mt-[2px] truncate text-[11px] text-[#858b9c]">
-                                {String(session.agent_name || session.agent_id || '未指定员工')}
-                                {session.status ? ` · ${String(session.status)}` : ''}
+                                {session.agent_name || session.agent_id ? (
+                                  <RawIdentifier value={String(session.agent_name || session.agent_id)} />
+                                ) : t('teamDetailPage.dialog.employeeFallback')}
+                                {session.status ? (
+                                  <>
+                                    {' · '}
+                                    <RawIdentifier value={String(session.status)} />
+                                  </>
+                                ) : null}
                               </p>
                             </div>
                             <div className="flex shrink-0 flex-wrap justify-end gap-[5px] text-[10px] text-[#697086]">
-                              <span className="rounded-full bg-[#f1f3f7] px-[7px] py-[3px]">消息 {messages.length}</span>
-                              <span className="rounded-full bg-[#f1f3f7] px-[7px] py-[3px]">事件 {events.length}</span>
-                              <span className="rounded-full bg-[#f1f3f7] px-[7px] py-[3px]">工具调用 {invocations.length}</span>
+                              <span className="rounded-full bg-[#f1f3f7] px-[7px] py-[3px]">
+                                {t('teamDetailPage.value.messageCount', { count: messages.length })}
+                              </span>
+                              <span className="rounded-full bg-[#f1f3f7] px-[7px] py-[3px]">
+                                {t('teamDetailPage.value.eventCount', { count: events.length })}
+                              </span>
+                              <span className="rounded-full bg-[#f1f3f7] px-[7px] py-[3px]">
+                                {t('teamDetailPage.value.toolCount', { count: invocations.length })}
+                              </span>
                             </div>
                           </div>
                         </summary>
@@ -1979,23 +2161,27 @@ function TeamLogDialog({
                                     )}
                                   >
                                     <div className="mb-[4px] text-[10px] font-medium text-[#858b9c]">
-                                      {role === 'user' ? '用户' : role === 'assistant' ? '数字员工' : role}
+                                      {role === 'user'
+                                        ? t('teamDetailPage.role.user')
+                                        : role === 'assistant'
+                                          ? t('teamDetailPage.role.assistant')
+                                          : <RawIdentifier value={role} />}
                                     </div>
                                     {role === 'assistant'
                                       ? <MarkdownMessage content={content} />
-                                      : <p className="whitespace-pre-wrap">{content}</p>}
+                                      : <p className="whitespace-pre-wrap"><RawContent value={content} /></p>}
                                   </div>
                                 </div>
                               );
                             })}
                             {messages.length === 0 && (
-                              <p className="py-[12px] text-center text-[11px] text-[#a7adbb]">暂无消息</p>
+                              <p className="py-[12px] text-center text-[11px] text-[#a7adbb]">{t('teamDetailPage.value.noMessages')}</p>
                             )}
                           </div>
 
                           {(events.length > 0 || invocations.length > 0) && (
                             <details className="mt-[10px] rounded-[9px] border border-[#e7eaf0] bg-[#fafbfc] px-[11px] py-[8px]">
-                              <summary className="cursor-pointer text-[11px] font-medium text-[#60677a]">原始事件与工具调用</summary>
+                              <summary className="cursor-pointer text-[11px] font-medium text-[#60677a]">{t('teamDetailPage.section.rawEvents')}</summary>
                               <pre className="mt-[8px] max-h-[420px] overflow-auto rounded-[8px] bg-[#18181a] p-[11px] text-[10px] leading-[1.55] text-[#d8e2f0]">
                                 {JSON.stringify({
                                   traces: sessionLog.traces || [],
@@ -2012,19 +2198,21 @@ function TeamLogDialog({
                   })}
                 </div>
               ) : (
-                <p className="py-[24px] text-center text-[12px] text-[#a7adbb]">暂无成员会话</p>
+                <p className="py-[24px] text-center text-[12px] text-[#a7adbb]">{t('teamDetailPage.value.noSessions')}</p>
               )}
             </section>
 
             <details className="mt-[12px] rounded-[12px] border border-[#e3e7f1] bg-white px-[14px] py-[11px]">
-              <summary className="cursor-pointer text-[12px] font-medium text-[#464c5e]">查看调度、黑板与完整原始 JSON</summary>
+              <summary className="cursor-pointer text-[12px] font-medium text-[#464c5e]">{t('teamDetailPage.section.rawJson')}</summary>
               <pre className="mt-[10px] max-h-[560px] overflow-auto rounded-[8px] bg-[#18181a] p-[12px] text-[10px] leading-[1.55] text-[#d8e2f0]">
                 {JSON.stringify(log, null, 2)}
               </pre>
             </details>
 
             <p className="mt-[10px] text-right text-[10px] text-[#a7adbb]">
-              导出时间：{log.exported_at ? formatClientDateTime(log.exported_at) : '-'}
+              {t('teamDetailPage.value.exportedAt', {
+                time: formatTeamDateTime(log.exported_at, locale, t),
+              })}
             </p>
           </div>
         ) : null}
