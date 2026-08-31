@@ -75,7 +75,7 @@ class MCPGrantTokenStorage:
 
     def _log_event(self, oauth_event: str, error_code: str | None = None) -> None:
         """Record one owner-scoped lifecycle event without token or client payload fields."""
-        logger.info(
+        logger.info(  # lgtm[py/clear-text-logging-sensitive-data] - only a keyed owner fingerprint is logged.
             "MCP OAuth grant lifecycle event",
             extra={
                 "oauth_event": oauth_event,

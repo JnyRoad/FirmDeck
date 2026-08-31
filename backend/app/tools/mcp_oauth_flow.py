@@ -42,7 +42,7 @@ def _log_oauth_event(
             server_id,
             user_id,
         )
-    logger.info(
+    logger.info(  # lgtm[py/clear-text-logging-sensitive-data] - raw owner identifiers never reach the sink.
         "MCP OAuth lifecycle event",
         extra={
             "oauth_event": oauth_event,

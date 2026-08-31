@@ -18,7 +18,7 @@ def _keyed_fingerprint(domain: str, payload: object) -> str:
     """Return a deployment-scoped digest without exposing guessable input hashes."""
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     message = domain.encode("utf-8") + b"\x00" + encoded
-    return hmac.new(
+    return hmac.new(  # lgtm[py/weak-sensitive-data-hashing] - keyed audit fingerprint, not password storage.
         get_settings().app_secret.encode("utf-8"),
         message,
         digestmod="sha256",
