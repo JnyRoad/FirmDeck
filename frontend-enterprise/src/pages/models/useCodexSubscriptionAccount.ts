@@ -32,11 +32,12 @@ export function useCodexSubscriptionAccount({
   const [loading, setLoading] = useState(false);
   const activeTenantRef = useRef<string | null>(null);
   const requestGenerationRef = useRef(0);
+  const accountActionInFlightRef = useRef(false);
   activeTenantRef.current = enabled ? tenantId : null;
 
   /** 读取当前租户的订阅账号状态。 */
   const reload = useCallback(async () => {
-    if (!enabled) return;
+    if (!enabled || accountActionInFlightRef.current) return;
     const requestTenantId = tenantId;
     const requestGeneration = ++requestGenerationRef.current;
     try {
@@ -63,6 +64,7 @@ export function useCodexSubscriptionAccount({
 
   useEffect(() => {
     requestGenerationRef.current += 1;
+    accountActionInFlightRef.current = false;
     setAccount(null);
     setLoading(false);
     if (!enabled) {
@@ -84,6 +86,7 @@ export function useCodexSubscriptionAccount({
     async (action: SubscriptionAction, fallbackMessage: string) => {
       if (!enabled) return;
       const requestTenantId = tenantId;
+      accountActionInFlightRef.current = true;
       const requestGeneration = ++requestGenerationRef.current;
       setLoading(true);
       try {
@@ -107,6 +110,9 @@ export function useCodexSubscriptionAccount({
         }
         notify.error(apiErrorMessage(error, fallbackMessage));
       } finally {
+        if (requestGenerationRef.current === requestGeneration) {
+          accountActionInFlightRef.current = false;
+        }
         if (
           activeTenantRef.current === requestTenantId &&
           requestGenerationRef.current === requestGeneration
