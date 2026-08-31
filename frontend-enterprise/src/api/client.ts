@@ -207,7 +207,7 @@ async function createWechatKfAccount(
   });
 }
 
-/** 更新已绑定客服账号的名称与头像 media ID。 */
+/** 更新已绑定客服账号名称；只有选择新头像时才携带可选 media ID。 */
 async function updateWechatKfAccount(
   bindingId: string,
   payload: WeChatKfAccountUpdateWrite,
