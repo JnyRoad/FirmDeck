@@ -849,7 +849,7 @@ def test_protected_mcp_tool_without_user_identity_fails_closed(monkeypatch) -> N
 
 
 def test_protected_mcp_tool_uses_current_user_grant_and_official_adapter(monkeypatch) -> None:
-    """Catch a protected invocation using another user's grant or static Authorization header."""
+    """Catch a protected invocation using another user's grant."""
     from mcp.shared.auth import OAuthToken
 
     from app.tools.mcp_oauth_service import MCPGrantTokenStorage

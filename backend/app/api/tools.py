@@ -34,6 +34,7 @@ from app.db.models import (
     AgentEvent,
     AgentProfile,
     AgentResourceBinding,
+    MCPOAuthFlow,
     MCPServer,
     MCPUserOAuthGrant,
     Tool,
@@ -1072,6 +1073,22 @@ def _delete_mcp_oauth_grants(db: Session, tenant_id: str, server_id: str) -> Non
         db.delete(grant)
 
 
+def _cancel_mcp_oauth_flows(db: Session, tenant_id: str, server_id: str) -> None:
+    """Invalidate callbacks that still target a changed or deleted server identity."""
+    flows = db.exec(
+        select(MCPOAuthFlow).where(
+            MCPOAuthFlow.tenant_id == tenant_id,
+            MCPOAuthFlow.server_id == server_id,
+            MCPOAuthFlow.status.in_({"pending", "callback_received"}),
+        )
+    ).all()
+    for flow in flows:
+        flow.status = "cancelled"
+        flow.error_code = "MCP_AUTHORIZATION_REQUIRED"
+        flow.updated_at = utc_now()
+        db.add(flow)
+
+
 @mcp_router.get(
     "", response_model=list[MCPServerRead], dependencies=[Depends(require_tenant_admin)]
 )
@@ -1290,6 +1307,7 @@ def update_mcp_server(
     row.updated_at = utc_now()
     db.add(row)
     if oauth_binding_changed:
+        _cancel_mcp_oauth_flows(db, request.tenant_id, row.id)
         _delete_mcp_oauth_grants(db, request.tenant_id, row.id)
     db.commit()
     db.refresh(row)
@@ -1316,6 +1334,7 @@ def delete_mcp_server(
         tools = db.exec(select(Tool).where(Tool.mcp_server_id == server_id)).all()
         for tool in tools:
             db.delete(tool)
+    _cancel_mcp_oauth_flows(db, tenant_id, row.id)
     _delete_mcp_oauth_grants(db, tenant_id, row.id)
     db.delete(row)
     db.commit()

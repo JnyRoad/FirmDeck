@@ -12,6 +12,16 @@ from sqlmodel import Session, SQLModel
 from app.db.models import MCPServer, Tenant, User, utc_now
 
 
+@pytest.fixture(autouse=True)
+def _reset_settings_cache() -> None:
+    """Reload environment-backed settings independently for every OAuth API test."""
+    from app.config import get_settings
+
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
+
+
 def _db(tmp_path) -> tuple[object, Session]:
     """Create an isolated tenant with one protected remote MCP server."""
     engine = create_engine(f"sqlite:///{tmp_path / 'api.db'}")
@@ -264,11 +274,32 @@ async def test_disconnect_removes_only_the_current_users_grant(tmp_path) -> None
     await first.set_tokens(OAuthToken(access_token="first", expires_in=3600))
     await second.set_tokens(OAuthToken(access_token="second", expires_in=3600))
 
-    api.disconnect_mcp_oauth("server_1", "tenant_1", db, _user("user_1"))
-    api.disconnect_mcp_oauth("server_1", "tenant_1", db, _user("user_1"))
+    await api.disconnect_mcp_oauth("server_1", "tenant_1", db, _user("user_1"))
+    await api.disconnect_mcp_oauth("server_1", "tenant_1", db, _user("user_1"))
 
     assert first.read_status().state == "disconnected"
     assert second.read_status().state == "connected"
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_disconnect_cancels_the_current_users_pending_flow(tmp_path, monkeypatch) -> None:
+    """Release an authorizing owner immediately while leaving peer flows untouched."""
+    import app.api.mcp_oauth as api
+
+    _engine, db = _db(tmp_path)
+    captured: list[tuple[str, str, str]] = []
+
+    class FakeCoordinator:
+        async def cancel_owner(self, tenant_id: str, server_id: str, user_id: str) -> None:
+            """Capture the exact owner scope cancelled by the disconnect route."""
+            captured.append((tenant_id, server_id, user_id))
+
+    monkeypatch.setattr(api, "_coordinator_for_engine", lambda _engine: FakeCoordinator())
+
+    await api.disconnect_mcp_oauth("server_1", "tenant_1", db, _user("user_1"))
+
+    assert captured == [("tenant_1", "server_1", "user_1")]
     db.close()
 
 
@@ -359,6 +390,46 @@ async def test_callback_redirects_expired_and_invalid_flows_to_recoverable_ui(
     assert expired.headers["location"] == "/enterprise/tools?mcp_oauth=expired"
     assert invalid.headers["location"] == "/enterprise/tools?mcp_oauth=failed"
     assert "secret" not in expired.headers["location"]
+
+
+@pytest.mark.asyncio
+async def test_callback_contains_unknown_failures_and_clears_the_flow_cookie(
+    monkeypatch,
+) -> None:
+    """Return a credential-free recovery redirect for an unexpected SDK failure."""
+    import app.api.mcp_oauth as api
+
+    class FakeCoordinator:
+        def browser_cookie_name_for_state(self, _state: str) -> str:
+            """Resolve the terminal browser cookie without exposing callback state."""
+            return "staffdeck_mcp_oauth_flow_unknown"
+
+        async def complete_callback(self, **kwargs):
+            """Model an unexpected provider failure after callback routing."""
+            del kwargs
+            raise RuntimeError("provider-body-must-not-escape")
+
+    monkeypatch.setattr(api, "_coordinator_for_engine", lambda _engine: FakeCoordinator())
+
+    response = await api.mcp_oauth_callback(
+        Request(
+            {
+                "type": "http",
+                "headers": [
+                    (b"cookie", b"staffdeck_mcp_oauth_flow_unknown=browser-binding")
+                ],
+            }
+        ),
+        state="secret-state",
+        code="secret-code",
+        iss=None,
+        error=None,
+    )
+
+    assert response.status_code == 302
+    assert response.headers["location"] == "/enterprise/tools?mcp_oauth=failed"
+    assert "provider-body" not in response.headers["location"]
+    assert "Max-Age=0" in response.headers["set-cookie"]
 
 
 def test_saved_protected_server_discovery_uses_current_user_sdk_grant(

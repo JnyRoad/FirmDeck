@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import secrets
 from datetime import datetime
 from typing import Literal
@@ -36,6 +37,7 @@ router = APIRouter(
     prefix="/api/enterprise/mcp-servers",
     tags=["enterprise:mcp-oauth"],
 )
+logger = logging.getLogger(__name__)
 _coordinators: dict[int, MCPOAuthFlowCoordinator] = {}
 
 
@@ -212,7 +214,7 @@ async def start_mcp_oauth(
 
 
 @router.delete("/{server_id}/oauth", status_code=204)
-def disconnect_mcp_oauth(
+async def disconnect_mcp_oauth(
     server_id: str,
     tenant_id: str = Query(..., min_length=1),
     db: Session = Depends(get_session),
@@ -221,8 +223,14 @@ def disconnect_mcp_oauth(
     """Delete only the signed-in user's encrypted grant for one server."""
     ensure_current_user_tenant(tenant_id, current_user)
     server = _get_server(db, tenant_id, server_id)
+    engine = _session_engine(db)
+    await _coordinator_for_engine(engine).cancel_owner(
+        tenant_id,
+        server.id,
+        current_user.id,
+    )
     MCPGrantTokenStorage(
-        _session_engine(db),
+        engine,
         tenant_id,
         server.id,
         current_user.id,
@@ -254,13 +262,19 @@ async def mcp_oauth_callback(
         )
     except (MCPOAuthFlowError, MCPAdapterError) as exc:
         outcome = "expired" if exc.code == "MCP_OAUTH_FLOW_EXPIRED" else "failed"
+    except Exception:  # noqa: BLE001 - callback failures must render a safe recovery route.
+        logger.error(
+            "MCP OAuth callback failed unexpectedly",
+            extra={"oauth_event": "mcp_oauth.callback_failed"},
+        )
+        outcome = "failed"
     response = RedirectResponse(
         url=f"/enterprise/tools?mcp_oauth={outcome}",
         status_code=302,
     )
     response.headers["Cache-Control"] = "no-store"
     response.headers["Referrer-Policy"] = "no-referrer"
-    if cookie_name and outcome in {"completed", "denied"}:
+    if cookie_name:
         response.delete_cookie(
             cookie_name,
             path="/api/enterprise/mcp-servers/oauth/callback",

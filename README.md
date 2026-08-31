@@ -169,39 +169,6 @@ subscription model and potentially other applications on the same computer that 
 login. This flow requires a local Codex CLI that can open a browser; it is not supported from
 remote or headless deployments.
 
-## MCP OAuth 2.1 + PKCE
-
-Saved Streamable HTTP MCP servers can opt in to per-user OAuth from the MCP server editor. StaffDeck
-uses the pinned official Python MCP SDK for protected discovery and invocation while preserving the
-existing client for no-auth, stdio, builtin, and legacy SSE connections.
-
-- Configure only public client data: either a pre-registered public client ID or a provider-supported
-  client metadata document URL, plus the exact redirect URI. Do not paste access tokens, refresh
-  tokens, PKCE verifiers, or client secrets into headers or the editor.
-- Each signed-in user connects and disconnects independently. SDK token and dynamic client models are
-  encrypted at rest and are never returned by server/status APIs.
-- The configured redirect URI must use the exact
-  `/api/enterprise/mcp-servers/oauth/callback` path. In deployed environments its HTTPS origin must
-  match `STAFFDECK_PUBLIC_URL`; loopback HTTP is allowed only for local development.
-- The callback is accepted only from the same browser flow that started authorization, using a
-  short-lived HttpOnly, SameSite cookie scoped to the callback path.
-- Every SDK HTTP target is restricted to HTTPS and public addresses. DNS is resolved and validated
-  again at connection time, then the TCP connection is pinned to the validated numeric address.
-- An unfinished browser authorization expires after 10 minutes and cannot resume after a process
-  restart. The start request and callback use process-local coordination, so multi-worker deployments
-  must route both requests to the same application process (for example with sticky routing) or add
-  a distributed coordinator.
-- Refresh operations are serialized per tenant/server/user in the current process and guarded by an
-  optimistic database version. Multi-worker deployments do not have a distributed refresh lock, so
-  route one user's OAuth work to a single process or add a distributed lock before scaling this path.
-- Frozen builds collect the `mcp` package modules and distribution metadata because the adapter checks
-  the reviewed SDK version at runtime.
-
-Provider registration remains external: the provider must accept the StaffDeck redirect URI and the
-configured public client identity, CIMD document, or SDK-supported dynamic registration. Live-provider
-interoperability is not implied by the controlled tests and must be validated separately with an
-approved StaffDeck client registration.
-
 ### 3. Launch the Web Demo
 
 | Platform | Recommended command |
@@ -263,6 +230,39 @@ Replace `up --detach` with another lifecycle argument when needed:
 | Stop the local service | `down` |
 
 > Full guide → [StaffDeck Tutorial](https://staffdeck.openbmb.cn/#/docs/introduce?lang=en)
+
+## MCP OAuth 2.1 + PKCE
+
+Saved Streamable HTTP MCP servers can opt in to per-user OAuth from the MCP server editor. StaffDeck
+uses the pinned official Python MCP SDK for protected discovery and invocation while preserving the
+existing client for no-auth, stdio, builtin, and legacy SSE connections.
+
+- Configure only public client data: either a pre-registered public client ID or a provider-supported
+  client metadata document URL, plus the exact redirect URI. Do not paste access tokens, refresh
+  tokens, PKCE verifiers, or client secrets into headers or the editor.
+- Each signed-in user connects and disconnects independently. SDK token and dynamic client models are
+  encrypted at rest and are never returned by server/status APIs.
+- The configured redirect URI must use the exact
+  `/api/enterprise/mcp-servers/oauth/callback` path. In deployed environments its HTTPS origin must
+  match `STAFFDECK_PUBLIC_URL`; loopback HTTP is allowed only for local development.
+- The callback is accepted only from the same browser flow that started authorization, using a
+  short-lived HttpOnly, SameSite cookie scoped to the callback path.
+- Every SDK HTTP target is restricted to HTTPS and public addresses. DNS is resolved and validated
+  again at connection time, then the TCP connection is pinned to the validated numeric address.
+- An unfinished browser authorization expires after 10 minutes and cannot resume after a process
+  restart. The start request and callback use process-local coordination, so multi-worker deployments
+  must route both requests to the same application process (for example with sticky routing) or add
+  a distributed coordinator.
+- Refresh operations are serialized per tenant/server/user in the current process and guarded by an
+  optimistic database version. Multi-worker deployments do not have a distributed refresh lock, so
+  route one user's OAuth work to a single process or add a distributed lock before scaling this path.
+- Frozen builds collect the `mcp` package modules and distribution metadata because the adapter checks
+  the reviewed SDK version at runtime.
+
+Provider registration remains external: the provider must accept the StaffDeck redirect URI and the
+configured public client identity, CIMD document, or SDK-supported dynamic registration. Live-provider
+interoperability is not implied by the controlled tests and must be validated separately with an
+approved StaffDeck client registration.
 
 
 

@@ -2095,6 +2095,16 @@ function McpServerEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'e
   const isRemote = values.transport === 'streamable_http' || values.transport === 'sse';
   const isStdio = values.transport === 'stdio';
   const isOAuth = values.auth_mode === 'oauth_personal';
+  const savedOAuthValues = server ? serverToFormValues(server) : null;
+  const oauthConfigurationDirty = Boolean(savedOAuthValues && (
+    values.auth_mode !== savedOAuthValues.auth_mode
+    || values.transport !== savedOAuthValues.transport
+    || values.url.trim() !== savedOAuthValues.url.trim()
+    || values.headers.trim() !== savedOAuthValues.headers.trim()
+    || values.oauth_client_id.trim() !== savedOAuthValues.oauth_client_id.trim()
+    || values.oauth_client_metadata_url.trim() !== savedOAuthValues.oauth_client_metadata_url.trim()
+    || values.oauth_redirect_uri.trim() !== savedOAuthValues.oauth_redirect_uri.trim()
+  ));
 
   async function loadOAuthStatus(targetServerId: string): Promise<void> {
     /** Refresh only the signed-in user's credential-free authorization projection. */
@@ -2628,7 +2638,7 @@ function McpServerEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'e
                       <span className={HINT_CLASS}>{t(TOOLS_MESSAGE_IDS.hintMcpOAuthStatus)}</span>
                     </div>
                     <div className="flex flex-wrap gap-[8px]">
-                      {oauthStatus?.state === 'connected' ? (
+                      {oauthStatus?.state === 'connected' || oauthStatus?.state === 'authorizing' ? (
                         <UIButton
                           variant="outline"
                           disabled={oauthBusy}
@@ -2639,7 +2649,7 @@ function McpServerEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'e
                         </UIButton>
                       ) : (
                         <UIButton
-                          disabled={oauthBusy || oauthStatus?.state === 'authorizing'}
+                          disabled={oauthBusy || oauthConfigurationDirty}
                           onClick={() => void beginOAuth()}
                           className={PRIMARY_BUTTON_CLASS}
                         >

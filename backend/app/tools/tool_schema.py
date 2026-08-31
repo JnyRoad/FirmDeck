@@ -285,8 +285,9 @@ class MCPServerCreateRequest(BaseModel):
             metadata = urlparse(self.oauth_client_metadata_url)
             if metadata.scheme != "https" or not metadata.netloc or metadata.path in {"", "/"}:
                 raise ValueError("OAuth client metadata URL must use HTTPS with a non-root path")
-        if self.oauth_redirect_uri:
-            self.oauth_redirect_uri = validate_mcp_oauth_redirect_uri(self.oauth_redirect_uri)
+        if not self.oauth_redirect_uri:
+            raise ValueError("personal OAuth requires a redirect URI")
+        self.oauth_redirect_uri = validate_mcp_oauth_redirect_uri(self.oauth_redirect_uri)
         return self
 
 

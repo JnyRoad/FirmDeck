@@ -1,5 +1,6 @@
 import asyncio
 import sys
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -25,11 +26,13 @@ from app.api.tools import (
 from app.db.models import (
     AgentProfile,
     AgentResourceBinding,
+    MCPOAuthFlow,
     MCPServer,
     MCPUserOAuthGrant,
     Tenant,
     Tool,
     User,
+    utc_now,
 )
 from app.tools.mcp_client import (
     MCPClientError,
@@ -47,6 +50,16 @@ from app.tools.tool_schema import (
     MCPSyncRequest,
     ToolCall,
 )
+
+
+@pytest.fixture(autouse=True)
+def _reset_settings_cache() -> None:
+    """Reload environment-backed settings independently for every API behavior test."""
+    from app.config import get_settings
+
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
 
 
 def _oauth_server_update(
@@ -138,6 +151,40 @@ def test_updating_oauth_binding_configuration_deletes_existing_grants(
         )
 
         assert db.exec(select(MCPUserOAuthGrant)).all() == []
+
+
+def test_updating_oauth_binding_configuration_cancels_pending_flows(
+    monkeypatch,
+) -> None:
+    """Prevent a callback for the old server identity from reaching its live SDK task."""
+    monkeypatch.setenv("STAFFDECK_PUBLIC_URL", "https://staffdeck.example")
+    with _test_session() as db:
+        server = _seed_oauth_server_and_grant(db)
+        db.add(
+            MCPOAuthFlow(
+                id="flow_update",
+                tenant_id="tenant_demo",
+                server_id=server.id,
+                user_id="user_admin",
+                state_digest="state-update",
+                redirect_uri=server.oauth_redirect_uri or "",
+                status="pending",
+                expires_at=utc_now() + timedelta(minutes=10),
+            )
+        )
+        db.commit()
+
+        update_mcp_server(
+            server.id,
+            _oauth_server_update(url="https://new-mcp.example.test/mcp"),
+            db,
+            _admin_user(),
+        )
+
+        flow = db.get(MCPOAuthFlow, "flow_update")
+        assert flow is not None
+        assert flow.status == "cancelled"
+        assert flow.error_code == "MCP_AUTHORIZATION_REQUIRED"
 
 
 def test_rotating_static_mcp_headers_deletes_existing_oauth_grants(monkeypatch) -> None:
@@ -994,6 +1041,38 @@ def test_delete_mcp_server_removes_personal_oauth_grants() -> None:
         )
 
         assert db.exec(select(MCPUserOAuthGrant)).all() == []
+
+
+def test_delete_mcp_server_cancels_pending_oauth_flows() -> None:
+    """Reject callbacks whose protected server was deleted during authorization."""
+    with _test_session() as db:
+        server = _seed_oauth_server_and_grant(db)
+        db.add(
+            MCPOAuthFlow(
+                id="flow_delete",
+                tenant_id="tenant_demo",
+                server_id=server.id,
+                user_id="user_admin",
+                state_digest="state-delete",
+                redirect_uri=server.oauth_redirect_uri or "",
+                status="pending",
+                expires_at=utc_now() + timedelta(minutes=10),
+            )
+        )
+        db.commit()
+
+        delete_mcp_server(
+            server.id,
+            "tenant_demo",
+            db,
+            agent_id=None,
+            remove_tools=True,
+            current_user=_admin_user(),
+        )
+
+        flow = db.get(MCPOAuthFlow, "flow_delete")
+        assert flow is not None
+        assert flow.status == "cancelled"
 
 
 def test_delete_mcp_server_in_employee_scope_only_unbinds() -> None:

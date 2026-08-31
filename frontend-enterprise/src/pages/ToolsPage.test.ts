@@ -432,6 +432,95 @@ describe('MCP personal OAuth lifecycle', () => {
     expect(await screen.findByRole('button', { name: 'Connect personal account' })).toBeTruthy();
   });
 
+  it('prevents authorization from starting with unsaved OAuth configuration', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/oauth/status')) {
+        return jsonResponse({
+          server_id: 'server-oauth',
+          auth_mode: 'oauth_personal',
+          state: 'disconnected',
+          expires_at: null,
+          scopes: [],
+          error_code: null,
+        });
+      }
+      if (url.includes('/api/enterprise/mcp-servers/server-oauth')) {
+        return jsonResponse(oauthServerResponse());
+      }
+      return jsonResponse([]);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const user = userEvent.setup();
+    renderSemanticMcpEditor('en-US');
+
+    const clientId = await screen.findByLabelText('Public client ID');
+    await user.clear(clientId);
+    await user.type(clientId, 'unsaved-client');
+
+    const connect = await screen.findByRole('button', { name: 'Connect personal account' });
+    expect((connect as HTMLButtonElement).disabled).toBe(true);
+    expect(fetchMock.mock.calls.some(([input]) => String(input).includes('/oauth/start'))).toBe(false);
+  });
+
+  it('prevents authorization after editing the saved server URL or static headers', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/oauth/status')) {
+        return jsonResponse({
+          server_id: 'server-oauth',
+          auth_mode: 'oauth_personal',
+          state: 'disconnected',
+          expires_at: null,
+          scopes: [],
+          error_code: null,
+        });
+      }
+      if (url.includes('/api/enterprise/mcp-servers/server-oauth')) {
+        return jsonResponse(oauthServerResponse());
+      }
+      return jsonResponse([]);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const user = userEvent.setup();
+    renderSemanticMcpEditor('en-US');
+
+    const serverUrl = await screen.findByLabelText('Server URL');
+    await user.clear(serverUrl);
+    await user.type(serverUrl, 'https://new-target.example/mcp');
+
+    const connect = await screen.findByRole('button', { name: 'Connect personal account' });
+    expect((connect as HTMLButtonElement).disabled).toBe(true);
+    expect(fetchMock.mock.calls.some(([input]) => String(input).includes('/oauth/start'))).toBe(false);
+  });
+
+  it('offers disconnect recovery while authorization is still pending', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/oauth/status')) {
+        return jsonResponse({
+          server_id: 'server-oauth',
+          auth_mode: 'oauth_personal',
+          state: 'authorizing',
+          expires_at: null,
+          scopes: [],
+          error_code: null,
+        });
+      }
+      if (url.includes('/api/enterprise/mcp-servers/server-oauth')) {
+        return jsonResponse(oauthServerResponse());
+      }
+      return jsonResponse([]);
+    }));
+
+    renderSemanticMcpEditor('en-US');
+
+    const disconnect = await screen.findByRole('button', { name: 'Disconnect account' });
+    expect((disconnect as HTMLButtonElement).disabled).toBe(false);
+  });
+
   it.each([
     ['zh-CN', '连接个人账户', '个人 OAuth 授权'],
     ['en-US', 'Connect personal account', 'Personal OAuth authorization'],

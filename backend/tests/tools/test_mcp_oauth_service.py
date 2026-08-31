@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import threading
+import weakref
 from datetime import UTC, datetime
 
 import pytest
@@ -304,6 +306,40 @@ def test_grant_operation_lock_is_shared_only_by_the_same_owner(tmp_path) -> None
 
     assert first.operation_lock() is same_owner.operation_lock()
     assert first.operation_lock() is not other_user.operation_lock()
+
+
+def test_grant_operation_locks_release_collected_engines(tmp_path) -> None:
+    """Prevent the process-wide owner lock registry from retaining dead engines forever."""
+    from app.tools.mcp_oauth_service import MCPGrantTokenStorage, _operation_locks
+
+    engine = _engine(tmp_path)
+    engine_id = id(engine)
+    storage = MCPGrantTokenStorage(engine, "tenant_1", "server_1", "user_1")
+    storage.operation_lock()
+    engine_reference = weakref.ref(engine)
+
+    del storage
+    del engine
+    gc.collect()
+
+    assert engine_reference() is None
+    assert all(
+        id(key) != engine_id
+        and not (isinstance(key, tuple) and key and key[0] == engine_id)
+        for key in _operation_locks
+    )
+
+
+def test_grant_operation_locks_release_inactive_owners_on_a_live_engine(tmp_path) -> None:
+    """Avoid retaining one lock forever for every owner seen by a long-lived engine."""
+    from app.tools.mcp_oauth_service import MCPGrantTokenStorage, _operation_locks
+
+    engine = _engine(tmp_path)
+    storage = MCPGrantTokenStorage(engine, "tenant_1", "server_1", "user_1")
+    storage.operation_lock()
+    gc.collect()
+
+    assert len(_operation_locks.get(engine, {})) == 0
 
 
 @pytest.mark.asyncio

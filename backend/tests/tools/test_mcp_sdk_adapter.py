@@ -26,6 +26,34 @@ def test_adapter_rejects_an_unpinned_sdk_version() -> None:
     from app.tools.mcp_sdk_adapter import assert_supported_sdk_version
 
     assert assert_supported_sdk_version("2.1.1") == "2.1.1"
+    with pytest.raises(RuntimeError, match="expected 2.1.1, got 2.1.2"):
+        assert_supported_sdk_version("2.1.2")
+
+
+def test_adapter_recovers_a_wrapped_oauth_flow_error() -> None:
+    """Preserve the authorization signal when the SDK wraps its flow exception."""
+    from mcp.client.auth import OAuthFlowError
+
+    from app.tools.mcp_sdk_adapter import _find_adapter_error
+
+    error = _find_adapter_error(
+        ExceptionGroup("sdk task group", [OAuthFlowError("provider rejected")]),
+        oauth_error_code="MCP_TOKEN_REFRESH_FAILED",
+    )
+
+    assert error is not None
+    assert error.code == "MCP_TOKEN_REFRESH_FAILED"
+
+
+def test_public_transport_rejects_an_incompatible_httpcore_pool() -> None:
+    """Fail closed if an SDK upgrade removes the resolver boundary injection point."""
+    from app.tools.mcp_sdk_adapter import _PublicOnlyAsyncHTTPTransport
+
+    transport = object.__new__(_PublicOnlyAsyncHTTPTransport)
+    transport._pool = object()  # type: ignore[attr-defined]
+
+    with pytest.raises(RuntimeError, match="network backend"):
+        transport._install_public_network_backend()
 
 
 def test_adapter_maps_wrapped_grant_conflict_to_flow_conflict() -> None:
@@ -426,6 +454,37 @@ async def test_adapter_cancellation_while_waiting_does_not_strand_operation_lock
     assert reacquired is True
 
 
+@pytest.mark.asyncio
+async def test_adapter_bounds_operation_lock_wait_by_request_timeout() -> None:
+    """Return a stable conflict instead of waiting forever behind a stalled owner request."""
+    from app.tools.mcp_sdk_adapter import MCPAdapterError, MCPSDKAdapter
+
+    lock = threading.Lock()
+    lock.acquire()
+
+    class LockOnlyStorage:
+        """Expose the deliberately held owner lock without reaching SDK storage calls."""
+
+        def operation_lock(self) -> threading.Lock:
+            """Return the held lock used to exercise the acquisition deadline."""
+            return lock
+
+    adapter = MCPSDKAdapter(
+        server_url="https://mcp.example.test/mcp",
+        headers={},
+        storage=LockOnlyStorage(),  # type: ignore[arg-type]
+        redirect_uri="https://staffdeck.example/oauth/callback",
+        timeout_seconds=0.01,
+        url_validator=lambda _url: None,
+    )
+
+    try:
+        with pytest.raises(MCPAdapterError, match="MCP_OAUTH_FLOW_CONFLICT"):
+            await asyncio.wait_for(adapter.discover(), timeout=0.2)
+    finally:
+        lock.release()
+
+
 class _OAuthMCPServer:
     """Controlled HTTP boundary that exercises the real SDK OAuth and MCP transports."""
 
@@ -581,7 +640,11 @@ async def test_adapter_uses_official_pkce_flow_and_normalizes_results(tmp_path) 
 
     adapter = MCPSDKAdapter(
         server_url="https://mcp.example.test/mcp",
-        headers={"Cookie": "mcp-session", "X-Api-Key": "mcp-api-key"},
+        headers={
+            "Cookie": "mcp-session",
+            "Proxy-Authorization": "Basic must-not-leak",
+            "X-Api-Key": "mcp-api-key",
+        },
         storage=storage,
         redirect_uri="https://staffdeck.example/oauth/callback",
         redirect_handler=capture_redirect,
@@ -621,7 +684,9 @@ async def test_adapter_uses_official_pkce_flow_and_normalizes_results(tmp_path) 
     assert mcp_headers
     assert all(headers.get("cookie") == "mcp-session" for headers in mcp_headers)
     assert all(headers.get("x-api-key") == "mcp-api-key" for headers in mcp_headers)
+    assert all("proxy-authorization" not in headers for headers in mcp_headers)
     assert all("cookie" not in headers for headers in oauth_headers)
+    assert all("proxy-authorization" not in headers for headers in oauth_headers)
     assert all("x-api-key" not in headers for headers in oauth_headers)
     assert storage.read_authorization_server() == "https://auth.example.test"
 

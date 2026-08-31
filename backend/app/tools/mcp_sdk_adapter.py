@@ -131,7 +131,14 @@ class _PublicOnlyAsyncHTTPTransport(httpx2.AsyncHTTPTransport):
     def __init__(self) -> None:
         """Replace the locked transport's resolver before it opens any connection."""
         super().__init__(trust_env=False, retries=0)
-        self._pool._network_backend = _PublicOnlyNetworkBackend()
+        self._install_public_network_backend()
+
+    def _install_public_network_backend(self) -> None:
+        """Fail closed when the reviewed httpcore injection boundary is unavailable."""
+        pool = getattr(self, "_pool", None)
+        if pool is None or not hasattr(pool, "_network_backend"):
+            raise RuntimeError("HTTP transport has no compatible network backend boundary")
+        pool._network_backend = _PublicOnlyNetworkBackend()
 
 
 class MCPAdapterError(RuntimeError):
@@ -164,15 +171,21 @@ def _validate_oauth_target_url(raw_url: str) -> None:
         raise MCPAdapterError("MCP_OAUTH_PROVIDER_UNSUPPORTED") from exc
 
 
-def _find_adapter_error(exc: BaseException) -> MCPAdapterError | None:
+def _find_adapter_error(
+    exc: BaseException,
+    *,
+    oauth_error_code: str = "MCP_AUTHORIZATION_REQUIRED",
+) -> MCPAdapterError | None:
     """Recover a safe adapter error wrapped by an SDK task-group exception."""
     if isinstance(exc, MCPAdapterError):
         return exc
     if isinstance(exc, MCPGrantConflict):
         return MCPAdapterError("MCP_OAUTH_FLOW_CONFLICT")
+    if isinstance(exc, OAuthFlowError):
+        return MCPAdapterError(oauth_error_code)
     if isinstance(exc, BaseExceptionGroup):
         for nested in exc.exceptions:
-            found = _find_adapter_error(nested)
+            found = _find_adapter_error(nested, oauth_error_code=oauth_error_code)
             if found is not None:
                 return found
     return None
@@ -225,7 +238,9 @@ class MCPSDKAdapter:
         assert_supported_sdk_version()
         self.server_url = server_url
         self.headers = {
-            key: value for key, value in headers.items() if key.lower() != "authorization"
+            key: value
+            for key, value in headers.items()
+            if key.lower() not in {"authorization", "proxy-authorization"}
         }
         self.storage = storage
         self.redirect_uri = redirect_uri
@@ -308,7 +323,10 @@ class MCPSDKAdapter:
 
         lock_acquired = False
         if operation_lock is not None:
+            lock_deadline = asyncio.get_running_loop().time() + self.timeout_seconds
             while not operation_lock.acquire(blocking=False):
+                if asyncio.get_running_loop().time() >= lock_deadline:
+                    raise MCPAdapterError("MCP_OAUTH_FLOW_CONFLICT")
                 await asyncio.sleep(0.01)
             lock_acquired = True
         try:
@@ -358,7 +376,19 @@ class MCPSDKAdapter:
                 code = "MCP_INSUFFICIENT_SCOPE" if status == 403 else "MCP_ERROR"
                 raise MCPAdapterError(code) from exc
             except Exception as exc:  # noqa: BLE001 - SDK task groups wrap transport failures.
-                adapter_error = _find_adapter_error(exc)
+                status_reader = getattr(self.storage, "read_status", None)
+                status = status_reader() if callable(status_reader) else None
+                oauth_error_code = (
+                    "MCP_TOKEN_REFRESH_FAILED"
+                    if status is not None
+                    and status.state == "connected"
+                    and self.redirect_handler is None
+                    else "MCP_AUTHORIZATION_REQUIRED"
+                )
+                adapter_error = _find_adapter_error(
+                    exc,
+                    oauth_error_code=oauth_error_code,
+                )
                 if adapter_error is not None:
                     raise adapter_error from exc
                 code = (

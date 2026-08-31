@@ -6,6 +6,16 @@ from pydantic import ValidationError
 from app.tools.tool_schema import MCPServerConnection, MCPServerCreateRequest
 
 
+@pytest.fixture(autouse=True)
+def _reset_settings_cache() -> None:
+    """Reload environment-backed settings independently for every policy test."""
+    from app.config import get_settings
+
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
+
+
 def _request(**overrides):
     """Build the smallest valid server request and apply one policy variation."""
     values = {
@@ -17,6 +27,10 @@ def _request(**overrides):
         ),
     }
     values.update(overrides)
+    if values.get("auth_mode") == "oauth_personal" and "oauth_redirect_uri" not in overrides:
+        values["oauth_redirect_uri"] = (
+            "http://127.0.0.1/api/enterprise/mcp-servers/oauth/callback"
+        )
     return MCPServerCreateRequest(**values)
 
 
@@ -49,6 +63,24 @@ def test_personal_oauth_rejects_two_client_identification_modes() -> None:
             auth_mode="oauth_personal",
             oauth_client_id="staffdeck-public",
             oauth_client_metadata_url="https://staffdeck.example/.well-known/mcp-client.json",
+        )
+
+
+def test_personal_oauth_allows_sdk_dynamic_client_registration() -> None:
+    """Preserve the official SDK path when no pre-registered client identity exists."""
+    request = _request(auth_mode="oauth_personal")
+
+    assert request.oauth_client_id is None
+    assert request.oauth_client_metadata_url is None
+
+
+def test_personal_oauth_requires_a_redirect_uri() -> None:
+    """Reject a saved policy that cannot receive the authorization callback."""
+    with pytest.raises(ValidationError, match="redirect URI"):
+        _request(
+            auth_mode="oauth_personal",
+            oauth_client_id="staffdeck-public",
+            oauth_redirect_uri=None,
         )
 
 
@@ -120,3 +152,18 @@ def test_redirect_uri_accepts_the_configured_public_callback(monkeypatch) -> Non
     request = _request(auth_mode="oauth_personal", oauth_redirect_uri=redirect_uri)
 
     assert request.oauth_redirect_uri == redirect_uri
+
+
+def test_redirect_uri_uses_public_origin_loaded_from_dotenv(tmp_path, monkeypatch) -> None:
+    """Honor the deployment origin when it exists only in the configured dotenv file."""
+    from app.config import Settings
+    from app.tools import mcp_oauth_policy
+
+    dotenv = tmp_path / "oauth.env"
+    dotenv.write_text("STAFFDECK_PUBLIC_URL=https://dotenv.example\n", encoding="utf-8")
+    monkeypatch.delenv("STAFFDECK_PUBLIC_URL", raising=False)
+    settings = Settings(_env_file=dotenv)
+    monkeypatch.setattr(mcp_oauth_policy, "get_settings", lambda: settings)
+
+    redirect_uri = "https://dotenv.example/api/enterprise/mcp-servers/oauth/callback"
+    assert mcp_oauth_policy.validate_mcp_oauth_redirect_uri(redirect_uri) == redirect_uri

@@ -7,6 +7,7 @@ import logging
 from datetime import UTC, datetime, timedelta
 from threading import Lock
 from typing import Any, Literal
+from weakref import WeakKeyDictionary, WeakValueDictionary
 
 from mcp.shared.auth import OAuthClientInformationFull, OAuthMetadata, OAuthToken
 from pydantic import BaseModel, Field
@@ -23,7 +24,10 @@ from app.tools.mcp_oauth_policy import (
 
 logger = logging.getLogger(__name__)
 _operation_locks_guard = Lock()
-_operation_locks: dict[tuple[int, str, str, str], Lock] = {}
+_operation_locks: WeakKeyDictionary[
+    Engine,
+    WeakValueDictionary[tuple[str, str, str], Lock],
+] = WeakKeyDictionary()
 
 
 class MCPGrantConflict(RuntimeError):
@@ -86,12 +90,16 @@ class MCPGrantTokenStorage:
 
     def operation_lock(self) -> Lock:
         """Return the process-wide lock serializing one owner grant's SDK operations."""
-        key = (id(self.engine), self.tenant_id, self.server_id, self.user_id)
+        key = (self.tenant_id, self.server_id, self.user_id)
         with _operation_locks_guard:
-            lock = _operation_locks.get(key)
+            engine_locks = _operation_locks.get(self.engine)
+            if engine_locks is None:
+                engine_locks = WeakValueDictionary()
+                _operation_locks[self.engine] = engine_locks
+            lock = engine_locks.get(key)
             if lock is None:
                 lock = Lock()
-                _operation_locks[key] = lock
+                engine_locks[key] = lock
             return lock
 
     def _select_row(self, db: Session) -> MCPUserOAuthGrant | None:

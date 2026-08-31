@@ -157,6 +157,80 @@ class MCPOAuthFlowCoordinator:
         if pending is not None:
             self._pending_by_digest.pop(pending.state_digest, None)
 
+    async def _wait_for_task_until_expiry(
+        self,
+        pending: _PendingFlow,
+        expires_at: datetime,
+    ) -> None:
+        """Bound post-callback SDK work by the durable authorization deadline."""
+        remaining = max((expires_at - utc_now()).total_seconds(), 0.0)
+        try:
+            await asyncio.wait_for(pending.task, timeout=remaining)
+        except TimeoutError as exc:
+            self._update_status(pending.flow_id, "expired", "MCP_OAUTH_FLOW_EXPIRED")
+            raise MCPOAuthFlowError("MCP_OAUTH_FLOW_EXPIRED") from exc
+
+    async def cancel_owner(self, tenant_id: str, server_id: str, user_id: str) -> None:
+        """Cancel every live authorization task owned by one disconnected account."""
+        with Session(self.engine) as db:
+            rows = db.exec(
+                select(MCPOAuthFlow).where(
+                    MCPOAuthFlow.tenant_id == tenant_id,
+                    MCPOAuthFlow.server_id == server_id,
+                    MCPOAuthFlow.user_id == user_id,
+                    MCPOAuthFlow.status.in_({"pending", "callback_received"}),
+                )
+            ).all()
+            flow_ids = {row.id for row in rows}
+            for row in rows:
+                row.status = "cancelled"
+                row.error_code = "MCP_AUTHORIZATION_REQUIRED"
+                row.updated_at = utc_now()
+                db.add(row)
+            db.commit()
+
+        await self._stop_pending_tasks(flow_ids)
+
+    async def _stop_pending_tasks(self, flow_ids: set[str]) -> None:
+        """Wake or cancel selected SDK tasks after their durable flow is inactive."""
+        tasks: list[asyncio.Task[None]] = []
+        for flow_id in flow_ids:
+            pending = self._pending_by_id.get(flow_id)
+            if pending is None:
+                continue
+            if not pending.callback_future.done():
+                pending.callback_future.set_exception(
+                    MCPOAuthFlowError("MCP_AUTHORIZATION_REQUIRED")
+                )
+            elif not pending.task.done():
+                pending.task.cancel()
+            tasks.append(pending.task)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _reconcile_inactive_owner_tasks(
+        self,
+        tenant_id: str,
+        server_id: str,
+        user_id: str,
+    ) -> None:
+        """Release process-local tasks invalidated by another committed request."""
+        inactive_flow_ids: set[str] = set()
+        with Session(self.engine) as db:
+            for pending in self._pending_by_id.values():
+                row = db.get(MCPOAuthFlow, pending.flow_id)
+                if (
+                    row is None
+                    or (
+                        row.tenant_id == tenant_id
+                        and row.server_id == server_id
+                        and row.user_id == user_id
+                        and row.status not in {"pending", "callback_received"}
+                    )
+                ):
+                    inactive_flow_ids.add(pending.flow_id)
+        await self._stop_pending_tasks(inactive_flow_ids)
+
     async def start(
         self,
         *,
@@ -171,6 +245,7 @@ class MCPOAuthFlowCoordinator:
         if not browser_binding:
             raise MCPOAuthFlowError("MCP_OAUTH_CALLBACK_INVALID")
         owner_key = (tenant_id, server_id, user_id)
+        await self._reconcile_inactive_owner_tasks(tenant_id, server_id, user_id)
         if owner_key in self._pending_owner_keys:
             raise MCPOAuthFlowError("MCP_OAUTH_FLOW_CONFLICT")
         for pending in self._pending_by_id.values():
@@ -234,12 +309,22 @@ class MCPOAuthFlowCoordinator:
 
         async def callback_handler() -> AuthorizationCodeResult:
             """Wait no longer than the persisted flow TTL for the browser callback."""
-            remaining = max((expires_at - utc_now()).total_seconds(), 0.0)
-            try:
-                return await asyncio.wait_for(asyncio.shield(callback_future), timeout=remaining)
-            except TimeoutError as exc:
-                self._update_status(flow_id, "expired", "MCP_OAUTH_FLOW_EXPIRED")
-                raise MCPOAuthFlowError("MCP_OAUTH_FLOW_EXPIRED") from exc
+            while True:
+                remaining = max((expires_at - utc_now()).total_seconds(), 0.0)
+                if remaining <= 0:
+                    self._update_status(flow_id, "expired", "MCP_OAUTH_FLOW_EXPIRED")
+                    raise MCPOAuthFlowError("MCP_OAUTH_FLOW_EXPIRED")
+                try:
+                    return await asyncio.wait_for(
+                        asyncio.shield(callback_future),
+                        timeout=min(remaining, 0.1),
+                    )
+                except TimeoutError as exc:
+                    durable_status = self.read_flow_status(flow_id)
+                    if durable_status == "expired":
+                        raise MCPOAuthFlowError("MCP_OAUTH_FLOW_EXPIRED") from exc
+                    if durable_status not in {"pending", "callback_received"}:
+                        raise MCPOAuthFlowError("MCP_AUTHORIZATION_REQUIRED") from exc
 
         async def run_operation() -> None:
             """Run the SDK operation and close the durable audit state on every exit path."""
@@ -258,7 +343,7 @@ class MCPOAuthFlowCoordinator:
                 raise
             except Exception as exc:
                 status = self.read_flow_status(flow_id)
-                if status not in {"denied", "expired"}:
+                if status not in {"cancelled", "denied", "expired"}:
                     self._update_status(flow_id, "failed", "MCP_OAUTH_CALLBACK_INVALID")
                     _log_oauth_event(
                         "mcp_oauth.failed",
@@ -397,7 +482,10 @@ class MCPOAuthFlowCoordinator:
                     MCPOAuthFlowError("MCP_AUTHORIZATION_REQUIRED")
                 )
             try:
-                await pending.task
+                await self._wait_for_task_until_expiry(pending, row.expires_at)
+            except MCPOAuthFlowError as exc:
+                if exc.code == "MCP_OAUTH_FLOW_EXPIRED":
+                    raise
             except Exception:  # The SDK may wrap the intentional callback denial.
                 pass
             return "denied"
@@ -421,7 +509,10 @@ class MCPOAuthFlowCoordinator:
                     MCPOAuthFlowError("MCP_OAUTH_CALLBACK_INVALID")
                 )
             try:
-                await pending.task
+                await self._wait_for_task_until_expiry(pending, row.expires_at)
+            except MCPOAuthFlowError as exc:
+                if exc.code == "MCP_OAUTH_FLOW_EXPIRED":
+                    raise
             except Exception:  # The SDK may wrap the intentional callback failure.
                 pass
             raise MCPOAuthFlowError("MCP_OAUTH_CALLBACK_INVALID")
@@ -433,7 +524,7 @@ class MCPOAuthFlowCoordinator:
         pending.callback_future.set_result(
             AuthorizationCodeResult(code=code, state=state, iss=iss)
         )
-        await pending.task
+        await self._wait_for_task_until_expiry(pending, row.expires_at)
         return "completed"
 
     async def wait_until_finished(

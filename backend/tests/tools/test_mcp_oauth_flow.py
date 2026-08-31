@@ -428,3 +428,134 @@ async def test_flow_security_events_never_log_state_or_authorization_code(
     events = [getattr(record, "oauth_event", None) for record in caplog.records]
     assert "mcp_oauth.started" in events
     assert "mcp_oauth.completed" in events
+
+
+@pytest.mark.asyncio
+async def test_callback_bounds_token_exchange_by_the_persisted_flow_ttl(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """Expire and cancel an SDK task that stalls after receiving the callback code."""
+    import app.tools.mcp_oauth_flow as flow
+
+    monkeypatch.setattr(flow, "FLOW_TTL_SECONDS", 0.02)
+    _engine, coordinator = _coordinator(tmp_path)
+
+    async def operation(redirect_handler, callback_handler) -> None:
+        """Accept the callback and then model a token exchange that never returns."""
+        await redirect_handler("https://auth.example/authorize?state=stall-after-code")
+        await callback_handler()
+        await asyncio.Event().wait()
+
+    started = await coordinator.start(
+        tenant_id="tenant_1",
+        server_id="server_1",
+        user_id="user_1",
+        redirect_uri="https://staffdeck.example/oauth/callback",
+        browser_binding="browser-binding",
+        operation=operation,
+    )
+
+    with pytest.raises(flow.MCPOAuthFlowError, match="MCP_OAUTH_FLOW_EXPIRED"):
+        await asyncio.wait_for(
+            coordinator.complete_callback(
+                state="stall-after-code",
+                code="authorization-code",
+                browser_binding="browser-binding",
+            ),
+            timeout=0.2,
+        )
+
+    assert coordinator.read_flow_status(started.flow_id) == "expired"
+    assert coordinator._pending_by_id == {}
+
+
+@pytest.mark.asyncio
+async def test_cancel_owner_releases_the_live_flow_for_immediate_reconnect(tmp_path) -> None:
+    """Cancel only one owner's task and allow that account to start a replacement flow."""
+    _engine, coordinator = _coordinator(tmp_path)
+    operation_count = 0
+
+    async def operation(redirect_handler, callback_handler) -> None:
+        """Keep each controlled authorization alive until cancellation."""
+        nonlocal operation_count
+        operation_count += 1
+        await redirect_handler(
+            f"https://auth.example/authorize?state=cancel-owner-{operation_count}"
+        )
+        await callback_handler()
+
+    started = await coordinator.start(
+        tenant_id="tenant_1",
+        server_id="server_1",
+        user_id="user_1",
+        redirect_uri="https://staffdeck.example/oauth/callback",
+        browser_binding="browser-binding",
+        operation=operation,
+    )
+
+    await coordinator.cancel_owner("tenant_1", "server_1", "user_1")
+
+    assert coordinator.read_flow_status(started.flow_id) == "cancelled"
+    assert coordinator._pending_by_id == {}
+    restarted = await coordinator.start(
+        tenant_id="tenant_1",
+        server_id="server_1",
+        user_id="user_1",
+        redirect_uri="https://staffdeck.example/oauth/callback",
+        browser_binding="browser-binding",
+        operation=operation,
+    )
+    assert restarted.flow_id != started.flow_id
+    coordinator.cancel_all()
+
+
+@pytest.mark.asyncio
+async def test_start_reconciles_a_flow_cancelled_by_server_configuration_change(
+    tmp_path,
+) -> None:
+    """Allow reconnect after another request invalidates the durable server binding."""
+    engine, coordinator = _coordinator(tmp_path)
+    operation_count = 0
+
+    async def operation(redirect_handler, callback_handler) -> None:
+        """Keep each flow alive until durable cancellation or test cleanup."""
+        nonlocal operation_count
+        operation_count += 1
+        await redirect_handler(
+            f"https://auth.example/authorize?state=config-change-{operation_count}"
+        )
+        await callback_handler()
+
+    started = await coordinator.start(
+        tenant_id="tenant_1",
+        server_id="server_1",
+        user_id="user_1",
+        redirect_uri="https://staffdeck.example/oauth/callback",
+        browser_binding="browser-binding",
+        operation=operation,
+    )
+    with Session(engine) as db:
+        row = db.get(MCPOAuthFlow, started.flow_id)
+        assert row is not None
+        row.status = "cancelled"
+        db.add(row)
+        db.commit()
+
+    for _attempt in range(50):
+        if not coordinator._pending_by_id:
+            break
+        await asyncio.sleep(0.01)
+    assert coordinator._pending_by_id == {}
+
+    restarted = await coordinator.start(
+        tenant_id="tenant_1",
+        server_id="server_1",
+        user_id="user_1",
+        redirect_uri="https://staffdeck.example/oauth/callback",
+        browser_binding="browser-binding",
+        operation=operation,
+    )
+
+    assert restarted.flow_id != started.flow_id
+    coordinator.cancel_all()

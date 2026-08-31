@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hmac
 import json
-import os
 from collections.abc import Mapping
 from typing import Any, Protocol
 from urllib.parse import SplitResult, urlsplit
@@ -62,7 +61,7 @@ def validate_mcp_oauth_redirect_uri(redirect_uri: str) -> str:
     ):
         raise ValueError("OAuth redirect URI must use the exact StaffDeck callback endpoint")
 
-    public_url = os.environ.get("STAFFDECK_PUBLIC_URL", "").strip()
+    public_url = get_settings().staffdeck_public_url.strip()
     if public_url:
         public = urlsplit(public_url)
         public_hostname = (public.hostname or "").lower()
