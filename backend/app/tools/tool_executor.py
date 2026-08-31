@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import os
 import re
+from collections.abc import Coroutine
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypeVar
 from urllib.parse import urlsplit
 
 import httpx
+from sqlalchemy import Engine
 from sqlmodel import Session, select
 
 from app.agents.branching import visible_tool_rows
@@ -24,9 +28,13 @@ from app.tools.mcp_client import (
     execute_mcp_tool,
     execute_mcp_tool_result,
 )
+from app.tools.mcp_oauth_policy import mcp_oauth_config_fingerprint
+from app.tools.mcp_oauth_service import MCPGrantTokenStorage
+from app.tools.mcp_sdk_adapter import MCPAdapterError, MCPSDKAdapter
 from app.tools.tool_schema import MCPAppDescriptor, ToolCall, ToolError, ToolResult
 
 SECRET_PATTERN = re.compile(r"\$\{secret\.([A-Z0-9_]+)\}")
+_AsyncResultT = TypeVar("_AsyncResultT")
 
 
 @dataclass(frozen=True)
@@ -49,6 +57,7 @@ class ToolExecutor:
         invocation_id: str | None = None,
         timeout_seconds_override: float | None = None,
         language_context: LanguageContext | dict[str, Any] | None = None,
+        user_id: str | None = None,
     ) -> ToolResult:
         """Execute one configured tool while preserving success data and sanitizing failures."""
         language_context = language_context or tool_call.language_context
@@ -81,6 +90,7 @@ class ToolExecutor:
                 active_skill_id=active_skill_id,
                 invocation_id=invocation_id,
                 timeout_seconds_override=timeout_seconds_override,
+                user_id=user_id,
             )
         if (tool.tool_type or "http") == "a2a":
             return self._execute_a2a_tool(
@@ -242,15 +252,24 @@ class ToolExecutor:
         active_skill_id: str | None = None,
         invocation_id: str | None = None,
         timeout_seconds_override: float | None = None,
+        user_id: str | None = None,
     ) -> ToolResult:
         """Execute MCP while keeping successful envelopes raw and failures canonical."""
         try:
-            config, tool_name = self._resolve_mcp_config(tool)
+            server, config, tool_name = self._resolve_mcp_config(tool)
             policy = self._execution_policy(
                 tool,
                 timeout_seconds_override=timeout_seconds_override,
             )
-            if config.get("apps_mode") == "auto":
+            if server.auth_mode == "oauth_personal":
+                envelope = self._execute_oauth_mcp_tool(
+                    server,
+                    tool_name=tool_name,
+                    arguments=arguments,
+                    user_id=user_id,
+                    timeout_seconds=policy.timeout_seconds,
+                )
+            elif config.get("apps_mode") == "auto":
                 envelope = execute_mcp_tool_result(
                     config,
                     arguments,
@@ -301,6 +320,14 @@ class ToolExecutor:
                     envelope.get("meta") if isinstance(envelope.get("meta"), dict) else {}
                 ),
             )
+        except MCPAdapterError as exc:
+            return self._error(
+                tool.name,
+                exc.code,
+                exc.code,
+                request_id=invocation_id,
+                trace_id=session_id,
+            )
         except MCPClientError as exc:
             descriptor = exc.occurrence.descriptor
             return self._error(
@@ -340,7 +367,10 @@ class ToolExecutor:
             timeout_seconds = min(timeout_seconds, max(float(timeout_seconds_override), 0.1))
         return ToolExecutionPolicy(timeout_seconds=timeout_seconds)
 
-    def _resolve_mcp_config(self, tool: Tool) -> tuple[dict[str, Any], str | None]:
+    def _resolve_mcp_config(
+        self,
+        tool: Tool,
+    ) -> tuple[MCPServer, dict[str, Any], str | None]:
         """Resolve an MCP tool through its persisted MCP server relation."""
         tool_config = tool.config_json or {}
         tool_name = (
@@ -353,7 +383,63 @@ class ToolExecutor:
             raise MCPClientError("MCP 工具关联的 Server 不存在或已删除。")
         if not server.enabled:
             raise MCPClientError("MCP 工具关联的 Server 当前已停用。")
-        return self._server_client_config(server), tool_name
+        return server, self._server_client_config(server), tool_name
+
+    def _execute_oauth_mcp_tool(
+        self,
+        server: MCPServer,
+        *,
+        tool_name: str | None,
+        arguments: dict[str, Any],
+        user_id: str | None,
+        timeout_seconds: float,
+    ) -> dict[str, Any]:
+        """Invoke a protected server only with the current user's encrypted SDK grant."""
+        if (
+            not user_id
+            or server.transport != "streamable_http"
+            or not server.url
+            or not server.oauth_redirect_uri
+            or not tool_name
+        ):
+            raise MCPAdapterError("MCP_AUTHORIZATION_REQUIRED")
+        bind = self.db.get_bind()
+        if not isinstance(bind, Engine):
+            raise MCPAdapterError("MCP_AUTHORIZATION_REQUIRED")
+
+        storage = MCPGrantTokenStorage(
+            bind,
+            server.tenant_id,
+            server.id,
+            user_id,
+            public_client_id=server.oauth_client_id,
+            client_metadata_url=server.oauth_client_metadata_url,
+            redirect_uri=server.oauth_redirect_uri,
+            config_fingerprint=mcp_oauth_config_fingerprint(server),
+            enforce_owner_binding=True,
+        )
+        status = storage.read_status()
+        if status.state != "connected":
+            code = (
+                "MCP_TOKEN_REFRESH_FAILED"
+                if status.state == "reconnect_required"
+                else "MCP_AUTHORIZATION_REQUIRED"
+            )
+            raise MCPAdapterError(code)
+        adapter = MCPSDKAdapter(
+            server_url=server.url,
+            headers=dict(server.headers_json or {}),
+            storage=storage,
+            redirect_uri=server.oauth_redirect_uri,
+            client_metadata_url=server.oauth_client_metadata_url,
+            timeout_seconds=timeout_seconds,
+        )
+        try:
+            return _run_coroutine(adapter.call_tool(tool_name, arguments))
+        except MCPAdapterError as exc:
+            if exc.code == "MCP_TOKEN_REFRESH_FAILED":
+                storage.mark_reconnect_required()
+            raise
 
     def _server_client_config(self, server: MCPServer) -> dict[str, Any]:
         transport = server.transport or "streamable_http"
@@ -484,3 +570,15 @@ class ToolExecutor:
 
 def _default_port(scheme: str) -> int | None:
     return 443 if scheme.lower() == "https" else 80 if scheme.lower() == "http" else None
+
+
+def _run_coroutine(coroutine: Coroutine[Any, Any, _AsyncResultT]) -> _AsyncResultT:
+    """Run one SDK operation from both sync workers and event-loop-owned call paths."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coroutine)
+    # Some recovery and test paths call the synchronous executor while already owning
+    # an event loop. Keep the SDK lifecycle isolated instead of nesting asyncio.run().
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="mcp-oauth") as executor:
+        return executor.submit(asyncio.run, coroutine).result()

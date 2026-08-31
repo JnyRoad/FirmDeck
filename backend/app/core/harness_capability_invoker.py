@@ -1165,6 +1165,7 @@ class HarnessCapabilityInvoker:
             invocation_id=call_id,
             timeout_seconds_override=self._remaining_step_seconds(),
             language_context=self.language_context,
+            user_id=self.session.user_id,
         )
         payload = result.model_dump(mode="json")
         # MCP Apps payloads belong to the host UI, not to the isolated model

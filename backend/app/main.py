@@ -18,6 +18,7 @@ from app.api import (
     general_skills,
     knowledge,
     knowledge_bases,
+    mcp_oauth,
     memories,
     mock,
     model_configs,
@@ -151,6 +152,7 @@ app.include_router(teams.router)
 app.include_router(teams.threads_router)
 app.include_router(tools.router)
 app.include_router(tools.mcp_router)
+app.include_router(mcp_oauth.router)
 app.include_router(sessions.router)
 app.include_router(traces.router)
 app.include_router(mock.router)

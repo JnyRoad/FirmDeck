@@ -609,6 +609,7 @@ export type CodexA2AAdapterRead = {
 
 export type MCPTransport = 'stdio' | 'streamable_http' | 'sse' | 'builtin';
 export type MCPAppsMode = 'disabled' | 'auto';
+export type MCPAuthMode = 'none' | 'oauth_personal';
 
 export type MCPServerConnection = {
   transport: MCPTransport;
@@ -629,6 +630,10 @@ export type MCPServerRead = {
   bucket: string;
   connection: MCPServerConnection;
   apps_mode: MCPAppsMode;
+  auth_mode: MCPAuthMode;
+  oauth_client_id?: string | null;
+  oauth_client_metadata_url?: string | null;
+  oauth_redirect_uri?: string | null;
   apps_negotiated: boolean;
   negotiated_capabilities: Record<string, unknown>;
   capability_scope?: CapabilityScope;
@@ -637,6 +642,21 @@ export type MCPServerRead = {
   tool_count: number;
   created_at: string;
   updated_at: string;
+};
+
+export type MCPOAuthStatusRead = {
+  server_id: string;
+  auth_mode: MCPAuthMode;
+  state: 'not_required' | 'disconnected' | 'authorizing' | 'connected' | 'reconnect_required';
+  expires_at?: string | null;
+  scopes: string[];
+  error_code?: string | null;
+};
+
+export type MCPOAuthStartResult = {
+  authorization_url: string;
+  flow_id: string;
+  expires_at: string;
 };
 
 export type MCPDiscoveredTool = {

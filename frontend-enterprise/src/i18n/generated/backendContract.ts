@@ -1816,6 +1816,14 @@ export const BACKEND_ERROR_CONTRACT = {
     "status": 404,
     "visibility": "public"
   },
+  "MCP_AUTHORIZATION_REQUIRED": {
+    "code": "MCP_AUTHORIZATION_REQUIRED",
+    "message_key": "errors.tool.mcpOAuthAuthorizationRequired",
+    "params": {},
+    "retryable": false,
+    "status": 401,
+    "visibility": "public"
+  },
   "MCP_DISCOVER_ERROR": {
     "code": "MCP_DISCOVER_ERROR",
     "message_key": "errors.tool.mcpDiscoverError",
@@ -1840,12 +1848,60 @@ export const BACKEND_ERROR_CONTRACT = {
     "status": 400,
     "visibility": "public"
   },
+  "MCP_INSUFFICIENT_SCOPE": {
+    "code": "MCP_INSUFFICIENT_SCOPE",
+    "message_key": "errors.tool.mcpOAuthInsufficientScope",
+    "params": {},
+    "retryable": false,
+    "status": 403,
+    "visibility": "public"
+  },
+  "MCP_OAUTH_CALLBACK_INVALID": {
+    "code": "MCP_OAUTH_CALLBACK_INVALID",
+    "message_key": "errors.tool.mcpOAuthCallbackInvalid",
+    "params": {},
+    "retryable": false,
+    "status": 400,
+    "visibility": "public"
+  },
+  "MCP_OAUTH_FLOW_CONFLICT": {
+    "code": "MCP_OAUTH_FLOW_CONFLICT",
+    "message_key": "errors.tool.mcpOAuthFlowConflict",
+    "params": {},
+    "retryable": false,
+    "status": 409,
+    "visibility": "public"
+  },
+  "MCP_OAUTH_FLOW_EXPIRED": {
+    "code": "MCP_OAUTH_FLOW_EXPIRED",
+    "message_key": "errors.tool.mcpOAuthFlowExpired",
+    "params": {},
+    "retryable": false,
+    "status": 410,
+    "visibility": "public"
+  },
+  "MCP_OAUTH_PROVIDER_UNSUPPORTED": {
+    "code": "MCP_OAUTH_PROVIDER_UNSUPPORTED",
+    "message_key": "errors.tool.mcpOAuthProviderUnsupported",
+    "params": {},
+    "retryable": false,
+    "status": 400,
+    "visibility": "public"
+  },
   "MCP_PROBE_ERROR": {
     "code": "MCP_PROBE_ERROR",
     "message_key": "errors.tool.mcpProbeError",
     "params": {},
     "retryable": false,
     "status": 500,
+    "visibility": "public"
+  },
+  "MCP_TOKEN_REFRESH_FAILED": {
+    "code": "MCP_TOKEN_REFRESH_FAILED",
+    "message_key": "errors.tool.mcpOAuthTokenRefreshFailed",
+    "params": {},
+    "retryable": false,
+    "status": 401,
     "visibility": "public"
   },
   "MEMORY_AGENT_NOT_FOUND": {

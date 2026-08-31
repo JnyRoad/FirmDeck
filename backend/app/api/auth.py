@@ -11,7 +11,14 @@ from sqlmodel import Session, select
 
 from app.contracts.http import build_http_exception
 from app.db import get_session
-from app.db.models import APIClient, APICredential, User, UserAvatar, utc_now
+from app.db.models import (
+    APIClient,
+    APICredential,
+    MCPUserOAuthGrant,
+    User,
+    UserAvatar,
+    utc_now,
+)
 from app.public_api.auth import generate_api_key
 from app.public_api.credential_profiles import USER_FULL_ACCESS_SCOPES
 from app.security.auth import (
@@ -525,6 +532,14 @@ def delete_user(
     avatar = db.get(UserAvatar, user_id)
     if avatar:
         db.delete(avatar)
+    grants = db.exec(
+        select(MCPUserOAuthGrant).where(
+            MCPUserOAuthGrant.tenant_id == tenant_id,
+            MCPUserOAuthGrant.user_id == user_id,
+        )
+    ).all()
+    for grant in grants:
+        db.delete(grant)
     db.delete(user)
     db.commit()
     return {"ok": True}

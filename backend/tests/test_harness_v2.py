@@ -2220,6 +2220,12 @@ def test_external_failure_claim_is_released_only_when_request_was_not_sent() -> 
     )
     assert not _failure_was_not_sent({"success": False, "error": {"code": "TIMEOUT"}})
     assert not _failure_was_not_sent({"success": False, "error": {"code": "HTTP_ERROR"}})
+    assert not _failure_was_not_sent(
+        {"success": False, "error": {"code": "MCP_AUTHORIZATION_REQUIRED"}}
+    )
+    assert not _failure_was_not_sent(
+        {"success": False, "error": {"code": "MCP_TOKEN_REFRESH_FAILED"}}
+    )
 
 
 def test_invoker_requires_run_local_activation_before_hidden_capability_call(
