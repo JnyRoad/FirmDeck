@@ -594,10 +594,28 @@ function registerFixtureHarnessTests() {
 
 /** Register the final migration absence tests without weakening their intentionally strict scans. */
 function registerFinalAbsenceTests() {
-  it('requires source-key catalogs and natural-language catalog keys to be absent', verifyFinalCatalogAbsence);
-  it('requires natural-language translation calls to be absent', verifyFinalNaturalTranslationKeyAbsence);
-  it('requires numeric placeholder compatibility to be absent', verifyFinalNumericPlaceholderAbsence);
-  it('requires broad ignores and compatibility allowlists to be absent', verifyFinalIgnoreAndAllowlistAbsence);
+  const wholeRepositoryScanTimeoutMs = 30_000;
+
+  it(
+    'requires source-key catalogs and natural-language catalog keys to be absent',
+    verifyFinalCatalogAbsence,
+    wholeRepositoryScanTimeoutMs,
+  );
+  it(
+    'requires natural-language translation calls to be absent',
+    verifyFinalNaturalTranslationKeyAbsence,
+    wholeRepositoryScanTimeoutMs,
+  );
+  it(
+    'requires numeric placeholder compatibility to be absent',
+    verifyFinalNumericPlaceholderAbsence,
+    wholeRepositoryScanTimeoutMs,
+  );
+  it(
+    'requires broad ignores and compatibility allowlists to be absent',
+    verifyFinalIgnoreAndAllowlistAbsence,
+    wholeRepositoryScanTimeoutMs,
+  );
 }
 
 /** Register T080 fixture contracts for typed IDs, expression sinks, dataflow, and exclusions. */

@@ -3,9 +3,10 @@ from __future__ import annotations
 import logging
 import time
 from collections import Counter
-from typing import Any, Final, TypedDict
+from typing import Any, Final
 
 from sqlmodel import Session, select
+from typing_extensions import TypedDict
 
 from app.db.models import (
     AgentEvent,

@@ -959,7 +959,8 @@ describe('TeamDetailPage', () => {
     renderDetail();
 
     const settings = await screen.findByLabelText('团队设置');
-    expect((within(settings).getByLabelText('成员并发上限') as HTMLInputElement).value).toBe('2');
+    const concurrencyInput = within(settings).getByLabelText('成员并发上限') as HTMLInputElement;
+    await waitFor(() => expect(concurrencyInput.value).toBe('2'));
     const timeoutInput = within(settings).getByLabelText('任务超时分钟') as HTMLInputElement;
     expect(timeoutInput.value).toBe('30');
     expect((within(settings).getByLabelText('竞标反驳轮数') as HTMLInputElement).value).toBe('1');
