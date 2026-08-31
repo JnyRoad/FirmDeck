@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react';
 
 import { Badge, Button } from '@/components/ui';
+import { useAppIntl, type MessageId, type MessageValues } from '@/i18n';
+import { RawIdentifier } from '@/i18n/RawContent';
 import type {
   KnowledgePermission,
   TeamKnowledgeBindingRead,
@@ -9,6 +11,8 @@ import type {
 } from '@/types';
 
 type PermissionChoice = KnowledgePermission | 'none';
+
+type PermissionMatrixMessageId = MessageId;
 
 type TeamKnowledgePermissionMatrixProps = {
   binding: TeamKnowledgeBindingRead;
@@ -32,6 +36,9 @@ export default function TeamKnowledgePermissionMatrix({
   onRemove,
 }: TeamKnowledgePermissionMatrixProps) {
   const [permissions, setPermissions] = useState<Record<string, PermissionChoice>>({});
+  const { t: appT } = useAppIntl();
+  /** 将待补齐目录键适配到受控 MessageId；成员与知识库名称仍作为 raw 参数。 */
+  const t = (id: PermissionMatrixMessageId, values?: MessageValues) => appT(id, values);
 
   useEffect(() => {
     /** Rebuild visible permissions whenever the server revision or roster changes. */
@@ -60,18 +67,21 @@ export default function TeamKnowledgePermissionMatrix({
       <div className="flex flex-wrap items-start justify-between gap-[10px]">
         <div>
           <div className="flex flex-wrap items-center gap-[8px]">
-            <h3 className="text-[14px] font-medium text-[#18181a]">{binding.knowledge_base_name}</h3>
+            <h3 className="text-[14px] font-medium text-[#18181a]"><RawIdentifier value={binding.knowledge_base_name} /></h3>
             <Badge className="rounded-full bg-[#e8f0ff] text-[11px] font-normal text-[#1a71ff]">
-              共享知识库
+              {t('teamKnowledgePermissionMatrix.badge.shared')}
             </Badge>
             {binding.is_default && (
               <Badge className="rounded-full bg-[#eaf7ef] text-[11px] font-normal text-[#287a4d]">
-                默认写入
+                {t('teamKnowledgePermissionMatrix.badge.default')}
               </Badge>
             )}
           </div>
           <p className="mt-[4px] text-[12px] text-[#858b9c]">
-            {`正式版本 ${binding.published_version || '--'} · 配置修订 ${binding.revision}`}
+            {t('teamKnowledgePermissionMatrix.versionInfo', {
+              version: binding.published_version || '--',
+              revision: binding.revision,
+            })}
           </p>
         </div>
         <div className="flex flex-wrap gap-[6px]">
@@ -80,22 +90,26 @@ export default function TeamKnowledgePermissionMatrix({
               type="button"
               variant="outline"
               disabled={busy}
-              aria-label={`设为默认 ${binding.knowledge_base_name}`}
+              aria-label={t('teamKnowledgePermissionMatrix.action.setDefault', {
+                knowledgeBaseName: binding.knowledge_base_name,
+              })}
               onClick={() => void onSetDefault(binding)}
               className="h-[30px] rounded-[9px] px-[10px] text-[12px]"
             >
-              设为默认
+              {t('teamKnowledgePermissionMatrix.action.setDefaultButton')}
             </Button>
           )}
           <Button
             type="button"
             variant="outline"
             disabled={busy}
-            aria-label={`移除共享知识库 ${binding.knowledge_base_name}`}
+            aria-label={t('teamKnowledgePermissionMatrix.action.remove', {
+              knowledgeBaseName: binding.knowledge_base_name,
+            })}
             onClick={() => void onRemove(binding)}
             className="h-[30px] rounded-[9px] px-[10px] text-[12px] text-[#c0342b]"
           >
-            移除
+            {t('teamKnowledgePermissionMatrix.action.removeButton')}
           </Button>
         </div>
       </div>
@@ -106,9 +120,12 @@ export default function TeamKnowledgePermissionMatrix({
             key={member.agent_id}
             className="flex items-center justify-between gap-[8px] rounded-[10px] bg-white px-[10px] py-[8px] text-[12px] text-[#464c5e]"
           >
-            <span className="min-w-0 truncate">{member.agent_name || member.agent_id}</span>
+            <span className="min-w-0 truncate"><RawIdentifier value={member.agent_name || member.agent_id} /></span>
             <select
-              aria-label={`${member.agent_name || member.agent_id} 在 ${binding.knowledge_base_name} 的权限`}
+              aria-label={t('teamKnowledgePermissionMatrix.permissionLabel', {
+                memberName: member.agent_name || member.agent_id,
+                knowledgeBaseName: binding.knowledge_base_name,
+              })}
               value={permissions[member.agent_id] || 'none'}
               disabled={busy}
               onChange={(event) => setPermissions((current) => ({
@@ -117,10 +134,10 @@ export default function TeamKnowledgePermissionMatrix({
               }))}
               className="h-[30px] rounded-[8px] border border-[#dfe4ed] bg-white px-[8px] text-[12px] text-[#18181a]"
             >
-              <option value="none">无权限</option>
-              <option value="reader">可读取</option>
-              <option value="editor">可编辑</option>
-              <option value="publisher">可发布</option>
+              <option value="none">{t('teamKnowledgePermissionMatrix.permission.none')}</option>
+              <option value="reader">{t('teamKnowledgePermissionMatrix.permission.reader')}</option>
+              <option value="editor">{t('teamKnowledgePermissionMatrix.permission.editor')}</option>
+              <option value="publisher">{t('teamKnowledgePermissionMatrix.permission.publisher')}</option>
             </select>
           </label>
         ))}
@@ -130,11 +147,15 @@ export default function TeamKnowledgePermissionMatrix({
         <Button
           type="button"
           disabled={busy}
-          aria-label={`保存 ${binding.knowledge_base_name} 权限`}
+          aria-label={t('teamKnowledgePermissionMatrix.action.save', {
+            knowledgeBaseName: binding.knowledge_base_name,
+          })}
           onClick={() => void onSave(binding, grantPayload())}
           className="h-[30px] rounded-[9px] bg-[#18181a] px-[12px] text-[12px] text-white"
         >
-          {busy ? '保存中…' : '保存权限'}
+          {busy
+            ? t('teamKnowledgePermissionMatrix.action.saving')
+            : t('teamKnowledgePermissionMatrix.action.saveButton')}
         </Button>
       </div>
     </article>

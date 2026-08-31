@@ -6,6 +6,13 @@ from typing import Any, Literal, Optional
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.capability_scope import CapabilityScope
+from app.i18n.language_context import (
+    LanguageContext,
+    LanguageContextInputs,
+    SupportedLocale,
+    normalize_locale,
+    resolve_language_context,
+)
 
 
 class SkillCapabilityRefs(BaseModel):
@@ -275,15 +282,31 @@ class SkillDistillRequest(BaseModel):
     raw_content: str
     business_domain: Optional[str] = None
     model_config_id: Optional[str] = None
+    ui_locale: SupportedLocale | None = None
+    agent_reply_locale: SupportedLocale | None = None
+    language_context: LanguageContext | None = Field(default=None, exclude=True)
     available_tools: list[dict[str, Any]] = Field(default_factory=list)
     available_general_skills: list[dict[str, Any]] = Field(default_factory=list)
     available_knowledge_bases: list[dict[str, Any]] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_locale_fields(cls, value: Any) -> Any:
+        """Normalize supported locale aliases before validating the authoring request."""
+        if not isinstance(value, dict):
+            return value
+        normalized = dict(value)
+        for field_name in ("ui_locale", "agent_reply_locale"):
+            if field_name in normalized:
+                normalized[field_name] = normalize_locale(normalized[field_name])
+        return normalized
 
 
 class SkillDistillResponse(BaseModel):
     draft_skill: SkillCard
     warnings: list[str] = Field(default_factory=list)
     tool_suggestions: list[ToolSuggestion] = Field(default_factory=list)
+    language_context: LanguageContext | None = None
 
 
 class SkillRewriteRequest(BaseModel):
@@ -292,12 +315,27 @@ class SkillRewriteRequest(BaseModel):
     current_skill: SkillCard
     instruction: str
     model_config_id: Optional[str] = None
+    ui_locale: SupportedLocale | None = None
+    agent_reply_locale: SupportedLocale | None = None
+    language_context: LanguageContext | None = Field(default=None, exclude=True)
     target_path: str = "all"
     target_paths: list[str] = Field(default_factory=list)
     target_label: Optional[str] = None
     conversation: list[dict[str, str]] = Field(default_factory=list)
     available_tools: list[dict[str, Any]] = Field(default_factory=list)
     available_sops: list[dict[str, Any]] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_locale_fields(cls, value: Any) -> Any:
+        """Normalize supported locale aliases before validating the rewrite request."""
+        if not isinstance(value, dict):
+            return value
+        normalized = dict(value)
+        for field_name in ("ui_locale", "agent_reply_locale"):
+            if field_name in normalized:
+                normalized[field_name] = normalize_locale(normalized[field_name])
+        return normalized
 
 
 class SkillRewriteResponse(BaseModel):
@@ -306,6 +344,36 @@ class SkillRewriteResponse(BaseModel):
     changed_paths: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     tool_suggestions: list[ToolSuggestion] = Field(default_factory=list)
+    language_context: LanguageContext | None = None
+
+
+def resolve_skill_language_context(
+    request: SkillDistillRequest | SkillRewriteRequest,
+    *,
+    user_ui_locale: str | SupportedLocale | None = None,
+    user_agent_reply_locale: str | SupportedLocale | None = None,
+) -> LanguageContext:
+    """Resolve one Skill request snapshot from explicit fields before mutable user preferences."""
+    if request.language_context is not None:
+        return request.language_context
+    return resolve_language_context(
+        LanguageContextInputs(
+            explicit_ui_locale=(request.ui_locale.value if request.ui_locale else None),
+            explicit_agent_reply_locale=(
+                request.agent_reply_locale.value if request.agent_reply_locale else None
+            ),
+            user_ui_locale=(
+                user_ui_locale.value
+                if isinstance(user_ui_locale, SupportedLocale)
+                else user_ui_locale
+            ),
+            user_agent_reply_locale=(
+                user_agent_reply_locale.value
+                if isinstance(user_agent_reply_locale, SupportedLocale)
+                else user_agent_reply_locale
+            ),
+        )
+    )
 
 
 class SkillFileExtractRequest(BaseModel):

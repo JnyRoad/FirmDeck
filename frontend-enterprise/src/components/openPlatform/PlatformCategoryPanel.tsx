@@ -26,6 +26,9 @@ export type PlatformCategoryPanelProps = {
   isEmpty?: boolean;
   emptyText?: string;
   emptyHint?: string;
+  emptyStateAriaLabel?: string;
+  /** Matches the loading skeleton to the active gallery card family. */
+  cardSize?: 'employee' | 'resource';
   /** 该分类下的全部卡片，一次性渲染，超出可视高度时靠面板自身滚动查看。 */
   children?: ReactNode;
   className?: string;
@@ -48,6 +51,8 @@ export default function PlatformCategoryPanel({
   isEmpty = false,
   emptyText = '暂无开放内容',
   emptyHint = '发布内容后会在这里展示',
+  emptyStateAriaLabel,
+  cardSize = 'resource',
   children,
   className,
 }: PlatformCategoryPanelProps) {
@@ -97,9 +102,12 @@ export default function PlatformCategoryPanel({
 
       <div className="min-h-0 flex-1 overflow-y-auto">
         {loading ? (
-          <PlatformCategorySkeleton />
+          <PlatformCategorySkeleton cardSize={cardSize} />
         ) : isEmpty ? (
-          <div className="flex min-h-[240px] w-full items-center justify-center rounded-[18px] border border-dashed border-[#e4e9f2] bg-[#fbfcfe] px-[18px] py-[40px] text-center">
+          <div
+            aria-label={emptyStateAriaLabel}
+            className="flex min-h-[240px] w-full items-center justify-center rounded-[18px] border border-dashed border-[#e4e9f2] bg-[#fbfcfe] px-[18px] py-[40px] text-center"
+          >
             <div className="flex max-w-[220px] flex-col items-center">
               <span className="grid size-[34px] place-items-center rounded-[12px] bg-white text-[#98a2b3] shadow-[0_1px_8px_rgba(70,76,94,0.06)] ring-1 ring-[#edf1f6]">
                 <IconChevronDown className="size-[16px] rotate-90" />
@@ -109,7 +117,7 @@ export default function PlatformCategoryPanel({
             </div>
           </div>
         ) : (
-          <div className="grid grid-cols-1 gap-[14px] sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5">
+          <div className="grid grid-cols-1 gap-[16px] sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
             {children}
           </div>
         )}
@@ -119,13 +127,18 @@ export default function PlatformCategoryPanel({
 }
 
 // 分类内容加载中的占位骨架，数量和实际网格的常见展示密度接近。
-function PlatformCategorySkeleton() {
+function PlatformCategorySkeleton({ cardSize }: { cardSize: 'employee' | 'resource' }) {
+  const cardHeight = cardSize === 'employee' ? 'h-[262px]' : 'h-[220px]';
   return (
-    <div className="grid grid-cols-1 gap-[14px] sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5">
+    <div className="grid grid-cols-1 gap-[16px] sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
       {Array.from({ length: 10 }, (_, index) => (
         <div
           key={index}
-          className="h-[140px] w-full animate-pulse rounded-[20px] border-[0.5px] border-[#f0f1f5] bg-[#f6f6f6]"
+          data-platform-skeleton
+          className={cn(
+            'w-full animate-pulse rounded-[20px] border-[0.5px] border-[#f0f1f5] bg-[#f6f6f6]',
+            cardHeight,
+          )}
         />
       ))}
     </div>

@@ -345,6 +345,60 @@ def test_batch_json_export_preserves_order_deduplicates_and_checks_visibility() 
         assert exc_info.value.status_code == 404
 
 
+def test_session_detail_and_export_sanitize_handoff_failure_events() -> None:
+    context = {
+        "ui_locale": "en-US",
+        "agent_reply_locale": "zh-CN",
+        "ui_locale_source": "explicit_request",
+        "agent_reply_locale_source": "session_snapshot",
+    }
+    with _test_session() as db:
+        users = _seed(db)
+        db.add(
+            AgentEvent(
+                tenant_id="tenant_demo",
+                session_id="session_channel",
+                event_type="human_handoff_resume_failed",
+                payload_json={
+                    "handoff_id": "handoff_demo",
+                    "error": "resume failed for session_channel secret=/private/handoff.sock",
+                    "language_context": context,
+                },
+            )
+        )
+        db.commit()
+
+        detail = get_session_detail(
+            "session_channel",
+            "tenant_demo",
+            current_user=users["owner"],
+            db=db,
+        )
+        export_payload = json.loads(
+            export_session_log(
+                "session_channel",
+                "tenant_demo",
+                current_user=users["owner"],
+                db=db,
+            ).body
+        )
+
+    for payload in (
+        detail["events"][0]["payload"],
+        export_payload["item"]["events"][0]["payload"],
+    ):
+        assert payload["handoff_id"] == "handoff_demo"
+        assert payload["error"] == {
+            "code": "INTERNAL_ERROR",
+            "params": {},
+            "retryable": False,
+            "request_id": None,
+            "trace_id": None,
+        }
+        assert payload["language_context"] == context
+        assert "secret=/private/handoff.sock" not in str(payload)
+
+
 def test_reset_allowed_for_agent_creator_and_admin_only() -> None:
     with _test_session() as db:
         users = _seed(db)

@@ -6,15 +6,44 @@ from typing import Any
 
 from sqlmodel import Session, select
 
-from app import paths
-from app.db.models import ChatSession, MemoryRecord, ModelConfig, Tool, User, utc_now
+from app.db.models import (
+    ChatSession,
+    MemoryRecord,
+    ModelConfig,
+    Tool,
+    User,
+    utc_now,
+)
+from app.i18n.language_context import LanguageContext
+from app.i18n.raw_source import RawSourceKind, RawSourceMarker
 from app.llm import LLMClient
 from app.observability.spans import llm_operation
 from app.session.session_schema import ChatTurnRequest, StepAgentResult
 from app.tools.tool_schema import ToolResult
 
+MEMORY_EXTRACTION_PROMPT = """You extract and update stable long-term memories about the user.
 
-PROMPT_PATH = paths.resource_dir() / "app" / "llm" / "prompts" / "memory_extractor_prompt.md"
+Use semantic understanding rather than keyword or regular-expression matching. Save only stable
+identity, preferred name, preferences, long-term background, or lasting service constraints. Do not
+save one-off requests, business workflow state, object identifiers, tool results, or assistant output.
+
+When a fact changes, update the same kind/key instead of creating a duplicate. A preferred name uses
+kind "profile", key "preferred_name", and content containing only the latest name. Preference and
+fact keys must be stable snake_case identifiers. The updated_summary field is deprecated and must be
+an empty string. Importance must be between 0 and 1. Return JSON only, without Markdown or analysis.
+
+Language and source contract:
+- Treat every raw_source_markers location as source-owned evidence and preserve it verbatim.
+- Memory content and an optional reason must preserve the source language of the underlying fact.
+- Never translate memory content or reason to match UI locale or Agent reply locale.
+- Preserve names, quoted values, identifiers, spelling, and punctuation exactly when retained.
+
+Return this shape:
+{"memories":[{"operation":"upsert | delete","kind":"profile | preference | fact",
+"key":"stable_snake_case_key","content":"stable user fact in its source language",
+"importance":0.85}],"updated_summary":""}
+If no stable memory is present, return {"memories":[],"updated_summary":""}.
+"""
 MEMORY_SOURCE = "model_memory_extractor"
 PROFILE_NAME_KEY = "preferred_name"
 ALLOWED_MEMORY_KINDS = {"profile", "preference", "fact"}
@@ -61,7 +90,10 @@ class MemoryService:
         tool_result: ToolResult | None,
         model_config: ModelConfig,
         conversation_messages: list[dict[str, str]],
+        *,
+        language_context: LanguageContext | None = None,
     ) -> list[MemoryRecord]:
+        """Extract stable memories without translating source evidence into a product locale."""
         from app.core.context_projection import compact_step_result
 
         if not request.user_id:
@@ -77,9 +109,14 @@ class MemoryService:
             normalize=False,
             agent_id=agent_id,
         )
+        # Workflow: attach locale only for diagnostics and mark every source-owned model input.
+        extraction_contract = _memory_extraction_contract(
+            language_context,
+            has_tool_result=tool_result is not None,
+        )
         with llm_operation("memory.capture", existing_count=len(existing_rows)):
             raw_delta = LLMClient(model_config).generate_json(
-                PROMPT_PATH.read_text(encoding="utf-8"),
+                MEMORY_EXTRACTION_PROMPT,
                 {
                     "conversation_context": {
                         "messages": conversation_messages
@@ -87,6 +124,7 @@ class MemoryService:
                     "existing_memories": _memories_for_model(existing_rows),
                     "step_result": compact_step_result(step_result.model_dump(mode="json")),
                     "tool_result": tool_result.model_dump(mode="json") if tool_result else None,
+                    **extraction_contract,
                 },
             )
         records: list[MemoryRecord] = []
@@ -308,12 +346,58 @@ def memory_read(record: MemoryRecord) -> dict[str, Any]:
 
 
 def _memories_for_model(records: list[MemoryRecord]) -> str:
+    """Serialize existing source-language memories without rewriting their content."""
     lines: list[str] = []
     for record in records:
         key = str((record.metadata_json or {}).get("key") or "").strip()
         label = "/".join(part for part in (record.kind, key) if part)
         lines.append(f"- {label}: {record.content}" if label else f"- {record.content}")
     return "\n".join(lines)
+
+
+def _memory_extraction_contract(
+    language_context: LanguageContext | None,
+    *,
+    has_tool_result: bool,
+) -> dict[str, object]:
+    """Build a locale-independent extraction contract with exact source-owned pointers."""
+    markers = [
+        RawSourceMarker(
+            json_pointer="/conversation_context",
+            kind=RawSourceKind.HISTORY,
+        ),
+        RawSourceMarker(
+            json_pointer="/existing_memories",
+            kind=RawSourceKind.BUSINESS_RECORD,
+        ),
+        RawSourceMarker(
+            json_pointer="/step_result",
+            kind=RawSourceKind.BUSINESS_RECORD,
+        ),
+    ]
+    if has_tool_result:
+        markers.append(
+            RawSourceMarker(
+                json_pointer="/tool_result",
+                kind=RawSourceKind.TOOL_PROVIDER_OUTPUT,
+            )
+        )
+    return {
+        "language_context": (
+            language_context.model_dump(mode="json")
+            if language_context is not None
+            else None
+        ),
+        "memory_language_policy": {
+            "content_language": "preserve_source_language",
+            "reason_language": "preserve_source_language",
+            "locale_context_role": "diagnostics_only",
+            "translation": "forbidden",
+        },
+        "raw_source_markers": [
+            marker.model_dump(mode="json") for marker in markers
+        ],
+    }
 
 
 def memory_rows_for_read(rows: list[MemoryRecord]) -> list[MemoryRecord]:
@@ -395,7 +479,7 @@ def _normalize_memory_key(value: Any, kind: str, content: str) -> str:
         normalized = re.sub(r"[^a-zA-Z0-9_]+", "_", value.strip().lower()).strip("_")
         if normalized:
             return normalized[:80]
-    digest = hashlib.md5(f"{kind}:{content}".encode("utf-8"), usedforsecurity=False).hexdigest()[:12]
+    digest = hashlib.md5(f"{kind}:{content}".encode(), usedforsecurity=False).hexdigest()[:12]
     return f"{kind}_{digest}"
 
 

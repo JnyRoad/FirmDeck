@@ -1,4 +1,5 @@
 import { formatClientDateTime } from './timezone';
+import { DEFAULT_LOCALE, type AppLocale } from '@/i18n/locales';
 
 /**
  * Shared Tailwind class tokens for the enterprise list pages (SOP, 技能, 定时任务,
@@ -58,7 +59,7 @@ export const SEARCH_COMBO_INPUT_CLASS =
 export const SEARCH_COMBO_BUTTON_CLASS =
   'shrink-0 bg-[#18181a] px-[20px] text-[14px] font-normal text-white transition-colors hover:bg-[#303030] disabled:pointer-events-none disabled:opacity-50';
 
-/** Format a backend timestamp in the active UI locale, or `-` when empty/invalid. */
-export function formatDateTime(value?: string): string {
-  return formatClientDateTime(value, '-');
+/** Format a backend timestamp in an explicit UI locale, or `-` when empty/invalid. */
+export function formatDateTime(value?: string, locale: AppLocale = DEFAULT_LOCALE): string {
+  return formatClientDateTime(value, locale, '-');
 }

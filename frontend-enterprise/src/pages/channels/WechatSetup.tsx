@@ -1,9 +1,13 @@
 import { useEffect, useRef, useState } from 'react';
 import QRCode from 'qrcode';
-import { notify } from '@/components/ui/app-toast';
+import { createToastNotifier } from '@/components/ui/app-toast';
 
 import { Input } from '@/components/ui';
 import { Button as UIButton } from '@/components/ui/button';
+import { createMessageDescriptor, type MessageDescriptor } from '@/i18n/descriptors';
+import { useAppIntl } from '@/i18n/useAppIntl';
+import type { MessageId } from '@/i18n/types';
+import { backendErrorMessageDescriptor } from '@/lib/apiErrorMessages';
 
 import { api, TENANT_ID } from '../../api/client';
 import type { ChannelBindingRead } from '../../types';
@@ -30,6 +34,15 @@ const PRIMARY_BUTTON_CLASS =
 const OUTLINE_BUTTON_CLASS =
   'h-8 gap-1 rounded-[10px] border-[#e3e7f1] px-5 text-[12px] font-normal text-[#464c5e] hover:bg-[#f6f6f6] hover:text-[#18181a]';
 
+/** 将稳定后端错误投影为当前二维码流程可展示的 descriptor，禁止 raw detail 透传。 */
+function errorDescriptor(error: unknown, fallbackId: MessageId): MessageDescriptor {
+  const descriptor = backendErrorMessageDescriptor(error);
+  return descriptor
+    ? { id: descriptor.messageId, values: descriptor.values }
+    : createMessageDescriptor(fallbackId);
+}
+
+/** 渲染微信二维码绑定区域；二维码 payload 与验证码保持 raw，状态 chrome 使用语义消息。 */
 export default function WechatSetup({
   binding,
   onChanged,
@@ -37,6 +50,8 @@ export default function WechatSetup({
   binding: ChannelBindingRead;
   onChanged: () => void;
 }) {
+  const { t } = useAppIntl();
+  const toast = createToastNotifier({ t });
   const [qr, setQr] = useState<QrState | null>(null);
   const [qrStatus, setQrStatus] = useState('');
   const [qrLoading, setQrLoading] = useState(false);
@@ -56,6 +71,7 @@ export default function WechatSetup({
     resetQrFlow();
   }, [binding.id]);
 
+  /** 清理二维码状态轮询计时器，避免卸载或重新扫码后继续写入旧会话。 */
   function clearPollTimer() {
     if (pollTimerRef.current != null) {
       window.clearTimeout(pollTimerRef.current);
@@ -63,6 +79,7 @@ export default function WechatSetup({
     }
   }
 
+  /** 重置二维码会话和验证码输入，不改变服务端原始二维码内容。 */
   function resetQrFlow() {
     qrSessionRef.current += 1;
     clearPollTimer();
@@ -72,6 +89,7 @@ export default function WechatSetup({
     setQrStatus('');
   }
 
+  /** 请求新的微信二维码并启动受控轮询；provider 返回值仅用于二维码 raw 数据。 */
   async function startQr(bindingId: string) {
     const session = ++qrSessionRef.current;
     clearPollTimer();
@@ -85,7 +103,7 @@ export default function WechatSetup({
       );
       const code = String(result.qrcode || '');
       const content = String(result.qrcode_img_content || result.qrcode_img_url || '');
-      if (!code || !content) throw new Error('获取微信二维码失败');
+      if (!code || !content) throw new Error('WECHAT_QR_CODE_EMPTY');
       const imageUrl = await QRCode.toDataURL(content, { width: 220, margin: 1 });
       if (session !== qrSessionRef.current) return;
       setQr({ qrcode: code, content, imageUrl });
@@ -93,13 +111,14 @@ export default function WechatSetup({
       scheduleStatusPoll(bindingId, code, session);
     } catch (error) {
       if (session === qrSessionRef.current) {
-        notify.error(error instanceof Error ? error.message : '获取微信二维码失败');
+        toast.error(errorDescriptor(error, 'channels.wechat.qrLoadFailed'));
       }
     } finally {
       if (session === qrSessionRef.current) setQrLoading(false);
     }
   }
 
+  /** 调度下一次二维码状态查询，session token 保证旧请求不会污染新状态。 */
   function scheduleStatusPoll(bindingId: string, code: string, session: number) {
     clearPollTimer();
     pollTimerRef.current = window.setTimeout(() => {
@@ -107,6 +126,7 @@ export default function WechatSetup({
     }, 2000);
   }
 
+  /** 查询二维码确认状态并把有限状态映射为产品文案，保留 provider 状态码作为控制数据。 */
   async function pollQrStatus(bindingId: string, code: string, session: number) {
     try {
       const submittedCode = verifyCodeRef.current.trim();
@@ -120,13 +140,13 @@ export default function WechatSetup({
       const status = String(result.status || 'wait');
       if (status === 'confirmed') {
         resetQrFlow();
-        notify.success('微信接入成功');
+        toast.success(createMessageDescriptor('channels.wechat.connected'));
         onChanged();
         return;
       }
       if (status === 'binded_redirect') {
         resetQrFlow();
-        notify.success('该微信已接入过，已恢复连接');
+        toast.success(createMessageDescriptor('channels.wechat.reconnected'));
         onChanged();
         return;
       }
@@ -139,10 +159,11 @@ export default function WechatSetup({
     } catch (error) {
       if (session !== qrSessionRef.current) return;
       clearPollTimer();
-      notify.error(error instanceof Error ? error.message : '确认接入状态失败');
+      toast.error(errorDescriptor(error, 'channels.wechat.statusLoadFailed'));
     }
   }
 
+  /** 提交用户输入的数字验证码；验证码保持 raw 输入并仅写入下一次 API 请求。 */
   function submitVerifyCode() {
     const code = verifyCode.trim();
     if (!code) return;
@@ -160,25 +181,25 @@ export default function WechatSetup({
 
   const qrHint =
     qrStatus === 'expired'
-      ? '二维码已过期，请重新获取'
+      ? t('channels.wechat.qr.expired')
       : qrStatus === 'verify_code_blocked'
-        ? '多次输入错误，请重新扫码'
+        ? t('channels.wechat.qr.verifyBlocked')
         : qrStatus === 'need_verifycode'
-          ? '请在手机微信上查看并输入显示的数字'
+          ? t('channels.wechat.qr.needVerifyCode')
           : qrStatus === 'scaned' || qrStatus === 'scaned_but_redirect'
-            ? '已扫码，请在手机上确认'
-            : '请使用微信扫描二维码完成接入';
+            ? t('channels.wechat.qr.scanned')
+            : t('channels.wechat.qr.instruction');
 
   return (
     <>
       {recovering && (
         <span className="flex items-center gap-[6px]">
-          <StatusBadge tone="orange">恢复中</StatusBadge>
-          <span className="text-[12px] text-[#858b9c]">会话恢复中，系统将自动重试</span>
+          <StatusBadge tone="orange">{t('channels.status.recovering')}</StatusBadge>
+          <span className="text-[12px] text-[#858b9c]">{t('channels.status.recoveringDescription')}</span>
         </span>
       )}
       {trulyExpired && (
-        <span className="text-[12px] text-[#d20b0b]">会话已过期，请重新扫码接入。</span>
+        <span className="text-[12px] text-[#d20b0b]">{t('channels.wechat.sessionExpired')}</span>
       )}
       {showScanButton && (
         <div className="flex items-center gap-[8px]">
@@ -187,7 +208,7 @@ export default function WechatSetup({
             disabled={qrLoading}
             className={PRIMARY_BUTTON_CLASS}
           >
-            {qrLoading ? '正在获取二维码…' : trulyExpired ? '重新扫码' : '扫码接入'}
+            {qrLoading ? t('channels.wechat.qr.loading') : trulyExpired ? t('channels.wechat.qr.rescan') : t('channels.wechat.qr.connect')}
           </UIButton>
         </div>
       )}
@@ -199,7 +220,7 @@ export default function WechatSetup({
             disabled={qrLoading}
             className={OUTLINE_BUTTON_CLASS}
           >
-            {qrLoading ? '正在获取二维码…' : '重新扫码'}
+            {qrLoading ? t('channels.wechat.qr.loading') : t('channels.wechat.qr.rescan')}
           </UIButton>
         </div>
       )}
@@ -207,7 +228,7 @@ export default function WechatSetup({
         <div className="flex flex-col items-center gap-[10px] rounded-[10px] bg-[#fafbfc] p-[16px]">
           <img
             src={qr.imageUrl}
-            alt="微信接入二维码"
+            alt={t('channels.wechat.qr.imageAlt')}
             className="size-[180px] rounded-[8px] border border-[#eef0f4]"
           />
           <span className="text-[12px] text-[#858b9c]">{qrHint}</span>
@@ -218,7 +239,7 @@ export default function WechatSetup({
                 onChange={(event) =>
                   setVerifyCode(event.target.value.replace(/\D/g, '').slice(0, 8))
                 }
-                placeholder="数字验证码"
+                placeholder={createMessageDescriptor('channels.wechat.qr.verifyCodePlaceholder')}
                 inputMode="numeric"
                 className="h-8 w-[140px] rounded-[10px] text-[12px]"
               />
@@ -227,7 +248,7 @@ export default function WechatSetup({
                 disabled={!verifyCode.trim()}
                 className={PRIMARY_BUTTON_CLASS}
               >
-                确定
+                {t('common.action.confirm')}
               </UIButton>
             </div>
           )}
@@ -238,18 +259,18 @@ export default function WechatSetup({
               className={PRIMARY_BUTTON_CLASS}
             >
               {qrLoading
-                ? '正在获取二维码…'
+                ? t('channels.wechat.qr.loading')
                 : qrStatus === 'expired'
-                  ? '刷新二维码'
-                  : '重新扫码'}
+                  ? t('channels.wechat.qr.refresh')
+                  : t('channels.wechat.qr.rescan')}
             </UIButton>
           ) : (
             <UIButton variant="outline" onClick={resetQrFlow} className={OUTLINE_BUTTON_CLASS}>
-              取消
+              {t('common.action.cancel')}
             </UIButton>
           )}
           <div className="flex max-w-full flex-col items-center gap-[4px]">
-            <span className="text-[11px] text-[#a0a6b8]">扫码失败时，可复制以下内容手动打开</span>
+            <span className="text-[11px] text-[#a0a6b8]">{t('channels.wechat.qr.copyHint')}</span>
             <code className="max-w-[420px] text-center text-[11px] leading-[1.5] break-all select-all text-[#858b9c]">
               {qr.content}
             </code>

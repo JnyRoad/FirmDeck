@@ -968,7 +968,7 @@ def test_scope_migration_roundtrip_and_noop(monkeypatch) -> None:
     # ② 显式空串去掉 corp_id:跨企业变更,400 拦截且数据零变化
     cleared = client.post(url, json={"tenant_id": "tenant_demo", "bot_id": "aib_bot1", "secret": "s2", "corp_id": ""}, headers=headers)
     assert cleared.status_code == 400
-    assert "corp_id" in cleared.json()["detail"]
+    assert cleared.json()["detail"]["code"] == "CHANNEL_BAD_REQUEST"
     with Session(engine) as db:
         assert db.exec(select(ChannelIdentity)).one().external_account_scope == "corpA"
         assert db.get(ChatSession, "s_scope").external_conv_id == "wecom_corpA_p2p_zhangsan"

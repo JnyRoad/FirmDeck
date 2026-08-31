@@ -5,6 +5,7 @@ import {
 } from '../chatPageStyles';
 import {
   CHAT_TRACE_RECOVERY_WINDOW_MS,
+  LEGACY_STOPPED_GENERATION_MARKER,
   createdScheduledTaskForMessage,
   harnessWorkspaceArtifacts,
   isScheduledTaskPrompt,
@@ -19,6 +20,7 @@ import {
   traceSummary,
 } from '../chatHelpers';
 import { staffdeckDisplayText } from '@/employee';
+import { useAppIntl } from '@/i18n/useAppIntl';
 import type { UseChatSession } from '../useChatSession';
 import ChatEmptyState from './ChatEmptyState';
 import MessageBubble, { type MessageRender } from './MessageBubble';
@@ -28,6 +30,7 @@ import TeamCollaborationPanel, {
   useTeamCollaborations,
 } from './TeamCollaborationPanel';
 
+/** 渲染聊天时间线；执行摘要的产品标签由当前 AppIntlProvider 语言生成，消息正文保持 raw。 */
 export default function MessageList({
   chat,
   emptyState,
@@ -35,6 +38,7 @@ export default function MessageList({
   chat: UseChatSession;
   emptyState?: ReactNode;
 }) {
+  const { t } = useAppIntl();
   const {
     displayedMessages,
     turnTraceRef,
@@ -95,7 +99,7 @@ export default function MessageList({
             && traceLines.some((line) => line.state === 'running'),
           );
           const visibleTrace = forceRunningTrace ? traceLines : allowedTrace;
-          const summary = trace && visibleTrace.length > 0 ? traceSummary(trace, visibleTrace) : null;
+          const summary = trace && visibleTrace.length > 0 ? traceSummary(trace, visibleTrace, t) : null;
           const details = traceDetails(visibleTrace);
           const traceActive = isCurrentStreamingTrace(traceTurnId, item);
           const summaryForRender = summary && traceActive && !trace?.completedAt
@@ -141,7 +145,7 @@ export default function MessageList({
           const stoppedStatusOnly = Boolean(
             item.role === 'system'
             && item.id.startsWith('local_interrupt_')
-            && visibleContent === '已停止生成',
+            && visibleContent === LEGACY_STOPPED_GENERATION_MARKER,
           );
           const attachments = messageAttachments(item);
           const harnessArtifacts = item.role === 'assistant'

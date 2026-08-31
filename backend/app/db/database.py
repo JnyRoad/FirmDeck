@@ -50,6 +50,7 @@ _CHANNEL_SCOPE_REBUILD_MIGRATION_ID = "20260719_channel_scope_rebuild"
 _CHANNEL_BINDINGS_MULTI_MIGRATION_ID = "20260721_channel_bindings_multi"
 _CHANNEL_ACCOUNT_KEY_MIGRATION_ID = "20260723_channel_account_key_v1"
 _FEISHU_CHANNEL_SCHEMA_MIGRATION_ID = "20260724_feishu_channel_schema_v1"
+_I18N_LANGUAGE_SCHEMA_MIGRATION_ID = "20260830_i18n_language_context_v1"
 _CAPABILITY_SCOPE_TABLES = (
     "general_skills",
     "tools",
@@ -57,6 +58,29 @@ _CAPABILITY_SCOPE_TABLES = (
     "knowledge_bases",
     "knowledge_base_versions",
 )
+_I18N_LANGUAGE_CONTEXT_TABLES = (
+    "api_jobs",
+    "a2a_task_runs",
+    "channel_inbound_events",
+    "channel_deliveries",
+    "human_handoff_requests",
+    "scheduled_tasks",
+    "scheduled_task_runs",
+    "harness_task_frames",
+    "harness_runs",
+    "harness_turns",
+    "harness_invocations",
+    "team_runs",
+    "team_tasks",
+    "team_wake_events",
+)
+_I18N_LANGUAGE_DEFAULT_SNAPSHOT = {
+    "version": 1,
+    "ui_locale": "zh-CN",
+    "agent_reply_locale": "zh-CN",
+    "ui_locale_source": "legacy_default",
+    "agent_reply_locale_source": "legacy_default",
+}
 
 
 def init_db() -> None:
@@ -131,6 +155,9 @@ def _migrate_sqlite_skill_schema() -> None:
     legacy_id_column = f"{legacy_key}_id"
     legacy_id_prefix = f"{legacy_key}_"
     with _sqlite_immediate_connection() as conn:
+        # Workflow: add and backfill locale metadata before other repair steps so one
+        # transaction can roll back the complete startup migration on any failure.
+        _migrate_i18n_language_schema(conn, tables)
         _migrate_model_api_protocols(conn, tables)
         _migrate_default_model_output_limit(conn, tables)
         _migrate_channel_binding_agents_backfill(conn, tables)
@@ -224,6 +251,8 @@ def _migrate_sqlite_skill_schema() -> None:
                 conn.execute(text("UPDATE sessions SET context_state_json = '{}'"))
             if "channel" not in session_columns:
                 conn.execute(text("ALTER TABLE sessions ADD COLUMN channel VARCHAR"))
+            if "session_kind" not in session_columns:
+                conn.execute(text("ALTER TABLE sessions ADD COLUMN session_kind VARCHAR"))
             if "external_conv_id" not in session_columns:
                 conn.execute(text("ALTER TABLE sessions ADD COLUMN external_conv_id VARCHAR"))
             if "channel_target_json" not in session_columns:
@@ -234,6 +263,59 @@ def _migrate_sqlite_skill_schema() -> None:
                 conn.execute(text("ALTER TABLE sessions ADD COLUMN channel_account_key VARCHAR"))
             if "team_id" not in session_columns:
                 conn.execute(text("ALTER TABLE sessions ADD COLUMN team_id VARCHAR"))
+            # Exact legacy projections are backfilled into a machine field without rewriting
+            # raw business titles. Runtime readers retain the same bounded fallback until all
+            # supported databases have completed this additive startup migration.
+            conn.execute(
+                text(
+                    """
+                    UPDATE sessions
+                    SET session_kind = CASE
+                        WHEN team_id IS NOT NULL AND title LIKE '团队 %TL 对话'
+                            THEN 'team_tl'
+                        WHEN team_id IS NOT NULL AND title LIKE '团队任务验收:%'
+                            THEN 'team_tl_review'
+                        WHEN team_id IS NOT NULL AND title LIKE '团队任务:%'
+                            THEN 'team_member_task'
+                        WHEN team_id IS NOT NULL AND title LIKE '团队竞标打分:%'
+                            THEN 'team_bid_score'
+                        WHEN team_id IS NOT NULL AND title LIKE '团队竞标裁决:%'
+                            THEN 'team_bid_judge'
+                        WHEN team_id IS NOT NULL AND title LIKE '团队竞标:%'
+                            THEN 'team_member_bid'
+                        WHEN team_id IS NOT NULL AND title LIKE '团队结果汇总:%'
+                            THEN 'team_synthesis'
+                        WHEN channel = 'skill_test'
+                            THEN 'skill_test'
+                        ELSE session_kind
+                    END
+                    WHERE session_kind IS NULL
+                    """
+                )
+            )
+            if (
+                "scheduled_task_runs" in tables
+                and "session_id" in _sqlite_table_columns(conn, "scheduled_task_runs")
+            ):
+                conn.execute(
+                    text(
+                        """
+                        UPDATE sessions
+                        SET session_kind = 'scheduled_task'
+                        WHERE session_kind IS NULL
+                          AND id IN (
+                              SELECT session_id FROM scheduled_task_runs
+                              WHERE session_id IS NOT NULL
+                          )
+                        """
+                    )
+                )
+            conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_sessions_session_kind "
+                    "ON sessions(session_kind)"
+                )
+            )
             # SQLite 唯一索引中 NULL 互不相等，web 会话（channel 为空）不受约束；
             # 含 channel_binding_id 以隔离同企业多 Bot(老三列索引先 DROP 再按新四列重建)
             session_index_columns = {
@@ -648,6 +730,123 @@ def _sqlite_immediate_connection():
         raise
     finally:
         conn.close()
+
+
+def _sqlite_table_columns(conn, table_name: str) -> set[str]:
+    """Read live SQLite columns so interrupted migrations can be repaired safely."""
+    return {
+        str(row[1])
+        for row in conn.execute(text(f"PRAGMA table_info({table_name})")).all()
+    }
+
+
+def _migrate_i18n_language_schema(conn, tables: set[str]) -> None:
+    """Add locale preferences and immutable execution snapshots without rewriting source data.
+
+    Existing rows receive only the deterministic compatibility snapshot when the new value is
+    absent. The marker is informational; live column inspection always takes precedence so an
+    interrupted migration is repaired on the next startup.
+    """
+    language_tables = {"users", "sessions", *_I18N_LANGUAGE_CONTEXT_TABLES}
+    present_tables = language_tables.intersection(tables)
+    if not present_tables:
+        return
+
+    # Workflow: ensure the shared marker table exists before any additive DDL is attempted.
+    conn.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS app_data_migrations (
+                id VARCHAR PRIMARY KEY,
+                applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+    )
+
+    # Workflow: repair every missing column from live metadata rather than trusting the marker.
+    additive_columns = {
+        "users": {
+            "ui_locale": "ALTER TABLE users ADD COLUMN ui_locale VARCHAR",
+            "agent_reply_locale": (
+                "ALTER TABLE users ADD COLUMN agent_reply_locale VARCHAR"
+            ),
+        },
+        "sessions": {
+            "agent_reply_locale": (
+                "ALTER TABLE sessions ADD COLUMN agent_reply_locale VARCHAR"
+            ),
+            "agent_reply_locale_source": (
+                "ALTER TABLE sessions ADD COLUMN agent_reply_locale_source VARCHAR"
+            ),
+        },
+    }
+    for table_name in _I18N_LANGUAGE_CONTEXT_TABLES:
+        additive_columns[table_name] = {
+            "language_context_json": (
+                f"ALTER TABLE {table_name} ADD COLUMN language_context_json JSON"
+            )
+        }
+    for table_name in sorted(present_tables):
+        columns = _sqlite_table_columns(conn, table_name)
+        for column_name, ddl in additive_columns.get(table_name, {}).items():
+            if column_name not in columns:
+                conn.execute(text(ddl))
+
+    # Workflow: backfill only absent values; historical content and explicit locale choices stay raw.
+    if "users" in present_tables:
+        conn.execute(
+            text(
+                "UPDATE users SET ui_locale = :default_locale "
+                "WHERE ui_locale IS NULL OR TRIM(ui_locale) = ''"
+            ),
+            {"default_locale": "zh-CN"},
+        )
+        conn.execute(
+            text(
+                "UPDATE users SET agent_reply_locale = :default_locale "
+                "WHERE agent_reply_locale IS NULL OR TRIM(agent_reply_locale) = ''"
+            ),
+            {"default_locale": "zh-CN"},
+        )
+    if "sessions" in present_tables:
+        conn.execute(
+            text(
+                "UPDATE sessions SET agent_reply_locale = :default_locale "
+                "WHERE agent_reply_locale IS NULL OR TRIM(agent_reply_locale) = ''"
+            ),
+            {"default_locale": "zh-CN"},
+        )
+        conn.execute(
+            text(
+                "UPDATE sessions SET agent_reply_locale_source = :default_source "
+                "WHERE agent_reply_locale_source IS NULL OR TRIM(agent_reply_locale_source) = ''"
+            ),
+            {"default_source": "legacy_default"},
+        )
+    snapshot_json = json.dumps(
+        _I18N_LANGUAGE_DEFAULT_SNAPSHOT,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    for table_name in _I18N_LANGUAGE_CONTEXT_TABLES:
+        if table_name not in present_tables:
+            continue
+        conn.execute(
+            text(
+                f"UPDATE {table_name} SET language_context_json = :snapshot "
+                "WHERE language_context_json IS NULL "
+                "OR TRIM(CAST(language_context_json AS TEXT)) = ''"
+            ),
+            {"snapshot": snapshot_json},
+        )
+
+    # Workflow: record completion only after all additions and deterministic backfills succeed.
+    conn.execute(
+        text("INSERT OR IGNORE INTO app_data_migrations (id) VALUES (:id)"),
+        {"id": _I18N_LANGUAGE_SCHEMA_MIGRATION_ID},
+    )
 
 
 def _migrate_default_model_output_limit(conn, tables: set[str]) -> None:

@@ -48,11 +48,38 @@ from app.skills.nesting import SopNestingError, validate_sop_nesting
 router = APIRouter(tags=["sops"])
 
 
+def _safe_validation_errors(errors: list[dict[str, Any]] | None) -> list[dict[str, str]]:
+    """Project validation findings to stable path/code pairs without carrying natural-language detail."""
+    safe_errors: list[dict[str, str]] = []
+    for error in errors or []:
+        raw_path = error.get("path", error.get("loc", []))
+        if isinstance(raw_path, str):
+            path = raw_path
+        elif isinstance(raw_path, list | tuple):
+            path = "/".join(str(item) for item in raw_path)
+        else:
+            path = ""
+        code = str(error.get("code") or error.get("type") or "validation_error")
+        safe_errors.append({"path": path, "code": code})
+    return safe_errors
+
+
+def _project_validation_payload(row: APISOPDraft) -> dict[str, Any]:
+    """Return the public-safe validation snapshot stored on a SOP draft."""
+    validation = dict(row.validation_json or {})
+    return {
+        "valid": bool(validation.get("valid")),
+        "errors": _safe_validation_errors(validation.get("errors") if isinstance(validation, dict) else []),
+        "warnings": list(validation.get("warnings") or row.warnings_json or []),
+    }
+
+
 def _draft_etag(content: dict[str, Any]) -> str:
     return etag_for(content)
 
 
 def _draft_payload(row: APISOPDraft) -> dict[str, Any]:
+    """Serialize one SOP draft while sanitizing any persisted validation diagnostics."""
     return {
         "id": row.id,
         "agent_id": row.agent_id,
@@ -63,7 +90,7 @@ def _draft_payload(row: APISOPDraft) -> dict[str, Any]:
         "status": row.status,
         "source": row.source,
         "warnings": list(row.warnings_json or []),
-        "validation": dict(row.validation_json or {}),
+        "validation": _project_validation_payload(row),
         "etag": row.etag,
         "created_at": row.created_at.isoformat() + "Z",
         "updated_at": row.updated_at.isoformat() + "Z",
@@ -192,6 +219,7 @@ def _validate_capability_refs(db: Session, row: APISOPDraft, card: SkillCard) ->
 
 
 def validate_draft(db: Session, row: APISOPDraft) -> dict[str, Any]:
+    """Validate one draft and persist only stable machine-readable findings at the public boundary."""
     try:
         card = skill_card_from_persisted(row.content_json)
         field_errors: list[dict[str, str]] = _validate_capability_refs(db, row, card)
@@ -219,11 +247,14 @@ def validate_draft(db: Session, row: APISOPDraft) -> dict[str, Any]:
             {
                 "path": "/".join(str(item) for item in error.get("loc") or []),
                 "code": str(error.get("type") or "INVALID_SOP"),
-                "detail": str(error.get("msg") or "Invalid SOP"),
             }
             for error in exc.errors()
         ]
-    result = {"valid": not field_errors, "errors": field_errors, "warnings": row.warnings_json or []}
+    result = {
+        "valid": not field_errors,
+        "errors": _safe_validation_errors(field_errors),
+        "warnings": row.warnings_json or [],
+    }
     row.validation_json = result
     row.updated_at = utc_now()
     db.add(row)

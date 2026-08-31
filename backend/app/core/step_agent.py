@@ -10,7 +10,10 @@ from app.core.context_projection import (
     compact_step_skill_context,
 )
 from app.db.models import ChatSession, ModelConfig, Skill, Tool
+from app.i18n.language_context import LanguageContext
+from app.i18n.raw_source import RawSourceKind, RawSourceMarker
 from app.llm import LLMClient, LLMError
+from app.llm.prompts.language import language_prompt_contract
 from app.llm.stage_protocol import (
     STEP_AGENT_OUTPUT_SCHEMA,
     stage_payload,
@@ -18,7 +21,6 @@ from app.llm.stage_protocol import (
 )
 from app.observability.spans import llm_operation
 from app.session.session_schema import RouterDecision, StepAgentResult
-
 
 PROMPT_PATH = paths.resource_dir() / "app" / "llm" / "prompts" / "step_agent_prompt.md"
 RULE_PATHS = {
@@ -63,7 +65,10 @@ class StepAgent:
         memory_context: list[dict[str, object]] | None = None,
         conversation_context: dict[str, object] | None = None,
         current_knowledge: list[dict[str, object]] | None = None,
+        language_context: LanguageContext | None = None,
     ) -> StepAgentResult:
+        """Produce one step action under reply-locale control while preserving source evidence."""
+        # Workflow: project only the active task state and raw evidence needed by this step.
         compact_knowledge = compact_knowledge_context(current_knowledge)
         compact_repair = _compact_repair_context(repair_context)
         active_skill = (
@@ -87,6 +92,39 @@ class StepAgent:
             selected_task_id=router_decision.selected_task_id if router_decision else None,
         )
         stage_data = {
+            **language_prompt_contract(
+                language_context,
+                [
+                    RawSourceMarker(
+                        json_pointer="/user_message",
+                        kind=RawSourceKind.USER_INPUT,
+                    ),
+                    RawSourceMarker(
+                        json_pointer="/conversation_context",
+                        kind=RawSourceKind.HISTORY,
+                    ),
+                    RawSourceMarker(
+                        json_pointer="/active_skill",
+                        kind=RawSourceKind.BUSINESS_RECORD,
+                    ),
+                    RawSourceMarker(
+                        json_pointer="/retrieved_knowledge",
+                        kind=RawSourceKind.KNOWLEDGE,
+                    ),
+                    RawSourceMarker(
+                        json_pointer="/slots",
+                        kind=RawSourceKind.BUSINESS_RECORD,
+                    ),
+                    RawSourceMarker(
+                        json_pointer="/repair_context",
+                        kind=RawSourceKind.TOOL_PROVIDER_OUTPUT,
+                    ),
+                    RawSourceMarker(
+                        json_pointer="/available_tools",
+                        kind=RawSourceKind.TOOL_PROVIDER_OUTPUT,
+                    ),
+                ],
+            ),
             "active_skill": active_skill,
             "retrieved_knowledge": compact_knowledge,
             "router_decision": compact_step_router_decision(
@@ -113,6 +151,7 @@ class StepAgent:
             output_contract=STEP_AGENT_OUTPUT_SCHEMA,
         )
         try:
+            # Workflow: generate and validate the structured action before inferring legacy omissions.
             operation = "step_agent.repair" if repair_context else "step_agent.run"
             repair_reason = str((repair_context or {}).get("reason") or "") or None
             with llm_operation(operation, repair_reason=repair_reason):

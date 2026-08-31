@@ -11,8 +11,13 @@ from app.public_api.idempotency import replay_idempotent_response, store_idempot
 from app.public_api.schemas import PublicSessionCreate, PublicSessionUpdate
 from app.public_api.utils import etag_for
 
-
 router = APIRouter(prefix="/agents/{agent_id}/sessions", tags=["sessions"])
+
+
+def _normalize_optional_title(value: str | None) -> str | None:
+    """Normalize a caller-owned raw title without inventing a locale-specific fallback."""
+    normalized = (value or "").strip()[:200]
+    return normalized or None
 
 
 def _session_payload(row: ChatSession, binding: ExternalSessionBinding | None = None) -> dict:
@@ -102,7 +107,7 @@ def create_public_session_row(
         tenant_id=principal.tenant_id,
         user_id=principal.actor_user.id,
         agent_id=agent_id,
-        title=(body.title or "新会话").strip()[:200],
+        title=_normalize_optional_title(body.title),
         channel="public_api",
     )
     db.add(row)
@@ -218,7 +223,7 @@ def update_session(
         raise PublicAPIError(412, "ETAG_MISMATCH", "The session changed since it was read.")
     changes = body.model_dump(exclude_unset=True)
     if "title" in changes:
-        row.title = (changes["title"] or "新会话").strip()[:200]
+        row.title = _normalize_optional_title(changes["title"])
     if "status" in changes:
         row.status = changes["status"]
     if binding and "metadata" in changes:

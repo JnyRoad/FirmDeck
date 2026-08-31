@@ -1,0 +1,20 @@
+{
+  "task": "T108",
+  "owner": "frontend-enterprise/dashboard-feedback",
+  "catalogs": ["en-US", "zh-CN"],
+  "status": "pending-catalog-unlock",
+  "entries": [
+    { "id": "dashboard.conversationLogs.bucket.skillInstructionIssue", "source": "ConversationLogsTab.tsx", "kind": "bucket" },
+    { "id": "dashboard.conversationLogs.bucket.sopTriggerIssue", "source": "ConversationLogsTab.tsx", "kind": "bucket" },
+    { "id": "dashboard.conversationLogs.bucket.sopSlotIssue", "source": "ConversationLogsTab.tsx", "kind": "bucket" },
+    { "id": "dashboard.conversationLogs.bucket.sopTransitionIssue", "source": "ConversationLogsTab.tsx", "kind": "bucket" },
+    { "id": "dashboard.conversationLogs.bucket.sopCapabilityIssue", "source": "ConversationLogsTab.tsx", "kind": "bucket" },
+    { "id": "dashboard.conversationLogs.bucket.knowledgeGap", "source": "ConversationLogsTab.tsx", "kind": "bucket" },
+    { "id": "dashboard.conversationLogs.bucket.toolOrRuntimeIssue", "source": "ConversationLogsTab.tsx", "kind": "bucket" },
+    { "id": "dashboard.conversationLogs.bucket.userRandomOrUnclear", "source": "ConversationLogsTab.tsx", "kind": "bucket" },
+    { "id": "dashboard.conversationLogs.bucket.unknown", "source": "ConversationLogsTab.tsx", "kind": "bucket" },
+    { "id": "dashboard.conversationLogs.analysis.evidenceLabel", "source": "ConversationLogsTab.tsx", "kind": "label" },
+    { "id": "dashboard.conversationLogs.analysis.failedAttempts", "source": "ConversationLogsTab.tsx", "kind": "status", "values": ["attempts"] },
+    { "id": "dashboard.conversationLogs.summary.count", "source": "ConversationLogsTab.tsx", "kind": "summary", "values": ["count"] }
+  ]
+}

@@ -5,10 +5,11 @@ import logging
 from datetime import datetime
 from typing import Literal, Optional
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Response, UploadFile
+from fastapi import APIRouter, Depends, File, Query, Request, Response, UploadFile
 from pydantic import BaseModel, Field
 from sqlmodel import Session, select
 
+from app.contracts.http import build_http_exception
 from app.db import get_session
 from app.db.models import APIClient, APICredential, User, UserAvatar, utc_now
 from app.public_api.auth import generate_api_key
@@ -115,10 +116,11 @@ ACCOUNT_API_CLIENT_PREFIX = "StaffDeck 账号全量 API"
 
 @router.post("/login", response_model=LoginResponse)
 def login(request: LoginRequest, db: Session = Depends(get_session)) -> LoginResponse:
+    """Authenticate one tenant account and return a safe login response."""
     ensure_tenant(db, request.tenant_id)
     username = request.username.strip()
     if not username or not request.password:
-        raise HTTPException(status_code=400, detail="Username and password are required")
+        raise build_http_exception("AUTH_LOGIN_FIELDS_REQUIRED")
 
     user = db.exec(
         select(User).where(User.tenant_id == request.tenant_id, User.username == username)
@@ -132,7 +134,7 @@ def login(request: LoginRequest, db: Session = Depends(get_session)) -> LoginRes
         if len(display_name_matches) == 1:
             user = display_name_matches[0]
     if not user or not verify_password(request.password, user.password_hash):
-        raise HTTPException(status_code=401, detail="Invalid username or password")
+        raise build_http_exception("AUTH_INVALID_CREDENTIALS")
 
     return LoginResponse(
         token=create_access_token(user),
@@ -177,11 +179,11 @@ def get_my_avatar(
     """头像资源端点:返回图片字节(不内联进 login/me,避免大字段进会话存储)。"""
     avatar = db.get(UserAvatar, current_user.id)
     if not avatar:
-        raise HTTPException(status_code=404, detail="Avatar not found")
+        raise build_http_exception("AUTH_AVATAR_NOT_FOUND")
     parsed = _parse_avatar_data_url(avatar.data_url)
     if not parsed:
         logger.warning("用户 %s 的头像数据损坏,按不存在处理", current_user.id)
-        raise HTTPException(status_code=404, detail="Avatar not found")
+        raise build_http_exception("AUTH_AVATAR_NOT_FOUND")
     data, content_type = parsed
     return Response(
         content=data,
@@ -202,14 +204,14 @@ async def update_my_avatar(
     content_length = request.headers.get("content-length")
     if content_length and content_length.isdigit():
         if int(content_length) > MAX_AVATAR_BYTES + _AVATAR_MULTIPART_OVERHEAD:
-            raise HTTPException(status_code=413, detail="头像文件超过 2MB 大小限制")
+            raise build_http_exception("AUTH_AVATAR_TOO_LARGE")
     # 限量读取(最多 MAX+1 字节)做硬性兜底,覆盖 Content-Length 缺失或虚报的情况
     data = await file.read(MAX_AVATAR_BYTES + 1)
     if len(data) > MAX_AVATAR_BYTES:
-        raise HTTPException(status_code=413, detail="头像文件超过 2MB 大小限制")
+        raise build_http_exception("AUTH_AVATAR_TOO_LARGE")
     content_type = _sniff_avatar_content_type(data)
     if not content_type:
-        raise HTTPException(status_code=400, detail="仅支持 png/jpeg/webp/gif 格式的图片")
+        raise build_http_exception("AUTH_AVATAR_FORMAT_UNSUPPORTED")
     data_url = f"data:{content_type};base64,{base64.b64encode(data).decode('ascii')}"
     avatar = db.get(UserAvatar, current_user.id)
     if avatar:
@@ -242,18 +244,19 @@ def create_user(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_session),
 ) -> UserRead:
+    """Create a tenant-local account after enforcing administrator policy."""
     if not is_admin_user(current_user):
-        raise HTTPException(status_code=403, detail="Only administrator can create accounts")
+        raise build_http_exception("PERMISSION_TENANT_ADMIN_REQUIRED")
     if request.tenant_id != current_user.tenant_id:
-        raise HTTPException(status_code=403, detail="Cannot create accounts for another tenant")
+        raise build_http_exception("TENANT_MISMATCH")
     username = request.username.strip()
     if not username or not request.password:
-        raise HTTPException(status_code=400, detail="Username and password are required")
+        raise build_http_exception("AUTH_LOGIN_FIELDS_REQUIRED")
     existing = db.exec(
         select(User).where(User.tenant_id == request.tenant_id, User.username == username)
     ).first()
     if existing:
-        raise HTTPException(status_code=409, detail="Account already exists")
+        raise build_http_exception("AUTH_ACCOUNT_EXISTS")
     user = User(
         tenant_id=request.tenant_id,
         username=username,
@@ -426,15 +429,12 @@ def reveal_account_api_credential(
     )
     # 仅启用中的凭据允许读取，禁用后的值不能被重新复制。
     if row.status != "active":
-        raise HTTPException(status_code=409, detail="API credential is not active")
+        raise build_http_exception("AUTH_API_CREDENTIAL_INACTIVE")
     # 历史凭据没有加密副本，或 APP_SECRET 已变更时，提示轮换而不返回部分值。
     try:
         api_key = decrypt_recoverable_api_key(row.encrypted_key)
     except ValueError as exc:
-        raise HTTPException(
-            status_code=409,
-            detail="API credential cannot be recovered; rotate it to create a new key",
-        ) from exc
+        raise build_http_exception("AUTH_API_CREDENTIAL_UNRECOVERABLE") from exc
     return AccountAPICredentialReveal(api_key=api_key)
 
 
@@ -484,10 +484,11 @@ def update_user(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_session),
 ) -> UserRead:
+    """Update a tenant-local account while preserving administrator invariants."""
     _require_admin(current_user, request.tenant_id)
     user = db.get(User, user_id)
     if not user or user.tenant_id != request.tenant_id:
-        raise HTTPException(status_code=404, detail="Account not found")
+        raise build_http_exception("AUTH_ACCOUNT_NOT_FOUND")
     if request.display_name is not None:
         display_name = request.display_name.strip()[:80]
         user.display_name = display_name or user.username
@@ -497,7 +498,7 @@ def update_user(
             user.password_hash = hash_password(password)
     if request.role is not None and request.role != user.role:
         if user.id == current_user.id:
-            raise HTTPException(status_code=400, detail="Cannot change your own account role")
+            raise build_http_exception("AUTH_SELF_ROLE_CHANGE_FORBIDDEN")
         user.role = request.role
     user.updated_at = utc_now()
     db.add(user)
@@ -513,12 +514,13 @@ def delete_user(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_session),
 ) -> dict[str, bool]:
+    """Delete a non-administrator tenant account after ownership checks."""
     _require_admin(current_user, tenant_id)
     user = db.get(User, user_id)
     if not user or user.tenant_id != tenant_id:
-        raise HTTPException(status_code=404, detail="Account not found")
+        raise build_http_exception("AUTH_ACCOUNT_NOT_FOUND")
     if user.id == current_user.id or is_admin_user(user):
-        raise HTTPException(status_code=400, detail="Administrator account cannot be deleted")
+        raise build_http_exception("AUTH_ADMIN_DELETE_FORBIDDEN")
     # 头像为独立小表、无外键级联:显式随用户删除,避免残留孤儿记录
     avatar = db.get(UserAvatar, user_id)
     if avatar:
@@ -566,10 +568,11 @@ def _parse_avatar_data_url(data_url: str) -> Optional[tuple[bytes, str]]:
 
 
 def _require_admin(user: User, tenant_id: str) -> None:
+    """Require an administrator operating inside the authenticated tenant."""
     if not is_admin_user(user):
-        raise HTTPException(status_code=403, detail="Only administrator can manage accounts")
+        raise build_http_exception("PERMISSION_TENANT_ADMIN_REQUIRED")
     if user.tenant_id != tenant_id:
-        raise HTTPException(status_code=403, detail="Cannot manage accounts for another tenant")
+        raise build_http_exception("TENANT_MISMATCH")
 
 
 def _account_api_client_name(user_id: str) -> str:
@@ -641,6 +644,7 @@ def _get_account_api_credential(
     user_id: str,
     credential_id: str,
 ) -> APICredential:
+    """Load a credential owned by the account or return a safe not-found contract."""
     client = _find_account_api_client(db, tenant_id, user_id)
     row = db.get(APICredential, credential_id)
     if (
@@ -650,7 +654,7 @@ def _get_account_api_credential(
         or row.client_id != client.id
         or row.agent_id is not None
     ):
-        raise HTTPException(status_code=404, detail="Account API credential not found")
+        raise build_http_exception("AUTH_ACCOUNT_API_CREDENTIAL_NOT_FOUND")
     return row
 
 

@@ -11,6 +11,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlmodel import Session
 
+from app.contracts.errors import InternalErrorContext
+from app.contracts.http import build_http_exception
 from app.core.harness_session_cleanup import default_harness_storage_root
 from app.db import get_session
 from app.db.models import UIConfig, User, utc_now
@@ -37,6 +39,30 @@ network_router = APIRouter(
 )
 
 
+class SandboxStatusParams(BaseModel):
+    """Expose only raw sandbox runtime metadata needed by a localized UI."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    backend: str | None = None
+
+
+class SandboxRemediationParams(BaseModel):
+    """Carry typed raw values for a localized sandbox remediation message."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    command: str | None = None
+
+
+class SandboxSetupParams(BaseModel):
+    """Carry the administrator command separately from localized setup prose."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    command: str
+
+
 class UIConfigRead(BaseModel):
     tenant_id: str
     show_thinking_trace: bool
@@ -60,11 +86,13 @@ class UIConfigRead(BaseModel):
     sandbox_allowed_domains: list[str] = Field(default_factory=list)
     sandbox_backend: str | None = None
     sandbox_setup_required: bool = False
-    sandbox_setup_instructions: str | None = None
     sandbox_status: str = "unavailable"
     sandbox_status_code: str | None = None
-    sandbox_status_message: str | None = None
-    sandbox_status_remediation: str | None = None
+    sandbox_status_params: SandboxStatusParams = Field(default_factory=SandboxStatusParams)
+    sandbox_remediation_code: str | None = None
+    sandbox_remediation_params: SandboxRemediationParams | None = None
+    sandbox_setup_code: str | None = None
+    sandbox_setup_params: SandboxSetupParams | None = None
     updated_at: str
 
     model_config = ConfigDict(from_attributes=True)
@@ -148,12 +176,19 @@ class NetworkSettingsUpdateRequest(BaseModel):
 
 
 def ui_config_read(row: UIConfig, *, restart_scheduled: bool = False) -> UIConfigRead:
+    """Project sandbox diagnostics as stable codes and typed raw values for the UI boundary."""
+
     report = diagnostics() if row.sandbox_enabled else None
     windows_setup_required = (
         row.sandbox_enabled
         and sys.platform == "win32"
         and report is not None
         and report.code == "SANDBOX_WINDOWS_SETUP_REQUIRED"
+    )
+    setup_command = windows_install_command() if windows_setup_required else None
+    setup_params = SandboxSetupParams(command=setup_command) if setup_command else None
+    remediation_params = (
+        SandboxRemediationParams(command=setup_command) if setup_command else None
     )
     return UIConfigRead(
         tenant_id=row.tenant_id,
@@ -197,24 +232,19 @@ def ui_config_read(row: UIConfig, *, restart_scheduled: bool = False) -> UIConfi
         ],
         sandbox_backend=report.backend if report is not None else "disabled",
         sandbox_setup_required=windows_setup_required,
-        sandbox_setup_instructions=(
-            "StaffDeck 服务运行在 Windows 主机上，首次启用安全执行环境需要一次管理员确认。\n"
-            "请在这台 Windows 电脑上打开 PowerShell 或 CMD（右键并选择‘以管理员身份运行’），执行：\n"
-            f"{windows_install_command()}\n"
-            "确认 UAC 后等待初始化完成，然后重启 StaffDeck 服务。"
-            if windows_setup_required
-            else (
-                f"沙盒状态：{report.message}\n{report.remediation}"
-                if report is not None and report.status != "ready"
-                else None
-            )
-        ),
         sandbox_status=report.status if report is not None else "disabled",
         sandbox_status_code=report.code if report is not None else None,
-        sandbox_status_message=(
-            report.message if report is not None else "沙盒已由管理员关闭。"
+        sandbox_status_params=SandboxStatusParams(
+            backend=report.backend if report is not None else "disabled"
         ),
-        sandbox_status_remediation=report.remediation if report is not None else None,
+        sandbox_remediation_code=(
+            report.code if report is not None and report.remediation else None
+        ),
+        sandbox_remediation_params=remediation_params,
+        sandbox_setup_code=(
+            report.code if windows_setup_required and report is not None else None
+        ),
+        sandbox_setup_params=setup_params,
         updated_at=row.updated_at.isoformat(),
     )
 
@@ -296,7 +326,7 @@ def update_network_settings(
         from desktop_launcher import port_in_use
 
         if port_in_use(str(normalized["host"]), int(normalized["port"])):
-            raise HTTPException(status_code=409, detail="所选端口已被其他进程占用")
+            raise build_http_exception("UI_NETWORK_PORT_IN_USE")
 
     # Import only during a request so the launcher still controls the pre-ASGI startup sequence.
     from desktop_launcher import _save_network_config
@@ -317,7 +347,7 @@ def get_chat_ui_config(
     db: Session = Depends(get_session),
 ) -> UIConfigRead:
     if tenant_id != current_user.tenant_id:
-        raise HTTPException(status_code=403, detail="Tenant mismatch")
+        raise build_http_exception("TENANT_MISMATCH")
     return ui_config_read(get_or_create_ui_config(db, tenant_id))
 
 
@@ -328,16 +358,26 @@ def _active_runtime_network() -> dict[str, str | int]:
         try:
             return parse_runtime_network_snapshot(raw_snapshot)
         except NetworkSettingsValidationError as exc:
-            raise HTTPException(
+            raise build_http_exception(
+                "UI_RUNTIME_NETWORK_UNAVAILABLE",
                 status_code=503,
-                detail="当前运行网络状态不可用，请通过 StaffDeck 桌面启动器重新启动",
+                internal=InternalErrorContext(
+                    source="runtime_network_snapshot",
+                    exception_type=type(exc).__name__,
+                    raw_message=str(exc),
+                ),
             ) from exc
     try:
         return _web_runtime_network()
     except NetworkSettingsValidationError as exc:
-        raise HTTPException(
+        raise build_http_exception(
+            "UI_RUNTIME_NETWORK_UNAVAILABLE",
             status_code=503,
-            detail="当前运行网络状态不可用，请检查 Web 服务的监听配置",
+            internal=InternalErrorContext(
+                source="web_runtime_network",
+                exception_type=type(exc).__name__,
+                raw_message=str(exc),
+            ),
         ) from exc
 
 

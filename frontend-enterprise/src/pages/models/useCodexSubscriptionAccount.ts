@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 
 import { api } from '@/api/client';
 import { notify } from '@/components/ui/app-toast';
-import { useI18n } from '@/i18n';
+import { useAppIntl } from '@/i18n';
 import { apiErrorMessage } from '@/lib/apiErrorMessages';
 import type { CodexSubscriptionAccountRead } from '@/types';
 
@@ -27,7 +27,7 @@ export function useCodexSubscriptionAccount({
   tenantId,
   enabled = true,
 }: UseCodexSubscriptionAccountOptions): UseCodexSubscriptionAccountResult {
-  const { t } = useI18n();
+  const { t } = useAppIntl();
   const [account, setAccount] = useState<CodexSubscriptionAccountRead | null>(null);
   const [loading, setLoading] = useState(false);
   const activeTenantRef = useRef<string | null>(null);
@@ -58,7 +58,7 @@ export function useCodexSubscriptionAccount({
       ) {
         return;
       }
-      notify.error(apiErrorMessage(error, t('无法读取 ChatGPT 订阅状态')));
+      notify.error(apiErrorMessage(error, t('modelsPage.toast.subscriptionStatusLoadFailed')));
     }
   }, [enabled, t, tenantId]);
   const reloadRef = useRef(reload);
@@ -102,7 +102,19 @@ export function useCodexSubscriptionAccount({
           return;
         }
         setAccount(nextAccount);
-        if (nextAccount.message) notify.success(nextAccount.message);
+        switch (nextAccount.status) {
+          case 'connected':
+            notify.success(t('modelsPage.subscription.connected'));
+            break;
+          case 'pending':
+            notify.success(t('modelsPage.subscription.pending'));
+            break;
+          case 'requires_login':
+            notify.success(t('modelsPage.subscription.requiresLogin'));
+            break;
+          default:
+            notify.success(t('modelsPage.subscription.unavailable'));
+        }
       } catch (error) {
         if (
           activeTenantRef.current !== requestTenantId ||
@@ -123,24 +135,24 @@ export function useCodexSubscriptionAccount({
         }
       }
     },
-    [enabled, tenantId],
+    [enabled, t, tenantId],
   );
 
   /** 启动本机 Codex 登录流程。 */
   const startLogin = useCallback(
-    () => updateAccount('login', t('无法启动本机 Codex 登录')),
+    () => updateAccount('login', t('modelsPage.toast.subscriptionLoginFailed')),
     [t, updateAccount],
   );
 
   /** 取消仍在等待的本机 Codex 登录流程。 */
   const cancelLogin = useCallback(
-    () => updateAccount('login/cancel', t('无法取消本机 Codex 登录')),
+    () => updateAccount('login/cancel', t('modelsPage.toast.subscriptionCancelFailed')),
     [t, updateAccount],
   );
 
   /** 退出当前本机 ChatGPT 订阅账号。 */
   const logout = useCallback(
-    () => updateAccount('logout', t('无法退出 ChatGPT 订阅')),
+    () => updateAccount('logout', t('modelsPage.toast.subscriptionLogoutFailed')),
     [t, updateAccount],
   );
 

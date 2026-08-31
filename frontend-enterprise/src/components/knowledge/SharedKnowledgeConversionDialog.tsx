@@ -2,7 +2,7 @@
  * 专用知识库转换向导：读取员工分支版本与可选团队，提交原子转换，并清楚展示来源保护边界。
  */
 
-import { useEffect, useMemo, useState } from 'react';
+import { useContext, useEffect, useMemo, useState } from 'react';
 
 import { api, TENANT_ID } from '@/api/client';
 import {
@@ -15,6 +15,9 @@ import {
 } from '@/components/ui';
 import { notify } from '@/components/ui/app-toast';
 import { Button } from '@/components/ui/button';
+import { createAppTranslator, getStoredLocale } from '@/i18n';
+import { RawContent, RawIdentifier } from '@/i18n/RawContent';
+import { AppIntlContext } from '@/i18n/provider';
 import { apiErrorMessage } from '@/lib/apiErrorMessages';
 import type {
   KnowledgeBaseConversionRead,
@@ -31,6 +34,12 @@ type SharedKnowledgeConversionDialogProps = {
   onConverted: (result: KnowledgeBaseConversionRead) => void | Promise<void>;
 };
 
+/** 为共享知识转换对话框提供稳定翻译入口；无 Provider 时回退当前持久化 locale。 */
+function useSharedKnowledgeConversionIntl() {
+  const context = useContext(AppIntlContext);
+  return useMemo(() => context ?? createAppTranslator(getStoredLocale()), [context]);
+}
+
 export function SharedKnowledgeConversionDialog({
   open,
   knowledgeBase,
@@ -39,6 +48,7 @@ export function SharedKnowledgeConversionDialog({
   onConverted,
 }: SharedKnowledgeConversionDialogProps) {
   /** 管理一次员工专用分支到新共享谱系的预览、配置和提交。 */
+  const { t } = useSharedKnowledgeConversionIntl();
   const [versions, setVersions] = useState<KnowledgeBaseVersionRead[]>([]);
   const [teams, setTeams] = useState<TeamRead[]>([]);
   const [sourceVersionId, setSourceVersionId] = useState('');
@@ -76,7 +86,7 @@ export function SharedKnowledgeConversionDialog({
     setVersions([]);
     setTeams([]);
     setSourceVersionId('');
-    setSharedName(`${knowledgeBase.name}（共享）`);
+    setSharedName(`${knowledgeBase.name}${t('sharedKnowledgeConversion.field.defaultNameSuffix')}`);
     setSharedDescription(knowledgeBase.description || '');
     setChangeReason('');
     setSelectedTeamIds([]);
@@ -106,11 +116,11 @@ export function SharedKnowledgeConversionDialog({
       setTeams(teamRows.filter((team) => team.status === 'active'));
       setSourceVersionId(defaultVersion?.id || '');
       if (!defaultVersion) {
-        setErrorMessage('当前员工分支没有可转换的版本，来源知识库未发生任何变化。');
+        setErrorMessage(t('sharedKnowledgeConversion.error.noVersion'));
       }
     } catch (error) {
-      const message = apiErrorMessage(error, '加载转换信息失败');
-      setErrorMessage(`${message}。来源专用知识库未发生任何变化。`);
+      const message = apiErrorMessage(error, 'sharedKnowledgeConversion.error.contextLoad', { t });
+      setErrorMessage(t('sharedKnowledgeConversion.error.contextLoadBoundary', { message }));
       notify.error(message);
     } finally {
       setContextLoading(false);
@@ -150,10 +160,8 @@ export function SharedKnowledgeConversionDialog({
         },
       );
     } catch (error) {
-      const message = apiErrorMessage(error, '转换失败');
-      setErrorMessage(
-        `${message}。转换失败，来源专用知识库仍保持可用，尚未归档；不会显示未完成的共享知识库。`,
-      );
+      const message = apiErrorMessage(error, 'sharedKnowledgeConversion.error.failed', { t });
+      setErrorMessage(t('sharedKnowledgeConversion.error.failedBoundary', { message }));
       notify.error(message);
       setSubmitting(false);
       return;
@@ -161,11 +169,11 @@ export function SharedKnowledgeConversionDialog({
 
     // 页面回调只负责定位新共享库；即使刷新失败，也不能把已完成的转换误报为失败。
     setConversionResult(result);
-    notify.success(`已创建共享知识库「${result.new_knowledge_base.name}」`);
+    notify.success(t('sharedKnowledgeConversion.toast.created', { name: result.new_knowledge_base.name }));
     try {
       await onConverted(result);
     } catch {
-      notify.warning('转换已成功，但列表刷新失败，请手动刷新后查看共享知识库。');
+      notify.warning(t('sharedKnowledgeConversion.toast.refreshFailed'));
     } finally {
       setSubmitting(false);
     }
@@ -180,47 +188,47 @@ export function SharedKnowledgeConversionDialog({
     >
       <DialogContent className="max-h-[88vh] max-w-[780px] overflow-y-auto p-0">
         <div className="border-b border-[#eef0f4] px-6 py-5">
-          <DialogTitle>转换为共享知识库：{knowledgeBase?.name || ''}</DialogTitle>
+          <DialogTitle>{t('sharedKnowledgeConversion.dialog.title', { name: knowledgeBase?.name || '' })}</DialogTitle>
           <p className="mt-2 mb-0 text-sm leading-6 text-[#757f9c]">
-            系统会先复制并校验所选版本，全部通过后才创建全局唯一正式版。
+            {t('sharedKnowledgeConversion.dialog.description')}
           </p>
         </div>
 
         <div className="flex flex-col gap-5 px-6 pb-6">
-          <section aria-label="转换来源预览" className="rounded-xl border border-[#e7eaf1] bg-[#fafbfc] p-4">
+          <section aria-label={t('sharedKnowledgeConversion.preview.label')} className="rounded-xl border border-[#e7eaf1] bg-[#fafbfc] p-4">
             <div className="flex flex-wrap items-start justify-between gap-3">
               <div>
-                <p className="m-0 text-xs font-medium tracking-wide text-[#858b9c]">来源专用实例</p>
-                <strong className="mt-1 block text-sm text-[#18181a]">{knowledgeBase?.name || '-'}</strong>
+                <p className="m-0 text-xs font-medium tracking-wide text-[#858b9c]">{t('sharedKnowledgeConversion.preview.source')}</p>
+                <strong className="mt-1 block text-sm text-[#18181a]"><RawContent value={knowledgeBase?.name || '-'} /></strong>
               </div>
               <span className="rounded-full bg-[#eef1fb] px-3 py-1 text-xs font-medium text-[#5f73b7]">
-                员工分支：{agentId || '-'}
+                {t('sharedKnowledgeConversion.preview.branchLabel')}<RawIdentifier value={agentId || '-'} />
               </span>
             </div>
             <div className="mt-4 grid grid-cols-3 gap-2">
               <div className="rounded-lg bg-white p-3 ring-1 ring-[#eef0f4]">
                 <strong className="block text-base text-[#18181a]">{knowledgeBase?.document_count || 0}</strong>
-                <span className="text-xs text-[#858b9c]">个文档</span>
+                <span className="text-xs text-[#858b9c]">{t('sharedKnowledgeConversion.preview.documents')}</span>
               </div>
               <div className="rounded-lg bg-white p-3 ring-1 ring-[#eef0f4]">
                 <strong className="block text-base text-[#18181a]">{knowledgeBase?.bucket_count || 0}</strong>
-                <span className="text-xs text-[#858b9c]">个知识节点</span>
+                <span className="text-xs text-[#858b9c]">{t('sharedKnowledgeConversion.preview.nodes')}</span>
               </div>
               <div className="rounded-lg bg-white p-3 ring-1 ring-[#eef0f4]">
                 <strong className="block text-base text-[#18181a]">{knowledgeBase?.chunk_count || 0}</strong>
-                <span className="text-xs text-[#858b9c]">个引用片段</span>
+                <span className="text-xs text-[#858b9c]">{t('sharedKnowledgeConversion.preview.citations')}</span>
               </div>
             </div>
             <p className="mt-4 mb-0 text-xs leading-5 text-[#5d6475]">
-              转换成功后只归档当前员工的专用实例，不删除历史数据，也不影响其他员工的独立分支。
+              {t('sharedKnowledgeConversion.preview.boundary')}
             </p>
           </section>
 
           <div className="grid gap-4 md:grid-cols-2">
             <label className="flex flex-col gap-2 text-sm font-medium text-[#464c5e]">
-              来源版本
+              {t('sharedKnowledgeConversion.field.sourceVersion')}
               <select
-                aria-label="来源版本"
+                aria-label={t('sharedKnowledgeConversion.field.sourceVersion')}
                 className="h-10 rounded-lg border border-[#dfe3ec] bg-white px-3 text-sm outline-none focus:border-[#879ee0]"
                 value={sourceVersionId}
                 disabled={contextLoading || submitting}
@@ -228,20 +236,23 @@ export function SharedKnowledgeConversionDialog({
               >
                 {versions.map((version) => (
                   <option key={version.id} value={version.id}>
-                    v{version.version}{version.is_head ? ' · 当前分支 Head' : ''}
+                    {t('sharedKnowledgeConversion.field.versionOption', {
+                      version: version.version,
+                      suffix: version.is_head ? ` · ${t('sharedKnowledgeConversion.field.currentHead')}` : '',
+                    })}
                   </option>
                 ))}
               </select>
               {selectedVersion ? (
                 <span className="text-xs font-normal text-[#858b9c]">
-                  更新时间：{selectedVersion.updated_at.slice(0, 10)}
+                  {t('sharedKnowledgeConversion.field.updatedAt', { date: selectedVersion.updated_at.slice(0, 10) })}
                 </span>
               ) : null}
             </label>
             <label className="flex flex-col gap-2 text-sm font-medium text-[#464c5e]">
-              共享知识库名称
+              {t('sharedKnowledgeConversion.field.name')}
               <Input
-                aria-label="共享知识库名称"
+                aria-label={t('sharedKnowledgeConversion.field.name')}
                 value={sharedName}
                 disabled={submitting}
                 onChange={(event) => setSharedName(event.target.value)}
@@ -250,34 +261,34 @@ export function SharedKnowledgeConversionDialog({
           </div>
 
           <label className="flex flex-col gap-2 text-sm font-medium text-[#464c5e]">
-            共享知识库描述
+            {t('sharedKnowledgeConversion.field.description')}
             <Textarea
-              aria-label="共享知识库描述"
+              aria-label={t('sharedKnowledgeConversion.field.description')}
               value={sharedDescription}
               disabled={submitting}
               onChange={(event) => setSharedDescription(event.target.value)}
-              placeholder="说明团队将如何使用这份共享知识"
+              placeholder={t('sharedKnowledgeConversion.field.descriptionPlaceholder')}
             />
           </label>
 
           <label className="flex flex-col gap-2 text-sm font-medium text-[#464c5e]">
-            转换原因
+            {t('sharedKnowledgeConversion.field.reason')}
             <Textarea
-              aria-label="转换原因"
+              aria-label={t('sharedKnowledgeConversion.field.reason')}
               value={changeReason}
               disabled={submitting}
               onChange={(event) => setChangeReason(event.target.value)}
-              placeholder="记录为什么把这份专用知识转为组织共享资产"
+              placeholder={t('sharedKnowledgeConversion.field.reasonPlaceholder')}
             />
           </label>
 
-          <section aria-label="初始团队绑定" className="rounded-xl border border-[#e7eaf1] p-4">
+          <section aria-label={t('sharedKnowledgeConversion.binding.label')} className="rounded-xl border border-[#e7eaf1] p-4">
             <div className="flex flex-wrap items-center justify-between gap-2">
               <div>
-                <h3 className="m-0 text-sm font-medium text-[#18181a]">初始团队绑定</h3>
-                <p className="mt-1 mb-0 text-xs text-[#858b9c]">可先不绑定，后续仍可在团队详情中分配。</p>
+                <h3 className="m-0 text-sm font-medium text-[#18181a]">{t('sharedKnowledgeConversion.binding.title')}</h3>
+                <p className="mt-1 mb-0 text-xs text-[#858b9c]">{t('sharedKnowledgeConversion.binding.description')}</p>
               </div>
-              <span className="text-xs text-[#858b9c]">已选 {selectedTeamIds.length} 个团队</span>
+              <span className="text-xs text-[#858b9c]">{t('sharedKnowledgeConversion.binding.count', { count: selectedTeamIds.length })}</span>
             </div>
             <div className="mt-3 grid gap-2 sm:grid-cols-2">
               {teams.map((team) => (
@@ -286,28 +297,28 @@ export function SharedKnowledgeConversionDialog({
                   className="flex cursor-pointer items-center gap-3 rounded-lg border border-[#eef0f4] px-3 py-2.5 text-sm text-[#464c5e] hover:bg-[#fafbfc]"
                 >
                   <Checkbox
-                    aria-label={`绑定 ${team.name}`}
+                    aria-label={t('sharedKnowledgeConversion.binding.teamAria', { name: team.name })}
                     checked={selectedTeamIds.includes(team.id)}
                     disabled={submitting}
                     onCheckedChange={(checked) => toggleTeam(team.id, checked === true)}
                   />
-                  <span>{team.name}</span>
+                  <span><RawContent value={team.name} /></span>
                 </label>
               ))}
               {!contextLoading && teams.length === 0 ? (
-                <p className="col-span-full m-0 text-sm text-[#858b9c]">当前没有可绑定的活动团队。</p>
+                <p className="col-span-full m-0 text-sm text-[#858b9c]">{t('sharedKnowledgeConversion.binding.empty')}</p>
               ) : null}
             </div>
             <label className="mt-4 flex flex-col gap-2 text-sm font-medium text-[#464c5e]">
-              默认写入团队
+              {t('sharedKnowledgeConversion.binding.defaultTeam')}
               <select
-                aria-label="默认写入团队"
+                aria-label={t('sharedKnowledgeConversion.binding.defaultTeam')}
                 className="h-10 rounded-lg border border-[#dfe3ec] bg-white px-3 text-sm outline-none focus:border-[#879ee0]"
                 value={defaultTeamId}
                 disabled={selectedTeams.length === 0 || submitting}
                 onChange={(event) => setDefaultTeamId(event.target.value)}
               >
-                <option value="">暂不设置默认团队</option>
+                <option value="">{t('sharedKnowledgeConversion.binding.defaultUnset')}</option>
                 {selectedTeams.map((team) => (
                   <option key={team.id} value={team.id}>{team.name}</option>
                 ))}
@@ -316,11 +327,11 @@ export function SharedKnowledgeConversionDialog({
           </section>
 
           {contextLoading ? (
-            <p role="status" className="m-0 text-sm text-[#757f9c]">正在读取来源版本与团队…</p>
+            <p role="status" className="m-0 text-sm text-[#757f9c]">{t('sharedKnowledgeConversion.status.loading')}</p>
           ) : null}
           {submitting ? (
             <p role="status" className="m-0 rounded-lg bg-[#f4f6fb] px-3 py-2 text-sm text-[#5f6d91]">
-              正在复制、校验并创建首个正式版本，请勿关闭窗口…
+              {t('sharedKnowledgeConversion.status.submitting')}
             </p>
           ) : null}
           {errorMessage ? (
@@ -330,15 +341,17 @@ export function SharedKnowledgeConversionDialog({
           ) : null}
           {conversionResult ? (
             <div role="status" className="rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-sm leading-6 text-emerald-800">
-              转换成功：已创建「{conversionResult.new_knowledge_base.name}」v{conversionResult.released_version.version}，
-              来源专用实例已安全归档。
+              {t('sharedKnowledgeConversion.status.success', {
+                name: conversionResult.new_knowledge_base.name,
+                version: conversionResult.released_version.version,
+              })}
             </div>
           ) : null}
 
           <div className="flex justify-end gap-2 border-t border-[#eef0f4] pt-4">
-            <Button variant="outline" disabled={submitting} onClick={onClose}>取消</Button>
+            <Button variant="outline" disabled={submitting} onClick={onClose}>{t('common.action.cancel')}</Button>
             <Button disabled={!canSubmit} onClick={() => void submitConversion()}>
-              {submitting ? '正在转换…' : '确认转换'}
+              {submitting ? t('sharedKnowledgeConversion.actions.converting') : t('sharedKnowledgeConversion.actions.confirm')}
             </Button>
           </div>
         </div>

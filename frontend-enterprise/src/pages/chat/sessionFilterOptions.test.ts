@@ -28,7 +28,34 @@ function session(id: string, agentId: string): ChatSession {
   };
 }
 
+const zhContext = {
+  locale: 'zh-CN',
+  allConversationsLabel: '全部会话',
+  teamFallbackLabel: '团队',
+} as const;
+
 describe('chat session filter options', () => {
+  it('uses localized aggregate and team fallback labels while preserving raw entity names', () => {
+    const groupWithoutName = {
+      ...session('session-team', 'agent-a'),
+      team_id: 'team-1',
+    };
+
+    expect(buildSessionFilterOptions(
+      [agent('agent-a', 'Raw Alpha')],
+      [session('session-a1', 'agent-a'), groupWithoutName],
+      {
+        locale: 'en-US',
+        allConversationsLabel: 'All conversations',
+        teamFallbackLabel: 'Team',
+      },
+    )).toEqual([
+      { value: 'all', label: 'All conversations · 2' },
+      { value: 'agent-a', label: 'Raw Alpha · 1' },
+      { value: 'team:team-1', label: 'Team · 1' },
+    ]);
+  });
+
   it('keeps the aggregate option and excludes agents with no sessions', () => {
     const agents = [agent('agent-c', 'Gamma'), agent('agent-b', 'Beta'), agent('agent-a', 'Alpha')];
     const originalOrder = agents.map((item) => item.id);
@@ -38,7 +65,7 @@ describe('chat session filter options', () => {
       session('session-b1', 'agent-b'),
     ];
 
-    expect(buildSessionFilterOptions(agents, sessions)).toEqual([
+    expect(buildSessionFilterOptions(agents, sessions, zhContext)).toEqual([
       { value: 'all', label: '全部会话 · 3' },
       { value: 'agent-a', label: 'Alpha · 2' },
       { value: 'agent-b', label: 'Beta · 1' },
@@ -50,7 +77,7 @@ describe('chat session filter options', () => {
     const options = buildSessionFilterOptions(
       [agent('agent-a', 'Alpha'), agent('agent-draft', 'Draft Agent')],
       [session('session-a1', 'agent-a')],
-      'agent-draft',
+      { ...zhContext, activeDraftAgentId: 'agent-draft' },
     );
 
     expect(options).toContainEqual({ value: 'agent-draft', label: 'Draft Agent' });
@@ -64,7 +91,7 @@ describe('chat session filter options', () => {
       team_name: '增长团队',
     };
 
-    expect(buildSessionFilterOptions([agent('agent-a', 'Alpha')], [group])).toEqual([
+    expect(buildSessionFilterOptions([agent('agent-a', 'Alpha')], [group], zhContext)).toEqual([
       { value: 'all', label: '全部会话 · 1' },
       { value: 'team:team-1', label: '增长团队 · 1' },
     ]);

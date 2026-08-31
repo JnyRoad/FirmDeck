@@ -1,10 +1,12 @@
 // @vitest-environment jsdom
 
+import type { InputHTMLAttributes, TextareaHTMLAttributes } from 'react';
 import { cleanup, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { I18nProvider } from '@/i18n';
+import { notify } from '@/components/ui';
+import { AppIntlProvider, I18nProvider, type AppLocale } from '@/i18n';
 
 import RuntimeSettingsPage, {
   buildApiEndpointLinks,
@@ -12,18 +14,45 @@ import RuntimeSettingsPage, {
   validateNetworkSettings,
 } from './RuntimeSettingsPage';
 
+vi.mock('@/components/ui/input', async () => {
+  const { createElement } = await import('react');
+
+  /** 用无翻译原生控件隔离早期 shared-input legacy 依赖。 */
+  function SemanticTestInput(props: InputHTMLAttributes<HTMLInputElement>) {
+    return createElement('input', props);
+  }
+
+  return { Input: SemanticTestInput };
+});
+
+vi.mock('@/components/ui/textarea', async () => {
+  const { createElement } = await import('react');
+
+  /** 用无翻译原生控件隔离早期 shared-textarea legacy 依赖。 */
+  function SemanticTestTextarea(props: TextareaHTMLAttributes<HTMLTextAreaElement>) {
+    return createElement('textarea', props);
+  }
+
+  return { Textarea: SemanticTestTextarea };
+});
+
 const mocks = vi.hoisted(() => ({
   get: vi.fn(),
   put: vi.fn(),
 }));
 
-vi.mock('../api/client', () => ({
-  TENANT_ID: 'tenant_demo',
-  api: {
-    get: mocks.get,
-    put: mocks.put,
-  },
-}));
+vi.mock('../api/client', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../api/client')>();
+  return {
+    ...actual,
+    TENANT_ID: 'tenant_demo',
+    api: {
+      ...actual.api,
+      get: mocks.get,
+      put: mocks.put,
+    },
+  };
+});
 
 const validForm = {
   show_thinking_trace: true,
@@ -83,6 +112,19 @@ const networkSettings = {
   restart_required: false,
 };
 
+const semanticRuntimeCopy = {
+  'zh-CN': {
+    adminHint: '仅管理员可修改。打开或关闭后保存将自动重启 StaffDeck。默认关闭。',
+    heading: '运行设置',
+    save: '保存设置',
+  },
+  'en-US': {
+    adminHint: 'Only administrators can change this setting. Saving after a change restarts StaffDeck. Disabled by default.',
+    heading: 'Runtime settings',
+    save: 'Save settings',
+  },
+} as const;
+
 function renderRuntimeSettings(): void {
   /** Renders the page with its locale observer and the tenant administrator identity. */
 
@@ -100,6 +142,22 @@ function renderRuntimeSettings(): void {
   );
 }
 
+/** 仅用语义 Provider 渲染管理员运行设置页，排除 legacy observer 翻译。 */
+function renderSemanticRuntimeSettings(locale: AppLocale): void {
+  render(
+    <AppIntlProvider locale={locale}>
+      <RuntimeSettingsPage
+        currentUser={{
+          id: 'admin_demo',
+          tenant_id: 'tenant_demo',
+          username: 'admin',
+          role: 'admin',
+        }}
+      />
+    </AppIntlProvider>,
+  );
+}
+
 beforeEach(() => {
   mocks.get.mockReset();
   mocks.put.mockReset();
@@ -113,6 +171,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  vi.restoreAllMocks();
   window.localStorage.clear();
 });
 
@@ -211,7 +270,85 @@ describe('Harness workspace settings', () => {
     expect(await screen.findByText('Current effective Harness workspace')).toBeTruthy();
     expect(screen.getByText('/Users/demo/.staffdeck/workspaces')).toBeTruthy();
     expect(
-      screen.getByText((_, element) => element?.textContent === 'Sandbox status:Unavailable'),
+      screen.getByText('Sandbox status:Unavailable', { selector: '.font-medium' }),
     ).toBeTruthy();
   });
+});
+
+describe('semantic runtime settings locale contract', () => {
+  for (const locale of ['zh-CN', 'en-US'] as const) {
+    const copy = semanticRuntimeCopy[locale];
+
+    it(`localizes settings actions and administrator-only permission guidance in ${locale}`, async () => {
+      renderSemanticRuntimeSettings(locale);
+
+      expect(await screen.findByText(copy.heading)).toBeTruthy();
+      expect(screen.getByRole('button', { name: copy.save })).toBeTruthy();
+      expect(screen.getByText(copy.adminHint)).toBeTruthy();
+    });
+  }
+
+  it('localizes settings load errors without exposing raw transport messages in en-US', async () => {
+    const notifyError = vi.spyOn(notify, 'error');
+    mocks.get.mockImplementation((path: string) => Promise.reject(new Error(
+      path.includes('/ui-config') ? 'RAW_UI_LOAD_FAILURE' : 'RAW_NETWORK_LOAD_FAILURE',
+    )));
+
+    renderSemanticRuntimeSettings('en-US');
+
+    await waitFor(() => expect(notifyError).toHaveBeenCalledTimes(2));
+    expect(notifyError).toHaveBeenCalledWith('Unable to load runtime settings.');
+    expect(notifyError).toHaveBeenCalledWith('Unable to load network and API settings.');
+    expect(notifyError).not.toHaveBeenCalledWith(expect.stringContaining('RAW_'));
+  });
+});
+
+describe('sandbox diagnostic contract', () => {
+  const cases = [
+    {
+      locale: 'zh-CN' as const,
+      setupCopy: '需要管理员初始化 Windows 沙盒。请执行下方命令，确认 UAC 后重启 StaffDeck。',
+    },
+    {
+      locale: 'en-US' as const,
+      setupCopy: 'An administrator must initialize the Windows sandbox. Run the command below, confirm UAC, then restart StaffDeck.',
+    },
+  ];
+
+  for (const { locale, setupCopy } of cases) {
+    it(`localizes sandbox diagnostics and preserves technical values in ${locale}`, async () => {
+      const rawCommand = '/opt/staffdeck/node srt-cli.js windows-install';
+      mocks.get.mockImplementation((path: string) => {
+        if (path.includes('/ui-config')) {
+          return Promise.resolve({
+            ...runtimeSettings,
+            sandbox_enabled: true,
+            sandbox_status: 'unavailable' as const,
+            sandbox_status_code: 'SANDBOX_WINDOWS_SETUP_REQUIRED',
+            sandbox_status_params: { backend: 'srt' },
+            sandbox_remediation_code: 'SANDBOX_WINDOWS_SETUP_REQUIRED',
+            sandbox_remediation_params: { command: rawCommand },
+            sandbox_setup_required: true,
+            sandbox_setup_code: 'SANDBOX_WINDOWS_SETUP_REQUIRED',
+            sandbox_setup_params: { command: rawCommand },
+            sandbox_status_message: 'RAW_STATUS_TEXT_MUST_NOT_REACH_UI',
+            sandbox_status_remediation: 'RAW_REMEDIATION_TEXT_MUST_NOT_REACH_UI',
+            sandbox_setup_instructions: 'RAW_SETUP_TEXT_MUST_NOT_REACH_UI',
+          });
+        }
+        if (path.includes('/network-settings')) return Promise.resolve(networkSettings);
+        return Promise.resolve({});
+      });
+
+      renderSemanticRuntimeSettings(locale);
+
+      expect(await screen.findByText(setupCopy)).toBeTruthy();
+      expect(screen.getByText(rawCommand)).toBeTruthy();
+      expect(screen.getByText('srt')).toBeTruthy();
+      expect(screen.getByText('/Users/demo/.staffdeck/workspaces')).toBeTruthy();
+      expect(screen.queryByText('RAW_STATUS_TEXT_MUST_NOT_REACH_UI')).toBeNull();
+      expect(screen.queryByText('RAW_REMEDIATION_TEXT_MUST_NOT_REACH_UI')).toBeNull();
+      expect(screen.queryByText('RAW_SETUP_TEXT_MUST_NOT_REACH_UI')).toBeNull();
+    });
+  }
 });

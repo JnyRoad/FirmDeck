@@ -67,12 +67,34 @@ export type PlatformKindDetailViewProps = {
   onUnpublishItem?: (item: PlatformDetailItem) => void;
   onLogout?: () => void;
   userName?: string;
+  copy?: Partial<PlatformKindDetailViewCopy>;
+};
+
+export type PlatformKindDetailViewCopy = {
+  backAction: string;
+  createAction: string;
+  refreshAction: string;
+  statsAriaSuffix: string;
+  searchPrefix: string;
+  emptyText: string;
+  searchEmptyText: string;
+  employeeCard?: Partial<import('./PlatformEmployeeCard').PlatformEmployeeCardCopy>;
+};
+
+const DEFAULT_PLATFORM_KIND_DETAIL_VIEW_COPY: PlatformKindDetailViewCopy = {
+  backAction: '返回开放广场',
+  createAction: '创建开放 Skill',
+  refreshAction: '刷新',
+  statsAriaSuffix: '统计',
+  searchPrefix: '搜索',
+  emptyText: '暂无开放内容',
+  searchEmptyText: '没有匹配的广场内容',
 };
 
 function DetailSkeleton({ kind }: { kind: PlatformDetailKind }) {
-  const cardHeight = kind === 'agents' ? 'h-[140px]' : 'h-[112px]';
+  const cardHeight = kind === 'agents' ? 'h-[262px]' : 'h-[220px]';
   return (
-    <div className="grid grid-cols-1 gap-[16px] sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5">
+    <div className="grid grid-cols-1 gap-[16px] sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
       {Array.from({ length: 8 }, (_, index) => (
         <div
           key={index}
@@ -109,7 +131,9 @@ export default function PlatformKindDetailView({
   onUnpublishItem,
   onLogout,
   userName,
+  copy,
 }: PlatformKindDetailViewProps) {
+  const ui = { ...DEFAULT_PLATFORM_KIND_DETAIL_VIEW_COPY, ...copy };
   const [searchText, setSearchText] = useState('');
 
   const filteredItems = useMemo(() => {
@@ -135,12 +159,12 @@ export default function PlatformKindDetailView({
       <div className="mt-[20px] mb-[16px] flex flex-wrap justify-end gap-[16px]">
         <UIButton variant="outline" onClick={onBack} className={RETURN_BUTTON_CLASS}>
           <IconArrowRight className="size-3.5 rotate-180" />
-          返回开放广场
+          {ui.backAction}
         </UIButton>
         {onCreate && (
           <UIButton onClick={onCreate} className="h-8 gap-1 rounded-[10px] bg-[#18181a] px-5 text-[12px] font-normal text-white hover:bg-[#303030]">
             <IconAdd className="size-3.5" />
-            创建开放 Skill
+            {ui.createAction}
           </UIButton>
         )}
         <UIButton
@@ -150,12 +174,12 @@ export default function PlatformKindDetailView({
           className={RETURN_BUTTON_CLASS}
         >
           <IconRefresh className={cn('size-[14px]', loading && 'animate-spin')} />
-          刷新
+          {ui.refreshAction}
         </UIButton>
       </div>
 
       <div className="flex flex-col gap-[24px] rounded-[20px] bg-white p-[18px_18px_24px_18px] shadow-[0_-4px_16px_0_rgba(0,0,0,0.05)]">
-        <div className="flex flex-wrap items-stretch gap-[20px]" aria-label={`${title}统计`}>
+        <div className="flex flex-wrap items-stretch gap-[20px]" aria-label={`${title}${ui.statsAriaSuffix}`}>
           <StatCard value={items.length} label={countLabel} className="max-w-[220px]" />
         </div>
 
@@ -186,7 +210,8 @@ export default function PlatformKindDetailView({
               data-lpignore="true"
               data-bwignore="true"
               value={searchText}
-              placeholder={`搜索${countLabel}`}
+              aria-label={`${ui.searchPrefix}${countLabel}`}
+              placeholder={`${ui.searchPrefix}${countLabel}`}
               onChange={(event) => setSearchText(event.target.value)}
               className="min-w-0 flex-1 border-0 bg-transparent text-[12px] text-[#18181a] outline-none placeholder:text-[#858b9c]"
             />
@@ -197,18 +222,18 @@ export default function PlatformKindDetailView({
           ) : filteredItems.length === 0 ? (
             <div className="grid min-h-[180px] w-full place-items-center content-center gap-[10px] rounded-[18px] border border-dashed border-[#dfe4ec] bg-[#fbfcfd] px-[20px] py-[40px] text-center font-bold text-[#8b94aa]">
               <IconSearch className="size-[20px] shrink-0" />
-              <span>{items.length === 0 ? '暂无开放内容' : '没有匹配的广场内容'}</span>
+              <span>{items.length === 0 ? ui.emptyText : ui.searchEmptyText}</span>
             </div>
           ) : kind === 'agents' ? (
-            <div className="grid grid-cols-1 gap-[16px] sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5">
+            <div className="grid grid-cols-1 gap-[16px] sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
               {filteredItems.map((item) => item.agent && (
                 <PlatformEmployeeCard
                   key={item.id}
                   avatar={(
                     <EmployeeAvatar
                       agent={item.agent}
-                      width={50}
-                      height={59}
+                      width={80}
+                      height={94}
                       fit="contain"
                       objectPosition="center bottom"
                       className="overflow-visible! rounded-none! border-0! bg-transparent! bg-none! shadow-none! after:hidden!"
@@ -222,16 +247,17 @@ export default function PlatformKindDetailView({
                   onOpen={() => onOpenItem(item)}
                   onUnpublish={canManage && onUnpublishItem ? () => onUnpublishItem(item) : undefined}
                   unpublishing={unpublishingItemId === item.id}
+                  copy={ui.employeeCard}
                 />
               ))}
             </div>
           ) : (
-            <div className="grid grid-cols-1 gap-[16px] sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5">
+            <div className="grid grid-cols-1 gap-[16px] sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
               {filteredItems.map((item) => (
                 <PlatformResourceCard
                   key={item.id}
                   icon={PLATFORM_RESOURCE_ICON[kind]
-                    ? <img src={PLATFORM_RESOURCE_ICON[kind]} alt="" className="size-[32px] shrink-0 object-contain" />
+                    ? <img src={PLATFORM_RESOURCE_ICON[kind]} alt="" className="size-[44px] shrink-0 object-contain" />
                     : undefined}
                   accent={PLATFORM_ACCENT[kind]}
                   title={item.title}

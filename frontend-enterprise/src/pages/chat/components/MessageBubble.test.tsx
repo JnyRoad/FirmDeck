@@ -1,10 +1,12 @@
 // @vitest-environment jsdom
 
-import { StrictMode } from 'react';
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { StrictMode, type ReactElement } from 'react';
+import { act, cleanup, fireEvent, render as rtlRender, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { AppIntlProvider } from '@/i18n';
+import type { AppLocale } from '@/i18n/locales';
 import type { AgentProfileRead, ChatMessage, ChatSlashCommand, TeamRead } from '@/types';
 
 import type { UseChatSession } from '../useChatSession';
@@ -18,6 +20,18 @@ vi.mock('@/lib/clipboard', () => ({
 afterEach(() => {
   cleanup();
 });
+
+/** 为既有消息行为测试提供明确的语义 i18n runtime，避免回退到 legacy observer。 */
+function render(
+  ui: ReactElement,
+  options?: Parameters<typeof rtlRender>[1],
+  locale: AppLocale = 'zh-CN',
+) {
+  return rtlRender(
+    <AppIntlProvider initialLocale={locale}>{ui}</AppIntlProvider>,
+    options,
+  );
+}
 
 const weatherCommand: ChatSlashCommand = {
   kind: 'skill',
@@ -143,18 +157,23 @@ describe('MessageBubble team group identity', () => {
     expect(screen.getByText('团队回复')).toBeTruthy();
   });
 
-  it('shows live team progress and hides feedback until synthesis finishes', () => {
+  it.each([
+    ['zh-CN', '已收到全部 2 项成员回复，正在整理答案。'],
+    ['en-US', 'Received all 2 member replies. Organizing the answer.'],
+  ] as const)('localizes canonical live team progress in %s and hides raw status text', (locale, expected) => {
     const item: ChatMessage = {
       id: 'message-team-progress',
       role: 'assistant',
-      content: '已收到全部 2 项成员回复。',
+      content: 'Split and dispatched 2 team tasks.',
       metadata: {
         team_run_id: 'team-run-1',
         team_progress: {
           phase: 'synthesizing',
           completed_tasks: 2,
           total_tasks: 2,
-          status_text: '正在整理答案',
+          event_code: 'team.run.progress.synthesizing',
+          params: { total_tasks: 2 },
+          status_text: 'LEGACY_STATUS_MUST_NOT_DRIVE_UI',
         },
       },
       created_at: '2026-08-15T00:00:00Z',
@@ -186,11 +205,65 @@ describe('MessageBubble team group identity', () => {
       activeConversationId: 'session-team-1',
     } as unknown as UseChatSession;
 
-    const { container } = render(<MessageBubble chat={chat} item={item} render={messageRender} />);
+    const { container } = render(
+      <MessageBubble chat={chat} item={item} render={messageRender} />,
+      undefined,
+      locale,
+    );
 
-    expect(screen.getByText('已收到全部 2 项成员回复。')).toBeTruthy();
-    expect(screen.getByRole('status', { name: '正在整理答案' })).toBeTruthy();
+    expect(screen.getByText('Split and dispatched 2 team tasks.')).toBeTruthy();
+    expect(screen.getByRole('status', { name: expected })).toBeTruthy();
+    expect(screen.queryByText('LEGACY_STATUS_MUST_NOT_DRIVE_UI')).toBeNull();
     expect(container.querySelector('button[aria-label="点赞"]')).toBeNull();
+  });
+
+  it('fails closed for malformed canonical team progress instead of displaying raw text', () => {
+    const item: ChatMessage = {
+      id: 'message-team-progress-malformed',
+      role: 'assistant',
+      content: 'Raw assistant reply remains unchanged.',
+      metadata: {
+        team_run_id: 'team-run-1',
+        team_progress: {
+          phase: 'collecting',
+          event_code: 'team.run.progress.collecting',
+          params: { completed_tasks: 'one', total_tasks: 2 },
+          status_text: 'RAW_STATUS_MUST_NOT_RENDER',
+        },
+      },
+      created_at: '2026-08-15T00:00:00Z',
+    };
+    const messageRender: MessageRender = {
+      traceTurnId: 'turn-team-progress-malformed',
+      summary: null,
+      details: [],
+      expanded: false,
+      showInlineTrace: false,
+      visibleContent: item.content,
+      citations: [],
+      scheduledDraft: null,
+      scheduledTaskPrompt: false,
+      attachments: [],
+      harnessArtifacts: [],
+      statusOnly: false,
+    };
+    const chat = {
+      displayedTeam: { id: 'team-1', name: 'Project Team' } as TeamRead,
+      slashCommands: [],
+      toggleTrace: vi.fn(),
+      rateMessage: vi.fn(),
+      setActiveCitation: vi.fn(),
+      confirmScheduledTask: vi.fn(),
+      dismissScheduledTaskDraft: vi.fn(),
+      removeQueuedTurn: vi.fn(),
+      tenantId: 'tenant_demo',
+      activeConversationId: 'session-team-1',
+    } as unknown as UseChatSession;
+
+    render(<MessageBubble chat={chat} item={item} render={messageRender} />, undefined, 'en-US');
+
+    expect(screen.getByRole('status', { name: 'Thinking' })).toBeTruthy();
+    expect(screen.queryByText('RAW_STATUS_MUST_NOT_RENDER')).toBeNull();
   });
 });
 
@@ -475,5 +548,134 @@ describe('MessageBubble copy button', () => {
 
     expect(copyTextToClipboardMock).toHaveBeenCalledWith('答案内容');
     await waitFor(() => expect(screen.getByRole('button', { name: '已复制' })).toBeTruthy());
+  });
+});
+
+/** 在不挂载 legacy observer 的前提下，为聊天消息提供新的语义 i18n Provider。 */
+function renderMessageWithAppLocale(
+  locale: 'zh-CN' | 'en-US',
+  item: ChatMessage,
+  messageRender: MessageRender,
+  chat: UseChatSession,
+) {
+  return render(
+    <AppIntlProvider initialLocale={locale}>
+      <MessageBubble chat={chat} item={item} render={messageRender} />
+    </AppIntlProvider>,
+  );
+}
+
+/** 构造只包含消息动作所需行为的聊天 facade，不引入 legacy Provider 或全局观察器。 */
+function buildLocaleChat(): UseChatSession {
+  return {
+    slashCommands: [],
+    toggleTrace: vi.fn(),
+    rateMessage: vi.fn(),
+    setActiveCitation: vi.fn(),
+    confirmScheduledTask: vi.fn(),
+    dismissScheduledTaskDraft: vi.fn(),
+    removeQueuedTurn: vi.fn(),
+    tenantId: 'tenant_demo',
+    activeConversationId: 'session-i18n',
+  } as unknown as UseChatSession;
+}
+
+/** 提取当前消息动作的可访问名称，比较 product chrome 而不是业务原始文本。 */
+function messageActionLabels(container: HTMLElement): string[] {
+  return [...container.querySelectorAll<HTMLButtonElement>('button')]
+    .map((button) => button.getAttribute('aria-label') || button.textContent || '')
+    .filter(Boolean);
+}
+
+describe('MessageBubble semantic locale and raw-content boundaries', () => {
+  /** 验证 Agent 原始输出与附件原始值不变，同时消息操作和无障碍名称随 locale 改变。 */
+  it('localizes product chrome without translating Agent output or attachment data', () => {
+    const rawAgentOutput = 'Agent 原始输出：保留 <raw>& 用户内容';
+    const rawFilename = '知识库/合同-中文.pdf';
+    const rawAttachmentError = 'provider_raw_error: 中文详情';
+    const item: ChatMessage = {
+      id: 'message-i18n-agent',
+      role: 'assistant',
+      content: rawAgentOutput,
+      created_at: '2026-08-15T00:00:00Z',
+    };
+    const messageRender: MessageRender = {
+      traceTurnId: 'turn-i18n-agent',
+      summary: null,
+      details: [],
+      expanded: false,
+      showInlineTrace: false,
+      visibleContent: rawAgentOutput,
+      citations: [],
+      scheduledDraft: null,
+      scheduledTaskPrompt: false,
+      attachments: [{
+        id: 'attachment-i18n',
+        filename: rawFilename,
+        content_type: 'application/pdf',
+        size: 42,
+        kind: 'pdf',
+        error: rawAttachmentError,
+      }],
+      harnessArtifacts: [],
+      statusOnly: false,
+    };
+    const chat = buildLocaleChat();
+
+    const zhView = renderMessageWithAppLocale('zh-CN', item, messageRender, chat);
+    const zhText = zhView.container.textContent || '';
+    const zhActions = messageActionLabels(zhView.container);
+    zhView.unmount();
+
+    const enView = renderMessageWithAppLocale('en-US', item, messageRender, chat);
+    const enText = enView.container.textContent || '';
+    const enActions = messageActionLabels(enView.container);
+
+    expect(zhText).toContain(rawAgentOutput);
+    expect(zhText).toContain(rawFilename);
+    expect(zhText).toContain(rawAttachmentError);
+    expect(enText).toContain(rawAgentOutput);
+    expect(enText).toContain(rawFilename);
+    expect(enText).toContain(rawAttachmentError);
+    expect(enActions).not.toEqual(zhActions);
+  });
+
+  /** 验证用户输入在 locale 切换后保持逐字一致，且复制反馈属于可翻译的产品 chrome。 */
+  it('keeps user-authored message content byte-for-byte stable across locales', () => {
+    const rawUserInput = '用户输入：不要翻译这段业务内容 / keep verbatim';
+    const item: ChatMessage = {
+      id: 'message-i18n-user',
+      role: 'user',
+      content: rawUserInput,
+      created_at: '2026-08-15T00:00:00Z',
+    };
+    const messageRender: MessageRender = {
+      traceTurnId: 'turn-i18n-user',
+      summary: null,
+      details: [],
+      expanded: false,
+      showInlineTrace: false,
+      visibleContent: rawUserInput,
+      citations: [],
+      scheduledDraft: null,
+      scheduledTaskPrompt: false,
+      attachments: [],
+      harnessArtifacts: [],
+      statusOnly: false,
+    };
+    const chat = buildLocaleChat();
+
+    const zhView = renderMessageWithAppLocale('zh-CN', item, messageRender, chat);
+    const zhText = zhView.container.textContent || '';
+    const zhActions = messageActionLabels(zhView.container);
+    zhView.unmount();
+
+    const enView = renderMessageWithAppLocale('en-US', item, messageRender, chat);
+    const enText = enView.container.textContent || '';
+    const enActions = messageActionLabels(enView.container);
+
+    expect(zhText).toContain(rawUserInput);
+    expect(enText).toContain(rawUserInput);
+    expect(enActions).not.toEqual(zhActions);
   });
 });

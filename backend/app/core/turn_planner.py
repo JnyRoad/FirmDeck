@@ -14,7 +14,10 @@ from app.core.context_projection import (
 from app.core.graph_rules import GraphRules
 from app.core.task_frame_store import MAX_TASK_FRAMES_PER_TURN
 from app.db.models import ChatSession, ModelConfig, Skill, new_id
+from app.i18n.language_context import LanguageContext
+from app.i18n.raw_source import RawSourceKind, RawSourceMarker
 from app.llm import LLMClient, LLMError
+from app.llm.prompts.language import language_prompt_contract
 from app.llm.stage_protocol import (
     TURN_PLANNER_OUTPUT_SCHEMA,
     stage_payload,
@@ -30,7 +33,6 @@ from app.session.session_schema import (
     TurnPlan,
 )
 from app.session.slot_policy import strip_router_generated_message_slots
-
 
 PROMPT_PATH = (
     paths.resource_dir() / "app" / "llm" / "prompts" / "turn_planner_prompt.md"
@@ -52,7 +54,10 @@ class TurnPlanner:
         task_frame_state: list[dict[str, Any]] | None = None,
         interaction_mode: str = "normal",
         team_context: TeamPlannerContext | None = None,
+        language_context: LanguageContext | None = None,
     ) -> TurnPlan:
+        """Plan task frames while keeping source text raw and generated fields in reply locale."""
+        # Workflow: construct one bounded planner payload with immutable language and raw markers.
         payload = stage_payload(
             phase="TurnPlanner",
             user_message=message,
@@ -60,6 +65,35 @@ class TurnPlanner:
             memory_context=memory_context,
             instructions=PROMPT_PATH.read_text(encoding="utf-8"),
             stage_data={
+                **language_prompt_contract(
+                    language_context,
+                    [
+                        RawSourceMarker(
+                            json_pointer="/user_message",
+                            kind=RawSourceKind.USER_INPUT,
+                        ),
+                        RawSourceMarker(
+                            json_pointer="/conversation_context",
+                            kind=RawSourceKind.HISTORY,
+                        ),
+                        RawSourceMarker(
+                            json_pointer="/_agent_stage/memory",
+                            kind=RawSourceKind.HISTORY,
+                        ),
+                        RawSourceMarker(
+                            json_pointer="/current_session",
+                            kind=RawSourceKind.BUSINESS_RECORD,
+                        ),
+                        RawSourceMarker(
+                            json_pointer="/available_sops",
+                            kind=RawSourceKind.BUSINESS_RECORD,
+                        ),
+                        RawSourceMarker(
+                            json_pointer="/team_context",
+                            kind=RawSourceKind.IDENTIFIER,
+                        ),
+                    ],
+                ),
                 "current_session": _session_payload(
                     session,
                     task_frame_state=task_frame_state,
@@ -77,6 +111,7 @@ class TurnPlanner:
             output_contract=TURN_PLANNER_OUTPUT_SCHEMA,
         )
         try:
+            # Workflow: validate the provider output before normalizing it to trusted frames.
             client = LLMClient(model_config)
             with llm_operation("turn_planner.plan"):
                 plan = self._generate_validated_plan(

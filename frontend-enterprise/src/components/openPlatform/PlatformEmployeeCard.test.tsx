@@ -10,7 +10,7 @@ function renderCard(onUnpublish?: () => void) {
   const onOpen = vi.fn();
   render(
     <PlatformEmployeeCard
-      avatar={<span>avatar</span>}
+      avatar={<span data-testid="employee-avatar">avatar</span>}
       name="Finance Employee"
       role="Finance"
       description="Handles finance workflows"
@@ -23,6 +23,16 @@ function renderCard(onUnpublish?: () => void) {
 }
 
 describe('PlatformEmployeeCard gallery governance', () => {
+  it('uses the readable employee-card geometry shared by desktop galleries', () => {
+    renderCard();
+
+    const card = screen.getByRole('article');
+    expect(card.className).toContain('h-[262px]');
+    expect(screen.getByTestId('employee-avatar').parentElement?.className).toContain('w-[80px]');
+    expect(screen.getByText('Finance Employee').className).toContain('text-[12px]');
+    expect(screen.getByText('Handles finance workflows').className).toContain('text-[12px]');
+  });
+
   it('does not expose the unpublish action without admin callback', () => {
     renderCard();
     expect(screen.queryByRole('button', { name: '从广场下线' })).toBeNull();

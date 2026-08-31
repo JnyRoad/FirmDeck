@@ -13,6 +13,7 @@ from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from app.agents.branching import ensure_open_gallery_binding
+from app.contracts.errors import InternalErrorContext
 from app.core import harness_agent as harness_agent_module
 from app.core import harness_v2_engine as harness_v2_engine_module
 from app.core import turn_planner as turn_planner_module
@@ -35,12 +36,15 @@ from app.core.harness_attachments import (
 )
 from app.core.harness_capability_invoker import (
     HarnessCapabilityInvoker,
+    _failure,
     _failure_was_not_sent,
 )
 from app.core.harness_session_cleanup import (
     harness_task_workspace_candidates,
     harness_task_workspace_path,
 )
+from app.core.harness_session_lock import HarnessSessionBusy
+from app.core.harness_turn_store import HarnessTurnConflict
 from app.core.harness_v2_engine import (
     HarnessV2Engine,
     _combine_results,
@@ -99,6 +103,11 @@ from app.general_skills.schema import GeneralSkillRunResponse
 from app.harness import artifacts as harness_artifacts
 from app.harness import publish_harness_artifacts
 from app.harness.errors import HarnessExecutionError
+from app.i18n.language_context import (
+    LanguageContext,
+    LocaleResolutionSource,
+    SupportedLocale,
+)
 from app.knowledge.errors import KnowledgeError
 from app.knowledge.schema import KnowledgeSearchResponse
 from app.observability.event_log import EventLog
@@ -122,6 +131,115 @@ from app.session.session_schema import (
 )
 from app.skills.skill_schema import SkillCapabilityRefs
 from app.tools.tool_schema import ToolResult
+
+
+def test_harness_task_prompt_carries_reply_locale_and_raw_source_markers(
+    monkeypatch,
+) -> None:
+    """Prevent Harness finish fragments and source-owned task data from bypassing locale rules."""
+    captured_payloads: list[dict[str, object]] = []
+
+    class FakeLLMClient:
+        """Capture the real Harness stage payload and return one terminal action."""
+
+        def __init__(self, _model_config: ModelConfig) -> None:
+            """Avoid external model initialization while retaining the Harness call boundary."""
+
+        def generate_json(
+            self,
+            _system_prompt: str,
+            payload: dict[str, object],
+        ) -> dict[str, object]:
+            """Record the stage contract and return newly generated English prose."""
+            captured_payloads.append(deepcopy(payload))
+            return {
+                "action": "finish",
+                "status": "completed",
+                "reply_fragment": "The raw order ORDER-原文 is ready.",
+                "task_summary": "Order ORDER-原文 completed.",
+            }
+
+    monkeypatch.setattr(harness_agent_module, "LLMClient", FakeLLMClient)
+    context = LanguageContext(
+        ui_locale=SupportedLocale.ZH_CN,
+        agent_reply_locale=SupportedLocale.EN_US,
+        ui_locale_source=LocaleResolutionSource.EXPLICIT_REQUEST,
+        agent_reply_locale_source=LocaleResolutionSource.USER_PREFERENCE,
+    )
+    requirement = TaskRequirement(
+        task_frame_id="task-language",
+        kind="conversation",
+        goal="查询 ORDER-原文",
+        source_user_message="请保留 ORDER-原文",
+        memory_projection=[{"kind": "history", "content": "文件 /原始/路径.txt"}],
+        prior_task_results=[{"provider": "RAW-供应商回文"}],
+        capability_manifest=CapabilityManifest(),
+    )
+
+    result = HarnessTaskAgent().run(
+        requirement,
+        _model_config(),
+        lambda _name, _arguments: {"success": True},
+        language_context=context,
+    )
+
+    payload = captured_payloads[0]
+    assert payload["language_context"]["agent_reply_locale"] == "en-US"
+    assert payload["language_directive"]["new_prose_locale"] == "en-US"
+    assert payload["raw_source_markers"] == [
+        {
+            "json_pointer": "/task_requirement/source_user_message",
+            "kind": "user_input",
+            "policy": "preserve_verbatim",
+        },
+        {
+            "json_pointer": "/task_requirement/memory_projection",
+            "kind": "history",
+            "policy": "preserve_verbatim",
+        },
+        {
+            "json_pointer": "/task_requirement/prior_task_results",
+            "kind": "tool_provider_output",
+            "policy": "preserve_verbatim",
+        },
+        {
+            "json_pointer": "/harness_transcript",
+            "kind": "tool_provider_output",
+            "policy": "preserve_verbatim",
+        },
+    ]
+    assert payload["task_requirement"]["source_user_message"] == "请保留 ORDER-原文"
+    assert result.reply_fragment == "The raw order ORDER-原文 is ready."
+
+
+def test_harness_failure_projects_canonical_fields_without_private_cause() -> None:
+    """Keep a provider exception private while exposing only stable Harness error metadata."""
+    raw_provider_error = "provider token=do-not-publish path=/private/runtime.sock"
+
+    result = _failure(
+        "TOOL_UPSTREAM_ERROR",
+        raw_provider_error,
+        params={},
+        retryable=True,
+        request_id="req-harness",
+        trace_id="trace-harness",
+        internal=InternalErrorContext(
+            source="harness_tool",
+            exception_type="RuntimeError",
+            raw_message=raw_provider_error,
+        ),
+    )
+
+    assert result["error"] == {
+        "code": "TOOL_UPSTREAM_ERROR",
+        "params": {},
+        "retryable": True,
+        "request_id": "req-harness",
+        "trace_id": "trace-harness",
+        "message": "TOOL_UPSTREAM_ERROR",
+        "deprecated_fields": ["message"],
+    }
+    assert raw_provider_error not in repr(result)
 
 
 def test_first_harness_turn_derives_a_recoverable_session_id() -> None:
@@ -353,7 +471,7 @@ def test_shared_knowledge_version_is_stable_this_turn_and_fresh_next_turn() -> N
 def test_agent_loop_has_no_legacy_runtime_switch(monkeypatch) -> None:
     calls: list[tuple[str, str]] = []
 
-    def fake_run(self, request):  # noqa: ANN001
+    def fake_run(self, request):
         calls.append((request.channel, request.interaction_mode))
         return request.message
 
@@ -414,10 +532,123 @@ def test_turn_claim_is_durable_before_knowledge_version_freeze(monkeypatch) -> N
             )
         ).all()
 
-    assert "HARNESS_V2_ERROR" in response.reply
+    assert "INTERNAL_ERROR" in response.reply
     assert len(records) == 1
     assert records[0].status == "failed"
-    assert records[0].error_json["code"] == "HARNESS_V2_ERROR"
+    assert records[0].error_json["code"] == "INTERNAL_ERROR"
+
+
+def test_agent_loop_runtime_failure_keeps_raw_exception_private(monkeypatch) -> None:
+    """Do not leak raw runtime exceptions into the user reply or persisted error event."""
+    raw_error = "provider token=do-not-publish path=/private/runtime.sock"
+    engine = _test_engine()
+
+    def fake_run(self, request):
+        """Raise one seeded runtime error from the real AgentLoop boundary."""
+        raise RuntimeError(raw_error)
+
+    monkeypatch.setattr(HarnessV2Engine, "run", fake_run)
+    monkeypatch.setattr(HarnessV2Engine, "close", lambda self: None)
+
+    with Session(engine) as db:
+        response = AgentLoop(db).handle_turn(
+            ChatTurnRequest(
+                tenant_id="tenant-demo",
+                user_id="user-1",
+                agent_id="agent-1",
+                client_turn_id="client-turn-private-error",
+                message="查询制度",
+            )
+        )
+        error_event = db.exec(
+            select(AgentEvent).where(AgentEvent.event_type == "error_occurred")
+        ).one()
+
+    assert response.runtime_error_code == "INTERNAL_ERROR"
+    assert "INTERNAL_ERROR" in response.reply
+    assert raw_error not in response.reply
+    assert error_event.payload_json["code"] == "INTERNAL_ERROR"
+    assert error_event.payload_json["message"] == "INTERNAL_ERROR"
+    assert raw_error not in json.dumps(error_event.payload_json, ensure_ascii=False)
+
+
+def test_agent_loop_busy_rejection_keeps_raw_exception_private(monkeypatch) -> None:
+    """Project a busy rejection with a stable public code instead of the raw exception text."""
+    raw_error = "busy token=do-not-publish owner=worker-7"
+    engine = _test_engine()
+
+    def fake_run(self, request):
+        """Raise one seeded busy error from the AgentLoop boundary."""
+        raise HarnessSessionBusy(raw_error)
+
+    monkeypatch.setattr(HarnessV2Engine, "run", fake_run)
+    monkeypatch.setattr(HarnessV2Engine, "close", lambda self: None)
+
+    with Session(engine) as db:
+        response = AgentLoop(db).handle_turn(
+            ChatTurnRequest(
+                tenant_id="tenant-demo",
+                user_id="user-1",
+                agent_id="agent-1",
+                client_turn_id="client-turn-busy-private",
+                message="查询制度",
+            )
+        )
+        rejection_event = db.exec(
+            select(AgentEvent).where(AgentEvent.event_type == "turn_rejected")
+        ).one()
+
+    assert response.runtime_error_code == "INTERNAL_ERROR"
+    assert "INTERNAL_ERROR" in response.reply
+    assert raw_error not in response.reply
+    assert rejection_event.payload_json["code"] == "INTERNAL_ERROR"
+    assert rejection_event.payload_json["message"] == "INTERNAL_ERROR"
+    assert raw_error not in json.dumps(rejection_event.payload_json, ensure_ascii=False)
+
+
+def test_agent_loop_conflict_rejection_keeps_safe_params_without_raw_exception(
+    monkeypatch,
+) -> None:
+    """Expose only the stable conflict code and safe params on a rejected Harness turn."""
+    raw_error = "conflict digest=do-not-publish existing=request-A new=request-B"
+    engine = _test_engine()
+
+    def fake_run(self, request):
+        """Raise one seeded conflict that still carries caller-safe locale params."""
+        raise HarnessTurnConflict(
+            raw_error,
+            code="AGENT_REPLY_LOCALE_CONFLICT",
+            params={"requested": "en-US", "session": "zh-CN"},
+        )
+
+    monkeypatch.setattr(HarnessV2Engine, "run", fake_run)
+    monkeypatch.setattr(HarnessV2Engine, "close", lambda self: None)
+
+    with Session(engine) as db:
+        response = AgentLoop(db).handle_turn(
+            ChatTurnRequest(
+                tenant_id="tenant-demo",
+                user_id="user-1",
+                agent_id="agent-1",
+                client_turn_id="client-turn-locale-conflict-private",
+                message="查询制度",
+            )
+        )
+        rejection_event = db.exec(
+            select(AgentEvent).where(AgentEvent.event_type == "turn_rejected")
+        ).one()
+
+    assert response.runtime_error_code == "AGENT_REPLY_LOCALE_CONFLICT"
+    assert "AGENT_REPLY_LOCALE_CONFLICT" in response.reply
+    assert raw_error not in response.reply
+    assert rejection_event.payload_json["code"] == "AGENT_REPLY_LOCALE_CONFLICT"
+    assert rejection_event.payload_json["message"] == "AGENT_REPLY_LOCALE_CONFLICT"
+    assert rejection_event.payload_json["client_turn_id"] == "client-turn-locale-conflict-private"
+    assert rejection_event.payload_json["params"] == {
+        "requested": "en-US",
+        "session": "zh-CN",
+    }
+    assert raw_error not in json.dumps(rejection_event.payload_json, ensure_ascii=False)
 
 
 def test_knowledge_search_maps_live_authorization_error_to_tool_failure(
@@ -427,7 +658,7 @@ def test_knowledge_search_maps_live_authorization_error_to_tool_failure(
     """运行时授权撤销返回稳定知识错误，而不是通用 Harness 工具异常。"""
     monkeypatch.setenv("ULTRARAG_DATA_DIR", str(tmp_path / "data"))
 
-    def denied(*_args, **_kwargs):  # noqa: ANN002, ANN003
+    def denied(*_args, **_kwargs):
         raise KnowledgeError("KNOWLEDGE_GRANT_REQUIRED")
 
     monkeypatch.setattr(
@@ -447,7 +678,7 @@ def test_knowledge_search_maps_live_authorization_error_to_tool_failure(
             active_step_id=None,
             agent_id="agent-1",
         )
-        result = invoker._search_knowledge(  # noqa: SLF001
+        result = invoker._search_knowledge(
             {
                 "allowed_knowledge_base_ids": ["kb-policy"],
                 "knowledge_version_by_base_id": {"kb-policy": "kbver-policy"},
@@ -551,6 +782,12 @@ def test_harness_stream_retry_bootstraps_the_same_first_session(
 
     assert seen_session_ids == [expected_session_id, expected_session_id]
     assert [event for event in first_events if event["event"] == "session_created"]
+    planning = next(
+        event
+        for event in first_events
+        if event["event"] == "status" and event["data"].get("phase") == "planning"
+    )
+    assert "text" not in planning["data"]
     assert not [event for event in retry_events if event["event"] == "session_created"]
     assert [session.id for session in sessions] == [expected_session_id]
 
@@ -2389,7 +2626,7 @@ def test_large_external_json_result_uses_sandbox_reference_and_auto_resolves(
     }
     sink_arguments: list[dict[str, object]] = []
 
-    def fake_execute(_self, _tenant_id, tool_call, **_kwargs):  # noqa: ANN001
+    def fake_execute(_self, _tenant_id, tool_call, **_kwargs):
         if tool_call.name == large_tool.name:
             return ToolResult(tool_name=tool_call.name, success=True, data=large_data)
         if tool_call.name == small_tool.name:
@@ -2498,7 +2735,7 @@ def test_mcp_app_descriptor_is_host_only_and_emitted_as_trace(
         "initial_meta": {"ui": {"render": True}},
     }
 
-    def fake_execute(_self, _tenant_id, tool_call, **_kwargs):  # noqa: ANN001
+    def fake_execute(_self, _tenant_id, tool_call, **_kwargs):
         return ToolResult(
             tool_name=tool_call.name,
             success=True,
@@ -3063,7 +3300,7 @@ def test_general_skill_harness_tool_never_executes_generated_runner(
     ]
     assert trace_events[0][1]["phase"] == "instructions_loaded"
     assert trace_events[1][1]["phase"] == "instructions_loaded"
-    assert trace_events[1][1]["skill_slug"] == "weather"
+    assert trace_events[1][1]["params"]["skill_slug"] == "weather"
 
 
 def test_general_skill_harness_tool_does_not_enter_legacy_sandbox_runner(
@@ -3237,6 +3474,7 @@ def test_general_skill_harness_tool_does_not_publish_legacy_runner_artifacts(
 def test_harness_agent_enforces_tool_allowlist_and_keeps_an_isolated_transcript(
     monkeypatch,
 ) -> None:
+    """Keep tool isolation while allowing the explicit language and raw-source contract keys."""
     payloads: list[dict[str, object]] = []
     system_prompts: list[str] = []
     actions = iter(
@@ -3322,6 +3560,9 @@ def test_harness_agent_enforces_tool_allowlist_and_keeps_an_isolated_transcript(
     }
 
     assert set(payloads[0]) == {
+        "language_context",
+        "language_directive",
+        "raw_source_markers",
         "task_requirement",
         "harness_transcript",
         "iteration",
@@ -3478,8 +3719,66 @@ def test_harness_agent_does_not_adapt_bare_json_without_loaded_general_skill(
 
     assert result.status == "failed"
     assert result.error is not None
-    assert result.error["code"] == "HARNESS_ACTION_INVALID"
+    assert result.error["code"] == "MODEL_INVALID_PROVIDER_RESPONSE"
     assert result.structured_result is None
+
+
+def test_harness_agent_keeps_invalid_action_details_private_in_public_trace(
+    monkeypatch,
+) -> None:
+    """Keep protocol repair details in the model payload only, not in public trace or result error."""
+    raw_error = "protocol token=do-not-publish path=/private/action.json"
+    payloads: list[dict[str, object]] = []
+    trace_events: list[tuple[str, dict[str, object]]] = []
+    actions = iter(
+        [
+            {"action": raw_error},
+            {"action": raw_error},
+        ]
+    )
+
+    class FakeLLMClient:
+        """Return two invalid action envelopes so Harness exposes one terminal failure."""
+
+        def __init__(self, _model_config: ModelConfig):
+            """Avoid external model setup during the focused failure test."""
+
+        def generate_json(self, _system_prompt, payload):
+            """Capture the repair payload and return the next invalid action."""
+            payloads.append(deepcopy(payload))
+            return next(actions)
+
+    monkeypatch.setattr(harness_agent_module, "LLMClient", FakeLLMClient)
+
+    result = HarnessTaskAgent().run(
+        TaskRequirement(
+            task_frame_id="task-invalid-trace-private",
+            kind="conversation",
+            goal="普通任务",
+            capability_manifest=CapabilityManifest(),
+        ),
+        _model_config(),
+        lambda _name, _arguments: {"success": True},
+        max_actions=1,
+        trace_sink=lambda event_type, payload: trace_events.append((event_type, payload)),
+    )
+
+    repair_payload = payloads[1]["protocol_repair"]
+    repair_event = next(
+        payload for event_type, payload in trace_events if event_type == "harness_action_repair_requested"
+    )
+    failed_event = next(
+        payload for event_type, payload in trace_events if event_type == "harness_action_failed"
+    )
+
+    assert raw_error in json.dumps(repair_payload, ensure_ascii=False)
+    assert result.error == {
+        "code": "MODEL_INVALID_PROVIDER_RESPONSE",
+        "message": "MODEL_INVALID_PROVIDER_RESPONSE",
+    }
+    assert raw_error not in json.dumps(repair_event, ensure_ascii=False)
+    assert raw_error not in json.dumps(failed_event, ensure_ascii=False)
+    assert raw_error not in json.dumps(result.error, ensure_ascii=False)
 
 
 def test_harness_agent_repairs_invalid_tool_action_envelope_once(
@@ -3553,6 +3852,74 @@ def test_harness_agent_repairs_invalid_tool_action_envelope_once(
         event_type == "harness_action_repair_requested"
         for event_type, _payload in trace_events
     ) == 1
+
+
+def test_harness_agent_keeps_tool_exception_private_in_public_trace(
+    monkeypatch,
+) -> None:
+    """Do not project raw tool exceptions into capability results or trace events."""
+    raw_error = "provider token=do-not-publish path=/private/tool.sock"
+    actions = iter(
+        [
+            {
+                "action": "tool",
+                "tool_name": "orders.lookup",
+                "arguments": {"order_id": "SO-42"},
+            },
+            {
+                "action": "finish",
+                "status": "failed",
+                "reply_fragment": "请稍后重试。",
+            },
+        ]
+    )
+
+    class FakeLLMClient:
+        """Return one tool action followed by one terminal finish action."""
+
+        def __init__(self, _model_config: ModelConfig):
+            """Avoid real model initialization during the trace-sanitizing test."""
+
+        def generate_json(self, _system_prompt, _payload):
+            """Return the next deterministic Harness action."""
+            return next(actions)
+
+    monkeypatch.setattr(harness_agent_module, "LLMClient", FakeLLMClient)
+    trace_events: list[tuple[str, dict[str, object]]] = []
+
+    def invoke_tool(_name: str, _arguments: dict[str, object]) -> dict[str, object]:
+        """Raise one seeded provider exception from the real tool boundary."""
+        raise RuntimeError(raw_error)
+
+    result = HarnessTaskAgent().run(
+        TaskRequirement(
+            task_frame_id="task-tool-private-trace",
+            kind="conversation",
+            goal="查询订单",
+            capability_manifest=CapabilityManifest(
+                available=[
+                    CapabilityDescriptor(
+                        capability_id="tool-orders-lookup",
+                        name="orders.lookup",
+                        kind="tool",
+                    )
+                ]
+            ),
+        ),
+        _model_config(),
+        invoke_tool,
+        max_actions=2,
+        trace_sink=lambda event_type, payload: trace_events.append((event_type, payload)),
+    )
+
+    tool_event = next(
+        payload for event_type, payload in trace_events if event_type == "harness_tool_completed"
+    )
+
+    assert result.capability_results[0]["error"]["code"] == "TOOL_UPSTREAM_ERROR"
+    assert result.capability_results[0]["error"]["message"] == "TOOL_UPSTREAM_ERROR"
+    assert raw_error not in json.dumps(tool_event, ensure_ascii=False)
+    assert raw_error not in json.dumps(result.capability_results, ensure_ascii=False)
 
 
 def test_harness_agent_executes_consecutive_json_actions_in_order(
@@ -3644,7 +4011,7 @@ def test_invalid_action_protocol_failure_keeps_sop_loop_recoverable() -> None:
         task_frame_id="task-purchase",
         status="failed",
         reply_fragment="当前任务的执行模型没有返回有效动作。",
-        error={"code": "HARNESS_ACTION_INVALID"},
+        error={"code": "MODEL_INVALID_PROVIDER_RESPONSE"},
     )
     business_failure = failure.model_copy(
         update={"error": {"code": "TOOL_EXECUTION_FAILED"}}
@@ -3667,7 +4034,7 @@ def test_failed_following_sop_step_keeps_completed_checkpoint_reply() -> None:
         status="failed",
         reply_fragment="当前任务的执行模型没有返回有效动作。",
         task_summary="Harness 动作解析失败。",
-        error={"code": "HARNESS_ACTION_INVALID", "message": "Connection error"},
+        error={"code": "MODEL_INVALID_PROVIDER_RESPONSE", "message": "Connection error"},
         action_count=1,
     )
 

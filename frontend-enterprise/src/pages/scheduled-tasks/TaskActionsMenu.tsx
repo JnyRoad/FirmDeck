@@ -5,6 +5,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui';
+import { useAppIntl, type MessageId, type MessageValues } from '@/i18n';
 
 import IconEdit from '../../assets/icons/edit.svg?react';
 import IconListBulleted from '../../assets/icons/list-bulleted.svg?react';
@@ -13,6 +14,8 @@ import IconPause from '../../assets/icons/pause.svg?react';
 import IconPlay from '../../assets/icons/play.svg?react';
 import IconTrash from '../../assets/icons/trash.svg?react';
 import type { ScheduledTaskRead } from '../../types';
+
+type TaskActionsMessageId = MessageId;
 
 const MENU_ITEM_CLASS =
   'w-[110px] cursor-pointer gap-[4px] rounded-[10px] px-[12px] py-[6px] text-[12px] text-[#858b9c] focus:text-[#18181a] [&_svg]:size-[14px]';
@@ -37,12 +40,19 @@ export function TaskActionsMenu({
   onToggleStatus,
   onDelete,
 }: TaskActionsMenuProps) {
+  const { t: appT } = useAppIntl();
   const isArchived = task.status === 'archived';
   const isCompleted = task.status === 'completed';
+
+  /** Format one scheduled-task action label from the canonical semantic catalog. */
+  function t(id: TaskActionsMessageId, values?: MessageValues): string {
+    return appT(id, values);
+  }
+
   return (
     <DropdownMenu>
       <DropdownMenuTrigger
-        aria-label="操作"
+        aria-label={t('scheduledTasksPage.action.menu')}
         className="grid size-7 place-items-center rounded-[8px] text-[#1a71ff] transition-colors outline-none hover:bg-black/5 hover:text-[#4a8dff] focus-visible:bg-black/5"
       >
         <IconMore className="size-3.5" />
@@ -53,22 +63,24 @@ export function TaskActionsMenu({
       >
         <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => onViewRuns(task)}>
           <IconListBulleted />
-          查看记录
+          {t('scheduledTasksPage.action.viewRuns')}
         </DropdownMenuItem>
         {!isArchived && (
           <>
             <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => onEdit(task)}>
               <IconEdit />
-              编辑
+              {t('scheduledTasksPage.action.edit')}
             </DropdownMenuItem>
             <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => onRunNow(task)}>
               <IconPlay />
-              立即执行
+              {t('scheduledTasksPage.action.runNow')}
             </DropdownMenuItem>
             {!isCompleted && (
               <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => onToggleStatus(task)}>
                 {task.status === 'active' ? <IconPause /> : <IconPlay />}
-                {task.status === 'active' ? '暂停' : '启用'}
+                {task.status === 'active'
+                  ? t('scheduledTasksPage.action.pause')
+                  : t('scheduledTasksPage.action.enable')}
               </DropdownMenuItem>
             )}
             <DropdownMenuSeparator className="my-[2px] bg-[#eef0f4]" />
@@ -78,7 +90,7 @@ export function TaskActionsMenu({
               onSelect={() => onDelete(task)}
             >
               <IconTrash />
-              删除
+              {t('scheduledTasksPage.action.delete')}
             </DropdownMenuItem>
           </>
         )}

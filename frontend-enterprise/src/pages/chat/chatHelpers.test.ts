@@ -2,21 +2,43 @@ import { describe, expect, it } from 'vitest';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 
+import { AppIntlProvider, createAppTranslator } from '@/i18n';
 import type { ChatMessage } from '@/types';
 
 import {
   STREAM_TERMINAL_EVENTS,
   MarkdownMessage,
+  attachmentTypeLabel,
   canRateMessage,
+  formatDraftSchedule,
   harnessEventTraceLine,
   harnessWorkspaceArtifacts,
   knowledgeCitations,
   messageAttachments,
   renderInlineMarkdown,
+  routerDecisionTraceLine,
   scheduledDraftForMessage,
   shouldDeferPersistedEventToLiveStream,
+  streamErrorTraceLine,
   stripTrailingCitationSummary,
+  traceSummary,
 } from './chatHelpers';
+
+const { t: translate } = createAppTranslator('zh-CN');
+const { t: translateEnglish } = createAppTranslator('en-US');
+
+/** 在显式语义 i18n Provider 中渲染 Markdown，确保图片宿主 ARIA 使用当前 locale。 */
+function renderLocalizedMarkdown(content: string, preserveLineBreaks = true): string {
+  return renderToStaticMarkup(
+    createElement(
+      AppIntlProvider,
+      {
+        initialLocale: 'zh-CN',
+        children: createElement(MarkdownMessage, { content, preserveLineBreaks }),
+      },
+    ),
+  );
+}
 
 function message(patch: Partial<ChatMessage> = {}): ChatMessage {
   return {
@@ -59,9 +81,7 @@ describe('chat history consumer contract', () => {
   });
 
   it('continues top-level process numbering across blank lines and bullet details', () => {
-    const rendered = renderToStaticMarkup(
-      createElement(MarkdownMessage, {
-        content: [
+    const rendered = renderLocalizedMarkdown([
           '## 用印审批流程指引',
           '',
           '1. **申请入口**：登录审批系统',
@@ -76,9 +96,7 @@ describe('chat history consumer contract', () => {
           '- 直属上级审批',
           '',
           '1. **用印办理**：前往办公室盖章',
-        ].join('\n'),
-      }),
-    );
+        ].join('\n'));
 
     expect(rendered.match(/<ol(?: start="\d+")?>/g)).toEqual([
       '<ol>',
@@ -89,11 +107,7 @@ describe('chat history consumer contract', () => {
   });
 
   it('restarts an ordered list after regular paragraph content', () => {
-    const rendered = renderToStaticMarkup(
-      createElement(MarkdownMessage, {
-        content: ['1. 第一组', '', '这是新的正文段落。', '', '1. 第二组'].join('\n'),
-      }),
-    );
+    const rendered = renderLocalizedMarkdown(['1. 第一组', '', '这是新的正文段落。', '', '1. 第二组'].join('\n'));
 
     expect(rendered.match(/<ol(?: start="\d+")?>/g)).toEqual(['<ol>', '<ol>']);
   });
@@ -154,15 +168,11 @@ describe('chat history consumer contract', () => {
   });
 
   it('renders safe Markdown images and keeps unsafe image targets as text', () => {
-    const rendered = renderToStaticMarkup(
-      createElement(MarkdownMessage, {
-        content: [
+    const rendered = renderLocalizedMarkdown([
           '![趋势图](https://images.example.com/chart.png)',
           '',
           '![危险图片](javascript:alert(1))',
-        ].join('\n'),
-      }),
-    );
+        ].join('\n'));
 
     expect(rendered).toContain('src="https://images.example.com/chart.png"');
     expect(rendered).toContain('alt="趋势图"');
@@ -303,6 +313,53 @@ describe('chat history consumer contract', () => {
     ]);
   });
 
+  /** 验证 trace、附件和排程摘要使用当前 locale，同时保留工具名等 raw 业务值。 */
+  it('localizes helper chrome without translating raw values', () => {
+    const rawToolName = '工具-中文-raw';
+    const rawIntent = '采购流程';
+    const rawToolLine = harnessEventTraceLine('harness_action_created', {
+      task_frame_id: 'task-locale',
+      action: 'tool',
+      tool_name: rawToolName,
+    }, translateEnglish);
+    const zhRouter = routerDecisionTraceLine({ user_intent: rawIntent }, translate);
+    const enRouter = routerDecisionTraceLine({ user_intent: rawIntent }, translateEnglish);
+    const zhError = streamErrorTraceLine({ code: 'PROVIDER_FAILURE' }, 'error', translate);
+    const enError = streamErrorTraceLine({ code: 'PROVIDER_FAILURE' }, 'error', translateEnglish);
+    const attachment = {
+      id: 'attachment-locale',
+      filename: '原始文件.txt',
+      content_type: 'text/plain',
+      size: 2048,
+      kind: 'text' as const,
+      text: 'raw body',
+    };
+    const draft = {
+      should_create: true,
+      tenant_id: 'tenant-demo',
+      agent_id: 'agent-demo',
+      title: 'raw schedule title',
+      prompt: 'raw schedule prompt',
+      schedule_type: 'weekly' as const,
+      schedule: { weekdays: [0, 2], time: '09:30' },
+      timezone: 'Asia/Shanghai',
+      confidence: 1,
+    };
+
+    expect(zhRouter.text).toContain(rawIntent);
+    expect(enRouter.text).toContain(rawIntent);
+    expect(zhRouter.text).not.toBe(enRouter.text);
+    expect(zhError.text).not.toBe(enError.text);
+    expect(zhError.detail).toContain('PROVIDER_FAILURE');
+    expect(attachmentTypeLabel(attachment, 'zh-CN', translate)).toContain('文本');
+    expect(attachmentTypeLabel(attachment, 'en-US', translateEnglish)).toContain('Text');
+    expect(formatDraftSchedule(draft, 'zh-CN', translate, 'Asia/Shanghai')).toContain('09:30');
+    expect(formatDraftSchedule(draft, 'en-US', translateEnglish, 'Asia/Shanghai')).toContain('09:30');
+    expect(formatDraftSchedule(draft, 'zh-CN', translate, 'Asia/Shanghai'))
+      .not.toBe(formatDraftSchedule(draft, 'en-US', translateEnglish, 'Asia/Shanghai'));
+    expect(rawToolLine?.text).toContain(rawToolName);
+  });
+
   it('replays persisted assistant and terminal events even when an old live stream owns the turn', () => {
     expect(shouldDeferPersistedEventToLiveStream('stream_delta', true)).toBe(true);
     expect(shouldDeferPersistedEventToLiveStream('assistant_message_created', true)).toBe(false);
@@ -315,13 +372,13 @@ describe('chat history consumer contract', () => {
     const started = harnessEventTraceLine('task_frame_started', {
       task_frame_id: 'task-weather',
       kind: 'conversation',
-    });
+    }, translate);
     const action = harnessEventTraceLine('harness_action_created', {
       task_frame_id: 'task-weather',
       iteration: 1,
       action: 'tool',
       tool_name: 'general_skill.weather',
-    });
+    }, translate);
     const completed = harnessEventTraceLine('harness_tool_completed', {
       task_frame_id: 'task-weather',
       iteration: 1,
@@ -331,7 +388,7 @@ describe('chat history consumer contract', () => {
         success: true,
         data: { structured_result: { temperature: 29 } },
       },
-    });
+    }, translate);
     const appView = harnessEventTraceLine('harness_mcp_app_view', {
       task_frame_id: 'task-weather',
       tool_name: 'weather.card',
@@ -342,12 +399,12 @@ describe('chat history consumer contract', () => {
         visibility: ['model', 'app'],
         mime_type: 'text/html;profile=mcp-app',
       },
-    });
+    }, translate);
     const finished = harnessEventTraceLine('task_frame_finished', {
       task_frame_id: 'task-weather',
       status: 'completed',
       action_count: 2,
-    });
+    }, translate);
 
     expect(started).toMatchObject({
       id: 'harness_frame_task-weather',
@@ -361,7 +418,7 @@ describe('chat history consumer contract', () => {
     });
     expect(completed).toMatchObject({
       id: 'harness_action_task-weather_1',
-      text: '能力调用完成 general_skill.weather',
+      text: '能力调用完成：general_skill.weather',
       state: 'completed',
       outputLanguage: 'json',
       outputTitle: '查看能力结果',
@@ -387,7 +444,7 @@ describe('chat history consumer contract', () => {
       skill_id: 'skill_purchase_001',
       skill_name: '购买商品流程',
       step_id: 'collect_user_name',
-    });
+    }, translate);
     const finished = harnessEventTraceLine('task_frame_finished', {
       task_frame_id: 'task-purchase',
       kind: 'sop',
@@ -396,18 +453,18 @@ describe('chat history consumer contract', () => {
       step_id: 'collect_user_name',
       status: 'awaiting_user',
       action_count: 1,
-    });
+    }, translate);
 
     expect(started).toMatchObject({
       id: 'harness_frame_task-purchase',
-      text: '开始SOP 购买商品流程',
+      text: '开始 SOP 购买商品流程',
       state: 'running',
     });
     expect(finished).toMatchObject({
       id: 'harness_frame_task-purchase',
       kind: 'skill',
-      text: '等待用户补充 购买商品流程',
-      detail: '状态 awaiting_user · 步骤 collect_user_name · 执行 1 个动作',
+      text: '等待用户补充：购买商品流程',
+      detail: '状态：awaiting_user · 步骤 collect_user_name · 已执行 1 个动作',
       state: 'running',
     });
   });

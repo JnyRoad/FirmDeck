@@ -5,6 +5,7 @@ from collections.abc import Callable
 from typing import Any
 
 from app.db.models import ChatSession, Message, Skill
+from app.i18n.language_context import LanguageContext
 from app.knowledge.citations import knowledge_citations_from_results
 from app.session.attachments import (
     message_content_with_attachment_context,
@@ -43,12 +44,19 @@ class ConversationProjection:
         step_result: StepAgentResult | None,
         *,
         citation_deduper: Callable[[list[dict[str, Any]]], list[dict[str, Any]]] | None = None,
+        language_context: LanguageContext | None = None,
     ) -> dict[str, Any]:
+        """Project assistant citations and the immutable language snapshot into message metadata."""
         knowledge_results = list(step_result.knowledge_results or []) if step_result else []
         dedupe = citation_deduper or cls.dedupe_knowledge_citations
         citations = dedupe(knowledge_citations_from_results(knowledge_results))
+        context_metadata = (
+            {"language_context": language_context.model_dump(mode="json")}
+            if language_context is not None
+            else {}
+        )
         if not citations:
-            return {}
+            return context_metadata
         latest_query = next(
             (
                 item.get("query")
@@ -58,6 +66,7 @@ class ConversationProjection:
             None,
         )
         return {
+            **context_metadata,
             "knowledge_citations": citations,
             "knowledge_query": latest_query or {},
         }
@@ -92,6 +101,7 @@ class ConversationProjection:
 
     @staticmethod
     def user_message_metadata(request: ChatTurnRequest) -> dict[str, Any]:
+        """Project non-content request metadata, including the resolved language snapshot."""
         metadata: dict[str, Any] = {}
         if request.client_turn_id:
             metadata["client_turn_id"] = request.client_turn_id
@@ -103,6 +113,8 @@ class ConversationProjection:
             metadata["model_config_id"] = request.model_config_id
         if request.attachments:
             metadata["attachments"] = [item.model_dump(mode="json") for item in request.attachments]
+        if request.language_context is not None:
+            metadata["language_context"] = request.language_context.model_dump(mode="json")
         return metadata
 
     @staticmethod

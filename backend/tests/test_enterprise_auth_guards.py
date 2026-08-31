@@ -13,7 +13,8 @@ from app.api.persona import router as persona_router
 from app.api.scheduled_tasks import enterprise_router as scheduled_tasks_router
 from app.api.sessions import router as sessions_router
 from app.api.skills import router as skills_router
-from app.api.tools import mcp_router, router as tools_router
+from app.api.tools import mcp_router
+from app.api.tools import router as tools_router
 from app.api.traces import router as traces_router
 from app.api.ui_config import enterprise_router as ui_config_router
 
@@ -65,4 +66,5 @@ def test_enterprise_read_endpoints_require_authentication() -> None:
     for path in paths:
         response = client.get(path)
         assert response.status_code == 401
-        assert response.json() == {"detail": "Not authenticated"}
+        payload = response.json()
+        assert payload["detail"]["code"] == "AUTH_NOT_AUTHENTICATED"

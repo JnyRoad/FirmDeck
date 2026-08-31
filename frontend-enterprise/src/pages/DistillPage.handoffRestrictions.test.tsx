@@ -89,4 +89,24 @@ describe('handoffAssigneeUserOptions channel variants', () => {
       { value: 'user-2', label: 'bob（网页端）' },
     ]);
   });
+
+  it('localizes supported channel labels in English while preserving raw usernames', () => {
+    /** 渠道标签属于产品 chrome，应随 locale 切换；用户名是原始身份数据，必须逐字保留。 */
+    const options = handoffAssigneeUserOptions([
+      {
+        id: 'user-1',
+        username: 'alice_日本語',
+        channel_identities: [
+          { channel: 'feishu', external_user_id: 'ou_1' },
+          { channel: 'wecom', external_user_id: 'wecom_1' },
+        ],
+      },
+    ], 'en-US');
+
+    expect(options).toEqual([
+      { value: 'user-1', label: 'alice_日本語 (Web)' },
+      { value: 'user-1::feishu', label: 'alice_日本語 (Feishu)' },
+      { value: 'user-1::wecom', label: 'alice_日本語 (WeCom)' },
+    ]);
+  });
 });

@@ -2,7 +2,7 @@
  * 共享知识库历史面板：管理全局版本生命周期，并按来源与权限变化复盘只追加审计事件。
  */
 
-import { useEffect, useMemo, useState } from 'react';
+import { useContext, useEffect, useMemo, useState } from 'react';
 
 import { api, TENANT_ID } from '@/api/client';
 import {
@@ -13,6 +13,9 @@ import {
 } from '@/components/ui';
 import { Button } from '@/components/ui/button';
 import { notify } from '@/components/ui/app-toast';
+import { createAppTranslator, getStoredLocale } from '@/i18n';
+import { RawContent, RawIdentifier } from '@/i18n/RawContent';
+import { AppIntlContext } from '@/i18n/provider';
 import { apiErrorCode, apiErrorMessage } from '@/lib/apiErrorMessages';
 import type {
   KnowledgeBaseAuditEventRead,
@@ -44,42 +47,6 @@ type AuditFilters = {
   versionId: string;
 };
 
-const VERSION_STATE_LABELS: Record<'draft' | 'released' | 'rejected', string> = {
-  draft: '草稿',
-  released: '正式版本',
-  rejected: '已驳回',
-};
-
-const AUDIT_ACTION_LABELS: Record<string, string> = {
-  shared_created: '创建共享知识库',
-  binding_created: '绑定团队',
-  binding_revoked: '移除团队绑定',
-  default_changed: '变更默认写入目标',
-  grant_created: '新增权限',
-  grant_changed: '变更权限',
-  grant_revoked: '撤销权限',
-  draft_created: '创建草稿',
-  draft_updated: '更新草稿',
-  version_published: '发布正式版本',
-  draft_rejected: '驳回草稿',
-  version_rolled_back: '回滚正式版本',
-  dedicated_converted: '专用知识转为共享',
-  conversion_failed: '转换失败',
-};
-
-const ACTOR_TYPE_LABELS: Record<string, string> = {
-  user: '用户',
-  agent: 'Agent',
-  system: '系统',
-};
-
-const PERMISSION_LABELS: Record<string, string> = {
-  none: '无权限',
-  reader: '可读取',
-  editor: '可编辑',
-  publisher: '可发布',
-};
-
 const EMPTY_AUDIT_FILTERS: AuditFilters = {
   teamId: '',
   action: '',
@@ -96,14 +63,39 @@ const EMPTY_AUDIT_PAGE: KnowledgeBaseAuditPageRead = {
   has_more: false,
 };
 
+/** 为共享知识版本对话框提供稳定翻译入口；无 Provider 时回退当前持久化 locale。 */
+function useSharedKnowledgeVersionsIntl() {
+  const context = useContext(AppIntlContext);
+  return useMemo(() => context ?? createAppTranslator(getStoredLocale()), [context]);
+}
+
 function publicationState(version: KnowledgeBaseVersionRead) {
   /** 旧版历史缺省视为正式版本，仅供专用兼容数据安全展示。 */
   return version.publication_state || 'released';
 }
 
-function auditActionLabel(action: string) {
+function auditActionLabel(
+  action: string,
+  t: ReturnType<typeof useSharedKnowledgeVersionsIntl>['t'],
+) {
   /** 将稳定审计动作码映射为可读业务动作，未知码保留原值便于诊断。 */
-  return AUDIT_ACTION_LABELS[action] || action;
+  const messageIds: Record<string, Parameters<typeof t>[0]> = {
+    shared_created: 'sharedKnowledgeVersions.auditAction.sharedCreated',
+    binding_created: 'sharedKnowledgeVersions.auditAction.bindingCreated',
+    binding_revoked: 'sharedKnowledgeVersions.auditAction.bindingRevoked',
+    default_changed: 'sharedKnowledgeVersions.auditAction.defaultChanged',
+    grant_created: 'sharedKnowledgeVersions.auditAction.grantCreated',
+    grant_changed: 'sharedKnowledgeVersions.auditAction.grantChanged',
+    grant_revoked: 'sharedKnowledgeVersions.auditAction.grantRevoked',
+    draft_created: 'sharedKnowledgeVersions.auditAction.draftCreated',
+    draft_updated: 'sharedKnowledgeVersions.auditAction.draftUpdated',
+    version_published: 'sharedKnowledgeVersions.auditAction.versionPublished',
+    draft_rejected: 'sharedKnowledgeVersions.auditAction.draftRejected',
+    version_rolled_back: 'sharedKnowledgeVersions.auditAction.versionRolledBack',
+    dedicated_converted: 'sharedKnowledgeVersions.auditAction.dedicatedConverted',
+    conversion_failed: 'sharedKnowledgeVersions.auditAction.conversionFailed',
+  };
+  return messageIds[action] ? t(messageIds[action]) : action;
 }
 
 function auditDetail(event: KnowledgeBaseAuditEventRead, key: string) {
@@ -112,16 +104,48 @@ function auditDetail(event: KnowledgeBaseAuditEventRead, key: string) {
   return typeof value === 'string' || typeof value === 'number' ? String(value) : '';
 }
 
-function permissionTransition(event: KnowledgeBaseAuditEventRead) {
+function permissionLabel(
+  permission: string,
+  t: ReturnType<typeof useSharedKnowledgeVersionsIntl>['t'],
+) {
+  const messageIds: Record<string, Parameters<typeof t>[0]> = {
+    none: 'sharedKnowledgeVersions.permission.none',
+    reader: 'sharedKnowledgeVersions.permission.reader',
+    editor: 'sharedKnowledgeVersions.permission.editor',
+    publisher: 'sharedKnowledgeVersions.permission.publisher',
+  };
+  return messageIds[permission] ? t(messageIds[permission]) : permission;
+}
+
+function actorTypeLabel(
+  actorType: string,
+  t: ReturnType<typeof useSharedKnowledgeVersionsIntl>['t'],
+) {
+  const messageIds: Record<string, Parameters<typeof t>[0]> = {
+    user: 'sharedKnowledgeVersions.actor.user',
+    agent: 'sharedKnowledgeVersions.actor.agent',
+    system: 'sharedKnowledgeVersions.actor.system',
+  };
+  return messageIds[actorType] ? t(messageIds[actorType]) : actorType;
+}
+
+function permissionTransition(
+  event: KnowledgeBaseAuditEventRead,
+  t: ReturnType<typeof useSharedKnowledgeVersionsIntl>['t'],
+) {
   /** 将权限变更前后状态投影为产品定义的四档权限文案。 */
   const previous = auditDetail(event, 'previous_permission') || 'none';
   const current = auditDetail(event, 'current_permission') || auditDetail(event, 'permission');
   if (!current) return '';
-  return `${PERMISSION_LABELS[previous] || previous} → ${PERMISSION_LABELS[current] || current}`;
+  return t('sharedKnowledgeVersions.audit.permissionTransition', {
+    previous: permissionLabel(previous, t),
+    current: permissionLabel(current, t),
+  });
 }
 
 function versionTransition(
   event: KnowledgeBaseAuditEventRead,
+  t: ReturnType<typeof useSharedKnowledgeVersionsIntl>['t'],
   versionLabels: Map<string, string>,
 ) {
   /** 从事件详情和受影响版本拼出发布或回滚指针变化。 */
@@ -133,14 +157,20 @@ function versionTransition(
   if (!previousId || !targetId) return '';
   const previous = versionLabels.get(previousId) || previousId;
   const target = versionLabels.get(targetId) || event.knowledge_base_version || targetId;
-  return `v${previous} → v${target}`;
+  return t('sharedKnowledgeVersions.audit.versionTransition', {
+    previous: `v${previous}`,
+    target: `v${target}`,
+  });
 }
 
-function formatAuditTime(value: string) {
+function formatAuditTime(
+  value: string,
+  locale: ReturnType<typeof useSharedKnowledgeVersionsIntl>['locale'],
+) {
   /** 以本地短日期时间展示事件时间；无效值原样返回避免丢失证据。 */
   const parsed = new Date(value);
   if (Number.isNaN(parsed.getTime())) return value;
-  return parsed.toLocaleString('zh-CN', {
+  return parsed.toLocaleString(locale, {
     year: 'numeric',
     month: '2-digit',
     day: '2-digit',
@@ -172,6 +202,7 @@ export function SharedKnowledgeVersionsDialog({
   onChanged,
 }: SharedKnowledgeVersionsDialogProps) {
   /** 管理一个共享库的全局草稿、发布、驳回与回滚生命周期。 */
+  const { locale, t } = useSharedKnowledgeVersionsIntl();
   const [versions, setVersions] = useState<KnowledgeBaseVersionRead[]>([]);
   const [selectedTeamId, setSelectedTeamId] = useState('');
   const [reason, setReason] = useState('');
@@ -200,7 +231,22 @@ export function SharedKnowledgeVersionsDialog({
     return Array.from(options, ([id, name]) => ({ id, name }));
   }, [auditPage.items, teamOptions]);
   const auditActionOptions = useMemo(() => {
-    const actions = new Set(Object.keys(AUDIT_ACTION_LABELS));
+    const actions = new Set([
+      'shared_created',
+      'binding_created',
+      'binding_revoked',
+      'default_changed',
+      'grant_created',
+      'grant_changed',
+      'grant_revoked',
+      'draft_created',
+      'draft_updated',
+      'version_published',
+      'draft_rejected',
+      'version_rolled_back',
+      'dedicated_converted',
+      'conversion_failed',
+    ]);
     auditPage.items.forEach((event) => actions.add(event.action));
     return Array.from(actions);
   }, [auditPage.items]);
@@ -243,7 +289,7 @@ export function SharedKnowledgeVersionsDialog({
       );
       setVersions(rows);
     } catch (error) {
-      const message = apiErrorMessage(error, '加载共享版本失败');
+      const message = apiErrorMessage(error, 'sharedKnowledgeVersions.error.loadVersions', { t });
       setErrorMessage(message);
       notify.error(message);
     } finally {
@@ -270,7 +316,7 @@ export function SharedKnowledgeVersionsDialog({
           : page
       ));
     } catch (error) {
-      const message = apiErrorMessage(error, '加载审计历史失败');
+      const message = apiErrorMessage(error, 'sharedKnowledgeVersions.error.loadAudit', { t });
       setAuditErrorMessage(message);
       notify.error(message);
     } finally {
@@ -304,7 +350,7 @@ export function SharedKnowledgeVersionsDialog({
       await loadVersions();
       await onChanged?.();
     } catch (error) {
-      const message = apiErrorMessage(error, '共享知识库版本操作失败');
+      const message = apiErrorMessage(error, 'sharedKnowledgeVersions.error.mutation', { t });
       setErrorMessage(message);
       notify.error(message);
       if (apiErrorCode(error) === 'KNOWLEDGE_PUBLISH_CONFLICT') {
@@ -326,7 +372,7 @@ export function SharedKnowledgeVersionsDialog({
         change_reason: reason.trim(),
         expected_published_version_id: expectedHead,
       }),
-      '共享知识草稿已创建',
+      t('sharedKnowledgeVersions.toast.createdDraft'),
     );
   }
 
@@ -343,7 +389,7 @@ export function SharedKnowledgeVersionsDialog({
           change_reason: reason.trim(),
         },
       ),
-      `已发布 ${version.version}`,
+      t('sharedKnowledgeVersions.toast.published', { version: version.version }),
     );
   }
 
@@ -359,7 +405,7 @@ export function SharedKnowledgeVersionsDialog({
           change_reason: reason.trim(),
         },
       ),
-      `已驳回 ${version.version}`,
+      t('sharedKnowledgeVersions.toast.rejected', { version: version.version }),
     );
   }
 
@@ -374,7 +420,7 @@ export function SharedKnowledgeVersionsDialog({
         expected_published_version_id: publishedHead.id,
         change_reason: reason.trim(),
       }),
-      `已回滚到 ${version.version}`,
+      t('sharedKnowledgeVersions.toast.rolledBack', { version: version.version }),
     );
   }
 
@@ -383,13 +429,13 @@ export function SharedKnowledgeVersionsDialog({
   return (
     <Dialog open={open} onOpenChange={(next) => !next && onClose()}>
       <DialogContent className="max-h-[86vh] max-w-[920px] overflow-y-auto">
-        <DialogTitle>共享版本：{knowledgeBase?.name || ''}</DialogTitle>
+        <DialogTitle>{t('sharedKnowledgeVersions.dialog.title', { name: knowledgeBase?.name || '' })}</DialogTitle>
         <div className="flex flex-col gap-4">
           <p className="m-0 text-sm leading-6 text-muted-foreground">
-            所有绑定团队共用一个最新正式版本；草稿在发布前不会影响团队读取。
+            {t('sharedKnowledgeVersions.dialog.description')}
           </p>
 
-          <div role="tablist" aria-label="共享知识库历史视图" className="flex gap-1 rounded-lg bg-muted p-1">
+          <div role="tablist" aria-label={t('sharedKnowledgeVersions.tabs.label')} className="flex gap-1 rounded-lg bg-muted p-1">
             <Button
               role="tab"
               aria-selected={activeView === 'versions'}
@@ -397,7 +443,7 @@ export function SharedKnowledgeVersionsDialog({
               className="flex-1"
               onClick={() => setActiveView('versions')}
             >
-              版本历史
+              {t('sharedKnowledgeVersions.tabs.versions')}
             </Button>
             <Button
               role="tab"
@@ -406,7 +452,7 @@ export function SharedKnowledgeVersionsDialog({
               className="flex-1"
               onClick={() => setActiveView('audit')}
             >
-              审计历史
+              {t('sharedKnowledgeVersions.tabs.audit')}
             </Button>
           </div>
 
@@ -414,9 +460,9 @@ export function SharedKnowledgeVersionsDialog({
             <>
               <div className="grid gap-3 rounded-xl border bg-muted/25 p-4 md:grid-cols-[220px_minmax(0,1fr)_auto]">
             <label className="flex flex-col gap-2 text-sm font-medium">
-              操作团队
+              {t('sharedKnowledgeVersions.field.team')}
               <select
-                aria-label="操作团队"
+                aria-label={t('sharedKnowledgeVersions.field.team')}
                 className="h-9 rounded-md border bg-background px-3 text-sm"
                 value={selectedTeamId}
                 onChange={(event) => setSelectedTeamId(event.target.value)}
@@ -427,22 +473,22 @@ export function SharedKnowledgeVersionsDialog({
               </select>
             </label>
             <label className="flex flex-col gap-2 text-sm font-medium">
-              变更原因
+              {t('sharedKnowledgeVersions.field.reason')}
               <Input
-                aria-label="变更原因"
+                aria-label={t('sharedKnowledgeVersions.field.reason')}
                 value={reason}
                 onChange={(event) => setReason(event.target.value)}
-                placeholder="说明本次新增、发布、驳回或回滚原因"
+                placeholder={t('sharedKnowledgeVersions.field.reasonPlaceholder')}
               />
             </label>
             <Button className="self-end" disabled={!canMutate} onClick={createDraft}>
-              创建草稿
+              {t('sharedKnowledgeVersions.actions.createDraft')}
             </Button>
               </div>
 
               {teamOptions.length === 0 ? (
                 <div role="alert" className="rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-800">
-                  当前账号没有可管理的团队绑定，请先在团队详情中绑定此共享知识库。
+                  {t('sharedKnowledgeVersions.status.noManagedTeams')}
                 </div>
               ) : null}
               {errorMessage ? (
@@ -451,10 +497,10 @@ export function SharedKnowledgeVersionsDialog({
                 </div>
               ) : null}
 
-              <div aria-label="共享版本历史" className="flex flex-col gap-2">
-            {loading ? <p className="text-sm text-muted-foreground">正在加载版本…</p> : null}
+              <div aria-label={t('sharedKnowledgeVersions.status.versionHistory')} className="flex flex-col gap-2">
+            {loading ? <p className="text-sm text-muted-foreground">{t('sharedKnowledgeVersions.status.loadingVersions')}</p> : null}
             {!loading && versions.length === 0 ? (
-              <p className="text-sm text-muted-foreground">暂无版本记录</p>
+              <p className="text-sm text-muted-foreground">{t('sharedKnowledgeVersions.status.emptyVersions')}</p>
             ) : null}
             {versions.map((version) => (
               <article
@@ -465,19 +511,24 @@ export function SharedKnowledgeVersionsDialog({
                   <div className="flex flex-wrap items-center gap-2">
                     <strong className="text-sm">v{version.version}</strong>
                     <span className="rounded-full bg-muted px-2 py-1 text-xs">
-                      {VERSION_STATE_LABELS[publicationState(version)]}
+                      {publicationState(version) === 'released'
+                        ? t('sharedKnowledgeVersions.state.released')
+                        : publicationState(version) === 'draft'
+                          ? t('sharedKnowledgeVersions.state.draft')
+                          : t('sharedKnowledgeVersions.state.rejected')}
                     </span>
                     {version.is_published_head ? (
                       <span className="rounded-full bg-emerald-100 px-2 py-1 text-xs text-emerald-700">
-                        当前正式
+                        {t('sharedKnowledgeVersions.state.current')}
                       </span>
                     ) : null}
                   </div>
                   <p className="mt-2 mb-0 text-sm text-muted-foreground">
-                    {version.change_reason || '未填写变更原因'}
+                    {version.change_reason || t('sharedKnowledgeVersions.field.reasonMissing')}
                   </p>
                   <small className="mt-1 block text-xs text-muted-foreground">
-                    来源团队：{teamOptions.find((team) => team.id === version.source_team_id)?.name || version.source_team_id || '-'}
+                    {t('sharedKnowledgeVersions.field.sourceTeam')}
+                    <RawContent value={teamOptions.find((team) => team.id === version.source_team_id)?.name || version.source_team_id || '-'} />
                   </small>
                 </div>
                 <div className="flex flex-wrap items-center justify-end gap-2">
@@ -487,18 +538,18 @@ export function SharedKnowledgeVersionsDialog({
                         size="sm"
                         disabled={!canMutate || !publishedHead}
                         onClick={() => publishDraft(version)}
-                        aria-label={`发布 ${version.version}`}
+                        aria-label={t('sharedKnowledgeVersions.actions.publishAria', { version: version.version })}
                       >
-                        发布
+                        {t('sharedKnowledgeVersions.actions.publish')}
                       </Button>
                       <Button
                         size="sm"
                         variant="outline"
                         disabled={!canMutate}
                         onClick={() => rejectDraft(version)}
-                        aria-label={`驳回 ${version.version}`}
+                        aria-label={t('sharedKnowledgeVersions.actions.rejectAria', { version: version.version })}
                       >
-                        驳回
+                        {t('sharedKnowledgeVersions.actions.reject')}
                       </Button>
                     </>
                   ) : null}
@@ -508,9 +559,9 @@ export function SharedKnowledgeVersionsDialog({
                       variant="outline"
                       disabled={!canMutate || !publishedHead}
                       onClick={() => rollbackTo(version)}
-                      aria-label={`回滚到 ${version.version}`}
+                      aria-label={t('sharedKnowledgeVersions.actions.rollbackAria', { version: version.version })}
                     >
-                      回滚
+                      {t('sharedKnowledgeVersions.actions.rollback')}
                     </Button>
                   ) : null}
                 </div>
@@ -519,78 +570,78 @@ export function SharedKnowledgeVersionsDialog({
               </div>
             </>
           ) : (
-            <div aria-label="共享知识库审计历史" className="flex flex-col gap-4">
+            <div aria-label={t('sharedKnowledgeVersions.audit.label')} className="flex flex-col gap-4">
               <div className="grid gap-3 rounded-xl border bg-muted/25 p-4 md:grid-cols-3">
                 <label className="flex flex-col gap-2 text-sm font-medium">
-                  审计动作
+                  {t('sharedKnowledgeVersions.audit.action')}
                   <select
-                    aria-label="审计动作"
+                    aria-label={t('sharedKnowledgeVersions.audit.action')}
                     className="h-9 rounded-md border bg-background px-3 text-sm"
                     value={auditFilters.action}
                     onChange={(event) => updateAuditFilter('action', event.target.value)}
                   >
-                    <option value="">全部动作</option>
+                    <option value="">{t('sharedKnowledgeVersions.audit.allActions')}</option>
                     {auditActionOptions.map((action) => (
-                      <option key={action} value={action}>{auditActionLabel(action)}</option>
+                      <option key={action} value={action}>{auditActionLabel(action, t)}</option>
                     ))}
                   </select>
                 </label>
                 <label className="flex flex-col gap-2 text-sm font-medium">
-                  操作者类型
+                  {t('sharedKnowledgeVersions.audit.actorType')}
                   <select
-                    aria-label="操作者类型"
+                    aria-label={t('sharedKnowledgeVersions.audit.actorType')}
                     className="h-9 rounded-md border bg-background px-3 text-sm"
                     value={auditFilters.actorType}
                     onChange={(event) => updateAuditFilter('actorType', event.target.value)}
                   >
-                    <option value="">全部类型</option>
-                    <option value="user">用户</option>
-                    <option value="agent">Agent</option>
-                    <option value="system">系统</option>
+                    <option value="">{t('sharedKnowledgeVersions.audit.allTypes')}</option>
+                    <option value="user">{t('sharedKnowledgeVersions.actor.user')}</option>
+                    <option value="agent">{t('sharedKnowledgeVersions.actor.agent')}</option>
+                    <option value="system">{t('sharedKnowledgeVersions.actor.system')}</option>
                   </select>
                 </label>
                 <label className="flex flex-col gap-2 text-sm font-medium">
-                  审计团队
+                  {t('sharedKnowledgeVersions.audit.team')}
                   <select
-                    aria-label="审计团队"
+                    aria-label={t('sharedKnowledgeVersions.audit.team')}
                     className="h-9 rounded-md border bg-background px-3 text-sm"
                     value={auditFilters.teamId}
                     onChange={(event) => updateAuditFilter('teamId', event.target.value)}
                   >
-                    <option value="">全部团队</option>
+                    <option value="">{t('sharedKnowledgeVersions.audit.allTeams')}</option>
                     {auditTeamOptions.map((team) => (
                       <option key={team.id} value={team.id}>{team.name}</option>
                     ))}
                   </select>
                 </label>
                 <label className="flex flex-col gap-2 text-sm font-medium">
-                  审计版本
+                  {t('sharedKnowledgeVersions.audit.version')}
                   <select
-                    aria-label="审计版本"
+                    aria-label={t('sharedKnowledgeVersions.audit.version')}
                     className="h-9 rounded-md border bg-background px-3 text-sm"
                     value={auditFilters.versionId}
                     onChange={(event) => updateAuditFilter('versionId', event.target.value)}
                   >
-                    <option value="">全部版本</option>
+                    <option value="">{t('sharedKnowledgeVersions.audit.allVersions')}</option>
                     {versions.map((version) => (
                       <option key={version.id} value={version.id}>v{version.version}</option>
                     ))}
                   </select>
                 </label>
                 <label className="flex flex-col gap-2 text-sm font-medium md:col-span-2">
-                  操作者 ID
+                  {t('sharedKnowledgeVersions.audit.actorId')}
                   <Input
-                    aria-label="操作者 ID"
+                    aria-label={t('sharedKnowledgeVersions.audit.actorId')}
                     value={auditFilters.actorId}
                     onChange={(event) => updateAuditFilter('actorId', event.target.value)}
-                    placeholder="按 Agent 或用户 ID 精确筛选"
+                    placeholder={t('sharedKnowledgeVersions.audit.actorIdPlaceholder')}
                   />
                 </label>
               </div>
 
               <div className="flex items-center justify-between text-xs text-muted-foreground">
-                <span>共 {auditPage.total} 条只追加事件</span>
-                <span>事件不会因回滚或后续发布而删除</span>
+                <span>{t('sharedKnowledgeVersions.audit.total', { count: auditPage.total })}</span>
+                <span>{t('sharedKnowledgeVersions.audit.appendOnly')}</span>
               </div>
               {auditErrorMessage ? (
                 <div role="alert" className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">
@@ -598,17 +649,17 @@ export function SharedKnowledgeVersionsDialog({
                 </div>
               ) : null}
               {auditLoading && auditPage.items.length === 0 ? (
-                <p role="status" className="text-sm text-muted-foreground">正在加载审计历史…</p>
+                <p role="status" className="text-sm text-muted-foreground">{t('sharedKnowledgeVersions.status.loadingAudit')}</p>
               ) : null}
               {!auditLoading && auditPage.items.length === 0 ? (
-                <p className="text-sm text-muted-foreground">当前筛选下暂无审计事件</p>
+                <p className="text-sm text-muted-foreground">{t('sharedKnowledgeVersions.status.emptyAudit')}</p>
               ) : null}
 
               <div className="flex flex-col gap-2">
                 {auditPage.items.map((event) => {
-                  const pointerTransition = versionTransition(event, versionLabels);
+                  const pointerTransition = versionTransition(event, t, versionLabels);
                   const grantTransition = event.action.startsWith('grant_')
-                    ? permissionTransition(event)
+                    ? permissionTransition(event, t)
                     : '';
                   const sourceTaskId = auditDetail(event, 'source_task_id');
                   const sourceConversationId = auditDetail(event, 'source_conversation_id')
@@ -618,23 +669,23 @@ export function SharedKnowledgeVersionsDialog({
                       <div className="flex flex-wrap items-start justify-between gap-3">
                         <div>
                           <strong className="text-sm text-foreground">
-                            {auditActionLabel(event.action)}
+                            {auditActionLabel(event.action, t)}
                           </strong>
                           <p className="mt-1 mb-0 text-sm text-muted-foreground">
-                            {event.reason || '未填写变更原因'}
+                            {event.reason || t('sharedKnowledgeVersions.field.reasonMissing')}
                           </p>
                         </div>
                         <time className="text-xs text-muted-foreground" dateTime={event.created_at}>
-                          {formatAuditTime(event.created_at)}
+                          {formatAuditTime(event.created_at, locale)}
                         </time>
                       </div>
                       <div className="mt-3 flex flex-wrap gap-2 text-xs text-muted-foreground">
                         <span className="rounded-full bg-muted px-2 py-1">
-                          {event.actor_name} · {ACTOR_TYPE_LABELS[event.actor_type] || event.actor_type}
+                          <RawContent value={event.actor_name} /> · {actorTypeLabel(event.actor_type, t)}
                         </span>
                         {event.team_id ? (
                           <span className="rounded-full bg-muted px-2 py-1">
-                            {event.team_name || event.team_id}
+                            <RawContent value={event.team_name || event.team_id} />
                           </span>
                         ) : null}
                         {event.knowledge_base_version ? (
@@ -651,12 +702,14 @@ export function SharedKnowledgeVersionsDialog({
                       ) : null}
                       {sourceTaskId ? (
                         <small className="mt-2 block text-xs text-muted-foreground">
-                          来源任务：{sourceTaskId}
+                          {t('sharedKnowledgeVersions.audit.sourceTask')}
+                          <RawIdentifier value={sourceTaskId} />
                         </small>
                       ) : null}
                       {sourceConversationId ? (
                         <small className="mt-1 block text-xs text-muted-foreground">
-                          来源会话：{sourceConversationId}
+                          {t('sharedKnowledgeVersions.audit.sourceConversation')}
+                          <RawIdentifier value={sourceConversationId} />
                         </small>
                       ) : null}
                     </article>
@@ -669,14 +722,14 @@ export function SharedKnowledgeVersionsDialog({
                   disabled={auditLoading}
                   onClick={loadMoreAuditEvents}
                 >
-                  {auditLoading ? '正在加载…' : '加载更多审计事件'}
+                  {auditLoading ? t('sharedKnowledgeVersions.actions.loadingMore') : t('sharedKnowledgeVersions.actions.loadMoreAudit')}
                 </Button>
               ) : null}
             </div>
           )}
 
           <div className="flex justify-end">
-            <Button variant="outline" onClick={onClose}>关闭</Button>
+            <Button variant="outline" onClick={onClose}>{t('common.action.cancel')}</Button>
           </div>
         </div>
       </DialogContent>

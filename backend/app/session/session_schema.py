@@ -4,8 +4,8 @@ from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.i18n.language_context import LanguageContext, SupportedLocale, normalize_locale
 from app.tools.tool_schema import ToolCall, ToolResult
-
 
 RouterDecisionValue = Literal[
     "continue_active",
@@ -218,6 +218,9 @@ class ChatTurnRequest(BaseModel):
     client_turn_id: Optional[str] = None
     user_id: Optional[str] = None
     message: str
+    ui_locale: SupportedLocale | None = None
+    agent_reply_locale: SupportedLocale | None = None
+    language_context: LanguageContext | None = Field(default=None, exclude=True)
     attachments: list["ChatAttachmentRead"] = Field(default_factory=list)
     channel: str = "web"
     interaction_mode: Literal["normal", "scheduled_task", "team_task", "team_tl"] = "normal"
@@ -238,6 +241,12 @@ class ChatTurnRequest(BaseModel):
     forced_sop_snapshot: Optional[dict[str, Any]] = Field(default=None, exclude=True)
     client_timezone: Optional[str] = None
     debug: bool = False
+
+    @field_validator("ui_locale", "agent_reply_locale", mode="before")
+    @classmethod
+    def _normalize_locale_fields(cls, value: Any) -> SupportedLocale | None:
+        """Normalize request locale aliases to the supported BCP 47 enum values."""
+        return normalize_locale(value)
 
 
 class TeamPlannerMember(BaseModel):
@@ -271,6 +280,9 @@ class ChatAttachmentRead(BaseModel):
 class ChatTurnResponse(BaseModel):
     reply: str
     session_id: str
+    ui_locale: SupportedLocale | None = None
+    agent_reply_locale: SupportedLocale | None = None
+    language_context: LanguageContext | None = None
     runtime_error_code: Optional[str] = None
     router_decision: Optional[RouterDecision] = None
     step_result: Optional[StepAgentResult] = None
@@ -300,6 +312,10 @@ class ChatSessionRead(BaseModel):
     active_skill_id: Optional[str]
     active_step_id: Optional[str]
     status: str
+    # Public session reads expose the authoritative Agent reply locale only;
+    # UI locale remains a user preference and is never inferred from session data.
+    agent_reply_locale: SupportedLocale | None = None
+    agent_reply_locale_source: str | None = None
     summary: Optional[str]
     last_agent_question: Optional[str]
     is_scheduled: bool = False

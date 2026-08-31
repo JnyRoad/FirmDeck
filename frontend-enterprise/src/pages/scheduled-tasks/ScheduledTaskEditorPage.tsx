@@ -1,6 +1,6 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
-import { notify } from '@/components/ui/app-toast';
+import { createToastNotifier } from '@/components/ui/app-toast';
 import { getClientTimeZone } from '@/lib/timezone';
 
 import AppHeader from '@/components/AppHeader';
@@ -17,7 +17,12 @@ import {
   Switch,
   Textarea,
 } from '@/components/ui';
+import { createMessageDescriptor, type MessageDescriptor } from '@/i18n/descriptors';
+import { RawContent, RawIdentifier } from '@/i18n/RawContent';
+import { type MessageId } from '@/i18n/types';
 import { cn } from '@/lib/utils';
+import { useAppIntl } from '@/i18n';
+import { backendErrorMessageDescriptor } from '@/lib/apiErrorMessages';
 
 import { api, TENANT_ID } from '../../api/client';
 import IconArrowRight from '../../assets/icons/arrow-right.svg?react';
@@ -27,10 +32,10 @@ import { isTeamScope, readEmployeeScope } from '../../lib/agent-scope-storage';
 import type { ScheduledTaskRead, SkillRead } from '../../types';
 import {
   INITIAL_VALUES,
-  WEEKDAY_OPTIONS,
   buildSchedule,
   scheduledTaskSopOptions,
   taskToFormValues,
+  weekdayOptions,
   type TaskFormValues,
 } from './shared';
 
@@ -39,10 +44,12 @@ export type ScheduledTaskPageProps = {
   onLogout?: () => void;
 };
 
+/** 渲染新建模式的定时任务编辑器，并透传当前用户和退出回调。 */
 export function ScheduledTaskNewPage(props: ScheduledTaskPageProps = {}) {
   return <ScheduledTaskEditorPage mode="new" {...props} />;
 }
 
+/** 渲染编辑模式的定时任务编辑器，并透传当前用户和退出回调。 */
 export function ScheduledTaskEditPage(props: ScheduledTaskPageProps = {}) {
   return <ScheduledTaskEditorPage mode="edit" {...props} />;
 }
@@ -55,6 +62,15 @@ const CARD_TITLE_CLASS = 'mb-[16px] text-[14px] font-medium text-[#18181a]';
 const FIELD_LABEL_CLASS = 'text-[13px] font-medium text-[#18181a]';
 const FIELD_ERROR_CLASS = 'text-[12px] leading-none text-[#d20b0b]';
 
+/** 将稳定后端错误投影为编辑器可展示的 descriptor，未知/畸形异常使用安全 fallback。 */
+function editorErrorDescriptor(error: unknown, fallbackId: MessageId): MessageDescriptor {
+  const descriptor = backendErrorMessageDescriptor(error);
+  return descriptor
+    ? { id: descriptor.messageId, values: descriptor.values }
+    : createMessageDescriptor(fallbackId);
+}
+
+/** 加载并保存定时任务编辑表单，同时将产品界面文案交给当前 locale 的 runtime。 */
 function ScheduledTaskEditorPage({
   mode,
   currentUser,
@@ -69,9 +85,17 @@ function ScheduledTaskEditorPage({
   const [taskMetadata, setTaskMetadata] = useState<Record<string, unknown>>({});
   const navigate = useNavigate();
   const { taskId } = useParams();
+  const { locale, t: translate } = useAppIntl();
+  const toast = useMemo(() => createToastNotifier({ t: translate }), [translate]);
   const isEdit = mode === 'edit';
   const scheduleType = values.schedule_type;
+  const localizedWeekdayOptions = weekdayOptions({ locale, t: translate });
+  const pinnedSopVersion =
+    typeof taskMetadata.sop_version === 'string' && taskMetadata.sop_version
+      ? taskMetadata.sop_version
+      : undefined;
 
+  /** 更新表单字段；调用方负责提供与字段键匹配的值。 */
   function update<K extends keyof TaskFormValues>(key: K, value: TaskFormValues[K]) {
     setValues((prev) => ({ ...prev, [key]: value }));
   }
@@ -99,9 +123,9 @@ function ScheduledTaskEditorPage({
         setTaskMetadata(row.metadata || {});
         setValues(taskToFormValues(row));
       })
-      .catch((error) => notify.error(error instanceof Error ? error.message : '加载定时任务失败'))
+      .catch((error) => toast.error(editorErrorDescriptor(error, 'scheduledTasksPage.editor.toast.loadFailed')))
       .finally(() => setLoading(false));
-  }, [isEdit, taskId]);
+  }, [isEdit, taskId, toast]);
 
   useEffect(() => {
     if (!agentId) {
@@ -125,26 +149,34 @@ function ScheduledTaskEditorPage({
     };
   }, [agentId]);
 
+  /** 校验必填排程字段并返回表单是否可提交，副作用是更新字段错误状态。 */
   function validate(): boolean {
     const nextErrors: FormErrors = {};
-    if (!values.title.trim()) nextErrors.title = '请填写任务名称';
-    if (!values.prompt.trim()) nextErrors.prompt = '请填写任务描述';
+    if (!values.title.trim()) {
+      nextErrors.title = translate('scheduledTasksPage.editor.validation.titleRequired');
+    }
+    if (!values.prompt.trim()) {
+      nextErrors.prompt = translate('scheduledTasksPage.editor.validation.promptRequired');
+    }
     if (values.schedule_type === 'once') {
-      if (!values.run_at) nextErrors.run_at = '请选择执行时间';
+      if (!values.run_at) {
+        nextErrors.run_at = translate('scheduledTasksPage.editor.validation.runAtRequired');
+      }
     } else if (!values.time) {
-      nextErrors.time = '请填写执行时间';
+      nextErrors.time = translate('scheduledTasksPage.editor.validation.timeRequired');
     }
     if (values.schedule_type === 'weekly' && !values.weekdays.length) {
-      nextErrors.weekdays = '请选择星期';
+      nextErrors.weekdays = translate('scheduledTasksPage.editor.validation.weekdaysRequired');
     }
     setErrors(nextErrors);
     return Object.keys(nextErrors).length === 0;
   }
 
+  /** 将已校验表单提交到后端，失败时只通过稳定错误 descriptor 呈现公共信息。 */
   async function save() {
     if (!validate()) return;
     if (!agentId) {
-      notify.error('请先选择员工');
+      toast.error(createMessageDescriptor('scheduledTasksPage.editor.validation.agentRequired'));
       return;
     }
     const metadata: Record<string, unknown> = {
@@ -182,7 +214,7 @@ function ScheduledTaskEditorPage({
         isEdit && taskId
           ? await api.put<ScheduledTaskRead>(`/api/enterprise/scheduled-tasks/${taskId}`, payload)
           : await api.post<ScheduledTaskRead>('/api/enterprise/scheduled-tasks', payload);
-      notify.success('定时任务已保存');
+      toast.success(createMessageDescriptor('scheduledTasksPage.editor.toast.saved'));
       if (!isEdit) {
         navigate(`/enterprise/scheduled-tasks/${saved.id}/edit`, { replace: true });
       } else {
@@ -190,12 +222,13 @@ function ScheduledTaskEditorPage({
         setValues(taskToFormValues(saved));
       }
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '保存定时任务失败');
+      toast.error(editorErrorDescriptor(error, 'scheduledTasksPage.editor.toast.saveFailed'));
     } finally {
       setSaving(false);
     }
   }
 
+  /** 切换周计划中的星期并按协议数值顺序保存选择结果。 */
   function toggleWeekday(day: number, checked: boolean) {
     setValues((prev) => {
       const next = checked
@@ -213,8 +246,8 @@ function ScheduledTaskEditorPage({
       <AppHeader
         onLogout={onLogout}
         userName={currentUser?.username}
-        title={isEdit ? '编辑定时任务' : '新建空白定时任务'}
-        description="保存后到点会拉起一个新的执行记录，并交给当前员工按 SOP、技能、资料和工具执行。"
+        title={translate(isEdit ? 'scheduledTasksPage.editor.editTitle' : 'scheduledTasksPage.editor.newTitle')}
+        description={translate('scheduledTasksPage.editor.description')}
       />
       <div className="flex justify-end gap-[16px] mt-[20px] mb-[16px]">
         <Button
@@ -223,24 +256,26 @@ function ScheduledTaskEditorPage({
           className="h-8 gap-1 rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-5 text-[12px] font-normal text-[#757f9c] hover:border-[#cbd3e6] hover:bg-white hover:text-[#18181a]"
         >
           <IconArrowRight className="size-3.5 rotate-180" />
-          返回定时任务
+          {translate('scheduledTasksPage.editor.action.back')}
         </Button>
         <Button
           onClick={() => void save()}
           disabled={saving}
           className="h-8 gap-1 rounded-[10px] bg-[#18181a] px-5 text-[12px] font-normal text-white hover:bg-[#303030]"
         >
-          保存
+          {translate('scheduledTasksPage.editor.action.save')}
         </Button>
       </div>
 
       <div className="grid grid-cols-1 items-start gap-[20px] lg:grid-cols-2">
         <section className={CARD_CLASS}>
-          <h3 className={CARD_TITLE_CLASS}>任务说明</h3>
+          <h3 className={CARD_TITLE_CLASS}>
+            {translate('scheduledTasksPage.editor.section.details')}
+          </h3>
           <div className="flex flex-col gap-[16px]">
             <div className="flex flex-col gap-[6px]">
               <Label htmlFor="task-title" className={FIELD_LABEL_CLASS}>
-                任务名称
+                {translate('scheduledTasksPage.editor.field.title')}
               </Label>
               <div className="relative">
                 <IconAlarm className="pointer-events-none absolute left-[10px] top-1/2 size-[14px] -translate-y-1/2 text-[#858b9c]" />
@@ -248,7 +283,7 @@ function ScheduledTaskEditorPage({
                   id="task-title"
                   className={cn('pl-[30px]', errors.title && 'border-destructive')}
                   maxLength={80}
-                  placeholder="例如：每日交付质量复盘"
+                  placeholder={translate('scheduledTasksPage.editor.placeholder.title')}
                   value={values.title}
                   onChange={(event) => update('title', event.target.value)}
                 />
@@ -258,14 +293,14 @@ function ScheduledTaskEditorPage({
 
             <div className="flex flex-col gap-[6px]">
               <Label htmlFor="task-prompt" className={FIELD_LABEL_CLASS}>
-                每次执行时交给员工的任务
+                {translate('scheduledTasksPage.editor.field.prompt')}
               </Label>
               <Textarea
                 id="task-prompt"
                 rows={7}
                 maxLength={10000}
                 className={cn(errors.prompt && 'border-destructive')}
-                placeholder="描述员工每次执行时需要做什么，可以包含拆解要求、输出格式和注意事项。"
+                placeholder={translate('scheduledTasksPage.editor.placeholder.prompt')}
                 value={values.prompt}
                 onChange={(event) => update('prompt', event.target.value)}
               />
@@ -282,7 +317,9 @@ function ScheduledTaskEditorPage({
             </div>
 
             <div className="flex flex-col gap-[6px]">
-              <Label className={FIELD_LABEL_CLASS}>指定 SOP</Label>
+              <Label className={FIELD_LABEL_CLASS}>
+                {translate('scheduledTasksPage.editor.field.sop')}
+              </Label>
               <Select
                 value={values.sop_id || '__auto__'}
                 onValueChange={(value) => {
@@ -294,60 +331,78 @@ function ScheduledTaskEditorPage({
                   }));
                 }}
               >
-                <SelectTrigger className="w-full">
-                  <SelectValue placeholder="由 Harness v2 自动判断" />
+                <SelectTrigger className="w-full" aria-label={translate('scheduledTasksPage.editor.field.sop')}>
+                  <SelectValue placeholder={translate('scheduledTasksPage.editor.placeholder.sop')} />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="__auto__">由 Harness v2 自动判断</SelectItem>
+                  <SelectItem value="__auto__">
+                    {translate('scheduledTasksPage.editor.sop.auto')}
+                  </SelectItem>
                   {sops.map((sop) => (
                     <SelectItem key={sop.skill_id} value={sop.skill_id}>
-                      {sop.name}
+                      <RawContent value={sop.name} />
                     </SelectItem>
                   ))}
                 </SelectContent>
               </Select>
               <p className="text-[12px] leading-[18px] text-[#858b9c]">
-                选择后每次唤醒都会由 Harness v2 强制启动该 SOP；未选择时仍由模型按任务判断。
+                {translate('scheduledTasksPage.editor.sop.help')}
               </p>
             </div>
 
             {values.sop_id && (
               <div className="flex flex-col gap-[6px]">
-                <Label className={FIELD_LABEL_CLASS}>SOP 版本策略</Label>
+                <Label className={FIELD_LABEL_CLASS}>
+                  {translate('scheduledTasksPage.editor.field.sopVersionPolicy')}
+                </Label>
                 <Select
                   value={values.sop_version_policy}
                   onValueChange={(value) =>
                     update('sop_version_policy', value === 'pinned' ? 'pinned' : 'latest')
                   }
                 >
-                  <SelectTrigger className="w-full">
+                  <SelectTrigger
+                    className="w-full"
+                    aria-label={translate('scheduledTasksPage.editor.field.sopVersionPolicy')}
+                  >
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="latest">始终使用最新发布版本</SelectItem>
-                    <SelectItem value="pinned">固定使用保存时版本</SelectItem>
+                    <SelectItem value="latest">
+                      {translate('scheduledTasksPage.editor.sopVersionPolicy.latest')}
+                    </SelectItem>
+                    <SelectItem value="pinned">
+                      {translate('scheduledTasksPage.editor.sopVersionPolicy.pinned')}
+                    </SelectItem>
                   </SelectContent>
                 </Select>
                 <p className="text-[12px] leading-[18px] text-[#858b9c]">
                   {values.sop_version_policy === 'latest'
-                    ? '每次运行前重新读取当前员工可用的最新已发布 SOP。'
-                    : `保存时锁定主 SOP 及其嵌套子 SOP${
-                        typeof taskMetadata.sop_version === 'string' && taskMetadata.sop_version
-                          ? `（当前固定版本 ${taskMetadata.sop_version}）`
-                          : ''
-                      }；后续发布新版本不会影响该任务。`}
+                    ? translate('scheduledTasksPage.editor.sopVersionPolicy.latestHelp')
+                    : (
+                      <>
+                        {translate('scheduledTasksPage.editor.sopVersionPolicy.pinnedHelp')}
+                        {pinnedSopVersion && (
+                          <>
+                            {' '}
+                            {translate('scheduledTasksPage.editor.sopVersionPolicy.pinnedVersionPrefix')}
+                            <RawIdentifier value={pinnedSopVersion} />
+                          </>
+                        )}
+                      </>
+                    )}
                 </p>
               </div>
             )}
 
             <div className="flex flex-col gap-[6px]">
               <Label htmlFor="task-description" className={FIELD_LABEL_CLASS}>
-                内部备注
+                {translate('scheduledTasksPage.editor.field.internalNote')}
               </Label>
               <Textarea
                 id="task-description"
                 rows={3}
-                placeholder="可选，用于说明这个定时任务的来源和目的"
+                placeholder={translate('scheduledTasksPage.editor.placeholder.internalNote')}
                 value={values.description || ''}
                 onChange={(event) => update('description', event.target.value)}
               />
@@ -356,11 +411,13 @@ function ScheduledTaskEditorPage({
         </section>
 
         <section className={CARD_CLASS}>
-          <h3 className={CARD_TITLE_CLASS}>唤醒计划</h3>
+          <h3 className={CARD_TITLE_CLASS}>
+            {translate('scheduledTasksPage.editor.section.schedule')}
+          </h3>
           <div className="flex flex-col gap-[16px]">
             <div className="flex items-center justify-between">
               <Label htmlFor="task-status" className={FIELD_LABEL_CLASS}>
-                启用状态
+                {translate('scheduledTasksPage.editor.field.status')}
               </Label>
               <div className="flex items-center gap-[8px]">
                 <Switch
@@ -369,27 +426,42 @@ function ScheduledTaskEditorPage({
                   onCheckedChange={(checked) => update('status', checked ? 'active' : 'paused')}
                 />
                 <span className="text-[13px] text-[#858b9c]">
-                  {values.status !== 'paused' ? '启用' : '暂停'}
+                  {values.status !== 'paused'
+                    ? translate('scheduledTasksPage.editor.status.active')
+                    : translate('scheduledTasksPage.editor.status.paused')}
                 </span>
               </div>
             </div>
 
             <div className="flex flex-col gap-[6px]">
-              <Label className={FIELD_LABEL_CLASS}>调度类型</Label>
+              <Label className={FIELD_LABEL_CLASS}>
+                {translate('scheduledTasksPage.editor.field.scheduleType')}
+              </Label>
               <Select
                 value={values.schedule_type}
                 onValueChange={(value) =>
                   update('schedule_type', value as TaskFormValues['schedule_type'])
                 }
               >
-                <SelectTrigger className="w-full">
+                <SelectTrigger
+                  className="w-full"
+                  aria-label={translate('scheduledTasksPage.editor.field.scheduleType')}
+                >
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="daily">每天</SelectItem>
-                  <SelectItem value="weekly">每周</SelectItem>
-                  <SelectItem value="monthly">每月</SelectItem>
-                  <SelectItem value="once">一次性</SelectItem>
+                  <SelectItem value="daily">
+                    {translate('scheduledTasksPage.editor.scheduleType.daily')}
+                  </SelectItem>
+                  <SelectItem value="weekly">
+                    {translate('scheduledTasksPage.editor.scheduleType.weekly')}
+                  </SelectItem>
+                  <SelectItem value="monthly">
+                    {translate('scheduledTasksPage.editor.scheduleType.monthly')}
+                  </SelectItem>
+                  <SelectItem value="once">
+                    {translate('scheduledTasksPage.editor.scheduleType.once')}
+                  </SelectItem>
                 </SelectContent>
               </Select>
             </div>
@@ -397,7 +469,7 @@ function ScheduledTaskEditorPage({
             {scheduleType === 'once' ? (
               <div className="flex flex-col gap-[6px]">
                 <Label htmlFor="task-run-at" className={FIELD_LABEL_CLASS}>
-                  执行时间
+                  {translate('scheduledTasksPage.editor.field.executionTime')}
                 </Label>
                 <Input
                   id="task-run-at"
@@ -411,7 +483,7 @@ function ScheduledTaskEditorPage({
             ) : (
               <div className="flex flex-col gap-[6px]">
                 <Label htmlFor="task-time" className={FIELD_LABEL_CLASS}>
-                  执行时间
+                  {translate('scheduledTasksPage.editor.field.executionTime')}
                 </Label>
                 <Input
                   id="task-time"
@@ -426,9 +498,11 @@ function ScheduledTaskEditorPage({
 
             {scheduleType === 'weekly' && (
               <div className="flex flex-col gap-[8px]">
-                <Label className={FIELD_LABEL_CLASS}>执行日期</Label>
+                <Label className={FIELD_LABEL_CLASS}>
+                  {translate('scheduledTasksPage.editor.field.executionDate')}
+                </Label>
                 <div className="flex flex-wrap gap-x-[16px] gap-y-[10px]">
-                  {WEEKDAY_OPTIONS.map((option) => (
+                  {localizedWeekdayOptions.map((option) => (
                     <label
                       key={option.value}
                       className="flex cursor-pointer items-center gap-[6px] text-[13px] text-[#18181a]"
@@ -450,7 +524,7 @@ function ScheduledTaskEditorPage({
             {scheduleType === 'monthly' && (
               <div className="flex flex-col gap-[6px]">
                 <Label htmlFor="task-day" className={FIELD_LABEL_CLASS}>
-                  每月几号
+                  {translate('scheduledTasksPage.editor.field.dayOfMonth')}
                 </Label>
                 <Input
                   id="task-day"
@@ -466,13 +540,13 @@ function ScheduledTaskEditorPage({
 
             <div className="flex flex-col gap-[6px]">
               <Label htmlFor="task-max-runs" className={FIELD_LABEL_CLASS}>
-                最大运行次数
+                {translate('scheduledTasksPage.editor.field.maxRuns')}
               </Label>
               <Input
                 id="task-max-runs"
                 type="number"
                 min={1}
-                placeholder="不填为无限制"
+                placeholder={translate('scheduledTasksPage.editor.placeholder.maxRuns')}
                 value={values.max_runs ?? ''}
                 onChange={(event) =>
                   update('max_runs', event.target.value ? Number(event.target.value) : undefined)
@@ -481,7 +555,7 @@ function ScheduledTaskEditorPage({
             </div>
 
             <div className="rounded-[12px] border border-[#eef0f4] bg-[#fafbfc] px-[14px] py-[12px] text-[13px] leading-[1.6] text-[#858b9c]">
-              默认使用 forbid 并发策略：上一轮未结束时跳过本次唤醒，避免同一员工重复处理同一批任务。
+              {translate('scheduledTasksPage.editor.notice.concurrency')}
             </div>
           </div>
         </section>

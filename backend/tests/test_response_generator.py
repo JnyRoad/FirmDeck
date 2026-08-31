@@ -1,5 +1,10 @@
 from app.core.response_generator import ResponseGenerator
 from app.db.models import ChatSession, Skill
+from app.i18n.language_context import (
+    LanguageContext,
+    LocaleResolutionSource,
+    SupportedLocale,
+)
 from app.llm.client import LLMClient
 from app.session.session_schema import RouterDecision, StepAgentResult
 from app.tools.tool_schema import ToolError, ToolResult
@@ -175,6 +180,7 @@ def test_tool_result_reply_is_model_driven(monkeypatch):
 
 
 def test_failed_tool_result_returns_explicit_failure_without_model_call(monkeypatch):
+    """Keep provider/tool prose and internal tool names out of a failed final reply."""
     def forbidden_generate_text(self, system_prompt, payload):  # noqa: ANN001
         raise AssertionError("failed tool replies should not rely on model generation")
 
@@ -194,10 +200,13 @@ def test_failed_tool_result_returns_explicit_failure_without_model_call(monkeypa
         model_config=None,  # type: ignore[arg-type]
     )
 
-    assert reply == "工具调用失败：order.query（HTTP_ERROR）：工具返回异常状态码：502。请检查工具配置、调用参数或外部服务状态后重试。"
+    assert reply == "工具调用失败（HTTP_ERROR）：本次操作未完成。请稍后重试，或联系管理员查看执行记录。"
+    assert "order.query" not in reply
+    assert "工具返回异常状态码：502" not in reply
 
 
 def test_model_failure_returns_explicit_reason(monkeypatch):
+    """Use a registered stable model code and neutral text for a raw provider failure."""
     def fake_init(self, model_config):  # noqa: ANN001
         return None
 
@@ -217,7 +226,8 @@ def test_model_failure_returns_explicit_reason(monkeypatch):
         model_config=None,  # type: ignore[arg-type]
     )
 
-    assert reply == "模型调用失败（LLM_ERROR）：upstream timeout。请检查模型配置、API Key、网络或模型服务状态后重试。"
+    assert reply == "模型调用失败（MODEL_UPSTREAM_ERROR）：本次操作未完成。请稍后重试，或联系管理员查看执行记录。"
+    assert "upstream timeout" not in reply
 
 
 def test_pending_reply_without_tool_result_uses_model_reply(monkeypatch):
@@ -437,6 +447,7 @@ def test_stream_reply_with_tool_result_is_model_driven(monkeypatch):
 
 
 def test_stream_failed_tool_result_returns_explicit_failure_without_model_call(monkeypatch):
+    """Keep raw tool failure prose out of streamed fallback chunks."""
     def forbidden_generate_text_stream(self, system_prompt, payload):  # noqa: ANN001
         raise AssertionError("failed tool replies should not rely on model generation")
 
@@ -458,10 +469,12 @@ def test_stream_failed_tool_result_returns_explicit_failure_without_model_call(m
         )
     )
 
-    assert "".join(chunks) == "工具调用失败：order.query（TIMEOUT）：工具调用超时。请检查工具配置、调用参数或外部服务状态后重试。"
+    assert "".join(chunks) == "工具调用失败（TIMEOUT）：本次操作未完成。请稍后重试，或联系管理员查看执行记录。"
+    assert "工具调用超时" not in "".join(chunks)
 
 
 def test_stream_model_failure_returns_explicit_reason(monkeypatch):
+    """Keep raw connection failures out of streamed model fallback chunks."""
     def fake_init(self, model_config):  # noqa: ANN001
         return None
 
@@ -484,7 +497,43 @@ def test_stream_model_failure_returns_explicit_reason(monkeypatch):
         )
     )
 
-    assert "".join(chunks) == "模型调用失败（LLM_ERROR）：connection refused。请检查模型配置、API Key、网络或模型服务状态后重试。"
+    assert "".join(chunks) == "模型调用失败（MODEL_UPSTREAM_ERROR）：本次操作未完成。请稍后重试，或联系管理员查看执行记录。"
+    assert "connection refused" not in "".join(chunks)
+
+
+def test_failure_reply_uses_agent_reply_locale_without_exposing_detail(monkeypatch):
+    """Select English developer prose from the reply locale, independently of UI locale."""
+    def fake_init(self, model_config):  # noqa: ANN001
+        return None
+
+    def fake_generate_text(self, system_prompt, payload):  # noqa: ANN001
+        raise RuntimeError("provider token=do-not-publish upstream timeout")
+
+    monkeypatch.setattr(LLMClient, "__init__", fake_init)
+    monkeypatch.setattr(LLMClient, "generate_text", fake_generate_text)
+    context = LanguageContext(
+        ui_locale=SupportedLocale.ZH_CN,
+        agent_reply_locale=SupportedLocale.EN_US,
+        ui_locale_source=LocaleResolutionSource.EXPLICIT_REQUEST,
+        agent_reply_locale_source=LocaleResolutionSource.EXPLICIT_REQUEST,
+    )
+
+    reply = ResponseGenerator().generate(
+        message="你好",
+        session=ChatSession(id="session_test", tenant_id="tenant_demo"),
+        skill=None,
+        router_decision=RouterDecision(decision="answer_only"),
+        step_result=StepAgentResult(reply="你好"),
+        tool_result=None,
+        model_config=None,  # type: ignore[arg-type]
+        language_context=context,
+    )
+
+    assert reply == (
+        "Model call failed (MODEL_UPSTREAM_ERROR): The operation could not be completed. "
+        "Please try again later or ask an administrator to inspect the run record."
+    )
+    assert "provider token=do-not-publish upstream timeout" not in reply
 
 
 def test_stream_pending_reply_without_tool_result_is_model_driven(monkeypatch):

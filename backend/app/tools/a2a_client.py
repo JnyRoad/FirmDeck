@@ -10,11 +10,24 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
+from pydantic import ValidationError
 from sqlmodel import Session, select
 
 from app.config import get_settings
+from app.contracts.error_registry import ERROR_REGISTRY, ErrorVisibility
+from app.contracts.errors import (
+    ErrorDescriptor,
+    ErrorOccurrence,
+    InternalErrorContext,
+    JsonValue,
+)
 from app.db.models import A2ATaskEvent, A2ATaskRun, Tool, utc_now
-
+from app.i18n.language_context import (
+    LanguageContext,
+    LanguageContextInputs,
+    resolve_compatible_language_context,
+    resolve_language_context,
+)
 
 _TERMINAL_STATES = {"completed", "failed", "canceled", "cancelled", "rejected"}
 _INTERRUPTED_STATES = {"input-required", "auth-required"}
@@ -23,9 +36,61 @@ _RUN_LOCKS_GUARD = threading.Lock()
 
 
 class A2AClientError(RuntimeError):
-    def __init__(self, code: str, message: str) -> None:
+    """A2A failure with a stable descriptor and private remote diagnostic context."""
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        params: dict[str, JsonValue] | None = None,
+        retryable: bool = False,
+        request_id: str | None = None,
+        trace_id: str | None = None,
+    ) -> None:
+        """Capture remote prose privately while preserving stable correlation metadata."""
         super().__init__(message)
-        self.code = code
+        # Workflow: resolve remote codes through the product registry before creating
+        # a descriptor; unregistered remote values remain private diagnostic context.
+        entry = ERROR_REGISTRY.get(code)
+        safe_params = params or {}
+        safe_retryable = retryable
+        if entry is None or entry.visibility is not ErrorVisibility.PUBLIC:
+            entry = ERROR_REGISTRY.require("INTERNAL_ERROR")
+            safe_params = {}
+            safe_retryable = entry.retryable_default
+        self.code = entry.code
+        self.occurrence = ErrorOccurrence(
+            descriptor=ErrorDescriptor(
+                code=entry.code,
+                params=safe_params,
+                retryable=safe_retryable,
+                request_id=request_id,
+                trace_id=trace_id,
+            ),
+            internal=InternalErrorContext(
+                source="a2a",
+                exception_type=type(self).__name__,
+                raw_message=message,
+                upstream_code=code,
+                upstream_request_id=request_id,
+            ),
+        )
+
+    def to_public_payload(
+        self,
+        *,
+        request_id: str | None = None,
+        trace_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Serialize canonical fields and fill boundary correlation when the provider lacks it."""
+        descriptor = self.occurrence.descriptor.model_copy(
+            update={
+                "request_id": self.occurrence.descriptor.request_id or request_id,
+                "trace_id": self.occurrence.descriptor.trace_id or trace_id,
+            }
+        )
+        return descriptor.model_dump(mode="json")
 
 
 class A2AClient:
@@ -41,7 +106,9 @@ class A2AClient:
         agent_id: str | None = None,
         session_id: str | None = None,
         invocation_id: str | None = None,
+        language_context: LanguageContext | dict[str, Any] | None = None,
     ) -> None:
+        """Bind one A2A client to an immutable locale snapshot for all sends and retries."""
         self.db = db
         self.tool = tool
         self.headers = dict(headers)
@@ -65,17 +132,20 @@ class A2AClient:
         self.agent_id = agent_id
         self.session_id = session_id
         self.invocation_id = invocation_id
+        self.language_context = _coerce_language_context(language_context)
         self.endpoint_url = tool.url
         self.protocol_binding = "JSONRPC"
         self.protocol_version = str(self.config.get("a2a_version") or "1.0")
         self.agent_card: dict[str, Any] = {}
 
     def execute(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Execute one A2A call under the invocation lock and its bound language context."""
         lock_key = self._invocation_lock_key()
         with _run_lock(lock_key):
             return self._execute_locked(arguments)
 
     def _execute_locked(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Create or resume a durable A2A run without re-resolving its locale on retries."""
         existing = self._existing_invocation()
         if existing is not None:
             return self._resume_existing(existing)
@@ -98,6 +168,7 @@ class A2AClient:
             status="submitted",
             request_json={"arguments": arguments, "message": message},
             agent_card_json=self.agent_card,
+            language_context_json=self.language_context.model_dump(mode="json"),
             started_at=utc_now(),
         )
         self.db.add(run)
@@ -111,7 +182,10 @@ class A2AClient:
             return self._finalize(run, result)
         except A2AClientError as exc:
             run.status = "failed"
-            run.error_json = {"code": exc.code, "message": str(exc)}
+            run.error_json = exc.to_public_payload(
+                request_id=self.invocation_id,
+                trace_id=self.session_id,
+            )
             run.finished_at = utc_now()
             run.updated_at = utc_now()
             self.db.add(run)
@@ -134,10 +208,18 @@ class A2AClient:
         ).first()
 
     def _resume_existing(self, run: A2ATaskRun) -> dict[str, Any]:
+        """Restore endpoint, request and locale state from one durable outbound A2A run."""
         self.endpoint_url = run.endpoint_url or self.tool.url
         self.protocol_binding = run.protocol_binding or "JSONRPC"
         self.protocol_version = run.protocol_version or self.protocol_version
         self.agent_card = dict(run.agent_card_json or {})
+        self.language_context = _coerce_language_context(run.language_context_json)
+        snapshot = self.language_context.model_dump(mode="json")
+        if run.language_context_json != snapshot:
+            run.language_context_json = snapshot
+            run.updated_at = utc_now()
+            self.db.add(run)
+            self.db.commit()
         if not self.agent_card:
             self._discover_agent()
 
@@ -187,7 +269,10 @@ class A2AClient:
             return self._finalize(run, result)
         except A2AClientError as exc:
             run.status = "failed"
-            run.error_json = {"code": exc.code, "message": str(exc)}
+            run.error_json = exc.to_public_payload(
+                request_id=self.invocation_id,
+                trace_id=self.session_id,
+            )
             run.finished_at = utc_now()
             run.updated_at = utc_now()
             self.db.add(run)
@@ -196,6 +281,7 @@ class A2AClient:
             raise
 
     def _response_from_run(self, run: A2ATaskRun) -> dict[str, Any]:
+        """Return a replay-safe response with the durable locale metadata extension."""
         task = run.result_json if isinstance(run.result_json, dict) else {}
         return {
             "a2a_run_id": run.id,
@@ -206,6 +292,7 @@ class A2AClient:
             "task": task,
             "message": _status_message(task),
             "artifacts": list(run.artifacts_json or []),
+            "metadata": _language_metadata(self.language_context),
         }
 
     def _invocation_lock_key(self) -> str:
@@ -346,8 +433,9 @@ class A2AClient:
         last: dict[str, Any] | None = None
         accumulated_task: dict[str, Any] | None = None
         timeout = max(deadline - time.monotonic(), 0.1)
-        with httpx.Client(timeout=timeout) as client:
-            with client.stream("POST", self.endpoint_url, headers=headers, json=payload) as response:
+        with httpx.Client(timeout=timeout) as client, client.stream(
+            "POST", self.endpoint_url, headers=headers, json=payload
+        ) as response:
                 response.raise_for_status()
                 for event_id, data in _iter_sse(response.iter_lines()):
                     if time.monotonic() >= deadline:
@@ -410,6 +498,7 @@ class A2AClient:
                 raise
 
     def _finalize(self, run: A2ATaskRun, result: dict[str, Any]) -> dict[str, Any]:
+        """Persist a successful A2A result and return raw business output plus stable metadata."""
         task = _task_from_event(result) or result
         state = _task_state(task) or "completed"
         artifacts = _artifacts(task)
@@ -437,6 +526,7 @@ class A2AClient:
             "task": task,
             "message": _status_message(task),
             "artifacts": artifacts,
+            "metadata": _language_metadata(self.language_context),
         }
 
     def _continuation(self, arguments: dict[str, Any]) -> dict[str, str | None]:
@@ -464,6 +554,7 @@ class A2AClient:
     def _message(
         self, arguments: dict[str, Any], continuation: dict[str, str | None]
     ) -> dict[str, Any]:
+        """Build an A2A message while leaving user-provided parts untouched."""
         supplied = arguments.get("message")
         if isinstance(supplied, dict):
             message = dict(supplied)
@@ -481,12 +572,14 @@ class A2AClient:
         return message
 
     def _send_params(self, message: dict[str, Any]) -> dict[str, Any]:
+        """Build SendMessage params with locale control metadata separate from raw message parts."""
         modes = self.config.get("accepted_output_modes")
         if not isinstance(modes, list) or not modes:
             modes = ["text/plain", "application/json"]
         return {
             "message": message,
             "configuration": {"acceptedOutputModes": [str(item) for item in modes]},
+            "metadata": _language_metadata(self.language_context),
         }
 
     def _payload(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -536,6 +629,15 @@ class A2AClient:
         *,
         event_id: str | None = None,
     ) -> None:
+        """Persist an outbound lifecycle event with stable locale metadata and raw success data."""
+        event_data = dict(data)
+        event_metadata = event_data.get("metadata")
+        metadata = dict(event_metadata) if isinstance(event_metadata, dict) else {}
+        context = self.language_context or resolve_language_context(LanguageContextInputs())
+        # The local durable snapshot is authoritative; never replay a provider's
+        # unvalidated metadata in place of the locale bound to this invocation.
+        metadata["language_context"] = context.model_dump(mode="json")
+        event_data["metadata"] = metadata
         last = self.db.exec(
             select(A2ATaskEvent)
             .where(A2ATaskEvent.run_id == run.id)
@@ -548,7 +650,7 @@ class A2AClient:
                 sequence=(last.sequence + 1) if last else 1,
                 external_event_id=event_id,
                 event_type=event_type,
-                data_json=data,
+                data_json=event_data,
             )
         )
         self.db.commit()
@@ -576,6 +678,26 @@ class A2AClient:
                 file_part["bytes"] = base64.b64encode(content).decode("ascii")
             hydrated.append(value)
         return hydrated
+
+
+def _coerce_language_context(
+    value: LanguageContext | dict[str, Any] | None,
+) -> LanguageContext:
+    """Normalize a caller or durable snapshot and fail closed to the legacy zh-CN default."""
+    try:
+        return resolve_compatible_language_context(
+            snapshot=value,
+            legacy_ui_locale=None,
+            legacy_agent_reply_locale=None,
+        )
+    except (TypeError, ValueError, ValidationError):
+        return resolve_language_context(LanguageContextInputs())
+
+
+def _language_metadata(context: LanguageContext | None) -> dict[str, Any]:
+    """Return the standard A2A metadata extension for one stable locale snapshot."""
+    snapshot = context or resolve_language_context(LanguageContextInputs())
+    return {"language_context": snapshot.model_dump(mode="json")}
 
 
 def _iter_sse(lines: Iterator[str]) -> Iterator[tuple[str | None, str]]:

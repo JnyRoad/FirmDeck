@@ -5,6 +5,7 @@ from typing import Any
 
 from sqlmodel import Session, select
 
+from app.contracts.domain_http import domain_http_error
 from app.db.models import (
     AgentKnowledgeBranch,
     AgentProfile,
@@ -146,10 +147,8 @@ def require_overall_agent(db: Session, tenant_id: str, agent_id: str | None) -> 
     if not agent_id and not get_overall_agent(db, tenant_id):
         return
     if not is_overall_agent(db, tenant_id, agent_id):
-        from fastapi import HTTPException
-
-        raise HTTPException(
-            status_code=403, detail="Only the overall agent can delete global resources"
+        raise domain_http_error(
+            "AGENT_OVERALL_ONLY_REQUIRED", source="agents.branching", status_code=403
         )
 
 
@@ -598,10 +597,8 @@ def sync_branch_from_overall(
     db: Session, tenant_id: str, agent_id: str, skill: Skill
 ) -> AgentSkillBranch:
     if skill.status != "published" or not is_open_gallery_resource(db, tenant_id, "skill", skill):
-        from fastapi import HTTPException
-
-        raise HTTPException(
-            status_code=400, detail="Disabled skill cannot be learned from the open gallery"
+        raise domain_http_error(
+            "AGENT_SKILL_NOT_PUBLISHED", source="agents.branching", status_code=400
         )
     branch = ensure_agent_skill_branch(db, tenant_id, agent_id, skill)
     branch.base_version = skill.version
@@ -619,9 +616,7 @@ def promote_branch_to_overall(db: Session, tenant_id: str, branch: AgentSkillBra
         select(Skill).where(Skill.tenant_id == tenant_id, Skill.skill_id == branch.skill_id)
     ).first()
     if not skill:
-        from fastapi import HTTPException
-
-        raise HTTPException(status_code=404, detail="Skill not found")
+        raise domain_http_error("SKILL_NOT_FOUND", source="agents.branching", status_code=404)
     next_version = next_global_version(skill.version)
     content = dict(branch.content_json)
     content["version"] = next_version
@@ -666,9 +661,9 @@ def rollback_branch(
         )
     ).first()
     if not branch:
-        from fastapi import HTTPException
-
-        raise HTTPException(status_code=404, detail="Branch not found")
+        raise domain_http_error(
+            "AGENT_SKILL_BRANCH_NOT_FOUND", source="agents.branching", status_code=404
+        )
     version_row = db.exec(
         select(AgentSkillBranchVersion).where(
             AgentSkillBranchVersion.tenant_id == tenant_id,
@@ -678,9 +673,9 @@ def rollback_branch(
         )
     ).first()
     if not version_row:
-        from fastapi import HTTPException
-
-        raise HTTPException(status_code=404, detail="Branch version not found")
+        raise domain_http_error(
+            "AGENT_SKILL_VERSION_NOT_FOUND", source="agents.branching", status_code=404
+        )
     branch.content_json = dict(version_row.content_json)
     branch.head_version = version_row.version
     branch.status = version_row.status
@@ -847,9 +842,9 @@ def knowledge_version_for_upload(
 ) -> KnowledgeBaseVersion:
     kb = db.get(KnowledgeBase, knowledge_base_id)
     if not kb or kb.tenant_id != tenant_id or kb.status == "archived":
-        from fastapi import HTTPException
-
-        raise HTTPException(status_code=404, detail="Knowledge base not found")
+        raise domain_http_error(
+            "KNOWLEDGE_BASE_NOT_FOUND", source="agents.branching", status_code=404
+        )
     agent = get_agent(db, tenant_id, agent_id)
     if not agent or agent.is_overall:
         version = ensure_knowledge_base_version(db, kb, _current_knowledge_version(kb))
@@ -964,11 +959,10 @@ def sync_knowledge_branch_from_overall(
 ) -> AgentKnowledgeBranch:
     kb = _get_knowledge_base(db, tenant_id, knowledge_base_id)
     if kb.status != "active" or not is_open_gallery_resource(db, tenant_id, "knowledge_base", kb):
-        from fastapi import HTTPException
-
-        raise HTTPException(
+        raise domain_http_error(
+            "AGENT_KNOWLEDGE_BASE_NOT_PUBLISHED",
+            source="agents.branching",
             status_code=400,
-            detail="Disabled knowledge base cannot be learned from the open gallery",
         )
     branch = _ensure_knowledge_branch(db, tenant_id, agent_id, kb)
     current_version = _current_knowledge_version(kb)
@@ -996,9 +990,9 @@ def promote_knowledge_branch_to_overall(
         )
     ).first()
     if not branch:
-        from fastapi import HTTPException
-
-        raise HTTPException(status_code=404, detail="Knowledge branch not found")
+        raise domain_http_error(
+            "AGENT_KNOWLEDGE_BRANCH_NOT_FOUND", source="agents.branching", status_code=404
+        )
     source = ensure_knowledge_base_version(db, kb, branch.head_version)
     next_version = next_global_version(_current_knowledge_version(kb))
     target = ensure_knowledge_base_version(db, kb, next_version)
@@ -1282,9 +1276,9 @@ def _ensure_knowledge_branch(
 def _get_knowledge_base(db: Session, tenant_id: str, knowledge_base_id: str) -> KnowledgeBase:
     kb = db.get(KnowledgeBase, knowledge_base_id)
     if not kb or kb.tenant_id != tenant_id or kb.status == "archived":
-        from fastapi import HTTPException
-
-        raise HTTPException(status_code=404, detail="Knowledge base not found")
+        raise domain_http_error(
+            "KNOWLEDGE_BASE_NOT_FOUND", source="agents.branching", status_code=404
+        )
     return kb
 
 

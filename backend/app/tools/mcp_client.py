@@ -13,6 +13,8 @@ from typing import Any, TextIO
 
 import httpx
 
+from app.contracts.error_registry import ERROR_REGISTRY, ErrorVisibility
+from app.contracts.errors import ErrorDescriptor, ErrorOccurrence, InternalErrorContext, JsonValue
 from app.security.managed_subprocess import ManagedProcess, ManagedProcessError
 from app.tools.mcp_builtin import (
     BuiltinMCPError,
@@ -22,7 +24,48 @@ from app.tools.mcp_builtin import (
 
 
 class MCPClientError(RuntimeError):
-    pass
+    """MCP failure with canonical public metadata and process-private transport diagnostics."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "MCP_ERROR",
+        params: dict[str, JsonValue] | None = None,
+        retryable: bool = False,
+        request_id: str | None = None,
+        trace_id: str | None = None,
+    ) -> None:
+        """Capture raw MCP prose privately and make generic exception text stable."""
+        super().__init__(message)
+        # Workflow: accept only a registered public MCP code in the descriptor;
+        # preserve the original transport message solely in private context.
+        entry = ERROR_REGISTRY.get(code)
+        safe_params = params or {}
+        safe_retryable = retryable
+        if entry is None or entry.visibility is not ErrorVisibility.PUBLIC:
+            entry = ERROR_REGISTRY.require("INTERNAL_ERROR")
+            safe_params = {}
+            safe_retryable = entry.retryable_default
+        self.occurrence = ErrorOccurrence(
+            descriptor=ErrorDescriptor(
+                code=entry.code,
+                params=safe_params,
+                retryable=safe_retryable,
+                request_id=request_id,
+                trace_id=trace_id,
+            ),
+            internal=InternalErrorContext(
+                source="mcp",
+                exception_type=type(self).__name__,
+                raw_message=message,
+                upstream_code=code,
+            ),
+        )
+
+    def to_public_payload(self) -> dict[str, Any]:
+        """Serialize only canonical MCP error fields."""
+        return self.occurrence.descriptor.model_dump(mode="json")
 
 
 MCP_APPS_EXTENSION_ID = "io.modelcontextprotocol/ui"

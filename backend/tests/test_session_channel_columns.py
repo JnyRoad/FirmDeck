@@ -76,3 +76,40 @@ def test_channel_columns_migration_is_idempotent(monkeypatch, tmp_path) -> None:
                     "VALUES ('c2', 't', 'a', 'wechat', 'chan_1', 'wechat_p2p_x')"
                 )
             )
+
+
+def test_session_kind_migration_backfills_exact_legacy_team_titles(
+    monkeypatch, tmp_path
+) -> None:
+    """Add the machine-owned session kind without rewriting legacy business titles."""
+    db_path = tmp_path / "session-kind.db"
+    engine = create_engine(f"sqlite:///{db_path}")
+    with engine.begin() as conn:
+        _legacy_sessions_ddl(conn)
+
+    monkeypatch.setattr(database, "database_url", f"sqlite:///{db_path}")
+    monkeypatch.setattr(database, "engine", engine)
+    database._migrate_sqlite_skill_schema()
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO sessions (id, tenant_id, title, team_id, channel) VALUES "
+                "('tl', 't', '团队 增长 · TL 对话', 'team-a', 'feishu'), "
+                "('task', 't', '团队任务:原始任务', 'team-a', NULL), "
+                "('raw', 't', '用户自定义 TL 对话备忘', 'team-a', NULL)"
+            )
+        )
+
+    database._migrate_sqlite_skill_schema()
+
+    columns = {column["name"] for column in inspect(engine).get_columns("sessions")}
+    assert "session_kind" in columns
+    with engine.begin() as conn:
+        rows = conn.execute(
+            text("SELECT id, title, session_kind FROM sessions ORDER BY id")
+        ).all()
+    assert rows == [
+        ("raw", "用户自定义 TL 对话备忘", None),
+        ("task", "团队任务:原始任务", "team_member_task"),
+        ("tl", "团队 增长 · TL 对话", "team_tl"),
+    ]

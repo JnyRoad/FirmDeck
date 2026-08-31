@@ -8,6 +8,8 @@ import {
   ENTERPRISE_AUTH_STORAGE_KEY,
   type EnterpriseAuthSession,
 } from '../auth';
+import { AppIntlProvider } from '../i18n/provider';
+import type { AppLocale } from '../i18n/locales';
 import { I18nProvider } from '../i18n';
 
 import LoginPage from './LoginPage';
@@ -21,6 +23,25 @@ const session: EnterpriseAuthSession = {
     role: 'admin',
   },
 };
+
+const semanticLoginCopy = {
+  'zh-CN': {
+    hero: '我们来做什么？',
+    login: '登录',
+    account: '账号',
+    password: '密码',
+    showPassword: '显示密码',
+    previewAlt: 'StaffDeck 产品预览',
+  },
+  'en-US': {
+    hero: 'What will we build today?',
+    login: 'Log in',
+    account: 'Account',
+    password: 'Password',
+    showPassword: 'Show Password',
+    previewAlt: 'StaffDeck Product Preview',
+  },
+} as const satisfies Record<AppLocale, Record<string, string>>;
 
 function jsonResponse(body: unknown, status = 200): Response {
   return {
@@ -40,6 +61,16 @@ function renderLogin(onLogin = vi.fn()) {
   return onLogin;
 }
 
+/** 仅挂载语义 Provider 渲染登录页，确保新增断言不会经由 legacy source-key 运行时变绿。 */
+function renderSemanticLogin(locale: AppLocale, onLogin = vi.fn()) {
+  render(
+    <AppIntlProvider initialLocale={locale}>
+      <LoginPage onLogin={onLogin} />
+    </AppIntlProvider>,
+  );
+  return onLogin;
+}
+
 async function showFormAndEnterCredentials(
   user: ReturnType<typeof userEvent.setup>,
   username = 'admin',
@@ -54,6 +85,7 @@ afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
   window.localStorage.clear();
+  document.documentElement.lang = '';
 });
 
 describe('LoginPage', () => {
@@ -116,4 +148,25 @@ describe('LoginPage', () => {
     expect(JSON.parse(window.localStorage.getItem(ENTERPRISE_AUTH_STORAGE_KEY) || 'null'))
       .toEqual(session);
   });
+});
+
+describe('LoginPage semantic locale matrix', () => {
+  it.each(['zh-CN', 'en-US'] as const)(
+    'renders owned login copy and accessible names in %s',
+    async (locale) => {
+      const copy = semanticLoginCopy[locale];
+      const user = userEvent.setup();
+      renderSemanticLogin(locale);
+
+      expect(document.documentElement.lang).toBe(locale);
+      expect(screen.getByText(copy.hero)).toBeTruthy();
+      expect(screen.getByAltText(copy.previewAlt)).toBeTruthy();
+
+      await user.click(screen.getByRole('button', { name: copy.login }));
+
+      expect(screen.getByRole('textbox', { name: copy.account })).toBeTruthy();
+      expect(screen.getByLabelText(copy.password)).toBeTruthy();
+      expect(screen.getByRole('button', { name: copy.showPassword })).toBeTruthy();
+    },
+  );
 });

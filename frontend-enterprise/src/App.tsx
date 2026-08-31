@@ -103,7 +103,7 @@ import {
   DIALOG_PRIMARY_BUTTON_CLASS,
 } from "@/lib/enterprise-ui";
 import type { AgentProfileRead, ModelConfigRead, TeamRead } from "./types";
-import { useI18n } from "./i18n";
+import { useAppIntl } from "./i18n/useAppIntl";
 
 const ENTERPRISE_SIDEBAR_STORAGE_KEY = "ultrarag_enterprise_sidebar_expanded";
 const MODEL_CONFIGS_UPDATED_EVENT = "ultrarag-enterprise-model-configs-updated";
@@ -125,6 +125,7 @@ const EMPTY_AGENT_FORM: AgentCreateFormState = {
   copyFromAgentId: "",
 };
 
+/** 组合认证后的应用壳、导航和共享创建流程，并直接消费语义消息运行时。 */
 function Shell({
   auth,
   onLogout,
@@ -136,7 +137,7 @@ function Shell({
 }) {
   const navigate = useNavigate();
   const location = useLocation();
-  const { t } = useI18n();
+  const { t } = useAppIntl();
   const [agents, setAgents] = useState<AgentProfileRead[]>([]);
   const [agentsLoaded, setAgentsLoaded] = useState(false);
   const [scopeTeams, setScopeTeams] = useState<TeamRead[]>([]);
@@ -154,7 +155,7 @@ function Shell({
   const [modelConfigsLoaded, setModelConfigsLoaded] = useState(false);
   const isMobile = useIsMobile();
   const isAdmin = isEnterpriseAdmin(auth.user);
-  const accountRoleLabel = isAdmin ? "管理员" : "";
+  const accountRoleLabel = isAdmin ? t("shell.account.roleAdmin") : "";
   const isDistillRoute = location.pathname === "/enterprise/skills/distill";
   const selected =
     location.pathname === "/enterprise"
@@ -344,6 +345,7 @@ function Shell({
     emitAgentScopeChange(agentId);
   }
 
+  /** 创建团队会话并切换到团队作用域；服务端原始错误优先直出。 */
   async function selectTeamScope(teamId: string) {
     const scope = toTeamScope(teamId);
     try {
@@ -351,13 +353,13 @@ function Shell({
         `/api/enterprise/teams/${teamId}/tl/session`,
         { tenant_id: TENANT_ID },
       );
-      if (!result.session_id) throw new Error("发起群聊失败");
+      if (!result.session_id) throw new Error(t("shell.teamChat.startFailure"));
       setSelectedAgentId(scope);
       persistSharedAgentScope(scope, auth.user.id);
       emitAgentScopeChange(scope);
       navigate(`/workspace/chat/${result.session_id}`);
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : "发起群聊失败");
+      notify.error(error instanceof Error ? error.message : t("shell.teamChat.startFailure"));
     }
   }
 
@@ -373,8 +375,8 @@ function Shell({
   const hasUsableModelConfig = modelConfigs.some((item) => item.enabled);
   const showModelSetupNotice = guidesCompleted && modelConfigsLoaded && !hasUsableModelConfig;
   const modelSetupNoticeText = isAdmin
-    ? t("还没有可用模型配置，数字员工暂不能调用模型。请先完成模型配置。")
-    : t("系统管理员尚未配置可用模型，数字员工暂不能调用模型。请联系管理员完成模型配置。");
+    ? t("shell.modelSetup.adminNotice")
+    : t("shell.modelSetup.memberNotice");
   const selectedAgent = scopeAgents.find((item) => item.id === selectedAgentId);
   const sidebarAgent = selectedAgent;
   // Routes that operate on a specific employee; show the empty guide when none exist.
@@ -402,12 +404,13 @@ function Shell({
   );
   const selectedAgentName = selectedAgent
     ? employeeDisplayName(selectedAgent)
-    : "未选择";
+    : t("sidebar.notSelected");
   const selectedAgentCaption = selectedAgent
     ? selectedAgent.is_overall
-      ? "开放广场"
+      ? t("sidebar.marketplaceShort")
       : employeeProfile(selectedAgent).roleName
     : "-";
+  /** 使用当前可复制员工初始化创建表单，不翻译员工名称或已有员工档案字段。 */
   function openCreateAgentModal() {
     setAgentForm({
       ...EMPTY_AGENT_FORM,
@@ -416,10 +419,11 @@ function Shell({
     setAgentCreateOpen(true);
   }
 
+  /** 校验并创建数字员工；用户输入和复制的员工元数据保持原始值。 */
   async function saveAgentCreateModal() {
     const name = agentForm.name.trim();
     if (!name) {
-      notify.error("请填写数字员工姓名");
+      notify.error(t("shell.agentCreate.nameRequired"));
       return;
     }
     const isBlankOnboarding = agentForm.sourceMode === "blank";
@@ -435,7 +439,7 @@ function Shell({
     const roleName =
       agentForm.roleName.trim() ||
       (!isBlankOnboarding ? sourceRoleName : "") ||
-      "待补充职位";
+      t("shell.agentCreate.roleFallback");
     const description =
       agentForm.description.trim() ||
       (!isBlankOnboarding
@@ -479,9 +483,9 @@ function Shell({
       await loadAgents();
       changeAgentScope(created.id);
       setAgentCreateOpen(false);
-      notify.success("数字员工创建成功");
+      notify.success(t("shell.agentCreate.success"));
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : "创建数字员工失败");
+      notify.error(error instanceof Error ? error.message : t("shell.agentCreate.failure"));
     }
   }
 
@@ -491,7 +495,7 @@ function Shell({
       onOpenChange={handleSidebarOpenChange}
       style={
         {
-          "--sidebar-width": "220px",
+          "--sidebar-width": "240px",
           "--sidebar-width-icon": "72px",
         } as CSSProperties
       }
@@ -538,7 +542,7 @@ function Shell({
                   onClick={() => navigate(EnterpriseRoute.Models)}
                   className="h-[32px] shrink-0 rounded-[8px] bg-[#1a71ff] px-[12px] text-[12px] text-white hover:bg-[#0f5ed7]"
                 >
-                  {t("去配置")}
+                  {t("shell.modelSetup.configure")}
                 </UIButton>
               )}
             </div>
@@ -830,15 +834,15 @@ function Shell({
       <Dialog open={agentCreateOpen} onOpenChange={setAgentCreateOpen}>
         <DialogContent className="flex max-h-[calc(100dvh-32px)] w-[calc(100%-32px)] flex-col gap-0 overflow-hidden rounded-[16px] p-0 sm:max-w-[520px]">
           <DialogTitle className="shrink-0 px-[24px] py-[16px] text-[16px] font-semibold text-foreground">
-            新建数字员工
+            {t("shell.agentCreate.title")}
           </DialogTitle>
           <div className="agent-editor-form min-h-0 flex-1 overflow-y-auto px-[24px] pb-[16px]">
             <label>
-              创建方式
+              {t("shell.agentCreate.method")}
               <div className="inline-flex w-fit gap-[4px] rounded-[10px] border border-border p-[2px]">
                 {[
-                  { label: "从广场复制", value: "copy" as const },
-                  { label: "从空白开始", value: "blank" as const },
+                  { label: t("shell.agentCreate.copyMarketplace"), value: "copy" as const },
+                  { label: t("shell.agentCreate.startBlank"), value: "blank" as const },
                 ].map((option) => (
                   <button
                     key={option.value}
@@ -864,7 +868,7 @@ function Shell({
               </div>
             </label>
             <label>
-              职位
+              {t("shell.agentCreate.role")}
               <Input
                 value={agentForm.roleName}
                 onChange={(event) =>
@@ -873,13 +877,13 @@ function Shell({
                     roleName: event.target.value,
                   }))
                 }
-                placeholder="例如 研发工程师、财务助理"
+                placeholder={t("shell.agentCreate.rolePlaceholder")}
               />
             </label>
             <div className="grid content-start gap-[6px]">
             {agentForm.sourceMode === "copy" && (
               <label>
-                复制来源
+                {t("shell.agentCreate.copySource")}
                 <UISelect
                   value={agentForm.copyFromAgentId || undefined}
                   onValueChange={(value) =>
@@ -900,14 +904,14 @@ function Shell({
                   }
                 >
                   <SelectTrigger className={cn(SELECT_TRIGGER_CLASS, "w-full")}>
-                    <SelectValue placeholder="选择复制来源" />
+                    <SelectValue placeholder={t("shell.agentCreate.copySourcePlaceholder")} />
                   </SelectTrigger>
                   <SelectContent>
                     {sourceAgents.map((agent) => (
                       <SelectItem key={agent.id} value={agent.id}>
                         {agent.is_overall
-                          ? "开放广场"
-                          : `${employeeDisplayNameWithCreator(agent)} · ${employeeProfile(agent).roleName}${isGalleryEmployee(agent) ? " · 广场" : ""}`}
+                          ? t("shell.agentCreate.marketplace")
+                          : `${employeeDisplayNameWithCreator(agent)} · ${employeeProfile(agent).roleName}${isGalleryEmployee(agent) ? ` · ${t("shell.agentCreate.marketplaceSuffix")}` : ""}`}
                       </SelectItem>
                     ))}
                   </SelectContent>
@@ -916,12 +920,12 @@ function Shell({
             )}
             {agentForm.sourceMode === "blank" && (
               <div className="agent-definition-note">
-                从空白开始创建，不继承任何已有配置。
+                {t("shell.agentCreate.blankHint")}
               </div>
             )}
             </div>
             <label>
-              数字员工姓名
+              {t("shell.agentCreate.name")}
               <Input
                 value={agentForm.name}
                 onChange={(event) =>
@@ -933,7 +937,7 @@ function Shell({
               />
             </label>
             <label>
-              岗位描述
+              {t("shell.agentCreate.description")}
               <Textarea
                 rows={3}
                 value={agentForm.description}
@@ -943,7 +947,7 @@ function Shell({
                     description: event.target.value,
                   }))
                 }
-                placeholder="概括这个数字员工的岗位边界、服务风格和执行重点"
+                placeholder={t("shell.agentCreate.descriptionPlaceholder")}
               />
             </label>
           </div>
@@ -953,13 +957,13 @@ function Shell({
               className={DIALOG_CANCEL_BUTTON_CLASS}
               onClick={() => setAgentCreateOpen(false)}
             >
-              取消
+              {t("common.action.cancel")}
             </UIButton>
             <UIButton
               className={DIALOG_PRIMARY_BUTTON_CLASS}
               onClick={() => void saveAgentCreateModal()}
             >
-              创建
+              {t("common.action.create")}
             </UIButton>
           </div>
         </DialogContent>
@@ -1023,10 +1027,9 @@ function AuthedApp({
   return <Shell auth={auth} onLogout={onLogout} guidesCompleted={guidesCompleted} />;
 }
 
+/** 渲染应用根路由并用语义 locale 同步文档标题，不依赖 legacy observer 或 source-key facade。 */
 export default function App() {
-  // Subscribe the application tree to locale changes so locale-sensitive dates
-  // and computed labels update without remounting or losing form state.
-  useI18n();
+  const { locale, t } = useAppIntl();
   const [auth, setAuth] = useState<EnterpriseAuthSession | null>(() =>
     getEnterpriseAuthSession(),
   );
@@ -1035,6 +1038,11 @@ export default function App() {
     window.localStorage.getItem(ONBOARDING_SEEN_KEY)
     && window.localStorage.getItem(QUICK_START_SEEN_KEY),
   ));
+
+  /** locale 变化时同步浏览器标题；静态 HTML 仅保留默认语言的启动占位。 */
+  useEffect(() => {
+    document.title = t("app.document.title");
+  }, [locale, t]);
 
   useEffect(() => {
     const onQuickStartCompleted = () => setGuidesCompleted(true);

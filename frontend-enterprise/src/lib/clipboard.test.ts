@@ -79,4 +79,18 @@ describe('copyTextToClipboard', () => {
 
     await expect(copyTextToClipboard('unavailable')).rejects.toThrow('Clipboard access is unavailable');
   });
+
+  /**
+   * Verifies that source content is copied byte-for-byte and is never interpreted as a message ID.
+   * The test only mutates local clipboard mocks and the jsdom selection state.
+   */
+  it('copies raw source content without translating it as a message key', async () => {
+    const rawSource = '知识库原文 / User input';
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    setClipboard({ writeText } as unknown as Clipboard);
+
+    await copyTextToClipboard(rawSource);
+
+    expect(writeText).toHaveBeenCalledWith(rawSource);
+  });
 });

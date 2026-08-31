@@ -1,13 +1,23 @@
 // @vitest-environment jsdom
 
+import type { ReactNode } from 'react';
 import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { AppIntlProvider } from '@/i18n/provider';
+import type { AppLocale } from '@/i18n/locales';
 import { I18nProvider } from '@/i18n';
 import type { EnterpriseAuthUser } from '@/auth';
-import type { TeamRead } from '@/types';
+import type { AgentProfileRead, TeamRead } from '@/types';
+
+/** 隔离仍使用 legacy locale 的全局页头，使语义矩阵不依赖 DOM observer。 */
+vi.mock('../components/AppHeader', () => ({
+  default: ({ title, left }: { title?: ReactNode; left?: ReactNode }) => (
+    <header data-testid="semantic-test-header">{title ?? left}</header>
+  ),
+}));
 
 import EmployeeGalleryPage from './EmployeeGalleryPage';
 
@@ -29,6 +39,50 @@ const team: TeamRead = {
   updated_at: '2026-08-01T00:00:00Z',
 };
 
+const galleryAgent: AgentProfileRead = {
+  id: 'agent-gallery-1',
+  tenant_id: 'tenant_demo',
+  name: 'Gallery Agent Aurora',
+  description: 'Raw gallery description',
+  is_overall: false,
+  status: 'active',
+  metadata: {
+    published_to_gallery: true,
+    role_name: 'Raw gallery role',
+    work_styles: ['Raw gallery style'],
+  },
+  resources: [],
+  created_at: '2026-08-01T00:00:00Z',
+  updated_at: '2026-08-01T00:00:00Z',
+};
+
+const semanticGalleryCopy = {
+  'zh-CN': {
+    search: '搜索数字员工',
+    categories: '数字员工分类',
+    all: '所有员工',
+    mine: '我的数字员工',
+    teams: '团队对话',
+    gallery: '数字员工广场',
+    teamSection: '团队',
+    status: '在线',
+    chat: '发起对话',
+    empty: '暂无数字员工',
+  },
+  'en-US': {
+    search: 'Search digital employees',
+    categories: 'Employee categories',
+    all: 'All employees',
+    mine: 'My digital employees',
+    teams: 'Team conversations',
+    gallery: 'Employee marketplace',
+    teamSection: 'Teams',
+    status: 'Online',
+    chat: 'Start conversation',
+    empty: 'No digital employees yet',
+  },
+} as const satisfies Record<AppLocale, Record<string, string>>;
+
 function jsonResponse(body: unknown): Response {
   return {
     ok: true,
@@ -38,18 +92,33 @@ function jsonResponse(body: unknown): Response {
   } as Response;
 }
 
-function stubGalleryFetch(teams: TeamRead[]) {
+function stubGalleryFetch(teams: TeamRead[], agents: AgentProfileRead[] = []) {
   const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
     if (init?.method === 'POST' && url.includes('/tl/session')) {
       return jsonResponse({ session_id: 'session-tl-1' });
     }
     if (url.includes('/api/enterprise/teams')) return jsonResponse(teams);
-    if (url.includes('/api/enterprise/agents')) return jsonResponse([]);
+    if (url.includes('/api/enterprise/agents')) return jsonResponse(agents);
     return jsonResponse({});
   });
   vi.stubGlobal('fetch', fetchMock);
   return fetchMock;
+}
+
+/** 在不挂载 legacy Provider 的前提下渲染员工广场，保留真实筛选和权限边界。 */
+function renderSemanticGallery(locale: AppLocale, currentUser?: EnterpriseAuthUser): void {
+  render(
+    <AppIntlProvider initialLocale={locale}>
+      <MemoryRouter initialEntries={['/workspace/gallery']}>
+        <Routes>
+          <Route path="/workspace/gallery" element={<EmployeeGalleryPage currentUser={currentUser} />} />
+          <Route path="/workspace/chat/:sessionId" element={<LocationEcho />} />
+          <Route path="/enterprise/teams/:teamId" element={<LocationEcho />} />
+        </Routes>
+      </MemoryRouter>
+    </AppIntlProvider>,
+  );
 }
 
 function LocationEcho() {
@@ -88,7 +157,9 @@ describe('EmployeeGalleryPage teams tab', () => {
     expect(within(section).getByText('增长团队')).toBeTruthy();
     expect(within(section).getByText('负责增长实验与内容投放')).toBeTruthy();
     expect(within(section).getByText('4 名成员')).toBeTruthy();
-    expect(within(section).getByText('项目领导：小艾')).toBeTruthy();
+    expect(
+      within(section).getAllByText((_, element) => element?.textContent === '项目领导：小艾').length,
+    ).toBeGreaterThan(0);
     // 前 3 个成员头像叠放，其余折叠为 +N
     expect(within(section).getByText('+1')).toBeTruthy();
   });
@@ -147,7 +218,7 @@ describe('EmployeeGalleryPage teams tab', () => {
 
     await user.click(await screen.findByRole('tab', { name: '团队对话' }));
     const section = await screen.findByRole('region', { name: '团队' });
-    await user.click(within(section).getByRole('button', { name: '增长团队' }));
+    await user.click(within(section).getByText('增长团队'));
 
     expect((await screen.findByTestId('location')).textContent).toBe('/workspace/chat/session-tl-1');
     const postCall = fetchMock.mock.calls.find(([, init]) => init?.method === 'POST');
@@ -175,4 +246,60 @@ describe('EmployeeGalleryPage teams tab', () => {
 
     expect(await screen.findByText('暂无团队')).toBeTruthy();
   });
+});
+
+describe('EmployeeGalleryPage semantic locale matrix', () => {
+  it.each(['zh-CN', 'en-US'] as const)(
+    'renders localized product chrome and accessibility names while preserving raw employee data in %s',
+    async (locale) => {
+      const copy = semanticGalleryCopy[locale];
+      stubGalleryFetch([], [galleryAgent]);
+      renderSemanticGallery(locale);
+
+      expect(document.documentElement.lang).toBe(locale);
+      expect(await screen.findByText(galleryAgent.name)).toBeTruthy();
+      expect(screen.getByRole('textbox', { name: copy.search })).toBeTruthy();
+      expect(screen.getByRole('tablist', { name: copy.categories })).toBeTruthy();
+      expect(screen.getByRole('tab', { name: copy.all })).toBeTruthy();
+      expect(screen.getByRole('tab', { name: copy.mine })).toBeTruthy();
+      expect(screen.getByRole('tab', { name: copy.teams })).toBeTruthy();
+      expect(screen.getByRole('tab', { name: copy.gallery })).toBeTruthy();
+      expect(screen.getByText(copy.status)).toBeTruthy();
+      expect(screen.getByRole('button', { name: copy.chat })).toBeTruthy();
+      expect(screen.getByText('Raw gallery role')).toBeTruthy();
+      expect(screen.getByText('Raw gallery description')).toBeTruthy();
+    },
+  );
+
+  it.each(['zh-CN', 'en-US'] as const)(
+    'localizes the team scope region and preserves team source content in %s',
+    async (locale) => {
+      const copy = semanticGalleryCopy[locale];
+      const user = userEvent.setup();
+      stubGalleryFetch([team]);
+      renderSemanticGallery(locale);
+
+      await user.click(await screen.findByRole('tab', { name: copy.teams }));
+      const section = await screen.findByRole('region', { name: copy.teamSection });
+      expect(within(section).getByText(team.name)).toBeTruthy();
+      expect(within(section).getByText(team.description || '')).toBeTruthy();
+    },
+  );
+
+  it.each(['zh-CN', 'en-US'] as const)(
+    'renders a localized empty state when the user has no visible employees in %s',
+    async (locale) => {
+      const copy = semanticGalleryCopy[locale];
+      stubGalleryFetch([]);
+      renderSemanticGallery(locale, {
+        id: 'member-1',
+        tenant_id: 'tenant_demo',
+        username: 'member',
+        role: 'member',
+      });
+
+      expect(await screen.findByText(copy.empty)).toBeTruthy();
+      expect(screen.queryByText(galleryAgent.name)).toBeNull();
+    },
+  );
 });

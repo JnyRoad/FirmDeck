@@ -6,11 +6,12 @@ from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
 import app.api.channels as channels_api
+from app.channels.adapters.feishu import FeishuPermanentError
 from app.db import get_session
 from app.db.models import (
     AgentProfile,
-    ChannelBinding,
     ChannelBindCode,
+    ChannelBinding,
     ChannelBindingManager,
     Tenant,
     User,
@@ -126,6 +127,30 @@ def test_collaborator_can_save_feishu_credentials(monkeypatch) -> None:
     assert resp.status_code == 200, resp.text
     assert resp.json()["status"] == "active"
     assert resp.json()["my_role"] == "collaborator"
+
+
+def test_feishu_credential_error_keeps_provider_detail_private(monkeypatch) -> None:
+    """Return a registered Channel descriptor without exposing credential validation prose."""
+    engine = _engine()
+    users = _seed(engine)
+    client = _client(engine)
+    raw_provider_error = "Feishu rejected app_secret=do-not-publish"
+
+    def reject_credentials(*_args):
+        """Raise one seeded permanent provider rejection."""
+        raise FeishuPermanentError(raw_provider_error)
+
+    monkeypatch.setattr(channels_api, "validate_feishu_credentials", reject_credentials)
+    binding_id = _seed_binding(engine, status="pending")
+    response = client.post(
+        f"/api/enterprise/channels/{binding_id}/feishu/credentials",
+        json={"tenant_id": "tenant_demo", "app_id": "cli_bad", "app_secret": "sec"},
+        headers=_auth(users["owner"]),
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"]["code"] == "CHANNEL_BAD_REQUEST"
+    assert raw_provider_error not in response.text
 
 
 def test_collaborator_can_manage_agents() -> None:

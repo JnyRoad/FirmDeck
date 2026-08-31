@@ -1,11 +1,12 @@
 // @vitest-environment jsdom
 
-import { cleanup, render, screen } from '@testing-library/react';
+import { cleanup, render as rtlRender, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import type { ReactElement } from 'react';
 import type { AgentProfileRead, ChatMessage, TeamConversationRead, TeamRead } from '@/types';
-import { I18nProvider } from '@/i18n';
+import { AppIntlProvider } from '@/i18n';
 
 import TeamCollaborationPanel, {
   collaborationQuestion,
@@ -79,6 +80,11 @@ afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
 });
+
+/** 为团队协作行为测试提供显式语义 i18n runtime，避免依赖 legacy observer。 */
+function render(ui: ReactElement) {
+  return rtlRender(<AppIntlProvider initialLocale="zh-CN">{ui}</AppIntlProvider>);
+}
 
 describe('TeamCollaborationPanel', () => {
   it('renders leader mentions and expands only the member reply inline', async () => {
@@ -162,7 +168,11 @@ describe('TeamCollaborationPanel', () => {
       preview: '',
       created_at: '2026-08-15T00:00:30Z',
       updated_at: '2026-08-15T00:01:00Z',
-    })).toBe('@行政，请处理「季度报告」');
+    })).toEqual({
+      messageId: 'chat.team.memberTaskPromptTail',
+      memberName: '行政',
+      title: '季度报告',
+    });
   });
 
   it('lets the user answer a member question and resume the same team task', async () => {
@@ -381,9 +391,9 @@ describe('TeamCollaborationPanel', () => {
     };
 
     render(
-      <I18nProvider>
+      <AppIntlProvider initialLocale="zh-CN">
         <TeamCollaborationPanel team={team} agents={agents} conversation={conversation} />
-      </I18nProvider>,
+      </AppIntlProvider>,
     );
     await user.click(screen.getByRole('button', { name: '展开行政的回复' }));
 

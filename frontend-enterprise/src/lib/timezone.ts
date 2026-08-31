@@ -1,7 +1,8 @@
-import { getDateLocale } from '@/i18n';
+import { DEFAULT_LOCALE, type AppLocale } from '@/i18n/locales';
 
 const FALLBACK_TIME_ZONE = 'Asia/Shanghai';
 
+/** 获取浏览器报告的 IANA 时区；浏览器无法提供时使用兼容性默认值。 */
 export function getClientTimeZone(): string {
   try {
     return Intl.DateTimeFormat().resolvedOptions().timeZone || FALLBACK_TIME_ZONE;
@@ -10,6 +11,7 @@ export function getClientTimeZone(): string {
   }
 }
 
+/** 将后端 wire timestamp 解析为绝对时刻；无 offset 的 ISO 时间按 UTC 处理。 */
 export function parseBackendDateTime(value?: string): Date {
   const text = String(value || '').trim();
   if (!text) return new Date('');
@@ -20,11 +22,16 @@ export function parseBackendDateTime(value?: string): Date {
   return new Date(`${text}Z`);
 }
 
-export function formatClientDateTime(value?: string, emptyText = '-'): string {
+/** 按显式 UI locale 和客户端 timezone 展示后端时间；缺省 locale 仅保留旧调用的确定性兼容值。 */
+export function formatClientDateTime(
+  value?: string,
+  locale: AppLocale = DEFAULT_LOCALE,
+  emptyText = '-',
+): string {
   if (!value) return emptyText;
   const date = parseBackendDateTime(value);
   if (Number.isNaN(date.getTime())) return emptyText;
-  return date.toLocaleString(getDateLocale(), {
+  return date.toLocaleString(locale, {
     hour12: false,
     timeZone: getClientTimeZone(),
   });

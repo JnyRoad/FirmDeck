@@ -5,7 +5,7 @@ import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 
-import { I18nProvider } from '@/i18n';
+import { AppIntlProvider, I18nProvider } from '@/i18n';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import type { AgentProfileRead, KnowledgeBaseRead } from '@/types';
 
@@ -71,7 +71,10 @@ function jsonResponse(body: unknown): Response {
   } as Response;
 }
 
-function stubKnowledgeFetch(options?: { agents?: AgentProfileRead[] }) {
+function stubKnowledgeFetch(options?: {
+  agents?: AgentProfileRead[];
+  knowledgeBases?: KnowledgeBaseRead[];
+}) {
   /** 为管理页和新建页提供可按员工作用域调整的只读依赖接口。 */
   const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
@@ -134,7 +137,9 @@ function stubKnowledgeFetch(options?: { agents?: AgentProfileRead[] }) {
         name: body.name,
       });
     }
-    if (url.includes('/knowledge-bases')) return jsonResponse([dedicatedBase, sharedBase]);
+    if (url.includes('/knowledge-bases')) {
+      return jsonResponse(options?.knowledgeBases ?? [dedicatedBase, sharedBase]);
+    }
     return jsonResponse([]);
   });
   vi.stubGlobal('fetch', fetchMock);
@@ -183,11 +188,11 @@ describe('KnowledgePage shared knowledge', () => {
     const fetchMock = stubKnowledgeFetch();
     renderAddPage();
 
-    const form = await screen.findByLabelText('新建知识库配置');
-    expect(within(form).getByRole('radio', { name: /^专用知识库/ })).toBeTruthy();
-    await user.click(within(form).getByRole('radio', { name: /^共享知识库/ }));
+    const form = await screen.findByLabelText('知识库创建选项');
+    expect(within(form).getByRole('radio', { name: /^专用/ })).toBeTruthy();
+    await user.click(within(form).getByRole('radio', { name: /^共享/ }));
     await user.type(within(form).getByLabelText('知识库名称'), '团队内容中台');
-    await user.type(within(form).getByLabelText('知识库描述'), '沉淀选题、素材与复盘');
+    await user.type(within(form).getByLabelText('描述'), '沉淀选题、素材与复盘');
     await user.click(within(form).getByRole('button', { name: '创建知识库' }));
 
     await waitFor(() => {
@@ -287,5 +292,49 @@ describe('KnowledgePage shared knowledge', () => {
     expect(fetchMock.mock.calls.some(([input]) => (
       String(input).includes('/teams/team-content/knowledge-bases')
     ))).toBe(false);
+  });
+
+  it.each([
+    ['zh-CN', '知识库', '知识库列表', '共享知识库'],
+    ['en-US', 'Knowledge bases', 'Knowledge base list', 'Shared knowledge base'],
+  ] as const)('localizes product chrome in %s while preserving source titles', async (
+    locale,
+    pageTitle,
+    listLabel,
+    sharedTypeLabel,
+  ) => {
+    /** 语义 Provider 必须切换页面与 ARIA 文案，但不能改写用户提供的知识库名称。 */
+    stubKnowledgeFetch();
+    render(
+      <AppIntlProvider locale={locale}>
+        <TooltipProvider>
+          <MemoryRouter>
+            <KnowledgeManagePage currentUser={currentUser} />
+          </MemoryRouter>
+        </TooltipProvider>
+      </AppIntlProvider>,
+    );
+
+    expect(await screen.findByRole('heading', { name: pageTitle })).toBeTruthy();
+    const list = await screen.findByLabelText(listLabel);
+    expect(within(list).getByText(sharedTypeLabel)).toBeTruthy();
+    expect(within(list).getByText('团队选题库')).toBeTruthy();
+  });
+
+  it('localizes the English empty state without the legacy observer', async () => {
+    /** 空列表应由语义目录直接生成英文状态和可访问名称，不依赖 DOM 二次改写。 */
+    stubKnowledgeFetch({ knowledgeBases: [] });
+    render(
+      <AppIntlProvider locale="en-US">
+        <TooltipProvider>
+          <MemoryRouter>
+            <KnowledgeManagePage currentUser={currentUser} />
+          </MemoryRouter>
+        </TooltipProvider>
+      </AppIntlProvider>,
+    );
+
+    expect((await screen.findAllByText('This employee has no knowledge bases')).length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByRole('button', { name: 'Create knowledge base' })).toBeTruthy();
   });
 });

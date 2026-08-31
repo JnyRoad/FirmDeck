@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import base64
+from collections.abc import Mapping
 from datetime import UTC, datetime
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from pydantic import ValidationError as PydanticValidationError
 from sqlmodel import Session, select
 
 from app.api.sessions import (
@@ -12,6 +15,13 @@ from app.api.sessions import (
     _session_details_payload,
 )
 from app.async_jobs import enqueue_async_job
+from app.contracts.domain_http import domain_http_error
+from app.contracts.error_registry import (
+    ERROR_REGISTRY,
+    ErrorContractViolation,
+    ErrorVisibility,
+)
+from app.contracts.errors import ErrorDescriptor
 from app.core import AgentLoop
 from app.db import get_session
 from app.db.models import (
@@ -40,6 +50,12 @@ from app.security.permissions import is_admin_user as _is_admin_user
 from app.security.tenant import ensure_tenant
 from app.session.message_read import message_read
 from app.session.message_visibility import visible_message_content, visible_message_rows
+from app.session.session_kinds import (
+    SESSION_KIND_TEAM_TL,
+    is_team_tl_session,
+    team_conversation_kind,
+    team_tl_session_filter,
+)
 from app.session.session_schema import ChatTurnRequest
 from app.teams import service as team_service
 from app.teams.schema import (
@@ -123,15 +139,109 @@ OVERRIDABLE_STATUSES = {"review", "escalated"}
 AWARD_OVERRIDABLE_STATUSES = {"bidding", "pending"}
 
 
+def _project_team_error(candidate: object) -> dict[str, object]:
+    """Project a stored team error to a validated descriptor and discard diagnostic prose."""
+    code = "INTERNAL_ERROR"
+    params: dict[str, Any] = {}
+    retryable = False
+    request_id: str | None = None
+    trace_id: str | None = None
+    if isinstance(candidate, Mapping):
+        raw_code = candidate.get("code")
+        entry = ERROR_REGISTRY.get(raw_code) if isinstance(raw_code, str) else None
+        if entry is not None and entry.visibility is ErrorVisibility.PUBLIC:
+            code = entry.code
+            raw_params = candidate.get("params")
+            params = dict(raw_params) if isinstance(raw_params, Mapping) else {}
+            raw_retryable = candidate.get("retryable", entry.retryable_default)
+            retryable = raw_retryable if isinstance(raw_retryable, bool) else entry.retryable_default
+            request_id = candidate.get("request_id") if isinstance(candidate.get("request_id"), str) else None
+            trace_id = candidate.get("trace_id") if isinstance(candidate.get("trace_id"), str) else None
+    entry = ERROR_REGISTRY.get(code)
+    if entry is None or entry.visibility is not ErrorVisibility.PUBLIC:
+        return ErrorDescriptor(code="INTERNAL_ERROR", params={}, retryable=False).model_dump(mode="json")
+    descriptor = ErrorDescriptor(
+        code=entry.code,
+        params=params,
+        retryable=retryable,
+        request_id=request_id,
+        trace_id=trace_id,
+    )
+    try:
+        ERROR_REGISTRY.validate(descriptor)
+    except (ErrorContractViolation, PydanticValidationError, TypeError, ValueError):
+        descriptor = ErrorDescriptor(code="INTERNAL_ERROR", params={}, retryable=False)
+    return descriptor.model_dump(mode="json")
+
+
+def _project_team_payload(candidate: object) -> dict[str, Any]:
+    """Recursively sanitize persisted team errors while preserving successful raw content."""
+    if not isinstance(candidate, Mapping):
+        return {}
+    result: dict[str, Any] = {}
+    for key, value in candidate.items():
+        if key in {"error", "error_json", "failure"}:
+            result[str(key)] = _project_team_error(value)
+        elif isinstance(value, Mapping):
+            result[str(key)] = _project_team_payload(value)
+        elif isinstance(value, list):
+            result[str(key)] = [
+                _project_team_payload(item) if isinstance(item, Mapping) else item
+                for item in value
+            ]
+        else:
+            result[str(key)] = value
+    return result
+
+
+def _team_api_error(
+    code: str,
+    status_code: int | None = None,
+    *,
+    params: dict[str, object] | None = None,
+    cause: BaseException | None = None,
+) -> HTTPException:
+    """Build a canonical team API error while keeping raw causes private."""
+    # Workflow: resolve and validate the code at the team boundary; reject unknown
+    # or malformed metadata before handing it to the shared HTTP projection.
+    entry = ERROR_REGISTRY.get(code)
+    safe_params = dict(params or {})
+    if entry is None or entry.visibility is not ErrorVisibility.PUBLIC:
+        entry = ERROR_REGISTRY.require("INTERNAL_ERROR")
+        safe_params = {}
+        safe_status_code = 500
+    else:
+        safe_status_code = status_code
+        try:
+            ERROR_REGISTRY.validate(
+                ErrorDescriptor(
+                    code=entry.code,
+                    params=safe_params,
+                    retryable=entry.retryable_default,
+                )
+            )
+        except (ErrorContractViolation, PydanticValidationError):
+            entry = ERROR_REGISTRY.require("INTERNAL_ERROR")
+            safe_params = {}
+            safe_status_code = 500
+    return domain_http_error(
+        entry.code,
+        source="teams.api",
+        status_code=safe_status_code,
+        params=safe_params,
+        cause=cause,
+    )
+
+
 def _ensure_request_tenant(tenant_id: str, user: User) -> None:
     if user.tenant_id != tenant_id:
-        raise HTTPException(status_code=403, detail="Tenant mismatch")
+        raise _team_api_error("TENANT_MISMATCH", 403)
 
 
 def _ensure_team_manager(team: Team, user: User) -> None:
     """写操作权限:团队创建者(owner)或管理员。"""
     if team.owner_user_id != user.id and not _is_admin_user(user):
-        raise HTTPException(status_code=403, detail="Only team owner or administrator can manage this team")
+        raise _team_api_error("TEAM_MANAGE_FORBIDDEN", 403)
 
 
 def _member_read(db: Session, member) -> TeamMemberRead:
@@ -181,7 +291,7 @@ def _task_read(db: Session, task: TeamTask, *, with_events: bool = False) -> Tea
                 actor_type=row.actor_type,
                 actor_id=row.actor_id,
                 event_type=row.event_type,
-                payload=dict(row.payload_json or {}),
+                payload=_project_team_payload(row.payload_json),
                 created_at=row.created_at,
             )
             for row in rows
@@ -223,8 +333,8 @@ def _task_read(db: Session, task: TeamTask, *, with_events: bool = False) -> Tea
         session_id=task.session_id,
         depends_on_task_ids=list(task.depends_on_task_ids_json or []),
         activation_condition=dict(task.activation_condition_json or {}),
-        report=dict(task.report_json or {}),
-        review=dict(task.review_json or {}),
+        report=_project_team_payload(task.report_json),
+        review=_project_team_payload(task.review_json),
         version=task.version,
         events=events,
         bids=bids,
@@ -236,7 +346,7 @@ def _task_read(db: Session, task: TeamTask, *, with_events: bool = False) -> Tea
 def _get_team_task(db: Session, team: Team, task_id: str) -> TeamTask:
     task = db.get(TeamTask, task_id)
     if task is None or task.team_id != team.id:
-        raise HTTPException(status_code=404, detail="Team task not found")
+        raise _team_api_error("TEAM_TASK_NOT_FOUND", 404)
     return task
 
 
@@ -265,9 +375,19 @@ def create_team_endpoint(
 
 def _knowledge_http_error(exc: KnowledgeError) -> HTTPException:
     """把共享知识库领域错误映射为稳定 HTTP 载荷，不暴露受保护内容。"""
-    return HTTPException(
-        status_code=exc.status_code,
-        detail={"code": exc.code, "message": exc.message, **exc.details},
+    # Workflow: do not forward a domain-owned dynamic code until the team boundary
+    # has confirmed that it is registered and publicly projectable.
+    entry = ERROR_REGISTRY.get(exc.code)
+    if entry is None or entry.visibility is not ErrorVisibility.PUBLIC:
+        entry = ERROR_REGISTRY.require("INTERNAL_ERROR")
+        params: dict[str, object] = {}
+    else:
+        params = dict(exc.to_descriptor().params)
+    return _team_api_error(
+        entry.code,
+        exc.status_code,
+        params=params,
+        cause=exc,
     )
 
 
@@ -279,7 +399,7 @@ def _team_knowledge_binding_read(
     """将绑定、正式版本与当前有效授权合并成管理界面读取模型。"""
     knowledge_base = db.get(KnowledgeBase, binding.knowledge_base_id)
     if knowledge_base is None or knowledge_base.tenant_id != team.tenant_id:
-        raise HTTPException(status_code=404, detail="Knowledge base not found")
+        raise _team_api_error("KNOWLEDGE_BASE_NOT_FOUND", 404)
     version = (
         db.get(KnowledgeBaseVersion, knowledge_base.published_version_id)
         if knowledge_base.published_version_id
@@ -489,14 +609,14 @@ def update_team_endpoint(
     if request.name is not None:
         name = request.name.strip()
         if not name:
-            raise HTTPException(status_code=400, detail="Team name cannot be empty")
+            raise _team_api_error("TEAM_NAME_REQUIRED", 400)
         existing = db.exec(
             select(Team).where(
                 Team.tenant_id == team.tenant_id, Team.name == name, Team.id != team.id
             )
         ).first()
         if existing:
-            raise HTTPException(status_code=409, detail="Team name already exists")
+            raise _team_api_error("TEAM_NAME_CONFLICT", 409)
         team.name = name
     if request.description is not None:
         team.description = request.description
@@ -583,34 +703,35 @@ def tl_chat_endpoint(
     _ensure_request_tenant(request.tenant_id, current_user)
     team = get_team(db, request.tenant_id, team_id)
     if not request.message.strip():
-        raise HTTPException(status_code=400, detail="Message cannot be empty")
+        raise _team_api_error("TEAM_MESSAGE_REQUIRED", 400)
     leader = get_team_leader(db, team.id)
     if leader is None:
-        raise HTTPException(status_code=400, detail="Team has no leader (TL) yet")
+        raise _team_api_error("TEAM_LEADER_REQUIRED", 400)
     tl_agent = db.get(AgentProfile, leader.agent_id)
     if tl_agent is None or tl_agent.tenant_id != team.tenant_id or tl_agent.status != "active":
-        raise HTTPException(status_code=400, detail="Team leader agent is unavailable")
+        raise _team_api_error("TEAM_LEADER_UNAVAILABLE", 400)
     if request.session_id:
         session = db.get(ChatSession, request.session_id)
-        # 同一 Agent 可同时担任多个团队的 TL,必须同时校验 team_id 与「TL 对话」类型,
+        # 同一 Agent 可同时担任多个团队的 TL,必须同时校验 team_id 与 TL 会话类型,
         # 否则会把 A 团队的会话写进 B 团队的上下文(任务/审计串线)
         if (
             session is None
             or session.tenant_id != team.tenant_id
             or session.team_id != team.id
             or session.agent_id != tl_agent.id
-            or "TL 对话" not in (session.title or "")
+            or not is_team_tl_session(session)
         ):
-            raise HTTPException(status_code=404, detail="TL chat session not found")
+            raise _team_api_error("TEAM_CHAT_SESSION_NOT_FOUND", 404)
     else:
         session = ChatSession(
             id=new_id("session"),
             tenant_id=team.tenant_id,
             user_id=current_user.id,
             agent_id=tl_agent.id,
-            title=f"团队 {team.name} · TL 对话",
+            title=team.name,
             status="active",
             team_id=team.id,
+            session_kind=SESSION_KIND_TEAM_TL,
         )
         db.add(session)
         db.commit()
@@ -658,10 +779,10 @@ def tl_session_endpoint(
     team = get_team(db, request.tenant_id, team_id)
     leader = get_team_leader(db, team.id)
     if leader is None:
-        raise HTTPException(status_code=400, detail="Team has no leader (TL) yet")
+        raise _team_api_error("TEAM_LEADER_REQUIRED", 400)
     tl_agent = db.get(AgentProfile, leader.agent_id)
     if tl_agent is None or tl_agent.tenant_id != team.tenant_id or tl_agent.status != "active":
-        raise HTTPException(status_code=400, detail="Team leader agent is unavailable")
+        raise _team_api_error("TEAM_LEADER_UNAVAILABLE", 400)
     # 每个团队只有一个人类群聊。项目领导变更时沿用同一会话并更新承接 Agent，
     # 避免把同一团队拆成多个与普通单聊冲突的会话。
     session = db.exec(
@@ -669,7 +790,7 @@ def tl_session_endpoint(
         .where(
             ChatSession.tenant_id == team.tenant_id,
             ChatSession.team_id == team.id,
-            ChatSession.title.like("%TL 对话%"),
+            team_tl_session_filter(),
         )
         .order_by(ChatSession.created_at)
     ).first()
@@ -679,9 +800,10 @@ def tl_session_endpoint(
             tenant_id=team.tenant_id,
             user_id=current_user.id,
             agent_id=tl_agent.id,
-            title=f"团队 {team.name} · TL 对话",
+            title=team.name,
             status="active",
             team_id=team.id,
+            session_kind=SESSION_KIND_TEAM_TL,
         )
         db.add(session)
         db.commit()
@@ -699,31 +821,18 @@ def tl_session_endpoint(
 
 
 def _conversation_kind(session: ChatSession) -> TeamConversationKind:
-    """会话种类按标题前缀判定,与 wakeup.py / tl_chat 端点的命名约定一一对应(测试锁定):
-
-    「团队任务验收:」-> tl_review、「团队任务:」-> member_task、
-    「团队竞标」(竞标:/竞标打分:/竞标裁决:)-> member_bid、
-    其余(「团队 xx · TL 对话」)-> tl_chat。
-    标题前缀是当前唯一的持久化判据(session 无 kind 列),改命名约定需同步改这里。
-    """
-    title = session.title or ""
-    if title.startswith("团队任务验收:"):
-        return "tl_review"
-    if title.startswith("团队任务:"):
-        return "member_task"
-    if title.startswith("团队竞标"):
-        return "member_bid"
-    return "tl_chat"
+    """Project the stable machine kind, with an exact read-only fallback for legacy rows."""
+    return team_conversation_kind(session)
 
 
 def _tl_conversation_session(db: Session, team: Team) -> ChatSession | None:
-    """已有 TL 对话会话(与 tl/session 端点同判据:「TL 对话」标题,取最早一个)。"""
+    """Return the earliest stable TL session while retaining the exact legacy fallback."""
     return db.exec(
         select(ChatSession)
         .where(
             ChatSession.tenant_id == team.tenant_id,
             ChatSession.team_id == team.id,
-            ChatSession.title.like("%TL 对话%"),
+            team_tl_session_filter(),
         )
         .order_by(ChatSession.created_at)
     ).first()
@@ -839,7 +948,7 @@ def list_team_conversation_messages(
     team = get_team(db, tenant_id, team_id)
     session = db.get(ChatSession, session_id)
     if session is None or session.tenant_id != tenant_id or session.team_id != team.id:
-        raise HTTPException(status_code=404, detail="Team conversation not found")
+        raise _team_api_error("TEAM_CONVERSATION_NOT_FOUND", 404)
     rows = db.exec(
         select(Message).where(Message.session_id == session.id).order_by(Message.created_at)
     ).all()
@@ -881,7 +990,7 @@ def get_team_conversation_stream(
     team = get_team(db, tenant_id, team_id)
     session = db.get(ChatSession, session_id)
     if session is None or session.tenant_id != tenant_id or session.team_id != team.id:
-        raise HTTPException(status_code=404, detail="Team conversation not found")
+        raise _team_api_error("TEAM_CONVERSATION_NOT_FOUND", 404)
 
     rows = list(
         reversed(
@@ -966,12 +1075,12 @@ def create_team_task_endpoint(
     _ensure_team_manager(team, current_user)
     title = request.title.strip()
     if not title:
-        raise HTTPException(status_code=400, detail="Task title cannot be empty")
+        raise _team_api_error("TEAM_TASK_TITLE_REQUIRED", 400)
     assignee = (request.assignee_agent_id or "").strip()
     if assignee:
         member_ids = {item.agent_id for item in list_team_members(db, team.id)}
         if assignee not in member_ids:
-            raise HTTPException(status_code=404, detail="Agent is not a team member")
+            raise _team_api_error("TEAM_AGENT_NOT_MEMBER", 404)
     task = TeamTask(
         team_id=team.id,
         tenant_id=team.tenant_id,
@@ -1112,7 +1221,7 @@ def list_team_events(
             actor_type=row.actor_type,
             actor_id=row.actor_id,
             event_type=row.event_type,
-            payload=dict(row.payload_json or {}),
+            payload=_project_team_payload(row.payload_json),
             created_at=row.created_at,
         )
         for row in rows
@@ -1131,7 +1240,7 @@ def list_team_tasks(
     _ensure_request_tenant(tenant_id, current_user)
     team = get_team(db, tenant_id, team_id)
     if status is not None and status not in team_service.TASK_STATUSES:
-        raise HTTPException(status_code=400, detail=f"Unknown task status: {status}")
+        raise _team_api_error("TEAM_TASK_STATUS_INVALID", 400)
     statement = select(TeamTask).where(TeamTask.team_id == team.id)
     if status is not None:
         statement = statement.where(TeamTask.status == status)
@@ -1168,13 +1277,10 @@ def override_task_award(
     _ensure_team_manager(team, current_user)
     task = _get_team_task(db, team, task_id)
     if task.status not in AWARD_OVERRIDABLE_STATUSES:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Task in status {task.status} cannot be award-overridden",
-        )
+        raise _team_api_error("TEAM_TASK_AWARD_OVERRIDE_FORBIDDEN", 409)
     member_ids = {item.agent_id for item in list_team_members(db, team.id)}
     if request.agent_id not in member_ids:
-        raise HTTPException(status_code=404, detail="Agent is not a team member")
+        raise _team_api_error("TEAM_AGENT_NOT_MEMBER", 404)
     previous = task.assignee_agent_id
     task.assignee_agent_id = request.agent_id
     apply_task_transition(
@@ -1220,10 +1326,7 @@ def override_task_review(
     _ensure_team_manager(team, current_user)
     task = _get_team_task(db, team, task_id)
     if task.status not in OVERRIDABLE_STATUSES:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Task in status {task.status} cannot be overridden",
-        )
+        raise _team_api_error("TEAM_TASK_REVIEW_OVERRIDE_FORBIDDEN", 409)
     target = VERDICT_TARGET_STATUS[request.verdict]
     payload = {"verdict": request.verdict, "comment": request.comment or "", "override": True}
     if target in team_service.TASK_TRANSITIONS.get(task.status, set()) or target == task.status:
@@ -1294,12 +1397,12 @@ def resume_team_task(
         _ensure_team_manager(team, current_user)
     answer = request.answer.strip()
     if not answer:
-        raise HTTPException(status_code=400, detail="Answer is required")
+        raise _team_api_error("TEAM_TASK_ANSWER_REQUIRED", 400)
     report = dict(task.report_json or {})
     if task.status != "escalated" or not report.get("needs_input"):
-        raise HTTPException(status_code=409, detail="Task is not waiting for user input")
+        raise _team_api_error("TEAM_TASK_INPUT_NOT_REQUESTED", 409)
     if not task.assignee_agent_id:
-        raise HTTPException(status_code=409, detail="Task has no assigned member")
+        raise _team_api_error("TEAM_TASK_ASSIGNEE_REQUIRED", 409)
 
     now = utc_now()
     previous = task.status
@@ -1350,7 +1453,7 @@ def _blackboard_entry_read(entry: TeamBlackboardEntry) -> TeamBlackboardEntryRea
         source_type=entry.source_type,
         source_agent_id=entry.source_agent_id,
         source_task_id=entry.source_task_id,
-        citation=dict(entry.citation_json or {}),
+        citation=_project_team_payload(entry.citation_json),
         status=entry.status,
         pinned=entry.pinned,
         created_at=entry.created_at,
@@ -1361,7 +1464,7 @@ def _blackboard_entry_read(entry: TeamBlackboardEntry) -> TeamBlackboardEntryRea
 def _get_blackboard_entry(db: Session, team: Team, entry_id: str) -> TeamBlackboardEntry:
     entry = db.get(TeamBlackboardEntry, entry_id)
     if entry is None or entry.team_id != team.id:
-        raise HTTPException(status_code=404, detail="Blackboard entry not found")
+        raise _team_api_error("TEAM_BLACKBOARD_ENTRY_NOT_FOUND", 404)
     return entry
 
 
@@ -1377,7 +1480,7 @@ def list_blackboard_entries(
     _ensure_request_tenant(tenant_id, current_user)
     team = get_team(db, tenant_id, team_id)
     if status not in team_service.BLACKBOARD_STATUSES:
-        raise HTTPException(status_code=400, detail=f"Unknown blackboard status: {status}")
+        raise _team_api_error("TEAM_BLACKBOARD_STATUS_INVALID", 400)
     rows = db.exec(
         select(TeamBlackboardEntry)
         .where(TeamBlackboardEntry.team_id == team.id, TeamBlackboardEntry.status == status)
@@ -1429,7 +1532,7 @@ def update_blackboard_entry(
     if request.content is not None:
         content = normalize_blackboard_content(request.content)
         if not content:
-            raise HTTPException(status_code=400, detail="Blackboard content cannot be empty")
+            raise _team_api_error("TEAM_BLACKBOARD_CONTENT_REQUIRED", 400)
         entry.content = content
     if request.tags is not None:
         entry.tags_json = normalize_blackboard_tags(request.tags)
@@ -1505,15 +1608,9 @@ def promote_blackboard_entry(
     if entry.source_task_id:
         source_task = db.get(TeamTask, entry.source_task_id)
         source_task_title = source_task.title if source_task else ""
-    # 内容 + tags 拼成一段 markdown,标注来源团队/任务
-    lines = [f"# 团队黑板沉淀 · {team.name}", ""]
-    lines.append(f"> 来源团队:{team.name}(team_id={team.id})")
-    if entry.source_task_id:
-        lines.append(f"> 来源任务:{source_task_title or entry.source_task_id}(task_id={entry.source_task_id})")
-    if entry.tags_json:
-        lines.append(f"> 标签:{', '.join(str(tag) for tag in entry.tags_json)}")
-    lines.extend(["", entry.content, ""])
-    markdown = "\n".join(lines)
+    # 知识正文仅保留黑板的原始业务内容；来源和标签进入机器元数据，
+    # 避免把某一语言的产品包装持久化为用户知识。
+    markdown = entry.content
     filename = f"team-blackboard-{entry.id}.md"
     job = service.create_ingest_job(
         IngestPayload(
@@ -1522,11 +1619,15 @@ def promote_blackboard_entry(
             knowledge_base_version_id=knowledge_base.published_version_id,
             filename=filename,
             content_base64=base64.b64encode(markdown.encode("utf-8")).decode("ascii"),
-            title=f"团队黑板:{entry.content[:30]}",
+            title=entry.content[:30],
             metadata={
                 "source": "team_blackboard",
                 "team_id": team.id,
+                "team_name": team.name,
                 "blackboard_entry_id": entry.id,
+                "source_task_id": entry.source_task_id,
+                "source_task_title": source_task_title or None,
+                "tags": list(entry.tags_json or []),
             },
         )
     )
@@ -1577,7 +1678,7 @@ def list_team_threads(
                     ChatSession.tenant_id == tenant_id,
                     ChatSession.team_id == team.id,
                     ChatSession.agent_id == leader.agent_id,
-                    ChatSession.title.like("%TL 对话%"),
+                    team_tl_session_filter(),
                 )
             ).all()
             for session in tl_sessions:
@@ -1587,7 +1688,7 @@ def list_team_threads(
                         team_name=team.name,
                         kind="tl_chat",
                         session_id=session.id,
-                        title=session.title or f"团队 {team.name} · TL 对话",
+                        title=session.title or team.name,
                         updated_at=session.updated_at,
                     )
                 )

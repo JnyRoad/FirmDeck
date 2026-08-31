@@ -170,9 +170,10 @@ def test_team_binding_inbound_routes_to_tl() -> None:
 
     with Session(engine) as db:
         chat_session = db.get(ChatSession, request.session_id)
-        # 会话落 team_id 且标题命中 TL 对话识别三条件之一
+        # 会话落 team_id 与稳定机器类型，标题仅保留原始业务名称。
         assert chat_session.team_id == team_id
-        assert chat_session.title == "团队 增长团队 · TL 对话"
+        assert chat_session.session_kind == "team_tl"
+        assert chat_session.title == "增长团队"
         assert chat_session.channel_binding_id == binding_id
 
 
@@ -202,7 +203,8 @@ def test_team_binding_follows_leader_change() -> None:
         new_session = db.get(ChatSession, request.session_id)
         assert new_session.team_id == team_id
         assert new_session.agent_id == "agent_worker2"
-        assert "TL 对话" in (new_session.title or "")
+        assert new_session.session_kind == "team_tl"
+        assert new_session.title == "增长团队"
 
 
 def test_team_binding_tl_reply_creates_tasks(monkeypatch) -> None:
@@ -399,7 +401,7 @@ def test_create_team_binding_requires_leader() -> None:
         headers=_auth(users["admin"]),
     )
     assert response.status_code == 400
-    assert "TL" in response.json()["detail"]
+    assert response.json()["detail"]["code"] == "CHANNEL_BAD_REQUEST"
 
 
 def test_create_team_binding_rejects_cross_tenant_team() -> None:
@@ -451,7 +453,7 @@ def test_update_team_binding_rejects_agents_replacement() -> None:
         headers=_auth(users["admin"]),
     )
     assert response.status_code == 400
-    assert "团队绑定" in response.json()["detail"]
+    assert response.json()["detail"]["code"] == "CHANNEL_BAD_REQUEST"
 
 
 # ---------- SQLite 迁移 ----------

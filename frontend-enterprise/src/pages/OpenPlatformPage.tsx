@@ -7,6 +7,9 @@ import {
 } from '../icons';
 import { notify } from '@/components/ui';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
+import { RawContent } from '@/i18n/RawContent';
+import { useAppIntl } from '@/i18n/useAppIntl';
+import { apiErrorMessage } from '@/lib/apiErrorMessages';
 import type { ComponentType, ReactNode, SVGProps } from 'react';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
@@ -39,7 +42,6 @@ import {
   PlatformKindDetailView,
   PlatformResourceCard,
   PlatformResourceDrawer,
-  PlatformTabBar,
   type PlatformKind,
   type PlatformResourceAccent,
   type PlatformStat,
@@ -56,9 +58,12 @@ type PlatformConfig = {
   detail: string;
   useLabel: string;
   metricLabel: string;
+  searchPlaceholder: string;
   signals: string[];
   icon: ReactNode;
 };
+
+type PlatformCopyEntry = Omit<PlatformConfig, 'kind' | 'icon'>;
 
 type PlatformItem = {
   id: string;
@@ -70,60 +75,260 @@ type PlatformItem = {
   agent?: AgentProfileRead;
 };
 
-const PLATFORM_CONFIGS: PlatformConfig[] = [
-  {
-    kind: 'agents',
-    title: '数字员工广场',
-    subtitle: '已发布到广场，可在对话端直接使用。',
-    detail: '选择一个数字员工查看能力、岗位和服务范围。',
-    useLabel: '使用此员工',
-    metricLabel: '数字员工',
-    signals: ['聊天可用', '支持对话', '查看能力'],
-    icon: <UsergroupAddOutlined />,
-  },
-  {
-    kind: 'knowledge',
-    title: '知识库广场',
-    subtitle: '发布到广场的知识库，可复制到你的数字员工。',
-    detail: '从广场复制到当前数字员工的知识库。',
-    useLabel: '复制到知识库',
-    metricLabel: '知识库',
-    signals: ['知识图谱', '引用来源', '可复制'],
-    icon: <FileSearchOutlined />,
-  },
-  {
-    kind: 'general-skills',
-    title: '技能广场',
-    subtitle: '浏览器、MCP、查询工具等可复用能力。',
-    detail: '从广场复制到当前数字员工的技能。',
-    useLabel: '复制到技能',
-    metricLabel: '技能',
-    signals: ['运行测试', 'MCP/浏览器', '能力复用'],
-    icon: <SolutionOutlined />,
-  },
-  {
-    kind: 'skills',
-    title: 'SOP 广场',
-    subtitle: '可复制和复用的业务流程与执行规范。',
-    detail: '从广场复制到当前数字员工的 SOP。',
-    useLabel: '复制到 SOP',
-    metricLabel: '业务 SOP',
-    signals: ['流程推进', '执行规范', '可复制'],
-    icon: <ProfileOutlined />,
-  },
-  {
-    kind: 'tools',
-    title: '工具广场',
-    subtitle: '可开放给员工调用和测试的工具能力。',
-    detail: '前往工具页按现有流程配置和测试工具。',
-    useLabel: '前往工具页',
-    metricLabel: '工具能力',
-    signals: ['调用权限', '测试可用', '工具配置'],
-    icon: <ToolOutlined />,
-  },
-];
+/** 构造开放广场页的语义文案与平台配置，避免 file-local locale copy 常量继续扩散。 */
+function buildOpenPlatformCopy(
+  translate: ReturnType<typeof useAppIntl>['t'],
+): {
+  pageTitle: string;
+  tabsLabel: string;
+  countEmployees: string;
+  countContent: string;
+  statKnowledge: string;
+  statSkill: string;
+  statSop: string;
+  searchEmpty: string;
+  empty: string;
+  emptyHint: string;
+  searchEmptyHint: string;
+  loadFailed: string;
+  selectEmployeeFirst: string;
+  noAgent: string;
+  useAgentFailed: string;
+  unpublishSuccess: string;
+  removeSuccess: string;
+  unpublishFailed: string;
+  deleteFailed: string;
+  missingOverall: string;
+  createOpenSkill: string;
+  backToMarketplace: string;
+  refresh: string;
+  searchPrefix: string;
+  statsSuffix: string;
+  previousItem: string;
+  nextItem: string;
+  previousEmployee: string;
+  nextEmployee: string;
+  close: string;
+  category: string;
+  roleLabel: string;
+  descriptionLabel: string;
+  deleteAction: string;
+  useEmployee: string;
+  confirmCancel: string;
+  confirmDelete: string;
+  confirmUnpublish: string;
+  confirmUnpublishDescription: string;
+  confirmDeleteDescription: string;
+  statusOnline: string;
+  statusOffline: string;
+  unpublish: string;
+  agentDescriptionFallback: string;
+  knowledgeDescriptionFallback: string;
+  generalSkillDescriptionFallback: string;
+  sopDescriptionFallback: string;
+  toolDescriptionFallback: string;
+  documents: string;
+  buckets: string;
+  citations: string;
+  plazaVersion: string;
+  externalCapability: string;
+  builtInCapability: string;
+  enabled: string;
+  disabled: string;
+  businessProcess: string;
+  callsSuffix: string;
+  toolBucketFallback: string;
+  agentSearch: string;
+  knowledgeSearch: string;
+  generalSkillSearch: string;
+  sopSearch: string;
+  toolSearch: string;
+  platforms: Record<PlatformKind, PlatformCopyEntry>;
+} {
+  return {
+    pageTitle: translate('openPlatformPage.pageTitle'),
+    tabsLabel: translate('openPlatformPage.tabsLabel'),
+    countEmployees: translate('openPlatformPage.count.employees'),
+    countContent: translate('openPlatformPage.count.content'),
+    statKnowledge: translate('openPlatformPage.stats.knowledge'),
+    statSkill: translate('openPlatformPage.stats.skill'),
+    statSop: translate('openPlatformPage.stats.sop'),
+    searchEmpty: translate('openPlatformPage.empty.searchTitle'),
+    empty: translate('openPlatformPage.empty.defaultTitle'),
+    emptyHint: translate('openPlatformPage.empty.defaultHint'),
+    searchEmptyHint: translate('openPlatformPage.empty.searchHint'),
+    loadFailed: translate('openPlatformPage.error.loadFailed'),
+    selectEmployeeFirst: translate('openPlatformPage.error.selectEmployeeFirst'),
+    noAgent: translate('openPlatformPage.error.noAgent'),
+    useAgentFailed: translate('openPlatformPage.error.useAgentFailed'),
+    unpublishSuccess: translate('openPlatformPage.toast.unpublishSuccess'),
+    removeSuccess: translate('openPlatformPage.toast.removeSuccess'),
+    unpublishFailed: translate('openPlatformPage.error.unpublishFailed'),
+    deleteFailed: translate('openPlatformPage.error.deleteFailed'),
+    missingOverall: translate('openPlatformPage.error.missingOverall'),
+    createOpenSkill: translate('openPlatformPage.actions.createOpenSkill'),
+    backToMarketplace: translate('openPlatformPage.actions.back'),
+    refresh: translate('openPlatformPage.actions.refresh'),
+    searchPrefix: translate('openPlatformPage.copy.searchPrefix'),
+    statsSuffix: translate('openPlatformPage.copy.statsSuffix'),
+    previousItem: translate('openPlatformPage.drawer.previousItem'),
+    nextItem: translate('openPlatformPage.drawer.nextItem'),
+    previousEmployee: translate('openPlatformPage.drawer.previousEmployee'),
+    nextEmployee: translate('openPlatformPage.drawer.nextEmployee'),
+    close: translate('openPlatformPage.actions.close'),
+    category: translate('openPlatformPage.labels.category'),
+    roleLabel: translate('openPlatformPage.labels.role'),
+    descriptionLabel: translate('openPlatformPage.labels.description'),
+    deleteAction: translate('openPlatformPage.actions.delete'),
+    useEmployee: translate('openPlatformPage.actions.useEmployee'),
+    confirmCancel: translate('openPlatformPage.confirm.cancel'),
+    confirmDelete: translate('openPlatformPage.confirm.delete'),
+    confirmUnpublish: translate('openPlatformPage.confirm.unpublish'),
+    confirmUnpublishDescription: translate('openPlatformPage.confirm.unpublishDescription'),
+    confirmDeleteDescription: translate('openPlatformPage.confirm.deleteDescription'),
+    statusOnline: translate('openPlatformPage.status.online'),
+    statusOffline: translate('openPlatformPage.status.offline'),
+    unpublish: translate('openPlatformPage.actions.unpublish'),
+    agentDescriptionFallback: translate('openPlatformPage.fallback.agentDescription'),
+    knowledgeDescriptionFallback: translate('openPlatformPage.fallback.knowledgeDescription'),
+    generalSkillDescriptionFallback: translate('openPlatformPage.fallback.generalSkillDescription'),
+    sopDescriptionFallback: translate('openPlatformPage.fallback.sopDescription'),
+    toolDescriptionFallback: translate('openPlatformPage.fallback.toolDescription'),
+    documents: translate('openPlatformPage.metrics.documents'),
+    buckets: translate('openPlatformPage.metrics.buckets'),
+    citations: translate('openPlatformPage.metrics.citations'),
+    plazaVersion: translate('openPlatformPage.metrics.marketplaceVersion'),
+    externalCapability: translate('openPlatformPage.metrics.externalCapability'),
+    builtInCapability: translate('openPlatformPage.metrics.builtInCapability'),
+    enabled: translate('openPlatformPage.status.enabled'),
+    disabled: translate('openPlatformPage.status.disabled'),
+    businessProcess: translate('openPlatformPage.metrics.businessProcess'),
+    callsSuffix: translate('openPlatformPage.metrics.callsSuffix'),
+    toolBucketFallback: translate('openPlatformPage.metrics.toolBucketFallback'),
+    agentSearch: translate('openPlatformPage.search.agent'),
+    knowledgeSearch: translate('openPlatformPage.search.knowledge'),
+    generalSkillSearch: translate('openPlatformPage.search.generalSkill'),
+    sopSearch: translate('openPlatformPage.search.sop'),
+    toolSearch: translate('openPlatformPage.search.tool'),
+    platforms: {
+      agents: {
+        title: translate('openPlatformPage.platform.agents.title'),
+        subtitle: translate('openPlatformPage.platform.agents.subtitle'),
+        detail: translate('openPlatformPage.platform.agents.detail'),
+        useLabel: translate('openPlatformPage.platform.agents.useLabel'),
+        metricLabel: translate('openPlatformPage.platform.agents.metricLabel'),
+        searchPlaceholder: translate('openPlatformPage.platform.agents.searchPlaceholder'),
+        signals: [
+          translate('openPlatformPage.platform.agents.signal.chatReady'),
+          translate('openPlatformPage.platform.agents.signal.conversationEnabled'),
+          translate('openPlatformPage.platform.agents.signal.viewCapabilities'),
+        ],
+      },
+      knowledge: {
+        title: translate('openPlatformPage.platform.knowledge.title'),
+        subtitle: translate('openPlatformPage.platform.knowledge.subtitle'),
+        detail: translate('openPlatformPage.platform.knowledge.detail'),
+        useLabel: translate('openPlatformPage.platform.knowledge.useLabel'),
+        metricLabel: translate('openPlatformPage.platform.knowledge.metricLabel'),
+        searchPlaceholder: translate('openPlatformPage.platform.knowledge.searchPlaceholder'),
+        signals: [
+          translate('openPlatformPage.platform.knowledge.signal.graph'),
+          translate('openPlatformPage.platform.knowledge.signal.citations'),
+          translate('openPlatformPage.platform.knowledge.signal.copyable'),
+        ],
+      },
+      'general-skills': {
+        title: translate('openPlatformPage.platform.generalSkills.title'),
+        subtitle: translate('openPlatformPage.platform.generalSkills.subtitle'),
+        detail: translate('openPlatformPage.platform.generalSkills.detail'),
+        useLabel: translate('openPlatformPage.platform.generalSkills.useLabel'),
+        metricLabel: translate('openPlatformPage.platform.generalSkills.metricLabel'),
+        searchPlaceholder: translate('openPlatformPage.platform.generalSkills.searchPlaceholder'),
+        signals: [
+          translate('openPlatformPage.platform.generalSkills.signal.runtimeTested'),
+          translate('openPlatformPage.platform.generalSkills.signal.mcpBrowser'),
+          translate('openPlatformPage.platform.generalSkills.signal.reusableCapability'),
+        ],
+      },
+      skills: {
+        title: translate('openPlatformPage.platform.skills.title'),
+        subtitle: translate('openPlatformPage.platform.skills.subtitle'),
+        detail: translate('openPlatformPage.platform.skills.detail'),
+        useLabel: translate('openPlatformPage.platform.skills.useLabel'),
+        metricLabel: translate('openPlatformPage.platform.skills.metricLabel'),
+        searchPlaceholder: translate('openPlatformPage.platform.skills.searchPlaceholder'),
+        signals: [
+          translate('openPlatformPage.platform.skills.signal.workflowProgression'),
+          translate('openPlatformPage.platform.skills.signal.executionRules'),
+          translate('openPlatformPage.platform.skills.signal.copyable'),
+        ],
+      },
+      tools: {
+        title: translate('openPlatformPage.platform.tools.title'),
+        subtitle: translate('openPlatformPage.platform.tools.subtitle'),
+        detail: translate('openPlatformPage.platform.tools.detail'),
+        useLabel: translate('openPlatformPage.platform.tools.useLabel'),
+        metricLabel: translate('openPlatformPage.platform.tools.metricLabel'),
+        searchPlaceholder: translate('openPlatformPage.platform.tools.searchPlaceholder'),
+        signals: [
+          translate('openPlatformPage.platform.tools.signal.invocationPermissions'),
+          translate('openPlatformPage.platform.tools.signal.testable'),
+          translate('openPlatformPage.platform.tools.signal.configuration'),
+        ],
+      },
+    },
+  };
+}
 
-const PLATFORM_BY_KIND = new Map(PLATFORM_CONFIGS.map((item) => [item.kind, item]));
+type OpenPlatformCopy = ReturnType<typeof buildOpenPlatformCopy>;
+
+/** 用 ReactNode 生成确认框标题，保持 raw 名称独立边界而不拼进 catalog 文案。 */
+function renderConfirmTitle(prefix: string, name: string, suffix = '？'): ReactNode {
+  return (
+    <>
+      {prefix}
+      <RawContent value={name} />
+      {suffix}
+    </>
+  );
+}
+
+/** 返回开放广场页的本地语义文案；catalog 解锁前先以内嵌稳定键维护。 */
+function useOpenPlatformCopy(): OpenPlatformCopy {
+  const { t } = useAppIntl();
+  return buildOpenPlatformCopy(t);
+}
+
+/** 构造当前 locale 的平台分类配置，避免类别标题和说明固定在中文。 */
+function platformConfigs(copy: OpenPlatformCopy): PlatformConfig[] {
+  return [
+    {
+      kind: 'agents',
+      ...copy.platforms.agents,
+      icon: <UsergroupAddOutlined />,
+    },
+    {
+      kind: 'knowledge',
+      ...copy.platforms.knowledge,
+      icon: <FileSearchOutlined />,
+    },
+    {
+      kind: 'general-skills',
+      ...copy.platforms['general-skills'],
+      icon: <SolutionOutlined />,
+    },
+    {
+      kind: 'skills',
+      ...copy.platforms.skills,
+      icon: <ProfileOutlined />,
+    },
+    {
+      kind: 'tools',
+      ...copy.platforms.tools,
+      icon: <ToolOutlined />,
+    },
+  ];
+}
 
 // SD1 line glyph shown in each column header, matching the sidebar mapping.
 const PLATFORM_ICON: Record<PlatformKind, ComponentType<SVGProps<SVGSVGElement>>> = {
@@ -150,17 +355,24 @@ const PLATFORM_ACCENT: Partial<Record<PlatformKind, PlatformResourceAccent>> = {
   tools: 'orange',
 };
 
-// Unit rendered after the header count, e.g. "12 员工" / "12 内容".
-function platformCountLabel(kind: PlatformKind): string {
-  return kind === 'agents' ? '员工' : '内容';
+const LEGACY_UNBUCKETED_TOOL_BUCKET = '未分桶';
+
+/** 生成当前分类下的计数单位，避免固定中文后缀。 */
+function platformCountLabel(kind: PlatformKind, copy: OpenPlatformCopy): string {
+  return kind === 'agents' ? copy.countEmployees : copy.countContent;
 }
 
-// Bottom metric segments for a 数字员工广场 card.
-function employeeStats(agent: AgentProfileRead): PlatformStat[] {
+/** 精确归一化旧版空分桶标记；真实业务分桶名称继续原样展示。 */
+function platformToolBucketLabel(bucket: string | undefined, copy: OpenPlatformCopy): string {
+  return !bucket || bucket === LEGACY_UNBUCKETED_TOOL_BUCKET ? copy.toolBucketFallback : bucket;
+}
+
+/** 为员工广场卡片生成统计项，保证标签跟随当前 locale。 */
+function employeeStats(agent: AgentProfileRead, copy: OpenPlatformCopy): PlatformStat[] {
   return [
-    { value: agentResourceCount(agent, 'knowledge_base'), label: '资料' },
-    { value: agentResourceCount(agent, 'general_skill'), label: '技能' },
-    { value: agentResourceCount(agent, 'skill'), label: 'SOP' },
+    { value: agentResourceCount(agent, 'knowledge_base'), label: copy.statKnowledge },
+    { value: agentResourceCount(agent, 'general_skill'), label: copy.statSkill },
+    { value: agentResourceCount(agent, 'skill'), label: copy.statSop },
   ];
 }
 
@@ -180,6 +392,57 @@ function filterPlatformItems(items: PlatformItem[], keyword: string): PlatformIt
     .some((value) => value.toLowerCase().includes(trimmed)));
 }
 
+/** 把未知异常折叠为安全语义错误，避免把原始 Error.message 暴露为最终 UI。 */
+function platformErrorMessage(error: unknown, fallback: string): string {
+  const message = apiErrorMessage(error, 'common.error.generic');
+  return message === '发生错误，请稍后重试' || message === 'Something went wrong. Please try again later.'
+    ? fallback
+    : message;
+}
+
+/** 页面内自绘 tablist，提供稳定的 aria-label 和不含计数的 tab accessible name。 */
+function OpenPlatformTabList({
+  items,
+  activeKind,
+  ariaLabel,
+  onChange,
+}: {
+  items: PlatformTabItem[];
+  activeKind: PlatformKind;
+  ariaLabel: string;
+  onChange: (kind: PlatformKind) => void;
+}) {
+  return (
+    <div
+      role="tablist"
+      aria-label={ariaLabel}
+      className="inline-flex max-w-full flex-nowrap items-center gap-[2px] overflow-x-auto rounded-[14px] bg-[#f1f2f4] p-[4px] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+    >
+      {items.map((item) => {
+        const isActive = item.kind === activeKind;
+        return (
+          <button
+            key={item.kind}
+            type="button"
+            role="tab"
+            aria-selected={isActive}
+            aria-label={item.label}
+            onClick={() => onChange(item.kind)}
+            className={[
+              'inline-flex shrink-0 items-center gap-[6px] whitespace-nowrap rounded-[11px] px-[16px] py-[9px] text-[13px] font-medium text-[#757f9c] transition-colors max-2xl:px-[12px] max-2xl:text-[12px]',
+              isActive ? 'bg-white shadow-[0_1px_6px_rgba(15,23,42,0.10)] text-[#18181a]' : '',
+            ].join(' ')}
+          >
+            <span className="flex size-[14px] shrink-0 items-center justify-center" aria-hidden="true">{item.icon}</span>
+            <span>{item.label}</span>
+            <span aria-hidden="true" className="text-[10.5px] font-normal text-[#98a2b3]">{item.count}</span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
 export default function OpenPlatformPage({
   currentUser,
   isAdmin = false,
@@ -189,9 +452,16 @@ export default function OpenPlatformPage({
   isAdmin?: boolean;
   onLogout?: () => void;
 }) {
+  const { locale } = useAppIntl();
+  const copy = useOpenPlatformCopy();
   const navigate = useNavigate();
   const { kind } = useParams<{ kind?: PlatformKind }>();
-  const selectedKind = kind && PLATFORM_BY_KIND.has(kind) ? kind : undefined;
+  const platformConfigList = useMemo(() => platformConfigs(copy), [copy]);
+  const platformByKind = useMemo(
+    () => new Map(platformConfigList.map((item) => [item.kind, item])),
+    [platformConfigList],
+  );
+  const selectedKind = kind && platformByKind.has(kind) ? kind : undefined;
   const [agents, setAgents] = useState<AgentProfileRead[]>([]);
   const [knowledgeBases, setKnowledgeBases] = useState<KnowledgeBaseRead[]>([]);
   const [generalSkills, setGeneralSkills] = useState<GeneralSkillRead[]>([]);
@@ -234,11 +504,11 @@ export default function OpenPlatformPage({
       setSkills(skillRows);
       setTools(toolRows);
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '加载开放广场失败');
+      notify.error(platformErrorMessage(error, copy.loadFailed));
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [copy.loadFailed]);
 
   useEffect(() => {
     void loadPlatformData();
@@ -262,12 +532,12 @@ export default function OpenPlatformPage({
         id: item.id,
         deleteKey: item.id,
         title: employeeDisplayNameWithCreator(item),
-        description: item.description || '广场开放的数字员工。',
+        description: item.description || copy.agentDescriptionFallback,
         meta: profile.roleName,
         tags: [
-          item.status === 'active' ? '在线' : '下线',
+          item.status === 'active' ? copy.statusOnline : copy.statusOffline,
           `SOP ${agentResourceCount(item, 'skill')}`,
-          `技能 ${agentResourceCount(item, 'general_skill')}`,
+          `${copy.statSkill} ${agentResourceCount(item, 'general_skill')}`,
         ],
         agent: item,
       };
@@ -278,9 +548,9 @@ export default function OpenPlatformPage({
         id: item.id,
         deleteKey: item.id,
         title: resourceDisplayNameWithCreator(item.name, item),
-        description: item.description || '广场沉淀的知识库。',
-        meta: `${item.document_count} 文档 / ${item.bucket_count} 目录 / ${item.chunk_count} 引用`,
-        tags: [item.version || 'v1.0.0', item.branch_sync_state || '广场版'],
+        description: item.description || copy.knowledgeDescriptionFallback,
+        meta: `${item.document_count} ${copy.documents} / ${item.bucket_count} ${copy.buckets} / ${item.chunk_count} ${copy.citations}`,
+        tags: [item.version || 'v1.0.0', item.branch_sync_state || copy.plazaVersion],
       })),
     'general-skills': generalSkills
       .filter((item) => item.status === 'published')
@@ -288,9 +558,9 @@ export default function OpenPlatformPage({
         id: item.id,
         deleteKey: item.slug,
         title: resourceDisplayNameWithCreator(item.name, item),
-        description: item.description || '可复制到当前数字员工的技能。',
+        description: item.description || copy.generalSkillDescriptionFallback,
         meta: item.slug,
-        tags: [item.homepage ? '外部能力' : '内置能力', '已启用'],
+        tags: [item.homepage ? copy.externalCapability : copy.builtInCapability, copy.enabled],
       })),
     skills: skills
       .filter((item) => item.status === 'published')
@@ -298,9 +568,9 @@ export default function OpenPlatformPage({
         id: item.id,
         deleteKey: item.skill_id,
         title: resourceDisplayNameWithCreator(item.name, item),
-        description: item.description || '可复制和复用的业务 SOP。',
+        description: item.description || copy.sopDescriptionFallback,
         meta: `${item.skill_id} / ${item.version}`,
-        tags: [item.business_domain || '业务流程', `${item.total_call_count || item.call_count || 0} 次调用`],
+        tags: [item.business_domain || copy.businessProcess, `${item.total_call_count || item.call_count || 0} ${copy.callsSuffix}`],
       })),
     tools: tools
       .filter((item) => item.enabled)
@@ -308,20 +578,20 @@ export default function OpenPlatformPage({
         id: item.id,
         deleteKey: item.id,
         title: resourceDisplayNameWithCreator(item.display_name || item.name, item),
-        description: item.description || '可配置到员工工具的工具。',
-        meta: `${item.bucket || '工具'} / ${item.tool_type.toUpperCase()}`,
-        tags: [item.method, item.enabled ? '已启用' : '已停用'],
+        description: item.description || copy.toolDescriptionFallback,
+        meta: `${platformToolBucketLabel(item.bucket, copy)} / ${item.tool_type.toUpperCase()}`,
+        tags: [item.method, item.enabled ? copy.enabled : copy.disabled],
       })),
-  }), [generalSkills, knowledgeBases, skills, tools, visibleAgents]);
+  }), [copy, generalSkills, knowledgeBases, skills, tools, visibleAgents]);
 
-  const platformStats = PLATFORM_CONFIGS.map((config) => ({
+  const platformStats = platformConfigList.map((config) => ({
     ...config,
     count: platformItems[config.kind].length,
   }));
 
   function ensureTargetEmployee(): boolean {
     if (!targetEmployee) {
-      notify.warning('请先选择一个员工，再从广场复制资源。');
+      notify.warning(copy.selectEmployeeFirst);
       return false;
     }
     if (targetEmployee.id !== agentId) {
@@ -359,14 +629,14 @@ export default function OpenPlatformPage({
     if (platformKind === 'agents') {
       const agent = visibleAgents.find((item) => item.id === itemId) || visibleAgents[0];
       if (!agent) {
-        notify.warning('广场暂无可用数字员工');
+        notify.warning(copy.noAgent);
         return;
       }
       try {
         await markPlatformAgentUsed(agent);
         navigate('/enterprise/dashboard');
       } catch (error) {
-        notify.error(error instanceof Error ? error.message : '使用数字员工失败');
+        notify.error(platformErrorMessage(error, copy.useAgentFailed));
       }
       return;
     }
@@ -407,18 +677,14 @@ export default function OpenPlatformPage({
       } else {
         await api.delete(platformDeleteUrl(platformKind, item));
       }
-      notify.success(platformKind === 'agents' ? '员工已从广场下线' : '已从广场移除');
+      notify.success(platformKind === 'agents' ? copy.unpublishSuccess : copy.removeSuccess);
       setDetailItem((current) => (
         current && current.kind === platformKind && current.item.id === item.id ? null : current
       ));
       setConfirmTarget(null);
       await loadPlatformData();
     } catch (error) {
-      notify.error(error instanceof Error
-        ? error.message
-        : platformKind === 'agents'
-          ? '员工广场下线失败'
-          : '删除失败');
+      notify.error(platformErrorMessage(error, platformKind === 'agents' ? copy.unpublishFailed : copy.deleteFailed));
     } finally {
       setDeletingItemKey('');
     }
@@ -435,7 +701,7 @@ export default function OpenPlatformPage({
 
   function renderItemDrawer() {
     if (!detailItem) return null;
-    const config = PLATFORM_BY_KIND.get(detailItem.kind) || PLATFORM_CONFIGS[0];
+    const config = platformByKind.get(detailItem.kind) || platformConfigList[0];
     const { item } = detailItem;
     const deleteKey = platformItemDeleteKey(detailItem.kind, item);
     const drawerItems = platformItems[detailItem.kind];
@@ -456,7 +722,7 @@ export default function OpenPlatformPage({
           description={item.description}
           detailText={detailText}
           workStyles={profile.workStyles}
-          stats={employeeStats(item.agent)}
+          stats={employeeStats(item.agent, copy)}
           online={item.agent.status === 'active'}
           canManage={canManagePlatform}
           unpublishing={deletingItemKey === deleteKey}
@@ -469,6 +735,18 @@ export default function OpenPlatformPage({
           onUse={() => {
             setDetailItem(null);
             void usePlatformItem(detailItem.kind, item.id);
+          }}
+          copy={{
+            previousLabel: copy.previousEmployee,
+            nextLabel: copy.nextEmployee,
+            closeLabel: copy.close,
+            statusOnline: copy.statusOnline,
+            statusOffline: copy.statusOffline,
+            categoryLabel: copy.category,
+            roleLabel: copy.roleLabel,
+            descriptionLabel: copy.descriptionLabel,
+            unpublishAction: copy.unpublish,
+            useAction: copy.useEmployee,
           }}
         />
       );
@@ -500,25 +778,35 @@ export default function OpenPlatformPage({
           setDetailItem(null);
           void usePlatformItem(detailItem.kind, item.id);
         }}
+        copy={{
+          previousLabel: copy.previousItem,
+          nextLabel: copy.nextItem,
+          closeLabel: copy.close,
+          platformLabel: copy.category,
+          categoryLabel: copy.category,
+          descriptionLabel: copy.descriptionLabel,
+          deleteAction: copy.deleteAction,
+        }}
       />
     );
   }
 
   function renderConfirm() {
-    const config = confirmTarget ? PLATFORM_BY_KIND.get(confirmTarget.kind) || PLATFORM_CONFIGS[0] : null;
+    const config = confirmTarget ? platformByKind.get(confirmTarget.kind) || platformConfigList[0] : null;
     return (
       <ConfirmDialog
         open={Boolean(confirmTarget)}
         onOpenChange={(next) => { if (!next) setConfirmTarget(null); }}
         title={confirmTarget && config
           ? confirmTarget.kind === 'agents'
-            ? `从广场下线员工「${confirmTarget.item.title}」？`
-            : `删除${config.metricLabel}「${confirmTarget.item.title}」？`
+            ? renderConfirmTitle(copy.unpublish, confirmTarget.item.title)
+            : renderConfirmTitle(`${copy.deleteAction}${config.metricLabel}「`, confirmTarget.item.title, '」？')
           : ''}
         description={confirmTarget?.kind === 'agents'
-          ? '下线后该员工不再出现在开放广场，也不能被新用户添加；员工本体及其资源、已有使用记录都会保留。'
-          : '删除后该广场内容会从开放平台移除，已复制到员工侧的引用可能不再可同步。'}
-        confirmText={confirmTarget?.kind === 'agents' ? '确认下线' : '删除'}
+          ? copy.confirmUnpublishDescription
+          : copy.confirmDeleteDescription}
+        confirmText={confirmTarget?.kind === 'agents' ? copy.confirmUnpublish : copy.confirmDelete}
+        cancelText={copy.confirmCancel}
         loading={Boolean(confirmTarget) && deletingItemKey === (confirmTarget ? platformItemDeleteKey(confirmTarget.kind, confirmTarget.item) : '')}
         onConfirm={() => void runDelete()}
       />
@@ -526,7 +814,7 @@ export default function OpenPlatformPage({
   }
 
   if (selectedKind) {
-    const config = PLATFORM_BY_KIND.get(selectedKind) || PLATFORM_CONFIGS[0];
+    const config = platformByKind.get(selectedKind) || platformConfigList[0];
     const PlatformIcon = PLATFORM_ICON[selectedKind];
     return (
       <>
@@ -534,18 +822,18 @@ export default function OpenPlatformPage({
           kind={selectedKind}
           title={config.title}
           subtitle={config.subtitle}
-          countLabel={platformCountLabel(selectedKind)}
+          countLabel={platformCountLabel(selectedKind, copy)}
           signals={config.signals}
           icon={PlatformIcon}
           items={platformItems[selectedKind]}
           loading={loading}
-          employeeStats={employeeStats}
+          employeeStats={(agent) => employeeStats(agent, copy)}
           onBack={() => navigate('/enterprise/platform')}
           onRefresh={() => void loadPlatformData()}
           onCreate={selectedKind === 'general-skills' ? () => {
             const overall = agents.find((item) => item.is_overall);
             if (!overall) {
-              notify.error('暂时无法找到开放广场');
+              notify.error(copy.missingOverall);
               return;
             }
             window.localStorage.setItem(ENTERPRISE_AGENT_STORAGE_KEY, overall.id);
@@ -562,6 +850,22 @@ export default function OpenPlatformPage({
           onUnpublishItem={(item) => setConfirmTarget({ kind: 'agents', item })}
           onLogout={onLogout}
           userName={currentUser?.username}
+          copy={{
+            backAction: copy.backToMarketplace,
+            createAction: copy.createOpenSkill,
+            refreshAction: copy.refresh,
+            statsAriaSuffix: copy.statsSuffix,
+            searchPrefix: copy.searchPrefix,
+            emptyText: copy.empty,
+            searchEmptyText: copy.searchEmpty,
+            employeeCard: {
+              statusOnline: copy.statusOnline,
+              statusOffline: copy.statusOffline,
+              unpublishAria: copy.unpublish,
+              unpublishTitle: copy.unpublish,
+              unpublishAction: copy.deleteAction,
+            },
+          }}
         />
         {renderItemDrawer()}
         {renderConfirm()}
@@ -569,7 +873,7 @@ export default function OpenPlatformPage({
     );
   }
 
-  const activeConfig = PLATFORM_BY_KIND.get(activeKind) || PLATFORM_CONFIGS[0];
+  const activeConfig = platformByKind.get(activeKind) || platformConfigList[0];
   const ActivePlatformIcon = PLATFORM_ICON[activeKind];
   const activeItems = platformItems[activeKind];
   const activeItemsFiltered = filterPlatformItems(activeItems, searchText);
@@ -589,12 +893,13 @@ export default function OpenPlatformPage({
         className="mb-[24px]"
         onLogout={onLogout}
         userName={currentUser?.username}
-        title="开放广场平台"
+        title={copy.pageTitle}
       />
       <div className="flex w-full flex-col items-center gap-[20px] xl:min-h-0 xl:flex-1">
-        <PlatformTabBar
+        <OpenPlatformTabList
           items={tabItems}
           activeKind={activeKind}
+          ariaLabel={copy.tabsLabel}
           onChange={(nextKind) => { setActiveKind(nextKind); setSearchText(''); }}
         />
         <PlatformCategoryPanel
@@ -604,12 +909,14 @@ export default function OpenPlatformPage({
           count={activeItems.length}
           filters={activeConfig.signals}
           searchValue={searchText}
-          searchPlaceholder={`搜索${platformCountLabel(activeKind)}`}
+          searchPlaceholder={activeConfig.searchPlaceholder}
           onSearchChange={setSearchText}
           loading={loading}
           isEmpty={activeItemsFiltered.length === 0}
-          emptyText={searchText.trim() ? '没有匹配的广场内容' : '暂无开放内容'}
-          emptyHint={searchText.trim() ? '换个关键词试试' : '发布内容后会在这里展示'}
+          emptyText={searchText.trim() ? copy.searchEmpty : copy.empty}
+          emptyHint={searchText.trim() ? copy.searchEmptyHint : copy.emptyHint}
+          emptyStateAriaLabel={searchText.trim() ? copy.searchEmpty : copy.empty}
+          cardSize={activeKind === 'agents' ? 'employee' : 'resource'}
         >
           {activeItemsFiltered.map((item) => (
             activeKind === 'agents' && item.agent ? (
@@ -618,29 +925,34 @@ export default function OpenPlatformPage({
                 avatar={(
                   <EmployeeAvatar
                     agent={item.agent}
-                    width={50}
-                    height={59}
+                    width={80}
+                    height={94}
                     fit="contain"
                     objectPosition="center bottom"
                     className="overflow-visible! rounded-none! border-0! bg-transparent! bg-none! shadow-none! after:hidden!"
                   />
                 )}
-                name={item.title}
-                role={item.meta}
+                name={<RawContent value={item.title} />}
+                role={<RawContent value={item.meta} />}
                 online={item.agent.status === 'active'}
-                description={item.description}
-                stats={employeeStats(item.agent)}
+                description={item.agent.description ? <RawContent value={item.description} /> : item.description}
+                stats={employeeStats(item.agent, copy)}
                 onOpen={() => setDetailItem({ kind: activeKind, item })}
-                onUnpublish={canManagePlatform
-                  ? () => setConfirmTarget({ kind: activeKind, item })
-                  : undefined}
+                onUnpublish={canManagePlatform ? () => setConfirmTarget({ kind: activeKind, item }) : undefined}
                 unpublishing={deletingItemKey === platformItemDeleteKey(activeKind, item)}
+                copy={{
+                  statusOnline: copy.statusOnline,
+                  statusOffline: copy.statusOffline,
+                  unpublishAria: copy.unpublish,
+                  unpublishTitle: copy.unpublish,
+                  unpublishAction: copy.confirmUnpublish,
+                }}
               />
             ) : (
               <PlatformResourceCard
                 key={item.id}
                 icon={PLATFORM_RESOURCE_ICON[activeKind]
-                  ? <img src={PLATFORM_RESOURCE_ICON[activeKind]} alt="" className="size-[32px] shrink-0 object-contain" />
+                  ? <img src={PLATFORM_RESOURCE_ICON[activeKind]} alt="" className="size-[44px] shrink-0 object-contain" />
                   : undefined}
                 accent={PLATFORM_ACCENT[activeKind]}
                 title={item.title}

@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 
 import { api } from '@/api/client';
 import StaffdeckIcon from '@/components/StaffdeckIcon';
+import { useAppIntl } from '@/i18n/useAppIntl';
 
 import type { MCPAppViewDescriptor } from '../chatTypes';
 
@@ -38,10 +39,12 @@ type AppMessage = JsonRpcRequest & {
   method?: string;
 };
 
+/** 渲染 MCP 宿主边界：产品 chrome 使用语义消息，第三方资源和协议 payload 保持原样。 */
 export default function MCPAppView({ descriptor }: { descriptor: MCPAppViewDescriptor }) {
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const [resource, setResource] = useState<AppResource | null>(null);
-  const [error, setError] = useState('');
+  const [resourceLoadFailed, setResourceLoadFailed] = useState(false);
+  const { t } = useAppIntl();
 
   useEffect(() => {
     let active = true;
@@ -53,10 +56,16 @@ export default function MCPAppView({ descriptor }: { descriptor: MCPAppViewDescr
     api
       .get<AppResource>(`/api/enterprise/mcp-servers/${descriptor.server_id}/app-resource?${query}`)
       .then((next) => {
-        if (active) setResource(next);
+        if (active) {
+          setResource(next);
+          setResourceLoadFailed(false);
+        }
       })
       .catch((reason) => {
-        if (active) setError(reason instanceof Error ? reason.message : 'MCP App 资源加载失败');
+        if (!active) return;
+        // 原始 provider/网络异常只进入诊断日志，不把技术详情暴露给第三方 iframe 或产品 UI。
+        console.error('[mcp-app] resource load failed', reason);
+        setResourceLoadFailed(true);
       });
     return () => {
       active = false;
@@ -105,9 +114,9 @@ export default function MCPAppView({ descriptor }: { descriptor: MCPAppViewDescr
           payload,
         );
         if (response.requires_confirmation) {
-          const confirmed = window.confirm(`MCP App 请求执行可能产生副作用的工具“${toolName}”，是否继续？`);
+          const confirmed = window.confirm(t('chat.mcp.confirmSideEffect', { toolName }));
           if (!confirmed) {
-            postRpcError(request.id, -32001, '用户取消了工具调用。');
+            postRpcError(request.id, -32001, t('chat.mcp.userCancelled'));
             return;
           }
           response = await api.post<AppCallResponse>(
@@ -116,12 +125,16 @@ export default function MCPAppView({ descriptor }: { descriptor: MCPAppViewDescr
           );
         }
         if (!response.success) {
-          postRpcError(request.id, -32000, response.error?.message || 'MCP App 工具调用失败。');
+          // provider message 属于技术诊断；只返回稳定 RPC code 对应的安全产品文案。
+          console.error('[mcp-app] tool call failed', response.error);
+          postRpcError(request.id, -32000, t('chat.mcp.toolCallFailed'));
           return;
         }
         postRpcResult(request.id, response.result ?? null);
       } catch (reason) {
-        postRpcError(request.id, -32000, reason instanceof Error ? reason.message : 'MCP App 工具调用失败。');
+        // 保留根因供宿主诊断，但禁止将异常消息作为最终用户文本或 iframe 协议消息。
+        console.error('[mcp-app] tool call exception', reason);
+        postRpcError(request.id, -32000, t('chat.mcp.toolCallFailed'));
       }
     };
 
@@ -134,7 +147,7 @@ export default function MCPAppView({ descriptor }: { descriptor: MCPAppViewDescr
 
     window.addEventListener('message', onMessage);
     return () => window.removeEventListener('message', onMessage);
-  }, [descriptor, resource]);
+  }, [descriptor, resource, t]);
 
   const notifyInitialResult = () => {
     const params = {
@@ -146,26 +159,37 @@ export default function MCPAppView({ descriptor }: { descriptor: MCPAppViewDescr
     }
   };
 
-  if (error) {
+  if (resourceLoadFailed) {
     return (
       <div className="mt-2 flex items-start gap-2 rounded-lg border border-[#eceef1] bg-[#fafbfc] px-3 py-2 text-xs text-[#858b9c]">
         <StaffdeckIcon name="warning" size={14} />
-        <span>MCP App 无法展示，已保留上方文本结果。{error}</span>
+        <span>{t('chat.mcp.renderFailed')}</span>
       </div>
     );
   }
   if (!resource) {
-    return <div className="mt-2 text-xs text-[#858b9c]">正在加载 MCP App…</div>;
+    return (
+      <div
+        className="mt-2 text-xs text-[#858b9c]"
+        role="status"
+        aria-label={t('chat.mcp.loading')}
+      >
+        {t('chat.mcp.loading')}
+      </div>
+    );
   }
   return (
-    <section className="mt-2 overflow-hidden rounded-xl border border-[#dfe5e2] bg-white" aria-label="MCP App">
+    <section
+      className="mt-2 overflow-hidden rounded-xl border border-[#dfe5e2] bg-white"
+      aria-label={t('chat.mcp.appLabel')}
+    >
       <div className="flex items-center justify-between border-b border-[#eceef1] bg-[#fafbfc] px-3 py-2 text-xs text-[#5f6675]">
-        <span className="font-medium">MCP App · {descriptor.tool_name}</span>
-        <span>隔离视图</span>
+        <span className="font-medium">{t('chat.mcp.header', { toolName: descriptor.tool_name })}</span>
+        <span>{t('chat.mcp.isolatedView')}</span>
       </div>
       <iframe
         ref={iframeRef}
-        title={`MCP App ${descriptor.tool_name}`}
+        title={t('chat.mcp.iframeTitle', { toolName: descriptor.tool_name })}
         className="h-[360px] w-full border-0 bg-white"
         sandbox="allow-scripts"
         allow={(resource.meta.ui?.permissions || []).join('; ')}

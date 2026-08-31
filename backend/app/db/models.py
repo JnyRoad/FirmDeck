@@ -39,6 +39,10 @@ class User(SQLModel, table=True):
     role: str = Field(default="member", index=True)
     # 账号来源:web=网页端创建;wechat 等=渠道懒建(用户管理列表默认隐藏)
     source: str = Field(default="web", index=True)
+    # 产品界面语言偏好；迁移期间可为空，存量行由启动迁移补齐兼容默认值。
+    ui_locale: Optional[str] = Field(default=None)
+    # Agent 新生成自然语言的语言偏好；与产品界面语言独立保存。
+    agent_reply_locale: Optional[str] = Field(default=None)
     password_hash: str
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
@@ -158,6 +162,11 @@ class APIJob(SQLModel, table=True):
     execution_generation: int = 0
     lease_expires_at: Optional[datetime] = Field(default=None, index=True)
     session_id: Optional[str] = Field(default=None, index=True)
+    # Durable public run snapshot; never re-resolve from mutable preferences on retry.
+    language_context_json: Optional[dict[str, Any]] = Field(
+        default=None,
+        sa_column=Column(JSON, nullable=True),
+    )
     created_at: datetime = Field(default_factory=utc_now)
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
@@ -205,6 +214,11 @@ class A2ATaskRun(SQLModel, table=True):
     error_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     artifacts_json: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
     agent_card_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    # Local execution snapshot; remote protocol payloads remain unchanged and raw.
+    language_context_json: Optional[dict[str, Any]] = Field(
+        default=None,
+        sa_column=Column(JSON, nullable=True),
+    )
     last_event_id: Optional[str] = Field(default=None, index=True)
     cancel_requested: bool = False
     recovery_attempts: int = 0
@@ -847,6 +861,11 @@ class ChatSession(SQLModel, table=True):
     summary: Optional[str] = None
     last_agent_question: Optional[str] = None
     status: str = "active"
+    # Existing sessions keep one authoritative Agent reply locale across retries and resumes.
+    agent_reply_locale: Optional[str] = Field(default=None)
+    agent_reply_locale_source: Optional[str] = Field(default=None)
+    # Machine-owned classification stays independent from raw, user-visible session titles.
+    session_kind: Optional[str] = Field(default=None, index=True)
     channel: Optional[str] = None
     external_conv_id: Optional[str] = None
     channel_target_json: Optional[dict[str, Any]] = Field(default=None, sa_column=Column(JSON))
@@ -1036,6 +1055,11 @@ class ChannelInboundEvent(SQLModel, table=True):
     # 创建/接管该事件的进程启动代次；当前代次仍在运行时禁止按墙钟误接管。
     processor_run_id: Optional[str] = Field(default=None, index=True)
     processor_lease_expires_at: Optional[datetime] = Field(default=None, index=True)
+    # Capture the ingress turn's language choices before asynchronous processing.
+    language_context_json: Optional[dict[str, Any]] = Field(
+        default=None,
+        sa_column=Column(JSON, nullable=True),
+    )
     error: Optional[str] = None
     processed_at: Optional[datetime] = None
     created_at: datetime = Field(default_factory=utc_now)
@@ -1073,6 +1097,11 @@ class ChannelDelivery(SQLModel, table=True):
     # 第一次真正尝试远端发送的时间，用于飞书 UUID 一小时去重窗口
     first_attempt_at: Optional[datetime] = None
     delivered_at: Optional[datetime] = None
+    # Repeated delivery sends the already-localized text under this exact snapshot.
+    language_context_json: Optional[dict[str, Any]] = Field(
+        default=None,
+        sa_column=Column(JSON, nullable=True),
+    )
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 
@@ -1100,6 +1129,11 @@ class HumanHandoffRequest(SQLModel, table=True):
     # 飞书 handoff_notice 投递成功后回写的飞书 message_id;阶段 4 据此关联处理人回复。
     # 网页触发的 handoff 无此字段(为空),不影响现有网页回复链路。
     notify_message_id: Optional[str] = Field(default=None, index=True)
+    # Handoff/resume keeps the source turn's immutable language choices.
+    language_context_json: Optional[dict[str, Any]] = Field(
+        default=None,
+        sa_column=Column(JSON, nullable=True),
+    )
 
 
 class ScheduledTask(SQLModel, table=True):
@@ -1129,6 +1163,11 @@ class ScheduledTask(SQLModel, table=True):
     lease_until: Optional[datetime] = Field(default=None, index=True)
     source_session_id: Optional[str] = Field(default=None, index=True)
     metadata_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    # Scheduled executions inherit this snapshot instead of current user settings.
+    language_context_json: Optional[dict[str, Any]] = Field(
+        default=None,
+        sa_column=Column(JSON, nullable=True),
+    )
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 
@@ -1152,6 +1191,11 @@ class ScheduledTaskRun(SQLModel, table=True):
     result_summary: Optional[str] = None
     error: Optional[str] = None
     trace_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    # Each retry/recovery uses the run snapshot captured at enqueue time.
+    language_context_json: Optional[dict[str, Any]] = Field(
+        default=None,
+        sa_column=Column(JSON, nullable=True),
+    )
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 
@@ -1215,6 +1259,11 @@ class HarnessTaskFrameRecord(SQLModel, table=True):
     )
     result_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     error_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    # Durable task-frame snapshot used by recovery and replay.
+    language_context_json: Optional[dict[str, Any]] = Field(
+        default=None,
+        sa_column=Column(JSON, nullable=True),
+    )
     state_version: int = 1
     attempt_no: int = 0
     lease_owner: Optional[str] = Field(default=None, index=True)
@@ -1245,6 +1294,11 @@ class HarnessRunRecord(SQLModel, table=True):
         default_factory=dict, sa_column=Column(JSON)
     )
     result_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    # Durable run snapshot; absence is only valid for pre-migration records.
+    language_context_json: Optional[dict[str, Any]] = Field(
+        default=None,
+        sa_column=Column(JSON, nullable=True),
+    )
     started_at: datetime = Field(default_factory=utc_now)
     finished_at: Optional[datetime] = None
     created_at: datetime = Field(default_factory=utc_now)
@@ -1280,6 +1334,11 @@ class HarnessTurnRecord(SQLModel, table=True):
     error_json: dict[str, Any] = Field(
         default_factory=dict,
         sa_column=Column(JSON),
+    )
+    # Exactly-once receipt includes the locale snapshot used to produce its response.
+    language_context_json: Optional[dict[str, Any]] = Field(
+        default=None,
+        sa_column=Column(JSON, nullable=True),
     )
     started_at: datetime = Field(default_factory=utc_now)
     finished_at: Optional[datetime] = None
@@ -1338,6 +1397,11 @@ class HarnessInvocationRecord(SQLModel, table=True):
         sa_column=Column(JSON),
     )
     approval_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    # Tool execution remains tied to the source turn's language context.
+    language_context_json: Optional[dict[str, Any]] = Field(
+        default=None,
+        sa_column=Column(JSON, nullable=True),
+    )
     started_at: datetime = Field(default_factory=utc_now)
     finished_at: Optional[datetime] = None
     created_at: datetime = Field(default_factory=utc_now)
@@ -1580,6 +1644,11 @@ class TeamRun(SQLModel, table=True):
     synthesis_session_id: Optional[str] = Field(default=None, index=True)
     final_message_id: Optional[str] = Field(default=None, index=True)
     error: Optional[str] = None
+    # Team synthesis must inherit the initiating turn's immutable snapshot.
+    language_context_json: Optional[dict[str, Any]] = Field(
+        default=None,
+        sa_column=Column(JSON, nullable=True),
+    )
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
     completed_at: Optional[datetime] = None
@@ -1611,6 +1680,11 @@ class TeamTask(SQLModel, table=True):
     activation_condition_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     report_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     review_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    # Delegated member work uses the source TeamRun snapshot.
+    language_context_json: Optional[dict[str, Any]] = Field(
+        default=None,
+        sa_column=Column(JSON, nullable=True),
+    )
     # 乐观锁版本号,人改判/验收并发时防覆盖
     version: int = 0
     created_at: datetime = Field(default_factory=utc_now)
@@ -1648,6 +1722,11 @@ class TeamWakeEvent(SQLModel, table=True):
     # status: pending -> claimed -> done / failed
     status: str = Field(default="pending", index=True)
     error: Optional[str] = None
+    # Background wakeups must not resolve language from a later mutable preference.
+    language_context_json: Optional[dict[str, Any]] = Field(
+        default=None,
+        sa_column=Column(JSON, nullable=True),
+    )
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 

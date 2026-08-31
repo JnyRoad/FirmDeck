@@ -1,4 +1,5 @@
 import { api } from '@/api/client';
+import type { MessageId } from '@/i18n/types';
 import type { ModelAuthMode, ModelConfigRead } from '@/types';
 
 export type ApiKeyProtocol = Exclude<ModelConfigRead['api_protocol'], 'codex_app_server'>;
@@ -18,7 +19,7 @@ export type ChannelPreset = {
   id: string;
   category: ChannelCategory;
   name: string;
-  description: string;
+  descriptionMessageId: MessageId;
   badgeLabel: string;
   badgeColor: { background: string; text: string };
   apiProtocol: ApiKeyProtocol | null;
@@ -30,7 +31,7 @@ export const CHANNEL_PRESETS: ChannelPreset[] = [
     id: 'openai',
     category: 'vendor',
     name: 'OpenAI',
-    description: 'GPT-4o、GPT-4o mini 等',
+    descriptionMessageId: 'modelSetup.channelDescription.openai',
     badgeLabel: 'O',
     badgeColor: { background: '#e6f4ef', text: '#0f6b52' },
     apiProtocol: 'openai_chat_completions',
@@ -40,7 +41,7 @@ export const CHANNEL_PRESETS: ChannelPreset[] = [
     id: 'anthropic',
     category: 'vendor',
     name: 'Anthropic',
-    description: 'Claude 全系列模型',
+    descriptionMessageId: 'modelSetup.channelDescription.anthropic',
     badgeLabel: 'A',
     badgeColor: { background: '#fbeee7', text: '#b1502f' },
     apiProtocol: 'anthropic_messages',
@@ -50,7 +51,7 @@ export const CHANNEL_PRESETS: ChannelPreset[] = [
     id: 'gemini',
     category: 'vendor',
     name: 'Google Gemini',
-    description: 'Gemini 2.5 Pro / Flash',
+    descriptionMessageId: 'modelSetup.channelDescription.gemini',
     badgeLabel: 'G',
     badgeColor: { background: '#eaf1fe', text: '#2f5fd6' },
     apiProtocol: 'gemini_generate_content',
@@ -60,7 +61,7 @@ export const CHANNEL_PRESETS: ChannelPreset[] = [
     id: 'deepseek',
     category: 'vendor',
     name: 'DeepSeek',
-    description: 'DeepSeek-V3 / R1',
+    descriptionMessageId: 'modelSetup.channelDescription.deepseek',
     badgeLabel: 'D',
     badgeColor: { background: '#eef0fb', text: '#4a3fb0' },
     apiProtocol: 'openai_chat_completions',
@@ -70,7 +71,7 @@ export const CHANNEL_PRESETS: ChannelPreset[] = [
     id: 'moonshot',
     category: 'vendor',
     name: 'Moonshot（Kimi）',
-    description: 'Kimi K2 等',
+    descriptionMessageId: 'modelSetup.channelDescription.moonshot',
     badgeLabel: 'K',
     badgeColor: { background: '#fdeef4', text: '#c23b78' },
     apiProtocol: 'openai_chat_completions',
@@ -80,7 +81,7 @@ export const CHANNEL_PRESETS: ChannelPreset[] = [
     id: 'chatgpt_subscription',
     category: 'subscription',
     name: 'ChatGPT 订阅（Codex）',
-    description: '复用本机 Codex 登录，无需 API Key',
+    descriptionMessageId: 'modelSetup.channelDescription.subscription',
     badgeLabel: '',
     badgeColor: { background: '#f4f4f6', text: '#55596b' },
     apiProtocol: null,
@@ -90,7 +91,7 @@ export const CHANNEL_PRESETS: ChannelPreset[] = [
     id: 'custom',
     category: 'custom',
     name: '自定义渠道',
-    description: '自建代理 / 私有部署，手动配置',
+    descriptionMessageId: 'modelSetup.channelDescription.custom',
     badgeLabel: '',
     badgeColor: { background: '#f4f4f6', text: '#55596b' },
     apiProtocol: null,
@@ -134,6 +135,21 @@ export type ModelConfigCreatePayload = {
 const DEFAULT_TEMPERATURE = 0.2;
 const DEFAULT_MAX_OUTPUT_TOKENS = 8192;
 
+export type ModelPayloadValidationErrorCode =
+  | 'MODEL_CLIENT_EXTRA_BODY_INVALID'
+  | 'MODEL_CLIENT_NUMERIC_FIELDS_INVALID';
+
+/** 承载前端本地配置校验失败的稳定错误码，供 UI 层映射语义文案。 */
+export class ModelPayloadValidationError extends Error {
+  code: ModelPayloadValidationErrorCode;
+
+  constructor(code: ModelPayloadValidationErrorCode) {
+    super(code);
+    this.name = 'ModelPayloadValidationError';
+    this.code = code;
+  }
+}
+
 export function buildModelConfigPayload(
   channel: ChannelPreset,
   formValues: VendorFormValues | CustomFormValues | SubscriptionFormValues,
@@ -166,7 +182,7 @@ export function buildModelConfigPayload(
     if (trimmed) {
       const parsed = JSON.parse(trimmed) as unknown;
       if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-        throw new SyntaxError('额外参数必须是合法的 JSON 对象');
+        throw new ModelPayloadValidationError('MODEL_CLIENT_EXTRA_BODY_INVALID');
       }
       extraBody = parsed as Record<string, unknown>;
     }
@@ -175,7 +191,7 @@ export function buildModelConfigPayload(
     const temperature = Number(values.temperature);
     const maxOutputTokens = Number(values.maxOutputTokens);
     if (!values.temperature.trim() || !values.maxOutputTokens.trim() || Number.isNaN(temperature) || Number.isNaN(maxOutputTokens)) {
-      throw new SyntaxError('Temperature 与 Max Tokens 必须是数字');
+      throw new ModelPayloadValidationError('MODEL_CLIENT_NUMERIC_FIELDS_INVALID');
     }
     return {
       ...base,

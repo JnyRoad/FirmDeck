@@ -11,6 +11,8 @@ import {
 import { Button } from "@/components/ui/button";
 import { XIcon } from "lucide-react";
 import { EnterpriseRoute } from "@/enums/routes";
+import { useAppIntl } from "@/i18n/useAppIntl";
+import type { MessageId } from "@/i18n/types";
 import { OPEN_QUICK_START_EVENT } from "./OnboardingGuide";
 
 const ONBOARDING_SEEN_KEY = "staffdeck_onboarding_guide_seen";
@@ -19,89 +21,89 @@ export const QUICK_START_COMPLETED_EVENT = "staffdeck-quick-start-completed";
 export const OPEN_MODEL_CREATE_EVENT = "staffdeck-open-model-create";
 
 type QuickStartStep = {
-  title: string;
-  description: string;
+  titleId: MessageId;
+  descriptionId: MessageId;
   route: EnterpriseRoute;
   target: string;
   fallbackTarget?: string;
   actionTarget?: string;
   side?: "top" | "right" | "bottom" | "left";
-  nextLabel?: string;
+  nextLabelId?: MessageId;
   nextRoute?: EnterpriseRoute;
   eventName?: string;
 };
 
 const STEPS: QuickStartStep[] = [
   {
-    title: "配置模型 API Key",
-    description: "模型是数字员工的大脑。点击「新建模型」，从列表中选一个渠道，按提示填完就能接入。",
+    titleId: "quickStart.model.title",
+    descriptionId: "quickStart.model.description",
     route: EnterpriseRoute.Models,
     target: "models-create",
     eventName: OPEN_MODEL_CREATE_EVENT,
   },
   {
-    title: "创建你的数字员工",
-    description: "在这里新建数字员工，绑定模型、知识库、技能与 SOP，它就正式上岗了。",
+    titleId: "quickStart.agent.title",
+    descriptionId: "quickStart.agent.description",
     route: EnterpriseRoute.Agents,
     target: "route-/enterprise/agents",
     side: "right",
   },
   {
-    title: "开放广场 · 共享与复用",
-    description: "汇集可共享的 SOP、知识库、技能和工具，新建数字员工时可以直接复制作为起点。",
+    titleId: "quickStart.platform.title",
+    descriptionId: "quickStart.platform.description",
     route: EnterpriseRoute.Platform,
     target: "route-/enterprise/platform",
     side: "right",
   },
   {
-    title: "员工档案 · 一目了然",
-    description: "查看数字员工的基本信息、能力配置和工作情况，像翻真人员工的档案一样。",
+    titleId: "quickStart.dashboard.title",
+    descriptionId: "quickStart.dashboard.description",
     route: EnterpriseRoute.Dashboard,
     target: "route-/enterprise/dashboard",
     side: "right",
   },
   {
-    title: "定时任务 · 主动干活",
-    description: "设置周期任务，数字员工到点自动执行，比如每天早上生成日报。",
+    titleId: "quickStart.scheduledTasks.title",
+    descriptionId: "quickStart.scheduledTasks.description",
     route: EnterpriseRoute.ScheduledTasks,
     target: "route-/enterprise/scheduled-tasks",
     side: "right",
   },
   {
-    title: "记忆 · 越用越懂你",
-    description: "数字员工会记住对话中的关键信息，越用越了解你的业务和习惯。",
+    titleId: "quickStart.memories.title",
+    descriptionId: "quickStart.memories.description",
     route: EnterpriseRoute.Memories,
     target: "route-/enterprise/memories",
     side: "right",
   },
   {
-    title: "知识库 · 沉淀业务知识",
-    description: "上传文档自动沉淀为结构化知识，回答自带出处，业务口径始终一致。",
+    titleId: "quickStart.knowledge.title",
+    descriptionId: "quickStart.knowledge.description",
     route: EnterpriseRoute.Knowledge,
     target: "route-/enterprise/knowledge",
     side: "right",
   },
   {
-    title: "技能 · 扩展它会做的事",
-    description: "这里是通用技能（Skills），扩展数字员工会做的事，支持从 GitHub 等开源社区直接导入。",
+    titleId: "quickStart.generalSkills.title",
+    descriptionId: "quickStart.generalSkills.description",
     route: EnterpriseRoute.GeneralSkills,
     target: "route-/enterprise/general-skills",
     side: "right",
   },
   {
-    title: "SOP · 流程型技能",
-    description: "SOP 是流程型技能：数字员工按步骤执行业务流程，可打断、可恢复，比固定的 workflow 更灵活。一句话描述需求，即可快速生成 SOP。",
+    titleId: "quickStart.sop.title",
+    descriptionId: "quickStart.sop.description",
     route: EnterpriseRoute.Skills,
     target: "route-/enterprise/skills",
     side: "right",
   },
   {
-    title: "去对话端开始协作",
-    description: "一切就绪！去对话端选择数字员工开始对话",
+    titleId: "quickStart.chat.title",
+    descriptionId: "quickStart.chat.description",
     route: EnterpriseRoute.Skills,
     target: "open-chat",
     side: "right",
-    nextLabel: "开始对话",
+    nextLabelId: "quickStart.action.startChat",
     nextRoute: EnterpriseRoute.Gallery,
   },
 ];
@@ -118,6 +120,7 @@ function findStepTarget(step: QuickStartStep) {
 }
 
 export default function QuickStartGuide({ isAdmin }: { isAdmin: boolean }) {
+  const { t } = useAppIntl();
   const navigate = useNavigate();
   const location = useLocation();
   const steps = useMemo(() => (isAdmin ? STEPS : STEPS.slice(1)), [isAdmin]);
@@ -142,12 +145,14 @@ export default function QuickStartGuide({ isAdmin }: { isAdmin: boolean }) {
     return () => window.removeEventListener(OPEN_QUICK_START_EVENT, reopen);
   }, []);
 
+  /** 记录快速开始已完成，并通知页面其他区域。 */
   function finish() {
     window.localStorage.setItem(QUICK_START_SEEN_KEY, "1");
     setOpen(false);
     window.dispatchEvent(new Event(QUICK_START_COMPLETED_EVENT));
   }
 
+  /** 前往下一步，末页时跳转到目标并完成。 */
   function goNext() {
     if (step === steps.length - 1) {
       if (current.nextRoute) navigate(current.nextRoute);
@@ -155,10 +160,12 @@ export default function QuickStartGuide({ isAdmin }: { isAdmin: boolean }) {
     } else setStep((current) => current + 1);
   }
 
+  /** 返回快速开始的上一步。 */
   function goPrev() {
     setStep((current) => Math.max(0, current - 1));
   }
 
+  /** 执行当前步骤的页面导航与可选目标操作。 */
   function runAction() {
     const current = steps[step];
     navigate(current.route);
@@ -237,7 +244,7 @@ export default function QuickStartGuide({ isAdmin }: { isAdmin: boolean }) {
           type="button"
           variant="ghost"
           size="icon-sm"
-          aria-label="关闭引导"
+          aria-label={t("quickStart.action.close")}
           onClick={finish}
           className="absolute top-[18px] right-[18px] text-white hover:bg-white/10 hover:text-white"
         >
@@ -245,10 +252,10 @@ export default function QuickStartGuide({ isAdmin }: { isAdmin: boolean }) {
         </Button>
         <div className="flex min-h-[86px] flex-col gap-[4px] pb-[32px]">
           <PopoverTitle className="text-[14px] leading-[22px] font-medium text-white">
-            {current.title}
+            {t(current.titleId)}
           </PopoverTitle>
           <PopoverDescription className="text-[14px] leading-[22px] font-normal text-[#f6f6f6]">
-            {current.description}
+            {t(current.descriptionId)}
           </PopoverDescription>
         </div>
 
@@ -262,13 +269,15 @@ export default function QuickStartGuide({ isAdmin }: { isAdmin: boolean }) {
               onClick={step === 0 ? runAction : goPrev}
               className="h-[34px] min-w-[100px] rounded-[10px] border-[0.5px] border-[#6d6d6d] bg-black/20 px-[20px] text-[14px] leading-[22px] font-normal whitespace-nowrap text-white hover:bg-white/10 hover:text-white"
             >
-              {step === 0 ? "立即添加" : "上一步"}
+              {step === 0 ? t("quickStart.action.addNow") : t("quickStart.action.previous")}
             </Button>
             <Button
               onClick={goNext}
               className="h-[34px] min-w-[100px] rounded-[8px] bg-white px-[16px] text-[14px] leading-[22px] font-normal whitespace-nowrap text-[#29282d] hover:bg-[#f0f0f0] hover:text-[#29282d]"
             >
-              {current.nextLabel || (isLast ? "完成" : "下一步")}
+              {current.nextLabelId
+                ? t(current.nextLabelId)
+                : t(isLast ? "quickStart.action.finish" : "quickStart.action.next")}
             </Button>
           </div>
         </div>

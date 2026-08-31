@@ -5,8 +5,9 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 from app.db.models import ChatSession, Skill
+from app.i18n.language_context import LanguageContext
+from app.llm.prompts.language import resolve_prompt_language_context
 from app.session.session_schema import PlannedTaskFrame
-
 
 CapabilityKind = Literal[
     "general_skill",
@@ -71,6 +72,7 @@ class TaskRequirement(BaseModel):
     attachments: list[dict[str, Any]] = Field(default_factory=list)
     published_deliverables: list[dict[str, Any]] = Field(default_factory=list)
     capability_manifest: CapabilityManifest = Field(default_factory=CapabilityManifest)
+    language_context: LanguageContext | None = None
 
 
 class TaskExecutionResult(BaseModel):
@@ -112,7 +114,10 @@ class TaskRequestCompiler:
         published_deliverables: list[dict[str, Any]] | None = None,
         source_user_message: str | None = None,
         out_of_scope_task_intents: list[str] | None = None,
+        language_context: LanguageContext | None = None,
     ) -> TaskRequirement:
+        """Compile one frame and bind its immutable language snapshot for retries and recovery."""
+        # Workflow: derive task constraints from the persisted frame and current SOP node.
         current_node = _current_node(skill, frame.target_step_id or session.active_step_id)
         expected_fields = _text_list((current_node or {}).get("expected_user_info"))
         known_slots = (
@@ -186,6 +191,7 @@ class TaskRequestCompiler:
             attachments=list(attachments or []),
             published_deliverables=list(published_deliverables or []),
             capability_manifest=manifest,
+            language_context=resolve_prompt_language_context(language_context),
         )
 
 

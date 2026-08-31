@@ -20,19 +20,34 @@ def test_record_result_deduplicates_history_but_preserves_all_results() -> None:
 
 
 def test_record_result_preserves_structured_error() -> None:
+    """Persist canonical correlation fields without replaying raw provider prose."""
+    raw_provider_error = "provider secret=do-not-publish"
     call = ToolCall(name="orders.create", arguments={})
     result = ToolResult(
         tool_name=call.name,
         success=False,
-        error=ToolError(code="FAILED", message="failed"),
+        error=ToolError(
+            code="FAILED",
+            message=raw_provider_error,
+            params={"provider_id": "orders-primary"},
+            retryable=True,
+            request_id="req-replay",
+            trace_id="trace-replay",
+        ),
     )
 
     slots = ToolReplayPolicy.record_result({}, call, result)
 
     assert slots[TOOL_RESULTS_SLOT][0]["error"] == {
-        "code": "FAILED",
-        "message": "failed",
+        "code": "INTERNAL_ERROR",
+        "message": "INTERNAL_ERROR",
+        "params": {},
+        "retryable": False,
+        "request_id": "req-replay",
+        "trace_id": "trace-replay",
+        "deprecated_fields": ["message"],
     }
+    assert raw_provider_error not in repr(slots[TOOL_RESULTS_SLOT][0]["error"])
 
 
 def test_configuration_preserves_legacy_precedence_and_confirmation_fallback() -> None:

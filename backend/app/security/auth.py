@@ -8,14 +8,14 @@ import os
 import time
 from typing import Any
 
-from fastapi import Depends, HTTPException, Query
+from fastapi import Depends, Query
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlmodel import Session
 
 from app.config import get_settings
+from app.contracts.http import build_http_exception
 from app.db import get_session
 from app.db.models import User
-
 
 TOKEN_TTL_SECONDS = 60 * 60 * 24 * 14
 security = HTTPBearer(auto_error=False)
@@ -53,20 +53,22 @@ def get_current_user(
     credentials: HTTPAuthorizationCredentials | None = Depends(security),
     db: Session = Depends(get_session),
 ) -> User:
+    """Authenticate the bearer token and expose only registered auth failures at the API boundary."""
     if not credentials:
-        raise HTTPException(status_code=401, detail="Not authenticated")
+        raise build_http_exception("AUTH_NOT_AUTHENTICATED")
     payload = _decode_token(credentials.credentials)
     user = db.get(User, payload.get("user_id", ""))
     if not user or user.tenant_id != payload.get("tenant_id"):
-        raise HTTPException(status_code=401, detail="Invalid user token")
+        raise build_http_exception("AUTH_INVALID_USER_TOKEN")
     return user
 
 
 def ensure_current_user_tenant(tenant_id: str, current_user: User) -> None:
+    """Ensure an authenticated principal belongs to the requested tenant."""
     if not isinstance(current_user, User):
-        raise HTTPException(status_code=401, detail="Not authenticated")
+        raise build_http_exception("AUTH_NOT_AUTHENTICATED")
     if tenant_id != current_user.tenant_id:
-        raise HTTPException(status_code=403, detail="Tenant mismatch")
+        raise build_http_exception("TENANT_MISMATCH")
 
 
 def require_current_tenant(
@@ -78,18 +80,19 @@ def require_current_tenant(
 
 
 def _decode_token(token: str) -> dict[str, Any]:
+    """Decode and verify a signed token while keeping malformed-token causes private."""
     try:
         body, signature = token.split(".", 1)
     except ValueError as exc:
-        raise HTTPException(status_code=401, detail="Invalid token") from exc
+        raise build_http_exception("AUTH_INVALID_TOKEN") from exc
     if not hmac.compare_digest(_sign(body), signature):
-        raise HTTPException(status_code=401, detail="Invalid token signature")
+        raise build_http_exception("AUTH_INVALID_TOKEN_SIGNATURE")
     try:
         payload = json.loads(base64.urlsafe_b64decode(_pad_b64(body)).decode("utf-8"))
     except Exception as exc:
-        raise HTTPException(status_code=401, detail="Invalid token payload") from exc
+        raise build_http_exception("AUTH_INVALID_TOKEN_PAYLOAD") from exc
     if int(payload.get("exp", 0)) < int(time.time()):
-        raise HTTPException(status_code=401, detail="Token expired")
+        raise build_http_exception("AUTH_TOKEN_EXPIRED")
     return payload
 
 

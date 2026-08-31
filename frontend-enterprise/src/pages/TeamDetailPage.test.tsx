@@ -1,12 +1,12 @@
 // @vitest-environment jsdom
 
+import type { ComponentProps, ReactElement, ReactNode } from 'react';
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 
-import { I18nProvider } from '@/i18n';
-import { notify } from '@/components/ui/app-toast';
+import { AppIntlProvider, createAppTranslator, I18nProvider, type AppLocale } from '@/i18n';
 import type {
   AgentProfileRead,
   TeamBlackboardEntryRead,
@@ -17,7 +17,30 @@ import type {
   TeamTaskRead,
 } from '@/types';
 
-import TeamDetailPage from './TeamDetailPage';
+import TeamDetailPage, { teamEventLabel } from './TeamDetailPage';
+
+const sonnerSpies = vi.hoisted(() => ({
+  custom: vi.fn(),
+}));
+
+vi.mock('sonner', () => ({
+  toast: sonnerSpies,
+}));
+
+vi.mock('@/components/LanguageSwitcher', () => ({
+  /** Keep unrelated shell migration out of the team-detail locale contract. */
+  default: () => null,
+}));
+
+vi.mock('@/components/ui/input', () => ({
+  /** Preserve native input semantics without the legacy arbitrary-prop observer. */
+  Input: (props: ComponentProps<'input'>) => <input {...props} />,
+}));
+
+vi.mock('@/components/ui/textarea', () => ({
+  /** Preserve native textarea semantics without the legacy arbitrary-prop observer. */
+  Textarea: (props: ComponentProps<'textarea'>) => <textarea {...props} />,
+}));
 
 const team: TeamRead = {
   id: 'team-1',
@@ -379,6 +402,24 @@ function renderDetail(initialEntry = '/enterprise/teams/team-1') {
   );
 }
 
+/** Render team detail with the semantic provider as the only locale source. */
+function renderDetailWithAppLocale(
+  locale: AppLocale,
+  initialEntry = '/enterprise/teams/team-1',
+) {
+  return render(
+    <AppIntlProvider locale={locale}>
+      <MemoryRouter initialEntries={[initialEntry]}>
+        <Routes>
+          <Route path="/enterprise/teams/:teamId" element={<TeamDetailPage />} />
+          <Route path="/enterprise/teams/:teamId/chat" element={<LocationEcho />} />
+          <Route path="/workspace/chat/:sessionId" element={<LocationEcho />} />
+        </Routes>
+      </MemoryRouter>
+    </AppIntlProvider>,
+  );
+}
+
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
@@ -393,6 +434,32 @@ beforeAll(() => {
 });
 
 describe('TeamDetailPage', () => {
+  it('projects canonical team event params and never renders legacy payload prose', () => {
+    const english = createAppTranslator('en-US');
+    const chinese = createAppTranslator('zh-CN');
+    const payload = {
+      event_code: 'team.run.progress.completed',
+      params: { total_tasks: 2 },
+      text: 'backend-rendered text must stay hidden',
+    };
+
+    expect(teamEventLabel('task_escalated', payload, english.t)).toBe(
+      'Received all 2 member replies. The team summary is complete.',
+    );
+    expect(teamEventLabel('task_escalated', payload, chinese.t)).toBe(
+      '已收到全部 2 项成员回复，团队汇总已完成。',
+    );
+    expect(teamEventLabel('task_escalated', payload, english.t)).not.toContain('backend-rendered');
+  });
+
+  it('falls back to the legacy event code label only when canonical metadata is unavailable', () => {
+    const english = createAppTranslator('en-US');
+    expect(teamEventLabel('task_escalated', { event_code: 'team.unknown.event', params: {} }, english.t)).toBe(
+      'Task escalated',
+    );
+    expect(teamEventLabel('unknown_event', { text: 'backend text' }, english.t)).toBe('unknown_event');
+  });
+
   it('explains the group-read union, private isolation, and shared-only team writes', async () => {
     stubDetailFetch({ knowledgeRows: knowledgeBindings });
     renderDetail();
@@ -453,7 +520,7 @@ describe('TeamDetailPage', () => {
 
   it('shows a safe reload instruction on permission revision conflict', async () => {
     const user = userEvent.setup();
-    const errorNotice = vi.spyOn(notify, 'error');
+    sonnerSpies.custom.mockClear();
     stubDetailFetch({ knowledgeRows: knowledgeBindings, conflictOnGrantSave: true });
     renderDetail();
 
@@ -461,7 +528,11 @@ describe('TeamDetailPage', () => {
     await user.click(within(section).getByRole('button', { name: '保存 共享制度库 权限' }));
 
     await waitFor(() => {
-      expect(errorNotice).toHaveBeenCalledWith('权限配置已被其他管理员更新，请刷新后重新确认。');
+      const renderer =
+        sonnerSpies.custom.mock.calls[sonnerSpies.custom.mock.calls.length - 1]?.[0];
+      expect(typeof renderer).toBe('function');
+      const { container } = render((renderer as () => ReactNode)() as ReactElement);
+      expect(container.textContent).toContain('权限配置已被其他管理员更新，请刷新后重新确认。');
     });
   });
 
@@ -648,7 +719,9 @@ describe('TeamDetailPage', () => {
     expect(within(board).getByText('okr')).toBeTruthy();
     expect(within(board).getByText((content) => content.startsWith('项目领导'))).toBeTruthy();
     expect(within(board).getByText((content) => content.startsWith('小北'))).toBeTruthy();
-    expect(within(board).getByText(/关联任务：写周报/)).toBeTruthy();
+    expect(within(board).getByText((_, element) => (
+      element?.textContent === '关联任务：写周报'
+    ))).toBeTruthy();
     expect(within(board).getAllByText('置顶').length).toBeGreaterThan(0);
   });
 
@@ -1008,6 +1081,32 @@ describe('TeamDetailPage', () => {
     expect(await within(dialog).findByText('周报已完成')).toBeTruthy();
   });
 
+  it('renders canonical team event params in the activity timeline', async () => {
+    stubDetailFetch({
+      events: [
+        {
+          id: 'canonical-event-1',
+          task_id: 'task-1',
+          task_title: '写周报',
+          actor_type: 'system',
+          actor_id: null,
+          event_type: 'task_escalated',
+          payload: {
+            event_code: 'team.run.progress.completed',
+            params: { total_tasks: 2 },
+            text: 'legacy backend prose must not render',
+          },
+          created_at: new Date().toISOString(),
+        },
+      ],
+    });
+    renderDetailWithAppLocale('en-US');
+
+    const activity = await screen.findByLabelText('Team activity');
+    expect(within(activity).getByText('Received all 2 member replies. The team summary is complete.')).toBeTruthy();
+    expect(within(activity).queryByText('legacy backend prose must not render')).toBeNull();
+  });
+
   it('renders the review verdict as a prominent banner with the comment quote', async () => {
     const user = userEvent.setup();
     stubDetailFetch({
@@ -1027,7 +1126,7 @@ describe('TeamDetailPage', () => {
     const verdict = await within(dialog).findByLabelText('验收结论');
     expect(within(verdict).getByText('退回重做')).toBeTruthy();
     const quote = within(verdict).getByText('数据不完整，请补充来源');
-    expect(quote.tagName).toBe('BLOCKQUOTE');
+    expect(quote.closest('blockquote')?.tagName).toBe('BLOCKQUOTE');
   });
 
   it('renders an approve banner and hides the section when there is no verdict', async () => {
@@ -1045,7 +1144,7 @@ describe('TeamDetailPage', () => {
     let dialog = await screen.findByRole('dialog');
     const verdict = await within(dialog).findByLabelText('验收结论');
     expect(within(verdict).getByText('验收通过')).toBeTruthy();
-    await user.click(within(dialog).getByRole('button', { name: 'Close' }));
+    await user.click(within(dialog).getByRole('button', { name: '关闭' }));
     await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
 
     await user.click(within(board).getByText('投放分析'));
@@ -1100,5 +1199,121 @@ describe('TeamDetailPage', () => {
     const removeButton = within(members).getByRole('button', { name: '移除成员 小北' });
     expect(promoteButton.className).toContain('whitespace-nowrap');
     expect(removeButton.className).toContain('whitespace-nowrap');
+  });
+});
+
+describe('TeamDetailPage semantic locale boundary', () => {
+  it.each([
+    {
+      locale: 'zh-CN',
+      memberSection: '成员管理',
+      activeStatus: '正常',
+      leaderRole: '项目领导',
+      memberRole: '成员',
+      promote: '设为项目领导',
+      removeAria: '移除成员 小北',
+      memberListAria: '团队成员列表',
+      knowledgeSection: '团队知识库',
+      permissionAria: '小艾 在 共享制度库 的权限',
+      noAccess: '无权限',
+      reader: '可读取',
+      editor: '可编辑',
+      publisher: '可发布',
+      taskBoard: '任务看板',
+      reviewStatus: '待验收',
+    },
+    {
+      locale: 'en-US',
+      memberSection: 'Member management',
+      activeStatus: 'Active',
+      leaderRole: 'Project lead',
+      memberRole: 'Member',
+      promote: 'Set as project lead',
+      removeAria: 'Remove member 小北',
+      memberListAria: 'Team member list',
+      knowledgeSection: 'Team knowledge bases',
+      permissionAria: 'Permissions for 小艾 in 共享制度库',
+      noAccess: 'No access',
+      reader: 'Read',
+      editor: 'Edit',
+      publisher: 'Publish',
+      taskBoard: 'Task board',
+      reviewStatus: 'In review',
+    },
+  ] as const)(
+    'localizes roles, permissions, statuses and ARIA in $locale while names stay raw',
+    async ({
+      locale,
+      memberSection,
+      activeStatus,
+      leaderRole,
+      memberRole,
+      promote,
+      removeAria,
+      memberListAria,
+      knowledgeSection,
+      permissionAria,
+      noAccess,
+      reader,
+      editor,
+      publisher,
+      taskBoard,
+      reviewStatus,
+    }) => {
+      stubDetailFetch({ knowledgeRows: knowledgeBindings });
+      renderDetailWithAppLocale(locale);
+
+      expect(await screen.findByText('增长团队')).toBeTruthy();
+      expect(screen.getByText('负责增长实验')).toBeTruthy();
+      const members = screen.getByLabelText(memberSection);
+      expect(within(members).getByText(activeStatus)).toBeTruthy();
+      expect(within(members).getByText(leaderRole)).toBeTruthy();
+      expect(within(members).getByText(memberRole)).toBeTruthy();
+      expect(within(members).getByRole('button', { name: promote })).toBeTruthy();
+      expect(within(members).getByRole('button', { name: removeAria })).toBeTruthy();
+      expect(within(members).getByRole('region', { name: memberListAria })).toBeTruthy();
+      expect(within(members).getByText('小艾')).toBeTruthy();
+      expect(within(members).getByText('小北')).toBeTruthy();
+
+      const knowledge = screen.getByLabelText(knowledgeSection);
+      const permission = within(knowledge).getByLabelText(permissionAria);
+      expect(within(permission).getByRole('option', { name: noAccess })).toBeTruthy();
+      expect(within(permission).getByRole('option', { name: reader })).toBeTruthy();
+      expect(within(permission).getByRole('option', { name: editor })).toBeTruthy();
+      expect(within(permission).getByRole('option', { name: publisher })).toBeTruthy();
+      expect(within(knowledge).getByText('共享制度库')).toBeTruthy();
+
+      const board = screen.getByLabelText(taskBoard);
+      expect(within(board).getByText(reviewStatus)).toBeTruthy();
+      expect(within(board).getByText('写周报')).toBeTruthy();
+    },
+  );
+
+  it('localizes empty collaboration states without altering the team record', async () => {
+    stubDetailFetch({ taskList: [], events: [], teamOverride: { ...team, members: [] } });
+    renderDetailWithAppLocale('en-US');
+
+    expect(await screen.findByText('增长团队')).toBeTruthy();
+    expect(screen.getByLabelText('Member management')).toBeTruthy();
+    expect(screen.getByText('No members')).toBeTruthy();
+    expect(screen.getAllByText('No tasks').length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText('No team activity')).toBeTruthy();
+    expect(screen.getByText('No blackboard entries')).toBeTruthy();
+  });
+
+  it('localizes native archive confirmation while keeping entry content raw', async () => {
+    const user = userEvent.setup();
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false);
+    stubDetailFetch({ entries: [makeEntry({ id: 'entry-1', content: 'stale note' })] });
+    renderDetailWithAppLocale('en-US');
+
+    const board = await screen.findByLabelText('Team blackboard');
+    expect(within(board).getByText('stale note')).toBeTruthy();
+    await user.click(within(board).getByRole('button', { name: 'Archive' }));
+
+    expect(confirm).toHaveBeenCalledWith(
+      'Archive this blackboard entry? Archived entries are no longer shown.',
+    );
+    expect(within(board).getByText('stale note')).toBeTruthy();
   });
 });

@@ -3,7 +3,7 @@ import { ArrowUpRight, CircleArrowUp, X } from 'lucide-react';
 import { toast } from 'sonner';
 
 import { api } from '@/api/client';
-import { useI18n } from '@/i18n';
+import { useAppIntl } from '@/i18n/useAppIntl';
 
 export const REMINDED_VERSION_KEY = 'staffdeck_update_reminded_version';
 
@@ -16,6 +16,7 @@ type AppVersion = {
   check_succeeded: boolean;
 };
 
+/** 渲染已结构化版本数据的本地化更新提示。 */
 export function UpdateNotice({
   currentVersion,
   latestVersion,
@@ -27,7 +28,7 @@ export function UpdateNotice({
   releaseUrl: string;
   onClose: () => void;
 }) {
-  const { t } = useI18n();
+  const { t } = useAppIntl();
 
   return (
     <div
@@ -40,10 +41,13 @@ export function UpdateNotice({
       </span>
       <div className="min-w-0 flex-1">
         <p className="text-[14px] font-medium leading-[20px] text-[#18181a]">
-          {t('StaffDeck 有新版本')}
+          {t('updateReminder.title')}
         </p>
         <p className="mt-[1px] text-[12px] leading-[18px] text-[#757f9c]">
-          {t('v{1} 已发布，你正在使用 v{2}', { 1: latestVersion, 2: currentVersion })}
+          {t('updateReminder.versionSummary', {
+            latestVersion,
+            currentVersion,
+          })}
         </p>
       </div>
       <a
@@ -53,12 +57,12 @@ export function UpdateNotice({
         onClick={onClose}
         className="flex h-[32px] shrink-0 items-center gap-[4px] rounded-[7px] bg-[#18181a] px-[10px] text-[12px] font-medium text-white transition-opacity hover:opacity-80"
       >
-        {t('查看更新')}
+        {t('updateReminder.viewUpdate')}
         <ArrowUpRight className="size-[13px]" aria-hidden="true" />
       </a>
       <button
         type="button"
-        aria-label={t('关闭更新提醒')}
+        aria-label={t('updateReminder.close')}
         onClick={onClose}
         className="absolute right-[8px] top-[7px] grid size-[24px] place-items-center text-[#9aa3ba] transition-colors hover:text-[#464c5e]"
       >

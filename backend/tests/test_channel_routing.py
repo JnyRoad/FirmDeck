@@ -28,6 +28,7 @@ from app.db.models import (
     User,
     new_id,
 )
+from app.i18n.language_context import LanguageContext, LocaleResolutionSource
 
 
 def _test_engine():
@@ -188,7 +189,9 @@ def test_mounted_agents_legacy_fallback() -> None:
 
 def test_mounted_agents_ordering() -> None:
     engine = _test_engine()
-    binding_id = _seed_binding(engine, mounts=[("agent_cw", "财务", False), ("agent_xz", "行政", True)])
+    binding_id = _seed_binding(
+        engine, mounts=[("agent_cw", "财务", False), ("agent_xz", "行政", True)]
+    )
     with Session(engine) as db:
         binding = db.get(ChannelBinding, binding_id)
         mounts = mounted_agents(db, binding)
@@ -200,7 +203,11 @@ def test_mounted_agents_ignores_deleted_agents() -> None:
     engine = _test_engine()
     binding_id = _seed_binding(
         engine,
-        mounts=[("agent_xz", "行政", True), ("agent_gone", "已删除", False), ("agent_cw", "财务", False)],
+        mounts=[
+            ("agent_xz", "行政", True),
+            ("agent_gone", "已删除", False),
+            ("agent_cw", "财务", False),
+        ],
     )
     with Session(engine) as db:
         binding = db.get(ChannelBinding, binding_id)
@@ -229,7 +236,9 @@ def test_mounted_agents_all_deleted_falls_back_to_binding_default() -> None:
 
 def test_resolve_current_agent_creates_pointer_at_default() -> None:
     engine = _test_engine()
-    binding_id = _seed_binding(engine, mounts=[("agent_xz", "行政", True), ("agent_cw", "财务", False)])
+    binding_id = _seed_binding(
+        engine, mounts=[("agent_xz", "行政", True), ("agent_cw", "财务", False)]
+    )
     with Session(engine) as db:
         binding = db.get(ChannelBinding, binding_id)
         current, reset = resolve_current_agent(db, binding, "wechat_p2p_u1")
@@ -242,7 +251,9 @@ def test_resolve_current_agent_creates_pointer_at_default() -> None:
 
 def test_resolve_current_agent_resets_when_unmounted() -> None:
     engine = _test_engine()
-    binding_id = _seed_binding(engine, mounts=[("agent_xz", "行政", True), ("agent_cw", "财务", False)])
+    binding_id = _seed_binding(
+        engine, mounts=[("agent_xz", "行政", True), ("agent_cw", "财务", False)]
+    )
     with Session(engine) as db:
         db.add(
             ChannelConvState(
@@ -289,7 +300,9 @@ def test_run_command_switch_and_current() -> None:
     with Session(engine) as db:
         reply = run_command(db, binding, "wechat_p2p_u1", parse_command("/切换 财务"))
         db.commit()
-        assert reply == "已切换到「财务」，后续消息由 TA 回复。上下文各自独立，输入 /员工 查看列表。"
+        assert (
+            reply == "已切换到「财务」，后续消息由 TA 回复。上下文各自独立，输入 /员工 查看列表。"
+        )
         current, _ = resolve_current_agent(db, binding, "wechat_p2p_u1")
         assert current == "agent_cw"
 
@@ -327,19 +340,60 @@ def test_help_text_uses_actual_channel_name(channel: str, label: str) -> None:
     assert f"解除{label}账号与 StaffDeck 账号的绑定" in text
 
 
+def _reply_context(locale: str) -> LanguageContext:
+    """Build an immutable reply-locale snapshot for channel notice tests."""
+    return LanguageContext(
+        ui_locale="zh-CN" if locale == "en-US" else "en-US",
+        agent_reply_locale=locale,
+        ui_locale_source=LocaleResolutionSource.EXPLICIT_REQUEST,
+        agent_reply_locale_source=LocaleResolutionSource.EXPLICIT_REQUEST,
+    )
+
+
+def test_channel_notice_descriptor_is_typed_and_preserves_raw_params() -> None:
+    """Represent product chrome as code plus raw params before locale-specific rendering."""
+    from app.channels.service_routing import ChannelNotice, render_channel_notice
+
+    notice = ChannelNotice(code="routing.switched", params={"agent_name": "财务 SKU-A/42"})
+
+    assert notice.code == "routing.switched"
+    assert notice.params == {"agent_name": "财务 SKU-A/42"}
+    assert "Switched to" in render_channel_notice(notice, _reply_context("en-US"))
+    assert "财务 SKU-A/42" in render_channel_notice(notice, _reply_context("en-US"))
+    assert "已切换" in render_channel_notice(notice, _reply_context("zh-CN"))
+
+
+def test_run_command_uses_reply_locale_and_keeps_agent_names_raw() -> None:
+    """Localize command chrome from the immutable reply locale without translating agent names."""
+    engine = _test_engine()
+    binding = _command_setup(engine)
+    with Session(engine) as db:
+        reply = run_command(
+            db,
+            binding,
+            "wechat_p2p_u1",
+            parse_command("/switch 财务"),
+            language_context=_reply_context("en-US"),
+        )
+
+    assert "Switched to" in reply
+    assert "财务" in reply
+    assert "已切换" not in reply
+
+
 # ---------- intake 集成 ----------
 
 
 def _notices(engine) -> list[ChannelDelivery]:
     with Session(engine) as db:
-        return db.exec(
-            select(ChannelDelivery).where(ChannelDelivery.kind == "notice")
-        ).all()
+        return db.exec(select(ChannelDelivery).where(ChannelDelivery.kind == "notice")).all()
 
 
 def test_command_message_creates_no_session_and_notices_via_outbox() -> None:
     engine = _test_engine()
-    binding_id = _seed_binding(engine, mounts=[("agent_xz", "行政", True), ("agent_cw", "财务", False)])
+    binding_id = _seed_binding(
+        engine, mounts=[("agent_xz", "行政", True), ("agent_cw", "财务", False)]
+    )
     binding = _load_binding(engine, binding_id)
 
     assert process_inbound(binding, _p2p_message("evt_cmd1", "/员工"), db_engine=engine) is False
@@ -359,7 +413,9 @@ def test_command_message_creates_no_session_and_notices_via_outbox() -> None:
 
 def test_switch_then_next_message_routes_to_new_agent_session() -> None:
     engine = _test_engine()
-    binding_id = _seed_binding(engine, mounts=[("agent_xz", "行政", True), ("agent_cw", "财务", False)])
+    binding_id = _seed_binding(
+        engine, mounts=[("agent_xz", "行政", True), ("agent_cw", "财务", False)]
+    )
     binding = _load_binding(engine, binding_id)
 
     # 默认员工会话
@@ -376,7 +432,9 @@ def test_switch_then_next_message_routes_to_new_agent_session() -> None:
 
     # 切回行政:原会话还在(上下文独立保留)
     assert process_inbound(binding, _p2p_message("evt_4", "/切换 行政"), db_engine=engine) is False
-    assert process_inbound(binding, _p2p_message("evt_5", "会议室订好了吗"), db_engine=engine) is True
+    assert (
+        process_inbound(binding, _p2p_message("evt_5", "会议室订好了吗"), db_engine=engine) is True
+    )
     assert RecordingAgentLoop.calls[-1].agent_id == "agent_xz"
     assert RecordingAgentLoop.calls[-1].session_id == session_xz
 
@@ -392,12 +450,18 @@ def test_switch_then_next_message_routes_to_new_agent_session() -> None:
 
 def test_group_pointer_independent_from_p2p() -> None:
     engine = _test_engine()
-    binding_id = _seed_binding(engine, mounts=[("agent_xz", "行政", True), ("agent_cw", "财务", False)])
+    binding_id = _seed_binding(
+        engine, mounts=[("agent_xz", "行政", True), ("agent_cw", "财务", False)]
+    )
     binding = _load_binding(engine, binding_id)
 
     # 群里切到财务
-    assert process_inbound(binding, _group_message("evt_g1", "/切换 财务"), db_engine=engine) is False
-    assert process_inbound(binding, _group_message("evt_g2", "群里问报销"), db_engine=engine) is True
+    assert (
+        process_inbound(binding, _group_message("evt_g1", "/切换 财务"), db_engine=engine) is False
+    )
+    assert (
+        process_inbound(binding, _group_message("evt_g2", "群里问报销"), db_engine=engine) is True
+    )
     assert RecordingAgentLoop.calls[-1].agent_id == "agent_cw"
 
     # 私聊仍是默认行政
@@ -405,7 +469,12 @@ def test_group_pointer_independent_from_p2p() -> None:
     assert RecordingAgentLoop.calls[-1].agent_id == "agent_xz"
 
     # 另一个群独立指针
-    assert process_inbound(binding, _group_message("evt_g3", "新群第一句", group_id="room_999"), db_engine=engine) is True
+    assert (
+        process_inbound(
+            binding, _group_message("evt_g3", "新群第一句", group_id="room_999"), db_engine=engine
+        )
+        is True
+    )
     assert RecordingAgentLoop.calls[-1].agent_id == "agent_xz"
 
 
@@ -420,7 +489,9 @@ def test_legacy_binding_routes_to_binding_default_agent() -> None:
 
 def test_pointer_reset_notice_when_agent_unmounted() -> None:
     engine = _test_engine()
-    binding_id = _seed_binding(engine, mounts=[("agent_xz", "行政", True), ("agent_cw", "财务", False)])
+    binding_id = _seed_binding(
+        engine, mounts=[("agent_xz", "行政", True), ("agent_cw", "财务", False)]
+    )
     binding = _load_binding(engine, binding_id)
 
     # 切到财务后,把财务从挂载集移除
@@ -605,9 +676,7 @@ def test_delete_agent_cleans_channel_mounts_and_repoints_default() -> None:
         )
         db.add(binding)
         db.flush()
-        for index, (agent_id, is_default) in enumerate(
-            (("agent_cw", True), ("agent_xz", False))
-        ):
+        for index, (agent_id, is_default) in enumerate((("agent_cw", True), ("agent_xz", False))):
             db.add(
                 ChannelBindingAgent(
                     tenant_id="tenant_demo",
@@ -622,7 +691,7 @@ def test_delete_agent_cleans_channel_mounts_and_repoints_default() -> None:
 
     client = _make_agents_client(engine)
     deleted = client.delete(
-        f"/api/enterprise/agents/agent_cw?tenant_id=tenant_demo",
+        "/api/enterprise/agents/agent_cw?tenant_id=tenant_demo",
         headers=_auth(users["owner"]),
     )
     assert deleted.status_code == 200
@@ -671,7 +740,7 @@ def test_delete_agent_last_mount_keeps_binding_agent() -> None:
 
     client = _make_agents_client(engine)
     deleted = client.delete(
-        f"/api/enterprise/agents/agent_cw?tenant_id=tenant_demo",
+        "/api/enterprise/agents/agent_cw?tenant_id=tenant_demo",
         headers=_auth(users["owner"]),
     )
     assert deleted.status_code == 200

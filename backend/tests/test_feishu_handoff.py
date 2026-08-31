@@ -20,6 +20,7 @@ from app.db.models import (
     User,
     utc_now,
 )
+from app.i18n.language_context import LanguageContext, LocaleResolutionSource
 
 
 class FakeEvents:
@@ -884,9 +885,7 @@ def test_agent_loop_notify_routes_declared_channel_to_matching_binding() -> None
             channel_binding_id="binding_wecom",
         )
         db.add(session)
-        db.add(
-            _pending_handoff(metadata={"assignee_notify_channel": "feishu"})
-        )
+        db.add(_pending_handoff(metadata={"assignee_notify_channel": "feishu"}))
         db.commit()
 
         recorder = _RecordingOutbox()
@@ -896,9 +895,11 @@ def test_agent_loop_notify_routes_declared_channel_to_matching_binding() -> None
         outbox_mod.notify_handoff_assignee = recorder
         try:
             loop, chat_session = _loop_with_session(db, session)
-            loop._maybe_notify_handoff_assignee("tenant_demo", chat_session, _pending_handoff(
-                metadata={"assignee_notify_channel": "feishu"}
-            ))
+            loop._maybe_notify_handoff_assignee(
+                "tenant_demo",
+                chat_session,
+                _pending_handoff(metadata={"assignee_notify_channel": "feishu"}),
+            )
         finally:
             outbox_mod.notify_handoff_assignee = original
 
@@ -936,9 +937,11 @@ def test_agent_loop_notify_prefers_session_binding_when_channel_matches() -> Non
         outbox_mod.notify_handoff_assignee = recorder
         try:
             loop, chat_session = _loop_with_session(db, session)
-            loop._maybe_notify_handoff_assignee("tenant_demo", chat_session, _pending_handoff(
-                metadata={"assignee_notify_channel": "wecom"}
-            ))
+            loop._maybe_notify_handoff_assignee(
+                "tenant_demo",
+                chat_session,
+                _pending_handoff(metadata={"assignee_notify_channel": "wecom"}),
+            )
         finally:
             outbox_mod.notify_handoff_assignee = original
 
@@ -946,7 +949,7 @@ def test_agent_loop_notify_prefers_session_binding_when_channel_matches() -> Non
 
 
 def test_agent_loop_notify_skips_web_preference_and_missing_binding() -> None:
-    """"web" 偏好仅网页收件箱;指定渠道租户内无 active 绑定时跳过且不抛错。"""
+    """ "web" 偏好仅网页收件箱;指定渠道租户内无 active 绑定时跳过且不抛错。"""
     engine = _test_engine()
     with Session(engine) as db:
         _seed_tenant(db)
@@ -969,11 +972,15 @@ def test_agent_loop_notify_skips_web_preference_and_missing_binding() -> None:
         try:
             loop, chat_session = _loop_with_session(db, session)
             loop._maybe_notify_handoff_assignee(
-                "tenant_demo", chat_session, _pending_handoff(metadata={"assignee_notify_channel": "web"})
+                "tenant_demo",
+                chat_session,
+                _pending_handoff(metadata={"assignee_notify_channel": "web"}),
             )
             # 租户内无 feishu active 绑定:静默跳过,不调用 notify
             loop._maybe_notify_handoff_assignee(
-                "tenant_demo", chat_session, _pending_handoff(metadata={"assignee_notify_channel": "feishu"})
+                "tenant_demo",
+                chat_session,
+                _pending_handoff(metadata={"assignee_notify_channel": "feishu"}),
             )
         finally:
             outbox_mod.notify_handoff_assignee = original
@@ -1008,7 +1015,9 @@ def test_agent_loop_notify_default_uses_session_binding_when_supported() -> None
         outbox_mod.notify_handoff_assignee = recorder
         try:
             loop, chat_session = _loop_with_session(db, session)
-            loop._maybe_notify_handoff_assignee("tenant_demo", chat_session, _pending_handoff(metadata={}))
+            loop._maybe_notify_handoff_assignee(
+                "tenant_demo", chat_session, _pending_handoff(metadata={})
+            )
         finally:
             outbox_mod.notify_handoff_assignee = original
 
@@ -1191,10 +1200,12 @@ def _seed_handoff_reply_scenario(
 ) -> tuple[ChannelBinding, HumanHandoffRequest, ChannelInbound, object]:
     binding = _feishu_binding()
     db.add(binding)
-    db.add(_channel_identity(
-        external_user_id=sender_open_id,
-        staffdeck_user_id=sender_staffdeck_user_id,
-    ))
+    db.add(
+        _channel_identity(
+            external_user_id=sender_open_id,
+            staffdeck_user_id=sender_staffdeck_user_id,
+        )
+    )
     session = ChatSession(
         id="session_demo",
         tenant_id="tenant_demo",
@@ -1208,21 +1219,23 @@ def _seed_handoff_reply_scenario(
     db.add(session)
     db.add(handoff)
     # 模拟 handoff_notice 已投递成功,有对应 ChannelDelivery
-    db.add(ChannelDelivery(
-        tenant_id="tenant_demo",
-        binding_id=binding.id,
-        session_id=f"handoff:{handoff.id}",
-        message_id=notify_message_id,
-        kind="handoff_notice",
-        text="通知",
-        target_json={
-            "receive_id_type": "open_id",
-            "receive_id": notice_receive_id,
-            "handoff_id": handoff.id,
-        },
-        status="delivered",
-        idempotency_key="notice_k",
-    ))
+    db.add(
+        ChannelDelivery(
+            tenant_id="tenant_demo",
+            binding_id=binding.id,
+            session_id=f"handoff:{handoff.id}",
+            message_id=notify_message_id,
+            kind="handoff_notice",
+            text="通知",
+            target_json={
+                "receive_id_type": "open_id",
+                "receive_id": notice_receive_id,
+                "handoff_id": handoff.id,
+            },
+            status="delivered",
+            idempotency_key="notice_k",
+        )
+    )
     db.commit()
     inbound = _inbound(
         event_id="om_reply_1",
@@ -1263,7 +1276,10 @@ def test_try_handle_feishu_handoff_reply_matches_and_answers_handoff(monkeypatch
             monkeypatch.setattr(chat_api, "_apply_handoff_reply", fake_apply)
 
             handled = _try_handle_feishu_handoff_reply(
-                db, binding, inbound, event,
+                db,
+                binding,
+                inbound,
+                event,
                 {"receive_id_type": "open_id", "receive_id": "ou_assignee"},
             )
             assert handled is True
@@ -1411,20 +1427,22 @@ def test_try_handle_feishu_handoff_reply_consumes_reply_to_ack_message(monkeypat
         handoff.human_reply = "首次答复"
         db.add(handoff)
         # 确认消息已投递,处理人转而引用它继续补充
-        db.add(ChannelDelivery(
-            tenant_id="tenant_demo",
-            binding_id=binding.id,
-            session_id=f"handoff:{handoff.id}",
-            message_id="om_ack_1",
-            kind="handoff_ack",
-            text="已收到你的回复",
-            target_json={
-                "receive_id_type": "open_id",
-                "receive_id": "ou_assignee",
-            },
-            status="delivered",
-            idempotency_key="ack_k",
-        ))
+        db.add(
+            ChannelDelivery(
+                tenant_id="tenant_demo",
+                binding_id=binding.id,
+                session_id=f"handoff:{handoff.id}",
+                message_id="om_ack_1",
+                kind="handoff_ack",
+                text="已收到你的回复",
+                target_json={
+                    "receive_id_type": "open_id",
+                    "receive_id": "ou_assignee",
+                },
+                status="delivered",
+                idempotency_key="ack_k",
+            )
+        )
         db.commit()
         inbound = _inbound(
             event_id="om_reply_ack",
@@ -1486,21 +1504,23 @@ def test_process_inbound_quote_reply_without_prefix_answers_handoff(monkeypatch)
         )
         db.add(session)
         db.add(handoff)
-        db.add(ChannelDelivery(
-            tenant_id="tenant_demo",
-            binding_id=binding.id,
-            session_id=f"handoff:{handoff.id}",
-            message_id="om_notice_e2e",
-            kind="handoff_notice",
-            text="通知",
-            target_json={
-                "receive_id_type": "open_id",
-                "receive_id": "ou_assignee",
-                "handoff_id": handoff.id,
-            },
-            status="delivered",
-            idempotency_key="notice_e2e",
-        ))
+        db.add(
+            ChannelDelivery(
+                tenant_id="tenant_demo",
+                binding_id=binding.id,
+                session_id=f"handoff:{handoff.id}",
+                message_id="om_notice_e2e",
+                kind="handoff_notice",
+                text="通知",
+                target_json={
+                    "receive_id_type": "open_id",
+                    "receive_id": "ou_assignee",
+                    "handoff_id": handoff.id,
+                },
+                status="delivered",
+                idempotency_key="notice_e2e",
+            )
+        )
         db.commit()
 
         original = intake_mod.external_account_scope
@@ -1552,9 +1572,7 @@ def test_process_inbound_quote_reply_without_prefix_answers_handoff(monkeypatch)
             from app.db.models import ChannelInboundEvent
 
             events = db.exec(
-                select(ChannelInboundEvent).where(
-                    ChannelInboundEvent.event_id == "om_reply_e2e"
-                )
+                select(ChannelInboundEvent).where(ChannelInboundEvent.event_id == "om_reply_e2e")
             ).all()
             assert [e.status for e in events] == ["done"]
         finally:
@@ -1589,21 +1607,23 @@ def test_process_inbound_quote_reply_to_answered_notice_consumes_without_new_ses
         handoff.human_reply = "首次答复"
         db.add(session)
         db.add(handoff)
-        db.add(ChannelDelivery(
-            tenant_id="tenant_demo",
-            binding_id=binding.id,
-            session_id=f"handoff:{handoff.id}",
-            message_id="om_notice_e2e",
-            kind="handoff_notice",
-            text="通知",
-            target_json={
-                "receive_id_type": "open_id",
-                "receive_id": "ou_assignee",
-                "handoff_id": handoff.id,
-            },
-            status="delivered",
-            idempotency_key="notice_e2e",
-        ))
+        db.add(
+            ChannelDelivery(
+                tenant_id="tenant_demo",
+                binding_id=binding.id,
+                session_id=f"handoff:{handoff.id}",
+                message_id="om_notice_e2e",
+                kind="handoff_notice",
+                text="通知",
+                target_json={
+                    "receive_id_type": "open_id",
+                    "receive_id": "ou_assignee",
+                    "handoff_id": handoff.id,
+                },
+                status="delivered",
+                idempotency_key="notice_e2e",
+            )
+        )
         db.commit()
 
         original = intake_mod.external_account_scope
@@ -1841,43 +1861,51 @@ def test_run_handoff_reply_command_rejects_multiple_pending(monkeypatch) -> None
         binding = _feishu_binding()
         db.add(binding)
         db.add(_channel_identity())
-        db.add(ChatSession(
-            id="session_old",
-            tenant_id="tenant_demo",
-            agent_id="agent_demo",
-            status="handoff",
-        ))
-        db.add(ChatSession(
-            id="session_new",
-            tenant_id="tenant_demo",
-            agent_id="agent_demo",
-            status="handoff",
-        ))
+        db.add(
+            ChatSession(
+                id="session_old",
+                tenant_id="tenant_demo",
+                agent_id="agent_demo",
+                status="handoff",
+            )
+        )
+        db.add(
+            ChatSession(
+                id="session_new",
+                tenant_id="tenant_demo",
+                agent_id="agent_demo",
+                status="handoff",
+            )
+        )
         old_time = utc_now()
         new_time = old_time + timedelta(seconds=10)
-        db.add(_pending_handoff(
-            handoff_id="handoff_old",
-            session_id="session_old",
-        ).__class__(  # 重建以设 created_at
-            id="handoff_old",
-            tenant_id="tenant_demo",
-            session_id="session_old",
-            agent_id="agent_demo",
-            assignee_user_id="assignee_user",
-            pending_question="旧问题",
-            status="pending",
-            created_at=old_time,
-        ))
-        db.add(HumanHandoffRequest(
-            id="handoff_new",
-            tenant_id="tenant_demo",
-            session_id="session_new",
-            agent_id="agent_demo",
-            assignee_user_id="assignee_user",
-            pending_question="新问题",
-            status="pending",
-            created_at=new_time,
-        ))
+        db.add(
+            _pending_handoff(
+                handoff_id="handoff_old",
+                session_id="session_old",
+            ).__class__(  # 重建以设 created_at
+                id="handoff_old",
+                tenant_id="tenant_demo",
+                session_id="session_old",
+                agent_id="agent_demo",
+                assignee_user_id="assignee_user",
+                pending_question="旧问题",
+                status="pending",
+                created_at=old_time,
+            )
+        )
+        db.add(
+            HumanHandoffRequest(
+                id="handoff_new",
+                tenant_id="tenant_demo",
+                session_id="session_new",
+                agent_id="agent_demo",
+                assignee_user_id="assignee_user",
+                pending_question="新问题",
+                status="pending",
+                created_at=new_time,
+            )
+        )
         db.commit()
 
         inbound = _inbound(event_id="om_hr_5", text="/回复反馈 解决了")
@@ -1949,42 +1977,50 @@ def test_run_handoff_reply_command_matches_by_parent_id(monkeypatch) -> None:
         binding = _feishu_binding()
         db.add(binding)
         db.add(_channel_identity())
-        db.add(ChatSession(
-            id="session_p1",
-            tenant_id="tenant_demo",
-            agent_id="agent_demo",
-            status="handoff",
-        ))
-        db.add(ChatSession(
-            id="session_p2",
-            tenant_id="tenant_demo",
-            agent_id="agent_demo",
-            status="handoff",
-        ))
+        db.add(
+            ChatSession(
+                id="session_p1",
+                tenant_id="tenant_demo",
+                agent_id="agent_demo",
+                status="handoff",
+            )
+        )
+        db.add(
+            ChatSession(
+                id="session_p2",
+                tenant_id="tenant_demo",
+                agent_id="agent_demo",
+                status="handoff",
+            )
+        )
         old_time = utc_now()
         new_time = old_time + timedelta(seconds=10)
-        db.add(HumanHandoffRequest(
-            id="handoff_p1",
-            tenant_id="tenant_demo",
-            session_id="session_p1",
-            agent_id="agent_demo",
-            assignee_user_id="assignee_user",
-            pending_question="旧问题",
-            status="pending",
-            notify_message_id="om_notice_1",
-            created_at=old_time,
-        ))
-        db.add(HumanHandoffRequest(
-            id="handoff_p2",
-            tenant_id="tenant_demo",
-            session_id="session_p2",
-            agent_id="agent_demo",
-            assignee_user_id="assignee_user",
-            pending_question="新问题",
-            status="pending",
-            notify_message_id="om_notice_2",
-            created_at=new_time,
-        ))
+        db.add(
+            HumanHandoffRequest(
+                id="handoff_p1",
+                tenant_id="tenant_demo",
+                session_id="session_p1",
+                agent_id="agent_demo",
+                assignee_user_id="assignee_user",
+                pending_question="旧问题",
+                status="pending",
+                notify_message_id="om_notice_1",
+                created_at=old_time,
+            )
+        )
+        db.add(
+            HumanHandoffRequest(
+                id="handoff_p2",
+                tenant_id="tenant_demo",
+                session_id="session_p2",
+                agent_id="agent_demo",
+                assignee_user_id="assignee_user",
+                pending_question="新问题",
+                status="pending",
+                notify_message_id="om_notice_2",
+                created_at=new_time,
+            )
+        )
         db.add(
             ChannelDelivery(
                 tenant_id="tenant_demo",
@@ -2038,19 +2074,23 @@ def test_run_handoff_reply_command_matches_by_parent_id(monkeypatch) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_apply_handoff_reply_records_source_feishu() -> None:
+def test_apply_handoff_reply_records_source_feishu(monkeypatch) -> None:
+    import app.api.chat as chat_api
     from app.api.chat import _apply_handoff_reply
     from app.db.models import AgentEvent
 
+    monkeypatch.setattr(chat_api, "_resume_human_handoff_async", lambda _handoff_id: None)
     engine = _test_engine()
     with Session(engine) as db:
         _seed_tenant(db)
-        db.add(ChatSession(
-            id="session_src",
-            tenant_id="tenant_demo",
-            agent_id="agent_demo",
-            status="handoff",
-        ))
+        db.add(
+            ChatSession(
+                id="session_src",
+                tenant_id="tenant_demo",
+                agent_id="agent_demo",
+                status="handoff",
+            )
+        )
         db.add(_pending_handoff(handoff_id="handoff_src", session_id="session_src"))
         db.commit()
 
@@ -2068,19 +2108,23 @@ def test_apply_handoff_reply_records_source_feishu() -> None:
         assert events[0].payload_json["source"] == "feishu"
 
 
-def test_apply_handoff_reply_records_source_web_by_default() -> None:
+def test_apply_handoff_reply_records_source_web_by_default(monkeypatch) -> None:
+    import app.api.chat as chat_api
     from app.api.chat import _apply_handoff_reply
     from app.db.models import AgentEvent
 
+    monkeypatch.setattr(chat_api, "_resume_human_handoff_async", lambda _handoff_id: None)
     engine = _test_engine()
     with Session(engine) as db:
         _seed_tenant(db)
-        db.add(ChatSession(
-            id="session_src2",
-            tenant_id="tenant_demo",
-            agent_id="agent_demo",
-            status="handoff",
-        ))
+        db.add(
+            ChatSession(
+                id="session_src2",
+                tenant_id="tenant_demo",
+                agent_id="agent_demo",
+                status="handoff",
+            )
+        )
         db.add(_pending_handoff(handoff_id="handoff_src2", session_id="session_src2"))
         db.commit()
 
@@ -2095,3 +2139,103 @@ def test_apply_handoff_reply_records_source_web_by_default() -> None:
         ).all()
         assert len(events) == 1
         assert events[0].payload_json["source"] == "web"
+
+
+def test_feishu_handoff_notice_carries_bound_language_snapshot_and_raw_context() -> None:
+    """Persist the handoff locale snapshot while leaving the question and context raw."""
+    from app.channels.service_outbox import notify_handoff_assignee
+
+    context = LanguageContext(
+        ui_locale="zh-CN",
+        agent_reply_locale="en-US",
+        ui_locale_source=LocaleResolutionSource.EXPLICIT_REQUEST,
+        agent_reply_locale_source=LocaleResolutionSource.EXPLICIT_REQUEST,
+    )
+    expected_snapshot = context.model_dump(mode="json")
+
+    engine = _test_engine()
+    with Session(engine) as db:
+        _seed_tenant(db)
+        binding = _feishu_binding()
+        db.add(binding)
+        db.add(_channel_identity(external_user_id="ou_assignee"))
+        handoff = _pending_handoff()
+        handoff.language_context_json = expected_snapshot
+        db.add(handoff)
+        db.commit()
+
+        notify_handoff_assignee(
+            db,
+            binding,
+            handoff,
+            "网络故障 SKU-A/42",
+            "user: 保留 /kb/C-42.md 原文",
+        )
+
+        delivery = db.exec(
+            select(ChannelDelivery).where(ChannelDelivery.kind == "handoff_notice")
+        ).one()
+        assert delivery.language_context_json == expected_snapshot
+        assert "[Human handoff]" in delivery.text
+        assert "Issue:" in delivery.text
+        assert "网络故障 SKU-A/42" in delivery.text
+        assert "保留 /kb/C-42.md 原文" in delivery.text
+        assert "问题:" not in delivery.text
+
+
+def test_feishu_handoff_reply_ack_reuses_snapshot_after_ui_switch_and_keeps_raw_reply(
+    monkeypatch,
+) -> None:
+    """Use the handoff snapshot for a quoted reply even after binding UI preferences change."""
+    import app.api.chat as chat_api
+    import app.channels.service_intake as intake_mod
+    from app.channels.service_intake import _try_handle_feishu_handoff_reply
+
+    context = LanguageContext(
+        ui_locale="zh-CN",
+        agent_reply_locale="en-US",
+        ui_locale_source=LocaleResolutionSource.EXPLICIT_REQUEST,
+        agent_reply_locale_source=LocaleResolutionSource.EXPLICIT_REQUEST,
+    )
+    expected_snapshot = context.model_dump(mode="json")
+    raw_reply = "已修复网络 SKU-A/42；保留 /kb/C-42.md 原文"
+
+    engine = _test_engine()
+    with Session(engine) as db:
+        _seed_tenant(db)
+        binding, handoff, inbound, event = _seed_handoff_reply_scenario(db)
+        handoff.language_context_json = expected_snapshot
+        event.language_context_json = expected_snapshot
+        binding.config_json = {
+            "ui_locale": "en-US",
+            "agent_reply_locale": "zh-CN",
+        }
+        inbound.text = raw_reply
+        db.add_all([binding, handoff, event])
+        db.commit()
+
+        resumed: list[tuple[str, str, str]] = []
+
+        def fake_apply(db_arg, row, reply, *, answered_by_user_id, source="web"):
+            """Record the raw handoff answer without starting the resume worker."""
+            row.status = "answered"
+            row.human_reply = reply
+            db_arg.add(row)
+            db_arg.commit()
+            resumed.append((row.id, reply, source))
+
+        monkeypatch.setattr(chat_api, "_apply_handoff_reply", fake_apply)
+        original_scope = intake_mod.external_account_scope
+        intake_mod.external_account_scope = lambda _db, _binding: ""
+        try:
+            assert _try_handle_feishu_handoff_reply(db, binding, inbound, event, {}) is True
+        finally:
+            intake_mod.external_account_scope = original_scope
+
+        ack = db.exec(select(ChannelDelivery).where(ChannelDelivery.kind == "handoff_ack")).one()
+        assert resumed == [(handoff.id, raw_reply, "feishu")]
+        assert handoff.human_reply == raw_reply
+        assert ack.language_context_json == expected_snapshot
+        assert raw_reply in ack.text
+        assert "We received your reply and are resuming SOP execution." in ack.text
+        assert "已收到你的回复" not in ack.text

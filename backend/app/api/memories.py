@@ -1,15 +1,20 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Query
 from sqlmodel import Session, select
 
+from app.contracts.http import build_http_exception
 from app.db import get_session
 from app.db.models import AgentProfile, ChatSession, MemoryRecord, User
-from app.memory.service import memory_agent_id, memory_matches_agent, memory_read, memory_rows_for_read
+from app.memory.service import (
+    memory_agent_id,
+    memory_matches_agent,
+    memory_read,
+    memory_rows_for_read,
+)
 from app.security.auth import get_current_user, require_current_tenant
 from app.security.permissions import agent_owned_by_user, is_admin_user
 from app.security.tenant import ensure_tenant
-
 
 router = APIRouter(prefix="/api/enterprise/memories", tags=["enterprise:memories"])
 
@@ -61,7 +66,7 @@ def clear_my_memories(
     db: Session = Depends(get_session),
 ) -> dict:
     if tenant_id != current_user.tenant_id:
-        raise HTTPException(status_code=403, detail="Tenant mismatch")
+        raise build_http_exception("TENANT_MISMATCH")
     ensure_tenant(db, tenant_id)
     rows = list(
         db.exec(
@@ -104,7 +109,7 @@ def _can_view_all_memories(
         return False
     agent = db.get(AgentProfile, agent_id)
     if not agent or agent.tenant_id != tenant_id:
-        raise HTTPException(status_code=404, detail="Agent not found")
+        raise build_http_exception("MEMORY_AGENT_NOT_FOUND")
     return agent_owned_by_user(agent, current_user)
 
 

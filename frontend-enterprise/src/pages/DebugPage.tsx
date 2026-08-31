@@ -1,3 +1,5 @@
+/** Agent 调试页：产品 chrome 由语义 i18n 投影，用户输入与执行诊断保持 raw。 */
+
 import { SendOutlined } from '../icons';
 import { useState } from 'react';
 import {
@@ -11,20 +13,59 @@ import {
   CardHeader,
   CardTitle,
   Input,
-  notify,
 } from '@/components/ui';
+import { createToastNotifier } from '@/components/ui/app-toast';
+import { createMessageDescriptor, type MessageDescriptor } from '@/i18n/descriptors';
+import { RawContent } from '@/i18n/RawContent';
+import { useAppIntl } from '@/i18n/useAppIntl';
+import type { MessageId } from '@/i18n/types';
+import { backendErrorMessageDescriptor } from '@/lib/apiErrorMessages';
 import { api, TENANT_ID } from '../api/client';
 import type { ChatTurnResponse } from '../types';
 
 type ChatMessage = { role: 'user' | 'assistant'; content: string };
 
+const DEBUG_MESSAGE_IDS = {
+  titleId: 'knowledgePage.cards.searchDebugTitle',
+  sessionId: 'scheduledTasksPage.column.session',
+  inputId: 'chat.composer.placeholder',
+  sendId: 'common.action.send',
+  snapshotId: 'chat.trace.executionRecord',
+  routerId: 'chat.trace.router',
+  stepId: 'chat.trace.nextStep',
+  toolId: 'chat.trace.toolResult',
+  sessionStateId: 'chat.dialog.contextSummary',
+  replyFailedId: 'chat.error.replyFailed',
+} as const satisfies Record<string, MessageId>;
+
+/** 将后端错误收窄为稳定的 toast descriptor，未知异常只走安全的本地化 fallback。 */
+function debugErrorDescriptor(error: unknown): MessageDescriptor {
+  const descriptor = backendErrorMessageDescriptor(error);
+  return descriptor
+    ? { id: descriptor.messageId, values: descriptor.values }
+    : createMessageDescriptor(DEBUG_MESSAGE_IDS.replyFailedId);
+}
+
+/** 将调试对象序列化为只读 raw 诊断文本；序列化失败时返回空值而不伪造产品文案。 */
+function serializeDebugPayload(value: unknown): string {
+  try {
+    return JSON.stringify(value, null, 2) ?? '';
+  } catch {
+    return '';
+  }
+}
+
+/** 渲染 Agent 调试页；副作用仅限提交调试请求与显示安全 toast。 */
 export default function DebugPage() {
+  const { t } = useAppIntl();
+  const toast = createToastNotifier({ t });
   const [sessionId, setSessionId] = useState('');
   const [input, setInput] = useState('');
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [lastTurn, setLastTurn] = useState<ChatTurnResponse | null>(null);
   const [loading, setLoading] = useState(false);
 
+  /** 提交调试消息并保存服务端返回的会话、回复和 raw 诊断快照。 */
   async function send() {
     if (!input.trim()) return;
     const userText = input;
@@ -44,7 +85,8 @@ export default function DebugPage() {
       setLastTurn(result);
       setMessages((items) => [...items, { role: 'assistant', content: result.reply }]);
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '发送失败');
+      console.error('[debug-page] turn failed', error);
+      toast.error(debugErrorDescriptor(error));
     } finally {
       setLoading(false);
     }
@@ -53,12 +95,12 @@ export default function DebugPage() {
   return (
     <>
       <div className="page-title">
-        <h3>Agent 调试</h3>
+        <h3>{t(DEBUG_MESSAGE_IDS.titleId)}</h3>
         <Input
           className="page-field w-[240px]"
           value={sessionId}
           onChange={(event) => setSessionId(event.target.value)}
-          placeholder="Session ID"
+          placeholder={t(DEBUG_MESSAGE_IDS.sessionId)}
         />
       </div>
       <div className="grid-2">
@@ -68,7 +110,7 @@ export default function DebugPage() {
               <div className="messages">
                 {messages.map((item, index) => (
                   <div key={`${item.role}-${index}`} className={`message-row ${item.role}`}>
-                    <div className="bubble">{item.content}</div>
+                    <div className="bubble"><RawContent value={item.content} /></div>
                   </div>
                 ))}
               </div>
@@ -82,11 +124,11 @@ export default function DebugPage() {
                       void send();
                     }
                   }}
-                  placeholder="输入调试消息"
+                  placeholder={t(DEBUG_MESSAGE_IDS.inputId)}
                 />
                 <Button disabled={loading} onClick={() => void send()}>
                   <SendOutlined />
-                  发送
+                  {t(DEBUG_MESSAGE_IDS.sendId)}
                 </Button>
               </div>
             </div>
@@ -94,25 +136,25 @@ export default function DebugPage() {
         </Card>
         <Card>
           <CardHeader>
-            <CardTitle>Trace Snapshot</CardTitle>
+            <CardTitle>{t(DEBUG_MESSAGE_IDS.snapshotId)}</CardTitle>
           </CardHeader>
           <CardContent>
             <Accordion type="multiple" defaultValue={['router', 'session']}>
               <AccordionItem value="router">
-                <AccordionTrigger>Router Decision</AccordionTrigger>
-                <AccordionContent><pre>{JSON.stringify(lastTurn?.router_decision, null, 2)}</pre></AccordionContent>
+                <AccordionTrigger>{t(DEBUG_MESSAGE_IDS.routerId)}</AccordionTrigger>
+                <AccordionContent><pre><RawContent value={serializeDebugPayload(lastTurn?.router_decision)} /></pre></AccordionContent>
               </AccordionItem>
               <AccordionItem value="step">
-                <AccordionTrigger>Step Agent</AccordionTrigger>
-                <AccordionContent><pre>{JSON.stringify(lastTurn?.step_result, null, 2)}</pre></AccordionContent>
+                <AccordionTrigger>{t(DEBUG_MESSAGE_IDS.stepId)}</AccordionTrigger>
+                <AccordionContent><pre><RawContent value={serializeDebugPayload(lastTurn?.step_result)} /></pre></AccordionContent>
               </AccordionItem>
               <AccordionItem value="tool">
-                <AccordionTrigger>Tool Result</AccordionTrigger>
-                <AccordionContent><pre>{JSON.stringify(lastTurn?.tool_result, null, 2)}</pre></AccordionContent>
+                <AccordionTrigger>{t(DEBUG_MESSAGE_IDS.toolId)}</AccordionTrigger>
+                <AccordionContent><pre><RawContent value={serializeDebugPayload(lastTurn?.tool_result)} /></pre></AccordionContent>
               </AccordionItem>
               <AccordionItem value="session">
-                <AccordionTrigger>Session State</AccordionTrigger>
-                <AccordionContent><pre>{JSON.stringify(lastTurn?.session_state, null, 2)}</pre></AccordionContent>
+                <AccordionTrigger>{t(DEBUG_MESSAGE_IDS.sessionStateId)}</AccordionTrigger>
+                <AccordionContent><pre><RawContent value={serializeDebugPayload(lastTurn?.session_state)} /></pre></AccordionContent>
               </AccordionItem>
             </Accordion>
           </CardContent>

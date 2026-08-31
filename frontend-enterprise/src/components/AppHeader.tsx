@@ -22,6 +22,7 @@ import {
 } from '../auth';
 import LanguageSwitcher from './LanguageSwitcher';
 import AccountApiKeyDialog from './AccountApiKeyDialog';
+import { useAppIntl } from '../i18n/useAppIntl';
 
 /** 只允许 http/https/data:image/blob 协议的图片地址,其余一律视为无效。 */
 function safeImageUrl(value: string): string {
@@ -77,6 +78,7 @@ export default function AppHeader({
   userName,
   className,
 }: AppHeaderProps) {
+  const { t } = useAppIntl();
   const [user, setUser] = useState(() => getEnterpriseAuthSession()?.user);
   const [uploadPreviewUrl, setUploadPreviewUrl] = useState('');
   const uploadPreviewUrlRef = useRef('');
@@ -165,7 +167,7 @@ export default function AppHeader({
     }
   }
 
-  // 选图即传:本地预览乐观渲染,成功后刷新会话;失败回滚并提示
+  /** 选图即传：本地预览乐观渲染，成功后刷新会话；失败保留服务端原始错误或使用本地兜底。 */
   async function pickAvatar(file: File | null) {
     if (!file || avatarSaving) return;
     clearUploadPreview();
@@ -182,29 +184,30 @@ export default function AppHeader({
         headers: session?.token ? { Authorization: `Bearer ${session.token}` } : {},
         body: form,
       });
-      if (!response.ok) throw new Error('上传头像失败');
-      notify.success('头像已更新');
+      if (!response.ok) throw new Error(t('shell.account.avatarUploadFailed'));
+      notify.success(t('shell.account.avatarUpdated'));
       await refreshSessionUser();
       // 覆盖上传时指针字符串不变,effect 不会重触发,显式重拉头像字节
       await loadAvatar();
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '上传头像失败');
+      notify.error(error instanceof Error ? error.message : t('shell.account.avatarUploadFailed'));
     } finally {
       setAvatarSaving(false);
       clearUploadPreview();
     }
   }
 
+  /** 删除当前用户头像并刷新认证快照；服务端原始错误不做翻译。 */
   async function removeAvatar() {
     if (avatarSaving) return;
     setAvatarSaving(true);
     try {
       await api.delete('/api/auth/me/avatar');
-      notify.success('头像已移除');
+      notify.success(t('shell.account.avatarRemoved'));
       await refreshSessionUser();
       await loadAvatar();
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '移除头像失败');
+      notify.error(error instanceof Error ? error.message : t('shell.account.avatarRemoveFailed'));
     } finally {
       setAvatarSaving(false);
     }
@@ -231,7 +234,7 @@ export default function AppHeader({
         {right !== undefined ? right : (
           <DropdownMenu>
             <DropdownMenuTrigger
-              aria-label="账户菜单"
+              aria-label={t('shell.account.menu')}
               className="flex h-[32px] shrink-0 items-center gap-[8px] rounded-[10px] pl-[4px] pr-[8px] outline-none"
             >
               <span className="grid size-[32px] shrink-0 place-items-center overflow-hidden rounded-full bg-[#eef1fb] text-[14px] font-medium leading-none text-[#7e96dc]">
@@ -254,8 +257,8 @@ export default function AppHeader({
                       <div className="relative shrink-0">
                         <button
                           type="button"
-                          title="更换头像"
-                          aria-label="更换头像"
+                          title={t('shell.account.changeAvatar')}
+                          aria-label={t('shell.account.changeAvatar')}
                           onClick={() => {
                             // 打开文件对话框前清空 input,确保重复选择同一文件也能触发 onChange
                             if (fileInputRef.current) fileInputRef.current.value = '';
@@ -310,7 +313,7 @@ export default function AppHeader({
                               : 'bg-[#f2f3f7] text-[#858b9c]',
                           )}
                         >
-                          {isAdmin ? '管理员' : '成员'}
+                          {isAdmin ? t('shell.account.roleAdmin') : t('shell.account.roleMember')}
                         </span>
                         {user.avatar_url && (
                           <button
@@ -319,7 +322,7 @@ export default function AppHeader({
                             disabled={avatarSaving}
                             className="text-[11px] text-[#a0a8bd] transition-colors hover:text-[#d20b0b] disabled:opacity-50"
                           >
-                            移除头像
+                            {t('shell.account.removeAvatar')}
                           </button>
                         )}
                       </div>
@@ -339,7 +342,7 @@ export default function AppHeader({
                   className="h-[36px] cursor-pointer gap-2 rounded-[10px] px-[12px] text-[14px] text-[#464C5E]"
                 >
                   <KeyRound className="size-[16px]" />
-                  API 全量密钥
+                  {t('shell.account.fullApiKey')}
                 </DropdownMenuItem>
               )}
               <DropdownMenuItem
@@ -347,7 +350,7 @@ export default function AppHeader({
                 className="h-[36px] cursor-pointer gap-2 rounded-[10px] px-[12px] text-[14px] text-[#464C5E]"
               >
                 <IconLogout className="size-[16px]" />
-                退出登录
+                {t('shell.account.logout')}
               </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>

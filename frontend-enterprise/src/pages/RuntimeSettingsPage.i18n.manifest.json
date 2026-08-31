@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "canonicalLocale": "en-US",
+  "supportedLocales": ["en-US", "zh-CN"],
+  "sourceFiles": ["src/pages/RuntimeSettingsPage.tsx"],
+  "messages": {
+    "runtimeSettings.sandbox.backendLabel": {"en-US": "Runtime: ", "zh-CN": "运行时：", "params": {}},
+    "runtimeSettings.sandbox.remediation.rootUser": {"en-US": "Run StaffDeck under a dedicated non-root service account, then restart it.", "zh-CN": "请使用独立的非 root 服务账号运行 StaffDeck，然后重启。", "params": {}},
+    "runtimeSettings.sandbox.remediation.runtimeUnavailable": {"en-US": "Install or repair a supported sandbox runtime, then restart StaffDeck.", "zh-CN": "请安装或修复受支持的沙盒运行时，然后重启 StaffDeck。", "params": {}},
+    "runtimeSettings.sandbox.remediation.unsandboxedFallback": {"en-US": "The sandbox is unavailable and execution is running without OS-level isolation. Configure a signed Windows runtime or an isolated host.", "zh-CN": "沙盒不可用，执行正在无操作系统级隔离的模式下运行。请配置已签名的 Windows 运行时或隔离主机。", "params": {}},
+    "runtimeSettings.sandbox.remediation.userNamespacesDisabled": {"en-US": "Enable Linux user namespaces for the service account, then restart StaffDeck.", "zh-CN": "请为服务账号启用 Linux user namespace，然后重启 StaffDeck。", "params": {}},
+    "runtimeSettings.sandbox.remediation.windowsSetupRequired": {"en-US": "Initialize the Windows sandbox with administrator permissions before restarting StaffDeck.", "zh-CN": "请先使用管理员权限初始化 Windows 沙盒，再重启 StaffDeck。", "params": {}},
+    "runtimeSettings.sandbox.setup.commandLabel": {"en-US": "Administrator command:", "zh-CN": "管理员命令：", "params": {}},
+    "runtimeSettings.sandbox.setup.windowsRequired": {"en-US": "An administrator must initialize the Windows sandbox. Run the command below, confirm UAC, then restart StaffDeck.", "zh-CN": "需要管理员初始化 Windows 沙盒。请执行下方命令，确认 UAC 后重启 StaffDeck。", "params": {}}
+  }
+}

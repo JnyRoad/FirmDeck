@@ -225,7 +225,6 @@ class SharedKnowledgeVersionService:
             raise knowledge_error(
                 KNOWLEDGE_MODE_INVALID,
                 message="共享知识库正式版本或已驳回版本不可修改。",
-                details={"knowledge_base_version_id": version.id},
             )
         return version
 
@@ -479,7 +478,6 @@ class SharedKnowledgeVersionService:
             raise knowledge_error(
                 KNOWLEDGE_MODE_INVALID,
                 message="只能回滚到同一共享知识库的正式版本。",
-                details={"target_version_id": target_version_id},
             )
         reason = _required_reason(change_reason)
         now = utc_now()

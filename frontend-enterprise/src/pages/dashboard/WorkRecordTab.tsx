@@ -1,6 +1,8 @@
 import { Fragment, useMemo, useState } from 'react';
 import type { ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { RawContent } from '@/i18n/RawContent';
+import { useAppIntl } from '@/i18n/useAppIntl';
 
 import { HoverCard, HoverCardContent, HoverCardTrigger } from '../../components/ui/hover-card';
 import { Popover, PopoverContent, PopoverTrigger } from '../../components/ui/popover';
@@ -29,13 +31,185 @@ import type {
   ToolRead,
 } from '../../types';
 
-const TIMELINE_MODES = [
-  { key: 'day', label: 'Day' },
-  { key: 'week', label: 'Week' },
-  { key: 'month', label: 'Month' },
-] as const;
-type TimelineMode = (typeof TIMELINE_MODES)[number]['key'];
-const TIMELINE_WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+function buildWorkRecordCopy(
+  translate: ReturnType<typeof useAppIntl>['t'],
+): {
+  metricConversations: string;
+  metricFeedback: string;
+  metricPositiveRate: string;
+  metricNegativeRate: string;
+  growthTitle: string;
+  noGrowth: string;
+  titleKnowledge: string;
+  titleGeneralSkills: string;
+  titleSop: string;
+  titleTools: string;
+  titleScheduledTasks: string;
+  titleLogs: string;
+  emptyKnowledge: string;
+  emptyGeneralSkills: string;
+  emptySop: string;
+  emptyTools: string;
+  emptyTasks: string;
+  emptyLogs: string;
+  timelineDay: string;
+  timelineWeek: string;
+  timelineMonth: string;
+  previousPeriod: string;
+  nextPeriod: string;
+  previousPage: string;
+  nextPage: string;
+  noDayActivity: string;
+  noWeekActivity: string;
+  moreItems: (count: number) => string;
+  collapse: string;
+  totalCount: (count: number, unit: string) => string;
+  weekdayLong: string[];
+  weekdayShort: string[];
+  trackChat: string;
+  unitChat: string;
+  trackTask: string;
+  unitTask: string;
+  trackSop: string;
+  unitSop: string;
+  trackTool: string;
+  unitTool: string;
+  trackKnowledge: string;
+  unitKnowledge: string;
+  trackSkill: string;
+  unitSkill: string;
+  chatCountLabel: (count: number) => string;
+  trackOverflow: (count: number) => string;
+  shortcutToday: string;
+  shortcutYesterday: string;
+  shortcutThisWeek: string;
+  shortcutLastWeek: string;
+  shortcutThisMonth: string;
+  shortcutLastMonth: string;
+  monthDayFirst: (month: number) => string;
+  dayChatCount: (count: number) => string;
+  addedSopPrefix: string;
+  addedToolPrefix: string;
+  addedKnowledgePrefix: string;
+  addedSkillPrefix: string;
+  growthSopEvolved: string;
+  growthSopCreated: string;
+  growthSopEvolvedDesc: (from: string, to: string) => string;
+  growthSopCreatedDesc: (version: string) => string;
+  growthGeneralSkillUpgraded: string;
+  growthGeneralSkillCreated: string;
+  growthGeneralSkillUpgradedDesc: string;
+  growthGeneralSkillCreatedDesc: (slug: string) => string;
+  growthToolCreated: string;
+  growthToolBucketFallback: string;
+  growthToolDesc: (bucket: string, toolType: string) => string;
+} {
+  return {
+    metricConversations: translate('dashboard.workRecord.metric.conversations'),
+    metricFeedback: translate('dashboard.workRecord.metric.feedback'),
+    metricPositiveRate: translate('dashboard.workRecord.metric.positiveRate'),
+    metricNegativeRate: translate('dashboard.workRecord.metric.negativeRate'),
+    growthTitle: translate('dashboard.workRecord.growth.title'),
+    noGrowth: translate('dashboard.workRecord.growth.empty'),
+    titleKnowledge: translate('dashboard.workRecord.card.knowledge.title'),
+    titleGeneralSkills: translate('dashboard.workRecord.card.generalSkills.title'),
+    titleSop: translate('dashboard.workRecord.card.sop.title'),
+    titleTools: translate('dashboard.workRecord.card.tools.title'),
+    titleScheduledTasks: translate('dashboard.workRecord.card.scheduledTasks.title'),
+    titleLogs: translate('dashboard.workRecord.card.logs.title'),
+    emptyKnowledge: translate('dashboard.workRecord.card.knowledge.empty'),
+    emptyGeneralSkills: translate('dashboard.workRecord.card.generalSkills.empty'),
+    emptySop: translate('dashboard.workRecord.card.sop.empty'),
+    emptyTools: translate('dashboard.workRecord.card.tools.empty'),
+    emptyTasks: translate('dashboard.workRecord.card.scheduledTasks.empty'),
+    emptyLogs: translate('dashboard.workRecord.card.logs.empty'),
+    timelineDay: translate('dashboard.workRecord.timeline.mode.day'),
+    timelineWeek: translate('dashboard.workRecord.timeline.mode.week'),
+    timelineMonth: translate('dashboard.workRecord.timeline.mode.month'),
+    previousPeriod: translate('dashboard.workRecord.timeline.previousPeriod'),
+    nextPeriod: translate('dashboard.workRecord.timeline.nextPeriod'),
+    previousPage: translate('dashboard.workRecord.timeline.previousPage'),
+    nextPage: translate('dashboard.workRecord.timeline.nextPage'),
+    noDayActivity: translate('dashboard.workRecord.timeline.empty.day'),
+    noWeekActivity: translate('dashboard.workRecord.timeline.empty.week'),
+    moreItems: (count) => translate('dashboard.workRecord.timeline.moreItems', { count }),
+    collapse: translate('dashboard.workRecord.timeline.collapse'),
+    totalCount: (count, unit) => translate('dashboard.workRecord.timeline.totalCount', { count, unit }),
+    weekdayLong: [
+      translate('dashboard.workRecord.weekday.long.sun'),
+      translate('dashboard.workRecord.weekday.long.mon'),
+      translate('dashboard.workRecord.weekday.long.tue'),
+      translate('dashboard.workRecord.weekday.long.wed'),
+      translate('dashboard.workRecord.weekday.long.thu'),
+      translate('dashboard.workRecord.weekday.long.fri'),
+      translate('dashboard.workRecord.weekday.long.sat'),
+    ],
+    weekdayShort: [
+      translate('dashboard.workRecord.weekday.short.sun'),
+      translate('dashboard.workRecord.weekday.short.mon'),
+      translate('dashboard.workRecord.weekday.short.tue'),
+      translate('dashboard.workRecord.weekday.short.wed'),
+      translate('dashboard.workRecord.weekday.short.thu'),
+      translate('dashboard.workRecord.weekday.short.fri'),
+      translate('dashboard.workRecord.weekday.short.sat'),
+    ],
+    trackChat: translate('dashboard.workRecord.track.chat.label'),
+    unitChat: translate('dashboard.workRecord.track.chat.unit'),
+    trackTask: translate('dashboard.workRecord.track.task.label'),
+    unitTask: translate('dashboard.workRecord.track.task.unit'),
+    trackSop: translate('dashboard.workRecord.track.sop.label'),
+    unitSop: translate('dashboard.workRecord.track.sop.unit'),
+    trackTool: translate('dashboard.workRecord.track.tool.label'),
+    unitTool: translate('dashboard.workRecord.track.tool.unit'),
+    trackKnowledge: translate('dashboard.workRecord.track.knowledge.label'),
+    unitKnowledge: translate('dashboard.workRecord.track.knowledge.unit'),
+    trackSkill: translate('dashboard.workRecord.track.skill.label'),
+    unitSkill: translate('dashboard.workRecord.track.skill.unit'),
+    chatCountLabel: (count) => translate('dashboard.workRecord.track.chatCountLabel', { count }),
+    trackOverflow: (count) => translate('dashboard.workRecord.track.overflow', { count }),
+    shortcutToday: translate('dashboard.workRecord.picker.shortcut.today'),
+    shortcutYesterday: translate('dashboard.workRecord.picker.shortcut.yesterday'),
+    shortcutThisWeek: translate('dashboard.workRecord.picker.shortcut.thisWeek'),
+    shortcutLastWeek: translate('dashboard.workRecord.picker.shortcut.lastWeek'),
+    shortcutThisMonth: translate('dashboard.workRecord.picker.shortcut.thisMonth'),
+    shortcutLastMonth: translate('dashboard.workRecord.picker.shortcut.lastMonth'),
+    monthDayFirst: (month) => translate('dashboard.workRecord.picker.monthDayFirst', { month }),
+    dayChatCount: (count) => translate('dashboard.workRecord.activity.dayChatCount', { count }),
+    addedSopPrefix: translate('dashboard.workRecord.activity.addedSopPrefix'),
+    addedToolPrefix: translate('dashboard.workRecord.activity.addedToolPrefix'),
+    addedKnowledgePrefix: translate('dashboard.workRecord.activity.addedKnowledgePrefix'),
+    addedSkillPrefix: translate('dashboard.workRecord.activity.addedSkillPrefix'),
+    growthSopEvolved: translate('dashboard.workRecord.growth.sop.evolved'),
+    growthSopCreated: translate('dashboard.workRecord.growth.sop.created'),
+    growthSopEvolvedDesc: (from, to) => translate('dashboard.workRecord.growth.sop.evolvedDesc', { from, to }),
+    growthSopCreatedDesc: (version) => translate('dashboard.workRecord.growth.sop.createdDesc', { version }),
+    growthGeneralSkillUpgraded: translate('dashboard.workRecord.growth.generalSkill.upgraded'),
+    growthGeneralSkillCreated: translate('dashboard.workRecord.growth.generalSkill.created'),
+    growthGeneralSkillUpgradedDesc: translate('dashboard.workRecord.growth.generalSkill.upgradedDesc'),
+    growthGeneralSkillCreatedDesc: (slug) => translate('dashboard.workRecord.growth.generalSkill.createdDesc', { slug }),
+    growthToolCreated: translate('dashboard.workRecord.growth.tool.created'),
+    growthToolBucketFallback: translate('dashboard.workRecord.growth.tool.bucketFallback'),
+    growthToolDesc: (bucket, toolType) => translate('dashboard.workRecord.growth.tool.description', { bucket, toolType }),
+  };
+}
+
+type WorkRecordCopy = ReturnType<typeof buildWorkRecordCopy>;
+
+const TIMELINE_MODES = ['day', 'week', 'month'] as const;
+type TimelineMode = (typeof TIMELINE_MODES)[number];
+
+/** 返回工作记录页的本地语义文案；catalog 写入前先在文件内集中维护。 */
+function useWorkRecordCopy(): WorkRecordCopy {
+  const { t } = useAppIntl();
+  return buildWorkRecordCopy(t);
+}
+
+/** 返回时间线模式按钮文案，避免 day/week/month 常量直接暴露到最终 UI。 */
+function timelineModeLabel(mode: TimelineMode, copy: WorkRecordCopy): string {
+  if (mode === 'day') return copy.timelineDay;
+  if (mode === 'week') return copy.timelineWeek;
+  return copy.timelineMonth;
+}
 
 type GrowthEvent = {
   id: string;
@@ -92,84 +266,92 @@ export default function WorkRecordTab({
   positiveRate,
   negativeRate,
 }: WorkRecordTabProps) {
+  const { locale } = useAppIntl();
+  const copy = useWorkRecordCopy();
   const navigate = useNavigate();
   const goToLogs = () => navigate(`/enterprise/feedback?agent_id=${encodeURIComponent(selectedAgent.id)}`);
 
   const capabilityCards = [
     {
       route: '/enterprise/knowledge',
-      title: '知识库',
+      title: copy.titleKnowledge,
       tone: 'knowledge',
       count: activeKnowledge.length,
-      body: activeKnowledge.slice(0, 3).map((item) => staffdeckDisplayText(item.name)).join(' / ') || '暂无知识库',
+      body: activeKnowledge.slice(0, 3).map((item) => staffdeckDisplayText(item.name)).join(' / '),
+      emptyBody: copy.emptyKnowledge,
       icon: <IconCapFolder className={capabilityGlyphClass} />,
       dark: false,
     },
     {
       route: '/enterprise/general-skills',
-      title: '技能',
+      title: copy.titleGeneralSkills,
       tone: 'skill',
       count: activeGeneralSkills.length,
-      body: activeGeneralSkills.slice(0, 3).map((item) => staffdeckDisplayText(item.name)).join(' / ') || '暂无启用技能',
+      body: activeGeneralSkills.slice(0, 3).map((item) => staffdeckDisplayText(item.name)).join(' / '),
+      emptyBody: copy.emptyGeneralSkills,
       icon: <IconCapMagicWand className={capabilityGlyphClass} />,
       dark: false,
     },
     {
       route: '/enterprise/skills',
-      title: 'SOP',
+      title: copy.titleSop,
       tone: 'sop',
       count: activeSkills.length,
-      body: activeSkills.slice(0, 3).map((item) => staffdeckDisplayText(item.name)).join(' / ') || '暂无启用 SOP',
+      body: activeSkills.slice(0, 3).map((item) => staffdeckDisplayText(item.name)).join(' / '),
+      emptyBody: copy.emptySop,
       icon: <IconCapClipboard className={capabilityGlyphClass} />,
       dark: false,
     },
     {
       route: '/enterprise/tools',
-      title: '工具',
+      title: copy.titleTools,
       tone: 'tools',
       count: activeTools.length,
-      body: activeTools.slice(0, 3).map((item) => staffdeckDisplayText(item.display_name || item.name)).join(' / ') || '暂无启用工具',
+      body: activeTools.slice(0, 3).map((item) => staffdeckDisplayText(item.display_name || item.name)).join(' / '),
+      emptyBody: copy.emptyTools,
       icon: <IconCapBriefcase className={capabilityGlyphClass} />,
       dark: true,
       illustration: capabilityTools,
     },
     {
       route: '/enterprise/scheduled-tasks',
-      title: '定时任务',
+      title: copy.titleScheduledTasks,
       tone: 'tasks',
       count: activeScheduledTasks.length,
-      body: activeScheduledTasks.slice(0, 2).map((item) => staffdeckDisplayText(item.title)).join(' / ') || '暂无启用定时任务',
+      body: activeScheduledTasks.slice(0, 2).map((item) => staffdeckDisplayText(item.title)).join(' / '),
+      emptyBody: copy.emptyTasks,
       icon: <IconProfileAlarm className={capabilityGlyphClass} />,
       dark: true,
       illustration: capabilityTasks,
     },
     {
       route: `/enterprise/feedback?agent_id=${encodeURIComponent(selectedAgent.id)}`,
-      title: '对话日志',
+      title: copy.titleLogs,
       tone: 'logs',
       count: conversationCount,
-      body: staffdeckDisplayText(employeeSessions[0]?.summary || employeeSessions[0]?.last_agent_question || '暂无对话任务'),
+      body: staffdeckDisplayText(employeeSessions[0]?.summary || employeeSessions[0]?.last_agent_question || ''),
+      emptyBody: copy.emptyLogs,
       icon: <IconProfileCalendar className={capabilityGlyphClass} />,
       dark: true,
       illustration: capabilityLogs,
     },
   ];
 
-  const growthItems = growthTimeline(activeSkills, activeGeneralSkills, activeTools);
+  const growthItems = growthTimeline(activeSkills, activeGeneralSkills, activeTools, copy);
 
   return (
     <section className="relative flex w-full min-w-0 max-w-full mt-[-2px] flex-col gap-[24px] overflow-hidden rounded-[18px] shadow-[0_20px_42px_rgba(21,26,38,0.045)] bg-white p-[14px] *:min-w-0 min-[521px]:p-[18px] in-data-[theme=dark]:border-[#343741] in-data-[theme=dark]:bg-[#202126] in-data-[theme=dark]:text-[#f0f2f6]">
       <div className="flex w-full items-stretch gap-[16px]">
-        <ClickableMetric label="对话次数" value={conversationCount} onClick={goToLogs} />
-        <ClickableMetric label="反馈次数" value={feedbackCount} onClick={goToLogs} />
-        <ClickableMetric label="好评率" value={positiveRate} suffix="%" tone="positive" onClick={goToLogs} />
-        <ClickableMetric label="差评率" value={negativeRate} suffix="%" tone="negative" onClick={goToLogs} />
+        <ClickableMetric label={copy.metricConversations} value={conversationCount} onClick={goToLogs} />
+        <ClickableMetric label={copy.metricFeedback} value={feedbackCount} onClick={goToLogs} />
+        <ClickableMetric label={copy.metricPositiveRate} value={positiveRate} suffix="%" tone="positive" onClick={goToLogs} />
+        <ClickableMetric label={copy.metricNegativeRate} value={negativeRate} suffix="%" tone="negative" onClick={goToLogs} />
       </div>
       <ActivityTimeline events={activityEvents} />
       <div className="flex w-full min-w-0 max-w-full flex-col gap-[10px] mt-[20px]">
         <div className="inline-flex items-center gap-[6px] self-start text-[14px] capitalize leading-none text-[#757f9c] in-data-[theme=dark]:text-[#8b93a6]">
           <IconGrowthArrow className="size-[14px] shrink-0" />
-          成长记录
+          {copy.growthTitle}
         </div>
         {growthItems.length ? (
           <div className="relative w-full min-w-0 max-w-full overflow-x-auto">
@@ -193,7 +375,7 @@ export default function WorkRecordTab({
             </div>
           </div>
         ) : (
-          <div className="employee-memory-empty">暂无成长轨迹</div>
+          <div className="employee-memory-empty">{copy.noGrowth}</div>
         )}
       </div>
       <div className="w-full min-w-0 max-w-full overflow-x-auto">
@@ -217,7 +399,9 @@ export default function WorkRecordTab({
                 <span className={capabilityBarClass}><span className={capabilityBarFillClass} /></span>
               </span>
             </span>
-            <span className={capabilityDescClass}>{item.body}</span>
+              <span className={capabilityDescClass}>
+                {item.body ? <RawContent value={item.body} /> : item.emptyBody}
+              </span>
             {item.illustration && (
               <img
                 className="pointer-events-none absolute bottom-0 left-1/2 h-[84px] w-[120px] -translate-x-1/2 object-contain object-bottom"
@@ -293,50 +477,53 @@ type TimelineTrackConfig = {
   bar: string;
 };
 
-const TIMELINE_TRACKS: TimelineTrackConfig[] = [
-  {
-    key: 'chat',
-    label: '对话',
-    unit: '次对话',
-    dot: ACTIVITY_DOT.chat,
-    bar: 'bg-[#e8f0ff] in-data-[theme=dark]:bg-[#1d2c47]',
-  },
-  {
-    key: 'task',
-    label: '定时任务',
-    unit: '个任务',
-    dot: ACTIVITY_DOT.task,
-    bar: 'bg-[#fff1e3] in-data-[theme=dark]:bg-[#3a2c1a]',
-  },
-  {
-    key: 'sop',
-    label: '新增SOP',
-    unit: '个 SOP',
-    dot: ACTIVITY_DOT.sop,
-    bar: 'bg-[#e9f7ef] in-data-[theme=dark]:bg-[#173a29]',
-  },
-  {
-    key: 'tool',
-    label: '新增工具',
-    unit: '个工具',
-    dot: ACTIVITY_DOT.tool,
-    bar: 'bg-[#f1ecff] in-data-[theme=dark]:bg-[#2c2544]',
-  },
-  {
-    key: 'knowledge',
-    label: '新增知识',
-    unit: '个知识',
-    dot: ACTIVITY_DOT.knowledge,
-    bar: 'bg-[#e2f6f9] in-data-[theme=dark]:bg-[#123037]',
-  },
-  {
-    key: 'skill',
-    label: '新增技能',
-    unit: '个技能',
-    dot: ACTIVITY_DOT.skill,
-    bar: 'bg-[#fde8f1] in-data-[theme=dark]:bg-[#3d1e2e]',
-  },
-];
+/** 为时间线轨道生成 locale 感知的标签和单位。 */
+function timelineTracks(copy: WorkRecordCopy): TimelineTrackConfig[] {
+  return [
+    {
+      key: 'chat',
+      label: copy.trackChat,
+      unit: copy.unitChat,
+      dot: ACTIVITY_DOT.chat,
+      bar: 'bg-[#e8f0ff] in-data-[theme=dark]:bg-[#1d2c47]',
+    },
+    {
+      key: 'task',
+      label: copy.trackTask,
+      unit: copy.unitTask,
+      dot: ACTIVITY_DOT.task,
+      bar: 'bg-[#fff1e3] in-data-[theme=dark]:bg-[#3a2c1a]',
+    },
+    {
+      key: 'sop',
+      label: copy.trackSop,
+      unit: copy.unitSop,
+      dot: ACTIVITY_DOT.sop,
+      bar: 'bg-[#e9f7ef] in-data-[theme=dark]:bg-[#173a29]',
+    },
+    {
+      key: 'tool',
+      label: copy.trackTool,
+      unit: copy.unitTool,
+      dot: ACTIVITY_DOT.tool,
+      bar: 'bg-[#f1ecff] in-data-[theme=dark]:bg-[#2c2544]',
+    },
+    {
+      key: 'knowledge',
+      label: copy.trackKnowledge,
+      unit: copy.unitKnowledge,
+      dot: ACTIVITY_DOT.knowledge,
+      bar: 'bg-[#e2f6f9] in-data-[theme=dark]:bg-[#123037]',
+    },
+    {
+      key: 'skill',
+      label: copy.trackSkill,
+      unit: copy.unitSkill,
+      dot: ACTIVITY_DOT.skill,
+      bar: 'bg-[#fde8f1] in-data-[theme=dark]:bg-[#3d1e2e]',
+    },
+  ];
+}
 
 type DayActivity = { label: string; dot: string; time?: string };
 
@@ -345,15 +532,17 @@ type ActivityTimelineProps = {
 };
 
 function ActivityTimeline({ events }: ActivityTimelineProps) {
+  const copy = useWorkRecordCopy();
   const [mode, setMode] = useState<TimelineMode>('day');
   const [anchor, setAnchor] = useState<number>(() => startOfDay(new Date()).getTime());
+  const tracks = useMemo(() => timelineTracks(copy), [copy]);
 
   const eventsByTrack = useMemo(() => {
     const collect = (entries: Array<{ value?: string; name?: string }>) =>
       entries
         .map((entry) => ({ time: entry.value ? new Date(entry.value).getTime() : Number.NaN, name: entry.name || '' }))
         .filter((entry) => Number.isFinite(entry.time));
-    return TIMELINE_TRACKS.reduce<Record<string, TrackEvent[]>>((grouped, track) => {
+    return tracks.reduce<Record<string, TrackEvent[]>>((grouped, track) => {
       grouped[track.key] = collect(
         events
           .filter((item) => item.kind === track.key)
@@ -361,22 +550,22 @@ function ActivityTimeline({ events }: ActivityTimelineProps) {
       );
       return grouped;
     }, {});
-  }, [events]);
+  }, [events, tracks]);
 
   const itemsByDay = useMemo(
-    () => (mode === 'month' || mode === 'week' ? buildDayActivities(events) : {}),
-    [events, mode],
+    () => (mode === 'month' || mode === 'week' ? buildDayActivities(events, copy) : {}),
+    [copy, events, mode],
   );
 
   const range = useMemo(() => timelineRange(mode, anchor), [mode, anchor]);
-  const ticks = useMemo(() => timelineTicks(mode, range), [mode, range]);
+  const ticks = useMemo(() => timelineTicks(mode, range, copy), [copy, mode, range]);
   const activeTracks = useMemo(
     () =>
-      TIMELINE_TRACKS.map((track) => ({
+      tracks.map((track) => ({
         track,
         segments: daySegments(eventsByTrack[track.key] || [], range),
       })).filter((item) => item.segments.length > 0),
-    [eventsByTrack, range],
+    [eventsByTrack, range, tracks],
   );
 
   const shift = (direction: number) => setAnchor((prev) => shiftAnchor(mode, prev, direction));
@@ -390,28 +579,28 @@ function ActivityTimeline({ events }: ActivityTimelineProps) {
       <div className="flex h-[36px] flex-wrap items-center justify-between gap-[12px]">
         <div className="flex items-center gap-[6px] text-[14px] text-[#858b9c] in-data-[theme=dark]:text-[#8b93a6]">
           <IconProfileCalendar className="size-[14px] shrink-0" />
-          {formatAnchorLabel(mode, range)}
+          {formatAnchorLabel(mode, range, copy)}
         </div>
         <div className="flex items-center gap-[24px] rounded-[8px] border border-[#e3e7f1] px-[12px] py-[8px] in-data-[theme=dark]:border-[#343741]">
           <button
             type="button"
             onClick={() => shift(-1)}
             className="flex size-[14px] items-center justify-center text-[#464c5e] transition-colors hover:text-[#18181a] in-data-[theme=dark]:text-[#c9cede]"
-            aria-label="上一个周期"
+            aria-label={copy.previousPeriod}
           >
             <TimelineChevron direction="left" />
           </button>
           <TimelineDatePicker
             mode={mode}
             anchor={anchor}
-            label={formatTimelineRange(mode, range)}
+            label={formatTimelineRange(mode, range, copy)}
             onPick={setAnchor}
           />
           <button
             type="button"
             onClick={() => shift(1)}
             className="flex size-[14px] items-center justify-center text-[#464c5e] transition-colors hover:text-[#18181a] in-data-[theme=dark]:text-[#c9cede]"
-            aria-label="下一个周期"
+            aria-label={copy.nextPeriod}
           >
             <TimelineChevron direction="right" />
           </button>
@@ -420,15 +609,15 @@ function ActivityTimeline({ events }: ActivityTimelineProps) {
           {TIMELINE_MODES.map((item) => (
             <button
               type="button"
-              key={item.key}
-              onClick={() => changeMode(item.key)}
+              key={item}
+              onClick={() => changeMode(item)}
               className={`flex w-[50px] items-center justify-center px-[8px] text-[12px] transition-colors ${
-                mode === item.key
+                mode === item
                   ? 'font-medium text-[#464c5e] in-data-[theme=dark]:text-[#f0f2f6]'
                   : 'text-[#757f9c] hover:text-[#464c5e] in-data-[theme=dark]:text-[#8b93a6]'
               }`}
             >
-              {item.label}
+              {timelineModeLabel(item, copy)}
             </button>
           ))}
         </div>
@@ -439,7 +628,7 @@ function ActivityTimeline({ events }: ActivityTimelineProps) {
       ) : mode === 'week' ? (
         <WeekCalendar anchor={anchor} itemsByDay={itemsByDay} />
       ) : activeTracks.length === 0 ? (
-        <TimelineEmptyState text="当日暂无活动记录" />
+        <TimelineEmptyState text={copy.noDayActivity} />
       ) : (
         <div className="flex min-h-[178px] w-full flex-col gap-[16px]">
           <div className="relative flex flex-1 w-full flex-col justify-center overflow-hidden rounded-[20px] px-[12px] py-[16px]">
@@ -452,7 +641,7 @@ function ActivityTimeline({ events }: ActivityTimelineProps) {
               {activeTracks.map(({ track, segments }) => (
                 <div key={track.key} className="relative h-[26px] w-full">
                   {segments.map((segment, segmentIndex) => {
-                    const label = trackBarLabel(track, segment);
+                    const label = trackBarLabel(track, segment, copy);
                     return (
                       <HoverCard key={segmentIndex} openDelay={120} closeDelay={80}>
                         <HoverCardTrigger asChild>
@@ -473,8 +662,7 @@ function ActivityTimeline({ events }: ActivityTimelineProps) {
                               {track.label}
                             </span>
                             <span className="text-[11px] text-[#858b9c]">
-                              共{segment.count}
-                              {track.unit}
+                              {copy.totalCount(segment.count, track.unit)}
                             </span>
                           </div>
                           <div className="flex flex-col gap-[4px]">
@@ -487,12 +675,14 @@ function ActivityTimeline({ events }: ActivityTimelineProps) {
                                   {formatHm(new Date(event.time))}
                                 </span>
                                 <span className="flex-1 break-words text-[#464c5e] in-data-[theme=dark]:text-[#c9cede]">
-                                  {event.name || track.label}
+                                  {event.name ? <RawContent value={event.name} /> : track.label}
                                 </span>
                               </div>
                             ))}
                             {segment.events.length > 12 && (
-                              <div className="text-[11px] text-[#858b9c]">…等{segment.events.length}项</div>
+                              <div className="text-[11px] text-[#858b9c]">
+                                {copy.trackOverflow(segment.events.length)}
+                              </div>
                             )}
                           </div>
                         </HoverCardContent>
@@ -537,6 +727,7 @@ function WeekCalendar({
   anchor: number;
   itemsByDay: Record<string, DayActivity[]>;
 }) {
+  const copy = useWorkRecordCopy();
   const weekStart = startOfWeek(new Date(anchor));
   const days = Array.from({ length: 7 }, (_, index) => {
     const date = new Date(weekStart);
@@ -549,7 +740,7 @@ function WeekCalendar({
 
   const hasActivity = days.some((date) => (itemsByDay[dateKey(date)] || []).length > 0);
   if (!hasActivity) {
-    return <TimelineEmptyState text="本周暂无活动记录" />;
+    return <TimelineEmptyState text={copy.noWeekActivity} />;
   }
 
   return (
@@ -606,7 +797,7 @@ function WeekCalendar({
                     className="flex items-center gap-[6px] rounded-[8px] p-[4px] text-left transition-colors hover:bg-[#f6f6f6] in-data-[theme=dark]:hover:bg-[#2b2d33]"
                   >
                     <span className="truncate text-[10px] leading-none text-[#757f9c] in-data-[theme=dark]:text-[#8b93a6]">
-                      还有{overflow}项
+                      {copy.moreItems(overflow)}
                     </span>
                   </button>
                 )}
@@ -617,7 +808,7 @@ function WeekCalendar({
                     className="flex items-center gap-[6px] rounded-[8px] p-[4px] text-left transition-colors hover:bg-[#f6f6f6] in-data-[theme=dark]:hover:bg-[#2b2d33]"
                   >
                     <span className="truncate text-[10px] leading-none text-[#757f9c] in-data-[theme=dark]:text-[#8b93a6]">
-                      收起
+                      {copy.collapse}
                     </span>
                   </button>
                 )}
@@ -637,6 +828,8 @@ function MonthCalendar({
   anchor: number;
   itemsByDay: Record<string, DayActivity[]>;
 }) {
+  const copy = useWorkRecordCopy();
+  const { locale } = useAppIntl();
   const weeks = monthCalendarWeeks(anchor);
   const month = new Date(anchor).getMonth();
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
@@ -644,7 +837,7 @@ function MonthCalendar({
   return (
     <div className="w-full overflow-hidden rounded-[20px] border border-[#eef1f7] in-data-[theme=dark]:border-[#2c2f38]">
       <div className="grid grid-cols-7">
-        {['周日', '周一', '周二', '周三', '周四', '周五', '周六'].map((day) => (
+        {copy.weekdayLong.map((day) => (
           <div
             key={day}
             className="px-[12px] py-[8px] text-[12px] leading-none text-[#757f9c] in-data-[theme=dark]:text-[#8b93a6]"
@@ -665,7 +858,9 @@ function MonthCalendar({
             const visible = isExpanded || items.length <= 4 ? items : items.slice(0, 3);
             const overflow = items.length - visible.length;
             const inMonth = date.getMonth() === month;
-            const dayLabel = date.getDate() === 1 ? `${date.getMonth() + 1}月1日` : `${date.getDate()}`;
+            const dayLabel = date.getDate() === 1
+              ? copy.monthDayFirst(date.getMonth() + 1)
+              : new Intl.NumberFormat(locale).format(date.getDate());
             return (
               <div
                 key={key}
@@ -705,7 +900,7 @@ function MonthCalendar({
                       className="flex items-center gap-[6px] rounded-[8px] p-[4px] text-left transition-colors hover:bg-[#f6f6f6] in-data-[theme=dark]:hover:bg-[#2b2d33]"
                     >
                       <span className="truncate text-[10px] leading-none text-[#757f9c] in-data-[theme=dark]:text-[#8b93a6]">
-                        还有{overflow}项
+                        {copy.moreItems(overflow)}
                       </span>
                     </button>
                   )}
@@ -716,7 +911,7 @@ function MonthCalendar({
                       className="flex items-center gap-[6px] rounded-[8px] p-[4px] text-left transition-colors hover:bg-[#f6f6f6] in-data-[theme=dark]:hover:bg-[#2b2d33]"
                     >
                       <span className="truncate text-[10px] leading-none text-[#757f9c] in-data-[theme=dark]:text-[#8b93a6]">
-                        收起
+                        {copy.collapse}
                       </span>
                     </button>
                   )}
@@ -784,10 +979,11 @@ function shiftAnchor(mode: TimelineMode, anchor: number, direction: number): num
 function trackBarLabel(
   track: TimelineTrackConfig,
   bar: { count: number; names: string[] },
+  copy: WorkRecordCopy,
 ): string {
-  if (track.key === 'chat') return `对话${bar.count}条`;
+  if (track.key === 'chat') return copy.chatCountLabel(bar.count);
   if (!bar.names.length) return track.label;
-  const suffix = bar.names.length > 1 ? ` 等${bar.names.length}项` : '';
+  const suffix = bar.names.length > 1 ? copy.trackOverflow(bar.names.length) : '';
   return `${track.label} ${bar.names[0]}${suffix}`;
 }
 
@@ -829,14 +1025,14 @@ function daySegments(events: TrackEvent[], range: { start: number; end: number }
   }));
 }
 
-function timelineTicks(mode: TimelineMode, range: { start: number; end: number }): string[] {
+function timelineTicks(mode: TimelineMode, range: { start: number; end: number }, copy: WorkRecordCopy): string[] {
   if (mode === 'day') {
     return Array.from({ length: 13 }, (_, index) => formatHour(index * 2));
   }
   if (mode === 'week') {
     return Array.from({ length: 7 }, (_, index) => {
       const date = new Date(range.start + index * 24 * 60 * 60 * 1000);
-      return `${TIMELINE_WEEKDAYS[date.getDay()]} ${date.getDate()}`;
+      return `${copy.weekdayLong[date.getDay()]} ${date.getDate()}`;
     });
   }
   const start = new Date(range.start);
@@ -861,7 +1057,7 @@ function formatTimelineDate(date: Date): string {
   return `${date.getFullYear()}/${month}/${day}`;
 }
 
-function formatTimelineRange(mode: TimelineMode, range: { start: number; end: number }): string {
+function formatTimelineRange(mode: TimelineMode, range: { start: number; end: number }, _copy: WorkRecordCopy): string {
   const start = new Date(range.start);
   if (mode === 'day') return formatTimelineDate(start);
   const last = new Date(range.end - 24 * 60 * 60 * 1000);
@@ -881,6 +1077,7 @@ function TimelineDatePicker({
   label: string;
   onPick: (ms: number) => void;
 }) {
+  const copy = useWorkRecordCopy();
   const [open, setOpen] = useState(false);
   const [viewDate, setViewDate] = useState(() => new Date(anchor));
 
@@ -902,17 +1099,17 @@ function TimelineDatePicker({
   const shortcuts: { label: string; date: Date }[] =
     mode === 'day'
       ? [
-          { label: '今天', date: now },
-          { label: '昨天', date: new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1) },
+          { label: copy.shortcutToday, date: now },
+          { label: copy.shortcutYesterday, date: new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1) },
         ]
       : mode === 'week'
         ? [
-            { label: '本周', date: now },
-            { label: '上周', date: new Date(now.getFullYear(), now.getMonth(), now.getDate() - 7) },
+            { label: copy.shortcutThisWeek, date: now },
+            { label: copy.shortcutLastWeek, date: new Date(now.getFullYear(), now.getMonth(), now.getDate() - 7) },
           ]
         : [
-            { label: '本月', date: now },
-            { label: '上月', date: new Date(now.getFullYear(), now.getMonth() - 1, 1) },
+            { label: copy.shortcutThisMonth, date: now },
+            { label: copy.shortcutLastMonth, date: new Date(now.getFullYear(), now.getMonth() - 1, 1) },
           ];
 
   return (
@@ -931,20 +1128,20 @@ function TimelineDatePicker({
             type="button"
             onClick={() => shiftView(mode === 'month' ? 0 : -1, mode === 'month' ? -1 : 0)}
             className="flex size-[24px] items-center justify-center rounded-[6px] text-[#464c5e] transition-colors hover:bg-[#f6f6f6] in-data-[theme=dark]:text-[#c9cede] in-data-[theme=dark]:hover:bg-[#2b2d33]"
-            aria-label="上一页"
+            aria-label={copy.previousPage}
           >
             <TimelineChevron direction="left" />
           </button>
           <span className="text-[13px] font-medium text-[#18181a] in-data-[theme=dark]:text-[#f0f2f6]">
             {mode === 'month'
-              ? `${viewDate.getFullYear()}年`
-              : `${viewDate.getFullYear()}年${viewDate.getMonth() + 1}月`}
+              ? String(viewDate.getFullYear())
+              : `${viewDate.getFullYear()}/${`${viewDate.getMonth() + 1}`.padStart(2, '0')}`}
           </span>
           <button
             type="button"
             onClick={() => shiftView(mode === 'month' ? 0 : 1, mode === 'month' ? 1 : 0)}
             className="flex size-[24px] items-center justify-center rounded-[6px] text-[#464c5e] transition-colors hover:bg-[#f6f6f6] in-data-[theme=dark]:text-[#c9cede] in-data-[theme=dark]:hover:bg-[#2b2d33]"
-            aria-label="下一页"
+            aria-label={copy.nextPage}
           >
             <TimelineChevron direction="right" />
           </button>
@@ -965,7 +1162,7 @@ function TimelineDatePicker({
                       : 'text-[#464c5e] hover:bg-[#f6f6f6] in-data-[theme=dark]:text-[#c9cede] in-data-[theme=dark]:hover:bg-[#2b2d33]'
                   }`}
                 >
-                  {index + 1}月
+                  {index + 1}
                 </button>
               );
             })}
@@ -973,9 +1170,9 @@ function TimelineDatePicker({
         ) : (
           <>
             <div className="grid grid-cols-7">
-              {['日', '一', '二', '三', '四', '五', '六'].map((day) => (
+              {copy.weekdayShort.map((day, index) => (
                 <span
-                  key={day}
+                  key={`${day}-${index}`}
                   className="flex size-[32px] items-center justify-center text-[11px] text-[#a7adbd] in-data-[theme=dark]:text-[#6b7080]"
                 >
                   {day}
@@ -1034,7 +1231,7 @@ function isSameDay(a: Date, b: Date): boolean {
   return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
 }
 
-function formatAnchorLabel(mode: TimelineMode, range: { start: number; end: number }): string {
+function formatAnchorLabel(mode: TimelineMode, range: { start: number; end: number }, _copy: WorkRecordCopy): string {
   const start = new Date(range.start);
   if (mode === 'month') return `${start.getFullYear()}/${`${start.getMonth() + 1}`.padStart(2, '0')}`;
   return formatTimelineDate(start);
@@ -1064,7 +1261,7 @@ function monthCalendarWeeks(anchor: number): Date[][] {
   return weeks;
 }
 
-function buildDayActivities(events: AgentWorkRecordEventRead[]): Record<string, DayActivity[]> {
+function buildDayActivities(events: AgentWorkRecordEventRead[], copy: WorkRecordCopy): Record<string, DayActivity[]> {
   const map: Record<string, DayActivity[]> = {};
   const push = (event: AgentWorkRecordEventRead, label: string) => {
     const date = new Date(event.timestamp);
@@ -1081,18 +1278,18 @@ function buildDayActivities(events: AgentWorkRecordEventRead[]): Record<string, 
     chatByDay[key] = (chatByDay[key] || 0) + 1;
   });
   Object.entries(chatByDay).forEach(([dayKey, count]) => {
-    (map[dayKey] ||= []).unshift({ label: `对话${count}条`, dot: ACTIVITY_DOT.chat });
+    (map[dayKey] ||= []).unshift({ label: copy.dayChatCount(count), dot: ACTIVITY_DOT.chat });
   });
 
   events.filter((item) => item.kind !== 'chat').forEach((item) => {
     const prefix = item.kind === 'sop'
-      ? '新增SOP '
+      ? copy.addedSopPrefix
       : item.kind === 'tool'
-        ? '新增工具 '
+        ? copy.addedToolPrefix
         : item.kind === 'knowledge'
-          ? '新增知识 '
+          ? copy.addedKnowledgePrefix
           : item.kind === 'skill'
-            ? '新增技能 '
+            ? copy.addedSkillPrefix
             : '';
     push(item, `${prefix}${staffdeckDisplayText(item.label)}`);
   });
@@ -1111,6 +1308,7 @@ function growthTimeline(
   sops: SkillRead[],
   generalSkills: GeneralSkillRead[],
   tools: ToolRead[],
+  copy: WorkRecordCopy,
 ): GrowthEvent[] {
   const events: GrowthEvent[] = [];
 
@@ -1118,11 +1316,14 @@ function growthTimeline(
     const evolved = Boolean(item.branch_head_version && item.branch_head_version !== item.branch_base_version);
     events.push({
       id: `sop-${item.id}`,
-      kind: evolved ? 'SOP 进化' : '新增 SOP',
+      kind: evolved ? copy.growthSopEvolved : copy.growthSopCreated,
       title: item.name,
       description: evolved
-        ? `本地版本从 ${item.branch_base_version || item.version} 进化到 ${item.branch_head_version || item.version}`
-        : `新增 ${item.version} 版业务流程`,
+        ? copy.growthSopEvolvedDesc(
+          item.branch_base_version || item.version,
+          item.branch_head_version || item.version,
+        )
+        : copy.growthSopCreatedDesc(item.version),
       timestamp: stableGrowthTimestamp(item),
       icon: <StaffdeckIcon name="filter" />,
       tone: 'mint',
@@ -1133,9 +1334,11 @@ function growthTimeline(
     const upgraded = isMeaningfullyUpdated(item.created_at, item.updated_at);
     events.push({
       id: `general-${item.id}`,
-      kind: upgraded ? '技能升级' : '新增技能',
+      kind: upgraded ? copy.growthGeneralSkillUpgraded : copy.growthGeneralSkillCreated,
       title: item.name,
-      description: upgraded ? '技能说明、权限或运行配置有更新' : `新增 ${item.slug} 通用能力`,
+      description: upgraded
+        ? copy.growthGeneralSkillUpgradedDesc
+        : copy.growthGeneralSkillCreatedDesc(item.slug),
       timestamp: stableGrowthTimestamp(item),
       icon: <StaffdeckIcon name="spark" />,
       tone: 'teal',
@@ -1145,9 +1348,12 @@ function growthTimeline(
   tools.forEach((item) => {
     events.push({
       id: `tool-${item.id}`,
-      kind: '新增工具',
+      kind: copy.growthToolCreated,
       title: item.display_name || item.name,
-      description: `${item.bucket || '工具'} · ${item.tool_type.toUpperCase()} 调用能力`,
+      description: copy.growthToolDesc(
+        item.bucket || copy.growthToolBucketFallback,
+        item.tool_type.toUpperCase(),
+      ),
       timestamp: stableGrowthTimestamp(item),
       icon: <StaffdeckIcon name="tool" />,
       tone: 'green',

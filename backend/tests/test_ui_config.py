@@ -188,9 +188,11 @@ def test_ui_config_read_fails_closed_for_unknown_network_policy(
     assert result.sandbox_backend == "srt"
 
 
-def test_windows_setup_prompt_is_based_on_backend_host(
+def test_windows_setup_contract_is_based_on_backend_host(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Return stable Windows setup codes and keep the administrator command raw."""
+
     monkeypatch.setattr(ui_config_module.sys, "platform", "win32")
     monkeypatch.setattr(
         ui_config_module,
@@ -212,8 +214,51 @@ def test_windows_setup_prompt_is_based_on_backend_host(
     result = ui_config_read(UIConfig(tenant_id="tenant_demo", sandbox_enabled=True))
 
     assert result.sandbox_setup_required is True
-    assert "PowerShell 或 CMD" in (result.sandbox_setup_instructions or "")
-    assert "node srt-cli.js windows-install" in (result.sandbox_setup_instructions or "")
+    assert result.sandbox_status_code == "SANDBOX_WINDOWS_SETUP_REQUIRED"
+    assert result.sandbox_status_params.backend == "srt"
+    assert result.sandbox_remediation_code == "SANDBOX_WINDOWS_SETUP_REQUIRED"
+    assert result.sandbox_setup_code == "SANDBOX_WINDOWS_SETUP_REQUIRED"
+    assert result.sandbox_setup_params is not None
+    assert result.sandbox_setup_params.command == "node srt-cli.js windows-install"
+
+
+def test_sandbox_diagnostics_use_codes_and_typed_raw_parameters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Expose sandbox diagnostics as stable codes without projecting diagnostic prose to the UI."""
+
+    monkeypatch.setattr(ui_config_module.sys, "platform", "win32")
+    monkeypatch.setattr(
+        ui_config_module,
+        "diagnostics",
+        lambda: SandboxDiagnostics(
+            status="unavailable",
+            code="SANDBOX_WINDOWS_SETUP_REQUIRED",
+            message="POISON_LOCALIZED_STATUS",
+            remediation="POISON_LOCALIZED_REMEDIATION",
+            backend="srt",
+        ),
+    )
+    monkeypatch.setattr(
+        ui_config_module,
+        "windows_install_command",
+        lambda: "/opt/staffdeck/node srt-cli.js windows-install",
+    )
+
+    result = ui_config_read(UIConfig(tenant_id="tenant_demo", sandbox_enabled=True))
+    payload = result.model_dump()
+
+    assert result.sandbox_status_code == "SANDBOX_WINDOWS_SETUP_REQUIRED"
+    assert result.sandbox_status_params.backend == "srt"
+    assert result.sandbox_remediation_code == "SANDBOX_WINDOWS_SETUP_REQUIRED"
+    assert result.sandbox_remediation_params.command == "/opt/staffdeck/node srt-cli.js windows-install"
+    assert result.sandbox_setup_code == "SANDBOX_WINDOWS_SETUP_REQUIRED"
+    assert result.sandbox_setup_params.command == "/opt/staffdeck/node srt-cli.js windows-install"
+    assert "POISON_LOCALIZED_STATUS" not in str(payload)
+    assert "POISON_LOCALIZED_REMEDIATION" not in str(payload)
+    assert "sandbox_status_message" not in payload
+    assert "sandbox_status_remediation" not in payload
+    assert "sandbox_setup_instructions" not in payload
 
 
 def test_sandbox_is_disabled_by_default_without_running_diagnostics(

@@ -1,17 +1,28 @@
 from __future__ import annotations
 
+import logging
 import time
 from collections import Counter
-from typing import Any
+from typing import Any, Final, TypedDict
 
 from sqlmodel import Session, select
 
-from app.db.models import AgentEvent, ChatSession, Message, MessageFeedback, ModelConfig, User, utc_now
+from app.db.models import (
+    AgentEvent,
+    ChatSession,
+    Message,
+    MessageFeedback,
+    ModelConfig,
+    User,
+    utc_now,
+)
 from app.llm import LLMClient, LLMError
 from app.llm.model_config_resolver import resolve_model_config_for_runtime
 from app.observability.spans import llm_operation
 
-
+# Product labels remain available only for the explicitly deprecated import
+# compatibility surface.  Canonical feedback projections below never read this
+# map; the enterprise client localizes stable bucket identifiers itself.
 FEEDBACK_BUCKET_LABELS: dict[str, str] = {
     "model_issue": "模型问题",
     "skill_issue": "技能问题",
@@ -29,9 +40,23 @@ FEEDBACK_BUCKET_LABELS: dict[str, str] = {
     "unknown": "未知",
 }
 
-ALLOWED_BUCKETS = set(FEEDBACK_BUCKET_LABELS)
+FEEDBACK_BUCKET_IDS: Final[frozenset[str]] = frozenset(FEEDBACK_BUCKET_LABELS)
+FEEDBACK_ANALYSIS_STATUS_IDS: Final[frozenset[str]] = frozenset(
+    {"pending", "analyzed", "failed", "needs_model", "unknown"}
+)
+ALLOWED_BUCKETS = set(FEEDBACK_BUCKET_IDS)
 FEEDBACK_ANALYSIS_MAX_ATTEMPTS = 3
 FEEDBACK_ANALYSIS_RETRY_DELAY_SECONDS = 0.6
+
+_LOGGER = logging.getLogger(__name__)
+
+
+class FeedbackSummaryDescriptor(TypedDict):
+    """Typed aggregate descriptor consumed by the localized feedback UI."""
+
+    bucket: str
+    params: dict[str, int]
+    detail: str | None
 
 FEEDBACK_ANALYSIS_PROMPT = """
 你是客服 Agent 质量分析器。请根据用户反馈、消息上下文和执行轨迹，判断反馈原因。
@@ -69,6 +94,7 @@ class FeedbackAnalysisService:
         self.db = db
 
     def analyze_feedback(self, feedback_id: str) -> MessageFeedback | None:
+        """Analyze one feedback row and persist only canonical identifiers plus raw model content."""
         feedback = self.db.get(MessageFeedback, feedback_id)
         if not feedback:
             return None
@@ -102,11 +128,12 @@ class FeedbackAnalysisService:
         return feedback
 
     def _default_model_config(self, tenant_id: str) -> ModelConfig | None:
+        """Resolve the enabled default model for a tenant, if one is configured."""
         row = self.db.exec(
             select(ModelConfig).where(
                 ModelConfig.tenant_id == tenant_id,
-                ModelConfig.is_default == True,  # noqa: E712
-                ModelConfig.enabled == True,  # noqa: E712
+                ModelConfig.is_default == True,
+                ModelConfig.enabled == True,
             )
         ).first()
         if row is None:
@@ -114,13 +141,14 @@ class FeedbackAnalysisService:
         return resolve_model_config_for_runtime(self.db, tenant_id, row.id)
 
     def _mark_needs_model(self, feedback: MessageFeedback) -> MessageFeedback:
+        """Persist a stable no-model state without writing a locale-specific fallback sentence."""
         analysis = {
             "bucket": "needs_model_analysis",
             "confidence": 0.0,
-            "reason": "没有可用默认模型，无法完成自动归因。",
-            "summary": "反馈已记录，等待配置模型后重新分析。",
+            "reason": "",
+            "summary": "",
             "evidence": [],
-            "suggested_action": "配置默认模型后重新触发分析。",
+            "suggested_action": "",
         }
         self._apply_analysis(feedback, analysis, "needs_model")
         self.db.add(feedback)
@@ -129,16 +157,21 @@ class FeedbackAnalysisService:
         return feedback
 
     def _mark_failed(self, feedback: MessageFeedback, exc: LLMError, attempts: int) -> None:
-        error_message = str(exc)[:300]
+        """Persist a retryable stable failure while retaining the exception only in private logs."""
+        _LOGGER.error(
+            "feedback analysis failed",
+            extra={"error_type": type(exc).__name__, "attempts": attempts},
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
         self._apply_analysis(
             feedback,
             {
                 "bucket": "unknown",
                 "confidence": None,
-                "reason": f"模型分析失败：{error_message}",
-                "summary": "反馈已记录，后台分析暂时失败，可重新分析。",
+                "reason": "",
+                "summary": "",
                 "evidence": [],
-                "suggested_action": "稍后重新分析。",
+                "suggested_action": "",
                 "error_type": "llm_error",
                 "retryable": True,
                 "attempts": attempts,
@@ -147,8 +180,9 @@ class FeedbackAnalysisService:
         )
 
     def _apply_analysis(self, feedback: MessageFeedback, analysis: dict[str, Any], status: str) -> None:
-        feedback.analysis_status = status
-        feedback.analysis_bucket = str(analysis.get("bucket") or "unknown")
+        """Persist canonical status/bucket identifiers while retaining normalized model fields."""
+        feedback.analysis_status = _canonical_feedback_status(status, default="unknown")
+        feedback.analysis_bucket = _canonical_feedback_bucket(analysis.get("bucket"))
         feedback.analysis_reason = str(analysis.get("reason") or "")[:300]
         feedback.analysis_summary = str(analysis.get("summary") or "")[:500]
         confidence = analysis.get("confidence")
@@ -158,6 +192,7 @@ class FeedbackAnalysisService:
         feedback.updated_at = utc_now()
 
     def _analysis_payload(self, feedback: MessageFeedback) -> dict[str, Any]:
+        """Build the model input from feedback context without localizing or rewriting source content."""
         message = self.db.get(Message, feedback.message_id)
         chat_session = self.db.get(ChatSession, feedback.session_id)
         user = self.db.get(User, feedback.user_id)
@@ -225,43 +260,57 @@ class FeedbackAnalysisService:
 
 
 def feedback_analysis_read(row: MessageFeedback) -> dict[str, Any]:
-    bucket = row.analysis_bucket or "unknown"
+    """Project one feedback row using stable IDs, typed params, and raw model-owned fields."""
+    bucket = _canonical_feedback_bucket(row.analysis_bucket)
     status = _effective_analysis_status(row)
     confidence = None if status == "failed" else row.analysis_confidence
+    metadata = _safe_analysis_metadata(row.analysis_json)
+    evidence = _raw_evidence(metadata)
     return {
         "status": status,
+        "status_params": _analysis_status_params(status, metadata),
         "bucket": bucket,
-        "bucket_label": FEEDBACK_BUCKET_LABELS.get(bucket, bucket),
+        "bucket_params": {},
         "reason": row.analysis_reason,
         "summary": row.analysis_summary,
+        "evidence": evidence,
         "confidence": confidence,
-        "metadata": row.analysis_json or {},
+        "metadata": metadata,
         "analyzed_at": row.analyzed_at.isoformat() if row.analyzed_at else None,
     }
 
 
 def _effective_analysis_status(row: MessageFeedback) -> str:
-    if row.analysis_status != "analyzed":
-        return row.analysis_status
-    metadata = row.analysis_json or {}
+    """Return a stable persisted status, deriving failed from legacy error metadata."""
+    status = _canonical_feedback_status(row.analysis_status)
+    if status != "analyzed":
+        return status
+    metadata = row.analysis_json if isinstance(row.analysis_json, dict) else {}
     if metadata.get("error_type") or metadata.get("retryable"):
         return "failed"
-    return row.analysis_status
+    return status
 
 
 def feedback_summary(rows: list[MessageFeedback]) -> dict[str, Any]:
+    """Build a locale-neutral feedback summary with typed count parameters and raw model text."""
     total = len(rows)
     down_rows = [row for row in rows if row.rating == "down"]
     up_rows = [row for row in rows if row.rating == "up"]
-    bucket_counts = Counter(row.analysis_bucket or "unknown" for row in down_rows)
+    bucket_counts = Counter(_canonical_feedback_bucket(row.analysis_bucket) for row in down_rows)
     status_counts = Counter(_effective_analysis_status(row) or "pending" for row in rows)
     top_summaries = [
         {
             "message_id": row.message_id,
-            "bucket": row.analysis_bucket or "unknown",
-            "bucket_label": FEEDBACK_BUCKET_LABELS.get(row.analysis_bucket or "unknown", row.analysis_bucket or "unknown"),
+            "bucket": _canonical_feedback_bucket(row.analysis_bucket),
+            "bucket_params": {},
+            "status": _effective_analysis_status(row),
+            "status_params": _analysis_status_params(
+                _effective_analysis_status(row),
+                row.analysis_json if isinstance(row.analysis_json, dict) else {},
+            ),
             "summary": row.analysis_summary,
             "reason": row.analysis_reason,
+            "evidence": _raw_evidence(row.analysis_json),
             "confidence": row.analysis_confidence,
         }
         for row in sorted(down_rows, key=lambda item: item.updated_at, reverse=True)
@@ -274,8 +323,8 @@ def feedback_summary(rows: list[MessageFeedback]) -> dict[str, Any]:
         "bucket_counts": [
             {
                 "bucket": bucket,
-                "label": FEEDBACK_BUCKET_LABELS.get(bucket, bucket),
                 "count": count,
+                "params": {"count": int(count)},
             }
             for bucket, count in bucket_counts.most_common()
         ],
@@ -286,36 +335,78 @@ def feedback_summary(rows: list[MessageFeedback]) -> dict[str, Any]:
 
 
 def _normalize_analysis(raw: dict[str, Any], rating: str) -> dict[str, Any]:
+    """Normalize model JSON to bounded stable IDs while retaining raw summary and evidence values."""
+    if not isinstance(raw, dict):
+        raw = {}
     bucket = str(raw.get("bucket") or "").strip()
     if rating == "up" and bucket in {"", "unknown", "user_random_or_unclear"}:
         bucket = "positive_or_resolved"
-    if bucket not in ALLOWED_BUCKETS:
-        bucket = "unknown"
+    bucket = _canonical_feedback_bucket(bucket)
     evidence = raw.get("evidence")
     if not isinstance(evidence, list):
         evidence = []
     return {
         "bucket": bucket,
         "confidence": _float_in_range(raw.get("confidence"), 0.0, 1.0),
-        "reason": str(raw.get("reason") or FEEDBACK_BUCKET_LABELS.get(bucket, "未知"))[:300],
+        "reason": str(raw.get("reason") or "")[:300],
         "summary": str(raw.get("summary") or raw.get("reason") or "")[:500],
-        "evidence": [str(item)[:200] for item in evidence[:3]],
+        "evidence": evidence[:3],
         "suggested_action": str(raw.get("suggested_action") or "")[:300],
     }
 
 
-def _compact_overall_summary(bucket_counts: Counter[str], top_summaries: list[dict[str, Any]]) -> str:
+def _compact_overall_summary(
+    bucket_counts: Counter[str], top_summaries: list[dict[str, Any]]
+) -> FeedbackSummaryDescriptor | None:
+    """Return a locale-neutral aggregate descriptor instead of composing product prose server-side."""
     if not bucket_counts:
-        return "暂无点踩归因数据。"
+        return None
     leader, count = bucket_counts.most_common(1)[0]
-    label = FEEDBACK_BUCKET_LABELS.get(leader, leader)
     detail = next((item.get("summary") or item.get("reason") for item in top_summaries if item.get("bucket") == leader), "")
-    if detail:
-        return f"当前点踩主要集中在「{label}」（{count} 次）：{detail}"
-    return f"当前点踩主要集中在「{label}」（{count} 次）。"
+    return {"bucket": leader, "params": {"count": int(count)}, "detail": detail or None}
+
+
+def _canonical_feedback_bucket(value: object) -> str:
+    """Map persisted or model bucket input to the stable public identifier set."""
+    return value if isinstance(value, str) and value in FEEDBACK_BUCKET_IDS else "unknown"
+
+
+def _canonical_feedback_status(value: object, *, default: str = "pending") -> str:
+    """Map persisted status input to a stable identifier, failing closed for malformed values."""
+    if value is None or value == "":
+        return default
+    return value if isinstance(value, str) and value in FEEDBACK_ANALYSIS_STATUS_IDS else "unknown"
+
+
+def _analysis_status_params(status: str, metadata: dict[str, Any]) -> dict[str, int]:
+    """Return only typed, non-sensitive status parameters for localized UI messages."""
+    attempts = metadata.get("attempts") if status == "failed" else None
+    if isinstance(attempts, int) and not isinstance(attempts, bool) and attempts > 0:
+        return {"attempts": attempts}
+    return {}
+
+
+def _raw_evidence(metadata: object) -> list[Any]:
+    """Copy model-owned evidence without translating or coercing its raw values."""
+    if not isinstance(metadata, dict):
+        return []
+    evidence = metadata.get("evidence")
+    return list(evidence) if isinstance(evidence, list) else []
+
+
+def _safe_analysis_metadata(value: object) -> dict[str, Any]:
+    """Drop deprecated localized label fields while preserving model-owned metadata and evidence."""
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(key): item
+        for key, item in value.items()
+        if str(key) not in {"bucket_label", "status_label", "label"}
+    }
 
 
 def _float_in_range(value: Any, minimum: float, maximum: float) -> float:
+    """Clamp model confidence to a finite numeric range without changing other raw fields."""
     try:
         parsed = float(value)
     except (TypeError, ValueError):

@@ -10,13 +10,13 @@ from fastapi import HTTPException
 from sqlalchemy import text
 from sqlmodel import Session, SQLModel, create_engine, select
 
+import app.api.model_configs as model_configs_module
 from app.api.model_configs import (
     create_model_config,
     delete_model_config,
     set_default_model_config,
     update_model_config,
 )
-import app.api.model_configs as model_configs_module
 from app.api.model_configs import (
     test_model_config as run_model_config_test,
 )
@@ -116,7 +116,7 @@ def test_failed_verified_create_does_not_leave_disabled_model(tmp_path, monkeypa
 
         assert exc_info.value.status_code == 502
         assert exc_info.value.detail["code"] == "MODEL_CONNECTION_FAILED"
-        assert exc_info.value.detail["message"] == "Connection error"
+        assert "Connection error" not in repr(exc_info.value.detail)
         assert db.exec(select(ModelConfig)).all() == []
 
 
@@ -156,10 +156,11 @@ def test_model_test_returns_structured_provider_diagnostics(tmp_path, monkeypatc
         assert result.success is False
         assert result.message == "MODEL_UPSTREAM_ERROR"
         assert result.error is not None
-        assert result.error.upstream_status == 422
-        assert result.error.provider_code == "invalid_model"
-        assert result.error.provider_message == "model does not exist"
-        assert result.error.upstream_body == '{"error":{"code":"invalid_model"}}'
+        assert result.error.params == {}
+        assert result.error.upstream_status is None
+        assert result.error.provider_code is None
+        assert result.error.provider_message is None
+        assert result.error.upstream_body is None
         assert result.error.request_id == "req_123"
 
 
@@ -348,7 +349,7 @@ def test_subscription_account_routes_map_runtime_browser_errors_without_upstream
         model_configs_module.start_codex_subscription_login("tenant_a", _admin())
 
     assert exc_info.value.status_code == 503
-    assert exc_info.value.detail == "MODEL_SUBSCRIPTION_BROWSER_UNAVAILABLE"
+    assert exc_info.value.detail["code"] == "MODEL_SUBSCRIPTION_BROWSER_UNAVAILABLE"
     assert "token" not in str(exc_info.value.detail).lower()
 
 
@@ -386,7 +387,7 @@ def test_subscription_runtime_errors_use_safe_http_statuses(
         model_configs_module.start_codex_subscription_login("tenant_a", _admin())
 
     assert exc_info.value.status_code == status_code
-    assert exc_info.value.detail == code
+    assert exc_info.value.detail["code"] == code
     assert "traceback" not in str(exc_info.value.detail).lower()
 
 
@@ -438,7 +439,7 @@ def test_non_chat_protocol_rejects_extra_body_with_distinct_error(tmp_path) -> N
                 current_user=_admin(),
             )
 
-        assert exc_info.value.detail == "MODEL_EXTRA_BODY_UNSUPPORTED"
+        assert exc_info.value.detail["code"] == "MODEL_EXTRA_BODY_UNSUPPORTED"
 
 
 def test_model_config_delete_removes_agent_bindings(tmp_path) -> None:
@@ -601,7 +602,7 @@ def test_unverified_config_cannot_become_default(tmp_path) -> None:
             set_default_model_config("model_a", tenant_id="tenant_a", db=db)
         except HTTPException as exc:
             assert exc.status_code == 409
-            assert exc.detail == "MODEL_CONFIG_VERIFICATION_REQUIRED"
+            assert exc.detail["code"] == "MODEL_CONFIG_VERIFICATION_REQUIRED"
         else:
             raise AssertionError("unverified config unexpectedly became default")
 

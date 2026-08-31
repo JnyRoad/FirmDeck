@@ -5,6 +5,8 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui';
+import { RawContent } from '@/i18n/RawContent';
+import { useAppIntl } from '@/i18n/useAppIntl';
 import { cn } from '@/lib/utils';
 
 import IconChat from '../assets/icons/chat.svg?react';
@@ -44,6 +46,29 @@ export type EmployeeCardProps = {
   onEdit: () => void;
   onChat: () => void;
   onApiKeys?: () => void;
+  copy?: Partial<EmployeeCardCopy>;
+};
+
+export type EmployeeCardCopy = {
+  openMarketplaceName: string;
+  rolePlaceholder: string;
+  descriptionPlaceholder: string;
+  statKnowledge: string;
+  statSkill: string;
+  statSop: string;
+  statusOnline: string;
+  statusOffline: string;
+  chatAria: string;
+  actionAria: string;
+  chatAction: string;
+  archiveAction: string;
+  publishAction: string;
+  publishToMarketplace: string;
+  unpublishFromMarketplace: string;
+  editProfile: string;
+  setAvatar: string;
+  apiKeyAction: string;
+  deleteAction: string;
 };
 
 export default function EmployeeCard({
@@ -60,7 +85,31 @@ export default function EmployeeCard({
   onEdit,
   onChat,
   onApiKeys,
+  copy,
 }: EmployeeCardProps) {
+  const { t } = useAppIntl();
+  const ui: EmployeeCardCopy = {
+    openMarketplaceName: t('employeeCard.openMarketplaceName'),
+    rolePlaceholder: t('employeeCard.rolePlaceholder'),
+    descriptionPlaceholder: t('employeeCard.descriptionPlaceholder'),
+    statKnowledge: t('employeeCard.statKnowledge'),
+    statSkill: t('employeeCard.statSkill'),
+    statSop: t('employeeCard.statSop'),
+    statusOnline: t('employeeCard.statusOnline'),
+    statusOffline: t('employeeCard.statusOffline'),
+    chatAria: t('employeeCard.chatAria'),
+    actionAria: t('employeeCard.actionAria'),
+    chatAction: t('employeeCard.chatAction'),
+    archiveAction: t('employeeCard.archiveAction'),
+    publishAction: t('employeeCard.publishAction'),
+    publishToMarketplace: t('employeeCard.publishToMarketplace'),
+    unpublishFromMarketplace: t('employeeCard.unpublishFromMarketplace'),
+    editProfile: t('employeeCard.editProfile'),
+    setAvatar: t('employeeCard.setAvatar'),
+    apiKeyAction: t('employeeCard.apiKeyAction'),
+    deleteAction: t('employeeCard.deleteAction'),
+    ...copy,
+  };
   const profile = employeeProfile(employee);
   const sopCount = resourceCount(employee.resources, 'skill');
   const skillCount = resourceCount(employee.resources, 'general_skill');
@@ -70,13 +119,13 @@ export default function EmployeeCard({
 
   // Show raw API values on the card (bypass the SD1 term relabeling in staffdeckDisplayText).
   const rawRoleName = (employee.metadata?.role_name as string | undefined) || profile.roleName;
-  const displayName = employee.is_overall ? '开放广场' : employeeDisplayNameWithCreator(employee);
-  const displayDescription = employee.description || '暂无描述';
+  const displayName = employee.is_overall ? ui.openMarketplaceName : employeeDisplayNameWithCreator(employee);
+  const displayDescription = employee.description || ui.descriptionPlaceholder;
 
   const stats: Array<{ value: number; label: string }> = [
-    { value: kbCount, label: '资料' },
-    { value: skillCount, label: '技能' },
-    { value: sopCount, label: 'SOP' },
+    { value: kbCount, label: ui.statKnowledge },
+    { value: skillCount, label: ui.statSkill },
+    { value: sopCount, label: ui.statSop },
   ];
 
   return (
@@ -104,7 +153,7 @@ export default function EmployeeCard({
       <div className="flex rounded-[18px] h-[68px] box-border gap-[10px] bg-[#f6f6f6] p-[8px] mt-[34px]" >
 
         {/* Avatar illustration — absolutely positioned so its head pokes above the gray band */}
-        <div className='w-[80px] relative'>
+        <div className="relative w-[80px] shrink-0">
           <div className='absolute inset-0 flex items-end justify-center'>
             <EmployeeAvatar
               agent={employee}
@@ -120,17 +169,17 @@ export default function EmployeeCard({
         </div>
 
         {/* Name / role / status */}
-        <div className="flex-1 flex flex-col gap-[2px]">
+        <div className="flex min-w-0 flex-1 flex-col gap-[2px]">
           <strong className="truncate text-[12px] font-bold text-[#18181A]">
-            {employee.is_overall ? displayName : <span data-i18n-ignore>{displayName}</span>}
+            {employee.is_overall ? displayName : <RawContent value={displayName} />}
           </strong>
           <span className="truncate text-[10px] text-[#757F9C]">
-            {rawRoleName === '待补充岗位' ? rawRoleName : <span data-i18n-ignore>{rawRoleName}</span>}
+            {rawRoleName ? <RawContent value={rawRoleName} /> : ui.rolePlaceholder}
           </span>
           <div className="leading-none">
             <span className="inline-flex items-center gap-[2px] py-[2px] px-[4px] text-[8px] font-semibold text-[#757F9C] rounded-[90px] bg-white">
               <i className={cn('size-[6px] shrink-0 rounded-full', online ? 'bg-[#22c55e]' : 'bg-[#9ca3af]')} aria-hidden="true" />
-              {online ? '在线' : '下线'}
+              {online ? ui.statusOnline : ui.statusOffline}
             </span>
           </div>
         </div>
@@ -138,7 +187,7 @@ export default function EmployeeCard({
         {/* Chat button */}
         <button
           type="button"
-          aria-label="发起对话"
+          aria-label={ui.chatAria}
           disabled={!online || busy}
           onClick={(event) => {
             event.stopPropagation();
@@ -156,7 +205,7 @@ export default function EmployeeCard({
       <div className="absolute right-[12px] top-[12px] z-20">
         <DropdownMenu>
           <DropdownMenuTrigger
-            aria-label="员工操作"
+            aria-label={ui.actionAria}
             onPointerDown={(event) => event.stopPropagation()}
             onClick={(event) => event.stopPropagation()}
             className="grid size-7 place-items-center rounded-[10px] text-[#757F9C] transition-colors outline-none hover:bg-black/5 focus-visible:bg-black/5"
@@ -175,7 +224,7 @@ export default function EmployeeCard({
               onSelect={() => onChat()}
             >
               <IconChat className="size-[16px]" />
-              发起对话
+              {ui.chatAction}
             </DropdownMenuItem>
             {online ? (
               <DropdownMenuItem
@@ -185,7 +234,7 @@ export default function EmployeeCard({
                 onSelect={() => onStatus('archived')}
               >
                 <IconPause className="size-[16px]" />
-                下线
+                {ui.archiveAction}
               </DropdownMenuItem>
             ) : (
               <DropdownMenuItem
@@ -195,7 +244,7 @@ export default function EmployeeCard({
                 onSelect={() => onStatus('active')}
               >
                 <IconPlay className="size-[16px]" />
-                上线
+                {ui.publishAction}
               </DropdownMenuItem>
             )}
             <DropdownMenuItem
@@ -205,7 +254,7 @@ export default function EmployeeCard({
               onSelect={() => onGallery(!galleryPublished)}
             >
               <IconPlatform className="size-[16px]" />
-              {galleryPublished ? '从广场下架' : '发布到广场'}
+              {galleryPublished ? ui.unpublishFromMarketplace : ui.publishToMarketplace}
             </DropdownMenuItem>
             <DropdownMenuItem
               className={MENU_ITEM_CLASS}
@@ -214,7 +263,7 @@ export default function EmployeeCard({
               onSelect={() => onEdit()}
             >
               <IconEdit className="size-[16px]" />
-              编辑资料
+              {ui.editProfile}
             </DropdownMenuItem>
             <DropdownMenuItem
               className={MENU_ITEM_CLASS}
@@ -223,7 +272,7 @@ export default function EmployeeCard({
               onSelect={() => onAvatar()}
             >
               <IconImage className="size-[16px]" />
-              设置头像
+              {ui.setAvatar}
             </DropdownMenuItem>
             {onApiKeys && (
               <DropdownMenuItem
@@ -233,7 +282,7 @@ export default function EmployeeCard({
                 onSelect={() => onApiKeys()}
               >
                 <KeyRound className="size-[16px]" />
-                API 密钥
+                {ui.apiKeyAction}
               </DropdownMenuItem>
             )}
             <DropdownMenuSeparator className="my-[2px] bg-[#eef0f4]" />
@@ -245,7 +294,7 @@ export default function EmployeeCard({
               onSelect={() => onDelete()}
             >
               <IconTrash className="size-[16px]" />
-              删除
+              {ui.deleteAction}
             </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>
@@ -254,7 +303,7 @@ export default function EmployeeCard({
 
       {/* Description */}
       <p className="line-clamp-2 mt-[8px] h-[36px] shrink-0 text-[12px] leading-[18px] text-[#757F9C]">
-        {employee.description ? <span data-i18n-ignore>{displayDescription}</span> : displayDescription}
+        {employee.description ? <RawContent value={displayDescription} /> : displayDescription}
       </p>
 
       {/* Work style tags */}
@@ -264,23 +313,23 @@ export default function EmployeeCard({
             key={item}
             className="rounded-[20px] px-[8px] py-px text-[10px] leading-[13px] text-[#757f9c] border border-[#E3E7F1]"
           >
-            <span data-i18n-ignore>{item}</span>
+            <RawContent value={item} />
           </span>
         ))}
       </div>
 
       {/* Stats — pinned to the bottom of the card */}
-      <div className="mt-auto grid grid-cols-3 rounded-[14px] border border-[#E3E7F1] box-sizing: border-box">
+      <div className="mt-auto grid grid-cols-3 overflow-hidden rounded-[14px] border border-[#E3E7F1] box-border">
         {stats.map((stat, index) => (
           <div
             key={stat.label}
             className={cn(
-              'flex flex-col justify-center gap-[4px] px-[20px] py-[6px]',
+              'flex min-w-0 flex-col items-center justify-center gap-[4px] px-[4px] py-[6px] text-center',
               index < stats.length - 1 && 'border-r border-[#eef1f5]',
             )}
           >
-            <strong className="text-[18px] leading-[24px] font-bold text-[#18181A]">{stat.value}</strong>
-            <em className="text-[10px] not-italic text-[#464C5E]">{stat.label}</em>
+            <strong className="w-full truncate text-center text-[18px] leading-[24px] font-bold tabular-nums text-[#18181A]">{stat.value}</strong>
+            <em className="w-full truncate text-center text-[10px] leading-[13px] not-italic text-[#464C5E]">{stat.label}</em>
           </div>
         ))}
       </div>

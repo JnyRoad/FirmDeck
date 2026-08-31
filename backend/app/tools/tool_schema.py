@@ -2,9 +2,21 @@ from __future__ import annotations
 
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_serializer
 
 from app.capability_scope import CapabilityScope
+from app.contracts.error_registry import (
+    ERROR_REGISTRY,
+    ErrorContractViolation,
+    ErrorVisibility,
+)
+from app.contracts.errors import (
+    ErrorDescriptor,
+    ErrorOccurrence,
+    InternalErrorContext,
+    JsonValue,
+)
+from app.i18n.language_context import LanguageContext
 
 
 class ToolExecutionPolicy(BaseModel):
@@ -73,11 +85,103 @@ class ToolBucketRead(BaseModel):
 class ToolCall(BaseModel):
     name: str
     arguments: dict[str, Any] = Field(default_factory=dict)
+    # Server-only immutable locale context; never serialize it as provider arguments.
+    language_context: LanguageContext | None = Field(default=None, exclude=True)
 
 
 class ToolError(BaseModel):
+    """Canonical Tool error with a deprecated safe message and excluded diagnostic context."""
+
     code: str
     message: str
+    params: dict[str, JsonValue] = Field(default_factory=dict)
+    retryable: bool = False
+    request_id: str | None = None
+    trace_id: str | None = None
+    deprecated_fields: list[Literal["message"]] = Field(default_factory=lambda: ["message"])
+    internal_context: InternalErrorContext | None = Field(
+        default=None,
+        exclude=True,
+        repr=False,
+    )
+
+    def model_post_init(self, __context: Any, /) -> None:
+        """Retain legacy prose only for internal consumers and private diagnostic inspection."""
+        raw_message = self.message
+        if self.internal_context is None and raw_message != self.code:
+            self.internal_context = InternalErrorContext(
+                source="tool",
+                raw_message=raw_message,
+                upstream_code=self.code,
+            )
+
+    @model_serializer(mode="wrap")
+    def serialize_public(self, handler: Any) -> dict[str, Any]:
+        """Serialize the legacy message as a stable code while excluding private diagnostics."""
+        payload = handler(self)
+        # Workflow: use the same registry-resolved descriptor for every public field;
+        # remote/raw codes and prose never cross the Tool result boundary.
+        descriptor = self.to_descriptor()
+        payload["code"] = descriptor.code
+        payload["params"] = descriptor.params
+        payload["retryable"] = descriptor.retryable
+        payload["message"] = descriptor.code
+        payload["deprecated_fields"] = ["message"]
+        return payload
+
+    @classmethod
+    def from_occurrence(cls, occurrence: ErrorOccurrence) -> "ToolError":
+        """Create a ToolError from an already projected occurrence without reintroducing prose."""
+        descriptor = occurrence.descriptor
+        return cls(
+            code=descriptor.code,
+            message=descriptor.code,
+            params=descriptor.params,
+            retryable=descriptor.retryable,
+            request_id=descriptor.request_id,
+            trace_id=descriptor.trace_id,
+            internal_context=occurrence.internal,
+        )
+
+    def to_descriptor(self) -> ErrorDescriptor:
+        """Validate exact registry params before a Tool error can cross a public boundary."""
+        # Workflow: resolve dynamic tool codes before descriptor construction and
+        # fail closed for unregistered/internal remote values or mismatched params.
+        entry = ERROR_REGISTRY.get(self.code)
+        if entry is None or entry.visibility is not ErrorVisibility.PUBLIC:
+            fallback = ERROR_REGISTRY.require("INTERNAL_ERROR")
+            return ErrorDescriptor(
+                code=fallback.code,
+                params={},
+                retryable=fallback.retryable_default,
+                request_id=self.request_id,
+                trace_id=self.trace_id,
+            )
+        try:
+            descriptor = ErrorDescriptor(
+                code=entry.code,
+                params=self.params,
+                retryable=self.retryable,
+                request_id=self.request_id,
+                trace_id=self.trace_id,
+            )
+            return ERROR_REGISTRY.validate(descriptor)
+        except (ErrorContractViolation, ValueError, TypeError):
+            fallback = ERROR_REGISTRY.require("INTERNAL_ERROR")
+            return ErrorDescriptor(
+                code=fallback.code,
+                params={},
+                retryable=fallback.retryable_default,
+                request_id=self.request_id,
+                trace_id=self.trace_id,
+            )
+
+    def to_occurrence(self) -> ErrorOccurrence:
+        """Pair public-safe Tool metadata with its excluded diagnostic context."""
+        return ErrorOccurrence(
+            descriptor=self.to_descriptor(),
+            internal=self.internal_context,
+        )
 
 
 class MCPAppDescriptor(BaseModel):

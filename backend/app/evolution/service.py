@@ -15,6 +15,8 @@ from app.agents.branching import (
     update_branch_skill,
     visible_skill_rows,
 )
+from app.contracts.errors import InternalErrorContext
+from app.contracts.http import build_http_exception
 from app.db.models import (
     AgentEvent,
     AgentResourceBinding,
@@ -35,7 +37,6 @@ from app.llm.model_config_resolver import resolve_model_config_for_runtime
 from app.skills import SkillEditor
 from app.skills.nesting import SopNestingError, validate_sop_nesting
 from app.skills.skill_schema import SkillCard, SkillRewriteRequest, skill_card_from_persisted
-
 
 GENERAL_SKILL_EVOLUTION_PROMPT = """
 你是 StaffDeck 的通用技能改进器。根据当前 SKILL.md 和真实用户反馈，生成一次最小、可审核的改进。
@@ -646,9 +647,15 @@ def _hypothesis(evidence: list[dict[str, Any]], fallback: str) -> str:
 
 
 def _evolution_http_error(status_code: int, code: str, message: str) -> HTTPException:
-    return HTTPException(
+    """Build one canonical evolution HTTP error and keep the legacy helper prose private."""
+    return build_http_exception(
+        code,
         status_code=status_code,
-        detail={"code": code, "message": message},
+        internal=InternalErrorContext(
+            source="evolution.service",
+            raw_message=message,
+            upstream_code=code,
+        ),
     )
 
 

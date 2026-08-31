@@ -13,13 +13,18 @@ from sqlmodel import Session, select
 
 from app.agents.branching import visible_tool_rows
 from app.config import get_settings
+from app.contracts.errors import InternalErrorContext, JsonValue
 from app.db.models import MCPServer, Tool
+from app.i18n.language_context import LanguageContext
 from app.security.internal_service import INTERNAL_SERVICE_HEADER, internal_service_token
 from app.tools.a2a_client import A2AClient, A2AClientError
 from app.tools.http_request import prepare_get_request
-from app.tools.mcp_client import MCPClientError, execute_mcp_tool, execute_mcp_tool_result
+from app.tools.mcp_client import (
+    MCPClientError,
+    execute_mcp_tool,
+    execute_mcp_tool_result,
+)
 from app.tools.tool_schema import MCPAppDescriptor, ToolCall, ToolError, ToolResult
-
 
 SECRET_PATTERN = re.compile(r"\$\{secret\.([A-Z0-9_]+)\}")
 
@@ -43,7 +48,10 @@ class ToolExecutor:
         session_id: str | None = None,
         invocation_id: str | None = None,
         timeout_seconds_override: float | None = None,
+        language_context: LanguageContext | dict[str, Any] | None = None,
     ) -> ToolResult:
+        """Execute one configured tool while preserving success data and sanitizing failures."""
+        language_context = language_context or tool_call.language_context
         with self.db.no_autoflush:
             tool = self.db.exec(
                 select(Tool).where(Tool.tenant_id == tenant_id, Tool.name == tool_call.name)
@@ -71,6 +79,7 @@ class ToolExecutor:
                 agent_id=agent_id,
                 session_id=session_id,
                 active_skill_id=active_skill_id,
+                invocation_id=invocation_id,
                 timeout_seconds_override=timeout_seconds_override,
             )
         if (tool.tool_type or "http") == "a2a":
@@ -81,6 +90,7 @@ class ToolExecutor:
                 session_id=session_id,
                 invocation_id=invocation_id,
                 timeout_seconds_override=timeout_seconds_override,
+                language_context=language_context,
             )
         if (tool.tool_type or "http") != "http":
             return self._error(
@@ -113,20 +123,44 @@ class ToolExecutor:
                     data=self._response_data(response),
                     error=None,
                 )
-        except httpx.TimeoutException:
+        except httpx.TimeoutException as exc:
             return self._error(
                 tool.name,
                 "TIMEOUT",
                 f"工具调用超过 {policy.timeout_seconds:g} 秒未返回。",
+                params={"timeout_seconds": policy.timeout_seconds},
+                retryable=True,
+                request_id=invocation_id,
+                trace_id=session_id,
+                internal_context=InternalErrorContext(
+                    source="http_tool",
+                    exception_type=type(exc).__name__,
+                    raw_message=str(exc),
+                ),
             )
         except httpx.HTTPStatusError as exc:
             return self._error(
                 tool.name,
                 "HTTP_ERROR",
                 f"工具返回异常状态码：{exc.response.status_code}",
+                params={"status_code": exc.response.status_code},
+                request_id=invocation_id,
+                trace_id=session_id,
+                internal_context=InternalErrorContext(
+                    source="http_tool",
+                    exception_type=type(exc).__name__,
+                    raw_message=str(exc),
+                    upstream_status=exc.response.status_code,
+                ),
             )
-        except Exception as exc:
-            return self._error(tool.name, "EXECUTION_ERROR", str(exc))
+        except Exception as exc:  # noqa: BLE001 - provider execution must fail closed.
+            return self._error(
+                tool.name,
+                "EXECUTION_ERROR",
+                str(exc),
+                request_id=invocation_id,
+                trace_id=session_id,
+            )
 
     def _execute_a2a_tool(
         self,
@@ -137,6 +171,7 @@ class ToolExecutor:
         session_id: str | None = None,
         invocation_id: str | None = None,
         timeout_seconds_override: float | None = None,
+        language_context: LanguageContext | dict[str, Any] | None = None,
     ) -> ToolResult:
         """Invoke an A2A agent and wait for its durable Task lifecycle."""
 
@@ -158,18 +193,44 @@ class ToolExecutor:
                 agent_id=agent_id,
                 session_id=session_id,
                 invocation_id=invocation_id,
+                language_context=language_context,
             ).execute(arguments)
             return ToolResult(tool_name=tool.name, success=True, data=data, error=None)
         except A2AClientError as exc:
-            return self._error(tool.name, exc.code, str(exc))
+            descriptor = exc.occurrence.descriptor
+            return self._error(
+                tool.name,
+                descriptor.code,
+                descriptor.code,
+                params=descriptor.params,
+                retryable=descriptor.retryable,
+                request_id=invocation_id or descriptor.request_id,
+                trace_id=session_id or descriptor.trace_id,
+                internal_context=exc.occurrence.internal,
+            )
         except httpx.HTTPStatusError as exc:
             return self._error(
                 tool.name,
                 "A2A_HTTP_ERROR",
                 f"A2A Agent 返回异常状态码：{exc.response.status_code}",
+                params={"status_code": exc.response.status_code},
+                request_id=invocation_id,
+                trace_id=session_id,
+                internal_context=InternalErrorContext(
+                    source="a2a",
+                    exception_type=type(exc).__name__,
+                    raw_message=str(exc),
+                    upstream_status=exc.response.status_code,
+                ),
             )
-        except Exception as exc:
-            return self._error(tool.name, "A2A_EXECUTION_ERROR", str(exc))
+        except Exception as exc:  # noqa: BLE001 - provider execution must fail closed.
+            return self._error(
+                tool.name,
+                "A2A_EXECUTION_ERROR",
+                str(exc),
+                request_id=invocation_id,
+                trace_id=session_id,
+            )
 
     def _execute_mcp_tool(
         self,
@@ -179,8 +240,10 @@ class ToolExecutor:
         agent_id: str | None = None,
         session_id: str | None = None,
         active_skill_id: str | None = None,
+        invocation_id: str | None = None,
         timeout_seconds_override: float | None = None,
     ) -> ToolResult:
+        """Execute MCP while keeping successful envelopes raw and failures canonical."""
         try:
             config, tool_name = self._resolve_mcp_config(tool)
             policy = self._execution_policy(
@@ -239,9 +302,25 @@ class ToolExecutor:
                 ),
             )
         except MCPClientError as exc:
-            return self._error(tool.name, "MCP_ERROR", str(exc))
-        except Exception as exc:
-            return self._error(tool.name, "MCP_EXECUTION_ERROR", str(exc))
+            descriptor = exc.occurrence.descriptor
+            return self._error(
+                tool.name,
+                descriptor.code,
+                descriptor.code,
+                params=descriptor.params,
+                retryable=descriptor.retryable,
+                request_id=invocation_id or descriptor.request_id,
+                trace_id=session_id or descriptor.trace_id,
+                internal_context=exc.occurrence.internal,
+            )
+        except Exception as exc:  # noqa: BLE001 - provider execution must fail closed.
+            return self._error(
+                tool.name,
+                "MCP_EXECUTION_ERROR",
+                str(exc),
+                request_id=invocation_id,
+                trace_id=session_id,
+            )
 
     def _execution_policy(
         self,
@@ -298,7 +377,7 @@ class ToolExecutor:
     def _response_data(self, response: httpx.Response) -> Any:
         try:
             return response.json()
-        except Exception:
+        except (ValueError, UnicodeDecodeError):
             return response.text
 
     def _resolve_headers(self, headers: dict[str, Any], auth: dict[str, Any]) -> dict[str, str]:
@@ -369,12 +448,37 @@ class ToolExecutor:
 
         return SECRET_PATTERN.sub(repl, value)
 
-    def _error(self, tool_name: str, code: str, message: str) -> ToolResult:
+    def _error(
+        self,
+        tool_name: str,
+        code: str,
+        message: str,
+        *,
+        params: dict[str, JsonValue] | None = None,
+        retryable: bool = False,
+        request_id: str | None = None,
+        trace_id: str | None = None,
+        internal_context: InternalErrorContext | None = None,
+    ) -> ToolResult:
+        """Build a failed ToolResult whose serialized form cannot contain diagnostic prose."""
+        private_context = internal_context or InternalErrorContext(
+            source="tool_executor",
+            raw_message=message,
+            upstream_code=code,
+        )
         return ToolResult(
             tool_name=tool_name,
             success=False,
             data=None,
-            error=ToolError(code=code, message=message),
+            error=ToolError(
+                code=code,
+                message=code,
+                params=params or {},
+                retryable=retryable,
+                request_id=request_id,
+                trace_id=trace_id,
+                internal_context=private_context,
+            ),
         )
 
 

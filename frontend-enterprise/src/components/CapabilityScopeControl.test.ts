@@ -14,6 +14,6 @@ describe('capability scope helpers', () => {
   it('defaults missing or unknown values to general', () => {
     expect(normalizeCapabilityScope(undefined)).toBe('general');
     expect(normalizeCapabilityScope('unknown')).toBe('general');
-    expect(capabilityScopeLabel(undefined)).toBe('通用');
+    expect(capabilityScopeLabel(undefined)).toBe('capabilityScope.option.general');
   });
 });

@@ -5,6 +5,7 @@ import AppSidebar from '@/components/AppSidebar';
 import { notify } from '@/components/ui/app-toast';
 import { SidebarProvider } from '@/components/ui/sidebar';
 import { getEnterpriseAuthSession, isEnterpriseAdmin } from '@/auth';
+import { useAppIntl } from '@/i18n/useAppIntl';
 import type { AgentProfileRead } from '@/types';
 
 import EmployeeGalleryPage from '../EmployeeGalleryPage';
@@ -12,11 +13,14 @@ import { sessionHasUnreadReply } from './chatHelpers';
 import { useChatSession } from './useChatSession';
 import ChatDialogs from './components/ChatDialogs';
 
+/** 渲染聊天入口的员工广场，并让启动失败遵循统一错误消息契约。 */
 export default function ChatGalleryPage() {
   const chat = useChatSession();
+  const { t } = useAppIntl();
   const auth = getEnterpriseAuthSession();
   const isAdmin = isEnterpriseAdmin(auth?.user);
 
+  /** 启动员工草稿会话；服务端异常只记录诊断信息并显示稳定的本地化错误。 */
   async function startGalleryChat(agent: AgentProfileRead) {
     try {
       await api.post<AgentProfileRead>(`/api/chat/agents/${agent.id}/use?tenant_id=${TENANT_ID}`, {});
@@ -24,7 +28,8 @@ export default function ChatGalleryPage() {
       chat.setSessionAgentFilter(agent.id);
       chat.openDraftForAgent(agent.id);
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '无法打开数字员工');
+      console.error('[chat-gallery] start chat failed', error);
+      notify.error(t('chat.error.agentAccess'));
     }
   }
 
@@ -36,7 +41,7 @@ export default function ChatGalleryPage() {
       }}
       style={
         {
-          '--sidebar-width': '220px',
+          '--sidebar-width': '240px',
           '--sidebar-width-icon': '72px',
         } as CSSProperties
       }

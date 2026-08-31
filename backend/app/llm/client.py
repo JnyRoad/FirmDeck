@@ -73,15 +73,16 @@ class LLMError(Exception):
         self.retryable = retryable
 
     def public_detail(self) -> dict[str, Any]:
+        """Return only stable model metadata; provider prose remains private on the exception."""
+        code = self.code or "MODEL_CONNECTION_FAILED"
         return {
-            "code": self.code or "MODEL_CONNECTION_FAILED",
-            "message": str(self),
-            "upstream_status": self.status_code,
-            "provider_code": self.provider_code,
-            "provider_message": self.provider_message,
-            "upstream_body": self.upstream_body,
+            "code": code,
+            "message": code,
+            "params": {},
             "request_id": self.request_id,
+            "trace_id": None,
             "retryable": self.retryable,
+            "deprecated_fields": ["message"],
         }
 
 
@@ -360,8 +361,9 @@ class LLMClient:
                 try:
                     completion = driver.complete(request)
                 except BaseException as exc:
+                    failure_exception_type = exc.__class__.__name__
                     span.fail(
-                        exc,
+                        exception_type=failure_exception_type,
                         response_text="",
                         **_completion_span_metrics(None),
                     )
@@ -538,8 +540,9 @@ class LLMClient:
                             pending_parts.clear()
                             yield buffered
                 except BaseException as exc:
+                    failure_exception_type = exc.__class__.__name__
                     span.fail(
-                        exc,
+                        exception_type=failure_exception_type,
                         provider_setup_ms=provider_setup_ms,
                         ttft_ms=first_content_ms,
                         output_chars=output_chars,

@@ -5,8 +5,10 @@ from types import SimpleNamespace
 
 import app.async_jobs as async_jobs
 from app.async_jobs import AsyncJobQueue
+from app.contracts.events import SystemEvent
 from app.core.agent_loop import AgentLoop
 from app.db.models import ChatSession, ModelConfig
+from app.i18n.language_context import LanguageContext, LocaleResolutionSource, SupportedLocale
 from app.session.session_schema import ChatTurnRequest, StepAgentResult
 
 
@@ -162,6 +164,59 @@ def test_agent_loop_enqueues_memory_capture_without_running_it_inline(monkeypatc
     assert loop.db.commits == 1
 
 
+def test_agent_loop_memory_enqueue_failure_records_safe_product_event(monkeypatch) -> None:
+    """Keep enqueue causes private while exposing a replayable, locale-independent event."""
+
+    def fail_enqueue_memory_capture(*args):  # noqa: ANN002
+        raise RuntimeError("provider-secret /private/memory-request")
+
+    monkeypatch.setattr("app.core.agent_loop.enqueue_memory_capture", fail_enqueue_memory_capture)
+
+    context = LanguageContext(
+        ui_locale=SupportedLocale.EN_US,
+        agent_reply_locale=SupportedLocale.ZH_CN,
+        ui_locale_source=LocaleResolutionSource.EXPLICIT_REQUEST,
+        agent_reply_locale_source=LocaleResolutionSource.SESSION_SNAPSHOT,
+    )
+    loop = object.__new__(AgentLoop)
+    loop.events = _CanonicalEvents()
+    loop.db = _FakeDb()
+    loop._language_context = context
+
+    result = loop._enqueue_memory_capture(
+        ChatTurnRequest(
+            tenant_id="tenant_demo",
+            user_id="user_demo",
+            client_turn_id="turn_memory_1",
+            message="raw user input",
+            language_context=context,
+        ),
+        ChatSession(id="session_test", tenant_id="tenant_demo", user_id="user_demo"),
+        StepAgentResult(),
+        None,
+        ModelConfig(
+            id="model_test",
+            tenant_id="tenant_demo",
+            name="demo",
+            api_key_encrypted="encrypted",
+            model="demo",
+        ),
+    )
+
+    assert result == []
+    event = loop.events.events[0]
+    assert event.event_code == "memory.capture.failed"
+    assert event.params == {
+        "reason_code": "MEMORY_CAPTURE_ENQUEUE_FAILED",
+        "missing_session": False,
+        "missing_model_config": False,
+    }
+    assert event.language_context == context
+    assert event.client_turn_id == "turn_memory_1"
+    assert "provider-secret" not in repr(event)
+    assert "/private/memory-request" not in repr(event)
+
+
 def _eventually_succeeded(queue: AsyncJobQueue, job_id: str) -> bool:
     for _ in range(20):
         job = queue.get(job_id)
@@ -177,6 +232,15 @@ class _FakeEvents:
 
     def record(self, tenant_id: str, session_id: str, event_type: str, payload: dict) -> None:
         self.records.append((tenant_id, session_id, event_type, payload))
+
+
+class _CanonicalEvents:
+    def __init__(self) -> None:
+        self.events: list[SystemEvent] = []
+
+    def record_system_event(self, event: SystemEvent) -> SystemEvent:
+        self.events.append(event)
+        return event
 
 
 class _FakeDb:

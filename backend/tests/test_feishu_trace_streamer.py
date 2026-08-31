@@ -9,6 +9,7 @@ from sqlmodel import Session, SQLModel, create_engine
 from app.channels.adapters.feishu import FeishuPermanentError
 from app.channels.feishu_trace import FeishuTraceStreamer, _SinkEvent, is_feishu_trace_enabled
 from app.db.models import Skill, Tenant, Tool
+from app.i18n.language_context import LanguageContext, LocaleResolutionSource
 
 
 def _binding(channel: str = "feishu", config: dict | None = None) -> SimpleNamespace:
@@ -36,9 +37,7 @@ class FakeAdapter:
         return "om_card_123"
 
     def update_card(self, binding, message_id, card_json) -> None:
-        self.update_calls.append(
-            {"binding": binding, "message_id": message_id, "card": card_json}
-        )
+        self.update_calls.append({"binding": binding, "message_id": message_id, "card": card_json})
         if self.fail_update:
             raise FeishuPermanentError("update failed")
 
@@ -57,6 +56,45 @@ def _make_streamer(
         min_update_interval=min_update_interval,
         compact_sop=compact_sop,
     )
+
+
+def _reply_context(locale: str) -> LanguageContext:
+    """Build a mixed UI/reply snapshot to prove Feishu cards follow reply locale."""
+    return LanguageContext(
+        ui_locale="zh-CN" if locale == "en-US" else "en-US",
+        agent_reply_locale=locale,
+        ui_locale_source=LocaleResolutionSource.EXPLICIT_REQUEST,
+        agent_reply_locale_source=LocaleResolutionSource.EXPLICIT_REQUEST,
+    )
+
+
+def test_feishu_card_localizes_synthetic_chrome_and_preserves_descriptor_params() -> None:
+    """Render card-owned chrome in reply locale while retaining event parameter text verbatim."""
+    streamer = FeishuTraceStreamer(
+        _binding(),
+        {"message_id": "om_source"},
+        "turn_1",
+        adapter=FakeAdapter(),
+        language_context=_reply_context("en-US"),
+        compact_sop=False,
+    )
+    card = streamer._render_card(
+        lines=[
+            {
+                "id": "intent-1",
+                "event_code": "public.run.intent",
+                "params": {"decision": "退款 SKU-A/42"},
+                "text": "",
+                "state": "running",
+            }
+        ]
+    )
+    rendered = "\n".join(element["text"]["content"] for element in card["elements"])
+
+    assert card["header"]["title"]["content"] == "Thinking…"
+    assert "Routing request" in rendered
+    assert "退款 SKU-A/42" in rendered
+    assert "正在思考" not in str(card)
 
 
 def _wait_for_card(streamer: FeishuTraceStreamer, timeout: float = 1.0) -> None:
@@ -226,7 +264,10 @@ def test_sink_event_construction() -> None:
 def test_is_feishu_trace_enabled() -> None:
     assert is_feishu_trace_enabled(_binding(channel="feishu")) is True
     assert is_feishu_trace_enabled(_binding(channel="wechat")) is False
-    assert is_feishu_trace_enabled(_binding(channel="feishu", config={"trace_enabled": False})) is False
+    assert (
+        is_feishu_trace_enabled(_binding(channel="feishu", config={"trace_enabled": False}))
+        is False
+    )
     assert is_feishu_trace_enabled(None) is False
 
 
@@ -265,7 +306,9 @@ def test_finish_before_card_created_still_sends_final_state() -> None:
 class _SlowAdapter(FakeAdapter):
     """模拟飞书网络慢：create_card/update_card 阻塞指定秒数。"""
 
-    def __init__(self, *, delay: float, fail_create: bool = False, fail_update: bool = False) -> None:
+    def __init__(
+        self, *, delay: float, fail_create: bool = False, fail_update: bool = False
+    ) -> None:
         super().__init__(fail_create=fail_create, fail_update=fail_update)
         self.delay = delay
 
@@ -351,7 +394,11 @@ def test_card_renders_readable_step_and_status_labels() -> None:
     _wait_for_card(streamer)
     streamer.on_event(
         "skill_step_changed",
-        {"turn_id": "t1", "to_skill_id": "skill_refund", "to_step_id": "handoff_to_repair_specialist"},
+        {
+            "turn_id": "t1",
+            "to_skill_id": "skill_refund",
+            "to_step_id": "handoff_to_repair_specialist",
+        },
     )
     streamer.on_event(
         "task_frame_finished",
@@ -382,7 +429,11 @@ def test_card_falls_back_to_readable_labels_for_unknown_step_ids() -> None:
     _wait_for_card(streamer)
     streamer.on_event(
         "skill_step_changed",
-        {"turn_id": "t1", "to_skill_id": "skill_refund", "to_step_id": "handoff_to_repair_specialist"},
+        {
+            "turn_id": "t1",
+            "to_skill_id": "skill_refund",
+            "to_step_id": "handoff_to_repair_specialist",
+        },
     )
     streamer.on_event(
         "task_frame_started",
@@ -414,7 +465,13 @@ def test_card_renders_tool_display_names_and_readable_completion_reason() -> Non
     _wait_for_card(streamer)
     streamer.on_event(
         "harness_action_created",
-        {"turn_id": "t1", "task_frame_id": "f1", "iteration": 1, "action": "tool", "tool_name": "hr.balance_query"},
+        {
+            "turn_id": "t1",
+            "task_frame_id": "f1",
+            "iteration": 1,
+            "action": "tool",
+            "tool_name": "hr.balance_query",
+        },
     )
     streamer.on_event(
         "harness_tool_completed",
@@ -569,7 +626,7 @@ def _run_sop_lifecycle_running(streamer: FeishuTraceStreamer) -> None:
         {
             "turn_id": "t1",
             "user_intent": "电脑无法开机",
-            "reason": "匹配\"电脑故障处理\"SOP",
+            "reason": '匹配"电脑故障处理"SOP',
             "target_skill_id": "skill_pc",
         },
     )
@@ -579,8 +636,13 @@ def _run_sop_lifecycle_running(streamer: FeishuTraceStreamer) -> None:
     )
     streamer.on_event(
         "skill_step_changed",
-        {"turn_id": "t1", "from_skill_id": "skill_pc", "from_step_id": "collect_info",
-         "to_skill_id": "skill_pc", "to_step_id": "reply"},
+        {
+            "turn_id": "t1",
+            "from_skill_id": "skill_pc",
+            "from_step_id": "collect_info",
+            "to_skill_id": "skill_pc",
+            "to_step_id": "reply",
+        },
     )
     streamer.on_event(
         "task_frame_started",
@@ -588,8 +650,13 @@ def _run_sop_lifecycle_running(streamer: FeishuTraceStreamer) -> None:
     )
     streamer.on_event(
         "harness_action_created",
-        {"turn_id": "t1", "task_frame_id": "f1", "iteration": 1, "action": "tool",
-         "tool_name": "capability_describe"},
+        {
+            "turn_id": "t1",
+            "task_frame_id": "f1",
+            "iteration": 1,
+            "action": "tool",
+            "tool_name": "capability_describe",
+        },
     )
 
 
@@ -620,7 +687,7 @@ def test_compact_sop_hides_intermediate_steps_while_running() -> None:
     joined = "\n".join(texts)
     # 仅保留判断意图（含匹配 SOP 理由），其余中间步骤全部隐藏
     assert "判断意图 电脑无法开机" in joined
-    assert "匹配\"电脑故障处理\"SOP" in joined
+    assert '匹配"电脑故障处理"SOP' in joined
     # 翻书动画 + 正在推进SOP 合成行
     assert any("正在推进SOP" in t for t in texts)
     # 中间步骤全部隐藏
@@ -646,7 +713,9 @@ def test_compact_sop_shows_finished_after_skill_completed() -> None:
     streamer.start()
     _wait_for_card(streamer)
     _run_sop_lifecycle(streamer)
-    streamer.on_event("skill_completed", {"turn_id": "t1", "skill_id": "skill_pc", "reason": "step_completed"})
+    streamer.on_event(
+        "skill_completed", {"turn_id": "t1", "skill_id": "skill_pc", "reason": "step_completed"}
+    )
     streamer.finish()
     _wait_for_worker_done(streamer)
 
@@ -720,8 +789,12 @@ def test_compact_sop_suspended_skill_state_shows_paused() -> None:
         {
             "turn_id": "t1",
             "currentSkills": [
-                {"skillId": "skill_pc", "name": "电脑故障处理", "state": "suspended",
-                 "stepId": "collect_info"},
+                {
+                    "skillId": "skill_pc",
+                    "name": "电脑故障处理",
+                    "state": "suspended",
+                    "stepId": "collect_info",
+                },
             ],
         },
     )
