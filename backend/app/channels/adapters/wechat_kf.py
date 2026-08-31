@@ -115,6 +115,7 @@ class WeChatKfTokenProvider:
         if not corp_id or not secret:
             raise WeChatKfPermanentError("微信客服企业 ID 或 Secret 缺失")
 
+        request_failed = False
         try:
             with self._client_factory(timeout=15.0) as client:
                 response = client.get(
@@ -124,8 +125,10 @@ class WeChatKfTokenProvider:
                 response.raise_for_status()
                 payload = response.json()
         except (httpx.HTTPError, ValueError):
-            # httpx status errors retain the full request URL, including corpsecret query data.
-            raise WeChatKfTransientError("获取微信客服 access_token 失败") from None
+            # Leave the secret-bearing httpx exception scope before creating the stable error.
+            request_failed = True
+        if request_failed:
+            raise WeChatKfTransientError("获取微信客服 access_token 失败")
         error_code = _provider_error_code(payload)
         if error_code in _TOKEN_ERROR_CODES:
             raise WeChatKfTransientError("微信客服 access_token 请求失效")

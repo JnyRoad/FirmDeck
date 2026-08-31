@@ -422,28 +422,12 @@ def test_wechat_kf_token_provider_classifies_provider_errors(
 
 
 def test_wechat_kf_token_transport_traceback_redacts_secret() -> None:
-    """A token HTTP failure traceback never retains the query-string corporation secret."""
+    """A token HTTP failure retains no secret-bearing exception anywhere in its chain."""
     module = _wechat_kf_adapter_module()
     secret = "trace-secret-must-not-appear"
 
-    class FailingResponse:
-        """Raise an HTTP status error whose request URL contains the sensitive query."""
-
-        def raise_for_status(self) -> None:
-            """Reproduce httpx's URL-bearing HTTPStatusError."""
-            request = httpx.Request(
-                "GET",
-                f"{module.WECOM_API_BASE}/gettoken?corpid=corp-a&corpsecret={secret}",
-            )
-            response = httpx.Response(500, request=request)
-            raise httpx.HTTPStatusError("provider failed", request=request, response=response)
-
-        def json(self) -> dict[str, Any]:
-            """Remain unreachable because status validation fails first."""
-            return {}
-
     class FailingClient:
-        """Return the URL-bearing failure without contacting the provider."""
+        """Return a real httpx failure response without contacting the provider."""
 
         def __enter__(self):
             """Expose this fake as the synchronous client context value."""
@@ -452,10 +436,14 @@ def test_wechat_kf_token_transport_traceback_redacts_secret() -> None:
         def __exit__(self, *_args) -> None:
             """Close the fake context without external side effects."""
 
-        def get(self, _url: str, *, params: dict[str, str]) -> FailingResponse:
-            """Confirm the secret crossed the HTTP boundary before reproducing failure."""
+        def get(self, _url: str, *, params: dict[str, str]) -> httpx.Response:
+            """Build the same secret-bearing request URL that httpx would report."""
             assert params["corpsecret"] == secret
-            return FailingResponse()
+            request = httpx.Request(
+                "GET",
+                f"{module.WECOM_API_BASE}/gettoken?corpid=corp-a&corpsecret={secret}",
+            )
+            return httpx.Response(500, request=request)
 
     provider = module.WeChatKfTokenProvider(client_factory=lambda **_kwargs: FailingClient())
     binding = ChannelBinding(
@@ -470,8 +458,21 @@ def test_wechat_kf_token_transport_traceback_redacts_secret() -> None:
     with pytest.raises(module.WeChatKfTransientError) as captured:
         provider.get(binding)
 
-    formatted = "".join(traceback.format_exception(captured.value))
-    assert secret not in formatted
+    assert captured.value.__context__ is None
+    pending: list[BaseException] = [captured.value]
+    visited: set[int] = set()
+    recursive_diagnostics: list[str] = []
+    while pending:
+        current = pending.pop()
+        if id(current) in visited:
+            continue
+        visited.add(id(current))
+        recursive_diagnostics.append("".join(traceback.format_exception(current)))
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+    assert secret not in "".join(recursive_diagnostics)
 
 
 def test_wechat_kf_provider_errors_are_classified_for_retry(monkeypatch) -> None:
