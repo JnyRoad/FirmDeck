@@ -1089,18 +1089,20 @@ def _cancel_mcp_oauth_flows(db: Session, tenant_id: str, server_id: str) -> None
         db.add(flow)
 
 
-def _invalidate_mcp_oauth_process_tasks(
+def _begin_mcp_oauth_server_change(
     db: Session,
     tenant_id: str,
     server_id: str,
-) -> None:
-    """Fence process-local SDK tasks after the durable server change commits."""
+) -> Any:
+    """Hold a process-local OAuth fence across one server database transaction."""
     from app.api.mcp_oauth import _coordinator_for_engine
 
     bind = db.get_bind()
     if not isinstance(bind, Engine):
         raise TypeError("MCP OAuth requires an engine-bound database session")
-    _coordinator_for_engine(bind).invalidate_server(tenant_id, server_id)
+    coordinator = _coordinator_for_engine(bind)
+    coordinator.begin_server_change(tenant_id, server_id)
+    return coordinator
 
 
 @mcp_router.get(
@@ -1295,37 +1297,44 @@ def update_mcp_server(
     oauth_binding_changed = (
         _mcp_oauth_binding_values(row) != _request_oauth_binding_values(request)
     )
-    conn = request.connection
-    row.name = request.name
-    row.display_name = request.display_name
-    row.description = request.description
-    row.bucket = _normalize_bucket(request.bucket) if request.bucket else "MCP 工具"
-    row.transport = conn.transport
-    row.url = conn.url
-    row.headers_json = conn.headers
-    row.command = conn.command
-    row.args_json = conn.args
-    row.env_json = conn.env
-    row.cwd = conn.cwd
-    if row.apps_mode != request.apps_mode:
-        row.negotiated_capabilities_json = {}
-    row.apps_mode = request.apps_mode
-    row.auth_mode = request.auth_mode
-    row.oauth_client_id = request.oauth_client_id
-    row.oauth_client_metadata_url = request.oauth_client_metadata_url
-    row.oauth_redirect_uri = request.oauth_redirect_uri
-    if request.capability_scope is not None:
-        row.capability_scope = request.capability_scope
-        _update_inherited_mcp_tool_scopes(db, row)
-    row.enabled = request.enabled
-    row.updated_at = utc_now()
-    db.add(row)
-    if oauth_binding_changed:
-        _cancel_mcp_oauth_flows(db, request.tenant_id, row.id)
-        _delete_mcp_oauth_grants(db, request.tenant_id, row.id)
-    db.commit()
-    if oauth_binding_changed:
-        _invalidate_mcp_oauth_process_tasks(db, request.tenant_id, row.id)
+    change_coordinator = (
+        _begin_mcp_oauth_server_change(db, request.tenant_id, row.id)
+        if oauth_binding_changed
+        else None
+    )
+    try:
+        conn = request.connection
+        row.name = request.name
+        row.display_name = request.display_name
+        row.description = request.description
+        row.bucket = _normalize_bucket(request.bucket) if request.bucket else "MCP 工具"
+        row.transport = conn.transport
+        row.url = conn.url
+        row.headers_json = conn.headers
+        row.command = conn.command
+        row.args_json = conn.args
+        row.env_json = conn.env
+        row.cwd = conn.cwd
+        if row.apps_mode != request.apps_mode:
+            row.negotiated_capabilities_json = {}
+        row.apps_mode = request.apps_mode
+        row.auth_mode = request.auth_mode
+        row.oauth_client_id = request.oauth_client_id
+        row.oauth_client_metadata_url = request.oauth_client_metadata_url
+        row.oauth_redirect_uri = request.oauth_redirect_uri
+        if request.capability_scope is not None:
+            row.capability_scope = request.capability_scope
+            _update_inherited_mcp_tool_scopes(db, row)
+        row.enabled = request.enabled
+        row.updated_at = utc_now()
+        db.add(row)
+        if oauth_binding_changed:
+            _cancel_mcp_oauth_flows(db, request.tenant_id, row.id)
+            _delete_mcp_oauth_grants(db, request.tenant_id, row.id)
+        db.commit()
+    finally:
+        if change_coordinator is not None:
+            change_coordinator.end_server_change(request.tenant_id, row.id)
     db.refresh(row)
     return mcp_server_read(row, db)
 
@@ -1346,15 +1355,18 @@ def delete_mcp_server(
     require_overall_agent(db, tenant_id, agent_id)
     ensure_open_gallery_admin(tenant_id, current_user)
     row = _get_mcp_server(db, tenant_id, server_id)
-    if remove_tools:
-        tools = db.exec(select(Tool).where(Tool.mcp_server_id == server_id)).all()
-        for tool in tools:
-            db.delete(tool)
-    _cancel_mcp_oauth_flows(db, tenant_id, row.id)
-    _delete_mcp_oauth_grants(db, tenant_id, row.id)
-    db.delete(row)
-    db.commit()
-    _invalidate_mcp_oauth_process_tasks(db, tenant_id, server_id)
+    change_coordinator = _begin_mcp_oauth_server_change(db, tenant_id, row.id)
+    try:
+        if remove_tools:
+            tools = db.exec(select(Tool).where(Tool.mcp_server_id == server_id)).all()
+            for tool in tools:
+                db.delete(tool)
+        _cancel_mcp_oauth_flows(db, tenant_id, row.id)
+        _delete_mcp_oauth_grants(db, tenant_id, row.id)
+        db.delete(row)
+        db.commit()
+    finally:
+        change_coordinator.end_server_change(tenant_id, row.id)
     return {"status": "deleted"}
 
 

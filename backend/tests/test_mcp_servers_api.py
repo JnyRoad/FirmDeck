@@ -160,11 +160,19 @@ def test_updating_oauth_binding_configuration_cancels_pending_flows(
     import app.api.tools as tools_api
 
     monkeypatch.setenv("STAFFDECK_PUBLIC_URL", "https://staffdeck.example")
-    invalidated: list[tuple[str, str]] = []
+    invalidated: list[tuple[str, str, str]] = []
+
+    class FakeChangeCoordinator:
+        def end_server_change(self, tenant_id: str, server_id: str) -> None:
+            invalidated.append(("end", tenant_id, server_id))
+
     monkeypatch.setattr(
         tools_api,
-        "_invalidate_mcp_oauth_process_tasks",
-        lambda _db, tenant_id, server_id: invalidated.append((tenant_id, server_id)),
+        "_begin_mcp_oauth_server_change",
+        lambda _db, tenant_id, server_id: (
+            invalidated.append(("begin", tenant_id, server_id))
+            or FakeChangeCoordinator()
+        ),
     )
     with _test_session() as db:
         server = _seed_oauth_server_and_grant(db)
@@ -193,7 +201,10 @@ def test_updating_oauth_binding_configuration_cancels_pending_flows(
         assert flow is not None
         assert flow.status == "cancelled"
         assert flow.error_code == "MCP_AUTHORIZATION_REQUIRED"
-        assert invalidated == [("tenant_demo", server.id)]
+        assert invalidated == [
+            ("begin", "tenant_demo", server.id),
+            ("end", "tenant_demo", server.id),
+        ]
 
 
 def test_rotating_static_mcp_headers_deletes_existing_oauth_grants(monkeypatch) -> None:
@@ -1056,11 +1067,19 @@ def test_delete_mcp_server_cancels_pending_oauth_flows(monkeypatch) -> None:
     """Reject callbacks whose protected server was deleted during authorization."""
     import app.api.tools as tools_api
 
-    invalidated: list[tuple[str, str]] = []
+    invalidated: list[tuple[str, str, str]] = []
+
+    class FakeChangeCoordinator:
+        def end_server_change(self, tenant_id: str, server_id: str) -> None:
+            invalidated.append(("end", tenant_id, server_id))
+
     monkeypatch.setattr(
         tools_api,
-        "_invalidate_mcp_oauth_process_tasks",
-        lambda _db, tenant_id, server_id: invalidated.append((tenant_id, server_id)),
+        "_begin_mcp_oauth_server_change",
+        lambda _db, tenant_id, server_id: (
+            invalidated.append(("begin", tenant_id, server_id))
+            or FakeChangeCoordinator()
+        ),
     )
     with _test_session() as db:
         server = _seed_oauth_server_and_grant(db)
@@ -1090,7 +1109,10 @@ def test_delete_mcp_server_cancels_pending_oauth_flows(monkeypatch) -> None:
         flow = db.get(MCPOAuthFlow, "flow_delete")
         assert flow is not None
         assert flow.status == "cancelled"
-        assert invalidated == [("tenant_demo", server.id)]
+        assert invalidated == [
+            ("begin", "tenant_demo", server.id),
+            ("end", "tenant_demo", server.id),
+        ]
 
 
 def test_delete_mcp_server_in_employee_scope_only_unbinds() -> None:

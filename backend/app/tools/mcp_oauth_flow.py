@@ -101,8 +101,10 @@ class MCPOAuthFlowCoordinator:
         self._pending_by_id: dict[str, _PendingFlow] = {}
         self._pending_owner_keys: set[tuple[str, str, str]] = set()
         self._tasks_by_owner: dict[tuple[str, str, str], asyncio.Task[None]] = {}
+        self._task_cancel_codes: dict[asyncio.Task[None], str] = {}
         self._server_generations: dict[tuple[str, str], int] = {}
         self._starting_servers: dict[tuple[str, str], int] = {}
+        self._changing_servers: dict[tuple[str, str], int] = {}
         self._registry_guard = Lock()
 
     @staticmethod
@@ -202,15 +204,20 @@ class MCPOAuthFlowCoordinator:
         owner_key = (tenant_id, server_id, user_id)
         with self._registry_guard:
             owner_task = self._tasks_by_owner.get(owner_key)
+            if owner_task is not None:
+                self._task_cancel_codes[owner_task] = "MCP_AUTHORIZATION_REQUIRED"
         await self._stop_pending_tasks(flow_ids)
         if owner_task is not None and not owner_task.done():
             owner_task.cancel()
             await asyncio.gather(owner_task, return_exceptions=True)
 
-    def invalidate_server(self, tenant_id: str, server_id: str) -> None:
-        """Fence new redirects and cancel live tasks after a server binding changes."""
+    def begin_server_change(self, tenant_id: str, server_id: str) -> None:
+        """Fence starts and cancel live tasks before a server binding transaction."""
         server_key = (tenant_id, server_id)
         with self._registry_guard:
+            self._changing_servers[server_key] = (
+                self._changing_servers.get(server_key, 0) + 1
+            )
             self._server_generations[server_key] = (
                 self._server_generations.get(server_key, 0) + 1
             )
@@ -219,13 +226,38 @@ class MCPOAuthFlowCoordinator:
                 for owner_key, task in self._tasks_by_owner.items()
                 if owner_key[:2] == server_key and not task.done()
             ]
+            for task in tasks:
+                self._task_cancel_codes[task] = "MCP_AUTHORIZATION_REQUIRED"
             self._cleanup_server_generation_locked(server_key)
         for task in tasks:
             task.get_loop().call_soon_threadsafe(task.cancel)
 
+    def end_server_change(self, tenant_id: str, server_id: str) -> None:
+        """Release a server transaction fence after its commit or rollback completes."""
+        server_key = (tenant_id, server_id)
+        with self._registry_guard:
+            changing = self._changing_servers.get(server_key, 0)
+            if changing <= 0:
+                raise RuntimeError("MCP OAuth server change fence is not active")
+            self._server_generations[server_key] = (
+                self._server_generations.get(server_key, 0) + 1
+            )
+            if changing == 1:
+                self._changing_servers.pop(server_key, None)
+            else:
+                self._changing_servers[server_key] = changing - 1
+            self._cleanup_server_generation_locked(server_key)
+
+    def invalidate_server(self, tenant_id: str, server_id: str) -> None:
+        """Apply one immediate server fence outside a wider database transaction."""
+        self.begin_server_change(tenant_id, server_id)
+        self.end_server_change(tenant_id, server_id)
+
     def _cleanup_server_generation_locked(self, server_key: tuple[str, str]) -> None:
         """Drop an idle server fence after every older start has observed it."""
         if self._starting_servers.get(server_key, 0) > 0:
+            return
+        if self._changing_servers.get(server_key, 0) > 0:
             return
         if any(owner_key[:2] == server_key for owner_key in self._pending_owner_keys):
             return
@@ -243,6 +275,7 @@ class MCPOAuthFlowCoordinator:
         with self._registry_guard:
             if self._tasks_by_owner.get(owner_key) is task:
                 self._tasks_by_owner.pop(owner_key, None)
+            self._task_cancel_codes.pop(task, None)
             self._pending_owner_keys.discard(owner_key)
             self._cleanup_server_generation_locked(owner_key[:2])
 
@@ -304,6 +337,8 @@ class MCPOAuthFlowCoordinator:
         server_key = (tenant_id, server_id)
         await self._reconcile_inactive_owner_tasks(tenant_id, server_id, user_id)
         with self._registry_guard:
+            if self._changing_servers.get(server_key, 0) > 0:
+                raise MCPOAuthFlowError("MCP_AUTHORIZATION_REQUIRED")
             server_generation = self._server_generations.get(server_key, 0)
             self._starting_servers[server_key] = (
                 self._starting_servers.get(server_key, 0) + 1
@@ -321,6 +356,9 @@ class MCPOAuthFlowCoordinator:
                 self._server_generations.get(server_key, 0) != server_generation
             )
             if not binding_current or server_invalidated:
+                self._cleanup_server_generation_locked(server_key)
+                raise MCPOAuthFlowError("MCP_AUTHORIZATION_REQUIRED")
+            if self._changing_servers.get(server_key, 0) > 0:
                 self._cleanup_server_generation_locked(server_key)
                 raise MCPOAuthFlowError("MCP_AUTHORIZATION_REQUIRED")
             if owner_key in self._pending_owner_keys:
@@ -355,38 +393,44 @@ class MCPOAuthFlowCoordinator:
             if len(states) != 1 or not states[0]:
                 raise MCPOAuthFlowError("MCP_OAUTH_CALLBACK_INVALID")
             state_digest = self._digest_state(states[0])
-            with Session(self.engine) as db:
-                db.add(
-                    MCPOAuthFlow(
-                        id=flow_id,
-                        tenant_id=tenant_id,
-                        server_id=server_id,
-                        user_id=user_id,
-                        state_digest=state_digest,
-                        redirect_uri=redirect_uri,
-                        status="pending",
-                        expires_at=expires_at,
+            with self._registry_guard:
+                if (
+                    self._server_generations.get(server_key, 0) != server_generation
+                    or self._changing_servers.get(server_key, 0) > 0
+                ):
+                    raise MCPOAuthFlowError("MCP_AUTHORIZATION_REQUIRED")
+                with Session(self.engine) as db:
+                    db.add(
+                        MCPOAuthFlow(
+                            id=flow_id,
+                            tenant_id=tenant_id,
+                            server_id=server_id,
+                            user_id=user_id,
+                            state_digest=state_digest,
+                            redirect_uri=redirect_uri,
+                            status="pending",
+                            expires_at=expires_at,
+                        )
                     )
+                    db.commit()
+                pending = _PendingFlow(
+                    flow_id=flow_id,
+                    state_digest=state_digest,
+                    browser_binding_digest=self._digest_state(browser_binding),
+                    callback_future=callback_future,
+                    task=task,
                 )
-                db.commit()
-            pending = _PendingFlow(
-                flow_id=flow_id,
-                state_digest=state_digest,
-                browser_binding_digest=self._digest_state(browser_binding),
-                callback_future=callback_future,
-                task=task,
-            )
-            self._pending_by_digest[state_digest] = pending
-            self._pending_by_id[flow_id] = pending
-            _log_oauth_event(
-                "mcp_oauth.started",
-                tenant_id=tenant_id,
-                server_id=server_id,
-                user_id=user_id,
-                flow_id=flow_id,
-            )
-            if not authorization_future.done():
-                authorization_future.set_result(authorization_url)
+                self._pending_by_digest[state_digest] = pending
+                self._pending_by_id[flow_id] = pending
+                _log_oauth_event(
+                    "mcp_oauth.started",
+                    tenant_id=tenant_id,
+                    server_id=server_id,
+                    user_id=user_id,
+                    flow_id=flow_id,
+                )
+                if not authorization_future.done():
+                    authorization_future.set_result(authorization_url)
 
         async def callback_handler() -> AuthorizationCodeResult:
             """Wait no longer than the persisted flow TTL for the browser callback."""
@@ -414,13 +458,17 @@ class MCPOAuthFlowCoordinator:
             except asyncio.CancelledError:
                 status = self.read_flow_status(flow_id)
                 with self._registry_guard:
+                    task_cancel_code = self._task_cancel_codes.get(task)
                     server_invalidated = (
                         self._server_generations.get(server_key, 0) != server_generation
                     )
                 cancellation_code = (
-                    "MCP_AUTHORIZATION_REQUIRED"
-                    if status == "cancelled" or server_invalidated
-                    else "MCP_OAUTH_FLOW_EXPIRED"
+                    task_cancel_code
+                    or (
+                        "MCP_AUTHORIZATION_REQUIRED"
+                        if status == "cancelled" or server_invalidated
+                        else "MCP_OAUTH_FLOW_EXPIRED"
+                    )
                 )
                 if cancellation_code == "MCP_OAUTH_FLOW_EXPIRED":
                     self._update_status(flow_id, "expired", cancellation_code)
@@ -481,12 +529,15 @@ class MCPOAuthFlowCoordinator:
             """Wake a start cancelled before its coroutine executes, then release it."""
             if completed_task.cancelled() and not authorization_future.done():
                 with self._registry_guard:
+                    task_cancel_code = self._task_cancel_codes.get(completed_task)
                     invalidated = (
                         self._server_generations.get(server_key, 0) != server_generation
                     )
-                if invalidated:
+                if task_cancel_code or invalidated:
                     authorization_future.set_exception(
-                        MCPOAuthFlowError("MCP_AUTHORIZATION_REQUIRED")
+                        MCPOAuthFlowError(
+                            task_cancel_code or "MCP_AUTHORIZATION_REQUIRED"
+                        )
                     )
             self._release_owner_task(owner_key, completed_task)
 

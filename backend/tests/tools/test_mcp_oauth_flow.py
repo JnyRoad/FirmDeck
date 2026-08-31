@@ -595,6 +595,64 @@ async def test_server_invalidation_cancels_a_flow_before_redirect_persistence(tm
 
 
 @pytest.mark.asyncio
+async def test_owner_disconnect_cancels_a_flow_before_redirect_persistence(tmp_path) -> None:
+    """Return a safe start error when disconnect wins before the redirect is stored."""
+    from app.tools.mcp_oauth_flow import MCPOAuthFlowError
+
+    _engine, coordinator = _coordinator(tmp_path)
+    operation_started = asyncio.Event()
+
+    async def operation(redirect_handler, callback_handler) -> None:
+        """Pause before redirect publication so owner cancellation has no flow row."""
+        operation_started.set()
+        await asyncio.Event().wait()
+
+    start_task = asyncio.create_task(
+        coordinator.start(
+            tenant_id="tenant_1",
+            server_id="server_1",
+            user_id="user_1",
+            redirect_uri="https://staffdeck.example/oauth/callback",
+            browser_binding="browser-binding",
+            operation=operation,
+        )
+    )
+    await operation_started.wait()
+
+    await coordinator.cancel_owner("tenant_1", "server_1", "user_1")
+
+    with pytest.raises(MCPOAuthFlowError, match="MCP_AUTHORIZATION_REQUIRED"):
+        await asyncio.wait_for(start_task, timeout=0.2)
+    assert coordinator._pending_owner_keys == set()
+
+
+@pytest.mark.asyncio
+async def test_redirect_rechecks_server_generation_before_publishing(tmp_path) -> None:
+    """Never publish an authorization URL after its server binding is invalidated."""
+    from app.tools.mcp_oauth_flow import MCPOAuthFlowError
+
+    engine, coordinator = _coordinator(tmp_path)
+
+    async def operation(redirect_handler, callback_handler) -> None:
+        """Invalidate after task registration but immediately before redirect storage."""
+        coordinator.invalidate_server("tenant_1", "server_1")
+        await redirect_handler("https://auth.example/authorize?state=stale-redirect")
+
+    with pytest.raises(MCPOAuthFlowError, match="MCP_AUTHORIZATION_REQUIRED"):
+        await coordinator.start(
+            tenant_id="tenant_1",
+            server_id="server_1",
+            user_id="user_1",
+            redirect_uri="https://staffdeck.example/oauth/callback",
+            browser_binding="browser-binding",
+            operation=operation,
+        )
+
+    with Session(engine) as db:
+        assert db.exec(select(MCPOAuthFlow)).all() == []
+
+
+@pytest.mark.asyncio
 async def test_start_rejects_a_binding_invalidated_during_freshness_check(tmp_path) -> None:
     """Reject an API snapshot invalidated between its database read and task start."""
     from app.tools.mcp_oauth_flow import MCPOAuthFlowError
@@ -623,6 +681,38 @@ async def test_start_rejects_a_binding_invalidated_during_freshness_check(tmp_pa
         )
 
     assert operation_called is False
+    assert coordinator._server_generations == {}
+
+
+@pytest.mark.asyncio
+async def test_start_rejects_while_server_change_transaction_is_active(tmp_path) -> None:
+    """Keep the fence visible from transaction begin until commit or rollback."""
+    from app.tools.mcp_oauth_flow import MCPOAuthFlowError
+
+    _engine, coordinator = _coordinator(tmp_path)
+    operation_called = False
+    coordinator.begin_server_change("tenant_1", "server_1")
+
+    async def operation(redirect_handler, callback_handler) -> None:
+        nonlocal operation_called
+        operation_called = True
+
+    try:
+        with pytest.raises(MCPOAuthFlowError, match="MCP_AUTHORIZATION_REQUIRED"):
+            await coordinator.start(
+                tenant_id="tenant_1",
+                server_id="server_1",
+                user_id="user_1",
+                redirect_uri="https://staffdeck.example/oauth/callback",
+                browser_binding="browser-binding",
+                operation=operation,
+                binding_is_current=lambda: True,
+            )
+    finally:
+        coordinator.end_server_change("tenant_1", "server_1")
+
+    assert operation_called is False
+    assert coordinator._changing_servers == {}
     assert coordinator._server_generations == {}
 
 
