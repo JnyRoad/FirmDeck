@@ -73,6 +73,10 @@ from app.channels.schema import (
     channel_binding_read,
     channel_delivery_read,
 )
+from app.channels.service_account_operations import (
+    WECHAT_KF_OPERATION_RECONCILABLE,
+    ensure_channel_binding_has_no_blocking_account_operation,
+)
 from app.channels.service_identity import (
     IdentityScopeConflict,
     external_account_key,
@@ -777,8 +781,7 @@ def update_channel_binding_agents(
     db.rollback()
     with binding_lifecycle_lock(binding_id):
         binding = _get_binding(db, tenant_id, binding_id)
-        if binding.channel == "wechat_kf":
-            _ensure_wechat_kf_binding_has_no_blocking_operation(db, binding)
+        ensure_channel_binding_has_no_blocking_account_operation(db, binding)
         if request.agents is not None:
             existing = db.exec(
                 select(ChannelBindingAgent).where(ChannelBindingAgent.binding_id == binding.id)
@@ -858,8 +861,7 @@ def delete_channel_binding(
     db.rollback()
     with binding_lifecycle_lock(binding_id):
         binding = _get_binding(db, tenant_id, binding_id)
-        if binding.channel == "wechat_kf":
-            _ensure_wechat_kf_binding_has_no_blocking_operation(db, binding)
+        ensure_channel_binding_has_no_blocking_account_operation(db, binding)
         expected_revision = binding.config_revision
         channel = binding.channel
         should_run = bool(binding.status == "active" and binding.credentials_enc)
@@ -1109,8 +1111,7 @@ def toggle_channel_binding_status(
     with binding_lifecycle_lock(binding_id):
         binding = _get_binding(db, tenant_id, binding_id)
         _ensure_revision(binding, expected_revision)
-        if binding.channel == "wechat_kf":
-            _ensure_wechat_kf_binding_has_no_blocking_operation(db, binding)
+        ensure_channel_binding_has_no_blocking_account_operation(db, binding)
         if target_status == "disabled":
             _quiesce_binding_or_409(channel, binding_id, should_run=should_run)
         try:
@@ -1536,7 +1537,7 @@ def prepare_wechat_kf_callback_config(
         binding = _wechat_kf_management_binding(
             db, request.tenant_id, binding_id, current_user
         )
-        _ensure_wechat_kf_binding_has_no_blocking_operation(db, binding)
+        ensure_channel_binding_has_no_blocking_account_operation(db, binding)
         config = dict(binding.config_json or {})
         old_corp_id = str(config.get("corp_id") or "").strip()
         if old_corp_id and old_corp_id != corp_id:
@@ -1608,7 +1609,7 @@ def save_wechat_kf_credentials(
         binding = _wechat_kf_management_binding(
             db, request.tenant_id, binding_id, current_user
         )
-        _ensure_wechat_kf_binding_has_no_blocking_operation(db, binding)
+        ensure_channel_binding_has_no_blocking_account_operation(db, binding)
         corp_id, credentials = _validated_wechat_kf_credentials(
             request, _wechat_kf_existing_credentials(binding)
         )
@@ -1717,25 +1718,7 @@ def _ensure_wechat_kf_account_binding(
     return account
 
 
-_WECHAT_KF_OPERATION_RECONCILABLE = {"prepared", "provider_inflight", "provider_applied"}
-_WECHAT_KF_OPERATION_BLOCKING = _WECHAT_KF_OPERATION_RECONCILABLE | {"manual_review"}
 _WECHAT_KF_RECONCILE_MAX_OPERATIONS = 20
-
-
-def _ensure_wechat_kf_binding_has_no_blocking_operation(
-    db: Session,
-    binding: ChannelBinding,
-) -> None:
-    """拒绝存在待恢复或人工裁决 operation 的 binding 写入；数据库只读。"""
-    blocking = db.exec(
-        select(WeChatKfAccountOperation.id).where(
-            WeChatKfAccountOperation.tenant_id == binding.tenant_id,
-            WeChatKfAccountOperation.binding_id == binding.id,
-            WeChatKfAccountOperation.status.in_(_WECHAT_KF_OPERATION_BLOCKING),
-        )
-    ).first()
-    if blocking is not None:
-        raise _channel_http_error(409, "wechat kf account operation already pending")
 
 
 def _prepare_wechat_kf_account_operation(
@@ -1753,7 +1736,7 @@ def _prepare_wechat_kf_account_operation(
     binding 必须由调用方持有生命周期锁；未决或人工裁决 operation 会在任何 provider 调用前
     拒绝。成功返回已提交的 durable operation。
     """
-    _ensure_wechat_kf_binding_has_no_blocking_operation(db, binding)
+    ensure_channel_binding_has_no_blocking_account_operation(db, binding)
 
     operation = WeChatKfAccountOperation(
         tenant_id=binding.tenant_id,
@@ -2091,7 +2074,7 @@ def reconcile_wechat_kf_account_operations(
             db.exec(
                 select(WeChatKfAccountOperation.id)
                 .where(
-                    WeChatKfAccountOperation.status.in_(_WECHAT_KF_OPERATION_RECONCILABLE)
+                    WeChatKfAccountOperation.status.in_(WECHAT_KF_OPERATION_RECONCILABLE)
                 )
                 .order_by(WeChatKfAccountOperation.created_at)
                 .limit(max(0, min(max_operations, _WECHAT_KF_RECONCILE_MAX_OPERATIONS)))
@@ -2103,7 +2086,7 @@ def reconcile_wechat_kf_account_operations(
     for operation_id in operation_ids:
         with Session(db_engine) as db:
             operation = db.get(WeChatKfAccountOperation, operation_id)
-            if operation is None or operation.status not in _WECHAT_KF_OPERATION_RECONCILABLE:
+            if operation is None or operation.status not in WECHAT_KF_OPERATION_RECONCILABLE:
                 continue
             with binding_lifecycle_lock(operation.binding_id):
                 try:
@@ -2176,7 +2159,7 @@ def select_wechat_kf_account(
         binding = _wechat_kf_management_binding(
             db, request.tenant_id, binding_id, current_user
         )
-        _ensure_wechat_kf_binding_has_no_blocking_operation(db, binding)
+        ensure_channel_binding_has_no_blocking_account_operation(db, binding)
         try:
             provider_accounts = WeChatKfAdapter().list_accounts(binding)
         except (WeChatKfPermanentError, WeChatKfTransientError) as exc:

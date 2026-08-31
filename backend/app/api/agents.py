@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import ExitStack
 from copy import deepcopy
 from datetime import UTC, datetime
 from time import sleep
@@ -43,7 +44,12 @@ from app.agents.schema import (
     AgentWorkRecordRead,
     AgentWorkRecordReplyStatsRead,
 )
+from app.channels import binding_lifecycle_lock
+from app.channels.service_account_operations import (
+    ensure_channel_binding_has_no_blocking_account_operation,
+)
 from app.contracts.domain_http import domain_http_error
+from app.contracts.http import build_http_exception
 from app.db import get_session
 from app.db.models import (
     AgentKnowledgeBranch,
@@ -520,6 +526,21 @@ def unpublish_agent_from_gallery(
     return agent_read(row, _bindings_by_agent(db, tenant_id).get(row.id, []))
 
 
+def _affected_channel_binding_ids(db: Session, agent_id: str) -> tuple[str, ...]:
+    """返回员工挂载或默认指针涉及的全部 binding ID，并按 ID 确定性排序。
+
+    该函数只读当前事务，覆盖有挂载行和仅保留 `ChannelBinding.agent_id` 的存量 binding；数据库
+    查询失败直接向调用方传播，不产生持久化副作用。
+    """
+    mounted_ids = db.exec(
+        select(ChannelBindingAgent.binding_id).where(ChannelBindingAgent.agent_id == agent_id)
+    ).all()
+    default_ids = db.exec(
+        select(ChannelBinding.id).where(ChannelBinding.agent_id == agent_id)
+    ).all()
+    return tuple(sorted({*mounted_ids, *default_ids}))
+
+
 @enterprise_router.delete("/{agent_id}")
 def delete_agent(
     agent_id: str,
@@ -527,84 +548,118 @@ def delete_agent(
     db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ) -> dict[str, str]:
-    """Delete an employee and clean each deleted session's captured Harness workspace roots."""
+    """原子删除员工及关联记录，并在渠道 binding 锁内安全改写挂载路由。
 
+    输入员工必须属于当前租户且可由调用者管理。该函数会提交数据库删除并清理会话工作区；
+    affected binding 集变化或任一微信客服账号 operation 未决时，以无敏感参数的稳定 409 拒绝，
+    不产生任何部分写入。
+    """
+    # 先完成员工权限校验并只读快照全部 affected binding ID，任何删除尚未开始。
     row = _get_agent(db, tenant_id, agent_id)
     _ensure_can_manage_agent(row, current_user)
     if row.is_overall:
         raise _agent_error("AGENT_OVERALL_DELETE_FORBIDDEN", 400)
-    bindings = db.exec(
-        select(AgentResourceBinding).where(AgentResourceBinding.agent_id == row.id)
-    ).all()
-    for binding in bindings:
-        db.delete(binding)
-    # 渠道挂载同步清理:否则孤儿挂载行会让 /员工 列出已删除员工的裸 ID,
-    # 甚至可被 /切换 路由到。默认挂载被删时把首个剩余挂载提升为默认并同步
-    # binding.agent_id,保持存量绑定回退路径有效。会话指针无需处理:
-    # resolve_current_agent 发现指针不在挂载集会自动重置默认。
-    channel_mounts = db.exec(
-        select(ChannelBindingAgent).where(ChannelBindingAgent.agent_id == row.id)
-    ).all()
-    affected_binding_ids = {mount.binding_id for mount in channel_mounts}
-    for mount in channel_mounts:
-        db.delete(mount)
-    for binding_id in affected_binding_ids:
-        channel_binding = db.get(ChannelBinding, binding_id)
-        if not channel_binding or channel_binding.agent_id != row.id:
-            continue
-        remaining = db.exec(
-            select(ChannelBindingAgent)
-            .where(ChannelBindingAgent.binding_id == binding_id)
-            .order_by(ChannelBindingAgent.sort_order, ChannelBindingAgent.created_at)
-        ).first()
-        if remaining:
-            remaining.is_default = True
-            channel_binding.agent_id = remaining.agent_id
+    affected_binding_ids = _affected_channel_binding_ids(db, row.id)
+    db.rollback()
+
+    workspace_cleanups: list[tuple[str, str, tuple[str, ...]]] = []
+    # 再按 binding ID 确定顺序取得全部生命周期锁，避免两个多 binding 删除形成锁环。
+    with ExitStack() as binding_locks:
+        for binding_id in affected_binding_ids:
+            binding_locks.enter_context(binding_lifecycle_lock(binding_id))
+
+        # 锁内重新校验员工和 affected 集；集合漂移时整次请求 fail-closed，由客户端重试。
+        row = _get_agent(db, tenant_id, agent_id)
+        _ensure_can_manage_agent(row, current_user)
+        if row.is_overall:
+            raise _agent_error("AGENT_OVERALL_DELETE_FORBIDDEN", 400)
+        channel_mounts = db.exec(
+            select(ChannelBindingAgent).where(ChannelBindingAgent.agent_id == row.id)
+        ).all()
+        locked_binding_ids = _affected_channel_binding_ids(db, row.id)
+        if locked_binding_ids != affected_binding_ids:
+            db.rollback()
+            raise build_http_exception("CHANNEL_CONFLICT", status_code=409)
+        affected_bindings = {
+            binding_id: binding
+            for binding_id in affected_binding_ids
+            if (binding := db.get(ChannelBinding, binding_id)) is not None
+        }
+
+        # 所有 guard 必须在首个数据库写入前完成，保证任一未决 operation 都是全局零部分提交。
+        for binding_id in affected_binding_ids:
+            binding = affected_bindings.get(binding_id)
+            if binding is not None:
+                ensure_channel_binding_has_no_blocking_account_operation(db, binding)
+
+        # guard 全部通过后才删除员工资源与渠道挂载。
+        bindings = db.exec(
+            select(AgentResourceBinding).where(AgentResourceBinding.agent_id == row.id)
+        ).all()
+        for binding in bindings:
+            db.delete(binding)
+        for mount in channel_mounts:
+            db.delete(mount)
+
+        # 每个发生挂载变化的 binding 只推进一次 revision；默认被删时同步提升剩余首个挂载。
+        for binding_id in affected_binding_ids:
+            channel_binding = affected_bindings.get(binding_id)
+            if channel_binding is None:
+                continue
+            remaining = db.exec(
+                select(ChannelBindingAgent)
+                .where(ChannelBindingAgent.binding_id == binding_id)
+                .order_by(ChannelBindingAgent.sort_order, ChannelBindingAgent.created_at)
+            ).first()
+            if channel_binding.agent_id == row.id and remaining:
+                remaining.is_default = True
+                channel_binding.agent_id = remaining.agent_id
+                db.add(remaining)
+            channel_binding.config_revision += 1
             channel_binding.updated_at = utc_now()
-            db.add(remaining)
             db.add(channel_binding)
-    # 会话级联清理:员工删除后其会话若保留,新消息会由租户默认 persona 静默接管,
-    # 与删除团队一致,直接清空其全部会话(消息/事件/反馈/Harness 记录与工作区)。
-    sessions = db.exec(
-        select(ChatSession).where(
-            ChatSession.tenant_id == tenant_id, ChatSession.agent_id == row.id
-        )
-    ).all()
-    workspace_cleanups = []
-    for session in sessions:
-        cleanup = purge_chat_session_records(db, session)
-        workspace_cleanups.append((session.tenant_id, session.id, cleanup.workspace_roots))
-    # 团队成员关系同步清理,避免花名册/TL 会话悬挂在已删除员工上。
-    memberships = db.exec(select(TeamMember).where(TeamMember.agent_id == row.id)).all()
-    for membership in memberships:
-        db.delete(membership)
-    # 定时任务立即暂停,而不是等到下次触发才失败。
-    scheduled_tasks = db.exec(
-        select(ScheduledTask).where(
-            ScheduledTask.tenant_id == tenant_id,
-            ScheduledTask.agent_id == row.id,
-            ScheduledTask.status == "active",
-        )
-    ).all()
-    for task in scheduled_tasks:
-        task.status = "paused"
-        task.next_run_at = None
-        task.updated_at = utc_now()
-        db.add(task)
-    # 待处理人工转接直接取消,避免悬挂在已删员工的收件箱里。
-    pending_handoffs = db.exec(
-        select(HumanHandoffRequest).where(
-            HumanHandoffRequest.tenant_id == tenant_id,
-            HumanHandoffRequest.agent_id == row.id,
-            HumanHandoffRequest.status == "pending",
-        )
-    ).all()
-    for handoff in pending_handoffs:
-        handoff.status = "cancelled"
-        handoff.updated_at = utc_now()
-        db.add(handoff)
-    db.delete(row)
-    db.commit()
+
+        # 会话级联清理：员工删除后不允许租户默认 persona 静默接管历史会话。
+        sessions = db.exec(
+            select(ChatSession).where(
+                ChatSession.tenant_id == tenant_id, ChatSession.agent_id == row.id
+            )
+        ).all()
+        for session in sessions:
+            cleanup = purge_chat_session_records(db, session)
+            workspace_cleanups.append((session.tenant_id, session.id, cleanup.workspace_roots))
+
+        # 团队成员、定时任务与待处理人工转接同步终结，随后原子提交全部数据库写入。
+        memberships = db.exec(select(TeamMember).where(TeamMember.agent_id == row.id)).all()
+        for membership in memberships:
+            db.delete(membership)
+        scheduled_tasks = db.exec(
+            select(ScheduledTask).where(
+                ScheduledTask.tenant_id == tenant_id,
+                ScheduledTask.agent_id == row.id,
+                ScheduledTask.status == "active",
+            )
+        ).all()
+        for task in scheduled_tasks:
+            task.status = "paused"
+            task.next_run_at = None
+            task.updated_at = utc_now()
+            db.add(task)
+        pending_handoffs = db.exec(
+            select(HumanHandoffRequest).where(
+                HumanHandoffRequest.tenant_id == tenant_id,
+                HumanHandoffRequest.agent_id == row.id,
+                HumanHandoffRequest.status == "pending",
+            )
+        ).all()
+        for handoff in pending_handoffs:
+            handoff.status = "cancelled"
+            handoff.updated_at = utc_now()
+            db.add(handoff)
+        db.delete(row)
+        db.commit()
+
+    # 数据库提交并释放全部 binding 锁后，再清理每个已删除会话的工作区。
     for session_tenant_id, session_id, workspace_roots in workspace_cleanups:
         remove_chat_session_workspace(
             tenant_id=session_tenant_id,

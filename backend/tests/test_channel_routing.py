@@ -26,6 +26,7 @@ from app.db.models import (
     Message,
     Tenant,
     User,
+    WeChatKfAccountOperation,
     new_id,
 )
 from app.i18n.language_context import LanguageContext, LocaleResolutionSource
@@ -704,6 +705,7 @@ def test_delete_agent_cleans_channel_mounts_and_repoints_default() -> None:
         assert mounts[0].is_default is True  # 首个剩余挂载提升为默认
         binding = db.get(ChannelBinding, binding_id)
         assert binding.agent_id == "agent_xz"
+        assert binding.config_revision == 1
         assert db.get(AgentProfile, "agent_cw") is None
 
         # /员工 列表不再出现已删除员工
@@ -752,6 +754,197 @@ def test_delete_agent_last_mount_keeps_binding_agent() -> None:
         assert mounts == []
         binding = db.get(ChannelBinding, binding_id)
         assert binding.agent_id == "agent_cw"  # 无剩余挂载可指,保持原值
+        assert binding.config_revision == 1
+
+
+@pytest.mark.parametrize("operation_status", ["manual_review", "provider_inflight"])
+def test_delete_agent_is_atomic_when_wechat_kf_binding_operation_blocks(
+    operation_status: str,
+) -> None:
+    """任一微信客服 binding 未决时，多 binding 员工删除必须零部分写入并返回安全 409。"""
+    engine = _test_engine()
+    users = _seed_api_users(engine)
+    private_detail = "provider-secret-private https://provider.invalid/account"
+    with Session(engine) as db:
+        wechat_kf_binding = ChannelBinding(
+            tenant_id="tenant_demo",
+            agent_id="agent_cw",
+            channel="wechat_kf",
+            status="active",
+            config_revision=7,
+            created_by_user_id="user_owner",
+        )
+        wechat_binding = ChannelBinding(
+            tenant_id="tenant_demo",
+            agent_id="agent_cw",
+            channel="wechat",
+            status="active",
+            config_revision=11,
+            created_by_user_id="user_owner",
+        )
+        db.add_all([wechat_kf_binding, wechat_binding])
+        db.flush()
+        mounts = (
+            (wechat_kf_binding.id, "agent_cw", True, 0),
+            (wechat_kf_binding.id, "agent_xz", False, 1),
+            (wechat_binding.id, "agent_cw", True, 0),
+            (wechat_binding.id, "agent_rs", False, 1),
+        )
+        for binding_id, agent_id, is_default, sort_order in mounts:
+            db.add(
+                ChannelBindingAgent(
+                    tenant_id="tenant_demo",
+                    binding_id=binding_id,
+                    agent_id=agent_id,
+                    is_default=is_default,
+                    sort_order=sort_order,
+                )
+            )
+        operation = WeChatKfAccountOperation(
+            tenant_id="tenant_demo",
+            binding_id=wechat_kf_binding.id,
+            kind="create" if operation_status == "manual_review" else "update",
+            status=operation_status,
+            open_kfid=None if operation_status == "manual_review" else "wk-pending-update",
+            desired_name=private_detail,
+            binding_revision=7,
+            last_error_code="CHANNEL_CONFLICT",
+        )
+        db.add(operation)
+        db.commit()
+        operation_id = operation.id
+        binding_ids = (wechat_kf_binding.id, wechat_binding.id)
+
+    response = _make_agents_client(engine).delete(
+        "/api/enterprise/agents/agent_cw?tenant_id=tenant_demo",
+        headers=_auth(users["owner"]),
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "CHANNEL_CONFLICT"
+    assert private_detail not in response.text
+    assert "provider.invalid" not in response.text
+    with Session(engine) as db:
+        assert db.get(AgentProfile, "agent_cw") is not None
+        stored_operation = db.get(WeChatKfAccountOperation, operation_id)
+        assert stored_operation.status == operation_status
+        assert stored_operation.binding_revision == 7
+        stored_bindings = [db.get(ChannelBinding, binding_id) for binding_id in binding_ids]
+        assert [(binding.agent_id, binding.config_revision) for binding in stored_bindings] == [
+            ("agent_cw", 7),
+            ("agent_cw", 11),
+        ]
+        stored_mounts = db.exec(
+            select(ChannelBindingAgent).order_by(
+                ChannelBindingAgent.binding_id,
+                ChannelBindingAgent.sort_order,
+            )
+        ).all()
+        assert [
+            (mount.binding_id, mount.agent_id, mount.is_default, mount.sort_order)
+            for mount in stored_mounts
+        ] == sorted(mounts)
+
+
+def test_delete_agent_succeeds_after_wechat_kf_operation_completed() -> None:
+    """显式裁决完成后的 operation 不再阻断删除，路由改写必须推进 binding revision。"""
+    engine = _test_engine()
+    users = _seed_api_users(engine)
+    with Session(engine) as db:
+        binding = ChannelBinding(
+            tenant_id="tenant_demo",
+            agent_id="agent_cw",
+            channel="wechat_kf",
+            status="active",
+            config_revision=3,
+            created_by_user_id="user_owner",
+        )
+        db.add(binding)
+        db.flush()
+        for index, (agent_id, is_default) in enumerate((("agent_cw", True), ("agent_xz", False))):
+            db.add(
+                ChannelBindingAgent(
+                    tenant_id="tenant_demo",
+                    binding_id=binding.id,
+                    agent_id=agent_id,
+                    is_default=is_default,
+                    sort_order=index,
+                )
+            )
+        operation = WeChatKfAccountOperation(
+            tenant_id="tenant_demo",
+            binding_id=binding.id,
+            kind="create",
+            status="completed",
+            open_kfid="wk-resolved",
+            desired_name="已裁决",
+            binding_revision=2,
+            completed_at=binding.updated_at,
+        )
+        db.add(operation)
+        db.commit()
+        binding_id = binding.id
+        operation_id = operation.id
+
+    response = _make_agents_client(engine).delete(
+        "/api/enterprise/agents/agent_cw?tenant_id=tenant_demo",
+        headers=_auth(users["owner"]),
+    )
+
+    assert response.status_code == 200
+    with Session(engine) as db:
+        binding = db.get(ChannelBinding, binding_id)
+        assert binding.agent_id == "agent_xz"
+        assert binding.config_revision == 4
+        assert db.get(WeChatKfAccountOperation, operation_id).status == "completed"
+        assert db.get(AgentProfile, "agent_cw") is None
+        mounts = db.exec(
+            select(ChannelBindingAgent).where(ChannelBindingAgent.binding_id == binding_id)
+        ).all()
+        assert [(mount.agent_id, mount.is_default) for mount in mounts] == [("agent_xz", True)]
+
+
+def test_delete_agent_blocks_legacy_default_wechat_kf_binding_operation() -> None:
+    """无挂载行的存量默认 binding 也必须取得锁并受 manual-review guard 保护。"""
+    engine = _test_engine()
+    users = _seed_api_users(engine)
+    with Session(engine) as db:
+        binding = ChannelBinding(
+            tenant_id="tenant_demo",
+            agent_id="agent_cw",
+            channel="wechat_kf",
+            status="active",
+            config_revision=5,
+            created_by_user_id="user_owner",
+        )
+        db.add(binding)
+        db.flush()
+        operation = WeChatKfAccountOperation(
+            tenant_id="tenant_demo",
+            binding_id=binding.id,
+            kind="create",
+            status="manual_review",
+            desired_name="legacy-default-private",
+            binding_revision=5,
+            last_error_code="CHANNEL_CONFLICT",
+        )
+        db.add(operation)
+        db.commit()
+        binding_id = binding.id
+        operation_id = operation.id
+
+    response = _make_agents_client(engine).delete(
+        "/api/enterprise/agents/agent_cw?tenant_id=tenant_demo",
+        headers=_auth(users["owner"]),
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "CHANNEL_CONFLICT"
+    with Session(engine) as db:
+        assert db.get(AgentProfile, "agent_cw") is not None
+        binding = db.get(ChannelBinding, binding_id)
+        assert (binding.agent_id, binding.config_revision) == ("agent_cw", 5)
+        assert db.get(WeChatKfAccountOperation, operation_id).status == "manual_review"
 
 
 # ---------- 迁移回填 ----------
