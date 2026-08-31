@@ -21,6 +21,7 @@ from sqlmodel import Session, select
 from app.db.models import MCPOAuthFlow, new_id, utc_now
 
 FLOW_TTL_SECONDS = 600
+BINDING_POLL_SECONDS = 0.1
 logger = logging.getLogger(__name__)
 
 
@@ -406,20 +407,38 @@ class MCPOAuthFlowCoordinator:
                     or self._changing_servers.get(server_key, 0) > 0
                 ):
                     raise MCPOAuthFlowError("MCP_AUTHORIZATION_REQUIRED")
-                with Session(self.engine) as db:
-                    db.add(
-                        MCPOAuthFlow(
-                            id=flow_id,
-                            tenant_id=tenant_id,
-                            server_id=server_id,
-                            user_id=user_id,
-                            state_digest=state_digest,
-                            redirect_uri=redirect_uri,
-                            status="pending",
-                            expires_at=expires_at,
-                        )
+            if binding_is_current is not None and not binding_is_current():
+                raise MCPOAuthFlowError("MCP_AUTHORIZATION_REQUIRED")
+            with Session(self.engine) as db:
+                db.add(
+                    MCPOAuthFlow(
+                        id=flow_id,
+                        tenant_id=tenant_id,
+                        server_id=server_id,
+                        user_id=user_id,
+                        state_digest=state_digest,
+                        redirect_uri=redirect_uri,
+                        status="pending",
+                        expires_at=expires_at,
                     )
-                    db.commit()
+                )
+                db.commit()
+            binding_current_after_write = (
+                binding_is_current is None or binding_is_current()
+            )
+            with self._registry_guard:
+                server_invalidated = (
+                    self._server_generations.get(server_key, 0) != server_generation
+                    or self._changing_servers.get(server_key, 0) > 0
+                )
+            if server_invalidated or not binding_current_after_write:
+                self._update_status(
+                    flow_id,
+                    "cancelled",
+                    "MCP_AUTHORIZATION_REQUIRED",
+                )
+                raise MCPOAuthFlowError("MCP_AUTHORIZATION_REQUIRED")
+            with self._registry_guard:
                 pending = _PendingFlow(
                     flow_id=flow_id,
                     state_digest=state_digest,
@@ -532,8 +551,32 @@ class MCPOAuthFlowCoordinator:
             server_invalidated = (
                 self._server_generations.get(server_key, 0) != server_generation
             )
+
+        async def monitor_binding() -> None:
+            """Cancel a live SDK task when another process commits a binding change."""
+            if binding_is_current is None:
+                return
+            while not task.done():
+                await asyncio.sleep(BINDING_POLL_SECONDS)
+                try:
+                    binding_current = binding_is_current()
+                except BaseException:
+                    binding_current = False
+                if binding_current:
+                    continue
+                with self._registry_guard:
+                    self._task_cancel_codes[task] = "MCP_AUTHORIZATION_REQUIRED"
+                task.cancel()
+                return
+
+        binding_monitor_task = asyncio.create_task(
+            monitor_binding(),
+            name=f"mcp-oauth-binding-{flow_id}",
+        )
+
         def finish_task(completed_task: asyncio.Task[None]) -> None:
             """Wake a start cancelled before its coroutine executes, then release it."""
+            binding_monitor_task.cancel()
             if completed_task.cancelled() and not authorization_future.done():
                 with self._registry_guard:
                     task_cancel_code = self._task_cancel_codes.get(completed_task)

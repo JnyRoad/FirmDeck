@@ -653,6 +653,74 @@ async def test_redirect_rechecks_server_generation_before_publishing(tmp_path) -
 
 
 @pytest.mark.asyncio
+async def test_redirect_persists_without_holding_the_registry_guard(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """Keep database I/O outside the process-local registry critical section."""
+    import app.tools.mcp_oauth_flow as flow
+
+    _engine, coordinator = _coordinator(tmp_path)
+    real_commit = flow.Session.commit
+
+    def commit_without_registry_guard(session) -> None:
+        acquired = coordinator._registry_guard.acquire(blocking=False)
+        assert acquired, "database commit ran while the registry guard was held"
+        coordinator._registry_guard.release()
+        real_commit(session)
+
+    monkeypatch.setattr(flow.Session, "commit", commit_without_registry_guard)
+
+    async def operation(redirect_handler, callback_handler) -> None:
+        await redirect_handler("https://auth.example/authorize?state=unlocked-write")
+        await callback_handler()
+
+    started = await coordinator.start(
+        tenant_id="tenant_1",
+        server_id="server_1",
+        user_id="user_1",
+        redirect_uri="https://staffdeck.example/oauth/callback",
+        browser_binding="browser-binding",
+        operation=operation,
+    )
+    await coordinator.cancel_owner("tenant_1", "server_1", "user_1")
+    assert started.authorization_url.endswith("state=unlocked-write")
+
+
+@pytest.mark.asyncio
+async def test_durable_binding_change_cancels_a_pre_redirect_sdk_task(tmp_path) -> None:
+    """Observe a server change committed by another process before redirect publication."""
+    from app.tools.mcp_oauth_flow import MCPOAuthFlowError
+
+    _engine, coordinator = _coordinator(tmp_path)
+    operation_started = asyncio.Event()
+    binding_current = True
+
+    async def operation(_redirect_handler, _callback_handler) -> None:
+        operation_started.set()
+        await asyncio.Event().wait()
+
+    start_task = asyncio.create_task(
+        coordinator.start(
+            tenant_id="tenant_1",
+            server_id="server_1",
+            user_id="user_1",
+            redirect_uri="https://staffdeck.example/oauth/callback",
+            browser_binding="browser-binding",
+            operation=operation,
+            binding_is_current=lambda: binding_current,
+        )
+    )
+    await operation_started.wait()
+    binding_current = False
+
+    with pytest.raises(MCPOAuthFlowError, match="MCP_AUTHORIZATION_REQUIRED"):
+        await asyncio.wait_for(start_task, timeout=0.5)
+
+    assert coordinator._pending_owner_keys == set()
+
+
+@pytest.mark.asyncio
 async def test_start_rejects_a_binding_invalidated_during_freshness_check(tmp_path) -> None:
     """Reject an API snapshot invalidated between its database read and task start."""
     from app.tools.mcp_oauth_flow import MCPOAuthFlowError
