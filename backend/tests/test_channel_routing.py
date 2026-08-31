@@ -1,3 +1,5 @@
+import threading
+
 import pytest
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
@@ -1012,6 +1014,28 @@ def _make_api_client(engine):
     return TestClient(app)
 
 
+def _make_agent_channel_client(engine):
+    """创建同时挂载员工与渠道路由的测试客户端；每个请求使用独立数据库 Session。"""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    import app.api.agents as agents_api
+    import app.api.channels as channels_api
+    from app.db import get_session
+
+    app = FastAPI()
+    app.include_router(agents_api.enterprise_router)
+    app.include_router(channels_api.router)
+
+    def override_get_session():
+        """为并发 API 请求提供独立 Session，退出请求时自动回滚未提交事务。"""
+        with Session(engine) as session:
+            yield session
+
+    app.dependency_overrides[get_session] = override_get_session
+    return TestClient(app)
+
+
 def _seed_api_users(engine) -> dict[str, User]:
     with Session(engine) as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
@@ -1039,6 +1063,47 @@ def _auth(user: User) -> dict[str, str]:
     from app.security.auth import create_access_token
 
     return {"Authorization": f"Bearer {create_access_token(user)}"}
+
+
+def _concurrent_test_engine(tmp_path):
+    """创建支持多连接并发的 WAL SQLite 测试库；数据库文件仅写入 pytest 临时目录。"""
+    db_path = tmp_path / "channel-routing-concurrency.db"
+    engine = create_engine(
+        f"sqlite:///{db_path}",
+        connect_args={"check_same_thread": False, "timeout": 5.0},
+    )
+    SQLModel.metadata.create_all(engine)
+    with engine.connect() as connection:
+        connection.exec_driver_sql("PRAGMA journal_mode=WAL")
+        connection.commit()
+    return engine
+
+
+def _seed_agent_delete_concurrency_binding(engine) -> tuple[dict[str, User], str]:
+    """创建可安全提升默认员工的双挂载 binding；提交测试租户、员工与路由数据。"""
+    users = _seed_api_users(engine)
+    with Session(engine) as db:
+        binding = ChannelBinding(
+            tenant_id="tenant_demo",
+            agent_id="agent_cw",
+            channel="wechat",
+            status="active",
+            created_by_user_id="user_owner",
+        )
+        db.add(binding)
+        db.flush()
+        for index, (agent_id, is_default) in enumerate((("agent_cw", True), ("agent_xz", False))):
+            db.add(
+                ChannelBindingAgent(
+                    tenant_id="tenant_demo",
+                    binding_id=binding.id,
+                    agent_id=agent_id,
+                    is_default=is_default,
+                    sort_order=index,
+                )
+            )
+        db.commit()
+        return users, binding.id
 
 
 def test_post_binding_auto_mounts_default_agent() -> None:
@@ -1193,3 +1258,289 @@ def test_put_agents_validations() -> None:
         headers=_auth(users["owner"]),
     )
     assert duplicated.status_code == 400
+
+
+def test_create_binding_waits_for_agent_delete_and_leaves_no_late_route(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """删除锁内复核后并发创建不得逃逸为悬空 binding、mount 或 operation。"""
+    import app.api.agents as agents_api
+    import app.api.channels as channels_api
+
+    engine = _concurrent_test_engine(tmp_path)
+    users, original_binding_id = _seed_agent_delete_concurrency_binding(engine)
+    delete_ready = threading.Event()
+    release_delete = threading.Event()
+    create_prevalidated = threading.Event()
+    create_done = threading.Event()
+    delete_responses: list = []
+    create_responses: list = []
+    real_operation_guard = agents_api.ensure_channel_binding_has_no_blocking_account_operation
+    real_scope_guard = channels_api.ensure_agent_scope_manager
+
+    def block_delete_after_guard(db, binding) -> None:
+        """把删除停在最后 guard 与首个写入之间，以复现 reviewer 指定窗口。"""
+        real_operation_guard(db, binding)
+        if binding.id == original_binding_id:
+            delete_ready.set()
+            if not release_delete.wait(timeout=5.0):
+                raise RuntimeError("delete barrier timed out")
+
+    def mark_create_prevalidated(db, tenant_id, agent_id, current_user):
+        """标记创建已读到待删员工；保持真实权限校验与数据库副作用。"""
+        result = real_scope_guard(db, tenant_id, agent_id, current_user)
+        if agent_id == "agent_cw":
+            create_prevalidated.set()
+        return result
+
+    def delete_request() -> None:
+        """在独立请求线程删除员工，并保留真实 HTTP 响应供主线程断言。"""
+        response = _make_agent_channel_client(engine).delete(
+            "/api/enterprise/agents/agent_cw?tenant_id=tenant_demo",
+            headers=_auth(users["owner"]),
+        )
+        delete_responses.append(response)
+
+    def create_request() -> None:
+        """在删除临界区并发创建微信客服 binding，并记录请求完成时点。"""
+        response = _make_agent_channel_client(engine).post(
+            "/api/enterprise/channels",
+            json={"tenant_id": "tenant_demo", "agent_id": "agent_cw", "channel": "wechat_kf"},
+            headers=_auth(users["owner"]),
+        )
+        create_responses.append(response)
+        create_done.set()
+
+    monkeypatch.setattr(
+        agents_api,
+        "ensure_channel_binding_has_no_blocking_account_operation",
+        block_delete_after_guard,
+    )
+    monkeypatch.setattr(channels_api, "ensure_agent_scope_manager", mark_create_prevalidated)
+
+    # 先把删除精确停在旧 affected set 已复核、数据库尚未写入的 reviewer 窗口。
+    delete_thread = threading.Thread(target=delete_request)
+    delete_thread.start()
+    assert delete_ready.wait(timeout=5.0)
+
+    # 再让创建读到员工；旧实现会在删除释放前完成并允许补入 manual-review operation。
+    create_thread = threading.Thread(target=create_request)
+    create_thread.start()
+    assert create_prevalidated.wait(timeout=5.0)
+    escaped_before_release = create_done.wait(timeout=0.5)
+    if escaped_before_release:
+        escaped_binding_id = create_responses[0].json()["id"]
+        with Session(engine) as db:
+            db.add(
+                WeChatKfAccountOperation(
+                    tenant_id="tenant_demo",
+                    binding_id=escaped_binding_id,
+                    kind="create",
+                    status="manual_review",
+                    desired_name="private-provider-state",
+                    binding_revision=0,
+                    last_error_code="CHANNEL_CONFLICT",
+                )
+            )
+            db.commit()
+    release_delete.set()
+    delete_thread.join(timeout=5.0)
+    create_thread.join(timeout=5.0)
+
+    # 正确锁序使删除先提交，随后创建在锁内重验时得到稳定未找到且不产生路由记录。
+    assert not delete_thread.is_alive()
+    assert not create_thread.is_alive()
+    assert len(delete_responses) == 1
+    assert len(create_responses) == 1
+    assert delete_responses[0].status_code == 200
+    assert create_responses[0].status_code == 404
+    assert create_responses[0].json()["detail"]["code"] == "AGENT_NOT_FOUND"
+    assert "private-provider-state" not in create_responses[0].text
+    with Session(engine) as db:
+        assert db.get(AgentProfile, "agent_cw") is None
+        original = db.get(ChannelBinding, original_binding_id)
+        assert (original.agent_id, original.config_revision) == ("agent_xz", 1)
+        assert (
+            db.exec(select(ChannelBinding).where(ChannelBinding.channel == "wechat_kf")).all() == []
+        )
+        assert (
+            db.exec(
+                select(ChannelBindingAgent).where(ChannelBindingAgent.agent_id == "agent_cw")
+            ).all()
+            == []
+        )
+        assert db.exec(select(WeChatKfAccountOperation)).all() == []
+
+
+def test_mount_update_revalidates_agent_after_concurrent_delete(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """先取得 binding 锁的员工删除完成后，已预校验的挂载更新不得复活该员工路由。"""
+    import app.api.agents as agents_api
+    import app.api.channels as channels_api
+
+    engine = _concurrent_test_engine(tmp_path)
+    users, binding_id = _seed_agent_delete_concurrency_binding(engine)
+    delete_ready = threading.Event()
+    release_delete = threading.Event()
+    update_prevalidated = threading.Event()
+    delete_responses: list = []
+    update_responses: list = []
+    real_operation_guard = agents_api.ensure_channel_binding_has_no_blocking_account_operation
+    real_scope_guard = channels_api.ensure_agent_scope_manager
+
+    def block_delete_after_guard(db, binding) -> None:
+        """让删除持有 binding 与 agent 锁等待，以压力测试更新的锁内重验。"""
+        real_operation_guard(db, binding)
+        if binding.id == binding_id:
+            delete_ready.set()
+            if not release_delete.wait(timeout=5.0):
+                raise RuntimeError("delete barrier timed out")
+
+    def mark_update_prevalidated(db, tenant_id, agent_id, current_user):
+        """记录更新已在锁外看到待删员工，同时执行真实管理权限校验。"""
+        result = real_scope_guard(db, tenant_id, agent_id, current_user)
+        if agent_id == "agent_cw":
+            update_prevalidated.set()
+        return result
+
+    def delete_request() -> None:
+        """并发删除默认员工；响应由主线程检查稳定契约和最终状态。"""
+        delete_responses.append(
+            _make_agent_channel_client(engine).delete(
+                "/api/enterprise/agents/agent_cw?tenant_id=tenant_demo",
+                headers=_auth(users["owner"]),
+            )
+        )
+
+    def update_request() -> None:
+        """用已预校验的员工替换挂载，覆盖删除先持锁的反向并发顺序。"""
+        update_responses.append(
+            _make_agent_channel_client(engine).put(
+                f"/api/enterprise/channels/{binding_id}?tenant_id=tenant_demo",
+                json={"agents": [{"agent_id": "agent_cw"}, {"agent_id": "agent_xz"}]},
+                headers=_auth(users["owner"]),
+            )
+        )
+
+    monkeypatch.setattr(
+        agents_api,
+        "ensure_channel_binding_has_no_blocking_account_operation",
+        block_delete_after_guard,
+    )
+    monkeypatch.setattr(channels_api, "ensure_agent_scope_manager", mark_update_prevalidated)
+
+    delete_thread = threading.Thread(target=delete_request)
+    delete_thread.start()
+    assert delete_ready.wait(timeout=5.0)
+    update_thread = threading.Thread(target=update_request)
+    update_thread.start()
+    assert update_prevalidated.wait(timeout=5.0)
+    release_delete.set()
+    delete_thread.join(timeout=5.0)
+    update_thread.join(timeout=5.0)
+
+    assert not delete_thread.is_alive()
+    assert not update_thread.is_alive()
+    assert delete_responses[0].status_code == 200
+    assert update_responses[0].status_code == 404
+    assert update_responses[0].json()["detail"]["code"] == "AGENT_NOT_FOUND"
+    with Session(engine) as db:
+        assert db.get(AgentProfile, "agent_cw") is None
+        binding = db.get(ChannelBinding, binding_id)
+        assert (binding.agent_id, binding.config_revision) == ("agent_xz", 1)
+        assert (
+            db.exec(
+                select(ChannelBindingAgent).where(ChannelBindingAgent.agent_id == "agent_cw")
+            ).all()
+            == []
+        )
+
+
+def test_agent_delete_and_mount_update_reverse_order_has_no_deadlock(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """挂载更新先持 binding/agent 锁时，员工删除须有界结束且不得覆盖新路由。"""
+    import app.api.agents as agents_api
+    import app.api.channels as channels_api
+
+    engine = _concurrent_test_engine(tmp_path)
+    users, binding_id = _seed_agent_delete_concurrency_binding(engine)
+    update_ready = threading.Event()
+    release_update = threading.Event()
+    delete_started = threading.Event()
+    delete_done = threading.Event()
+    update_responses: list = []
+    delete_responses: list = []
+    real_operation_guard = channels_api.ensure_channel_binding_has_no_blocking_account_operation
+    real_affected_ids = agents_api._affected_channel_binding_ids
+
+    def block_update_after_guard(db, binding) -> None:
+        """把更新停在所有路由锁内且首个写入前，验证反向锁序不会成环。"""
+        real_operation_guard(db, binding)
+        if binding.id == binding_id:
+            update_ready.set()
+            if not release_update.wait(timeout=5.0):
+                raise RuntimeError("update barrier timed out")
+
+    def mark_delete_started(db, agent_id):
+        """记录删除已取得初始 affected set；返回真实确定性 binding ID 集合。"""
+        result = real_affected_ids(db, agent_id)
+        if agent_id == "agent_cw":
+            delete_started.set()
+        return result
+
+    def update_request() -> None:
+        """先移除待删员工挂载；请求在首个写入前由 barrier 暂停。"""
+        update_responses.append(
+            _make_agent_channel_client(engine).put(
+                f"/api/enterprise/channels/{binding_id}?tenant_id=tenant_demo",
+                json={"agents": [{"agent_id": "agent_xz"}]},
+                headers=_auth(users["owner"]),
+            )
+        )
+
+    def delete_request() -> None:
+        """在更新持锁期间删除员工，并标记请求退出以检测死锁。"""
+        delete_responses.append(
+            _make_agent_channel_client(engine).delete(
+                "/api/enterprise/agents/agent_cw?tenant_id=tenant_demo",
+                headers=_auth(users["owner"]),
+            )
+        )
+        delete_done.set()
+
+    monkeypatch.setattr(
+        channels_api,
+        "ensure_channel_binding_has_no_blocking_account_operation",
+        block_update_after_guard,
+    )
+    monkeypatch.setattr(agents_api, "_affected_channel_binding_ids", mark_delete_started)
+
+    update_thread = threading.Thread(target=update_request)
+    update_thread.start()
+    assert update_ready.wait(timeout=5.0)
+    delete_thread = threading.Thread(target=delete_request)
+    delete_thread.start()
+    assert delete_started.wait(timeout=5.0)
+    assert not delete_done.wait(timeout=0.1)
+    release_update.set()
+    update_thread.join(timeout=5.0)
+    delete_thread.join(timeout=5.0)
+
+    assert not update_thread.is_alive()
+    assert not delete_thread.is_alive()
+    assert update_responses[0].status_code == 200
+    assert delete_responses[0].status_code == 409
+    assert delete_responses[0].json()["detail"]["code"] == "CHANNEL_CONFLICT"
+    with Session(engine) as db:
+        assert db.get(AgentProfile, "agent_cw") is not None
+        binding = db.get(ChannelBinding, binding_id)
+        assert binding.agent_id == "agent_xz"
+        mounts = db.exec(
+            select(ChannelBindingAgent).where(ChannelBindingAgent.binding_id == binding_id)
+        ).all()
+        assert [(mount.agent_id, mount.is_default) for mount in mounts] == [("agent_xz", True)]

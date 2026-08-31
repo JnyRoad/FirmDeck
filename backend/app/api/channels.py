@@ -85,6 +85,7 @@ from app.channels.service_identity import (
     scope_from_config,
     unbind_external_identity,
 )
+from app.channels.service_routing_locks import agent_routing_lifecycle_locks
 from app.channels.service_session import (
     adopt_orphan_channel_sessions,
     migrate_binding_session_account_key,
@@ -447,9 +448,19 @@ def create_channel_binding(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_session),
 ) -> ChannelBindingRead:
+    """创建员工或团队渠道 binding，并原子写入默认路由挂载。
+
+    输入必须选择当前租户内一个可管理员工或具备现任 TL 的团队。函数会在目标员工路由锁内
+    重验存在性与权限并提交 binding/mount；目标在等待期间删除或团队路由变化时返回稳定错误，
+    不留下部分 binding。
+    """
+    # 先完成租户、渠道与目标形态校验，避免非法请求进入路由临界区。
     ensure_current_user_tenant(request.tenant_id, current_user)
     if request.channel not in SUPPORTED_CHANNELS:
-        raise _channel_http_error(status_code=400, detail=f"v1 仅支持渠道: {sorted(SUPPORTED_CHANNELS)}")
+        raise _channel_http_error(
+            status_code=400,
+            detail=f"v1 仅支持渠道: {sorted(SUPPORTED_CHANNELS)}",
+        )
     # 挂员工集或绑团队二选一:都给/都不给均拒绝
     if bool(request.agent_id) == bool(request.team_id):
         raise _channel_http_error(status_code=400, detail="agent_id 与 team_id 必须且只能提供一个")
@@ -461,7 +472,10 @@ def create_channel_binding(
 
         leader = get_team_leader(db, team.id)
         if leader is None:
-            raise _channel_http_error(status_code=400, detail="团队暂未设置 TL，请先设置 TL 后再绑定渠道")
+            raise _channel_http_error(
+                status_code=400,
+                detail="团队暂未设置 TL，请先设置 TL 后再绑定渠道",
+            )
         # 复用员工绑定同款守卫:创建者须能管理现任 TL 员工
         ensure_agent_scope_manager(db, request.tenant_id, leader.agent_id, current_user)
         # agent_id 为非空遗留列(列表过滤/挂载回退仍在用):团队绑定回写现任 TL,
@@ -470,32 +484,56 @@ def create_channel_binding(
     else:
         ensure_agent_scope_manager(db, request.tenant_id, request.agent_id, current_user)
         target_agent_id = request.agent_id
-    # 同一员工同一渠道允许多个绑定实例,总是新建
-    binding = ChannelBinding(
-        tenant_id=request.tenant_id,
-        agent_id=target_agent_id,
-        channel=request.channel,
-        name=_validated_binding_name(request.name, default=_default_binding_name(request.channel)),
-        status="pending",
-        created_by_user_id=current_user.id,
-        team_id=request.team_id,
-    )
-    db.add(binding)
-    db.flush()
-    if not request.team_id:
-        # 新绑定自动挂载默认员工;团队绑定走 TL 直路由,不写挂载行
-        db.add(
-            ChannelBindingAgent(
-                tenant_id=request.tenant_id,
-                binding_id=binding.id,
-                agent_id=target_agent_id,
-                is_default=True,
-                sort_order=0,
-            )
+
+    # 结束锁外读取事务后只取得 agent lock；新 binding 尚无 ID，不能先取得 binding lock。
+    db.rollback()
+    with agent_routing_lifecycle_locks([target_agent_id]):
+        # 锁内重新读取员工与团队 TL，防止等待期间的员工删除转化为悬空路由。
+        if request.team_id:
+            team = db.get(Team, request.team_id)
+            if team is None or team.tenant_id != request.tenant_id:
+                raise _channel_http_error(status_code=404, detail="Team not found")
+            from app.teams.service import get_team_leader
+
+            leader = get_team_leader(db, team.id)
+            if leader is None:
+                raise _channel_http_error(
+                    status_code=400,
+                    detail="团队暂未设置 TL，请先设置 TL 后再绑定渠道",
+                )
+            if leader.agent_id != target_agent_id:
+                raise build_http_exception("CHANNEL_CONFLICT", status_code=409)
+        ensure_agent_scope_manager(db, request.tenant_id, target_agent_id, current_user)
+
+        # 所有锁内 guard 通过后才写 binding 与默认挂载，并在释放 agent lock 前提交。
+        binding = ChannelBinding(
+            tenant_id=request.tenant_id,
+            agent_id=target_agent_id,
+            channel=request.channel,
+            name=_validated_binding_name(
+                request.name,
+                default=_default_binding_name(request.channel),
+            ),
+            status="pending",
+            created_by_user_id=current_user.id,
+            team_id=request.team_id,
         )
-    db.commit()
-    db.refresh(binding)
-    return channel_binding_read(db, binding, current_user)
+        db.add(binding)
+        db.flush()
+        if not request.team_id:
+            # 团队绑定走 TL 直路由；员工绑定必须同步持久化唯一默认挂载。
+            db.add(
+                ChannelBindingAgent(
+                    tenant_id=request.tenant_id,
+                    binding_id=binding.id,
+                    agent_id=target_agent_id,
+                    is_default=True,
+                    sort_order=0,
+                )
+            )
+        db.commit()
+        db.refresh(binding)
+        return channel_binding_read(db, binding, current_user)
 
 
 BIND_CODE_TTL_MINUTES = 10
@@ -779,68 +817,88 @@ def update_channel_binding_agents(
         marked = [item.agent_id for item in request.agents if item.is_default]
         default_agent_id = marked[0] if marked else request.agents[0].agent_id
     db.rollback()
+    # 全局锁序第一层：先取得单个 binding lock，阻止挂载集合在计算 agent IDs 时变化。
     with binding_lifecycle_lock(binding_id):
         binding = _get_binding(db, tenant_id, binding_id)
-        ensure_channel_binding_has_no_blocking_account_operation(db, binding)
         if request.agents is not None:
             existing = db.exec(
                 select(ChannelBindingAgent).where(ChannelBindingAgent.binding_id == binding.id)
             ).all()
-            for row in existing:
-                db.delete(row)
-            db.flush()
-            for index, item in enumerate(request.agents):
-                db.add(
-                    ChannelBindingAgent(
-                        tenant_id=tenant_id,
-                        binding_id=binding.id,
-                        agent_id=item.agent_id,
-                        is_default=item.agent_id == default_agent_id,
-                        sort_order=index,
+            routed_agent_ids = {
+                binding.agent_id,
+                *(row.agent_id for row in existing),
+                *(item.agent_id for item in request.agents),
+            }
+        else:
+            routed_agent_ids = set()
+        db.rollback()
+
+        # 全局锁序第二层：按 ID 取得全部旧/新 agent locks，锁内重验后才改变默认或挂载。
+        with agent_routing_lifecycle_locks(routed_agent_ids):
+            binding = _get_binding(db, tenant_id, binding_id)
+            if request.agents is not None:
+                for item in request.agents:
+                    ensure_agent_scope_manager(db, tenant_id, item.agent_id, current_user)
+            ensure_channel_binding_has_no_blocking_account_operation(db, binding)
+            if request.agents is not None:
+                existing = db.exec(
+                    select(ChannelBindingAgent).where(ChannelBindingAgent.binding_id == binding.id)
+                ).all()
+                for row in existing:
+                    db.delete(row)
+                db.flush()
+                for index, item in enumerate(request.agents):
+                    db.add(
+                        ChannelBindingAgent(
+                            tenant_id=tenant_id,
+                            binding_id=binding.id,
+                            agent_id=item.agent_id,
+                            is_default=item.agent_id == default_agent_id,
+                            sort_order=index,
+                        )
                     )
+                binding.agent_id = default_agent_id
+            if new_name is not None:
+                binding.name = new_name
+            binding.updated_at = utc_now()
+            db.add(binding)
+            db.commit()
+            if request.auto_route is not None:
+                _patch_binding_config_key(
+                    db,
+                    tenant_id,
+                    binding_id,
+                    "auto_route",
+                    request.auto_route,
                 )
-            binding.agent_id = default_agent_id
-        if new_name is not None:
-            binding.name = new_name
-        binding.updated_at = utc_now()
-        db.add(binding)
-        db.commit()
-        if request.auto_route is not None:
-            _patch_binding_config_key(
-                db,
-                tenant_id,
-                binding_id,
-                "auto_route",
-                request.auto_route,
-            )
-            db.commit()
-        if request.default_handoff_assignee_user_id != "unchanged":
-            assignee_user_id = request.default_handoff_assignee_user_id or None
-            _patch_binding_config_key(
-                db,
-                tenant_id,
-                binding_id,
-                "default_handoff_assignee_user_id",
-                assignee_user_id,
-            )
-            # 通知渠道随处理人一起落库:清空处理人时同步清空;传 "web" 表示仅网页端,
-            # 传绑定渠道表示按该渠道转接;未传(None/unchanged)保持存量默认投递行为。
-            notify_channel = None
-            if assignee_user_id:
-                raw_channel = str(request.default_handoff_assignee_channel or "").strip()
-                if raw_channel and raw_channel != "unchanged":
-                    notify_channel = raw_channel
-            _patch_binding_config_key(
-                db,
-                tenant_id,
-                binding_id,
-                "default_handoff_assignee_channel",
-                notify_channel,
-            )
-            db.commit()
-        binding = _get_binding(db, tenant_id, binding_id)
-        db.refresh(binding)
-        return channel_binding_read(db, binding, current_user)
+                db.commit()
+            if request.default_handoff_assignee_user_id != "unchanged":
+                assignee_user_id = request.default_handoff_assignee_user_id or None
+                _patch_binding_config_key(
+                    db,
+                    tenant_id,
+                    binding_id,
+                    "default_handoff_assignee_user_id",
+                    assignee_user_id,
+                )
+                # 通知渠道随处理人一起落库:清空处理人时同步清空;传 "web" 表示仅网页端,
+                # 传绑定渠道表示按该渠道转接;未传(None/unchanged)保持存量默认投递行为。
+                notify_channel = None
+                if assignee_user_id:
+                    raw_channel = str(request.default_handoff_assignee_channel or "").strip()
+                    if raw_channel and raw_channel != "unchanged":
+                        notify_channel = raw_channel
+                _patch_binding_config_key(
+                    db,
+                    tenant_id,
+                    binding_id,
+                    "default_handoff_assignee_channel",
+                    notify_channel,
+                )
+                db.commit()
+            binding = _get_binding(db, tenant_id, binding_id)
+            db.refresh(binding)
+            return channel_binding_read(db, binding, current_user)
 
 
 @router.delete("/{binding_id}", status_code=204)
