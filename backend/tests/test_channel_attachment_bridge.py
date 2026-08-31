@@ -319,6 +319,45 @@ def test_bridge_passes_empty_content_type_as_none() -> None:
         register_channel_adapter("feishu", previous)
 
 
+def test_bridge_infers_generic_binary_mime_from_filename() -> None:
+    """A generic binary descriptor keeps its file semantics while gaining filename MIME metadata."""
+    fake_adapter = _FakeAdapter(b"plain text")
+    previous = get_channel_adapter("feishu")
+    register_channel_adapter("feishu", fake_adapter)
+    try:
+        inbound = _inbound(
+            [
+                ChannelInboundAttachment(
+                    media_id="file-key",
+                    kind="file",
+                    filename="notes.txt",
+                    content_type="application/octet-stream",
+                )
+            ]
+        )
+        staged = _staged_attachment(filename="notes.txt", content_type="text/plain")
+        with (
+            patch(
+                "app.session.attachments.parse_chat_attachment",
+                return_value=staged,
+            ) as mock_parse,
+            patch(
+                "app.session.attachment_store.stage_chat_attachment",
+                return_value=staged,
+            ),
+        ):
+            inbound_attachments_to_chat(
+                _binding(), inbound, db_engine=None, tenant_id="t", user_id="u"
+            )
+
+        args, _kwargs = mock_parse.call_args
+        assert args[0] == "notes.txt"
+        assert args[1] == "text/plain"
+        assert inbound.attachments[0].kind == "file"
+    finally:
+        register_channel_adapter("feishu", previous)
+
+
 def test_detect_image_media_type_recognizes_common_formats() -> None:
     """magic bytes 签名能识别 PNG/JPEG/GIF/WebP/BMP。"""
     assert detect_image_media_type(b"\x89PNG\r\n\x1a\n" + b"\x00" * 20) == (
