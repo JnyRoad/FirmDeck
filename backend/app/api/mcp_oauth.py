@@ -154,6 +154,7 @@ async def start_mcp_oauth(
         raise build_http_exception("MCP_OAUTH_PROVIDER_UNSUPPORTED") from exc
 
     engine = _session_engine(db)
+    expected_config_fingerprint = mcp_oauth_config_fingerprint(server)
     storage = MCPGrantTokenStorage(
         engine,
         request.tenant_id,
@@ -162,7 +163,7 @@ async def start_mcp_oauth(
         public_client_id=server.oauth_client_id,
         client_metadata_url=server.oauth_client_metadata_url,
         redirect_uri=redirect_uri,
-        config_fingerprint=mcp_oauth_config_fingerprint(server),
+        config_fingerprint=expected_config_fingerprint,
         enforce_owner_binding=True,
     )
     grant_state = storage.read_status().state
@@ -173,6 +174,17 @@ async def start_mcp_oauth(
     storage.begin_authorization()
     coordinator = _coordinator_for_engine(engine)
     browser_binding = secrets.token_urlsafe(32)
+
+    def binding_is_current() -> bool:
+        """Reject a stale route snapshot before its SDK task can publish a redirect."""
+        with Session(engine) as current_db:
+            current = current_db.get(MCPServer, server.id)
+            return bool(
+                current is not None
+                and current.tenant_id == request.tenant_id
+                and current.auth_mode == "oauth_personal"
+                and mcp_oauth_config_fingerprint(current) == expected_config_fingerprint
+            )
 
     async def operation(redirect_handler, callback_handler) -> None:
         """Keep the SDK coroutine alive while the coordinator bridges the callback."""
@@ -195,6 +207,7 @@ async def start_mcp_oauth(
             redirect_uri=redirect_uri,
             browser_binding=browser_binding,
             operation=operation,
+            binding_is_current=binding_is_current,
         )
     except (MCPOAuthFlowError, MCPAdapterError) as exc:
         entry = ERROR_REGISTRY.get(exc.code)

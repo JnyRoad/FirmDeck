@@ -438,7 +438,7 @@ async def test_callback_bounds_token_exchange_by_the_persisted_flow_ttl(
     """Expire and cancel an SDK task that stalls after receiving the callback code."""
     import app.tools.mcp_oauth_flow as flow
 
-    monkeypatch.setattr(flow, "FLOW_TTL_SECONDS", 0.02)
+    monkeypatch.setattr(flow, "FLOW_TTL_SECONDS", 0.2)
     _engine, coordinator = _coordinator(tmp_path)
 
     async def operation(redirect_handler, callback_handler) -> None:
@@ -463,7 +463,7 @@ async def test_callback_bounds_token_exchange_by_the_persisted_flow_ttl(
                 code="authorization-code",
                 browser_binding="browser-binding",
             ),
-            timeout=0.2,
+            timeout=1.0,
         )
 
     assert coordinator.read_flow_status(started.flow_id) == "expired"
@@ -559,3 +559,145 @@ async def test_start_reconciles_a_flow_cancelled_by_server_configuration_change(
 
     assert restarted.flow_id != started.flow_id
     coordinator.cancel_all()
+
+
+@pytest.mark.asyncio
+async def test_server_invalidation_cancels_a_flow_before_redirect_persistence(tmp_path) -> None:
+    """Close the race where a server changes before the SDK publishes its redirect URL."""
+    from app.tools.mcp_oauth_flow import MCPOAuthFlowError
+
+    _engine, coordinator = _coordinator(tmp_path)
+    operation_started = asyncio.Event()
+
+    async def operation(redirect_handler, callback_handler) -> None:
+        """Pause before redirect publication so invalidation hits the startup window."""
+        operation_started.set()
+        await asyncio.Event().wait()
+
+    start_task = asyncio.create_task(
+        coordinator.start(
+            tenant_id="tenant_1",
+            server_id="server_1",
+            user_id="user_1",
+            redirect_uri="https://staffdeck.example/oauth/callback",
+            browser_binding="browser-binding",
+            operation=operation,
+        )
+    )
+    await operation_started.wait()
+
+    coordinator.invalidate_server("tenant_1", "server_1")
+
+    with pytest.raises(MCPOAuthFlowError, match="MCP_AUTHORIZATION_REQUIRED"):
+        await asyncio.wait_for(start_task, timeout=0.2)
+    assert coordinator._pending_owner_keys == set()
+    assert coordinator._server_generations == {}
+
+
+@pytest.mark.asyncio
+async def test_start_rejects_a_binding_invalidated_during_freshness_check(tmp_path) -> None:
+    """Reject an API snapshot invalidated between its database read and task start."""
+    from app.tools.mcp_oauth_flow import MCPOAuthFlowError
+
+    _engine, coordinator = _coordinator(tmp_path)
+    operation_called = False
+
+    async def operation(redirect_handler, callback_handler) -> None:
+        """Fail the assertion if stale configuration reaches the SDK operation."""
+        nonlocal operation_called
+        operation_called = True
+
+    def invalidate_during_validation() -> bool:
+        coordinator.invalidate_server("tenant_1", "server_1")
+        return True
+
+    with pytest.raises(MCPOAuthFlowError, match="MCP_AUTHORIZATION_REQUIRED"):
+        await coordinator.start(
+            tenant_id="tenant_1",
+            server_id="server_1",
+            user_id="user_1",
+            redirect_uri="https://staffdeck.example/oauth/callback",
+            browser_binding="browser-binding",
+            operation=operation,
+            binding_is_current=invalidate_during_validation,
+        )
+
+    assert operation_called is False
+    assert coordinator._server_generations == {}
+
+
+@pytest.mark.asyncio
+async def test_invalidation_before_first_task_step_rejects_start_promptly(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """Wake the start future when invalidation cancels an unscheduled coroutine."""
+    import app.tools.mcp_oauth_flow as flow
+
+    _engine, coordinator = _coordinator(tmp_path)
+    real_create_task = asyncio.create_task
+
+    def create_cancelled_task(coroutine, *, name=None):
+        task = real_create_task(coroutine, name=name)
+        coordinator.invalidate_server("tenant_1", "server_1")
+        task.cancel()
+        return task
+
+    monkeypatch.setattr(flow.asyncio, "create_task", create_cancelled_task)
+
+    with pytest.raises(flow.MCPOAuthFlowError, match="MCP_AUTHORIZATION_REQUIRED"):
+        await asyncio.wait_for(
+            coordinator.start(
+                tenant_id="tenant_1",
+                server_id="server_1",
+                user_id="user_1",
+                redirect_uri="https://staffdeck.example/oauth/callback",
+                browser_binding="browser-binding",
+                operation=lambda _redirect, _callback: asyncio.sleep(0),
+            ),
+            timeout=0.2,
+        )
+
+    assert coordinator._pending_owner_keys == set()
+    assert coordinator._server_generations == {}
+
+
+@pytest.mark.asyncio
+async def test_disconnect_during_callback_exchange_preserves_cancelled_terminal_state(
+    tmp_path,
+) -> None:
+    """Translate an intentional task cancellation into the safe callback outcome."""
+    from app.tools.mcp_oauth_flow import MCPOAuthFlowError
+
+    _engine, coordinator = _coordinator(tmp_path)
+    callback_received = asyncio.Event()
+
+    async def operation(redirect_handler, callback_handler) -> None:
+        """Model an exchange that stalls after the browser callback is delivered."""
+        await redirect_handler("https://auth.example/authorize?state=disconnect-race")
+        await callback_handler()
+        callback_received.set()
+        await asyncio.Event().wait()
+
+    started = await coordinator.start(
+        tenant_id="tenant_1",
+        server_id="server_1",
+        user_id="user_1",
+        redirect_uri="https://staffdeck.example/oauth/callback",
+        browser_binding="browser-binding",
+        operation=operation,
+    )
+    callback_task = asyncio.create_task(
+        coordinator.complete_callback(
+            state="disconnect-race",
+            code="authorization-code",
+            browser_binding="browser-binding",
+        )
+    )
+    await callback_received.wait()
+
+    await coordinator.cancel_owner("tenant_1", "server_1", "user_1")
+
+    with pytest.raises(MCPOAuthFlowError, match="MCP_AUTHORIZATION_REQUIRED"):
+        await callback_task
+    assert coordinator.read_flow_status(started.flow_id) == "cancelled"

@@ -1089,6 +1089,20 @@ def _cancel_mcp_oauth_flows(db: Session, tenant_id: str, server_id: str) -> None
         db.add(flow)
 
 
+def _invalidate_mcp_oauth_process_tasks(
+    db: Session,
+    tenant_id: str,
+    server_id: str,
+) -> None:
+    """Fence process-local SDK tasks after the durable server change commits."""
+    from app.api.mcp_oauth import _coordinator_for_engine
+
+    bind = db.get_bind()
+    if not isinstance(bind, Engine):
+        raise TypeError("MCP OAuth requires an engine-bound database session")
+    _coordinator_for_engine(bind).invalidate_server(tenant_id, server_id)
+
+
 @mcp_router.get(
     "", response_model=list[MCPServerRead], dependencies=[Depends(require_tenant_admin)]
 )
@@ -1310,6 +1324,8 @@ def update_mcp_server(
         _cancel_mcp_oauth_flows(db, request.tenant_id, row.id)
         _delete_mcp_oauth_grants(db, request.tenant_id, row.id)
     db.commit()
+    if oauth_binding_changed:
+        _invalidate_mcp_oauth_process_tasks(db, request.tenant_id, row.id)
     db.refresh(row)
     return mcp_server_read(row, db)
 
@@ -1338,6 +1354,7 @@ def delete_mcp_server(
     _delete_mcp_oauth_grants(db, tenant_id, row.id)
     db.delete(row)
     db.commit()
+    _invalidate_mcp_oauth_process_tasks(db, tenant_id, server_id)
     return {"status": "deleted"}
 
 

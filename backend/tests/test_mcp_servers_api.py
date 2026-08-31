@@ -157,7 +157,15 @@ def test_updating_oauth_binding_configuration_cancels_pending_flows(
     monkeypatch,
 ) -> None:
     """Prevent a callback for the old server identity from reaching its live SDK task."""
+    import app.api.tools as tools_api
+
     monkeypatch.setenv("STAFFDECK_PUBLIC_URL", "https://staffdeck.example")
+    invalidated: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        tools_api,
+        "_invalidate_mcp_oauth_process_tasks",
+        lambda _db, tenant_id, server_id: invalidated.append((tenant_id, server_id)),
+    )
     with _test_session() as db:
         server = _seed_oauth_server_and_grant(db)
         db.add(
@@ -185,6 +193,7 @@ def test_updating_oauth_binding_configuration_cancels_pending_flows(
         assert flow is not None
         assert flow.status == "cancelled"
         assert flow.error_code == "MCP_AUTHORIZATION_REQUIRED"
+        assert invalidated == [("tenant_demo", server.id)]
 
 
 def test_rotating_static_mcp_headers_deletes_existing_oauth_grants(monkeypatch) -> None:
@@ -1043,8 +1052,16 @@ def test_delete_mcp_server_removes_personal_oauth_grants() -> None:
         assert db.exec(select(MCPUserOAuthGrant)).all() == []
 
 
-def test_delete_mcp_server_cancels_pending_oauth_flows() -> None:
+def test_delete_mcp_server_cancels_pending_oauth_flows(monkeypatch) -> None:
     """Reject callbacks whose protected server was deleted during authorization."""
+    import app.api.tools as tools_api
+
+    invalidated: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        tools_api,
+        "_invalidate_mcp_oauth_process_tasks",
+        lambda _db, tenant_id, server_id: invalidated.append((tenant_id, server_id)),
+    )
     with _test_session() as db:
         server = _seed_oauth_server_and_grant(db)
         db.add(
@@ -1073,6 +1090,7 @@ def test_delete_mcp_server_cancels_pending_oauth_flows() -> None:
         flow = db.get(MCPOAuthFlow, "flow_delete")
         assert flow is not None
         assert flow.status == "cancelled"
+        assert invalidated == [("tenant_demo", server.id)]
 
 
 def test_delete_mcp_server_in_employee_scope_only_unbinds() -> None:

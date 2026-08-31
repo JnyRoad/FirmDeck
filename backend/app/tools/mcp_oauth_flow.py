@@ -9,6 +9,7 @@ import secrets
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from threading import Lock
 from typing import Literal
 from urllib.parse import parse_qs, urlparse
 
@@ -87,6 +88,7 @@ FlowOperation = Callable[
     ],
     Awaitable[None],
 ]
+BindingValidator = Callable[[], bool]
 
 
 class MCPOAuthFlowCoordinator:
@@ -98,6 +100,10 @@ class MCPOAuthFlowCoordinator:
         self._pending_by_digest: dict[str, _PendingFlow] = {}
         self._pending_by_id: dict[str, _PendingFlow] = {}
         self._pending_owner_keys: set[tuple[str, str, str]] = set()
+        self._tasks_by_owner: dict[tuple[str, str, str], asyncio.Task[None]] = {}
+        self._server_generations: dict[tuple[str, str], int] = {}
+        self._starting_servers: dict[tuple[str, str], int] = {}
+        self._registry_guard = Lock()
 
     @staticmethod
     def _digest_state(state: str) -> str:
@@ -166,6 +172,10 @@ class MCPOAuthFlowCoordinator:
         remaining = max((expires_at - utc_now()).total_seconds(), 0.0)
         try:
             await asyncio.wait_for(pending.task, timeout=remaining)
+        except asyncio.CancelledError as exc:
+            if self.read_flow_status(pending.flow_id) == "cancelled":
+                raise MCPOAuthFlowError("MCP_AUTHORIZATION_REQUIRED") from exc
+            raise
         except TimeoutError as exc:
             self._update_status(pending.flow_id, "expired", "MCP_OAUTH_FLOW_EXPIRED")
             raise MCPOAuthFlowError("MCP_OAUTH_FLOW_EXPIRED") from exc
@@ -189,7 +199,52 @@ class MCPOAuthFlowCoordinator:
                 db.add(row)
             db.commit()
 
+        owner_key = (tenant_id, server_id, user_id)
+        with self._registry_guard:
+            owner_task = self._tasks_by_owner.get(owner_key)
         await self._stop_pending_tasks(flow_ids)
+        if owner_task is not None and not owner_task.done():
+            owner_task.cancel()
+            await asyncio.gather(owner_task, return_exceptions=True)
+
+    def invalidate_server(self, tenant_id: str, server_id: str) -> None:
+        """Fence new redirects and cancel live tasks after a server binding changes."""
+        server_key = (tenant_id, server_id)
+        with self._registry_guard:
+            self._server_generations[server_key] = (
+                self._server_generations.get(server_key, 0) + 1
+            )
+            tasks = [
+                task
+                for owner_key, task in self._tasks_by_owner.items()
+                if owner_key[:2] == server_key and not task.done()
+            ]
+            self._cleanup_server_generation_locked(server_key)
+        for task in tasks:
+            task.get_loop().call_soon_threadsafe(task.cancel)
+
+    def _cleanup_server_generation_locked(self, server_key: tuple[str, str]) -> None:
+        """Drop an idle server fence after every older start has observed it."""
+        if self._starting_servers.get(server_key, 0) > 0:
+            return
+        if any(owner_key[:2] == server_key for owner_key in self._pending_owner_keys):
+            return
+        if any(owner_key[:2] == server_key for owner_key in self._tasks_by_owner):
+            return
+        self._server_generations.pop(server_key, None)
+        self._starting_servers.pop(server_key, None)
+
+    def _release_owner_task(
+        self,
+        owner_key: tuple[str, str, str],
+        task: asyncio.Task[None],
+    ) -> None:
+        """Remove only the task that still owns the process-local reservation."""
+        with self._registry_guard:
+            if self._tasks_by_owner.get(owner_key) is task:
+                self._tasks_by_owner.pop(owner_key, None)
+            self._pending_owner_keys.discard(owner_key)
+            self._cleanup_server_generation_locked(owner_key[:2])
 
     async def _stop_pending_tasks(self, flow_ids: set[str]) -> None:
         """Wake or cancel selected SDK tasks after their durable flow is inactive."""
@@ -240,14 +295,38 @@ class MCPOAuthFlowCoordinator:
         redirect_uri: str,
         browser_binding: str,
         operation: FlowOperation,
+        binding_is_current: BindingValidator | None = None,
     ) -> MCPOAuthStartResult:
         """Launch the SDK operation and return as soon as it emits an authorization URL."""
         if not browser_binding:
             raise MCPOAuthFlowError("MCP_OAUTH_CALLBACK_INVALID")
         owner_key = (tenant_id, server_id, user_id)
+        server_key = (tenant_id, server_id)
         await self._reconcile_inactive_owner_tasks(tenant_id, server_id, user_id)
-        if owner_key in self._pending_owner_keys:
-            raise MCPOAuthFlowError("MCP_OAUTH_FLOW_CONFLICT")
+        with self._registry_guard:
+            server_generation = self._server_generations.get(server_key, 0)
+            self._starting_servers[server_key] = (
+                self._starting_servers.get(server_key, 0) + 1
+            )
+        try:
+            binding_current = binding_is_current is None or binding_is_current()
+        except BaseException:
+            with self._registry_guard:
+                self._starting_servers[server_key] -= 1
+                self._cleanup_server_generation_locked(server_key)
+            raise
+        with self._registry_guard:
+            self._starting_servers[server_key] -= 1
+            server_invalidated = (
+                self._server_generations.get(server_key, 0) != server_generation
+            )
+            if not binding_current or server_invalidated:
+                self._cleanup_server_generation_locked(server_key)
+                raise MCPOAuthFlowError("MCP_AUTHORIZATION_REQUIRED")
+            if owner_key in self._pending_owner_keys:
+                self._cleanup_server_generation_locked(server_key)
+                raise MCPOAuthFlowError("MCP_OAUTH_FLOW_CONFLICT")
+            self._pending_owner_keys.add(owner_key)
         for pending in self._pending_by_id.values():
             with Session(self.engine) as db:
                 row = db.get(MCPOAuthFlow, pending.flow_id)
@@ -258,8 +337,10 @@ class MCPOAuthFlowCoordinator:
                     and row.user_id == user_id
                     and row.status in {"pending", "callback_received"}
                 ):
+                    with self._registry_guard:
+                        self._pending_owner_keys.discard(owner_key)
+                        self._cleanup_server_generation_locked(server_key)
                     raise MCPOAuthFlowError("MCP_OAUTH_FLOW_CONFLICT")
-        self._pending_owner_keys.add(owner_key)
 
         loop = asyncio.get_running_loop()
         authorization_future: asyncio.Future[str] = loop.create_future()
@@ -331,15 +412,31 @@ class MCPOAuthFlowCoordinator:
             try:
                 await operation(redirect_handler, callback_handler)
             except asyncio.CancelledError:
-                self._update_status(flow_id, "expired", "MCP_OAUTH_FLOW_EXPIRED")
+                status = self.read_flow_status(flow_id)
+                with self._registry_guard:
+                    server_invalidated = (
+                        self._server_generations.get(server_key, 0) != server_generation
+                    )
+                cancellation_code = (
+                    "MCP_AUTHORIZATION_REQUIRED"
+                    if status == "cancelled" or server_invalidated
+                    else "MCP_OAUTH_FLOW_EXPIRED"
+                )
+                if cancellation_code == "MCP_OAUTH_FLOW_EXPIRED":
+                    self._update_status(flow_id, "expired", cancellation_code)
                 _log_oauth_event(
-                    "mcp_oauth.expired",
+                    "mcp_oauth.cancelled",
                     tenant_id=tenant_id,
                     server_id=server_id,
                     user_id=user_id,
                     flow_id=flow_id,
-                    error_code="MCP_OAUTH_FLOW_EXPIRED",
+                    error_code=cancellation_code,
                 )
+                if (
+                    cancellation_code == "MCP_AUTHORIZATION_REQUIRED"
+                    and not authorization_future.done()
+                ):
+                    authorization_future.set_exception(MCPOAuthFlowError(cancellation_code))
                 raise
             except Exception as exc:
                 status = self.read_flow_status(flow_id)
@@ -367,14 +464,35 @@ class MCPOAuthFlowCoordinator:
                 )
             finally:
                 self._discard_pending(flow_id)
-                self._pending_owner_keys.discard(owner_key)
+                self._release_owner_task(owner_key, task)
 
         try:
             task = asyncio.create_task(run_operation(), name=f"mcp-oauth-{flow_id}")
         except BaseException:
-            self._pending_owner_keys.discard(owner_key)
+            with self._registry_guard:
+                self._pending_owner_keys.discard(owner_key)
             raise
-        task.add_done_callback(lambda _task: self._pending_owner_keys.discard(owner_key))
+        with self._registry_guard:
+            self._tasks_by_owner[owner_key] = task
+            server_invalidated = (
+                self._server_generations.get(server_key, 0) != server_generation
+            )
+        def finish_task(completed_task: asyncio.Task[None]) -> None:
+            """Wake a start cancelled before its coroutine executes, then release it."""
+            if completed_task.cancelled() and not authorization_future.done():
+                with self._registry_guard:
+                    invalidated = (
+                        self._server_generations.get(server_key, 0) != server_generation
+                    )
+                if invalidated:
+                    authorization_future.set_exception(
+                        MCPOAuthFlowError("MCP_AUTHORIZATION_REQUIRED")
+                    )
+            self._release_owner_task(owner_key, completed_task)
+
+        task.add_done_callback(finish_task)
+        if server_invalidated:
+            task.cancel()
         try:
             authorization_url = await asyncio.wait_for(
                 asyncio.shield(authorization_future),
