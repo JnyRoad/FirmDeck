@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import importlib
 import json
+import traceback
 from typing import Any, ClassVar
 
+import httpx
 import pytest
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.pool import StaticPool
@@ -346,6 +348,132 @@ def test_wechat_kf_token_provider_caches_by_binding_revision() -> None:
     assert len(calls) == 2
 
 
+def test_wechat_kf_corrupt_credentials_are_permanent_configuration_errors() -> None:
+    """Corrupt encrypted credentials never leak the cryptography exception contract."""
+    module = _wechat_kf_adapter_module()
+    binding = ChannelBinding(
+        id="chan-corrupt",
+        tenant_id="tenant_a",
+        agent_id="agent_a",
+        channel="wechat_kf",
+        credentials_enc="not-a-valid-fernet-token",
+    )
+
+    with pytest.raises(module.WeChatKfPermanentError) as captured:
+        module.wechat_kf_credentials(binding)
+
+    assert captured.value.retryable is False
+
+
+@pytest.mark.parametrize(
+    ("error_code", "expected_retryable"),
+    [(42001, True), (45009, True), (45011, True), (40013, False)],
+)
+def test_wechat_kf_token_provider_classifies_provider_errors(
+    error_code: int, expected_retryable: bool
+) -> None:
+    """Token expiry and rate limits are retryable while invalid provider credentials are not."""
+    module = _wechat_kf_adapter_module()
+
+    class FakeResponse:
+        """Return one provider error from an otherwise successful HTTP response."""
+
+        def raise_for_status(self) -> None:
+            """Represent a successful HTTP status without side effects."""
+
+        def json(self) -> dict[str, Any]:
+            """Expose the selected provider error code."""
+            return {"errcode": error_code, "errmsg": "provider rejected token request"}
+
+    class FakeClient:
+        """Serve the token error without contacting the provider."""
+
+        def __enter__(self):
+            """Expose this fake as the synchronous client context value."""
+            return self
+
+        def __exit__(self, *_args) -> None:
+            """Close the fake context without external side effects."""
+
+        def get(self, _url: str, *, params: dict[str, str]) -> FakeResponse:
+            """Require the complete token request before returning the provider error."""
+            assert params == {"corpid": "corp-a", "corpsecret": "secret-a"}
+            return FakeResponse()
+
+    provider = module.WeChatKfTokenProvider(client_factory=lambda **_kwargs: FakeClient())
+    binding = ChannelBinding(
+        id=f"chan-token-error-{error_code}",
+        tenant_id="tenant_a",
+        agent_id="agent_a",
+        channel="wechat_kf",
+        credentials_enc=encrypt_channel_secret(json.dumps({"secret": "secret-a"})),
+        config_json={"corp_id": "corp-a"},
+    )
+    expected_error = (
+        module.WeChatKfTransientError
+        if expected_retryable
+        else module.WeChatKfPermanentError
+    )
+
+    with pytest.raises(expected_error) as captured:
+        provider.get(binding)
+
+    assert captured.value.retryable is expected_retryable
+
+
+def test_wechat_kf_token_transport_traceback_redacts_secret() -> None:
+    """A token HTTP failure traceback never retains the query-string corporation secret."""
+    module = _wechat_kf_adapter_module()
+    secret = "trace-secret-must-not-appear"
+
+    class FailingResponse:
+        """Raise an HTTP status error whose request URL contains the sensitive query."""
+
+        def raise_for_status(self) -> None:
+            """Reproduce httpx's URL-bearing HTTPStatusError."""
+            request = httpx.Request(
+                "GET",
+                f"{module.WECOM_API_BASE}/gettoken?corpid=corp-a&corpsecret={secret}",
+            )
+            response = httpx.Response(500, request=request)
+            raise httpx.HTTPStatusError("provider failed", request=request, response=response)
+
+        def json(self) -> dict[str, Any]:
+            """Remain unreachable because status validation fails first."""
+            return {}
+
+    class FailingClient:
+        """Return the URL-bearing failure without contacting the provider."""
+
+        def __enter__(self):
+            """Expose this fake as the synchronous client context value."""
+            return self
+
+        def __exit__(self, *_args) -> None:
+            """Close the fake context without external side effects."""
+
+        def get(self, _url: str, *, params: dict[str, str]) -> FailingResponse:
+            """Confirm the secret crossed the HTTP boundary before reproducing failure."""
+            assert params["corpsecret"] == secret
+            return FailingResponse()
+
+    provider = module.WeChatKfTokenProvider(client_factory=lambda **_kwargs: FailingClient())
+    binding = ChannelBinding(
+        id="chan-token-trace",
+        tenant_id="tenant_a",
+        agent_id="agent_a",
+        channel="wechat_kf",
+        credentials_enc=encrypt_channel_secret(json.dumps({"secret": secret})),
+        config_json={"corp_id": "corp-a"},
+    )
+
+    with pytest.raises(module.WeChatKfTransientError) as captured:
+        provider.get(binding)
+
+    formatted = "".join(traceback.format_exception(captured.value))
+    assert secret not in formatted
+
+
 def test_wechat_kf_provider_errors_are_classified_for_retry(monkeypatch) -> None:
     """Expired tokens and rate limits are retryable while provider validation errors are not."""
     module = _wechat_kf_adapter_module()
@@ -550,6 +678,161 @@ def test_wechat_kf_media_upload_and_account_operations_use_provider_contract(mon
     ]
 
 
+@pytest.mark.parametrize(
+    "data",
+    [b"", b"x" * (2 * 1024 * 1024 + 1)],
+    ids=["empty", "oversized"],
+)
+def test_wechat_kf_avatar_upload_rejects_invalid_size_before_network(
+    monkeypatch, data: bytes
+) -> None:
+    """Empty and oversized avatars fail locally before an HTTP client is constructed."""
+    module = _wechat_kf_adapter_module()
+    adapter = module.WeChatKfAdapter()
+    binding = ChannelBinding(tenant_id="tenant_a", agent_id="agent_a", channel="wechat_kf")
+    monkeypatch.setattr(adapter._tokens, "get", lambda _binding: "token")
+    client_calls: list[str] = []
+
+    class UploadResponse:
+        """Return success if the production code incorrectly reaches the network."""
+
+        def raise_for_status(self) -> None:
+            """Represent a successful HTTP status without side effects."""
+
+        def json(self) -> dict[str, Any]:
+            """Expose a media ID so only local validation can satisfy the test."""
+            return {"errcode": 0, "media_id": "should-not-upload"}
+
+    class UploadClient:
+        """Record an improper network boundary crossing."""
+
+        def __enter__(self):
+            """Expose this fake as the synchronous client context value."""
+            return self
+
+        def __exit__(self, *_args) -> None:
+            """Close the fake context without external side effects."""
+
+        def post(self, *_args, **_kwargs) -> UploadResponse:
+            """Record the improper provider write and return success."""
+            client_calls.append("post")
+            return UploadResponse()
+
+    def client_factory(**_kwargs) -> UploadClient:
+        """Record construction so validation must happen before the client boundary."""
+        client_calls.append("construct")
+        return UploadClient()
+
+    monkeypatch.setattr(module.httpx, "Client", client_factory)
+
+    with pytest.raises(module.WeChatKfPermanentError):
+        adapter.upload_avatar(binding, data, "avatar.png", "image/png")
+
+    assert client_calls == []
+
+
+def test_wechat_kf_send_requires_idempotency_key_before_provider_write(monkeypatch) -> None:
+    """Missing delivery identity fails closed before any provider request is emitted."""
+    module = _wechat_kf_adapter_module()
+    adapter = module.WeChatKfAdapter()
+    binding = ChannelBinding(tenant_id="tenant_a", agent_id="agent_a", channel="wechat_kf")
+    monkeypatch.setattr(adapter._tokens, "get", lambda _binding: "token")
+    requests: list[dict[str, Any]] = []
+
+    class FakeResponse:
+        """Return provider success if the missing-key guard is bypassed."""
+
+        def raise_for_status(self) -> None:
+            """Represent a successful HTTP status without side effects."""
+
+        def json(self) -> dict[str, Any]:
+            """Return the complete successful provider shape."""
+            return {"errcode": 0, "errmsg": "ok"}
+
+    class FakeClient:
+        """Capture improper send requests without external I/O."""
+
+        def __enter__(self):
+            """Expose this fake as the synchronous client context value."""
+            return self
+
+        def __exit__(self, *_args) -> None:
+            """Close the fake context without external side effects."""
+
+        def post(self, _url: str, **kwargs) -> FakeResponse:
+            """Record the provider JSON body if validation is bypassed."""
+            requests.append(kwargs["json"])
+            return FakeResponse()
+
+    monkeypatch.setattr(module.httpx, "Client", lambda **_kwargs: FakeClient())
+
+    with pytest.raises(module.WeChatKfPermanentError):
+        adapter.send(
+            binding,
+            {"to_user_id": "external-user", "open_kfid": "wk-support"},
+            "reply",
+        )
+
+    assert requests == []
+
+
+def test_wechat_kf_send_requests_keep_chunk_ids_stable_across_retry(monkeypatch) -> None:
+    """Real send requests use distinct byte-bounded chunk IDs that repeat deterministically."""
+    module = _wechat_kf_adapter_module()
+    adapter = module.WeChatKfAdapter()
+    binding = ChannelBinding(tenant_id="tenant_a", agent_id="agent_a", channel="wechat_kf")
+    monkeypatch.setattr(adapter._tokens, "get", lambda _binding: "token")
+    requests: list[dict[str, Any]] = []
+
+    class FakeResponse:
+        """Return one successful provider send response."""
+
+        def raise_for_status(self) -> None:
+            """Represent a successful HTTP status without side effects."""
+
+        def json(self) -> dict[str, Any]:
+            """Return the complete successful provider shape."""
+            return {"errcode": 0, "errmsg": "ok"}
+
+    class FakeClient:
+        """Capture provider requests while keeping adapter send logic real."""
+
+        def __enter__(self):
+            """Expose this fake as the synchronous client context value."""
+            return self
+
+        def __exit__(self, *_args) -> None:
+            """Close the fake context without external side effects."""
+
+        def post(self, url: str, **kwargs) -> FakeResponse:
+            """Record only valid WeChat客服 send requests."""
+            assert url.endswith("/kf/send_msg")
+            assert kwargs["params"] == {"access_token": "token"}
+            requests.append(kwargs["json"])
+            return FakeResponse()
+
+    monkeypatch.setattr(module.httpx, "Client", lambda **_kwargs: FakeClient())
+    target = {"to_user_id": "external-user", "open_kfid": "wk-support"}
+    text = "中" * 800
+
+    adapter.send(binding, target, text, idempotency_key="delivery-1")
+    adapter.send(binding, target, text, idempotency_key="delivery-1")
+
+    assert len(requests) == 4
+    first_attempt = requests[:2]
+    retry_attempt = requests[2:]
+    assert [request["msgid"] for request in first_attempt] == [
+        request["msgid"] for request in retry_attempt
+    ]
+    assert len({request["msgid"] for request in first_attempt}) == 2
+    assert all(len(request["msgid"]) == 32 for request in first_attempt)
+    assert "".join(request["text"]["content"] for request in first_attempt) == text
+    assert all(
+        len(request["text"]["content"].encode("utf-8")) <= module.TEXT_LIMIT_BYTES
+        for request in first_attempt
+    )
+
+
 def test_wechat_kf_replay_restores_attachment_dataclasses() -> None:
     """Replay decoding restores typed attachments and rejects cross-channel envelopes."""
     module = _wechat_kf_inbox_module()
@@ -621,6 +904,88 @@ def test_wechat_kf_stage_persists_language_snapshot_and_deduplicates() -> None:
             "ui_locale_source": "channel_default",
             "agent_reply_locale_source": "channel_default",
         }
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "cross_account",
+        "payload_scope",
+        "payload_open_kfid",
+        "target",
+        "tenant",
+        "channel",
+        "revision",
+    ],
+)
+def test_wechat_kf_stage_duplicate_requires_same_immutable_fences(mutation: str) -> None:
+    """An event-ID collision is acknowledged only when every immutable account fence matches."""
+    module = _wechat_kf_inbox_module()
+    account_model = _wechat_kf_account_model()
+    engine = _test_engine()
+    binding = _seed_binding_and_account(engine)
+    first = module.stage_wechat_kf_inbound(
+        db_engine=engine,
+        binding_id=binding.id,
+        expected_revision=7,
+        account_scope="ww-tenant-a:wk-support",
+        inbound=_inbound(text="first"),
+    )
+    assert first.disposition is StageDisposition.STAGED
+
+    retry_scope = "ww-tenant-a:wk-support"
+    retry = _inbound(text="retry")
+    with Session(engine) as db:
+        existing = db.get(ChannelInboundEvent, first.event_pk)
+        if mutation == "cross_account":
+            db.add(
+                account_model(
+                    id="wka_other",
+                    tenant_id="tenant_a",
+                    binding_id=binding.id,
+                    open_kfid="wk-other",
+                    agent_id="agent_a",
+                )
+            )
+            retry_scope = "ww-tenant-a:wk-other"
+            retry = _inbound(open_kfid="wk-other", account_scope=retry_scope, text="retry")
+        elif mutation == "payload_scope":
+            payload = dict(existing.payload_json)
+            payload["account"] = {"scope": "ww-tenant-a:wk-tampered"}
+            existing.payload_json = payload
+            db.add(existing)
+        elif mutation == "payload_open_kfid":
+            payload = dict(existing.payload_json)
+            payload["inbound"] = {
+                **payload["inbound"],
+                "to_user_id": "wk-tampered",
+            }
+            existing.payload_json = payload
+            db.add(existing)
+        elif mutation == "target":
+            retry.from_user_id = "external-other"
+            retry.session_id = "external-other"
+        elif mutation == "tenant":
+            existing.tenant_id = "tenant-other"
+            db.add(existing)
+        elif mutation == "channel":
+            existing.channel = "wecom"
+            db.add(existing)
+        else:
+            existing.config_revision = 8
+            db.add(existing)
+        db.commit()
+
+    collision = module.stage_wechat_kf_inbound(
+        db_engine=engine,
+        binding_id=binding.id,
+        expected_revision=7,
+        account_scope=retry_scope,
+        inbound=retry,
+    )
+
+    assert collision.disposition is StageDisposition.SECURITY_DROP
+    assert collision.error_code == "duplicate_fence_mismatch"
 
 
 @pytest.mark.parametrize(

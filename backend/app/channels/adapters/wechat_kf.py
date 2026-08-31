@@ -17,6 +17,7 @@ from typing import Any
 from urllib.parse import unquote
 
 import httpx
+from cryptography.fernet import InvalidToken
 
 from app.channels.adapters.base import (
     ChannelInbound,
@@ -73,7 +74,7 @@ def wechat_kf_credentials(binding: ChannelBinding) -> dict[str, str]:
         raise WeChatKfPermanentError("微信客服凭证未配置")
     try:
         credentials = json.loads(decrypt_channel_secret(binding.credentials_enc))
-    except (ValueError, TypeError, json.JSONDecodeError) as exc:
+    except (InvalidToken, ValueError, TypeError, json.JSONDecodeError) as exc:
         raise WeChatKfPermanentError("微信客服凭证无效") from exc
     if not isinstance(credentials, dict):
         raise WeChatKfPermanentError("微信客服凭证无效")
@@ -122,9 +123,17 @@ class WeChatKfTokenProvider:
                 )
                 response.raise_for_status()
                 payload = response.json()
-        except (httpx.HTTPError, ValueError) as exc:
-            raise WeChatKfTransientError("获取微信客服 access_token 失败") from exc
+        except (httpx.HTTPError, ValueError):
+            # httpx status errors retain the full request URL, including corpsecret query data.
+            raise WeChatKfTransientError("获取微信客服 access_token 失败") from None
         error_code = _provider_error_code(payload)
+        if error_code in _TOKEN_ERROR_CODES:
+            raise WeChatKfTransientError("微信客服 access_token 请求失效")
+        if error_code in _RATE_LIMIT_ERROR_CODES:
+            raise WeChatKfTransientError(
+                "获取微信客服 access_token 限流: "
+                f"{_provider_error_message(payload, error_code)}"
+            )
         if error_code:
             raise WeChatKfPermanentError(
                 "获取微信客服 access_token 失败: "
@@ -527,6 +536,8 @@ class WeChatKfAdapter:
         The call performs bounded-time network I/O but does not persist bytes locally. HTTP,
         malformed JSON, and missing media IDs are transient; provider validation is permanent.
         """
+        if not data or len(data) > WECOM_KF_IMAGE_MAX_BYTES:
+            raise WeChatKfPermanentError("微信客服头像必须为非空且不超过 2 MiB")
         token = self._tokens.get(binding)
         try:
             with httpx.Client(timeout=15.0) as client:
@@ -590,7 +601,10 @@ class WeChatKfAdapter:
         open_kfid = str(target.get("open_kfid") or "").strip()
         if not to_user or not open_kfid:
             raise WeChatKfPermanentError("微信客服投递目标无效")
-        key = hashlib.sha256(str(idempotency_key or "").encode("utf-8")).hexdigest()[:32]
+        normalized_key = str(idempotency_key or "").strip()
+        if not normalized_key:
+            raise WeChatKfPermanentError("微信客服投递缺少幂等键")
+        key = hashlib.sha256(normalized_key.encode("utf-8")).hexdigest()[:32]
 
         # Split before the first write so every provider request respects its UTF-8 byte limit.
         chunks = _split_utf8_text(text)

@@ -87,6 +87,33 @@ def _expected_account_scope(binding: ChannelBinding, inbound: ChannelInbound) ->
     return external_account_scope(None, binding)
 
 
+def _duplicate_matches_fences(
+    existing: ChannelInboundEvent,
+    *,
+    tenant_id: str,
+    expected_revision: int,
+    account_scope: str,
+    open_kfid: str,
+    target: dict[str, str],
+) -> bool:
+    """Confirm that an event-ID collision is the same immutable provider delivery."""
+    if (
+        existing.tenant_id != tenant_id
+        or existing.channel != "wechat_kf"
+        or existing.config_revision != expected_revision
+        or dict(existing.target_json or {}) != target
+    ):
+        return False
+    try:
+        persisted = decode_replay_envelope(existing.payload_json)
+    except ValueError:
+        return False
+    return (
+        persisted.account_scope == account_scope
+        and persisted.to_user_id == open_kfid
+    )
+
+
 def stage_wechat_kf_inbound(
     *,
     db_engine,
@@ -154,18 +181,20 @@ def stage_wechat_kf_inbound(
                 )
 
             # Persist raw replay data, outbound target, generation, and language snapshot atomically.
+            tenant_id = binding.tenant_id
+            target = {
+                "to_user_id": inbound.from_user_id,
+                "open_kfid": inbound.to_user_id,
+            }
             event = ChannelInboundEvent(
                 id=new_id("chevt"),
-                tenant_id=binding.tenant_id,
+                tenant_id=tenant_id,
                 binding_id=binding.id,
                 channel="wechat_kf",
                 event_id=inbound.event_id,
                 payload_json=envelope,
                 config_revision=expected_revision,
-                target_json={
-                    "to_user_id": inbound.from_user_id,
-                    "open_kfid": inbound.to_user_id,
-                },
+                target_json=target,
                 status="received",
                 language_context_json=channel_ingress_language_context(binding).model_dump(
                     mode="json"
@@ -182,8 +211,20 @@ def stage_wechat_kf_inbound(
                         ChannelInboundEvent.event_id == inbound.event_id,
                     )
                 ).first()
-                if existing:
+                if existing and _duplicate_matches_fences(
+                    existing,
+                    tenant_id=tenant_id,
+                    expected_revision=expected_revision,
+                    account_scope=normalized_scope,
+                    open_kfid=inbound.to_user_id,
+                    target=target,
+                ):
                     return StageResult(StageDisposition.DUPLICATE, event_pk=existing.id)
+                if existing:
+                    return StageResult(
+                        StageDisposition.SECURITY_DROP,
+                        error_code="duplicate_fence_mismatch",
+                    )
                 return StageResult(
                     StageDisposition.NACK,
                     error_code="inbox_integrity_error",
