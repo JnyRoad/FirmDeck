@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 from typing import Annotated
 from urllib.parse import quote
 
+from cryptography.fernet import InvalidToken
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile
 from fastapi.responses import Response as FastAPIResponse
 from sqlalchemy import case, or_, text, update
@@ -1536,7 +1537,7 @@ def _wechat_kf_existing_credentials(binding: ChannelBinding) -> dict[str, object
         return {}
     try:
         value = json.loads(decrypt_channel_secret(binding.credentials_enc))
-    except (ValueError, TypeError, json.JSONDecodeError) as exc:
+    except (InvalidToken, ValueError, TypeError, json.JSONDecodeError) as exc:
         raise _channel_http_error(400, exc) from exc
     if not isinstance(value, dict):
         raise _channel_http_error(400, "wechat kf credentials are not an object")

@@ -173,6 +173,44 @@ def test_callback_config_and_credentials_encrypt_secrets_without_echo(monkeypatc
         assert credentials["encoding_aes_key"] == prepared.json()["encoding_aes_key"]
 
 
+@pytest.mark.parametrize(
+    ("endpoint", "payload"),
+    [
+        ("callback-config", {"tenant_id": "tenant_demo", "corp_id": "ww1234567890"}),
+        (
+            "credentials",
+            {
+                "tenant_id": "tenant_demo",
+                "corp_id": "ww1234567890",
+                "secret": "replacement-provider-secret",
+            },
+        ),
+    ],
+)
+def test_wechat_kf_reconfiguration_projects_corrupt_credentials_as_bad_request(
+    endpoint: str,
+    payload: dict[str, str],
+) -> None:
+    """密钥轮换或密文损坏不得让重新配置路径泄漏为未投影的 500。"""
+    db_engine = _engine()
+    users, binding_id = _seed(db_engine)
+    with Session(db_engine) as db:
+        binding = db.get(ChannelBinding, binding_id)
+        assert binding is not None
+        binding.credentials_enc = "not-a-valid-fernet-token"
+        db.add(binding)
+        db.commit()
+
+    response = _client(db_engine, raise_server_exceptions=False).post(
+        f"/api/enterprise/channels/{binding_id}/wechat_kf/{endpoint}",
+        json=payload,
+        headers=_auth(users["owner"]),
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"]["code"] == "CHANNEL_BAD_REQUEST"
+
+
 def test_wechat_kf_management_requires_binding_permission(monkeypatch) -> None:
     """防止同租户非管理员读取账号或改写凭据。"""
     db_engine = _engine()
