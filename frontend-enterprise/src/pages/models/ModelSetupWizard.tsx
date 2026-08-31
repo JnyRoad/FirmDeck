@@ -90,7 +90,7 @@ function channelIcon(preset: ChannelPreset) {
   return <span>{preset.badgeLabel}</span>;
 }
 
-/** 引导管理员选择模型渠道，并在调用方租户内保存或验证模型配置。 */
+/** 引导管理员在调用方租户内配置模型，并只接受当前请求代次的异步结果。 */
 export default function ModelSetupWizard({
   open,
   tenantId,
@@ -128,7 +128,12 @@ export default function ModelSetupWizard({
   const [subscriptionModelsState, setSubscriptionModelsState] = useState<ModelsFetchState>(IDLE_MODELS_STATE);
   const vendorFetchSignatureRef = useRef<string | null>(null);
   const customFetchSignatureRef = useRef<string | null>(null);
-  const subscriptionFetchedRef = useRef(false);
+  const subscriptionFetchSignatureRef = useRef<string | null>(null);
+  const vendorFetchGenerationRef = useRef(0);
+  const customFetchGenerationRef = useRef(0);
+  const subscriptionFetchGenerationRef = useRef(0);
+  const activeTenantRef = useRef(tenantId);
+  activeTenantRef.current = tenantId;
 
   const selectedChannel = useMemo(
     () => CHANNEL_PRESETS.find((preset) => preset.id === selectedChannelId) ?? null,
@@ -143,6 +148,20 @@ export default function ModelSetupWizard({
     );
   }, [search]);
 
+  /** 清空模型列表并让所有尚未完成的列表请求失效。 */
+  function resetModelListRequests() {
+    setVendorModelsState(IDLE_MODELS_STATE);
+    setCustomModelsState(IDLE_MODELS_STATE);
+    setSubscriptionModelsState(IDLE_MODELS_STATE);
+    vendorFetchSignatureRef.current = null;
+    customFetchSignatureRef.current = null;
+    subscriptionFetchSignatureRef.current = null;
+    vendorFetchGenerationRef.current += 1;
+    customFetchGenerationRef.current += 1;
+    subscriptionFetchGenerationRef.current += 1;
+  }
+
+  /** 将向导恢复到首次打开时的初始状态。 */
   function resetAllSteps() {
     setStep(1);
     setSelectedChannelId(null);
@@ -161,13 +180,14 @@ export default function ModelSetupWizard({
     setTesting(false);
     setSaveResult('idle');
     setSaveErrorMessage(null);
-    setVendorModelsState(IDLE_MODELS_STATE);
-    setCustomModelsState(IDLE_MODELS_STATE);
-    setSubscriptionModelsState(IDLE_MODELS_STATE);
-    vendorFetchSignatureRef.current = null;
-    customFetchSignatureRef.current = null;
-    subscriptionFetchedRef.current = false;
+    resetModelListRequests();
   }
+
+  useEffect(() => {
+    resetModelListRequests();
+    // 租户是列表请求的隔离边界；其余表单状态由当前打开流程继续管理。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tenantId]);
 
   function handleClose() {
     if (saving || testing) return;
@@ -184,12 +204,7 @@ export default function ModelSetupWizard({
       setVendorForm(BLANK_VENDOR_FORM);
       setCustomForm(BLANK_CUSTOM_FORM);
       setSubscriptionForm(BLANK_SUBSCRIPTION_FORM);
-      setVendorModelsState(IDLE_MODELS_STATE);
-      setCustomModelsState(IDLE_MODELS_STATE);
-      setSubscriptionModelsState(IDLE_MODELS_STATE);
-      vendorFetchSignatureRef.current = null;
-      customFetchSignatureRef.current = null;
-      subscriptionFetchedRef.current = false;
+      resetModelListRequests();
       // A test result — and any draft row id — belongs to the channel that
       // was just saved/tested. Carrying either across a channel switch would
       // either misrepresent an untested channel as already verified, or PUT
@@ -206,20 +221,29 @@ export default function ModelSetupWizard({
     setSelectedChannelId(preset.id);
   }
 
+  /** 获取当前租户下预设厂商的模型列表，并丢弃被后续请求取代的响应。 */
   async function fetchVendorModelsNow(channel: ChannelPreset, apiKey: string) {
     const trimmedKey = apiKey.trim();
     if (!trimmedKey || !channel.apiProtocol || !channel.baseUrl) return;
-    const signature = `${channel.id}:${trimmedKey}`;
+    const requestTenantId = tenantId;
+    const signature = `${requestTenantId}:${channel.id}:${trimmedKey}`;
     if (vendorFetchSignatureRef.current === signature) return;
     vendorFetchSignatureRef.current = signature;
+    const requestGeneration = ++vendorFetchGenerationRef.current;
     setVendorModelsState((prev) => ({ ...prev, status: 'loading' }));
     const result = await fetchProviderModels({
-      tenantId,
+      tenantId: requestTenantId,
       apiProtocol: channel.apiProtocol,
       baseUrl: channel.baseUrl,
       apiKey: trimmedKey,
     });
-    if (vendorFetchSignatureRef.current !== signature) return; // superseded by a newer request
+    if (
+      activeTenantRef.current !== requestTenantId ||
+      vendorFetchSignatureRef.current !== signature ||
+      vendorFetchGenerationRef.current !== requestGeneration
+    ) {
+      return;
+    }
     if (result.success && result.models.length > 0) {
       setVendorModelsState({
         status: 'success',
@@ -230,16 +254,30 @@ export default function ModelSetupWizard({
     }
   }
 
+  /** 获取当前租户下自定义渠道的模型列表，并丢弃被后续请求取代的响应。 */
   async function fetchCustomModelsNow(form: CustomFormValues) {
     const baseUrl = form.baseUrl.trim();
     const apiKey = form.apiKey.trim();
     if (!baseUrl || !apiKey) return;
-    const signature = `${form.apiProtocol}:${baseUrl}:${apiKey}`;
+    const requestTenantId = tenantId;
+    const signature = `${requestTenantId}:${form.apiProtocol}:${baseUrl}:${apiKey}`;
     if (customFetchSignatureRef.current === signature) return;
     customFetchSignatureRef.current = signature;
+    const requestGeneration = ++customFetchGenerationRef.current;
     setCustomModelsState((prev) => ({ ...prev, status: 'loading' }));
-    const result = await fetchProviderModels({ tenantId, apiProtocol: form.apiProtocol, baseUrl, apiKey });
-    if (customFetchSignatureRef.current !== signature) return;
+    const result = await fetchProviderModels({
+      tenantId: requestTenantId,
+      apiProtocol: form.apiProtocol,
+      baseUrl,
+      apiKey,
+    });
+    if (
+      activeTenantRef.current !== requestTenantId ||
+      customFetchSignatureRef.current !== signature ||
+      customFetchGenerationRef.current !== requestGeneration
+    ) {
+      return;
+    }
     if (result.success && result.models.length > 0) {
       setCustomModelsState({
         status: 'success',
@@ -277,13 +315,25 @@ export default function ModelSetupWizard({
   // fetch on blur.
   useEffect(() => {
     if (!subscriptionStepComplete) {
-      subscriptionFetchedRef.current = false;
+      subscriptionFetchSignatureRef.current = null;
+      subscriptionFetchGenerationRef.current += 1;
+      setSubscriptionModelsState(IDLE_MODELS_STATE);
       return;
     }
-    if (subscriptionFetchedRef.current) return;
-    subscriptionFetchedRef.current = true;
+    const requestTenantId = tenantId;
+    const signature = `${requestTenantId}:codex_app_server`;
+    if (subscriptionFetchSignatureRef.current === signature) return;
+    subscriptionFetchSignatureRef.current = signature;
+    const requestGeneration = ++subscriptionFetchGenerationRef.current;
     setSubscriptionModelsState({ status: 'loading', options: [] });
-    void fetchProviderModels({ tenantId, apiProtocol: 'codex_app_server' }).then((result) => {
+    void fetchProviderModels({ tenantId: requestTenantId, apiProtocol: 'codex_app_server' }).then((result) => {
+      if (
+        activeTenantRef.current !== requestTenantId ||
+        subscriptionFetchSignatureRef.current !== signature ||
+        subscriptionFetchGenerationRef.current !== requestGeneration
+      ) {
+        return;
+      }
       if (result.success && result.models.length > 0) {
         setSubscriptionModelsState({
           status: 'success',
@@ -293,7 +343,7 @@ export default function ModelSetupWizard({
         setSubscriptionModelsState({ status: result.success ? 'empty' : 'error', options: [] });
       }
     });
-  }, [subscriptionStepComplete]);
+  }, [subscriptionStepComplete, tenantId]);
 
   const step2Complete = selectedChannel
     ? selectedChannel.category === 'vendor'

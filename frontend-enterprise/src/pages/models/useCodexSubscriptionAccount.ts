@@ -31,25 +31,38 @@ export function useCodexSubscriptionAccount({
   const [account, setAccount] = useState<CodexSubscriptionAccountRead | null>(null);
   const [loading, setLoading] = useState(false);
   const activeTenantRef = useRef<string | null>(null);
+  const requestGenerationRef = useRef(0);
   activeTenantRef.current = enabled ? tenantId : null;
 
   /** 读取当前租户的订阅账号状态。 */
   const reload = useCallback(async () => {
     if (!enabled) return;
     const requestTenantId = tenantId;
+    const requestGeneration = ++requestGenerationRef.current;
     try {
       const nextAccount = await api.get<CodexSubscriptionAccountRead>(
         `/api/enterprise/model-configs/codex-subscription/account?tenant_id=${encodeURIComponent(requestTenantId)}`,
       );
-      if (activeTenantRef.current !== requestTenantId) return;
+      if (
+        activeTenantRef.current !== requestTenantId ||
+        requestGenerationRef.current !== requestGeneration
+      ) {
+        return;
+      }
       setAccount(nextAccount);
     } catch (error) {
-      if (activeTenantRef.current !== requestTenantId) return;
+      if (
+        activeTenantRef.current !== requestTenantId ||
+        requestGenerationRef.current !== requestGeneration
+      ) {
+        return;
+      }
       notify.error(apiErrorMessage(error, t('无法读取 ChatGPT 订阅状态')));
     }
   }, [enabled, t, tenantId]);
 
   useEffect(() => {
+    requestGenerationRef.current += 1;
     setAccount(null);
     setLoading(false);
     if (!enabled) {
@@ -59,31 +72,47 @@ export function useCodexSubscriptionAccount({
   }, [enabled, reload]);
 
   useEffect(() => {
-    if (!enabled || account?.status !== 'pending') return;
+    if (!enabled || loading || account?.status !== 'pending') return;
     const timer = window.setInterval(() => {
       void reload();
     }, 2_000);
     return () => window.clearInterval(timer);
-  }, [account?.status, enabled, reload]);
+  }, [account?.status, enabled, loading, reload]);
 
   /** 执行订阅账号动作并用服务端返回状态更新界面。 */
   const updateAccount = useCallback(
     async (action: SubscriptionAction, fallbackMessage: string) => {
       if (!enabled) return;
       const requestTenantId = tenantId;
+      const requestGeneration = ++requestGenerationRef.current;
       setLoading(true);
       try {
         const nextAccount = await api.post<CodexSubscriptionAccountRead>(
           `/api/enterprise/model-configs/codex-subscription/${action}?tenant_id=${encodeURIComponent(requestTenantId)}`,
         );
-        if (activeTenantRef.current !== requestTenantId) return;
+        if (
+          activeTenantRef.current !== requestTenantId ||
+          requestGenerationRef.current !== requestGeneration
+        ) {
+          return;
+        }
         setAccount(nextAccount);
         if (nextAccount.message) notify.success(nextAccount.message);
       } catch (error) {
-        if (activeTenantRef.current !== requestTenantId) return;
+        if (
+          activeTenantRef.current !== requestTenantId ||
+          requestGenerationRef.current !== requestGeneration
+        ) {
+          return;
+        }
         notify.error(apiErrorMessage(error, fallbackMessage));
       } finally {
-        if (activeTenantRef.current === requestTenantId) setLoading(false);
+        if (
+          activeTenantRef.current === requestTenantId &&
+          requestGenerationRef.current === requestGeneration
+        ) {
+          setLoading(false);
+        }
       }
     },
     [enabled, tenantId],
