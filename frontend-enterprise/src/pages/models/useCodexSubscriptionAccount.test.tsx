@@ -136,4 +136,30 @@ describe('useCodexSubscriptionAccount', () => {
     });
     expect(result.current.account).toEqual(connected);
   });
+
+  it('does not let an older account read overwrite a newer login action for the same tenant', async () => {
+    let resolveInitialRead: ((account: CodexSubscriptionAccountRead) => void) | undefined;
+    mockedGet.mockImplementationOnce(
+      () =>
+        new Promise<CodexSubscriptionAccountRead>((resolve) => {
+          resolveInitialRead = resolve;
+        }),
+    );
+    mockedPost.mockResolvedValueOnce(pending);
+
+    const { result } = renderHook(
+      () => useCodexSubscriptionAccount({ tenantId: 'tenant-isolated' }),
+      { wrapper: Wrapper },
+    );
+    expect(mockedGet).toHaveBeenCalledTimes(1);
+
+    await act(async () => result.current.startLogin());
+    expect(result.current.account).toEqual(pending);
+
+    await act(async () => {
+      resolveInitialRead?.(requiresLogin);
+      await Promise.resolve();
+    });
+    expect(result.current.account).toEqual(pending);
+  });
 });

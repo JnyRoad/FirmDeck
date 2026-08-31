@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { createElement } from 'react';
-import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -325,6 +325,61 @@ describe('ModelSetupWizard — vendor branch (US1)', () => {
 });
 
 describe('ModelSetupWizard — auto-fetching the model list', () => {
+  it('ignores a pending model-list response after switching tenants and refetches for the new tenant', async () => {
+    let resolveFirstTenant:
+      | ((value: { success: boolean; models: Array<{ id: string; label: string }> }) => void)
+      | undefined;
+    mockedPost.mockImplementation((url: unknown) => {
+      const requestUrl = String(url);
+      if (requestUrl.includes('/list-models') && requestUrl.includes('tenant_id=tenant-first')) {
+        return new Promise((resolve) => {
+          resolveFirstTenant = resolve;
+        });
+      }
+      if (requestUrl.includes('/list-models') && requestUrl.includes('tenant_id=tenant-second')) {
+        return Promise.resolve({
+          success: true,
+          models: [{ id: 'tenant-second-model', label: 'tenant-second-model' }],
+        });
+      }
+      return Promise.reject(new Error(`unexpected call: ${requestUrl}`));
+    });
+    const user = userEvent.setup();
+    const rendered = renderWizard({ tenantId: 'tenant-first' });
+
+    await selectChannelAndAdvance(user, 'OpenAI');
+    const apiKeyInput = screen.getByPlaceholderText('sk-...');
+    await user.type(apiKeyInput, 'sk-shared-key');
+    await user.tab();
+    await waitFor(() =>
+      expect(mockedPost.mock.calls.some(([url]) => String(url).includes('tenant_id=tenant-first'))).toBe(true),
+    );
+
+    rendered.rerender(
+      createElement(
+        I18nProvider,
+        null,
+        createElement(ModelSetupWizard, { ...rendered.props, tenantId: 'tenant-second' }),
+      ),
+    );
+    await act(async () => {
+      resolveFirstTenant?.({
+        success: true,
+        models: [{ id: 'tenant-first-model', label: 'tenant-first-model' }],
+      });
+      await Promise.resolve();
+    });
+
+    await user.click(apiKeyInput);
+    await user.tab();
+    expect(await screen.findByText(/已自动获取到 1 个模型/)).toBeTruthy();
+    expect(mockedPost.mock.calls.some(([url]) => String(url).includes('tenant_id=tenant-second'))).toBe(true);
+
+    await user.click(screen.getByPlaceholderText('选择或输入模型'));
+    expect(await screen.findByText('tenant-second-model')).toBeTruthy();
+    expect(screen.queryByText('tenant-first-model')).toBeNull();
+  });
+
   it('fetches vendor models on API Key blur and offers them in the combobox', async () => {
     mockedPost.mockImplementation((url: unknown) => {
       if (String(url).includes('/list-models')) {
