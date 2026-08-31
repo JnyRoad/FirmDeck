@@ -55,9 +55,9 @@ def inbound_attachments_to_chat(
                     descriptor.filename or descriptor.media_id,
                     extension,
                 )
-            elif (
-                descriptor.filename
-                and descriptor.content_type == "application/octet-stream"
+            elif descriptor.filename and (
+                not descriptor.content_type
+                or descriptor.content_type == "application/octet-stream"
             ):
                 descriptor.content_type = (
                     mimetypes.guess_type(descriptor.filename)[0] or descriptor.content_type

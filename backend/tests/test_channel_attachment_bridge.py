@@ -285,8 +285,8 @@ def test_bridge_continues_on_single_attachment_failure() -> None:
         register_channel_adapter("feishu", previous)
 
 
-def test_bridge_passes_empty_content_type_as_none() -> None:
-    """att.content_type 为空字符串时传 None 给 parse_chat_attachment(让其自动推断)。"""
+def test_bridge_infers_empty_content_type_from_filename() -> None:
+    """空 MIME 描述符应在进入统一解析器前按文件名补齐类型。"""
     fake_adapter = _FakeAdapter(b"some bytes")
     previous = get_channel_adapter("feishu")
     register_channel_adapter("feishu", fake_adapter)
@@ -310,10 +310,10 @@ def test_bridge_passes_empty_content_type_as_none() -> None:
             inbound_attachments_to_chat(
                 _binding(), inbound, db_engine=None, tenant_id="t", user_id="u"
             )
-        # content_type="" -> None
+        # content_type="" -> extension-based MIME inference
         args, _kwargs = mock_parse.call_args
         assert args[0] == "report.pdf"
-        assert args[1] is None
+        assert args[1] == "application/pdf"
         assert args[2] == b"some bytes"
     finally:
         register_channel_adapter("feishu", previous)
