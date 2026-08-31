@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import timedelta
 
 import pytest
-from fastapi import HTTPException
+from fastapi import HTTPException, Request, Response
 from sqlalchemy import create_engine
 from sqlmodel import Session, SQLModel
 
@@ -105,9 +105,11 @@ async def test_status_and_start_are_scoped_to_current_user(tmp_path, monkeypatch
 
     monkeypatch.setattr(api, "_coordinator_for_engine", lambda _engine: FakeCoordinator())
     monkeypatch.setattr(api, "MCPSDKAdapter", FakeAdapter)
+    http_response = Response()
     started = await api.start_mcp_oauth(
         "server_1",
         api.MCPOAuthStartRequest(tenant_id="tenant_1"),
+        http_response,
         db,
         _user("user_2"),
     )
@@ -116,6 +118,11 @@ async def test_status_and_start_are_scoped_to_current_user(tmp_path, monkeypatch
     assert captured["user_id"] == "user_2"
     assert captured["storage"].user_id == "user_2"
     assert captured["storage"].config_fingerprint
+    cookie = http_response.headers["set-cookie"]
+    assert "staffdeck_mcp_oauth_flow_1=" in cookie
+    assert "HttpOnly" in cookie
+    assert "SameSite=lax" in cookie
+    assert "Secure" in cookie
     db.close()
 
 
@@ -150,6 +157,7 @@ async def test_start_rejects_a_persisted_redirect_for_another_origin(
         await api.start_mcp_oauth(
             "server_1",
             api.MCPOAuthStartRequest(tenant_id="tenant_1"),
+            Response(),
             db,
             _user("user_1"),
         )
@@ -220,12 +228,13 @@ async def test_start_discards_a_grant_bound_to_old_server_configuration(
     started = await api.start_mcp_oauth(
         "server_1",
         api.MCPOAuthStartRequest(tenant_id="tenant_1"),
+        Response(),
         db,
         _user("user_1"),
     )
 
     assert started.flow_id == "flow_reconnect"
-    assert captured["storage"].read_status().state == "disconnected"
+    assert captured["storage"].read_status().state == "authorizing"
     db.close()
 
 
@@ -269,13 +278,25 @@ async def test_callback_redirects_provider_denial_without_echoing_details(monkey
     import app.api.mcp_oauth as api
 
     class FakeCoordinator:
+        def browser_cookie_name_for_state(self, state: str) -> str:
+            """Resolve the flow-specific cookie selected by the callback state."""
+            assert state == "secret-state"
+            return "flow-cookie"
+
         async def complete_callback(self, **kwargs):
             """Return a valid provider denial while capturing no secret externally."""
             assert kwargs["error"] == "access_denied"
+            assert kwargs["browser_binding"] == "browser-binding"
             return "denied"
 
     monkeypatch.setattr(api, "_coordinator_for_engine", lambda _engine: FakeCoordinator())
     response = await api.mcp_oauth_callback(
+        Request(
+            {
+                "type": "http",
+                "headers": [(b"cookie", b"flow-cookie=browser-binding")],
+            }
+        ),
         state="secret-state",
         code=None,
         iss="https://issuer.example",
@@ -285,6 +306,8 @@ async def test_callback_redirects_provider_denial_without_echoing_details(monkey
     assert response.status_code == 302
     assert response.headers["location"] == "/enterprise/tools?mcp_oauth=denied"
     assert "secret-state" not in response.headers["location"]
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["referrer-policy"] == "no-referrer"
 
 
 @pytest.mark.asyncio
@@ -299,6 +322,10 @@ async def test_callback_redirects_expired_and_invalid_flows_to_recoverable_ui(
         def __init__(self) -> None:
             """Alternate between an expired and invalid credential-free outcome."""
             self.calls = 0
+
+        def browser_cookie_name_for_state(self, _state: str) -> None:
+            """Model an expired or invalid flow with no live browser binding."""
+            return None
 
         async def complete_callback(self, **kwargs):
             """Raise only stable application codes without echoing callback input."""
@@ -315,12 +342,14 @@ async def test_callback_redirects_expired_and_invalid_flows_to_recoverable_ui(
     monkeypatch.setattr(api, "_coordinator_for_engine", lambda _engine: coordinator)
 
     expired = await api.mcp_oauth_callback(
+        Request({"type": "http", "headers": []}),
         state="expired-secret-state",
         code="expired-secret-code",
         iss=None,
         error=None,
     )
     invalid = await api.mcp_oauth_callback(
+        Request({"type": "http", "headers": []}),
         state=None,
         code=None,
         iss=None,

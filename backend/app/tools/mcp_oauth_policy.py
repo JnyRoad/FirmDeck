@@ -5,7 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from typing import Protocol
+from collections.abc import Mapping
+from typing import Any, Protocol
 from urllib.parse import SplitResult, urlsplit
 
 MCP_OAUTH_CALLBACK_PATH = "/api/enterprise/mcp-servers/oauth/callback"
@@ -16,6 +17,7 @@ class MCPServerOAuthPolicy(Protocol):
     """Describe the persisted fields that bind a personal OAuth grant."""
 
     auth_mode: str
+    headers_json: dict[str, str]
     transport: str
     url: str | None
     oauth_client_id: str | None
@@ -70,10 +72,23 @@ def validate_mcp_oauth_redirect_uri(redirect_uri: str) -> str:
     return normalized
 
 
+def mcp_oauth_headers_fingerprint(headers: Mapping[str, Any] | None) -> str:
+    """Hash normalized static headers so rotations permanently invalidate old grants."""
+    normalized = {
+        str(name).strip().lower(): str(value)
+        for name, value in (headers or {}).items()
+    }
+    encoded = json.dumps(normalized, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def mcp_oauth_config_fingerprint(server: MCPServerOAuthPolicy) -> str:
     """Hash the server and public-client identity that an OAuth grant may authorize."""
     payload = {
         "auth_mode": server.auth_mode,
+        "headers_fingerprint": mcp_oauth_headers_fingerprint(
+            getattr(server, "headers_json", None)
+        ),
         "transport": server.transport,
         "server_url": server.url or "",
         "client_id": server.oauth_client_id or "",

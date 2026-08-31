@@ -53,13 +53,18 @@ def _oauth_server_update(
     *,
     url: str = "https://mcp.example.test/mcp",
     display_name: str = "Protected",
+    headers: dict[str, str] | None = None,
 ) -> MCPServerUpdateRequest:
     """Build one complete protected-server update for API behavior tests."""
     return MCPServerUpdateRequest(
         tenant_id="tenant_demo",
         name="protected",
         display_name=display_name,
-        connection=MCPServerConnection(transport="streamable_http", url=url),
+        connection=MCPServerConnection(
+            transport="streamable_http",
+            url=url,
+            headers=headers or {},
+        ),
         auth_mode="oauth_personal",
         oauth_client_id="staffdeck-public",
         oauth_redirect_uri=(
@@ -76,7 +81,11 @@ def _member_user() -> User:
     return User(id="user_member", tenant_id="tenant_demo", username="member", role="member", password_hash="test")
 
 
-def _seed_oauth_server_and_grant(db: Session) -> MCPServer:
+def _seed_oauth_server_and_grant(
+    db: Session,
+    *,
+    headers: dict[str, str] | None = None,
+) -> MCPServer:
     """Persist one protected server and matching encrypted user grant."""
     from mcp.shared.auth import OAuthToken
 
@@ -95,6 +104,7 @@ def _seed_oauth_server_and_grant(db: Session) -> MCPServer:
         oauth_redirect_uri=(
             "https://staffdeck.example/api/enterprise/mcp-servers/oauth/callback"
         ),
+        headers_json=headers or {},
     )
     db.add(Tenant(id="tenant_demo", name="Demo"))
     db.add(server)
@@ -123,6 +133,22 @@ def test_updating_oauth_binding_configuration_deletes_existing_grants(
         update_mcp_server(
             server.id,
             _oauth_server_update(url="https://new-mcp.example.test/mcp"),
+            db,
+            _admin_user(),
+        )
+
+        assert db.exec(select(MCPUserOAuthGrant)).all() == []
+
+
+def test_rotating_static_mcp_headers_deletes_existing_oauth_grants(monkeypatch) -> None:
+    """Prevent restoring an old grant after a static request credential is rotated."""
+    monkeypatch.setenv("STAFFDECK_PUBLIC_URL", "https://staffdeck.example")
+    with _test_session() as db:
+        server = _seed_oauth_server_and_grant(db, headers={"X-API-Key": "old-key"})
+
+        update_mcp_server(
+            server.id,
+            _oauth_server_update(headers={"x-api-key": "new-key"}),
             db,
             _admin_user(),
         )

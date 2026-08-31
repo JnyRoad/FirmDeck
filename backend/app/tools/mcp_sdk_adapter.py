@@ -3,17 +3,26 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
+import logging
+import socket
 from collections.abc import Awaitable, Callable
 from importlib.metadata import version as distribution_version
 from typing import Any, TypeVar
 from urllib.parse import urlsplit
 
+import httpcore2
 import httpx2
 import mcp
 from mcp.client.auth import OAuthClientProvider, OAuthFlowError, TokenStorage
 from mcp.client.client import Client
 from mcp.client.streamable_http import streamable_http_client
-from mcp.shared.auth import AuthorizationCodeResult, OAuthClientMetadata
+from mcp.shared.auth import (
+    AuthorizationCodeResult,
+    OAuthClientInformationFull,
+    OAuthClientMetadata,
+    OAuthMetadata,
+)
 
 from app.tools.mcp_client import (
     MCPClientError,
@@ -21,9 +30,108 @@ from app.tools.mcp_client import (
     _tool_result_envelope,
     _validate_remote_mcp_url,
 )
+from app.tools.mcp_oauth_service import MCPGrantConflict
 
 SUPPORTED_MCP_SDK_VERSION = "2.1.1"
 _ResultT = TypeVar("_ResultT")
+
+
+class _OAuthSDKLogSanitizer(logging.Filter):
+    """Strip upstream OAuth exception bodies before application handlers format them."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        """Keep the lifecycle signal while removing provider-controlled exception text."""
+        safe_messages = {
+            "Invalid refresh response": "MCP OAuth refresh response was invalid",
+            "OAuth flow error": "MCP OAuth flow failed",
+        }
+        if record.name == "mcp.client.auth.oauth2" and record.getMessage() in safe_messages:
+            record.msg = safe_messages[record.getMessage()]
+            record.args = ()
+            record.exc_info = None
+            record.exc_text = None
+        return True
+
+
+_oauth_sdk_logger = logging.getLogger("mcp.client.auth.oauth2")
+if not any(isinstance(item, _OAuthSDKLogSanitizer) for item in _oauth_sdk_logger.filters):
+    _oauth_sdk_logger.addFilter(_OAuthSDKLogSanitizer())
+
+
+class _PublicOnlyNetworkBackend(httpcore2.AsyncNetworkBackend):
+    """Resolve once, validate every answer, then connect to the chosen numeric address."""
+
+    def __init__(
+        self,
+        *,
+        resolver: Callable[..., list[Any]] = socket.getaddrinfo,
+        network_backend: httpcore2.AsyncNetworkBackend | None = None,
+    ) -> None:
+        """Allow controlled resolver/backend injection for connection-boundary tests."""
+        self._resolver = resolver
+        self._network_backend = network_backend or httpcore2.AnyIOBackend()
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Any = None,
+    ) -> httpcore2.AsyncNetworkStream:
+        """Connect only to a numeric public address from this exact DNS resolution."""
+        try:
+            resolved = await asyncio.to_thread(
+                self._resolver,
+                host,
+                port,
+                type=socket.SOCK_STREAM,
+            )
+            addresses = {
+                ipaddress.ip_address(sockaddr[0])
+                for *_prefix, sockaddr in resolved
+            }
+        except (OSError, ValueError) as exc:
+            raise httpcore2.ConnectError("MCP OAuth target could not be resolved") from exc
+        if not addresses or any(not address.is_global for address in addresses):
+            raise httpcore2.ConnectError("MCP OAuth target resolved to a non-public address")
+
+        last_error: Exception | None = None
+        for address in sorted(addresses, key=str):
+            try:
+                return await self._network_backend.connect_tcp(
+                    str(address),
+                    port,
+                    timeout=timeout,
+                    local_address=local_address,
+                    socket_options=socket_options,
+                )
+            except httpcore2.NetworkError as exc:
+                last_error = exc
+        raise httpcore2.ConnectError("MCP OAuth public target connection failed") from last_error
+
+    async def connect_unix_socket(
+        self,
+        path: str,
+        timeout: float | None = None,
+        socket_options: Any = None,
+    ) -> httpcore2.AsyncNetworkStream:
+        """Reject Unix sockets because every supported target is public HTTPS."""
+        del path, timeout, socket_options
+        raise httpcore2.ConnectError("MCP OAuth does not support Unix sockets")
+
+    async def sleep(self, seconds: float) -> None:
+        """Delegate retry timing to the selected async network backend."""
+        await self._network_backend.sleep(seconds)
+
+
+class _PublicOnlyAsyncHTTPTransport(httpx2.AsyncHTTPTransport):
+    """Use the pinned public-only resolver for every real SDK TCP connection."""
+
+    def __init__(self) -> None:
+        """Replace the locked transport's resolver before it opens any connection."""
+        super().__init__(trust_env=False, retries=0)
+        self._pool._network_backend = _PublicOnlyNetworkBackend()
 
 
 class MCPAdapterError(RuntimeError):
@@ -60,6 +168,8 @@ def _find_adapter_error(exc: BaseException) -> MCPAdapterError | None:
     """Recover a safe adapter error wrapped by an SDK task-group exception."""
     if isinstance(exc, MCPAdapterError):
         return exc
+    if isinstance(exc, MCPGrantConflict):
+        return MCPAdapterError("MCP_OAUTH_FLOW_CONFLICT")
     if isinstance(exc, BaseExceptionGroup):
         for nested in exc.exceptions:
             found = _find_adapter_error(nested)
@@ -69,7 +179,7 @@ def _find_adapter_error(exc: BaseException) -> MCPAdapterError | None:
 
 
 class _ExpiryAwareOAuthClientProvider(OAuthClientProvider):
-    """Pinned SDK 2.1.1 shim that restores StaffDeck's persisted absolute expiry."""
+    """Pinned SDK 2.1.1 shim that restores expiry and authorization-server metadata."""
 
     async def _initialize(self) -> None:
         """Load SDK state, then restore expiry omitted by the upstream storage protocol."""
@@ -77,6 +187,21 @@ class _ExpiryAwareOAuthClientProvider(OAuthClientProvider):
         expiry_reader = getattr(self.context.storage, "token_expiry_epoch", None)
         if callable(expiry_reader):
             self.context.token_expiry_time = expiry_reader()
+        issuer_reader = getattr(self.context.storage, "read_authorization_server", None)
+        metadata_reader = getattr(self.context.storage, "read_oauth_metadata", None)
+        issuer = issuer_reader() if callable(issuer_reader) else None
+        metadata = metadata_reader() if callable(metadata_reader) else None
+        if isinstance(metadata, OAuthMetadata):
+            self.context.oauth_metadata = metadata
+            self.context.auth_server_url = issuer or str(metadata.issuer)
+        elif isinstance(issuer, str) and issuer:
+            self.context.auth_server_url = issuer
+            tokens = self.context.current_tokens
+            if tokens is not None and tokens.refresh_token:
+                if self.context.is_token_valid():
+                    tokens.refresh_token = None
+                else:
+                    self.context.clear_tokens()
 
 
 class MCPSDKAdapter:
@@ -107,7 +232,7 @@ class MCPSDKAdapter:
         self.redirect_handler = redirect_handler
         self.callback_handler = callback_handler
         self.client_metadata_url = client_metadata_url
-        self.transport = transport
+        self.transport = transport or _PublicOnlyAsyncHTTPTransport()
         self.timeout_seconds = timeout_seconds
         self.url_validator = url_validator or _validate_oauth_target_url
         self._server_http_url = httpx2.URL(server_url)
@@ -150,19 +275,42 @@ class MCPSDKAdapter:
         async def prepare_request(request: httpx2.Request) -> None:
             """Enforce the network boundary and attach static headers only to the MCP server."""
             self.url_validator(str(request.url))
+            authorization_server = provider.context.auth_server_url
+            if authorization_server is None and provider.context.oauth_metadata is not None:
+                authorization_server = str(provider.context.oauth_metadata.issuer)
+            binding_writer = getattr(self.storage, "bind_authorization_server", None)
+            if authorization_server and callable(binding_writer):
+                tokens_cleared, client_info_cleared = await binding_writer(
+                    authorization_server,
+                    provider.context.oauth_metadata,
+                )
+                if tokens_cleared:
+                    provider.context.clear_tokens()
+                if client_info_cleared:
+                    provider.context.client_info = None
+                public_client_id = getattr(self.storage, "public_client_id", None)
+                if (
+                    not client_info_cleared
+                    and provider.context.client_info is None
+                    and isinstance(public_client_id, str)
+                    and public_client_id
+                ):
+                    public_client = OAuthClientInformationFull(
+                        client_id=public_client_id,
+                        redirect_uris=[self.redirect_uri],
+                        token_endpoint_auth_method="none",
+                        issuer=authorization_server,
+                    )
+                    provider.context.client_info = public_client
+                    await self.storage.set_client_info(public_client)
             if request.url == self._server_http_url:
                 request.headers.update(self.headers)
 
         lock_acquired = False
         if operation_lock is not None:
-            acquire_task = asyncio.create_task(asyncio.to_thread(operation_lock.acquire))
-            try:
-                await asyncio.shield(acquire_task)
-                lock_acquired = True
-            except asyncio.CancelledError:
-                if await acquire_task:
-                    operation_lock.release()
-                raise
+            while not operation_lock.acquire(blocking=False):
+                await asyncio.sleep(0.01)
+            lock_acquired = True
         try:
             try:
                 async with httpx2.AsyncClient(

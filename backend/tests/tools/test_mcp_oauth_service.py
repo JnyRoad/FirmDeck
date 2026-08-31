@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import threading
 from datetime import UTC, datetime
 
 import pytest
@@ -9,7 +11,7 @@ from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 from sqlalchemy import create_engine
 from sqlmodel import Session, SQLModel, select
 
-from app.db.models import MCPUserOAuthGrant
+from app.db.models import MCPServer, MCPUserOAuthGrant, Tenant, User
 
 
 def _engine(tmp_path):
@@ -17,6 +19,33 @@ def _engine(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'grant.db'}")
     SQLModel.metadata.create_all(engine)
     return engine
+
+
+def test_oauth_config_fingerprint_tracks_static_header_rotation() -> None:
+    """Require reconnect when static MCP credentials change without exposing their value."""
+    from app.tools.mcp_oauth_policy import mcp_oauth_config_fingerprint
+
+    server = MCPServer(
+        id="server_1",
+        tenant_id="tenant_1",
+        name="protected",
+        transport="streamable_http",
+        url="https://mcp.example.test/mcp",
+        auth_mode="oauth_personal",
+        oauth_client_id="staffdeck-public",
+        oauth_redirect_uri="https://staffdeck.example/oauth/callback",
+        headers_json={"X-API-Key": "header-secret"},
+    )
+    original = mcp_oauth_config_fingerprint(server)
+    server.headers_json = {"x-api-key": "header-secret"}
+    assert mcp_oauth_config_fingerprint(server) == original
+
+    server.headers_json = {"X-API-Key": "rotated-secret"}
+    rotated = mcp_oauth_config_fingerprint(server)
+
+    assert rotated != original
+    assert "header-secret" not in original
+    assert "rotated-secret" not in rotated
 
 
 @pytest.mark.asyncio
@@ -92,6 +121,37 @@ async def test_grant_storage_restores_absolute_expiry(tmp_path) -> None:
     expiry = restored.token_expiry_epoch()
     assert expiry is not None
     assert expiry > datetime.now(UTC).timestamp()
+
+
+@pytest.mark.asyncio
+async def test_grant_storage_fails_closed_after_app_secret_rotation(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """Turn an undecryptable grant into a recoverable reconnect state without a 500."""
+    from app.config import get_settings
+    from app.tools.mcp_oauth_service import MCPGrantTokenStorage
+
+    engine = _engine(tmp_path)
+    monkeypatch.setenv("APP_SECRET", "oauth-test-secret-before-rotation")
+    get_settings.cache_clear()
+    try:
+        original = MCPGrantTokenStorage(engine, "tenant_1", "server_1", "user_1")
+        await original.set_tokens(
+            OAuthToken(access_token="cannot-decrypt-after-rotation", expires_in=60)
+        )
+
+        monkeypatch.setenv("APP_SECRET", "oauth-test-secret-after-rotation")
+        get_settings.cache_clear()
+        restored = MCPGrantTokenStorage(engine, "tenant_1", "server_1", "user_1")
+
+        assert await restored.get_tokens() is None
+        assert restored.token_expiry_epoch() is None
+        assert restored.read_status().state == "reconnect_required"
+        with Session(engine) as db:
+            assert db.exec(select(MCPUserOAuthGrant)).one().status == "reconnect_required"
+    finally:
+        get_settings.cache_clear()
 
 
 @pytest.mark.asyncio
@@ -219,3 +279,110 @@ def test_grant_operation_lock_is_shared_only_by_the_same_owner(tmp_path) -> None
 
     assert first.operation_lock() is same_owner.operation_lock()
     assert first.operation_lock() is not other_user.operation_lock()
+
+
+@pytest.mark.asyncio
+async def test_disconnect_fences_an_inflight_public_client_token_write(tmp_path) -> None:
+    """Prevent a flow with no grant row yet from recreating authorization after disconnect."""
+    from app.tools.mcp_oauth_service import MCPGrantConflict, MCPGrantTokenStorage
+
+    engine = _engine(tmp_path)
+    inflight = MCPGrantTokenStorage(engine, "tenant_1", "server_1", "user_1")
+    MCPGrantTokenStorage(engine, "tenant_1", "server_1", "user_1").disconnect()
+
+    with pytest.raises(MCPGrantConflict):
+        await inflight.set_tokens(OAuthToken(access_token="late-token", expires_in=60))
+    assert (
+        MCPGrantTokenStorage(engine, "tenant_1", "server_1", "user_1")
+        .read_status()
+        .state
+        == "disconnected"
+    )
+
+    replacement = MCPGrantTokenStorage(engine, "tenant_1", "server_1", "user_1")
+    replacement.begin_authorization()
+    await replacement.set_tokens(OAuthToken(access_token="new-flow-token", expires_in=60))
+    assert (await replacement.get_tokens()).access_token == "new-flow-token"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_disconnect_is_idempotent(tmp_path, monkeypatch) -> None:
+    """Keep simultaneous owner disconnects from surfacing a unique-key failure."""
+    from app.tools.mcp_oauth_service import MCPGrantTokenStorage
+
+    engine = _engine(tmp_path)
+    first = MCPGrantTokenStorage(engine, "tenant_1", "server_1", "user_1")
+    second = MCPGrantTokenStorage(engine, "tenant_1", "server_1", "user_1")
+    original_select = MCPGrantTokenStorage._select_row
+    both_read_missing = threading.Barrier(2)
+
+    def synchronized_select(storage, db):
+        row = original_select(storage, db)
+        if row is None:
+            both_read_missing.wait(timeout=2)
+        return row
+
+    monkeypatch.setattr(MCPGrantTokenStorage, "_select_row", synchronized_select)
+    await asyncio.gather(
+        asyncio.to_thread(first.disconnect),
+        asyncio.to_thread(second.disconnect),
+    )
+
+    assert first.read_status().state == "disconnected"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", ["delete_server", "delete_user", "change_server"])
+async def test_live_owner_validation_fences_resource_changes(tmp_path, mutation: str) -> None:
+    """Reject late token writes after the bound server, user, or OAuth policy changes."""
+    from app.tools.mcp_oauth_policy import mcp_oauth_config_fingerprint
+    from app.tools.mcp_oauth_service import MCPGrantConflict, MCPGrantTokenStorage
+
+    engine = _engine(tmp_path)
+    with Session(engine) as db:
+        db.add(Tenant(id="tenant_1", name="Tenant"))
+        db.add(
+            User(
+                id="user_1",
+                tenant_id="tenant_1",
+                username="user_1",
+                password_hash="unused",
+            )
+        )
+        server = MCPServer(
+            id="server_1",
+            tenant_id="tenant_1",
+            name="protected",
+            transport="streamable_http",
+            url="https://mcp.example.test/mcp",
+            auth_mode="oauth_personal",
+            oauth_client_id="staffdeck-public",
+            oauth_redirect_uri="https://staffdeck.example/oauth/callback",
+        )
+        db.add(server)
+        db.commit()
+        fingerprint = mcp_oauth_config_fingerprint(server)
+
+    inflight = MCPGrantTokenStorage(
+        engine,
+        "tenant_1",
+        "server_1",
+        "user_1",
+        config_fingerprint=fingerprint,
+        enforce_owner_binding=True,
+    )
+    with Session(engine) as db:
+        server = db.get(MCPServer, "server_1")
+        user = db.get(User, "user_1")
+        assert server is not None and user is not None
+        if mutation == "delete_server":
+            db.delete(server)
+        elif mutation == "delete_user":
+            db.delete(user)
+        else:
+            server.url = "https://replacement.example.test/mcp"
+            db.add(server)
+        db.commit()
+
+    with pytest.raises(MCPGrantConflict):
+        await inflight.set_tokens(OAuthToken(access_token="late-token", expires_in=60))

@@ -442,7 +442,7 @@ describe('MCP personal OAuth lifecycle', () => {
   ) => {
     const authorizationUrl = 'https://auth.example/authorize?state=opaque';
     const openWindow = vi.spyOn(window, 'open').mockImplementation(() => null);
-    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       if (url.includes('/oauth/status')) {
         return jsonResponse({
@@ -494,7 +494,8 @@ describe('MCP personal OAuth lifecycle', () => {
         });
       }
       return jsonResponse([]);
-    }));
+    });
+    vi.stubGlobal('fetch', fetchMock);
 
     const user = userEvent.setup();
     renderSemanticMcpEditor(locale);
@@ -504,6 +505,10 @@ describe('MCP personal OAuth lifecycle', () => {
     await waitFor(() => {
       expect(openWindow).toHaveBeenCalledWith(authorizationUrl, '_self');
     });
+    const startCall = fetchMock.mock.calls.find(([input, init]) => (
+      String(input).includes('/oauth/start') && init?.method === 'POST'
+    ));
+    expect(startCall?.[1]).toEqual(expect.objectContaining({ credentials: 'include' }));
     expect(screen.queryByLabelText(/access token/i)).toBeNull();
   });
 });

@@ -63,7 +63,10 @@ from app.tools.mcp_client import (
     execute_mcp_tool,
     read_mcp_resource,
 )
-from app.tools.mcp_oauth_policy import mcp_oauth_config_fingerprint
+from app.tools.mcp_oauth_policy import (
+    mcp_oauth_config_fingerprint,
+    mcp_oauth_headers_fingerprint,
+)
 from app.tools.mcp_oauth_service import MCPGrantTokenStorage
 from app.tools.mcp_sdk_adapter import MCPAdapterError, MCPSDKAdapter
 from app.tools.tool_executor import _run_coroutine
@@ -1027,7 +1030,9 @@ def _update_inherited_mcp_tool_scopes(db: Session, server: MCPServer) -> None:
         db.add(tool)
 
 
-def _mcp_oauth_binding_values(server: MCPServer) -> tuple[str, str, str, str, str, str]:
+def _mcp_oauth_binding_values(
+    server: MCPServer,
+) -> tuple[str, str, str, str, str, str, str]:
     """Return the persisted server identity whose changes invalidate personal grants."""
     return (
         server.auth_mode or "none",
@@ -1036,12 +1041,13 @@ def _mcp_oauth_binding_values(server: MCPServer) -> tuple[str, str, str, str, st
         server.oauth_client_id or "",
         server.oauth_client_metadata_url or "",
         server.oauth_redirect_uri or "",
+        mcp_oauth_headers_fingerprint(server.headers_json),
     )
 
 
 def _request_oauth_binding_values(
     request: MCPServerUpdateRequest,
-) -> tuple[str, str, str, str, str, str]:
+) -> tuple[str, str, str, str, str, str, str]:
     """Return the requested server identity in the same grant-binding order."""
     return (
         request.auth_mode,
@@ -1050,6 +1056,7 @@ def _request_oauth_binding_values(
         request.oauth_client_id or "",
         request.oauth_client_metadata_url or "",
         request.oauth_redirect_uri or "",
+        mcp_oauth_headers_fingerprint(request.connection.headers),
     )
 
 
@@ -1569,8 +1576,10 @@ def _discover_protected_server(
         server.id,
         user_id,
         public_client_id=server.oauth_client_id,
+        client_metadata_url=server.oauth_client_metadata_url,
         redirect_uri=server.oauth_redirect_uri,
         config_fingerprint=mcp_oauth_config_fingerprint(server),
+        enforce_owner_binding=True,
     )
     status = storage.read_status()
     if status.state != "connected":
@@ -1627,8 +1636,10 @@ def _read_protected_resource(
         server.id,
         user_id,
         public_client_id=server.oauth_client_id,
+        client_metadata_url=server.oauth_client_metadata_url,
         redirect_uri=server.oauth_redirect_uri,
         config_fingerprint=mcp_oauth_config_fingerprint(server),
+        enforce_owner_binding=True,
     )
     status = storage.read_status()
     if status.state != "connected":

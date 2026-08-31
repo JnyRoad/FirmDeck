@@ -413,8 +413,10 @@ class ToolExecutor:
             server.id,
             user_id,
             public_client_id=server.oauth_client_id,
+            client_metadata_url=server.oauth_client_metadata_url,
             redirect_uri=server.oauth_redirect_uri,
             config_fingerprint=mcp_oauth_config_fingerprint(server),
+            enforce_owner_binding=True,
         )
         status = storage.read_status()
         if status.state != "connected":

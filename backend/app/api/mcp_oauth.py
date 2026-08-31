@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import secrets
 from datetime import datetime
 from typing import Literal
+from urllib.parse import urlsplit
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request, Response
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import Engine
@@ -18,6 +20,7 @@ from app.db import get_session
 from app.db.models import MCPServer, User
 from app.security.auth import ensure_current_user_tenant, get_current_user
 from app.tools.mcp_oauth_flow import (
+    FLOW_TTL_SECONDS,
     MCPOAuthFlowCoordinator,
     MCPOAuthFlowError,
     MCPOAuthStartResult,
@@ -118,7 +121,9 @@ def get_mcp_oauth_status(
         tenant_id,
         server.id,
         current_user.id,
+        client_metadata_url=server.oauth_client_metadata_url,
         config_fingerprint=mcp_oauth_config_fingerprint(server),
+        enforce_owner_binding=True,
     )
     return _project_status(server, storage.read_status())
 
@@ -127,6 +132,7 @@ def get_mcp_oauth_status(
 async def start_mcp_oauth(
     server_id: str,
     request: MCPOAuthStartRequest,
+    http_response: Response,
     db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ) -> MCPOAuthStartResult:
@@ -152,15 +158,19 @@ async def start_mcp_oauth(
         server.id,
         current_user.id,
         public_client_id=server.oauth_client_id,
+        client_metadata_url=server.oauth_client_metadata_url,
         redirect_uri=redirect_uri,
         config_fingerprint=mcp_oauth_config_fingerprint(server),
+        enforce_owner_binding=True,
     )
     grant_state = storage.read_status().state
     if grant_state == "connected":
         raise build_http_exception("MCP_OAUTH_FLOW_CONFLICT")
     if grant_state == "reconnect_required":
         storage.disconnect()
+    storage.begin_authorization()
     coordinator = _coordinator_for_engine(engine)
+    browser_binding = secrets.token_urlsafe(32)
 
     async def operation(redirect_handler, callback_handler) -> None:
         """Keep the SDK coroutine alive while the coordinator bridges the callback."""
@@ -176,11 +186,12 @@ async def start_mcp_oauth(
         await adapter.discover()
 
     try:
-        return await coordinator.start(
+        result = await coordinator.start(
             tenant_id=request.tenant_id,
             server_id=server.id,
             user_id=current_user.id,
             redirect_uri=redirect_uri,
+            browser_binding=browser_binding,
             operation=operation,
         )
     except (MCPOAuthFlowError, MCPAdapterError) as exc:
@@ -188,6 +199,16 @@ async def start_mcp_oauth(
         if entry is None or entry.visibility is not ErrorVisibility.PUBLIC:
             entry = ERROR_REGISTRY.require("INTERNAL_ERROR")
         raise build_http_exception(entry.code) from exc
+    http_response.set_cookie(
+        key=MCPOAuthFlowCoordinator.browser_cookie_name(result.flow_id),
+        value=browser_binding,
+        max_age=FLOW_TTL_SECONDS,
+        path="/api/enterprise/mcp-servers/oauth/callback",
+        secure=urlsplit(redirect_uri).scheme.lower() == "https",
+        httponly=True,
+        samesite="lax",
+    )
+    return result
 
 
 @router.delete("/{server_id}/oauth", status_code=204)
@@ -205,12 +226,15 @@ def disconnect_mcp_oauth(
         tenant_id,
         server.id,
         current_user.id,
+        client_metadata_url=server.oauth_client_metadata_url,
         config_fingerprint=mcp_oauth_config_fingerprint(server),
+        enforce_owner_binding=True,
     ).disconnect()
 
 
 @router.get("/oauth/callback", include_in_schema=False)
 async def mcp_oauth_callback(
+    request: Request,
     state: str | None = Query(default=None),
     code: str | None = Query(default=None),
     iss: str | None = Query(default=None),
@@ -218,16 +242,27 @@ async def mcp_oauth_callback(
 ) -> RedirectResponse:
     """Consume one provider callback and redirect without echoing callback secrets."""
     coordinator = _coordinator_for_engine(database_engine)
+    cookie_name = coordinator.browser_cookie_name_for_state(state or "")
+    browser_binding = request.cookies.get(cookie_name) if cookie_name else None
     try:
         outcome = await coordinator.complete_callback(
             state=state or "",
             code=code,
             iss=iss,
             error=error,
+            browser_binding=browser_binding,
         )
     except (MCPOAuthFlowError, MCPAdapterError) as exc:
         outcome = "expired" if exc.code == "MCP_OAUTH_FLOW_EXPIRED" else "failed"
-    return RedirectResponse(
+    response = RedirectResponse(
         url=f"/enterprise/tools?mcp_oauth={outcome}",
         status_code=302,
     )
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    if cookie_name and outcome in {"completed", "denied"}:
+        response.delete_cookie(
+            cookie_name,
+            path="/api/enterprise/mcp-servers/oauth/callback",
+        )
+    return response

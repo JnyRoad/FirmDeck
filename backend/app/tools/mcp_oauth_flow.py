@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import secrets
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -13,7 +14,7 @@ from urllib.parse import parse_qs, urlparse
 
 from mcp.shared.auth import AuthorizationCodeResult
 from pydantic import BaseModel
-from sqlalchemy import Engine
+from sqlalchemy import Engine, update
 from sqlmodel import Session, select
 
 from app.db.models import MCPOAuthFlow, new_id, utc_now
@@ -68,6 +69,7 @@ class _PendingFlow:
 
     flow_id: str
     state_digest: str
+    browser_binding_digest: str
     callback_future: asyncio.Future[AuthorizationCodeResult]
     task: asyncio.Task[None]
 
@@ -89,11 +91,24 @@ class MCPOAuthFlowCoordinator:
         self.engine = engine
         self._pending_by_digest: dict[str, _PendingFlow] = {}
         self._pending_by_id: dict[str, _PendingFlow] = {}
+        self._pending_owner_keys: set[tuple[str, str, str]] = set()
 
     @staticmethod
     def _digest_state(state: str) -> str:
         """Create the only callback-state representation allowed in persistent storage."""
         return hashlib.sha256(state.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def browser_cookie_name(flow_id: str) -> str:
+        """Return one host-only cookie name scoped to a single concurrent browser flow."""
+        return f"staffdeck_mcp_oauth_{flow_id}"
+
+    def browser_cookie_name_for_state(self, state: str) -> str | None:
+        """Resolve the expected browser cookie without exposing its stored digest."""
+        if not state:
+            return None
+        pending = self._pending_by_digest.get(self._digest_state(state))
+        return self.browser_cookie_name(pending.flow_id) if pending is not None else None
 
     def _update_status(self, flow_id: str, status: str, error_code: str | None = None) -> None:
         """Update credential-free lifecycle fields without touching callback secrets."""
@@ -106,6 +121,29 @@ class MCPOAuthFlowCoordinator:
             row.updated_at = utc_now()
             db.add(row)
             db.commit()
+
+    def _transition_pending(
+        self,
+        flow_id: str,
+        status: str,
+        error_code: str | None = None,
+    ) -> bool:
+        """Atomically let only one callback claim a still-pending flow."""
+        with Session(self.engine) as db:
+            result = db.execute(
+                update(MCPOAuthFlow)
+                .where(
+                    MCPOAuthFlow.id == flow_id,
+                    MCPOAuthFlow.status == "pending",
+                )
+                .values(
+                    status=status,
+                    error_code=error_code,
+                    updated_at=utc_now(),
+                )
+            )
+            db.commit()
+            return result.rowcount == 1
 
     def _discard_pending(self, flow_id: str) -> None:
         """Release completed process-local futures while retaining durable audit state."""
@@ -120,9 +158,15 @@ class MCPOAuthFlowCoordinator:
         server_id: str,
         user_id: str,
         redirect_uri: str,
+        browser_binding: str,
         operation: FlowOperation,
     ) -> MCPOAuthStartResult:
         """Launch the SDK operation and return as soon as it emits an authorization URL."""
+        if not browser_binding:
+            raise MCPOAuthFlowError("MCP_OAUTH_CALLBACK_INVALID")
+        owner_key = (tenant_id, server_id, user_id)
+        if owner_key in self._pending_owner_keys:
+            raise MCPOAuthFlowError("MCP_OAUTH_FLOW_CONFLICT")
         for pending in self._pending_by_id.values():
             with Session(self.engine) as db:
                 row = db.get(MCPOAuthFlow, pending.flow_id)
@@ -134,6 +178,7 @@ class MCPOAuthFlowCoordinator:
                     and row.status in {"pending", "callback_received"}
                 ):
                     raise MCPOAuthFlowError("MCP_OAUTH_FLOW_CONFLICT")
+        self._pending_owner_keys.add(owner_key)
 
         loop = asyncio.get_running_loop()
         authorization_future: asyncio.Future[str] = loop.create_future()
@@ -165,6 +210,7 @@ class MCPOAuthFlowCoordinator:
             pending = _PendingFlow(
                 flow_id=flow_id,
                 state_digest=state_digest,
+                browser_binding_digest=self._digest_state(browser_binding),
                 callback_future=callback_future,
                 task=task,
             )
@@ -230,15 +276,26 @@ class MCPOAuthFlowCoordinator:
                 )
             finally:
                 self._discard_pending(flow_id)
+                self._pending_owner_keys.discard(owner_key)
 
-        task = asyncio.create_task(run_operation(), name=f"mcp-oauth-{flow_id}")
+        try:
+            task = asyncio.create_task(run_operation(), name=f"mcp-oauth-{flow_id}")
+        except BaseException:
+            self._pending_owner_keys.discard(owner_key)
+            raise
+        task.add_done_callback(lambda _task: self._pending_owner_keys.discard(owner_key))
         try:
             authorization_url = await asyncio.wait_for(
                 asyncio.shield(authorization_future),
                 timeout=min(FLOW_TTL_SECONDS, 30),
             )
+        except asyncio.CancelledError:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            raise
         except Exception:
             task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
             raise
         return MCPOAuthStartResult(
             authorization_url=authorization_url,
@@ -253,6 +310,7 @@ class MCPOAuthFlowCoordinator:
         code: str | None = None,
         iss: str | None = None,
         error: str | None = None,
+        browser_binding: str | None = None,
     ) -> Literal["completed", "denied"]:
         """Validate one callback, deliver it once, and wait for the SDK exchange result."""
         if not state:
@@ -300,8 +358,26 @@ class MCPOAuthFlowCoordinator:
                 error_code="MCP_OAUTH_FLOW_EXPIRED",
             )
             raise MCPOAuthFlowError("MCP_OAUTH_FLOW_EXPIRED")
+        if not browser_binding or not secrets.compare_digest(
+            self._digest_state(browser_binding),
+            pending.browser_binding_digest,
+        ):
+            _log_oauth_event(
+                "mcp_oauth.invalid_browser_binding",
+                tenant_id=row.tenant_id,
+                server_id=row.server_id,
+                user_id=row.user_id,
+                flow_id=row.id,
+                error_code="MCP_OAUTH_CALLBACK_INVALID",
+            )
+            raise MCPOAuthFlowError("MCP_OAUTH_CALLBACK_INVALID")
         if error:
-            self._update_status(pending.flow_id, "denied", "MCP_AUTHORIZATION_REQUIRED")
+            if not self._transition_pending(
+                pending.flow_id,
+                "denied",
+                "MCP_AUTHORIZATION_REQUIRED",
+            ):
+                raise MCPOAuthFlowError("MCP_OAUTH_CALLBACK_INVALID")
             _log_oauth_event(
                 "mcp_oauth.denied",
                 tenant_id=row.tenant_id,
@@ -316,10 +392,16 @@ class MCPOAuthFlowCoordinator:
                 )
             try:
                 await pending.task
-            except MCPOAuthFlowError:
+            except Exception:  # The SDK may wrap the intentional callback denial.
                 pass
             return "denied"
         if not code:
+            if not self._transition_pending(
+                pending.flow_id,
+                "failed",
+                "MCP_OAUTH_CALLBACK_INVALID",
+            ):
+                raise MCPOAuthFlowError("MCP_OAUTH_CALLBACK_INVALID")
             _log_oauth_event(
                 "mcp_oauth.invalid_callback",
                 tenant_id=row.tenant_id,
@@ -334,11 +416,12 @@ class MCPOAuthFlowCoordinator:
                 )
             try:
                 await pending.task
-            except MCPOAuthFlowError:
+            except Exception:  # The SDK may wrap the intentional callback failure.
                 pass
             raise MCPOAuthFlowError("MCP_OAUTH_CALLBACK_INVALID")
 
-        self._update_status(pending.flow_id, "callback_received")
+        if not self._transition_pending(pending.flow_id, "callback_received"):
+            raise MCPOAuthFlowError("MCP_OAUTH_CALLBACK_INVALID")
         if pending.callback_future.done():
             raise MCPOAuthFlowError("MCP_OAUTH_CALLBACK_INVALID")
         pending.callback_future.set_result(

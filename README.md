@@ -183,6 +183,10 @@ existing client for no-auth, stdio, builtin, and legacy SSE connections.
 - The configured redirect URI must use the exact
   `/api/enterprise/mcp-servers/oauth/callback` path. In deployed environments its HTTPS origin must
   match `STAFFDECK_PUBLIC_URL`; loopback HTTP is allowed only for local development.
+- The callback is accepted only from the same browser flow that started authorization, using a
+  short-lived HttpOnly, SameSite cookie scoped to the callback path.
+- Every SDK HTTP target is restricted to HTTPS and public addresses. DNS is resolved and validated
+  again at connection time, then the TCP connection is pinned to the validated numeric address.
 - An unfinished browser authorization expires after 10 minutes and cannot resume after a process
   restart. The start request and callback use process-local coordination, so multi-worker deployments
   must route both requests to the same application process (for example with sticky routing) or add
