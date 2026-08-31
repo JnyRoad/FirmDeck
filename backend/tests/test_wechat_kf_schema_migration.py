@@ -18,7 +18,9 @@ def test_wechat_kf_accounts_migration_is_additive_idempotent_and_backfills(
     db_path = tmp_path / "wechat-kf-migration.db"
     engine = create_engine(f"sqlite:///{db_path}")
     existing_tables = [
-        table for table in SQLModel.metadata.sorted_tables if table.name != "wechat_kf_accounts"
+        table
+        for table in SQLModel.metadata.sorted_tables
+        if table.name not in {"wechat_kf_accounts", "wechat_kf_account_operations"}
     ]
     SQLModel.metadata.create_all(engine, tables=existing_tables)
     with engine.begin() as conn:
@@ -54,6 +56,7 @@ def test_wechat_kf_accounts_migration_is_additive_idempotent_and_backfills(
     monkeypatch.setattr(database, "database_url", f"sqlite:///{db_path}")
     monkeypatch.setattr(database, "engine", engine)
     assert "wechat_kf_accounts" not in inspect(engine).get_table_names()
+    assert "wechat_kf_account_operations" not in inspect(engine).get_table_names()
     migration_calls: list[set[str]] = []
     migrate_wechat_kf_accounts = database._migrate_wechat_kf_accounts
 
@@ -71,6 +74,7 @@ def test_wechat_kf_accounts_migration_is_additive_idempotent_and_backfills(
     assert len(migration_calls) == 2
     assert "wechat_kf_accounts" not in migration_calls[0]
     assert "wechat_kf_accounts" in inspector.get_table_names()
+    assert "wechat_kf_account_operations" in inspector.get_table_names()
     columns = {column["name"] for column in inspector.get_columns("wechat_kf_accounts")}
     assert {
         "id",
@@ -82,6 +86,25 @@ def test_wechat_kf_accounts_migration_is_additive_idempotent_and_backfills(
         "status",
         "sync_cursor",
     } <= columns
+    operation_columns = {
+        column["name"]
+        for column in inspector.get_columns("wechat_kf_account_operations")
+    }
+    assert {
+        "id",
+        "tenant_id",
+        "binding_id",
+        "kind",
+        "status",
+        "open_kfid",
+        "desired_name",
+        "desired_media_id",
+        "binding_revision",
+        "attempts",
+        "last_error_code",
+        "provider_applied_at",
+        "completed_at",
+    } <= operation_columns
     with engine.begin() as conn:
         row = conn.execute(text("SELECT * FROM wechat_kf_accounts")).mappings().one()
         assert row["tenant_id"] == "tenant_a"

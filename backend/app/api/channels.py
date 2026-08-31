@@ -35,6 +35,7 @@ from app.channels.adapters.feishu import (
 from app.channels.adapters.wechat import WeChatClient, sanitize_wechat_baseurl, validate_wechat_host
 from app.channels.adapters.wechat_kf import (
     WeChatKfAdapter,
+    WeChatKfNotFoundError,
     WeChatKfPermanentError,
     WeChatKfTokenProvider,
     WeChatKfTransientError,
@@ -88,7 +89,7 @@ from app.config import get_settings
 from app.contracts.error_registry import ERROR_REGISTRY, ErrorVisibility
 from app.contracts.errors import InternalErrorContext
 from app.contracts.http import build_http_exception
-from app.db import get_session
+from app.db import engine, get_session
 from app.db.models import (
     AgentProfile,
     ChannelBindCode,
@@ -104,6 +105,7 @@ from app.db.models import (
     Team,
     User,
     WeChatKfAccount,
+    WeChatKfAccountOperation,
     utc_now,
 )
 from app.security.auth import get_current_user
@@ -120,6 +122,7 @@ router = APIRouter(prefix="/api/enterprise/channels", tags=["enterprise:channels
 
 _CHANNEL_HTTP_CODES = {
     400: "CHANNEL_BAD_REQUEST",
+    413: "CHANNEL_BAD_REQUEST",
     403: "CHANNEL_FORBIDDEN",
     404: "CHANNEL_NOT_FOUND",
     409: "CHANNEL_CONFLICT",
@@ -200,6 +203,8 @@ def _patch_binding_config_key(
         raise _channel_http_error(status_code=404, detail="渠道绑定不存在")
 
 SUPPORTED_CHANNELS = {"wechat", "wechat_kf", "wecom", "feishu", "dingtalk"}
+# 微信客服 API 已可供受控内部调用；Task 3 setup UI 上线前不向旧接入页枚举。
+_CHANNEL_META_VISIBLE = {"wechat", "wecom", "feishu", "dingtalk"}
 INGRESS_QUIESCE_TIMEOUT_SECONDS = 5.0
 # 渠道中文名:错误信息与通知文案共用
 _CHANNEL_LABELS = {
@@ -394,7 +399,11 @@ def list_channel_meta(
 ) -> list[ChannelMetaRead]:
     """渠道描述清单:前端接入页按此渲染渠道卡片与凭证表单(任意登录用户)。"""
     ensure_current_user_tenant(tenant_id, current_user)
-    return [ChannelMetaRead.model_validate(item) for item in CHANNEL_META]
+    return [
+        ChannelMetaRead.model_validate(item)
+        for item in CHANNEL_META
+        if item.get("channel") in _CHANNEL_META_VISIBLE
+    ]
 
 
 @router.get("", response_model=list[ChannelBindingRead])
@@ -1683,6 +1692,311 @@ def _ensure_wechat_kf_account_binding(
     return account
 
 
+_WECHAT_KF_OPERATION_PENDING = {"prepared", "provider_inflight", "provider_applied"}
+_WECHAT_KF_RECONCILE_MAX_OPERATIONS = 20
+
+
+def _prepare_wechat_kf_account_operation(
+    db: Session,
+    binding: ChannelBinding,
+    *,
+    kind: str,
+    open_kfid: str | None = None,
+    desired_name: str = "",
+    desired_media_id: str | None = None,
+    tombstone: WeChatKfAccount | None = None,
+) -> WeChatKfAccountOperation:
+    """Persist one operation intent before provider I/O, optionally with a delete tombstone."""
+    pending = db.exec(
+        select(WeChatKfAccountOperation).where(
+            WeChatKfAccountOperation.binding_id == binding.id,
+            WeChatKfAccountOperation.status.in_(_WECHAT_KF_OPERATION_PENDING),
+        )
+    ).first()
+    if pending is not None:
+        raise _channel_http_error(409, "wechat kf account operation already pending")
+
+    operation = WeChatKfAccountOperation(
+        tenant_id=binding.tenant_id,
+        binding_id=binding.id,
+        kind=kind,
+        open_kfid=open_kfid.strip() if open_kfid else None,
+        desired_name=desired_name.strip(),
+        desired_media_id=desired_media_id.strip() if desired_media_id else None,
+        binding_revision=binding.config_revision,
+    )
+    # Delete fencing is durable in the same local transaction as its intent.
+    if tombstone is not None:
+        tombstone.status = "deleting"
+        tombstone.updated_at = utc_now()
+        binding.config_revision += 1
+        binding.updated_at = utc_now()
+        operation.binding_revision = binding.config_revision
+        db.add(tombstone)
+        db.add(binding)
+    db.add(operation)
+    db.commit()
+    db.refresh(operation)
+    return operation
+
+
+def _mark_wechat_kf_operation_inflight(
+    db: Session,
+    operation: WeChatKfAccountOperation,
+) -> None:
+    """Persist the provider-call boundary before any account administration request."""
+    operation.status = "provider_inflight"
+    operation.attempts += 1
+    operation.last_error_code = None
+    operation.updated_at = utc_now()
+    db.add(operation)
+    db.commit()
+    db.refresh(operation)
+
+
+def _mark_wechat_kf_operation_provider_applied(
+    db: Session,
+    operation: WeChatKfAccountOperation,
+    *,
+    open_kfid: str | None = None,
+) -> None:
+    """Persist provider success independently so local finalization can be replayed safely."""
+    if open_kfid:
+        operation.open_kfid = open_kfid.strip()
+    operation.status = "provider_applied"
+    operation.provider_applied_at = utc_now()
+    operation.last_error_code = None
+    operation.updated_at = utc_now()
+    db.add(operation)
+    db.commit()
+    db.refresh(operation)
+
+
+def _record_wechat_kf_operation_error(
+    db: Session,
+    operation: WeChatKfAccountOperation,
+    *,
+    error_code: str,
+    terminal: bool = False,
+) -> None:
+    """Persist only a stable error code while retaining a retryable intent when uncertain."""
+    operation.status = "failed" if terminal else "provider_inflight"
+    operation.last_error_code = error_code
+    operation.updated_at = utc_now()
+    db.add(operation)
+    db.commit()
+    db.refresh(operation)
+
+
+def _finalize_wechat_kf_account_operation(
+    db: Session,
+    operation: WeChatKfAccountOperation,
+) -> ChannelBinding:
+    """Apply one provider-confirmed desired state and complete it in one local transaction."""
+    binding = db.get(ChannelBinding, operation.binding_id)
+    if binding is None or binding.tenant_id != operation.tenant_id:
+        raise _channel_http_error(409, "wechat kf operation binding unavailable")
+    _ensure_revision(binding, operation.binding_revision)
+
+    # Create/update advance the binding generation only when desired local state commits.
+    if operation.kind == "create":
+        if not operation.open_kfid:
+            raise _channel_http_error(409, "wechat kf create result missing account id")
+        _ensure_wechat_kf_account_binding(
+            db,
+            binding,
+            operation.open_kfid,
+            name=operation.desired_name,
+        )
+        binding.config_revision += 1
+    elif operation.kind == "update":
+        account = db.exec(
+            select(WeChatKfAccount).where(
+                WeChatKfAccount.tenant_id == operation.tenant_id,
+                WeChatKfAccount.binding_id == operation.binding_id,
+                WeChatKfAccount.open_kfid == operation.open_kfid,
+                WeChatKfAccount.status == "active",
+            )
+        ).first()
+        if account is None:
+            raise _channel_http_error(409, "wechat kf update account unavailable")
+        account.name = operation.desired_name
+        account.updated_at = utc_now()
+        binding.config_revision += 1
+        db.add(account)
+    elif operation.kind == "delete":
+        account = db.exec(
+            select(WeChatKfAccount).where(
+                WeChatKfAccount.tenant_id == operation.tenant_id,
+                WeChatKfAccount.binding_id == operation.binding_id,
+                WeChatKfAccount.open_kfid == operation.open_kfid,
+            )
+        ).first()
+        if account is not None:
+            db.delete(account)
+    else:
+        raise _channel_http_error(409, "wechat kf operation kind invalid")
+
+    binding.updated_at = utc_now()
+    operation.status = "completed"
+    operation.completed_at = utc_now()
+    operation.last_error_code = None
+    operation.updated_at = utc_now()
+    db.add(binding)
+    db.add(operation)
+    db.commit()
+    db.refresh(binding)
+    return binding
+
+
+def _restore_failed_wechat_kf_delete(
+    db: Session,
+    operation: WeChatKfAccountOperation,
+) -> None:
+    """Restore local routing after a definitive provider delete rejection."""
+    account = db.exec(
+        select(WeChatKfAccount).where(
+            WeChatKfAccount.binding_id == operation.binding_id,
+            WeChatKfAccount.open_kfid == operation.open_kfid,
+            WeChatKfAccount.status == "deleting",
+        )
+    ).first()
+    if account is not None:
+        account.status = "active"
+        account.updated_at = utc_now()
+        db.add(account)
+    _record_wechat_kf_operation_error(
+        db,
+        operation,
+        error_code="CHANNEL_BAD_REQUEST",
+        terminal=True,
+    )
+
+
+def _reconcile_one_wechat_kf_account_operation(
+    db: Session,
+    operation: WeChatKfAccountOperation,
+    adapter: WeChatKfAdapter,
+) -> bool:
+    """Replay one recoverable intent while avoiding duplicate uncertain create requests."""
+    binding = db.get(ChannelBinding, operation.binding_id)
+    if binding is None or binding.tenant_id != operation.tenant_id:
+        _record_wechat_kf_operation_error(
+            db,
+            operation,
+            error_code="CHANNEL_CONFLICT",
+            terminal=True,
+        )
+        return False
+    if operation.status == "provider_applied":
+        _finalize_wechat_kf_account_operation(db, operation)
+        return True
+    if operation.kind == "create" and operation.status == "provider_inflight":
+        # A crash at this boundary cannot prove whether non-idempotent create reached provider.
+        _record_wechat_kf_operation_error(
+            db,
+            operation,
+            error_code="CHANNEL_CONFLICT",
+            terminal=True,
+        )
+        return False
+
+    _ensure_revision(binding, operation.binding_revision)
+    _mark_wechat_kf_operation_inflight(db, operation)
+    try:
+        if operation.kind == "create":
+            open_kfid = adapter.create_account_with_avatar(
+                binding,
+                operation.desired_name,
+                operation.desired_media_id or "",
+            )
+            _mark_wechat_kf_operation_provider_applied(
+                db,
+                operation,
+                open_kfid=open_kfid,
+            )
+        elif operation.kind == "update":
+            adapter.update_account(
+                binding,
+                operation.open_kfid or "",
+                operation.desired_name,
+                operation.desired_media_id,
+            )
+            _mark_wechat_kf_operation_provider_applied(db, operation)
+        elif operation.kind == "delete":
+            try:
+                adapter.delete_account(binding, operation.open_kfid or "")
+            except WeChatKfNotFoundError:
+                pass
+            _mark_wechat_kf_operation_provider_applied(db, operation)
+        else:
+            _record_wechat_kf_operation_error(
+                db,
+                operation,
+                error_code="CHANNEL_CONFLICT",
+                terminal=True,
+            )
+            return False
+    except WeChatKfTransientError:
+        _record_wechat_kf_operation_error(
+            db,
+            operation,
+            error_code="CHANNEL_UPSTREAM_ERROR",
+        )
+        return False
+    except WeChatKfPermanentError:
+        if operation.kind == "delete":
+            _restore_failed_wechat_kf_delete(db, operation)
+        else:
+            _record_wechat_kf_operation_error(
+                db,
+                operation,
+                error_code="CHANNEL_BAD_REQUEST",
+                terminal=True,
+            )
+        return False
+    _finalize_wechat_kf_account_operation(db, operation)
+    return True
+
+
+def reconcile_wechat_kf_account_operations(
+    *,
+    db_engine=engine,
+    adapter: WeChatKfAdapter | None = None,
+    max_operations: int = _WECHAT_KF_RECONCILE_MAX_OPERATIONS,
+) -> int:
+    """Reconcile a bounded startup batch of durable WeChat客服 account intents."""
+    provider = adapter or WeChatKfAdapter()
+    with Session(db_engine) as db:
+        operation_ids = list(
+            db.exec(
+                select(WeChatKfAccountOperation.id)
+                .where(WeChatKfAccountOperation.status.in_(_WECHAT_KF_OPERATION_PENDING))
+                .order_by(WeChatKfAccountOperation.created_at)
+                .limit(max(0, min(max_operations, _WECHAT_KF_RECONCILE_MAX_OPERATIONS)))
+            ).all()
+        )
+
+    completed = 0
+    for operation_id in operation_ids:
+        with Session(db_engine) as db:
+            operation = db.get(WeChatKfAccountOperation, operation_id)
+            if operation is None or operation.status not in _WECHAT_KF_OPERATION_PENDING:
+                continue
+            with binding_lifecycle_lock(operation.binding_id):
+                try:
+                    completed += int(
+                        _reconcile_one_wechat_kf_account_operation(db, operation, provider)
+                    )
+                except Exception:
+                    db.rollback()
+                    logger.warning(
+                        "微信客服账号操作恢复失败 operation=%s",
+                        operation.id,
+                    )
+    return completed
+
+
 @router.get("/{binding_id}/wechat_kf/accounts")
 def list_wechat_kf_accounts(
     binding_id: str,
@@ -1769,27 +2083,51 @@ def create_wechat_kf_account(
     current_user: Annotated[User, Depends(get_current_user)],
     db: Annotated[Session, Depends(get_session)],
 ) -> ChannelBindingRead:
-    """在 provider 创建客服账号并建立本地路由；会执行一次远端写入。"""
+    """持久化 create intent 后调用 provider，并以可恢复事务建立本地路由。"""
     with binding_lifecycle_lock(binding_id):
         binding = _wechat_kf_management_binding(
             db, request.tenant_id, binding_id, current_user
         )
+        operation = _prepare_wechat_kf_account_operation(
+            db,
+            binding,
+            kind="create",
+            desired_name=request.name,
+            desired_media_id=request.media_id,
+        )
+        _mark_wechat_kf_operation_inflight(db, operation)
         try:
             open_kfid = WeChatKfAdapter().create_account_with_avatar(
                 binding, request.name, request.media_id
             )
-        except (WeChatKfPermanentError, WeChatKfTransientError) as exc:
+        except WeChatKfTransientError as exc:
+            _record_wechat_kf_operation_error(
+                db,
+                operation,
+                error_code="CHANNEL_UPSTREAM_ERROR",
+            )
             _raise_wechat_kf_provider_error(exc)
-        _ensure_wechat_kf_account_binding(db, binding, open_kfid, name=request.name)
-        binding.config_revision += 1
-        binding.updated_at = utc_now()
-        db.add(binding)
+        except WeChatKfPermanentError as exc:
+            _record_wechat_kf_operation_error(
+                db,
+                operation,
+                error_code="CHANNEL_BAD_REQUEST",
+                terminal=True,
+            )
+            _raise_wechat_kf_provider_error(exc)
+        _mark_wechat_kf_operation_provider_applied(
+            db,
+            operation,
+            open_kfid=open_kfid,
+        )
         try:
-            db.commit()
-        except IntegrityError as exc:
+            binding = _finalize_wechat_kf_account_operation(db, operation)
+        except HTTPException:
             db.rollback()
-            raise _channel_http_error(409, exc) from exc
-        db.refresh(binding)
+            raise
+        except Exception as exc:
+            db.rollback()
+            raise _channel_http_error(502, exc) from exc
     return channel_binding_read(db, binding, current_user)
 
 
@@ -1800,7 +2138,7 @@ def update_wechat_kf_account(
     current_user: Annotated[User, Depends(get_current_user)],
     db: Annotated[Session, Depends(get_session)],
 ) -> ChannelBindingRead:
-    """更新 provider 与本地客服账号资料；会执行一次远端写入。"""
+    """持久化 update 期望状态，再调用 provider 并可重放本地最终提交。"""
     with binding_lifecycle_lock(binding_id):
         binding = _wechat_kf_management_binding(
             db, request.tenant_id, binding_id, current_user
@@ -1814,20 +2152,43 @@ def update_wechat_kf_account(
         ).first()
         if account is None:
             raise _channel_http_error(404, "wechat kf account not bound")
+        operation = _prepare_wechat_kf_account_operation(
+            db,
+            binding,
+            kind="update",
+            open_kfid=account.open_kfid,
+            desired_name=request.name,
+            desired_media_id=request.media_id,
+        )
+        _mark_wechat_kf_operation_inflight(db, operation)
         try:
             WeChatKfAdapter().update_account(
                 binding, account.open_kfid, request.name, request.media_id
             )
-        except (WeChatKfPermanentError, WeChatKfTransientError) as exc:
+        except WeChatKfTransientError as exc:
+            _record_wechat_kf_operation_error(
+                db,
+                operation,
+                error_code="CHANNEL_UPSTREAM_ERROR",
+            )
             _raise_wechat_kf_provider_error(exc)
-        account.name = request.name.strip()
-        account.updated_at = utc_now()
-        binding.config_revision += 1
-        binding.updated_at = utc_now()
-        db.add(account)
-        db.add(binding)
-        db.commit()
-        db.refresh(binding)
+        except WeChatKfPermanentError as exc:
+            _record_wechat_kf_operation_error(
+                db,
+                operation,
+                error_code="CHANNEL_BAD_REQUEST",
+                terminal=True,
+            )
+            _raise_wechat_kf_provider_error(exc)
+        _mark_wechat_kf_operation_provider_applied(db, operation)
+        try:
+            binding = _finalize_wechat_kf_account_operation(db, operation)
+        except HTTPException:
+            db.rollback()
+            raise
+        except Exception as exc:
+            db.rollback()
+            raise _channel_http_error(502, exc) from exc
     return channel_binding_read(db, binding, current_user)
 
 
@@ -1839,7 +2200,7 @@ def delete_wechat_kf_account(
     db: Annotated[Session, Depends(get_session)],
     tenant_id: str = Query(...),
 ) -> ChannelBindingRead:
-    """删除 provider 客服账号并释放本地唯一绑定；会执行一次远端写入。"""
+    """先持久化 deleting tombstone，再幂等删除 provider 并最终释放本地路由。"""
     with binding_lifecycle_lock(binding_id):
         binding = _wechat_kf_management_binding(db, tenant_id, binding_id, current_user)
         account = db.exec(
@@ -1851,16 +2212,37 @@ def delete_wechat_kf_account(
         ).first()
         if account is None:
             raise _channel_http_error(404, "wechat kf account not bound")
+        operation = _prepare_wechat_kf_account_operation(
+            db,
+            binding,
+            kind="delete",
+            open_kfid=account.open_kfid,
+            tombstone=account,
+        )
+        _mark_wechat_kf_operation_inflight(db, operation)
         try:
             WeChatKfAdapter().delete_account(binding, account.open_kfid)
-        except (WeChatKfPermanentError, WeChatKfTransientError) as exc:
+        except WeChatKfNotFoundError:
+            pass
+        except WeChatKfTransientError as exc:
+            _record_wechat_kf_operation_error(
+                db,
+                operation,
+                error_code="CHANNEL_UPSTREAM_ERROR",
+            )
             _raise_wechat_kf_provider_error(exc)
-        db.delete(account)
-        binding.config_revision += 1
-        binding.updated_at = utc_now()
-        db.add(binding)
-        db.commit()
-        db.refresh(binding)
+        except WeChatKfPermanentError as exc:
+            _restore_failed_wechat_kf_delete(db, operation)
+            _raise_wechat_kf_provider_error(exc)
+        _mark_wechat_kf_operation_provider_applied(db, operation)
+        try:
+            binding = _finalize_wechat_kf_account_operation(db, operation)
+        except HTTPException:
+            db.rollback()
+            raise
+        except Exception as exc:
+            db.rollback()
+            raise _channel_http_error(502, exc) from exc
     return channel_binding_read(db, binding, current_user)
 
 

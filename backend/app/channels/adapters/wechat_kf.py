@@ -12,6 +12,8 @@ import mimetypes
 import re
 import threading
 import time
+from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import PurePath
 from typing import Any
 from urllib.parse import unquote
@@ -43,10 +45,30 @@ class WeChatKfPermanentError(RuntimeError):
     retryable = False
 
 
+class WeChatKfNotFoundError(WeChatKfPermanentError):
+    """Report that a provider account is already absent for idempotent deletion."""
+
+
 class WeChatKfTransientError(RuntimeError):
     """Report a transport, token, or rate-limit failure that is safe to retry."""
 
     retryable = True
+
+
+class WeChatKfMessageDisposition(StrEnum):
+    """Classify provider messages without conflating unsupported and malformed payloads."""
+
+    ACCEPTED = "accepted"
+    IGNORED = "ignored"
+    INVALID = "invalid"
+
+
+@dataclass(frozen=True)
+class WeChatKfNormalizedMessage:
+    """Carry one normalization disposition and its accepted inbound value, if any."""
+
+    disposition: WeChatKfMessageDisposition
+    inbound: ChannelInbound | None = None
 
 
 def _provider_error_code(payload: object) -> int:
@@ -158,69 +180,92 @@ class WeChatKfTokenProvider:
 def normalize_wechat_kf_message(
     raw: dict[str, Any], *, account_scope: str = ""
 ) -> ChannelInbound | None:
-    """Normalize a customer-originated text/image/file/mixed message.
+    """Return the accepted inbound value while preserving the adapter compatibility API."""
+    return classify_wechat_kf_message(raw, account_scope=account_scope).inbound
 
-    Unsupported origins, missing identity fields, malformed nested payloads, and messages with no
-    usable text or attachment return ``None``. The function performs no I/O or persistent writes.
+
+def classify_wechat_kf_message(
+    raw: dict[str, Any], *, account_scope: str = ""
+) -> WeChatKfNormalizedMessage:
+    """Classify and normalize one customer-originated provider message.
+
+    Unsupported origins and message types are ignored. Once provider origin 3 selects a supported
+    type, missing identity or malformed nested content is invalid so callers can quarantine or
+    stop cursor advancement. The function performs no I/O or persistent writes.
     """
     if not isinstance(raw, dict):
-        return None
+        return WeChatKfNormalizedMessage(WeChatKfMessageDisposition.IGNORED)
     try:
         if int(raw.get("origin") or 0) != 3:
-            return None
+            return WeChatKfNormalizedMessage(WeChatKfMessageDisposition.IGNORED)
     except (TypeError, ValueError):
-        return None
+        return WeChatKfNormalizedMessage(WeChatKfMessageDisposition.IGNORED)
     message_id = str(raw.get("msgid") or "").strip()
     external_user_id = str(raw.get("external_userid") or "").strip()
     open_kfid = str(raw.get("open_kfid") or "").strip()
     message_type = str(raw.get("msgtype") or "").strip()
     if not message_id or not external_user_id or not open_kfid:
-        return None
+        return WeChatKfNormalizedMessage(WeChatKfMessageDisposition.INVALID)
+    if message_type not in {"text", "image", "file", "mixed"}:
+        return WeChatKfNormalizedMessage(WeChatKfMessageDisposition.IGNORED)
 
     text = ""
     attachments: list[ChannelInboundAttachment] = []
     if message_type == "text":
         text_payload = raw.get("text")
         if not isinstance(text_payload, dict):
-            return None
-        text = str(text_payload.get("content") or "").strip()
+            return WeChatKfNormalizedMessage(WeChatKfMessageDisposition.INVALID)
+        content = text_payload.get("content")
+        if not isinstance(content, str) or not content.strip():
+            return WeChatKfNormalizedMessage(WeChatKfMessageDisposition.INVALID)
+        text = content.strip()
     elif message_type in {"image", "file"}:
         attachments = _wechat_kf_attachments(raw, message_id, message_type)
+        if not attachments:
+            return WeChatKfNormalizedMessage(WeChatKfMessageDisposition.INVALID)
     elif message_type == "mixed":
         mixed = raw.get("mixed")
         if not isinstance(mixed, dict):
-            return None
+            return WeChatKfNormalizedMessage(WeChatKfMessageDisposition.INVALID)
         items = mixed.get("msg_item")
-        if not isinstance(items, list):
-            return None
+        if not isinstance(items, list) or not items:
+            return WeChatKfNormalizedMessage(WeChatKfMessageDisposition.INVALID)
         for item in items:
             if not isinstance(item, dict):
-                continue
+                return WeChatKfNormalizedMessage(WeChatKfMessageDisposition.INVALID)
             item_type = str(item.get("msgtype") or "").strip()
             if item_type == "text":
                 text_payload = item.get("text")
                 if not isinstance(text_payload, dict):
-                    continue
-                value = str(text_payload.get("content") or "").strip()
-                if value:
-                    text = f"{text}\n{value}".strip() if text else value
+                    return WeChatKfNormalizedMessage(WeChatKfMessageDisposition.INVALID)
+                content = text_payload.get("content")
+                if not isinstance(content, str) or not content.strip():
+                    return WeChatKfNormalizedMessage(WeChatKfMessageDisposition.INVALID)
+                value = content.strip()
+                text = f"{text}\n{value}".strip() if text else value
             elif item_type in {"image", "file"}:
-                attachments.extend(_wechat_kf_attachments(item, message_id, item_type))
+                item_attachments = _wechat_kf_attachments(item, message_id, item_type)
+                if not item_attachments:
+                    return WeChatKfNormalizedMessage(WeChatKfMessageDisposition.INVALID)
+                attachments.extend(item_attachments)
     if not text and not attachments:
-        return None
-    return ChannelInbound(
-        channel="wechat_kf",
-        event_id=message_id,
-        from_user_id=external_user_id,
-        to_user_id=open_kfid,
-        session_id=external_user_id,
-        group_id="",
-        context_token=open_kfid,
-        text=text,
-        is_group=False,
-        raw=raw,
-        account_scope=account_scope,
-        attachments=attachments,
+        return WeChatKfNormalizedMessage(WeChatKfMessageDisposition.IGNORED)
+    return WeChatKfNormalizedMessage(
+        WeChatKfMessageDisposition.ACCEPTED,
+        ChannelInbound(
+            channel="wechat_kf",
+            event_id=message_id,
+            from_user_id=external_user_id,
+            to_user_id=open_kfid,
+            session_id=external_user_id,
+            group_id="",
+            context_token=open_kfid,
+            text=text,
+            is_group=False,
+            raw=raw,
+            account_scope=account_scope,
+            attachments=attachments,
+        ),
     )
 
 
@@ -320,7 +365,7 @@ class WeChatKfAdapter:
     def _post(
         self, binding: ChannelBinding, path: str, body: dict[str, Any]
     ) -> dict[str, Any]:
-        """POST JSON to one provider endpoint and classify token/rate/permanent failures.
+        """POST JSON and classify not-found, token, rate, permanent, and transient failures.
 
         The call performs network I/O. Expired tokens invalidate only this binding revision;
         transport, malformed JSON, token, and rate-limit failures are retryable.
@@ -335,9 +380,15 @@ class WeChatKfAdapter:
                 )
                 response.raise_for_status()
                 payload = response.json()
-        except (httpx.HTTPError, ValueError) as exc:
-            raise WeChatKfTransientError("微信客服接口请求失败") from exc
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                raise WeChatKfNotFoundError("微信客服账号不存在") from None
+            raise WeChatKfTransientError("微信客服接口请求失败") from None
+        except (httpx.HTTPError, ValueError):
+            raise WeChatKfTransientError("微信客服接口请求失败") from None
         error_code = _provider_error_code(payload)
+        if error_code == 404:
+            raise WeChatKfNotFoundError("微信客服账号不存在")
         if error_code in _TOKEN_ERROR_CODES:
             self._tokens.invalidate(binding)
             raise WeChatKfTransientError("微信客服 access_token 已失效")

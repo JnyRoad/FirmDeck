@@ -13,16 +13,20 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from defusedxml import ElementTree as ET
 from defusedxml.common import DefusedXmlException
 from fastapi import APIRouter, Query, Request, Response
+from fastapi.responses import JSONResponse
 from sqlmodel import Session, select
+from starlette.concurrency import run_in_threadpool
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from app.api.channels import _channel_http_error
 from app.channels import binding_lifecycle_lock
 from app.channels.adapters.base import get_channel_adapter
 from app.channels.adapters.wechat_kf import (
     WeChatKfAdapter,
+    WeChatKfMessageDisposition,
     WeChatKfPermanentError,
     WeChatKfTransientError,
-    normalize_wechat_kf_message,
+    classify_wechat_kf_message,
     wechat_kf_credentials,
 )
 from app.channels.service_durable_inbox import StageDisposition
@@ -40,6 +44,86 @@ CALLBACK_MAX_PAGES = 20
 CALLBACK_MAX_MESSAGES_PER_PAGE = 1000
 CALLBACK_CURSOR_MAX_CHARS = 4096
 CALLBACK_SYNC_TOKEN_MAX_CHARS = 4096
+AVATAR_REQUEST_MAX_BYTES = 2 * 1024 * 1024 + 64 * 1024
+
+
+class WeChatKfAvatarRequestLimitMiddleware:
+    """Reject oversized avatar multipart requests before FastAPI parses the form."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        """Wrap one ASGI application without reading any request eagerly."""
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """Apply a streaming hard limit only to the WeChat客服 avatar upload route."""
+        if not self._is_avatar_request(scope):
+            await self.app(scope, receive, send)
+            return
+
+        content_length = self._content_length(scope)
+        if content_length is not None and content_length > AVATAR_REQUEST_MAX_BYTES:
+            await self._send_rejection(scope, send)
+            return
+
+        # Buffer at most the hard limit before calling the downstream app, so multipart parsing
+        # cannot begin until the complete request has passed the total-size gate.
+        consumed = 0
+        buffered: list[dict[str, Any]] = []
+        while True:
+            message = await receive()
+            if message.get("type") == "http.request":
+                consumed += len(message.get("body", b""))
+                if consumed > AVATAR_REQUEST_MAX_BYTES:
+                    await self._send_rejection(scope, send)
+                    return
+            buffered.append(message)
+            if message.get("type") != "http.request" or not message.get("more_body", False):
+                break
+
+        async def replay_receive() -> dict[str, Any]:
+            """Replay only the already bounded request messages to the multipart parser."""
+            if buffered:
+                return buffered.pop(0)
+            return {"type": "http.disconnect"}
+
+        await self.app(scope, replay_receive, send)
+
+    @staticmethod
+    def _is_avatar_request(scope: Scope) -> bool:
+        """Return whether the scope targets the single protected multipart route."""
+        path = str(scope.get("path") or "")
+        parts = path.rstrip("/").split("/")
+        return (
+            scope.get("type") == "http"
+            and scope.get("method") == "POST"
+            and len(parts) == 7
+            and parts[:4] == ["", "api", "enterprise", "channels"]
+            and parts[5:] == ["wechat_kf", "avatar"]
+            and bool(parts[4])
+        )
+
+    @staticmethod
+    def _content_length(scope: Scope) -> int | None:
+        """Read a valid non-negative Content-Length from raw headers when present."""
+        for name, value in scope.get("headers", []):
+            if name.lower() != b"content-length":
+                continue
+            try:
+                parsed = int(value.decode("ascii"))
+            except (UnicodeDecodeError, ValueError):
+                return AVATAR_REQUEST_MAX_BYTES + 1
+            return parsed if parsed >= 0 else AVATAR_REQUEST_MAX_BYTES + 1
+        return None
+
+    @staticmethod
+    async def _send_rejection(scope: Scope, send: Send) -> None:
+        """Send the canonical bounded-request descriptor without framework detail."""
+        projected = _channel_http_error(413, "wechat kf avatar request too large")
+        response = JSONResponse(
+            status_code=413,
+            content={"detail": projected.detail},
+        )
+        await response(scope, receive=None, send=send)  # type: ignore[arg-type]
 
 
 def _callback_signature(token: str, timestamp: str, nonce: str, ciphertext: str) -> str:
@@ -163,13 +247,18 @@ def _save_account_cursor(account_id: str, cursor: str, expected_revision: int) -
         db.commit()
 
 
-def _save_account_error(account_id: str, error: object) -> None:
-    """保存私有同步诊断摘要；只写数据库，内容不进入公共响应。"""
+def _save_account_error(account_id: str, error_code: str) -> None:
+    """保存稳定同步错误码；只写数据库且不保留 provider 正文或异常文本。"""
     with Session(engine) as db:
         account = db.get(WeChatKfAccount, account_id)
         if account is None:
             return
-        account.last_error = str(error)[:500]
+        account.last_error = (
+            error_code
+            if error_code
+            in {"CHANNEL_BAD_REQUEST", "CHANNEL_CONFLICT", "CHANNEL_UPSTREAM_ERROR"}
+            else "INTERNAL_ERROR"
+        )
         account.updated_at = utc_now()
         db.add(account)
         db.commit()
@@ -233,9 +322,14 @@ def _stage_sync_page(
     """规范化并暂存一页客户消息；写 durable inbox，失败不推进账号游标。"""
     staged = False
     for raw in raw_messages:
-        inbound = normalize_wechat_kf_message(raw, account_scope=account_scope)
-        if inbound is None:
+        normalized = classify_wechat_kf_message(raw, account_scope=account_scope)
+        if normalized.disposition is WeChatKfMessageDisposition.INVALID:
+            raise _channel_http_error(502, "wechat kf supported message payload invalid")
+        if normalized.disposition is WeChatKfMessageDisposition.IGNORED:
             continue
+        inbound = normalized.inbound
+        if inbound is None:
+            raise _channel_http_error(502, "wechat kf accepted message missing inbound")
         result = stage_wechat_kf_inbound(
             db_engine=engine,
             binding_id=binding.id,
@@ -293,9 +387,50 @@ async def receive_callback(
     # 先限界请求元数据和正文，避免未认证输入消耗 XML/AES/数据库资源。
     if not all((msg_signature, timestamp, nonce)):
         raise _channel_http_error(400, "wechat kf callback query incomplete")
-    body = await request.body()
-    if len(body) > CALLBACK_BODY_MAX_BYTES:
-        raise _channel_http_error(400, "wechat kf callback body too large")
+    body = await _read_bounded_callback_body(request)
+    # XML/AES、生命周期锁、SQLite、同步 httpx 和分页均在线程池执行，避免阻塞事件循环。
+    return await run_in_threadpool(
+        _receive_callback_sync,
+        binding_id,
+        body,
+        msg_signature,
+        timestamp,
+        nonce,
+    )
+
+
+async def _read_bounded_callback_body(request: Request) -> bytes:
+    """Stream one callback body and reject as soon as its hard limit is crossed."""
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            declared_length = int(content_length)
+        except ValueError as exc:
+            raise _channel_http_error(400, exc) from exc
+        if declared_length < 0:
+            raise _channel_http_error(400, "negative callback content length")
+        if declared_length > CALLBACK_BODY_MAX_BYTES:
+            raise _channel_http_error(413, "wechat kf callback body too large")
+
+    chunks: list[bytes] = []
+    consumed = 0
+    async for chunk in request.stream():
+        consumed += len(chunk)
+        if consumed > CALLBACK_BODY_MAX_BYTES:
+            raise _channel_http_error(413, "wechat kf callback body too large")
+        if chunk:
+            chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _receive_callback_sync(
+    binding_id: str,
+    body: bytes,
+    msg_signature: str,
+    timestamp: str,
+    nonce: str,
+) -> Response:
+    """Run verified callback parsing, sync pagination, staging, and cursor commit synchronously."""
     try:
         envelope = _parse_callback_xml(body)
     except (ET.ParseError, DefusedXmlException, ValueError) as exc:
@@ -367,15 +502,15 @@ async def receive_callback(
                 )
                 cursor = next_cursor
             except WeChatKfPermanentError as exc:
-                _save_account_error(account.id, exc)
+                _save_account_error(account.id, "CHANNEL_BAD_REQUEST")
                 raise _channel_http_error(400, exc) from exc
             except WeChatKfTransientError as exc:
-                _save_account_error(account.id, exc)
+                _save_account_error(account.id, "CHANNEL_UPSTREAM_ERROR")
                 raise _channel_http_error(502, exc) from exc
             if not has_more:
                 break
         else:
-            _save_account_error(account.id, "wechat kf pagination limit exceeded")
+            _save_account_error(account.id, "CHANNEL_UPSTREAM_ERROR")
             raise _channel_http_error(502, "wechat kf pagination limit exceeded")
         _save_account_cursor(account.id, cursor, binding.config_revision)
     if staged:

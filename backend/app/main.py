@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from sqlmodel import Session
 
@@ -34,6 +35,7 @@ from app.async_jobs import shutdown_async_jobs, start_async_jobs
 from app.channels import start_channel_services, stop_channel_services
 from app.codex_subscription import stop_codex_subscription_service
 from app.config import get_settings
+from app.contracts.fastapi import request_validation_error_handler
 from app.core.harness_recovery import (
     recover_orphan_harness_runs,
     start_harness_recovery_sweeper,
@@ -61,6 +63,9 @@ app = FastAPI(
     openapi_url=None,
 )
 
+app.add_exception_handler(RequestValidationError, request_validation_error_handler)
+app.add_middleware(wechat_kf.WeChatKfAvatarRequestLimitMiddleware)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origin_list,
@@ -72,6 +77,7 @@ app.add_middleware(
 
 @app.on_event("startup")
 def on_startup() -> None:
+    """Initialize durable stores and recover bounded work before starting live services."""
     acquire_runtime_instance_lock()
     try:
         start_async_jobs()
@@ -82,6 +88,7 @@ def on_startup() -> None:
         recover_codex_a2a_tasks()
         recover_a2a_client_tasks()
         start_background_worker()
+        channels.reconcile_wechat_kf_account_operations()
         start_channel_services()
         start_timeout_sweeper()
         start_harness_recovery_sweeper()

@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import importlib
+import json
 import struct
+import threading
 import time
 from typing import Any
+from urllib.parse import urlencode
 
+import httpx
 import pytest
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from fastapi import FastAPI
@@ -224,6 +229,58 @@ def test_callback_rejects_invalid_aes_payload_after_valid_signature(monkeypatch)
 
     assert response.status_code == 400
     assert response.json()["detail"]["code"] == "CHANNEL_BAD_REQUEST"
+
+
+async def _asgi_post_chunks(
+    app,
+    path: str,
+    *,
+    query: dict[str, str] | None = None,
+    headers: list[tuple[bytes, bytes]] | None = None,
+    chunks: list[bytes],
+) -> tuple[int, bytes, int]:
+    """向 ASGI 应用分块发送无缓冲请求，返回状态、响应体和实际读取块数。"""
+    messages = [
+        {
+            "type": "http.request",
+            "body": chunk,
+            "more_body": index < len(chunks) - 1,
+        }
+        for index, chunk in enumerate(chunks)
+    ]
+    receive_calls = 0
+    sent: list[dict[str, Any]] = []
+
+    async def receive() -> dict[str, Any]:
+        """逐次返回受控请求块；超过准备块数后返回断开事件。"""
+        nonlocal receive_calls
+        receive_calls += 1
+        if messages:
+            return messages.pop(0)
+        return {"type": "http.disconnect"}
+
+    async def send(message: dict[str, Any]) -> None:
+        """收集 ASGI 响应消息；只写当前测试内存。"""
+        sent.append(message)
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode(),
+        "query_string": urlencode(query or {}).encode(),
+        "headers": headers or [],
+        "client": ("testclient", 50000),
+        "server": ("testserver", 80),
+        "root_path": "",
+    }
+    await app(scope, receive, send)
+    status = next(item["status"] for item in sent if item["type"] == "http.response.start")
+    body = b"".join(item.get("body", b"") for item in sent if item["type"] == "http.response.body")
+    return status, body, receive_calls
 
 
 def test_callback_rejects_malicious_plaintext_and_wrong_corp(monkeypatch) -> None:
@@ -532,3 +589,266 @@ def test_main_application_registers_callback_router() -> None:
     assert post_response.status_code == 400
     assert get_response.json()["detail"]["code"] == "CHANNEL_BAD_REQUEST"
     assert post_response.json()["detail"]["code"] == "CHANNEL_BAD_REQUEST"
+
+
+def test_callback_streaming_limit_stops_before_buffering_tail(monkeypatch) -> None:
+    """无 Content-Length 的超限 callback 必须在越界块立即停止，不能读取剩余尾块。"""
+    _client_instance, _db_engine, binding_id, _secrets = _client(monkeypatch)
+    api = _wechat_kf_api()
+    app = FastAPI()
+    app.include_router(api.router)
+    limit = api.CALLBACK_BODY_MAX_BYTES
+    status, body, receive_calls = asyncio.run(
+        _asgi_post_chunks(
+            app,
+            f"/api/channels/wechat-kf/{binding_id}/callback",
+            query={"msg_signature": "x", "timestamp": str(int(time.time())), "nonce": "n"},
+            chunks=[b"a" * limit, b"b", b"unread-tail"],
+        )
+    )
+
+    assert status in {400, 413}
+    assert json.loads(body)["detail"]["code"] == "CHANNEL_BAD_REQUEST"
+    assert receive_calls == 2
+
+
+def test_callback_content_length_limit_rejects_without_reading_body(monkeypatch) -> None:
+    """声明 callback 正文超限时必须在第一次 receive 前拒绝。"""
+    _client_instance, _db_engine, binding_id, _secrets = _client(monkeypatch)
+    api = _wechat_kf_api()
+    app = FastAPI()
+    app.include_router(api.router)
+    status, body, receive_calls = asyncio.run(
+        _asgi_post_chunks(
+            app,
+            f"/api/channels/wechat-kf/{binding_id}/callback",
+            query={"msg_signature": "x", "timestamp": str(int(time.time())), "nonce": "n"},
+            headers=[(b"content-length", str(api.CALLBACK_BODY_MAX_BYTES + 1).encode())],
+            chunks=[b"must-not-be-read"],
+        )
+    )
+
+    assert status in {400, 413}
+    assert json.loads(body)["detail"]["code"] == "CHANNEL_BAD_REQUEST"
+    assert receive_calls == 0
+
+
+def test_avatar_chunked_limit_rejects_before_multipart_parser(monkeypatch) -> None:
+    """微信客服头像总请求超限时必须在 multipart parser 前停止读取。"""
+    from starlette import formparsers
+
+    from app.main import app
+
+    parse_calls = 0
+    real_parse = formparsers.MultiPartParser.parse
+
+    async def record_parse(self):
+        """记录 parser 是否被调用，并保持框架真实解析行为。"""
+        nonlocal parse_calls
+        parse_calls += 1
+        return await real_parse(self)
+
+    monkeypatch.setattr(formparsers.MultiPartParser, "parse", record_parse)
+    boundary = "staffdeck-boundary"
+    prefix = (
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="file"; filename="avatar.png"\r\n'
+        "Content-Type: image/png\r\n\r\n"
+    ).encode()
+    request_limit = 2 * 1024 * 1024 + 64 * 1024
+    multipart = prefix + b"x" * (request_limit + 32) + f"\r\n--{boundary}--\r\n".encode()
+    status, body, receive_calls = asyncio.run(
+        _asgi_post_chunks(
+            app,
+            "/api/enterprise/channels/chan-test/wechat_kf/avatar",
+            headers=[(b"content-type", f"multipart/form-data; boundary={boundary}".encode())],
+            chunks=[
+                multipart[:request_limit],
+                multipart[request_limit : request_limit + 1],
+                multipart[request_limit + 1 :],
+            ],
+        )
+    )
+
+    assert status == 413
+    assert json.loads(body)["detail"]["code"] == "CHANNEL_BAD_REQUEST"
+    assert receive_calls == 2
+    assert parse_calls == 0
+
+
+def test_main_validation_handler_redacts_oversized_callback_query() -> None:
+    """主应用必须把 callback query 校验错误投影为 descriptor 且不回显拒绝值。"""
+    from app.main import app
+
+    rejected = "signature-private-" + "x" * 129
+    response = TestClient(app).get(
+        "/api/channels/wechat-kf/chan-validation/callback",
+        params={
+            "msg_signature": rejected,
+            "timestamp": str(int(time.time())),
+            "nonce": "nonce",
+            "echostr": "echo",
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == {
+        "code": "VALIDATION_ERROR",
+        "message_key": "errors.common.validation",
+        "params": {"error_count": 1},
+        "retryable": False,
+        "status": 422,
+    }
+    assert rejected not in response.text
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        {
+            "msgid": "text-legal_123",
+            "open_kfid": "wk-legal_123",
+            "external_userid": "wm-legal_123",
+            "origin": 3,
+            "msgtype": "text",
+            "text": "not-an-object",
+        },
+        {
+            "msgid": "file-legal_123",
+            "open_kfid": "wk-legal_123",
+            "external_userid": "wm-legal_123",
+            "origin": 3,
+            "msgtype": "file",
+            "file": {"filename": "missing-media.pdf"},
+        },
+    ],
+)
+def test_supported_malformed_messages_fail_page_without_cursor_commit(
+    monkeypatch, malformed
+) -> None:
+    """origin=3 的受支持格式畸形时必须失败整页，不能静默推进 cursor。"""
+    client, db_engine, binding_id, secrets = _client(monkeypatch)
+    api = _wechat_kf_api()
+    malformed = dict(malformed, open_kfid=secrets["open_kfid"])
+
+    class FakeAdapter(WeChatKfAdapter):
+        """返回一条受支持但畸形的 provider 消息，不访问外部服务。"""
+
+        def sync_messages(self, *args, **kwargs):
+            """返回固定单页，使 cursor 安全语义可观察。"""
+            return {
+                "errcode": 0,
+                "next_cursor": "must-not-commit",
+                "has_more": 0,
+                "msg_list": [malformed],
+            }
+
+    monkeypatch.setattr(api, "get_channel_adapter", lambda _channel: FakeAdapter())
+    ciphertext, _plaintext = _callback_xml(secrets)
+    response = _post_callback(client, binding_id, secrets, ciphertext)
+
+    assert response.status_code == 502
+    assert response.json()["detail"]["code"] == "CHANNEL_UPSTREAM_ERROR"
+    with Session(db_engine) as db:
+        assert db.exec(select(WeChatKfAccount)).one().sync_cursor == ""
+        assert db.exec(select(ChannelInboundEvent)).all() == []
+
+
+def test_unsupported_origin_is_ignored_while_cursor_advances(monkeypatch) -> None:
+    """非客户来源消息保持来源无关忽略语义，并允许成功页推进 cursor。"""
+    client, db_engine, binding_id, secrets = _client(monkeypatch)
+    api = _wechat_kf_api()
+
+    class FakeAdapter(WeChatKfAdapter):
+        """返回未知来源消息，不访问外部服务。"""
+
+        def sync_messages(self, *args, **kwargs):
+            """返回固定 ignored 消息页。"""
+            return {
+                "errcode": 0,
+                "next_cursor": "ignored-origin-advanced",
+                "has_more": 0,
+                "msg_list": [
+                    {
+                        "msgid": "ignored-1",
+                        "open_kfid": secrets["open_kfid"],
+                        "external_userid": "external-1",
+                        "origin": 5,
+                        "msgtype": "text",
+                        "text": {"content": "servicer"},
+                    }
+                ],
+            }
+
+    monkeypatch.setattr(api, "get_channel_adapter", lambda _channel: FakeAdapter())
+    ciphertext, _plaintext = _callback_xml(secrets)
+    response = _post_callback(client, binding_id, secrets, ciphertext)
+
+    assert response.status_code == 200
+    with Session(db_engine) as db:
+        assert db.exec(select(WeChatKfAccount)).one().sync_cursor == "ignored-origin-advanced"
+        assert db.exec(select(ChannelInboundEvent)).all() == []
+
+
+def test_slow_provider_sync_does_not_block_event_loop_health(monkeypatch) -> None:
+    """慢 provider 分页必须在线程池运行，使同一事件循环仍可响应健康请求。"""
+    _client_instance, _db_engine, binding_id, secrets = _client(monkeypatch)
+    api = _wechat_kf_api()
+    release = threading.Event()
+
+    class SlowAdapter(WeChatKfAdapter):
+        """阻塞 provider 同步直到外部计时器释放，用于观测事件循环调度。"""
+
+        def sync_messages(self, binding, *, callback_token: str, cursor: str, open_kfid: str = ""):
+            """等待固定门闩后返回空成功页；不访问真实 provider。"""
+            release.wait(2.0)
+            return {
+                "errcode": 0,
+                "next_cursor": "slow-cursor",
+                "has_more": 0,
+                "msg_list": [],
+            }
+
+    monkeypatch.setattr(api, "get_channel_adapter", lambda _channel: SlowAdapter())
+    ciphertext, _plaintext = _callback_xml(secrets)
+    timestamp = str(int(time.time()))
+    params = {
+        "msg_signature": _signature(secrets["token"], timestamp, "nonce", ciphertext),
+        "timestamp": timestamp,
+        "nonce": "nonce",
+    }
+    body = f"<xml><Encrypt>{ciphertext}</Encrypt></xml>"
+    app = FastAPI()
+    app.include_router(api.router)
+
+    @app.get("/health-probe")
+    async def health_probe() -> dict[str, str]:
+        """返回事件循环存活标记，无副作用。"""
+        return {"status": "ok"}
+
+    async def exercise() -> tuple[float, int, int]:
+        """并发发送慢 callback 与健康请求，并返回调度耗时和状态。"""
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            timer = threading.Timer(0.6, release.set)
+            timer.start()
+            started = time.monotonic()
+            callback_task = asyncio.create_task(
+                client.post(
+                    f"/api/channels/wechat-kf/{binding_id}/callback",
+                    params=params,
+                    content=body,
+                )
+            )
+            await asyncio.sleep(0)
+            health = await client.get("/health-probe")
+            elapsed = time.monotonic() - started
+            callback = await callback_task
+            timer.cancel()
+            return elapsed, health.status_code, callback.status_code
+
+    elapsed, health_status, callback_status = asyncio.run(exercise())
+
+    assert health_status == 200
+    assert callback_status == 200
+    assert elapsed < 0.3

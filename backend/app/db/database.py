@@ -169,6 +169,7 @@ def _migrate_sqlite_skill_schema() -> None:
         _migrate_channel_inbound_run_schema(conn, tables)
         _migrate_channel_bind_code_constraints(conn, tables)
         _migrate_wechat_kf_accounts(conn, tables)
+        _migrate_wechat_kf_account_operations(conn, tables)
         _migrate_capability_scope_schema(conn, inspector, tables)
         _migrate_harness_v2_schema(conn, inspector, tables)
 
@@ -1461,6 +1462,50 @@ def _migrate_wechat_kf_accounts(conn, tables: set[str]) -> None:
                 f"ON wechat_kf_accounts ({column})"
             )
         )
+
+
+def _migrate_wechat_kf_account_operations(conn, tables: set[str]) -> None:
+    """Create the additive durable operation-intent table for existing SQLite installs."""
+    if "wechat_kf_account_operations" in tables:
+        return
+
+    # Keep only desired state and stable error codes; provider bodies and credentials never persist.
+    conn.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS wechat_kf_account_operations (
+                id VARCHAR PRIMARY KEY,
+                tenant_id VARCHAR NOT NULL,
+                binding_id VARCHAR NOT NULL,
+                kind VARCHAR NOT NULL,
+                status VARCHAR NOT NULL DEFAULT 'prepared',
+                open_kfid VARCHAR,
+                desired_name VARCHAR NOT NULL DEFAULT '',
+                desired_media_id VARCHAR,
+                binding_revision INTEGER NOT NULL DEFAULT 0,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error_code VARCHAR,
+                provider_applied_at DATETIME,
+                completed_at DATETIME,
+                created_at DATETIME NOT NULL,
+                updated_at DATETIME NOT NULL
+            )
+            """
+        )
+    )
+    for column in ("tenant_id", "binding_id", "kind", "status", "open_kfid"):
+        conn.execute(
+            text(
+                f"CREATE INDEX IF NOT EXISTS ix_wechat_kf_account_operations_{column} "
+                f"ON wechat_kf_account_operations ({column})"
+            )
+        )
+    conn.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_wechat_kf_account_operations_binding_status "
+            "ON wechat_kf_account_operations (binding_id, status)"
+        )
+    )
 
 
 def _channel_account_key_from_row(channel: str, config: object) -> str | None:
