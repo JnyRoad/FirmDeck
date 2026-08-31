@@ -9,50 +9,49 @@ from sqlmodel import Session, select
 
 from app.channels.adapters.base import ChannelInbound, ChannelInboundAttachment
 from app.channels.service_durable_inbox import StageDisposition, StageResult
-from app.db.models import ChannelBinding, ChannelInboundEvent, new_id
+from app.db.models import ChannelBinding, ChannelInboundEvent, WeChatKfAccount, new_id
 
-WECOM_ENVELOPE_VERSION = 1
+ENVELOPE_VERSION = 1
 MAX_ENVELOPE_BYTES = 256 * 1024
 
 
-def encode_wecom_replay_envelope(
-    inbound: ChannelInbound,
-    *,
-    account_scope: str,
-) -> dict[str, Any]:
+def encode_replay_envelope(inbound: ChannelInbound, *, account_scope: str) -> dict[str, Any]:
     return {
-        "schema_version": WECOM_ENVELOPE_VERSION,
+        "schema_version": ENVELOPE_VERSION,
         "account": {"scope": account_scope.strip()},
         "inbound": asdict(inbound),
     }
 
 
-def decode_wecom_replay_envelope(payload: object) -> ChannelInbound:
-    if not isinstance(payload, dict) or payload.get("schema_version") != WECOM_ENVELOPE_VERSION:
+def decode_replay_envelope(payload: object) -> ChannelInbound:
+    if not isinstance(payload, dict) or payload.get("schema_version") != ENVELOPE_VERSION:
         raise ValueError("unsupported_envelope_version")
     normalized = payload.get("inbound")
-    if not isinstance(normalized, dict):
+    allowed_fields = set(ChannelInbound.__dataclass_fields__)
+    if not isinstance(normalized, dict) or not set(normalized) <= allowed_fields:
         raise ValueError("invalid_envelope_inbound")
-    allowed = set(ChannelInbound.__dataclass_fields__)
-    if not set(normalized) <= allowed:
-        raise ValueError("invalid_envelope_fields")
-    copy = dict(normalized)
-    raw_attachments = copy.get("attachments") or []
-    if raw_attachments:
-        copy["attachments"] = [
-            ChannelInboundAttachment(**att) if isinstance(att, dict) else att
-            for att in raw_attachments
-        ]
+    raw_attachments = normalized.get("attachments") or []
+    if not isinstance(raw_attachments, list):
+        raise ValueError("invalid_envelope_attachments")  # noqa: TRY004
+    if any(not isinstance(attachment, dict) for attachment in raw_attachments):
+        raise ValueError("invalid_envelope_attachments")
     try:
-        inbound = ChannelInbound(**copy)
+        normalized = dict(normalized)
+        normalized["attachments"] = [
+            ChannelInboundAttachment(**attachment) for attachment in raw_attachments
+        ]
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid_envelope_attachments") from exc
+    try:
+        inbound = ChannelInbound(**normalized)
     except (TypeError, ValueError) as exc:
         raise ValueError("invalid_envelope_inbound") from exc
-    if inbound.channel != "wecom":
+    if inbound.channel != "wechat_kf":
         raise ValueError("invalid_envelope_channel")
     return inbound
 
 
-def stage_wecom_inbound(
+def stage_wechat_kf_inbound(
     *,
     db_engine,
     binding_id: str,
@@ -60,59 +59,59 @@ def stage_wecom_inbound(
     account_scope: str,
     inbound: ChannelInbound,
 ) -> StageResult:
-    """Persist a normalized WeCom message before returning from the SDK callback."""
-    account_scope = account_scope.strip()
-    if inbound.channel != "wecom" or not inbound.event_id or not account_scope:
+    if inbound.channel != "wechat_kf" or not inbound.event_id or not account_scope:
         return StageResult(StageDisposition.SECURITY_DROP, error_code="invalid_event_identity")
-    envelope = encode_wecom_replay_envelope(inbound, account_scope=account_scope)
-    try:
-        encoded_size = len(
-            json.dumps(envelope, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        )
-    except (TypeError, ValueError):
-        return StageResult(StageDisposition.SECURITY_DROP, error_code="invalid_event_payload")
-    if encoded_size > MAX_ENVELOPE_BYTES:
+    envelope = encode_replay_envelope(inbound, account_scope=account_scope)
+    if len(json.dumps(envelope, ensure_ascii=False).encode()) > MAX_ENVELOPE_BYTES:
         return StageResult(StageDisposition.SECURITY_DROP, error_code="event_payload_too_large")
-
     try:
         with Session(db_engine) as db:
             binding = db.get(ChannelBinding, binding_id)
             from app.channels.service_identity import external_account_scope
 
-            current_scope = external_account_scope(None, binding) if binding else ""
+            expected_scope = external_account_scope(None, binding) if binding else ""
+            if binding and binding.channel == "wechat_kf":
+                corp_id = str((binding.config_json or {}).get("corp_id") or "").strip()
+                expected_scope = (
+                    f"{corp_id}:{inbound.to_user_id}"
+                    if corp_id and inbound.to_user_id
+                    else expected_scope
+                )
             if (
                 not binding
-                or binding.channel != "wecom"
+                or binding.channel != "wechat_kf"
                 or binding.status != "active"
                 or binding.config_revision != expected_revision
-                or current_scope != account_scope
+                or expected_scope != account_scope
             ):
                 return StageResult(
                     StageDisposition.SECURITY_DROP,
                     error_code="binding_fence_mismatch",
                 )
-            target = {
-                "to_user_id": inbound.conv_key if inbound.is_group else inbound.from_user_id,
-                "context_token": inbound.context_token,
-            }
-            if inbound.is_group:
-                # Preserve the sender so later asynchronous replies can mention
-                # the user who asked the question in the group.
-                target["reply_to_user_id"] = inbound.from_user_id
-                target["is_group"] = True
-                target["reply_quote"] = {
-                    "sender_name": inbound.sender_name or inbound.from_user_id,
-                    "text": inbound.text,
-                }
+            account = db.exec(
+                select(WeChatKfAccount).where(
+                    WeChatKfAccount.binding_id == binding.id,
+                    WeChatKfAccount.open_kfid == inbound.to_user_id,
+                    WeChatKfAccount.status == "active",
+                )
+            ).first()
+            if not account:
+                return StageResult(
+                    StageDisposition.SECURITY_DROP,
+                    error_code="account_fence_mismatch",
+                )
             event = ChannelInboundEvent(
                 id=new_id("chevt"),
                 tenant_id=binding.tenant_id,
                 binding_id=binding.id,
-                channel="wecom",
+                channel="wechat_kf",
                 event_id=inbound.event_id,
                 payload_json=envelope,
                 config_revision=expected_revision,
-                target_json=target,
+                target_json={
+                    "to_user_id": inbound.from_user_id,
+                    "open_kfid": inbound.to_user_id,
+                },
                 status="received",
             )
             db.add(event)

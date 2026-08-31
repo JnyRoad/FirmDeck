@@ -639,8 +639,16 @@ class HarnessV2Engine:
             reply = (
                 f"已完成 {task_count} 个团队任务的拆分与派发。"
             )
-        if reply is None:
-            reply = self.owner.response_generator.generate(
+        is_handoff = any(result.status == "handoff" for result in execution_results)
+        if is_handoff:
+            # Handoff is now queued for a human; do not let the execution model
+            # describe the missing native channel as if the request failed.
+            reply = "已为你提交人工处理请求，请稍候，工作人员会尽快回复。"
+            if self.owner.stream_sink is not None:
+                for chunk in self.owner.response_generator.chunk_text(reply):
+                    self.owner.stream_sink.on_delta(chunk)
+        elif reply is None:
+            response_args = (
                 execution_request.message,
                 session,
                 response_skill,
@@ -653,6 +661,17 @@ class HarnessV2Engine:
                 conversation_context,
                 execution_payloads,
             )
+            if self.owner.stream_sink is not None:
+                parts: list[str] = []
+                for chunk in self.owner.response_generator.generate_stream(*response_args):
+                    parts.append(chunk)
+                    self.owner.stream_sink.on_delta(chunk)
+                reply = "".join(parts).strip()
+            else:
+                reply = self.owner.response_generator.generate(*response_args)
+        elif self.owner.stream_sink is not None:
+            for chunk in self.owner.response_generator.chunk_text(reply):
+                self.owner.stream_sink.on_delta(chunk)
         self._renew_session_lease()
         reply, citations = compact_knowledge_citation_labels(reply, citations)
         artifacts = _aggregate_artifacts(execution_results)
@@ -684,6 +703,8 @@ class HarnessV2Engine:
         # Cancellation and normal projection compete for this durable receipt.
         # Only the winner may append a terminal assistant message.
         self._raise_if_cancelled(request, session)
+        if self.owner.stream_sink is not None:
+            self.owner.stream_delivery_succeeded = self.owner.stream_sink.finish()
         self.turn_store.begin_completion(self.turn_record)
         reply = self.owner._finalize_turn(
             session,
@@ -948,6 +969,10 @@ class HarnessV2Engine:
                 step_timeout_seconds=step_timeout_seconds,
                 checkpoint=loop_checkpoint,
             )
+            if request.channel == "human_handoff_resume" and result.status == "handoff":
+                # The human reply is already the handoff completion signal. Do not
+                # re-enter the same terminal handoff node during the resume turn.
+                result.status = "completed"
             deferred_continuation = False
             if frame.kind == "sop":
                 deferred_result = _defer_failed_step_after_completed_checkpoint(
