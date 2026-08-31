@@ -162,4 +162,25 @@ describe('useCodexSubscriptionAccount', () => {
     });
     expect(result.current.account).toEqual(pending);
   });
+
+  it('blocks a queued poll after cancellation starts so the cancellation result remains current', async () => {
+    mockedGet.mockResolvedValueOnce(pending).mockResolvedValueOnce(connected);
+    mockedPost.mockResolvedValueOnce(requiresLogin);
+
+    const { result } = renderHook(
+      () => useCodexSubscriptionAccount({ tenantId: 'tenant-isolated' }),
+      { wrapper: Wrapper },
+    );
+    await waitFor(() => expect(result.current.account).toEqual(pending));
+
+    await act(async () => {
+      const cancellation = result.current.cancelLogin();
+      const queuedPoll = result.current.reload();
+      await Promise.all([cancellation, queuedPoll]);
+    });
+
+    expect(mockedGet).toHaveBeenCalledTimes(1);
+    expect(result.current.account).toEqual(requiresLogin);
+    expect(result.current.loading).toBe(false);
+  });
 });
