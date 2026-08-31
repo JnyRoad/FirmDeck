@@ -695,6 +695,10 @@ def update_channel_binding_agents(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_session),
 ) -> ChannelBindingRead:
+    """更新授权 binding 的挂载、名称与路由配置；会提交本地事务。
+
+    输入须至少包含一个有效变更；团队、人工转接权限或微信客服未决 operation 会安全拒绝。
+    """
     ensure_current_user_tenant(tenant_id, current_user)
     binding = _get_binding(db, tenant_id, binding_id)
     _ensure_binding_manager(db, tenant_id, binding, current_user, action=_MANAGER_ACTION_AGENTS)
@@ -773,6 +777,8 @@ def update_channel_binding_agents(
     db.rollback()
     with binding_lifecycle_lock(binding_id):
         binding = _get_binding(db, tenant_id, binding_id)
+        if binding.channel == "wechat_kf":
+            _ensure_wechat_kf_binding_has_no_blocking_operation(db, binding)
         if request.agents is not None:
             existing = db.exec(
                 select(ChannelBindingAgent).where(ChannelBindingAgent.binding_id == binding.id)
@@ -841,13 +847,19 @@ def delete_channel_binding(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_session),
 ) -> Response:
-    """Delete one authorized binding after ingress and intake generation quiesce."""
+    """在 intake 与运行代际停稳后删除授权 binding，并终结本地待处理数据。
+
+    该操作会提交数据库删除并切换运行服务；未决微信客服 operation、权限、停稳或 revision
+    冲突会在删除前安全拒绝。
+    """
     ensure_current_user_tenant(tenant_id, current_user)
     binding = _get_binding(db, tenant_id, binding_id)
     _ensure_binding_manager(db, tenant_id, binding, current_user)
     db.rollback()
     with binding_lifecycle_lock(binding_id):
         binding = _get_binding(db, tenant_id, binding_id)
+        if binding.channel == "wechat_kf":
+            _ensure_wechat_kf_binding_has_no_blocking_operation(db, binding)
         expected_revision = binding.config_revision
         channel = binding.channel
         should_run = bool(binding.status == "active" and binding.credentials_enc)
@@ -1082,6 +1094,7 @@ def toggle_channel_binding_status(
 
     active -> disabled(停用,quiesce 长连接);
     disabled/pending/expired -> active(启用,有凭证则恢复长连接)。
+    该操作会提交状态并切换运行服务；微信客服未决 operation 或 revision 冲突会安全拒绝。
     """
     ensure_current_user_tenant(tenant_id, current_user)
     binding = _get_binding(db, tenant_id, binding_id)
@@ -1096,6 +1109,8 @@ def toggle_channel_binding_status(
     with binding_lifecycle_lock(binding_id):
         binding = _get_binding(db, tenant_id, binding_id)
         _ensure_revision(binding, expected_revision)
+        if binding.channel == "wechat_kf":
+            _ensure_wechat_kf_binding_has_no_blocking_operation(db, binding)
         if target_status == "disabled":
             _quiesce_binding_or_409(channel, binding_id, should_run=should_run)
         try:
@@ -1504,7 +1519,11 @@ def prepare_wechat_kf_callback_config(
     current_user: Annotated[User, Depends(get_current_user)],
     db: Annotated[Session, Depends(get_session)],
 ) -> dict[str, str]:
-    """生成并加密回调凭据；会更新绑定代际但不要求 provider Secret。"""
+    """生成并加密回调凭据，返回一次性配置值并推进 binding 代际。
+
+    输入只接受当前租户授权 binding 的稳定 corp ID；身份冲突、未决账号 operation 或提交冲突
+    会安全拒绝。该函数不访问 provider，也不返回已有 Secret。
+    """
     # 先完成权限、渠道和 corp 输入校验，再进入 binding 生命周期锁。
     binding = _wechat_kf_management_binding(
         db, request.tenant_id, binding_id, current_user
@@ -1517,6 +1536,7 @@ def prepare_wechat_kf_callback_config(
         binding = _wechat_kf_management_binding(
             db, request.tenant_id, binding_id, current_user
         )
+        _ensure_wechat_kf_binding_has_no_blocking_operation(db, binding)
         config = dict(binding.config_json or {})
         old_corp_id = str(config.get("corp_id") or "").strip()
         if old_corp_id and old_corp_id != corp_id:
@@ -1571,7 +1591,11 @@ def save_wechat_kf_credentials(
     current_user: Annotated[User, Depends(get_current_user)],
     db: Annotated[Session, Depends(get_session)],
 ) -> ChannelBindingRead:
-    """验证并加密保存微信客服凭据；会切换绑定代际和连接状态。"""
+    """验证并加密保存微信客服凭据，随后切换 binding 代际和运行状态。
+
+    该函数会访问 provider token API、提交本地事务并重启 binding；无效输入、未决账号
+    operation、provider 或 revision 冲突均以稳定公共错误拒绝。
+    """
     # 先读取当前回调凭据并校验 prospective 配置，任何无效输入都不访问 provider。
     binding = _wechat_kf_management_binding(
         db, request.tenant_id, binding_id, current_user
@@ -1584,6 +1608,7 @@ def save_wechat_kf_credentials(
         binding = _wechat_kf_management_binding(
             db, request.tenant_id, binding_id, current_user
         )
+        _ensure_wechat_kf_binding_has_no_blocking_operation(db, binding)
         corp_id, credentials = _validated_wechat_kf_credentials(
             request, _wechat_kf_existing_credentials(binding)
         )
@@ -1692,8 +1717,25 @@ def _ensure_wechat_kf_account_binding(
     return account
 
 
-_WECHAT_KF_OPERATION_PENDING = {"prepared", "provider_inflight", "provider_applied"}
+_WECHAT_KF_OPERATION_RECONCILABLE = {"prepared", "provider_inflight", "provider_applied"}
+_WECHAT_KF_OPERATION_BLOCKING = _WECHAT_KF_OPERATION_RECONCILABLE | {"manual_review"}
 _WECHAT_KF_RECONCILE_MAX_OPERATIONS = 20
+
+
+def _ensure_wechat_kf_binding_has_no_blocking_operation(
+    db: Session,
+    binding: ChannelBinding,
+) -> None:
+    """拒绝存在待恢复或人工裁决 operation 的 binding 写入；数据库只读。"""
+    blocking = db.exec(
+        select(WeChatKfAccountOperation.id).where(
+            WeChatKfAccountOperation.tenant_id == binding.tenant_id,
+            WeChatKfAccountOperation.binding_id == binding.id,
+            WeChatKfAccountOperation.status.in_(_WECHAT_KF_OPERATION_BLOCKING),
+        )
+    ).first()
+    if blocking is not None:
+        raise _channel_http_error(409, "wechat kf account operation already pending")
 
 
 def _prepare_wechat_kf_account_operation(
@@ -1706,15 +1748,12 @@ def _prepare_wechat_kf_account_operation(
     desired_media_id: str | None = None,
     tombstone: WeChatKfAccount | None = None,
 ) -> WeChatKfAccountOperation:
-    """Persist one operation intent before provider I/O, optionally with a delete tombstone."""
-    pending = db.exec(
-        select(WeChatKfAccountOperation).where(
-            WeChatKfAccountOperation.binding_id == binding.id,
-            WeChatKfAccountOperation.status.in_(_WECHAT_KF_OPERATION_PENDING),
-        )
-    ).first()
-    if pending is not None:
-        raise _channel_http_error(409, "wechat kf account operation already pending")
+    """在 provider I/O 前持久化账号 intent，并可同事务写入 delete tombstone。
+
+    binding 必须由调用方持有生命周期锁；未决或人工裁决 operation 会在任何 provider 调用前
+    拒绝。成功返回已提交的 durable operation。
+    """
+    _ensure_wechat_kf_binding_has_no_blocking_operation(db, binding)
 
     operation = WeChatKfAccountOperation(
         tenant_id=binding.tenant_id,
@@ -1788,6 +1827,19 @@ def _record_wechat_kf_operation_error(
     db.refresh(operation)
 
 
+def _mark_wechat_kf_operation_manual_review(
+    db: Session,
+    operation: WeChatKfAccountOperation,
+) -> None:
+    """持久化非幂等 provider 结果未知状态；会阻断自动恢复和后续 binding 写入。"""
+    operation.status = "manual_review"
+    operation.last_error_code = "CHANNEL_CONFLICT"
+    operation.updated_at = utc_now()
+    db.add(operation)
+    db.commit()
+    db.refresh(operation)
+
+
 def _finalize_wechat_kf_account_operation(
     db: Session,
     operation: WeChatKfAccountOperation,
@@ -1849,6 +1901,65 @@ def _finalize_wechat_kf_account_operation(
     return binding
 
 
+def resolve_wechat_kf_account_operation(
+    db: Session,
+    *,
+    operation_id: str,
+    tenant_id: str,
+    binding_id: str,
+    current_user: User,
+    expected_revision: int,
+    outcome: str,
+    open_kfid: str | None = None,
+) -> ChannelBinding:
+    """按 inventory 裁决未知 create 结果，并在权限、租户与 revision fence 内完成或清除。
+
+    该内部服务不访问 provider；成功会提交裁决与可能的本地账号路由。未知 outcome、非 create
+    operation、缺失账号 ID、权限或代际冲突均通过稳定渠道错误拒绝。
+    """
+    # 先取得 binding 生命周期锁，再在同一锁内重做权限和 revision 校验。
+    with binding_lifecycle_lock(binding_id):
+        binding = _wechat_kf_management_binding(db, tenant_id, binding_id, current_user)
+        _ensure_revision(binding, expected_revision)
+        operation = db.exec(
+            select(WeChatKfAccountOperation).where(
+                WeChatKfAccountOperation.id == operation_id,
+                WeChatKfAccountOperation.tenant_id == tenant_id,
+                WeChatKfAccountOperation.binding_id == binding_id,
+            )
+        ).first()
+        if operation is None:
+            raise _channel_http_error(404, "wechat kf account operation not found")
+        if operation.status != "manual_review" or operation.kind != "create":
+            raise _channel_http_error(409, "wechat kf account operation is not reviewable")
+        if operation.binding_revision != expected_revision:
+            raise _channel_http_error(409, "wechat kf account operation revision conflict")
+
+        # inventory 确认 provider 已创建时，先持久化确定账号 ID，再走既有可重放 finalize。
+        if outcome == "provider_applied":
+            normalized_open_kfid = str(open_kfid or "").strip()
+            if not normalized_open_kfid or len(normalized_open_kfid) > 128:
+                raise _channel_http_error(400, "wechat kf account id invalid")
+            _mark_wechat_kf_operation_provider_applied(
+                db,
+                operation,
+                open_kfid=normalized_open_kfid,
+            )
+            return _finalize_wechat_kf_account_operation(db, operation)
+
+        # inventory 确认 provider 未创建时，安全终结 intent，保持 binding revision 不变。
+        if outcome == "provider_not_applied":
+            operation.status = "resolved_not_applied"
+            operation.completed_at = utc_now()
+            operation.last_error_code = None
+            operation.updated_at = utc_now()
+            db.add(operation)
+            db.commit()
+            db.refresh(binding)
+            return binding
+        raise _channel_http_error(400, "wechat kf account operation resolution invalid")
+
+
 def _restore_failed_wechat_kf_delete(
     db: Session,
     operation: WeChatKfAccountOperation,
@@ -1878,7 +1989,12 @@ def _reconcile_one_wechat_kf_account_operation(
     operation: WeChatKfAccountOperation,
     adapter: WeChatKfAdapter,
 ) -> bool:
-    """Replay one recoverable intent while avoiding duplicate uncertain create requests."""
+    """恢复一个可重放 intent，并把未知非幂等 create 转入人工裁决。
+
+    输入 operation 必须由 binding 生命周期锁保护；函数可能访问 provider 并提交状态。确定失败
+    返回 False，成功完成本地路由返回 True，revision/绑定冲突由调用方记录且不会重复 create。
+    """
+    # 先确认 operation 仍属于同租户 binding，避免恢复到已删除或跨租户对象。
     binding = db.get(ChannelBinding, operation.binding_id)
     if binding is None or binding.tenant_id != operation.tenant_id:
         _record_wechat_kf_operation_error(
@@ -1889,18 +2005,15 @@ def _reconcile_one_wechat_kf_account_operation(
         )
         return False
     if operation.status == "provider_applied":
+        # provider 结果已知时只重放本地 finalization，绝不重复远端写入。
         _finalize_wechat_kf_account_operation(db, operation)
         return True
     if operation.kind == "create" and operation.status == "provider_inflight":
         # A crash at this boundary cannot prove whether non-idempotent create reached provider.
-        _record_wechat_kf_operation_error(
-            db,
-            operation,
-            error_code="CHANNEL_CONFLICT",
-            terminal=True,
-        )
+        _mark_wechat_kf_operation_manual_review(db, operation)
         return False
 
+    # 只有尚未进入不确定 create 边界的安全 intent 才允许按原 revision 重放。
     _ensure_revision(binding, operation.binding_revision)
     _mark_wechat_kf_operation_inflight(db, operation)
     try:
@@ -1955,6 +2068,7 @@ def _reconcile_one_wechat_kf_account_operation(
                 terminal=True,
             )
         return False
+    # provider 结果持久化后再提交本地期望状态，使崩溃恢复不会重复远端写入。
     _finalize_wechat_kf_account_operation(db, operation)
     return True
 
@@ -1965,23 +2079,31 @@ def reconcile_wechat_kf_account_operations(
     adapter: WeChatKfAdapter | None = None,
     max_operations: int = _WECHAT_KF_RECONCILE_MAX_OPERATIONS,
 ) -> int:
-    """Reconcile a bounded startup batch of durable WeChat客服 account intents."""
+    """恢复有界批次的 durable 微信客服账号 intent，返回本轮完成数量。
+
+    该启动服务可能访问 provider 并提交多个独立事务；manual_review 永不自动重放。单条异常只按
+    operation ID 记录并继续下一条，避免 provider 或 Secret 详情进入日志。
+    """
     provider = adapter or WeChatKfAdapter()
+    # 先快照可自动恢复的 operation ID，严格排除需要 inventory 裁决的状态。
     with Session(db_engine) as db:
         operation_ids = list(
             db.exec(
                 select(WeChatKfAccountOperation.id)
-                .where(WeChatKfAccountOperation.status.in_(_WECHAT_KF_OPERATION_PENDING))
+                .where(
+                    WeChatKfAccountOperation.status.in_(_WECHAT_KF_OPERATION_RECONCILABLE)
+                )
                 .order_by(WeChatKfAccountOperation.created_at)
                 .limit(max(0, min(max_operations, _WECHAT_KF_RECONCILE_MAX_OPERATIONS)))
             ).all()
         )
 
+    # 再逐条取得 binding 生命周期锁恢复，避免一个失败回滚其他 operation。
     completed = 0
     for operation_id in operation_ids:
         with Session(db_engine) as db:
             operation = db.get(WeChatKfAccountOperation, operation_id)
-            if operation is None or operation.status not in _WECHAT_KF_OPERATION_PENDING:
+            if operation is None or operation.status not in _WECHAT_KF_OPERATION_RECONCILABLE:
                 continue
             with binding_lifecycle_lock(operation.binding_id):
                 try:
@@ -2045,11 +2167,16 @@ def select_wechat_kf_account(
     current_user: Annotated[User, Depends(get_current_user)],
     db: Annotated[Session, Depends(get_session)],
 ) -> ChannelBindingRead:
-    """选择 provider 可管理账号并建立本地路由；会更新 binding 代际。"""
+    """选择 provider 可管理账号并建立本地路由，成功后推进 binding 代际。
+
+    该函数会访问 provider 账号清单并提交本地事务；权限、未决 operation、账号可管理性或唯一性
+    冲突会在路由改写前安全拒绝。
+    """
     with binding_lifecycle_lock(binding_id):
         binding = _wechat_kf_management_binding(
             db, request.tenant_id, binding_id, current_user
         )
+        _ensure_wechat_kf_binding_has_no_blocking_operation(db, binding)
         try:
             provider_accounts = WeChatKfAdapter().list_accounts(binding)
         except (WeChatKfPermanentError, WeChatKfTransientError) as exc:
@@ -2083,11 +2210,16 @@ def create_wechat_kf_account(
     current_user: Annotated[User, Depends(get_current_user)],
     db: Annotated[Session, Depends(get_session)],
 ) -> ChannelBindingRead:
-    """持久化 create intent 后调用 provider，并以可恢复事务建立本地路由。"""
+    """持久化 create intent 后调用 provider，并以可恢复事务建立本地路由。
+
+    该函数执行一次非幂等 provider 写入并提交多段 durable 状态；权限、未决 operation、provider
+    或本地提交失败均使用稳定错误投影，provider 结果未知时由启动恢复转入 manual_review。
+    """
     with binding_lifecycle_lock(binding_id):
         binding = _wechat_kf_management_binding(
             db, request.tenant_id, binding_id, current_user
         )
+        # 先提交 intent 和 provider-call fence，确保任何远端副作用之前已有恢复证据。
         operation = _prepare_wechat_kf_account_operation(
             db,
             binding,
@@ -2096,6 +2228,7 @@ def create_wechat_kf_account(
             desired_media_id=request.media_id,
         )
         _mark_wechat_kf_operation_inflight(db, operation)
+        # 再执行唯一一次非幂等 create；明确 provider 失败只持久化稳定错误码。
         try:
             open_kfid = WeChatKfAdapter().create_account_with_avatar(
                 binding, request.name, request.media_id
@@ -2115,11 +2248,17 @@ def create_wechat_kf_account(
                 terminal=True,
             )
             _raise_wechat_kf_provider_error(exc)
-        _mark_wechat_kf_operation_provider_applied(
-            db,
-            operation,
-            open_kfid=open_kfid,
-        )
+        # provider 返回后独立提交确定结果；此提交失败仍保留 provider_inflight 供人工裁决。
+        try:
+            _mark_wechat_kf_operation_provider_applied(
+                db,
+                operation,
+                open_kfid=open_kfid,
+            )
+        except Exception as exc:
+            db.rollback()
+            raise _channel_http_error(502, exc) from exc
+        # 最后只提交本地路由与完成状态，失败可从 provider_applied 安全重放。
         try:
             binding = _finalize_wechat_kf_account_operation(db, operation)
         except HTTPException:

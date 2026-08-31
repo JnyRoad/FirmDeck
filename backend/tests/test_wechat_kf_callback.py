@@ -721,6 +721,11 @@ def test_main_validation_handler_redacts_oversized_callback_query() -> None:
             "msgtype": "file",
             "file": {"filename": "missing-media.pdf"},
         },
+        {
+            "origin": 3,
+            "msgtype": "text",
+            "text": {"content": "missing supported identity"},
+        },
     ],
 )
 def test_supported_malformed_messages_fail_page_without_cursor_commit(
@@ -787,6 +792,41 @@ def test_unsupported_origin_is_ignored_while_cursor_advances(monkeypatch) -> Non
     assert response.status_code == 200
     with Session(db_engine) as db:
         assert db.exec(select(WeChatKfAccount)).one().sync_cursor == "ignored-origin-advanced"
+        assert db.exec(select(ChannelInboundEvent)).all() == []
+
+
+def test_future_customer_message_type_without_identity_is_ignored_and_advances_cursor(
+    monkeypatch,
+) -> None:
+    """origin=3 的未来未知类型不应受当前身份字段约束，并允许整页成功推进 cursor。"""
+    client, db_engine, binding_id, secrets = _client(monkeypatch)
+    api = _wechat_kf_api()
+
+    class FakeAdapter(WeChatKfAdapter):
+        """返回缺少当前字段的未来 provider 类型，不访问外部服务。"""
+
+        def sync_messages(self, *args, **kwargs):
+            """返回固定 ignored 消息页，使 cursor 行为可观察。"""
+            return {
+                "errcode": 0,
+                "next_cursor": "future-type-advanced",
+                "has_more": 0,
+                "msg_list": [
+                    {
+                        "origin": 3,
+                        "msgtype": "future_customer_card",
+                        "future_payload": {"schema_version": 2},
+                    }
+                ],
+            }
+
+    monkeypatch.setattr(api, "get_channel_adapter", lambda _channel: FakeAdapter())
+    ciphertext, _plaintext = _callback_xml(secrets)
+    response = _post_callback(client, binding_id, secrets, ciphertext)
+
+    assert response.status_code == 200
+    with Session(db_engine) as db:
+        assert db.exec(select(WeChatKfAccount)).one().sync_cursor == "future-type-advanced"
         assert db.exec(select(ChannelInboundEvent)).all() == []
 
 

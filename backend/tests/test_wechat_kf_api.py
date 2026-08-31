@@ -7,7 +7,8 @@ import json
 import tomllib
 from pathlib import Path
 
-from fastapi import FastAPI
+import pytest
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from packaging.requirements import Requirement
 from sqlalchemy.pool import StaticPool
@@ -449,6 +450,13 @@ def _wechat_kf_reconciler():
     return reconcile
 
 
+def _wechat_kf_operation_resolver():
+    """返回账号操作人工裁决入口；缺失时以明确断言保留 RED。"""
+    resolve = getattr(channels_api, "resolve_wechat_kf_account_operation", None)
+    assert callable(resolve), "WeChat KF account operation resolver is missing"
+    return resolve
+
+
 def test_main_validation_handler_sanitizes_enterprise_query_and_body() -> None:
     """主应用企业路由的 query/body validation 必须统一返回安全 descriptor。"""
     from app.main import app
@@ -552,6 +560,418 @@ def test_create_intent_survives_local_commit_failure_and_reconciles(
         assert account.open_kfid == "wk-recovered-create"
         assert account.name == "恢复账号"
     assert provider_calls == 1
+
+
+def test_unknown_create_outcome_requires_manual_resolution_across_restarts(
+    monkeypatch,
+) -> None:
+    """provider create 已执行但确认提交失败时必须永久阻断自动重放与第二次创建。"""
+    operation_model = _wechat_kf_operation_model()
+    reconcile = _wechat_kf_reconciler()
+    resolve = _wechat_kf_operation_resolver()
+    db_engine = _engine()
+    users, binding_id = _seed(db_engine)
+    private_failure = "provider-private-result-commit"
+    provider_calls = 0
+
+    def create_account(self, binding, name: str, media_id: str) -> str:
+        """模拟 provider 已完成一次非幂等创建；仅记录调用次数。"""
+        nonlocal provider_calls
+        provider_calls += 1
+        return "wk-manual-review"
+
+    monkeypatch.setattr(
+        channels_api.WeChatKfAdapter,
+        "create_account_with_avatar",
+        create_account,
+    )
+    real_commit = Session.commit
+    failed = False
+
+    def fail_provider_result_commit(self) -> None:
+        """只在 provider_applied 边界注入一次进程崩溃等价失败。"""
+        nonlocal failed
+        confirms_provider = any(
+            isinstance(row, operation_model) and row.status == "provider_applied"
+            for row in self.dirty
+        )
+        if confirms_provider and not failed:
+            failed = True
+            raise RuntimeError(private_failure)
+        real_commit(self)
+
+    monkeypatch.setattr(Session, "commit", fail_provider_result_commit)
+    response = _client(db_engine, raise_server_exceptions=False).post(
+        f"/api/enterprise/channels/{binding_id}/wechat_kf/accounts",
+        json={"tenant_id": "tenant_demo", "name": "待裁决", "media_id": "media-unknown"},
+        headers=_auth(users["owner"]),
+    )
+    monkeypatch.setattr(Session, "commit", real_commit)
+
+    assert response.status_code == 502
+    assert response.json()["detail"]["code"] == "CHANNEL_UPSTREAM_ERROR"
+    assert private_failure not in response.text
+    with Session(db_engine) as db:
+        operation = db.exec(select(operation_model)).one()
+        operation_id = operation.id
+        assert operation.status == "provider_inflight"
+        assert db.exec(select(WeChatKfAccount)).all() == []
+
+    assert reconcile(db_engine=db_engine, adapter=WeChatKfAdapter()) == 0
+    with Session(db_engine) as db:
+        assert db.get(operation_model, operation_id).status == "manual_review"
+
+    second = _client(db_engine).post(
+        f"/api/enterprise/channels/{binding_id}/wechat_kf/accounts",
+        json={"tenant_id": "tenant_demo", "name": "不得重复", "media_id": "media-second"},
+        headers=_auth(users["owner"]),
+    )
+    assert second.status_code == 409
+    assert second.json()["detail"]["code"] == "CHANNEL_CONFLICT"
+    assert provider_calls == 1
+
+    assert reconcile(db_engine=db_engine, adapter=WeChatKfAdapter()) == 0
+    with Session(db_engine) as db:
+        assert db.get(operation_model, operation_id).status == "manual_review"
+    after_restart = _client(db_engine).post(
+        f"/api/enterprise/channels/{binding_id}/wechat_kf/accounts",
+        json={"tenant_id": "tenant_demo", "name": "重启后仍阻断", "media_id": "media-restart"},
+        headers=_auth(users["owner"]),
+    )
+    assert after_restart.status_code == 409
+    assert after_restart.json()["detail"]["code"] == "CHANNEL_CONFLICT"
+    assert provider_calls == 1
+
+    with Session(db_engine) as db:
+        resolve(
+            db,
+            operation_id=operation_id,
+            tenant_id="tenant_demo",
+            binding_id=binding_id,
+            current_user=users["owner"],
+            expected_revision=0,
+            outcome="provider_applied",
+            open_kfid="wk-manual-review",
+        )
+        assert db.get(operation_model, operation_id).status == "completed"
+        assert db.exec(select(WeChatKfAccount)).one().open_kfid == "wk-manual-review"
+    assert provider_calls == 1
+
+
+def test_manual_review_resolution_is_permission_tenant_and_revision_fenced(
+    monkeypatch,
+) -> None:
+    """人工清除未知 create 结果必须通过管理权限、租户与 binding revision fence。"""
+    operation_model = _wechat_kf_operation_model()
+    resolve = _wechat_kf_operation_resolver()
+    db_engine = _engine()
+    users, binding_id = _seed(db_engine)
+    with Session(db_engine) as db:
+        operation = operation_model(
+            tenant_id="tenant_demo",
+            binding_id=binding_id,
+            kind="create",
+            status="manual_review",
+            desired_name="未知结果",
+            binding_revision=0,
+            last_error_code="CHANNEL_CONFLICT",
+        )
+        db.add(operation)
+        db.commit()
+        db.refresh(operation)
+        operation_id = operation.id
+
+    attempts = (
+        (users["other"], "tenant_demo", 0, "CHANNEL_FORBIDDEN"),
+        (users["outsider"], "tenant_demo", 0, "TENANT_MISMATCH"),
+        (users["owner"], "tenant_demo", 1, "CHANNEL_CONFLICT"),
+    )
+    for user, tenant_id, revision, error_code in attempts:
+        with Session(db_engine) as db, pytest.raises(HTTPException) as caught:
+            resolve(
+                db,
+                operation_id=operation_id,
+                tenant_id=tenant_id,
+                binding_id=binding_id,
+                current_user=user,
+                expected_revision=revision,
+                outcome="provider_not_applied",
+            )
+        assert getattr(caught.value, "detail", {})["code"] == error_code
+
+    with Session(db_engine) as db:
+        assert db.get(operation_model, operation_id).status == "manual_review"
+        assert db.get(ChannelBinding, binding_id).config_revision == 0
+        resolve(
+            db,
+            operation_id=operation_id,
+            tenant_id="tenant_demo",
+            binding_id=binding_id,
+            current_user=users["owner"],
+            expected_revision=0,
+            outcome="provider_not_applied",
+        )
+        assert db.get(operation_model, operation_id).status == "resolved_not_applied"
+        assert db.get(ChannelBinding, binding_id).config_revision == 0
+
+    provider_calls = 0
+
+    def create_account(self, binding, name: str, media_id: str) -> str:
+        """证明显式安全清除后新账号写入恢复，且只调用 provider 一次。"""
+        nonlocal provider_calls
+        provider_calls += 1
+        return "wk-after-resolution"
+
+    monkeypatch.setattr(
+        channels_api.WeChatKfAdapter,
+        "create_account_with_avatar",
+        create_account,
+    )
+    response = _client(db_engine).post(
+        f"/api/enterprise/channels/{binding_id}/wechat_kf/accounts",
+        json={"tenant_id": "tenant_demo", "name": "恢复写入", "media_id": "media-safe"},
+        headers=_auth(users["owner"]),
+    )
+    assert response.status_code == 200
+    assert provider_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("operation_kind", "operation_status", "write_action"),
+    [
+        ("update", "provider_inflight", "select"),
+        ("delete", "provider_applied", "credentials"),
+        ("create", "manual_review", "callback_config"),
+        ("create", "manual_review", "update_binding"),
+        ("create", "manual_review", "toggle_status"),
+        ("create", "manual_review", "delete_binding"),
+    ],
+)
+def test_binding_writes_are_blocked_by_pending_or_manual_account_operation(
+    monkeypatch,
+    operation_kind: str,
+    operation_status: str,
+    write_action: str,
+) -> None:
+    """账号未决期间所有会改变 binding、路由或凭据的写入口必须统一拒绝。"""
+    operation_model = _wechat_kf_operation_model()
+    db_engine = _engine()
+    users, binding_id = _seed(db_engine)
+    with Session(db_engine) as db:
+        db.add(
+            operation_model(
+                tenant_id="tenant_demo",
+                binding_id=binding_id,
+                kind=operation_kind,
+                status=operation_status,
+                open_kfid="wk-pending" if operation_kind != "create" else None,
+                desired_name="未决状态",
+                binding_revision=0,
+            )
+        )
+        db.commit()
+
+    provider_calls = 0
+
+    def fail_if_provider_called(*args, **kwargs):
+        """记录 guard 之前不应发生的 provider 读写；无外部副作用。"""
+        nonlocal provider_calls
+        provider_calls += 1
+        return [{"open_kfid": "wk-selected", "name": "Selected"}]
+
+    monkeypatch.setattr(channels_api.WeChatKfAdapter, "list_accounts", fail_if_provider_called)
+    monkeypatch.setattr(channels_api.WeChatKfTokenProvider, "get", fail_if_provider_called)
+    client = _client(db_engine)
+    if write_action == "select":
+        response = client.post(
+            f"/api/enterprise/channels/{binding_id}/wechat_kf/account",
+            json={"tenant_id": "tenant_demo", "open_kfid": "wk-selected"},
+            headers=_auth(users["owner"]),
+        )
+    elif write_action == "credentials":
+        response = client.post(
+            f"/api/enterprise/channels/{binding_id}/wechat_kf/credentials",
+            json={
+                "tenant_id": "tenant_demo",
+                "corp_id": "ww1234567890",
+                "secret": "provider-secret-private",
+                "callback_token": "callback-token-private",
+                "encoding_aes_key": base64.b64encode(bytes(range(32))).decode().rstrip("="),
+            },
+            headers=_auth(users["owner"]),
+        )
+    elif write_action == "callback_config":
+        response = client.post(
+            f"/api/enterprise/channels/{binding_id}/wechat_kf/callback-config",
+            json={"tenant_id": "tenant_demo", "corp_id": "ww1234567890"},
+            headers=_auth(users["owner"]),
+        )
+    elif write_action == "toggle_status":
+        response = client.post(
+            f"/api/enterprise/channels/{binding_id}/toggle-status",
+            params={"tenant_id": "tenant_demo"},
+            headers=_auth(users["owner"]),
+        )
+    elif write_action == "update_binding":
+        response = client.put(
+            f"/api/enterprise/channels/{binding_id}",
+            params={"tenant_id": "tenant_demo"},
+            json={"name": "不得更新"},
+            headers=_auth(users["owner"]),
+        )
+    else:
+        response = client.delete(
+            f"/api/enterprise/channels/{binding_id}",
+            params={"tenant_id": "tenant_demo"},
+            headers=_auth(users["owner"]),
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "CHANNEL_CONFLICT"
+    assert provider_calls == 0
+    with Session(db_engine) as db:
+        binding = db.get(ChannelBinding, binding_id)
+        assert binding is not None
+        assert binding.config_revision == 0
+        assert db.exec(select(operation_model)).one().status == operation_status
+
+
+@pytest.mark.parametrize("write_action", ["create", "update", "delete"])
+def test_account_mutation_prepare_paths_share_manual_review_guard(
+    monkeypatch,
+    write_action: str,
+) -> None:
+    """create/update/delete 的 prepare 路径必须共同阻断 manual-review binding。"""
+    operation_model = _wechat_kf_operation_model()
+    db_engine = _engine()
+    users, binding_id = _seed(db_engine)
+    with Session(db_engine) as db:
+        db.add(
+            WeChatKfAccount(
+                tenant_id="tenant_demo",
+                binding_id=binding_id,
+                open_kfid="wk-guarded-mutation",
+                name="受保护账号",
+                agent_id="agent_1",
+            )
+        )
+        db.add(
+            operation_model(
+                tenant_id="tenant_demo",
+                binding_id=binding_id,
+                kind="create",
+                status="manual_review",
+                desired_name="未知 create",
+                binding_revision=0,
+            )
+        )
+        db.commit()
+
+    provider_calls = 0
+
+    def fail_if_provider_called(*args, **kwargs):
+        """记录 prepare guard 之后绝不应发生的账号 provider 写入。"""
+        nonlocal provider_calls
+        provider_calls += 1
+        return "wk-unexpected"
+
+    monkeypatch.setattr(
+        channels_api.WeChatKfAdapter,
+        "create_account_with_avatar",
+        fail_if_provider_called,
+    )
+    monkeypatch.setattr(channels_api.WeChatKfAdapter, "update_account", fail_if_provider_called)
+    monkeypatch.setattr(channels_api.WeChatKfAdapter, "delete_account", fail_if_provider_called)
+    client = _client(db_engine)
+    if write_action == "create":
+        response = client.post(
+            f"/api/enterprise/channels/{binding_id}/wechat_kf/accounts",
+            json={"tenant_id": "tenant_demo", "name": "不得创建", "media_id": "media"},
+            headers=_auth(users["owner"]),
+        )
+    elif write_action == "update":
+        response = client.patch(
+            f"/api/enterprise/channels/{binding_id}/wechat_kf/account",
+            json={
+                "tenant_id": "tenant_demo",
+                "open_kfid": "wk-guarded-mutation",
+                "name": "不得更新",
+            },
+            headers=_auth(users["owner"]),
+        )
+    else:
+        response = client.delete(
+            f"/api/enterprise/channels/{binding_id}/wechat_kf/account/wk-guarded-mutation",
+            params={"tenant_id": "tenant_demo"},
+            headers=_auth(users["owner"]),
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "CHANNEL_CONFLICT"
+    assert provider_calls == 0
+    with Session(db_engine) as db:
+        assert db.get(ChannelBinding, binding_id).config_revision == 0
+        assert db.exec(select(WeChatKfAccount)).one().status == "active"
+
+
+def test_binding_write_resumes_after_pending_operation_reconciliation(monkeypatch) -> None:
+    """可恢复 operation 完成后统一 guard 必须释放，并允许新的账号选择推进 revision。"""
+    operation_model = _wechat_kf_operation_model()
+    reconcile = _wechat_kf_reconciler()
+    db_engine = _engine()
+    users, binding_id = _seed(db_engine)
+    with Session(db_engine) as db:
+        db.add(
+            WeChatKfAccount(
+                tenant_id="tenant_demo",
+                binding_id=binding_id,
+                open_kfid="wk-reconcile-guard",
+                name="旧名称",
+                agent_id="agent_1",
+            )
+        )
+        db.add(
+            operation_model(
+                tenant_id="tenant_demo",
+                binding_id=binding_id,
+                kind="update",
+                status="provider_applied",
+                open_kfid="wk-reconcile-guard",
+                desired_name="恢复名称",
+                binding_revision=0,
+            )
+        )
+        db.commit()
+
+    provider_calls = 0
+
+    def list_accounts(self, binding):
+        """返回可管理账号并记录只在 reconcile 后允许的 provider 读取。"""
+        nonlocal provider_calls
+        provider_calls += 1
+        return [{"open_kfid": "wk-reconcile-guard", "name": "恢复名称"}]
+
+    monkeypatch.setattr(channels_api.WeChatKfAdapter, "list_accounts", list_accounts)
+    client = _client(db_engine)
+    blocked = client.post(
+        f"/api/enterprise/channels/{binding_id}/wechat_kf/account",
+        json={"tenant_id": "tenant_demo", "open_kfid": "wk-reconcile-guard"},
+        headers=_auth(users["owner"]),
+    )
+    assert blocked.status_code == 409
+    assert provider_calls == 0
+
+    assert reconcile(db_engine=db_engine, adapter=WeChatKfAdapter()) == 1
+    resumed = client.post(
+        f"/api/enterprise/channels/{binding_id}/wechat_kf/account",
+        json={"tenant_id": "tenant_demo", "open_kfid": "wk-reconcile-guard"},
+        headers=_auth(users["owner"]),
+    )
+    assert resumed.status_code == 200
+    assert provider_calls == 1
+    with Session(db_engine) as db:
+        assert db.exec(select(operation_model)).one().status == "completed"
+        assert db.get(ChannelBinding, binding_id).config_revision == 2
 
 
 def test_update_intent_replays_desired_local_state_without_second_provider_write(

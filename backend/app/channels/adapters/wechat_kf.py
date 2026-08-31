@@ -200,14 +200,14 @@ def classify_wechat_kf_message(
             return WeChatKfNormalizedMessage(WeChatKfMessageDisposition.IGNORED)
     except (TypeError, ValueError):
         return WeChatKfNormalizedMessage(WeChatKfMessageDisposition.IGNORED)
+    message_type = str(raw.get("msgtype") or "").strip()
+    if message_type not in {"text", "image", "file", "mixed"}:
+        return WeChatKfNormalizedMessage(WeChatKfMessageDisposition.IGNORED)
     message_id = str(raw.get("msgid") or "").strip()
     external_user_id = str(raw.get("external_userid") or "").strip()
     open_kfid = str(raw.get("open_kfid") or "").strip()
-    message_type = str(raw.get("msgtype") or "").strip()
     if not message_id or not external_user_id or not open_kfid:
         return WeChatKfNormalizedMessage(WeChatKfMessageDisposition.INVALID)
-    if message_type not in {"text", "image", "file", "mixed"}:
-        return WeChatKfNormalizedMessage(WeChatKfMessageDisposition.IGNORED)
 
     text = ""
     attachments: list[ChannelInboundAttachment] = []
