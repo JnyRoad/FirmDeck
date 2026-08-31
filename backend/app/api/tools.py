@@ -35,6 +35,7 @@ from app.db.models import (
     AgentProfile,
     AgentResourceBinding,
     MCPServer,
+    MCPUserOAuthGrant,
     Tool,
     User,
     utc_now,
@@ -62,6 +63,7 @@ from app.tools.mcp_client import (
     execute_mcp_tool,
     read_mcp_resource,
 )
+from app.tools.mcp_oauth_policy import mcp_oauth_config_fingerprint
 from app.tools.mcp_oauth_service import MCPGrantTokenStorage
 from app.tools.mcp_sdk_adapter import MCPAdapterError, MCPSDKAdapter
 from app.tools.tool_executor import _run_coroutine
@@ -1025,6 +1027,44 @@ def _update_inherited_mcp_tool_scopes(db: Session, server: MCPServer) -> None:
         db.add(tool)
 
 
+def _mcp_oauth_binding_values(server: MCPServer) -> tuple[str, str, str, str, str, str]:
+    """Return the persisted server identity whose changes invalidate personal grants."""
+    return (
+        server.auth_mode or "none",
+        server.transport or "",
+        server.url or "",
+        server.oauth_client_id or "",
+        server.oauth_client_metadata_url or "",
+        server.oauth_redirect_uri or "",
+    )
+
+
+def _request_oauth_binding_values(
+    request: MCPServerUpdateRequest,
+) -> tuple[str, str, str, str, str, str]:
+    """Return the requested server identity in the same grant-binding order."""
+    return (
+        request.auth_mode,
+        request.connection.transport,
+        request.connection.url or "",
+        request.oauth_client_id or "",
+        request.oauth_client_metadata_url or "",
+        request.oauth_redirect_uri or "",
+    )
+
+
+def _delete_mcp_oauth_grants(db: Session, tenant_id: str, server_id: str) -> None:
+    """Delete every personal grant bound to one tenant-owned MCP server."""
+    grants = db.exec(
+        select(MCPUserOAuthGrant).where(
+            MCPUserOAuthGrant.tenant_id == tenant_id,
+            MCPUserOAuthGrant.server_id == server_id,
+        )
+    ).all()
+    for grant in grants:
+        db.delete(grant)
+
+
 @mcp_router.get(
     "", response_model=list[MCPServerRead], dependencies=[Depends(require_tenant_admin)]
 )
@@ -1214,6 +1254,9 @@ def update_mcp_server(
 ) -> MCPServerRead:
     row = _get_mcp_server(db, request.tenant_id, server_id)
     ensure_open_gallery_admin(request.tenant_id, current_user)
+    oauth_binding_changed = (
+        _mcp_oauth_binding_values(row) != _request_oauth_binding_values(request)
+    )
     conn = request.connection
     row.name = request.name
     row.display_name = request.display_name
@@ -1239,6 +1282,8 @@ def update_mcp_server(
     row.enabled = request.enabled
     row.updated_at = utc_now()
     db.add(row)
+    if oauth_binding_changed:
+        _delete_mcp_oauth_grants(db, request.tenant_id, row.id)
     db.commit()
     db.refresh(row)
     return mcp_server_read(row, db)
@@ -1264,6 +1309,7 @@ def delete_mcp_server(
         tools = db.exec(select(Tool).where(Tool.mcp_server_id == server_id)).all()
         for tool in tools:
             db.delete(tool)
+    _delete_mcp_oauth_grants(db, tenant_id, row.id)
     db.delete(row)
     db.commit()
     return {"status": "deleted"}
@@ -1524,6 +1570,7 @@ def _discover_protected_server(
         user_id,
         public_client_id=server.oauth_client_id,
         redirect_uri=server.oauth_redirect_uri,
+        config_fingerprint=mcp_oauth_config_fingerprint(server),
     )
     status = storage.read_status()
     if status.state != "connected":
@@ -1581,6 +1628,7 @@ def _read_protected_resource(
         user_id,
         public_client_id=server.oauth_client_id,
         redirect_uri=server.oauth_redirect_uri,
+        config_fingerprint=mcp_oauth_config_fingerprint(server),
     )
     status = storage.read_status()
     if status.state != "connected":

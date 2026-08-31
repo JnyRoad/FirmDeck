@@ -49,10 +49,20 @@ async def test_status_and_start_are_scoped_to_current_user(tmp_path, monkeypatch
     """Catch a server-level grant lookup or a start flow bound to the wrong user."""
     import app.api.mcp_oauth as api
     from app.tools.mcp_oauth_flow import MCPOAuthStartResult
+    from app.tools.mcp_oauth_policy import mcp_oauth_config_fingerprint
     from app.tools.mcp_oauth_service import MCPGrantTokenStorage
 
     engine, db = _db(tmp_path)
-    first_storage = MCPGrantTokenStorage(engine, "tenant_1", "server_1", "user_1")
+    monkeypatch.setenv("STAFFDECK_PUBLIC_URL", "https://staffdeck.example")
+    server = db.get(MCPServer, "server_1")
+    assert server is not None
+    first_storage = MCPGrantTokenStorage(
+        engine,
+        "tenant_1",
+        "server_1",
+        "user_1",
+        config_fingerprint=mcp_oauth_config_fingerprint(server),
+    )
     from mcp.shared.auth import OAuthToken
 
     await first_storage.set_tokens(OAuthToken(access_token="first-only", expires_in=3600))
@@ -105,6 +115,117 @@ async def test_status_and_start_are_scoped_to_current_user(tmp_path, monkeypatch
     assert started.flow_id == "flow_1"
     assert captured["user_id"] == "user_2"
     assert captured["storage"].user_id == "user_2"
+    assert captured["storage"].config_fingerprint
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_start_rejects_a_persisted_redirect_for_another_origin(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """Catch legacy or direct database writes bypassing callback-origin validation."""
+    import app.api.mcp_oauth as api
+
+    _engine, db = _db(tmp_path)
+    server = db.get(MCPServer, "server_1")
+    assert server is not None
+    server.oauth_redirect_uri = (
+        "https://other.example/api/enterprise/mcp-servers/oauth/callback"
+    )
+    db.add(server)
+    db.commit()
+    monkeypatch.setenv("STAFFDECK_PUBLIC_URL", "https://staffdeck.example")
+
+    class UnexpectedCoordinator:
+        """Fail if invalid persisted configuration reaches flow creation."""
+
+        async def start(self, **_kwargs):
+            """Expose a missing preflight validation as a test failure."""
+            raise AssertionError("invalid redirect reached flow coordinator")
+
+    monkeypatch.setattr(api, "_coordinator_for_engine", lambda _engine: UnexpectedCoordinator())
+
+    with pytest.raises(HTTPException) as exc_info:
+        await api.start_mcp_oauth(
+            "server_1",
+            api.MCPOAuthStartRequest(tenant_id="tenant_1"),
+            db,
+            _user("user_1"),
+        )
+
+    assert exc_info.value.detail["code"] == "MCP_OAUTH_PROVIDER_UNSUPPORTED"
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_start_discards_a_grant_bound_to_old_server_configuration(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """Catch reconnect attempting to load credentials bound to an earlier server identity."""
+    import app.api.mcp_oauth as api
+    from app.tools.mcp_oauth_flow import MCPOAuthStartResult
+    from app.tools.mcp_oauth_service import MCPGrantTokenStorage
+
+    engine, db = _db(tmp_path)
+    monkeypatch.setenv("STAFFDECK_PUBLIC_URL", "https://staffdeck.example")
+    stale = MCPGrantTokenStorage(
+        engine,
+        "tenant_1",
+        "server_1",
+        "user_1",
+        config_fingerprint="old-server-configuration",
+    )
+    from mcp.shared.auth import OAuthToken
+
+    await stale.set_tokens(OAuthToken(access_token="stale-token", expires_in=3600))
+    captured: dict[str, object] = {}
+
+    class FakeCoordinator:
+        """Observe the grant state immediately before flow creation."""
+
+        async def start(self, **kwargs):
+            """Complete a controlled start after recording the storage projection."""
+            captured.update(kwargs)
+
+            async def redirect_handler(_url: str) -> None:
+                """Satisfy the operation handler shape for the fake adapter."""
+
+            async def callback_handler():
+                """Fail if the fake adapter unexpectedly requests a callback."""
+                raise AssertionError("callback should not be awaited")
+
+            await kwargs["operation"](redirect_handler, callback_handler)
+            return MCPOAuthStartResult(
+                authorization_url="https://auth.example/authorize",
+                flow_id="flow_reconnect",
+                expires_at=utc_now() + timedelta(minutes=10),
+            )
+
+    class FakeAdapter:
+        """Capture the storage after route-level stale-grant cleanup."""
+
+        def __init__(self, **kwargs):
+            """Store the owner-bound grant used for the new authorization."""
+            captured["storage"] = kwargs["storage"]
+
+        async def discover(self) -> dict[str, object]:
+            """Avoid external I/O while completing the controlled start."""
+            return {"tools": []}
+
+    monkeypatch.setattr(api, "_coordinator_for_engine", lambda _engine: FakeCoordinator())
+    monkeypatch.setattr(api, "MCPSDKAdapter", FakeAdapter)
+
+    started = await api.start_mcp_oauth(
+        "server_1",
+        api.MCPOAuthStartRequest(tenant_id="tenant_1"),
+        db,
+        _user("user_1"),
+    )
+
+    assert started.flow_id == "flow_reconnect"
+    assert captured["storage"].read_status().state == "disconnected"
     db.close()
 
 
@@ -162,7 +283,7 @@ async def test_callback_redirects_provider_denial_without_echoing_details(monkey
     )
 
     assert response.status_code == 302
-    assert response.headers["location"] == "/workspace/tools?mcp_oauth=denied"
+    assert response.headers["location"] == "/enterprise/tools?mcp_oauth=denied"
     assert "secret-state" not in response.headers["location"]
 
 
@@ -206,8 +327,8 @@ async def test_callback_redirects_expired_and_invalid_flows_to_recoverable_ui(
         error=None,
     )
 
-    assert expired.headers["location"] == "/workspace/tools?mcp_oauth=expired"
-    assert invalid.headers["location"] == "/workspace/tools?mcp_oauth=failed"
+    assert expired.headers["location"] == "/enterprise/tools?mcp_oauth=expired"
+    assert invalid.headers["location"] == "/enterprise/tools?mcp_oauth=failed"
     assert "secret" not in expired.headers["location"]
 
 
@@ -221,11 +342,20 @@ def test_saved_protected_server_discovery_uses_current_user_sdk_grant(
     from mcp.shared.auth import OAuthToken
 
     import app.api.tools as tools_api
+    from app.tools.mcp_oauth_policy import mcp_oauth_config_fingerprint
     from app.tools.mcp_oauth_service import MCPGrantTokenStorage
     from app.tools.tool_schema import MCPDiscoverRequest
 
     engine, db = _db(tmp_path)
-    storage = MCPGrantTokenStorage(engine, "tenant_1", "server_1", "user_1")
+    server = db.get(MCPServer, "server_1")
+    assert server is not None
+    storage = MCPGrantTokenStorage(
+        engine,
+        "tenant_1",
+        "server_1",
+        "user_1",
+        config_fingerprint=mcp_oauth_config_fingerprint(server),
+    )
     asyncio.run(storage.set_tokens(OAuthToken(access_token="private-token", expires_in=3600)))
     captured: dict[str, object] = {}
 

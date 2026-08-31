@@ -129,6 +129,50 @@ async def test_provider_denial_finishes_without_authorization_code(tmp_path) -> 
 
 
 @pytest.mark.asyncio
+async def test_malformed_callback_releases_the_live_flow_immediately(tmp_path) -> None:
+    """Catch a valid state without code/error blocking reconnect until the full TTL."""
+    from app.tools.mcp_oauth_flow import MCPOAuthFlowError
+
+    _engine, coordinator = _coordinator(tmp_path)
+    operation_count = 0
+
+    async def operation(redirect_handler, callback_handler) -> None:
+        """Wait as the SDK would so malformed callback cleanup is observable."""
+        nonlocal operation_count
+        operation_count += 1
+        await redirect_handler(
+            f"https://auth.example/authorize?state=malformed-state-{operation_count}"
+        )
+        await callback_handler()
+
+    started = await coordinator.start(
+        tenant_id="tenant_1",
+        server_id="server_1",
+        user_id="user_1",
+        redirect_uri="https://staffdeck.example/oauth/callback",
+        operation=operation,
+    )
+
+    with pytest.raises(MCPOAuthFlowError, match="MCP_OAUTH_CALLBACK_INVALID"):
+        await coordinator.complete_callback(state="malformed-state-1")
+    await coordinator.wait_until_finished(started.flow_id, allow_failure=True)
+
+    assert coordinator.read_flow_status(started.flow_id) == "failed"
+    assert coordinator._pending_by_id == {}
+    assert coordinator._pending_by_digest == {}
+
+    restarted = await coordinator.start(
+        tenant_id="tenant_1",
+        server_id="server_1",
+        user_id="user_1",
+        redirect_uri="https://staffdeck.example/oauth/callback",
+        operation=operation,
+    )
+    assert restarted.flow_id != started.flow_id
+    coordinator.cancel_all()
+
+
+@pytest.mark.asyncio
 async def test_flow_security_events_never_log_state_or_authorization_code(
     tmp_path,
     caplog,

@@ -849,6 +849,7 @@ class MCPUserOAuthGrant(SQLModel, table=True):
     tenant_id: str = Field(index=True)
     server_id: str = Field(index=True)
     user_id: str = Field(index=True)
+    config_fingerprint: str = Field(default="")
     encrypted_payload: str
     expires_at: Optional[datetime] = Field(default=None, index=True)
     status: str = Field(default="authorizing", index=True)

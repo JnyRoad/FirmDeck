@@ -1,9 +1,11 @@
+import asyncio
 import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
+from sqlalchemy import Engine
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
@@ -18,8 +20,17 @@ from app.api.tools import (
     get_mcp_app_resource,
     list_tools,
     sync_mcp_tools,
+    update_mcp_server,
 )
-from app.db.models import AgentProfile, AgentResourceBinding, MCPServer, Tenant, Tool, User
+from app.db.models import (
+    AgentProfile,
+    AgentResourceBinding,
+    MCPServer,
+    MCPUserOAuthGrant,
+    Tenant,
+    Tool,
+    User,
+)
 from app.tools.mcp_client import (
     MCPClientError,
     discover_mcp_server,
@@ -32,9 +43,29 @@ from app.tools.tool_schema import (
     MCPDiscoverRequest,
     MCPServerConnection,
     MCPServerCreateRequest,
+    MCPServerUpdateRequest,
     MCPSyncRequest,
     ToolCall,
 )
+
+
+def _oauth_server_update(
+    *,
+    url: str = "https://mcp.example.test/mcp",
+    display_name: str = "Protected",
+) -> MCPServerUpdateRequest:
+    """Build one complete protected-server update for API behavior tests."""
+    return MCPServerUpdateRequest(
+        tenant_id="tenant_demo",
+        name="protected",
+        display_name=display_name,
+        connection=MCPServerConnection(transport="streamable_http", url=url),
+        auth_mode="oauth_personal",
+        oauth_client_id="staffdeck-public",
+        oauth_redirect_uri=(
+            "https://staffdeck.example/api/enterprise/mcp-servers/oauth/callback"
+        ),
+    )
 
 
 def _admin_user() -> User:
@@ -43,6 +74,78 @@ def _admin_user() -> User:
 
 def _member_user() -> User:
     return User(id="user_member", tenant_id="tenant_demo", username="member", role="member", password_hash="test")
+
+
+def _seed_oauth_server_and_grant(db: Session) -> MCPServer:
+    """Persist one protected server and matching encrypted user grant."""
+    from mcp.shared.auth import OAuthToken
+
+    from app.tools.mcp_oauth_policy import mcp_oauth_config_fingerprint
+    from app.tools.mcp_oauth_service import MCPGrantTokenStorage
+
+    server = MCPServer(
+        id="server_protected",
+        tenant_id="tenant_demo",
+        name="protected",
+        display_name="Protected",
+        transport="streamable_http",
+        url="https://mcp.example.test/mcp",
+        auth_mode="oauth_personal",
+        oauth_client_id="staffdeck-public",
+        oauth_redirect_uri=(
+            "https://staffdeck.example/api/enterprise/mcp-servers/oauth/callback"
+        ),
+    )
+    db.add(Tenant(id="tenant_demo", name="Demo"))
+    db.add(server)
+    db.commit()
+    bind = db.get_bind()
+    assert isinstance(bind, Engine)
+    storage = MCPGrantTokenStorage(
+        bind,
+        server.tenant_id,
+        server.id,
+        "user_admin",
+        config_fingerprint=mcp_oauth_config_fingerprint(server),
+    )
+    asyncio.run(storage.set_tokens(OAuthToken(access_token="grant-token", expires_in=60)))
+    return server
+
+
+def test_updating_oauth_binding_configuration_deletes_existing_grants(
+    monkeypatch,
+) -> None:
+    """Catch server identity changes retaining tokens issued for the prior target."""
+    monkeypatch.setenv("STAFFDECK_PUBLIC_URL", "https://staffdeck.example")
+    with _test_session() as db:
+        server = _seed_oauth_server_and_grant(db)
+
+        update_mcp_server(
+            server.id,
+            _oauth_server_update(url="https://new-mcp.example.test/mcp"),
+            db,
+            _admin_user(),
+        )
+
+        assert db.exec(select(MCPUserOAuthGrant)).all() == []
+
+
+def test_updating_only_oauth_server_presentation_preserves_existing_grants(
+    monkeypatch,
+) -> None:
+    """Catch harmless presentation edits disconnecting every authorized user."""
+    monkeypatch.setenv("STAFFDECK_PUBLIC_URL", "https://staffdeck.example")
+    with _test_session() as db:
+        server = _seed_oauth_server_and_grant(db)
+
+        update_mcp_server(
+            server.id,
+            _oauth_server_update(display_name="Renamed"),
+            db,
+            _admin_user(),
+        )
+
+        assert len(db.exec(select(MCPUserOAuthGrant)).all()) == 1
 
 
 def test_discover_builtin_mcp_server_lists_tools() -> None:
@@ -848,6 +951,23 @@ def test_delete_mcp_server_removes_tools() -> None:
         assert result == {"status": "deleted"}
         assert db.get(MCPServer, server.id) is None
         assert len(db.exec(select(Tool).where(Tool.mcp_server_id == server.id)).all()) == 0
+
+
+def test_delete_mcp_server_removes_personal_oauth_grants() -> None:
+    """Catch server deletion leaving encrypted user grants as orphaned credentials."""
+    with _test_session() as db:
+        server = _seed_oauth_server_and_grant(db)
+
+        delete_mcp_server(
+            server.id,
+            "tenant_demo",
+            db,
+            agent_id=None,
+            remove_tools=True,
+            current_user=_admin_user(),
+        )
+
+        assert db.exec(select(MCPUserOAuthGrant)).all() == []
 
 
 def test_delete_mcp_server_in_employee_scope_only_unbinds() -> None:

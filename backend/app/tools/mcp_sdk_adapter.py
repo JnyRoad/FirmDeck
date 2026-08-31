@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from importlib.metadata import version as distribution_version
 from typing import Any, TypeVar
+from urllib.parse import urlsplit
 
 import httpx2
 import mcp
@@ -14,7 +15,12 @@ from mcp.client.client import Client
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.auth import AuthorizationCodeResult, OAuthClientMetadata
 
-from app.tools.mcp_client import _normalize_tool_definition, _tool_result_envelope
+from app.tools.mcp_client import (
+    MCPClientError,
+    _normalize_tool_definition,
+    _tool_result_envelope,
+    _validate_remote_mcp_url,
+)
 
 SUPPORTED_MCP_SDK_VERSION = "2.1.1"
 _ResultT = TypeVar("_ResultT")
@@ -38,6 +44,28 @@ def assert_supported_sdk_version(candidate: str | None = None) -> str:
             f"expected {SUPPORTED_MCP_SDK_VERSION}, got {resolved}"
         )
     return resolved
+
+
+def _validate_oauth_target_url(raw_url: str) -> None:
+    """Require every OAuth bridge request target to use public HTTPS."""
+    if urlsplit(raw_url).scheme.lower() != "https":
+        raise MCPAdapterError("MCP_OAUTH_PROVIDER_UNSUPPORTED")
+    try:
+        _validate_remote_mcp_url(raw_url)
+    except MCPClientError as exc:
+        raise MCPAdapterError("MCP_OAUTH_PROVIDER_UNSUPPORTED") from exc
+
+
+def _find_adapter_error(exc: BaseException) -> MCPAdapterError | None:
+    """Recover a safe adapter error wrapped by an SDK task-group exception."""
+    if isinstance(exc, MCPAdapterError):
+        return exc
+    if isinstance(exc, BaseExceptionGroup):
+        for nested in exc.exceptions:
+            found = _find_adapter_error(nested)
+            if found is not None:
+                return found
+    return None
 
 
 class _ExpiryAwareOAuthClientProvider(OAuthClientProvider):
@@ -66,6 +94,7 @@ class MCPSDKAdapter:
         client_metadata_url: str | None = None,
         transport: httpx2.AsyncBaseTransport | None = None,
         timeout_seconds: float = 30,
+        url_validator: Callable[[str], None] | None = None,
     ) -> None:
         """Capture only public connection policy and an owner-bound token store."""
         assert_supported_sdk_version()
@@ -80,6 +109,14 @@ class MCPSDKAdapter:
         self.client_metadata_url = client_metadata_url
         self.transport = transport
         self.timeout_seconds = timeout_seconds
+        self.url_validator = url_validator or _validate_oauth_target_url
+        self._server_http_url = httpx2.URL(server_url)
+
+    async def _handle_redirect(self, authorization_url: str) -> None:
+        """Validate one browser authorization target before invoking the caller handler."""
+        self.url_validator(authorization_url)
+        if self.redirect_handler is not None:
+            await self.redirect_handler(authorization_url)
 
     def build_oauth_provider(self) -> _ExpiryAwareOAuthClientProvider:
         """Build the sole supported SDK provider with PKCE authorization-code metadata."""
@@ -92,13 +129,14 @@ class MCPSDKAdapter:
             server_url=self.server_url,
             client_metadata=metadata,
             storage=self.storage,
-            redirect_handler=self.redirect_handler,
+            redirect_handler=self._handle_redirect if self.redirect_handler is not None else None,
             callback_handler=self.callback_handler,
             client_metadata_url=self.client_metadata_url,
         )
 
     async def _with_client(self, operation: Callable[[Client], Awaitable[_ResultT]]) -> _ResultT:
         """Open one bounded SDK client session and map OAuth failures to stable safe codes."""
+        self.url_validator(self.server_url)
         provider = self.build_oauth_provider()
         last_response_status: int | None = None
         lock_reader = getattr(self.storage, "operation_lock", None)
@@ -109,18 +147,34 @@ class MCPSDKAdapter:
             nonlocal last_response_status
             last_response_status = response.status_code
 
+        async def prepare_request(request: httpx2.Request) -> None:
+            """Enforce the network boundary and attach static headers only to the MCP server."""
+            self.url_validator(str(request.url))
+            if request.url == self._server_http_url:
+                request.headers.update(self.headers)
+
+        lock_acquired = False
         if operation_lock is not None:
-            await asyncio.to_thread(operation_lock.acquire)
+            acquire_task = asyncio.create_task(asyncio.to_thread(operation_lock.acquire))
+            try:
+                await asyncio.shield(acquire_task)
+                lock_acquired = True
+            except asyncio.CancelledError:
+                if await acquire_task:
+                    operation_lock.release()
+                raise
         try:
             try:
                 async with httpx2.AsyncClient(
                     auth=provider,
-                    headers=self.headers,
                     transport=self.transport,
                     timeout=self.timeout_seconds,
                     follow_redirects=False,
                     trust_env=False,
-                    event_hooks={"response": [observe_response]},
+                    event_hooks={
+                        "request": [prepare_request],
+                        "response": [observe_response],
+                    },
                 ) as http_client:
                     sdk_transport = streamable_http_client(
                         self.server_url,
@@ -156,6 +210,9 @@ class MCPSDKAdapter:
                 code = "MCP_INSUFFICIENT_SCOPE" if status == 403 else "MCP_ERROR"
                 raise MCPAdapterError(code) from exc
             except Exception as exc:  # noqa: BLE001 - SDK task groups wrap transport failures.
+                adapter_error = _find_adapter_error(exc)
+                if adapter_error is not None:
+                    raise adapter_error from exc
                 code = (
                     "MCP_INSUFFICIENT_SCOPE"
                     if last_response_status == 403
@@ -165,7 +222,7 @@ class MCPSDKAdapter:
                 )
                 raise MCPAdapterError(code) from exc
         finally:
-            if operation_lock is not None:
+            if operation_lock is not None and lock_acquired:
                 operation_lock.release()
 
     async def discover(self) -> dict[str, Any]:

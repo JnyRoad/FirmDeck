@@ -29,6 +29,32 @@ def test_mcp_oauth_migration_is_additive_and_idempotent(monkeypatch, tmp_path) -
                 "VALUES ('server_1', 'tenant_1', 'legacy', 'streamable_http')"
             )
         )
+        conn.execute(
+            text(
+                """
+                CREATE TABLE mcp_user_oauth_grants (
+                    id VARCHAR PRIMARY KEY,
+                    tenant_id VARCHAR NOT NULL,
+                    server_id VARCHAR NOT NULL,
+                    user_id VARCHAR NOT NULL,
+                    encrypted_payload VARCHAR NOT NULL,
+                    status VARCHAR NOT NULL,
+                    version INTEGER NOT NULL,
+                    created_at DATETIME NOT NULL,
+                    updated_at DATETIME NOT NULL
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO mcp_user_oauth_grants "
+                "(id, tenant_id, server_id, user_id, encrypted_payload, status, version, "
+                "created_at, updated_at) VALUES "
+                "('grant_1', 'tenant_1', 'server_1', 'user_1', 'encrypted', 'active', 1, "
+                "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            )
+        )
 
     monkeypatch.setattr(database, "database_url", str(engine.url))
     monkeypatch.setattr(database, "engine", engine)
@@ -46,10 +72,19 @@ def test_mcp_oauth_migration_is_additive_and_idempotent(monkeypatch, tmp_path) -
     assert {"mcp_user_oauth_grants", "mcp_oauth_flows"} <= set(
         inspector.get_table_names()
     )
+    assert "config_fingerprint" in {
+        column["name"] for column in inspector.get_columns("mcp_user_oauth_grants")
+    }
     with engine.connect() as conn:
         assert conn.execute(
             text("SELECT auth_mode FROM mcp_servers WHERE id = 'server_1'")
         ).scalar_one() == "none"
+        assert conn.execute(
+            text(
+                "SELECT config_fingerprint FROM mcp_user_oauth_grants "
+                "WHERE id = 'grant_1'"
+            )
+        ).scalar_one() == ""
 
 
 def test_mcp_oauth_grant_identity_is_unique(monkeypatch, tmp_path) -> None:

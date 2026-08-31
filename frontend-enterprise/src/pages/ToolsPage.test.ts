@@ -362,7 +362,7 @@ describe('MCP personal OAuth lifecycle', () => {
   ] as const)(
     'shows a localized recoverable %s callback outcome in %s',
     async (locale, outcome, variant, message) => {
-      renderSemanticTools(locale, 'admin', `/workspace/tools?mcp_oauth=${outcome}`);
+      renderSemanticTools(locale, 'admin', `/enterprise/tools?mcp_oauth=${outcome}`);
 
       await waitFor(() => {
         expect(toastSpies[variant]).toHaveBeenCalledWith(message);
@@ -435,7 +435,7 @@ describe('MCP personal OAuth lifecycle', () => {
   it.each([
     ['zh-CN', '连接个人账户', '个人 OAuth 授权'],
     ['en-US', 'Connect personal account', 'Personal OAuth authorization'],
-  ] as const)('loads current-user status and opens the returned authorization URL in %s', async (
+  ] as const)('loads current-user status and navigates the current tab for authorization in %s', async (
     locale,
     connectLabel,
     sectionLabel,
@@ -502,7 +502,7 @@ describe('MCP personal OAuth lifecycle', () => {
     expect(await screen.findByText(sectionLabel)).toBeTruthy();
     await user.click(await screen.findByRole('button', { name: connectLabel }));
     await waitFor(() => {
-      expect(openWindow).toHaveBeenCalledWith(authorizationUrl, '_blank', 'noopener,noreferrer');
+      expect(openWindow).toHaveBeenCalledWith(authorizationUrl, '_self');
     });
     expect(screen.queryByLabelText(/access token/i)).toBeNull();
   });

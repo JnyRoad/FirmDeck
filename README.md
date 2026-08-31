@@ -180,11 +180,13 @@ existing client for no-auth, stdio, builtin, and legacy SSE connections.
   tokens, PKCE verifiers, or client secrets into headers or the editor.
 - Each signed-in user connects and disconnects independently. SDK token and dynamic client models are
   encrypted at rest and are never returned by server/status APIs.
-- The configured redirect URI must be HTTPS in deployed environments (loopback HTTP is allowed for
-  local development) and must route to
-  `/api/enterprise/mcp-servers/oauth/callback` on the same running StaffDeck instance.
+- The configured redirect URI must use the exact
+  `/api/enterprise/mcp-servers/oauth/callback` path. In deployed environments its HTTPS origin must
+  match `STAFFDECK_PUBLIC_URL`; loopback HTTP is allowed only for local development.
 - An unfinished browser authorization expires after 10 minutes and cannot resume after a process
-  restart; start a new authorization instead.
+  restart. The start request and callback use process-local coordination, so multi-worker deployments
+  must route both requests to the same application process (for example with sticky routing) or add
+  a distributed coordinator.
 - Refresh operations are serialized per tenant/server/user in the current process and guarded by an
   optimistic database version. Multi-worker deployments do not have a distributed refresh lock, so
   route one user's OAuth work to a single process or add a distributed lock before scaling this path.

@@ -9,7 +9,7 @@ from sqlmodel import Session, SQLModel, create_engine, select
 
 import app.api.auth as auth_api
 from app.db import get_session
-from app.db.models import Tenant, User, UserAvatar
+from app.db.models import MCPUserOAuthGrant, Tenant, User, UserAvatar
 from app.security.auth import create_access_token, hash_password
 
 _PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
@@ -189,6 +189,14 @@ def test_delete_user_cascades_avatar() -> None:
             role="admin",
         )
         db.add(admin)
+        db.add(
+            MCPUserOAuthGrant(
+                tenant_id="tenant_demo",
+                server_id="server_deleted_user",
+                user_id="user_web",
+                encrypted_payload="encrypted-test-payload",
+            )
+        )
         db.commit()
         db.refresh(admin)
         db.expunge(admin)
@@ -202,6 +210,7 @@ def test_delete_user_cascades_avatar() -> None:
     with Session(engine) as db:
         assert db.get(User, "user_web") is None
         assert db.get(UserAvatar, "user_web") is None
+        assert db.exec(select(MCPUserOAuthGrant)).all() == []
 
 
 def test_upload_rejects_non_image() -> None:

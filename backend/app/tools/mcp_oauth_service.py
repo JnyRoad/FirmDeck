@@ -46,6 +46,7 @@ class MCPGrantTokenStorage:
         *,
         public_client_id: str | None = None,
         redirect_uri: str | None = None,
+        config_fingerprint: str = "",
     ) -> None:
         """Bind every storage operation to one tenant, server, and StaffDeck user."""
         self.engine = engine
@@ -54,6 +55,7 @@ class MCPGrantTokenStorage:
         self.user_id = user_id
         self.public_client_id = public_client_id
         self.redirect_uri = redirect_uri
+        self.config_fingerprint = config_fingerprint
         self._loaded_version: int | None = None
 
     def _log_event(self, oauth_event: str, error_code: str | None = None) -> None:
@@ -118,6 +120,9 @@ class MCPGrantTokenStorage:
             if row is None:
                 return None, self._empty_payload()
             self._loaded_version = row.version
+            if row.config_fingerprint != self.config_fingerprint:
+                db.expunge(row)
+                return row, self._empty_payload()
             payload = self._decode_payload(row)
             db.expunge(row)
             return row, payload
@@ -141,6 +146,7 @@ class MCPGrantTokenStorage:
                     tenant_id=self.tenant_id,
                     server_id=self.server_id,
                     user_id=self.user_id,
+                    config_fingerprint=self.config_fingerprint,
                     encrypted_payload=encrypted_payload,
                     expires_at=expires_at,
                     status=status,
@@ -153,6 +159,9 @@ class MCPGrantTokenStorage:
                 self._loaded_version = 1
                 return
 
+            if row.config_fingerprint != self.config_fingerprint:
+                raise MCPGrantConflict("MCP OAuth configuration changed during authorization")
+
             expected_version = self._loaded_version or row.version
             result = db.execute(
                 update(MCPUserOAuthGrant)
@@ -162,6 +171,7 @@ class MCPGrantTokenStorage:
                 )
                 .values(
                     encrypted_payload=encrypted_payload,
+                    config_fingerprint=self.config_fingerprint,
                     expires_at=expires_at,
                     status=status,
                     version=expected_version + 1,
@@ -177,7 +187,11 @@ class MCPGrantTokenStorage:
     async def get_tokens(self) -> OAuthToken | None:
         """Return the current user's SDK token model from encrypted storage."""
         row, payload = self._read()
-        if row is None or row.status in {"reconnect_required", "revoked"}:
+        if (
+            row is None
+            or row.config_fingerprint != self.config_fingerprint
+            or row.status in {"reconnect_required", "revoked"}
+        ):
             return None
         raw_tokens = payload["tokens"]
         return OAuthToken.model_validate(raw_tokens) if raw_tokens else None
@@ -194,7 +208,11 @@ class MCPGrantTokenStorage:
     async def get_client_info(self) -> OAuthClientInformationFull | None:
         """Return persisted registration info or a configured public client identity."""
         _row, payload = self._read()
-        raw_client = payload["client_info"]
+        raw_client = (
+            payload["client_info"]
+            if _row is not None and _row.config_fingerprint == self.config_fingerprint
+            else None
+        )
         if raw_client:
             return OAuthClientInformationFull.model_validate(raw_client)
         if self.public_client_id:
@@ -222,6 +240,8 @@ class MCPGrantTokenStorage:
             row = self._select_row(db)
             if row is None:
                 return None, self._empty_payload()
+            if row.config_fingerprint != self.config_fingerprint:
+                raise MCPGrantConflict("MCP OAuth configuration changed during authorization")
             if self._loaded_version is not None and row.version != self._loaded_version:
                 raise MCPGrantConflict("MCP OAuth grant changed during authorization")
             self._loaded_version = row.version
@@ -232,7 +252,11 @@ class MCPGrantTokenStorage:
     def token_expiry_epoch(self) -> float | None:
         """Restore the absolute expiry required by the pinned SDK compatibility shim."""
         row, _payload = self._read()
-        if row is None or row.expires_at is None:
+        if (
+            row is None
+            or row.config_fingerprint != self.config_fingerprint
+            or row.expires_at is None
+        ):
             return None
         return row.expires_at.replace(tzinfo=UTC).timestamp()
 
@@ -241,6 +265,11 @@ class MCPGrantTokenStorage:
         row, payload = self._read()
         if row is None or row.status == "revoked":
             return MCPGrantStatus(state="disconnected")
+        if row.config_fingerprint != self.config_fingerprint:
+            return MCPGrantStatus(
+                state="reconnect_required",
+                error_code="MCP_AUTHORIZATION_REQUIRED",
+            )
         if row.status == "authorizing":
             return MCPGrantStatus(state="authorizing", expires_at=row.expires_at)
         if row.status == "reconnect_required":

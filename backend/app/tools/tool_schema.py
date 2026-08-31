@@ -18,6 +18,7 @@ from app.contracts.errors import (
     JsonValue,
 )
 from app.i18n.language_context import LanguageContext
+from app.tools.mcp_oauth_policy import validate_mcp_oauth_redirect_uri
 
 
 class ToolExecutionPolicy(BaseModel):
@@ -285,12 +286,7 @@ class MCPServerCreateRequest(BaseModel):
             if metadata.scheme != "https" or not metadata.netloc or metadata.path in {"", "/"}:
                 raise ValueError("OAuth client metadata URL must use HTTPS with a non-root path")
         if self.oauth_redirect_uri:
-            redirect = urlparse(self.oauth_redirect_uri)
-            loopback = redirect.hostname in {"localhost", "127.0.0.1", "::1"}
-            if not redirect.netloc or (
-                redirect.scheme != "https" and not (redirect.scheme == "http" and loopback)
-            ):
-                raise ValueError("OAuth redirect URI must use HTTPS or loopback HTTP")
+            self.oauth_redirect_uri = validate_mcp_oauth_redirect_uri(self.oauth_redirect_uri)
         return self
 
 

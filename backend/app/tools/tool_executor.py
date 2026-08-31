@@ -28,6 +28,7 @@ from app.tools.mcp_client import (
     execute_mcp_tool,
     execute_mcp_tool_result,
 )
+from app.tools.mcp_oauth_policy import mcp_oauth_config_fingerprint
 from app.tools.mcp_oauth_service import MCPGrantTokenStorage
 from app.tools.mcp_sdk_adapter import MCPAdapterError, MCPSDKAdapter
 from app.tools.tool_schema import MCPAppDescriptor, ToolCall, ToolError, ToolResult
@@ -413,6 +414,7 @@ class ToolExecutor:
             user_id,
             public_client_id=server.oauth_client_id,
             redirect_uri=server.oauth_redirect_uri,
+            config_fingerprint=mcp_oauth_config_fingerprint(server),
         )
         status = storage.read_status()
         if status.state != "connected":

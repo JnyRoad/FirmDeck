@@ -22,6 +22,10 @@ from app.tools.mcp_oauth_flow import (
     MCPOAuthFlowError,
     MCPOAuthStartResult,
 )
+from app.tools.mcp_oauth_policy import (
+    mcp_oauth_config_fingerprint,
+    validate_mcp_oauth_redirect_uri,
+)
 from app.tools.mcp_oauth_service import MCPGrantStatus, MCPGrantTokenStorage
 from app.tools.mcp_sdk_adapter import MCPAdapterError, MCPSDKAdapter
 
@@ -114,6 +118,7 @@ def get_mcp_oauth_status(
         tenant_id,
         server.id,
         current_user.id,
+        config_fingerprint=mcp_oauth_config_fingerprint(server),
     )
     return _project_status(server, storage.read_status())
 
@@ -135,6 +140,10 @@ async def start_mcp_oauth(
         or not server.oauth_redirect_uri
     ):
         raise build_http_exception("MCP_OAUTH_PROVIDER_UNSUPPORTED")
+    try:
+        redirect_uri = validate_mcp_oauth_redirect_uri(server.oauth_redirect_uri)
+    except ValueError as exc:
+        raise build_http_exception("MCP_OAUTH_PROVIDER_UNSUPPORTED") from exc
 
     engine = _session_engine(db)
     storage = MCPGrantTokenStorage(
@@ -143,10 +152,14 @@ async def start_mcp_oauth(
         server.id,
         current_user.id,
         public_client_id=server.oauth_client_id,
-        redirect_uri=server.oauth_redirect_uri,
+        redirect_uri=redirect_uri,
+        config_fingerprint=mcp_oauth_config_fingerprint(server),
     )
-    if storage.read_status().state == "connected":
+    grant_state = storage.read_status().state
+    if grant_state == "connected":
         raise build_http_exception("MCP_OAUTH_FLOW_CONFLICT")
+    if grant_state == "reconnect_required":
+        storage.disconnect()
     coordinator = _coordinator_for_engine(engine)
 
     async def operation(redirect_handler, callback_handler) -> None:
@@ -155,7 +168,7 @@ async def start_mcp_oauth(
             server_url=server.url or "",
             headers=dict(server.headers_json or {}),
             storage=storage,
-            redirect_uri=server.oauth_redirect_uri or "",
+            redirect_uri=redirect_uri,
             redirect_handler=redirect_handler,
             callback_handler=callback_handler,
             client_metadata_url=server.oauth_client_metadata_url,
@@ -167,7 +180,7 @@ async def start_mcp_oauth(
             tenant_id=request.tenant_id,
             server_id=server.id,
             user_id=current_user.id,
-            redirect_uri=server.oauth_redirect_uri,
+            redirect_uri=redirect_uri,
             operation=operation,
         )
     except (MCPOAuthFlowError, MCPAdapterError) as exc:
@@ -192,6 +205,7 @@ def disconnect_mcp_oauth(
         tenant_id,
         server.id,
         current_user.id,
+        config_fingerprint=mcp_oauth_config_fingerprint(server),
     ).disconnect()
 
 
@@ -214,6 +228,6 @@ async def mcp_oauth_callback(
     except (MCPOAuthFlowError, MCPAdapterError) as exc:
         outcome = "expired" if exc.code == "MCP_OAUTH_FLOW_EXPIRED" else "failed"
     return RedirectResponse(
-        url=f"/workspace/tools?mcp_oauth={outcome}",
+        url=f"/enterprise/tools?mcp_oauth={outcome}",
         status_code=302,
     )

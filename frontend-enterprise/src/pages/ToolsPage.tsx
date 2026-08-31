@@ -2110,7 +2110,7 @@ function McpServerEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'e
   }
 
   async function beginOAuth(): Promise<void> {
-    /** Ask the backend SDK bridge for a one-time authorization URL and open it securely. */
+    /** Ask the backend SDK bridge for a one-time URL and continue in the current tab. */
     if (!server) return;
     setOauthBusy(true);
     try {
@@ -2126,7 +2126,7 @@ function McpServerEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'e
         scopes: [],
         error_code: null,
       });
-      window.open(started.authorization_url, '_blank', 'noopener,noreferrer');
+      window.open(started.authorization_url, '_self');
     } catch (error) {
       console.error('[tools-page] start MCP OAuth failed', error);
       toast.error(toolErrorDescriptor(error, TOOLS_MESSAGE_IDS.toastOAuthStartFailed));

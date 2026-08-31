@@ -328,6 +328,14 @@ class MCPOAuthFlowCoordinator:
                 flow_id=row.id,
                 error_code="MCP_OAUTH_CALLBACK_INVALID",
             )
+            if not pending.callback_future.done():
+                pending.callback_future.set_exception(
+                    MCPOAuthFlowError("MCP_OAUTH_CALLBACK_INVALID")
+                )
+            try:
+                await pending.task
+            except MCPOAuthFlowError:
+                pass
             raise MCPOAuthFlowError("MCP_OAUTH_CALLBACK_INVALID")
 
         self._update_status(pending.flow_id, "callback_received")

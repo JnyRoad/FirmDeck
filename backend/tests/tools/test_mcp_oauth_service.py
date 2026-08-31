@@ -95,6 +95,65 @@ async def test_grant_storage_restores_absolute_expiry(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_grant_storage_never_reuses_tokens_after_oauth_configuration_changes(
+    tmp_path,
+) -> None:
+    """Catch a token issued for an old server identity being sent to new configuration."""
+    from app.tools.mcp_oauth_service import MCPGrantTokenStorage
+
+    engine = _engine(tmp_path)
+    original = MCPGrantTokenStorage(
+        engine,
+        "tenant_1",
+        "server_1",
+        "user_1",
+        config_fingerprint="original-config",
+    )
+    await original.set_tokens(OAuthToken(access_token="old-config-token", expires_in=60))
+
+    changed = MCPGrantTokenStorage(
+        engine,
+        "tenant_1",
+        "server_1",
+        "user_1",
+        config_fingerprint="changed-config",
+    )
+
+    assert await changed.get_tokens() is None
+    assert changed.token_expiry_epoch() is None
+    assert changed.read_status().state == "reconnect_required"
+
+
+def test_configuration_mismatch_does_not_decrypt_the_stale_grant(tmp_path) -> None:
+    """Catch changed configuration touching credential payloads it is forbidden to reuse."""
+    from app.tools.mcp_oauth_service import MCPGrantTokenStorage
+
+    engine = _engine(tmp_path)
+    with Session(engine) as db:
+        db.add(
+            MCPUserOAuthGrant(
+                tenant_id="tenant_1",
+                server_id="server_1",
+                user_id="user_1",
+                config_fingerprint="old-config",
+                encrypted_payload="not-a-valid-encrypted-payload",
+                status="active",
+            )
+        )
+        db.commit()
+
+    changed = MCPGrantTokenStorage(
+        engine,
+        "tenant_1",
+        "server_1",
+        "user_1",
+        config_fingerprint="new-config",
+    )
+
+    assert changed.read_status().state == "reconnect_required"
+
+
+@pytest.mark.asyncio
 async def test_grant_storage_rejects_a_stale_rotating_token_write(tmp_path) -> None:
     """Catch an older refresh result overwriting a newly rotated refresh credential."""
     from app.tools.mcp_oauth_service import MCPGrantConflict, MCPGrantTokenStorage

@@ -819,7 +819,9 @@ def test_protected_mcp_tool_without_user_identity_fails_closed(monkeypatch) -> N
                 url="https://mcp.example/mcp",
                 auth_mode="oauth_personal",
                 oauth_client_id="staffdeck-public",
-                oauth_redirect_uri="https://staffdeck.example/oauth/callback",
+                oauth_redirect_uri=(
+                    "https://staffdeck.example/api/enterprise/mcp-servers/oauth/callback"
+                ),
             )
         )
         db.add(
@@ -878,7 +880,10 @@ def test_protected_mcp_tool_uses_current_user_grant_and_official_adapter(monkeyp
                 headers_json={"Authorization": "Bearer forbidden-static", "X-Public": "ok"},
                 auth_mode="oauth_personal",
                 oauth_client_id="staffdeck-public",
-                oauth_redirect_uri="https://staffdeck.example/oauth/callback",
+                oauth_redirect_uri=(
+                    "https://staffdeck.example/api/enterprise/"
+                    "mcp-servers/oauth/callback"
+                ),
             )
         )
         db.add(
@@ -894,11 +899,16 @@ def test_protected_mcp_tool_uses_current_user_grant_and_official_adapter(monkeyp
             )
         )
         db.commit()
+        from app.tools.mcp_oauth_policy import mcp_oauth_config_fingerprint
+
+        server = db.get(MCPServer, "server_oauth")
+        assert server is not None
         storage = MCPGrantTokenStorage(
             db.get_bind(),
             "tenant_demo",
             "server_oauth",
             "user_current",
+            config_fingerprint=mcp_oauth_config_fingerprint(server),
         )
         asyncio.run(storage.set_tokens(OAuthToken(access_token="current-only", expires_in=3600)))
 
