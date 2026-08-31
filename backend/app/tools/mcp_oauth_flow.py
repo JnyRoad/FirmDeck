@@ -34,14 +34,30 @@ def _log_oauth_event(
     error_code: str | None = None,
 ) -> None:
     """Write one credential-free structured lifecycle event for authorized diagnostics."""
-    logger.info(
-        "MCP OAuth lifecycle event",
-        extra={
-            "oauth_event": oauth_event,
-            "flow_id": flow_id,
-            "error_code": error_code,
-        },
-    )
+    if oauth_event == "mcp_oauth.started":
+        logger.info("MCP OAuth started", extra={"oauth_event": "mcp_oauth.started"})
+    elif oauth_event == "mcp_oauth.completed":
+        logger.info("MCP OAuth completed", extra={"oauth_event": "mcp_oauth.completed"})
+    elif oauth_event == "mcp_oauth.cancelled":
+        logger.info("MCP OAuth cancelled", extra={"oauth_event": "mcp_oauth.cancelled"})
+    elif oauth_event == "mcp_oauth.expired":
+        logger.info("MCP OAuth expired", extra={"oauth_event": "mcp_oauth.expired"})
+    elif oauth_event == "mcp_oauth.denied":
+        logger.info("MCP OAuth denied", extra={"oauth_event": "mcp_oauth.denied"})
+    elif oauth_event == "mcp_oauth.failed":
+        logger.info("MCP OAuth failed", extra={"oauth_event": "mcp_oauth.failed"})
+    elif oauth_event == "mcp_oauth.invalid_browser_binding":
+        logger.info(
+            "MCP OAuth browser binding rejected",
+            extra={"oauth_event": "mcp_oauth.invalid_browser_binding"},
+        )
+    elif oauth_event == "mcp_oauth.invalid_callback":
+        logger.info(
+            "MCP OAuth callback rejected",
+            extra={"oauth_event": "mcp_oauth.invalid_callback"},
+        )
+    else:
+        logger.info("MCP OAuth lifecycle event")
 
 
 class MCPOAuthFlowError(RuntimeError):

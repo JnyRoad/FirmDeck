@@ -72,13 +72,23 @@ class MCPGrantTokenStorage:
 
     def _log_event(self, oauth_event: str, error_code: str | None = None) -> None:
         """Record one owner-scoped lifecycle event without token or client payload fields."""
-        logger.info(
-            "MCP OAuth grant lifecycle event",
-            extra={
-                "oauth_event": oauth_event,
-                "error_code": error_code,
-            },
-        )
+        if oauth_event == "mcp_oauth.decrypt_failed":
+            logger.info(
+                "MCP OAuth grant decryption failed",
+                extra={"oauth_event": "mcp_oauth.decrypt_failed"},
+            )
+        elif oauth_event == "mcp_oauth.refresh_failed":
+            logger.info(
+                "MCP OAuth grant refresh failed",
+                extra={"oauth_event": "mcp_oauth.refresh_failed"},
+            )
+        elif oauth_event == "mcp_oauth.disconnected":
+            logger.info(
+                "MCP OAuth grant disconnected",
+                extra={"oauth_event": "mcp_oauth.disconnected"},
+            )
+        else:
+            logger.info("MCP OAuth grant lifecycle event")
 
     def operation_lock(self) -> Lock:
         """Return the process-wide lock serializing one owner grant's SDK operations."""
