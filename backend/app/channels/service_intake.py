@@ -1366,7 +1366,7 @@ def process_inbound(
         "to_user_id": inbound.conv_key if inbound.is_group else inbound.from_user_id,
         "context_token": inbound.context_token,
     }
-    if inbound.is_group:
+    if binding.channel == "wecom" and inbound.is_group:
         target.update(
             {
                 "reply_to_user_id": inbound.from_user_id,
@@ -1389,7 +1389,10 @@ def process_inbound(
                 or event.processor_run_id != current_processor_run_id()
             ):
                 return False
-            target = {**target, **dict(event.target_json or {})}
+            # Durable inbox targets are immutable channel-owned snapshots.
+            # Rebuilding/merging them here would leak WeCom-only compatibility
+            # keys into Feishu and other channel contracts.
+            target = dict(event.target_json or {})
             language_context = resolve_compatible_language_context(
                 snapshot=event.language_context_json,
                 legacy_ui_locale=None,
