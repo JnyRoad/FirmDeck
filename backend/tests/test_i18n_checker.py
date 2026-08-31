@@ -67,7 +67,7 @@ def test_python_checker_accepts_registered_contracts_and_explicit_exclusions() -
 def test_python_checker_detects_public_text_and_exception_leaks() -> None:
     """Detect natural HTTP/response/event text and str(exc) crossing a public boundary."""
     diagnostics = check_python_files(
-        [_fixture("invalid/public_text_boundaries.py")],
+        [_fixture("invalid/public_text_boundaries.fixture")],
         registered_error_codes={"INTERNAL_ERROR", "VALIDATION_ERROR"},
     )
     rules = {diagnostic.rule for diagnostic in diagnostics}

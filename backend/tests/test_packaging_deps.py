@@ -117,6 +117,15 @@ def test_release_builds_require_the_reusable_quality_gate_and_lockfile_install()
     assert install_step["run"] == "npm --prefix frontend-enterprise ci"
 
 
+def test_release_workflow_defaults_to_read_only_permissions() -> None:
+    """Keep build jobs least-privileged while retaining the release job's explicit grant."""
+    workflow_path = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "release.yml"
+    workflow = yaml.load(workflow_path.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+
+    assert workflow["permissions"] == {"contents": "read"}
+    assert workflow["jobs"]["release"]["permissions"] == {"contents": "write"}
+
+
 def test_pyinstaller_spec_imports_backend_modules_before_analysis(tmp_path: Path) -> None:
     """Run the real spec in isolation; writes stay in tmp_path and import failures fail the test."""
     source_root = Path(__file__).resolve().parents[2]

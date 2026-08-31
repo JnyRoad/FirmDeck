@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import type { SkillCard } from '../types';
 import {
+  countSkillFlowEdgeLabels,
   normalizeSkillFlowWheelDelta,
   reanchorSkillFlowConnection,
   skillNodeFlowPosition,
@@ -36,6 +37,20 @@ function fixture(): SkillCard {
 }
 
 describe('skill flow editor model', () => {
+  it('counts untrusted edge labels without mutating object prototypes', () => {
+    const edges = [
+      { source_node_id: '__proto__', label: '__proto__' },
+      { source_node_id: '__proto__', label: '__proto__' },
+      { source_node_id: 'constructor', label: 'prototype' },
+    ];
+
+    const counts = countSkillFlowEdgeLabels(edges, (edge) => String(edge.label));
+
+    expect(counts.get('__proto__')?.get('__proto__')).toBe(2);
+    expect(counts.get('constructor')?.get('prototype')).toBe(1);
+    expect(Object.prototype).not.toHaveProperty('polluted');
+  });
+
   it('persists visual node coordinates without changing graph semantics', () => {
     const original = fixture();
     const next = withSkillNodeFlowPosition(original, 0, { x: 421.6, y: 238.2 });

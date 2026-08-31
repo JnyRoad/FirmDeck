@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import queue
+import socket
 import subprocess
 import threading
 import time
@@ -10,6 +12,7 @@ from collections.abc import Mapping
 from contextlib import suppress
 from pathlib import Path
 from typing import Any, TextIO
+from urllib.parse import urljoin, urlsplit
 
 import httpx
 
@@ -70,6 +73,41 @@ class MCPClientError(RuntimeError):
 
 MCP_APPS_EXTENSION_ID = "io.modelcontextprotocol/ui"
 MCP_APP_MIME_TYPE = "text/html;profile=mcp-app"
+
+
+def _validate_remote_mcp_url(raw_url: str) -> str:
+    """Allow remote MCP only over public HTTP(S) endpoints."""
+    url = raw_url.strip()
+    parsed = urlsplit(url)
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        raise MCPClientError("远程 MCP URL 必须使用 HTTP 或 HTTPS。")
+    if parsed.username or parsed.password:
+        raise MCPClientError("远程 MCP URL 不得包含内嵌凭据。")
+    if parsed.fragment:
+        raise MCPClientError("远程 MCP URL 不得包含 fragment。")
+    try:
+        port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
+    except ValueError as exc:
+        raise MCPClientError("远程 MCP URL 端口无效。") from exc
+
+    hostname = parsed.hostname.rstrip(".").lower()
+    if hostname == "localhost" or hostname.endswith(".localhost"):
+        raise MCPClientError("远程 MCP URL 禁止访问本机或私有网络地址。")
+    try:
+        literal_address = ipaddress.ip_address(hostname)
+        addresses = {literal_address}
+    except ValueError:
+        try:
+            resolved = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
+        except OSError as exc:
+            raise MCPClientError("远程 MCP URL 的主机名无法解析。") from exc
+        addresses = {
+            ipaddress.ip_address(sockaddr[0])
+            for *_prefix, sockaddr in resolved
+        }
+    if not addresses or any(not address.is_global for address in addresses):
+        raise MCPClientError("远程 MCP URL 禁止访问本机或私有网络地址。")
+    return url
 
 
 # --------------------------------------------------------------------------- #
@@ -615,7 +653,11 @@ class _HttpSession(_MCPSession):
         self._session_id: str | None = None
 
     def __enter__(self) -> "_HttpSession":
-        self._client = httpx.Client(timeout=self.timeout_seconds)
+        self._client = httpx.Client(
+            timeout=self.timeout_seconds,
+            follow_redirects=False,
+            trust_env=False,
+        )
         return self
 
     def __exit__(self, *exc: Any) -> None:
@@ -628,7 +670,7 @@ class _HttpSession(_MCPSession):
         url = str(self.config.get("url") or self.config.get("endpoint") or "").strip()
         if not url:
             raise MCPClientError("HTTP MCP 连接缺少 url/endpoint。")
-        return url
+        return _validate_remote_mcp_url(url)
 
     def _headers(self) -> dict[str, str]:
         raw = self.config.get("headers") if isinstance(self.config.get("headers"), dict) else {}
@@ -708,13 +750,21 @@ class _SseSession(_MCPSession):
         self._next_id = 0
 
     def __enter__(self) -> "_SseSession":
-        self._client = httpx.Client(timeout=httpx.Timeout(self.timeout_seconds, read=None))
+        self._client = httpx.Client(
+            timeout=httpx.Timeout(self.timeout_seconds, read=None),
+            follow_redirects=False,
+            trust_env=False,
+        )
         url = str(self.config.get("url") or self.config.get("endpoint") or "").strip()
         if not url:
             raise MCPClientError("SSE MCP 连接缺少 url/endpoint。")
         raw = self.config.get("headers") if isinstance(self.config.get("headers"), dict) else {}
         headers = {"Accept": "text/event-stream", **{str(k): str(v) for k, v in raw.items()}}
-        self._stream_ctx = self._client.stream("GET", url, headers=headers)
+        self._stream_ctx = self._client.stream(
+            "GET",
+            _validate_remote_mcp_url(url),
+            headers=headers,
+        )
         response = self._stream_ctx.__enter__()
         response.raise_for_status()
         self._events = _iter_sse_events(response)
@@ -735,7 +785,7 @@ class _SseSession(_MCPSession):
         deadline = time.monotonic() + max(self.timeout_seconds, 0.1)
         for event, data in self._events:
             if event == "endpoint":
-                return _resolve_endpoint(base_url, data.strip())
+                return _validate_remote_mcp_url(_resolve_endpoint(base_url, data.strip()))
             if time.monotonic() > deadline:
                 break
         raise MCPClientError("SSE MCP 未返回 endpoint 事件。")
@@ -807,8 +857,6 @@ def _iter_sse_events(response: httpx.Response):
 def _resolve_endpoint(base_url: str, endpoint: str) -> str:
     if endpoint.startswith("http://") or endpoint.startswith("https://"):
         return endpoint
-    from urllib.parse import urljoin
-
     return urljoin(base_url, endpoint)
 
 

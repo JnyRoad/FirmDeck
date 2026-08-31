@@ -303,6 +303,7 @@ import {
 } from './distillPageStyles';
 import { buildDistillFailure, type DistillFailure } from './distillFailure';
 import {
+  countSkillFlowEdgeLabels,
   normalizeSkillFlowWheelDelta,
   reanchorSkillFlowConnection,
   skillNodeFlowPosition,
@@ -5642,14 +5643,10 @@ function buildSkillFlowCanvasLayout(
     if (sourceId) acc[sourceId] = (acc[sourceId] || 0) + 1;
     return acc;
   }, {});
-  const sourceEdgeLabelCounts = rawEdges.reduce<Record<string, Record<string, number>>>((acc, edge) => {
-    const sourceId = String(edge.source_node_id || '').trim();
-    if (!sourceId) return acc;
-    const label = normalizedEdgeLabel(edge, nodeNameMap);
-    if (!acc[sourceId]) acc[sourceId] = {};
-    acc[sourceId][label] = (acc[sourceId][label] || 0) + 1;
-    return acc;
-  }, {});
+  const sourceEdgeLabelCounts = countSkillFlowEdgeLabels(
+    rawEdges,
+    (edge) => normalizedEdgeLabel(edge, nodeNameMap),
+  );
   const incomingCounts = rawEdges.reduce<Record<string, number>>((acc, edge) => {
     const targetId = String(edge.next_node_id || '');
     if (targetId) acc[targetId] = (acc[targetId] || 0) + 1;
@@ -5695,7 +5692,7 @@ function buildSkillFlowCanvasLayout(
     if (!source || !target) return;
     const siblingCount = edgeSiblingCounts[sourceId] || 1;
     const baseLabel = normalizedEdgeLabel(edge, nodeNameMap);
-    const hasDuplicateSourceLabel = (sourceEdgeLabelCounts[sourceId]?.[baseLabel] || 0) > 1;
+    const hasDuplicateSourceLabel = (sourceEdgeLabelCounts.get(sourceId)?.get(baseLabel) || 0) > 1;
     const isParallelFlow = hasDuplicateSourceLabel;
     const label = flowEdgeDisplayLabel(edge, nodeNameMap, siblingCount, hasDuplicateSourceLabel);
     const title = incomingEdgeLabel(edge, nodeNameMap);
