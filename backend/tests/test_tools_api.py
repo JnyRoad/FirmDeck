@@ -25,6 +25,9 @@ from app.api.tools import (
 from app.api.tools import (
     probe_tool as _probe_tool,
 )
+from app.api.tools import (
+    test_tool as _test_tool,
+)
 from app.config import get_settings
 from app.db.models import (
     A2ATaskEvent,
@@ -36,7 +39,14 @@ from app.db.models import (
     User,
 )
 from app.security.internal_service import INTERNAL_SERVICE_HEADER, internal_service_token
-from app.tools.tool_schema import MCPServerConnection, ToolExecutionPolicy, ToolProbeRequest
+from app.tools.tool_schema import (
+    MCPServerConnection,
+    ToolCall,
+    ToolExecutionPolicy,
+    ToolProbeRequest,
+    ToolResult,
+    ToolTestRequest,
+)
 
 
 def _admin_user() -> User:
@@ -57,6 +67,53 @@ def _member_user() -> User:
 
 def probe_tool(request: ToolProbeRequest, db: Session):  # noqa: ANN201
     return _probe_tool(request, db, _member_user())
+
+
+def test_direct_tool_test_forwards_authenticated_user_identity(monkeypatch) -> None:
+    """Catch direct MCP tests dropping the authenticated user's personal grant identity."""
+    captured: dict[str, object] = {}
+
+    def fake_execute(self, tenant_id: str, tool_call: ToolCall, **kwargs):
+        """Capture the API-to-executor identity boundary without external I/O."""
+        del self
+        captured.update({"tenant_id": tenant_id, "tool_call": tool_call, **kwargs})
+        return ToolResult(tool_name=tool_call.name, success=True, data={"ok": True})
+
+    monkeypatch.setattr("app.api.tools.ToolExecutor.execute", fake_execute)
+    with _test_session() as db:
+        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.add(
+            AgentProfile(
+                id="agent_overall",
+                tenant_id="tenant_demo",
+                name="Open Gallery",
+                is_overall=True,
+            )
+        )
+        tool = Tool(
+            id="tool_direct",
+            tenant_id="tenant_demo",
+            name="mcp.direct",
+            tool_type="mcp",
+            method="POST",
+            url="mcp://server/direct",
+            enabled=True,
+        )
+        db.add(tool)
+        db.flush()
+        ensure_open_gallery_binding(db, "tenant_demo", "tool", tool.id, "active")
+        db.commit()
+
+        result = _test_tool(
+            tool.id,
+            ToolTestRequest(tenant_id="tenant_demo", arguments={"query": "hello"}),
+            "agent_overall",
+            db,
+            _member_user(),
+        )
+
+    assert result.success is True
+    assert captured["user_id"] == "user_member"
 
 
 def test_delete_tool_removes_tenant_tool() -> None:

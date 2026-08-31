@@ -1,3 +1,4 @@
+import asyncio
 import json
 import sys
 from pathlib import Path
@@ -797,6 +798,122 @@ def test_execute_mcp_tool_passes_configured_timeout(monkeypatch) -> None:
 
     assert result.success is True
     assert captured["timeout"] == 20
+
+
+def test_protected_mcp_tool_without_user_identity_fails_closed(monkeypatch) -> None:
+    """Catch protected MCP execution falling back to legacy anonymous dispatch."""
+
+    def fail_legacy(*_args, **_kwargs):
+        """Prove the existing client is unreachable for OAuth-protected servers."""
+        raise AssertionError("legacy MCP client must not receive protected execution")
+
+    monkeypatch.setattr("app.tools.tool_executor.execute_mcp_tool", fail_legacy)
+    with _test_session() as db:
+        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.add(
+            MCPServer(
+                id="server_oauth",
+                tenant_id="tenant_demo",
+                name="oauth",
+                transport="streamable_http",
+                url="https://mcp.example/mcp",
+                auth_mode="oauth_personal",
+                oauth_client_id="staffdeck-public",
+                oauth_redirect_uri="https://staffdeck.example/oauth/callback",
+            )
+        )
+        db.add(
+            Tool(
+                tenant_id="tenant_demo",
+                name="mcp.protected",
+                tool_type="mcp",
+                method="POST",
+                url="mcp://oauth/protected",
+                mcp_server_id="server_oauth",
+                config_json={"tool": "protected"},
+                enabled=True,
+            )
+        )
+        db.commit()
+
+        result = ToolExecutor(db).execute(
+            "tenant_demo",
+            ToolCall(name="mcp.protected", arguments={}),
+        )
+
+    assert result.success is False
+    assert result.error is not None
+    assert result.error.code == "MCP_AUTHORIZATION_REQUIRED"
+
+
+def test_protected_mcp_tool_uses_current_user_grant_and_official_adapter(monkeypatch) -> None:
+    """Catch a protected invocation using another user's grant or static Authorization header."""
+    from mcp.shared.auth import OAuthToken
+
+    from app.tools.mcp_oauth_service import MCPGrantTokenStorage
+
+    captured: dict[str, object] = {}
+
+    class FakeAdapter:
+        def __init__(self, **kwargs):
+            """Capture the sanitized owner-bound adapter configuration."""
+            captured.update(kwargs)
+
+        async def call_tool(self, name: str, arguments: dict[str, object]):
+            """Return the existing StaffDeck tool-result envelope without network access."""
+            captured["tool_name"] = name
+            captured["arguments"] = arguments
+            return {"data": {"ok": True}, "meta": {"provider": "official-sdk"}}
+
+    monkeypatch.setattr("app.tools.tool_executor.MCPSDKAdapter", FakeAdapter)
+    with _test_session() as db:
+        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.add(
+            MCPServer(
+                id="server_oauth",
+                tenant_id="tenant_demo",
+                name="oauth",
+                transport="streamable_http",
+                url="https://mcp.example/mcp",
+                headers_json={"Authorization": "Bearer forbidden-static", "X-Public": "ok"},
+                auth_mode="oauth_personal",
+                oauth_client_id="staffdeck-public",
+                oauth_redirect_uri="https://staffdeck.example/oauth/callback",
+            )
+        )
+        db.add(
+            Tool(
+                tenant_id="tenant_demo",
+                name="mcp.protected",
+                tool_type="mcp",
+                method="POST",
+                url="mcp://oauth/protected",
+                mcp_server_id="server_oauth",
+                config_json={"tool": "protected"},
+                enabled=True,
+            )
+        )
+        db.commit()
+        storage = MCPGrantTokenStorage(
+            db.get_bind(),
+            "tenant_demo",
+            "server_oauth",
+            "user_current",
+        )
+        asyncio.run(storage.set_tokens(OAuthToken(access_token="current-only", expires_in=3600)))
+
+        result = ToolExecutor(db).execute(
+            "tenant_demo",
+            ToolCall(name="mcp.protected", arguments={"query": "hello"}),
+            user_id="user_current",
+        )
+
+    assert result.success is True
+    assert result.data == {"ok": True}
+    assert result.mcp_metadata == {"provider": "official-sdk"}
+    assert captured["storage"].user_id == "user_current"
+    assert captured["headers"] == {"Authorization": "Bearer forbidden-static", "X-Public": "ok"}
+    assert captured["tool_name"] == "protected"
 
 
 def test_execute_builtin_mcp_tool_unknown_config_returns_error() -> None:

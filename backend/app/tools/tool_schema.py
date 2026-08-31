@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from typing import Any, Literal, Optional
+from urllib.parse import urlparse
 
-from pydantic import BaseModel, ConfigDict, Field, model_serializer
+from pydantic import BaseModel, ConfigDict, Field, model_serializer, model_validator
 
 from app.capability_scope import CapabilityScope
 from app.contracts.error_registry import (
@@ -240,6 +241,7 @@ class ToolProbeResponse(BaseModel):
 
 MCPTransport = Literal["stdio", "streamable_http", "sse", "builtin"]
 MCPAppsMode = Literal["disabled", "auto"]
+MCPAuthMode = Literal["none", "oauth_personal"]
 
 
 class MCPServerConnection(BaseModel):
@@ -262,8 +264,34 @@ class MCPServerCreateRequest(BaseModel):
     bucket: str = "MCP 工具"
     connection: MCPServerConnection = Field(default_factory=MCPServerConnection)
     apps_mode: MCPAppsMode = "disabled"
+    auth_mode: MCPAuthMode = "none"
+    oauth_client_id: Optional[str] = None
+    oauth_client_metadata_url: Optional[str] = None
+    oauth_redirect_uri: Optional[str] = None
     capability_scope: CapabilityScope = "general"
     enabled: bool = True
+
+    @model_validator(mode="after")
+    def validate_oauth_policy(self) -> "MCPServerCreateRequest":
+        """Keep personal OAuth on its supported transport and public client shapes."""
+        if self.auth_mode != "oauth_personal":
+            return self
+        if self.connection.transport != "streamable_http" or not self.connection.url:
+            raise ValueError("personal OAuth requires a streamable_http MCP server URL")
+        if self.oauth_client_id and self.oauth_client_metadata_url:
+            raise ValueError("configure only one OAuth client identification mode")
+        if self.oauth_client_metadata_url:
+            metadata = urlparse(self.oauth_client_metadata_url)
+            if metadata.scheme != "https" or not metadata.netloc or metadata.path in {"", "/"}:
+                raise ValueError("OAuth client metadata URL must use HTTPS with a non-root path")
+        if self.oauth_redirect_uri:
+            redirect = urlparse(self.oauth_redirect_uri)
+            loopback = redirect.hostname in {"localhost", "127.0.0.1", "::1"}
+            if not redirect.netloc or (
+                redirect.scheme != "https" and not (redirect.scheme == "http" and loopback)
+            ):
+                raise ValueError("OAuth redirect URI must use HTTPS or loopback HTTP")
+        return self
 
 
 class MCPServerUpdateRequest(MCPServerCreateRequest):
@@ -295,6 +323,10 @@ class MCPServerRead(BaseModel):
     bucket: str
     connection: MCPServerConnection
     apps_mode: MCPAppsMode = "disabled"
+    auth_mode: MCPAuthMode = "none"
+    oauth_client_id: Optional[str] = None
+    oauth_client_metadata_url: Optional[str] = None
+    oauth_redirect_uri: Optional[str] = None
     apps_negotiated: bool = False
     negotiated_capabilities: dict[str, Any] = Field(default_factory=dict)
     capability_scope: CapabilityScope

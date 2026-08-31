@@ -6,6 +6,7 @@ from typing import Any
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
+from sqlalchemy import Engine
 from sqlmodel import Session, select
 
 from app.agents.branching import (
@@ -22,8 +23,9 @@ from app.agents.branching import (
 )
 from app.capability_scope import normalize_capability_scope
 from app.config import get_settings
-from app.contracts.error_registry import ERROR_REGISTRY
+from app.contracts.error_registry import ERROR_REGISTRY, ErrorVisibility
 from app.contracts.errors import ErrorDescriptor, ErrorOccurrence, InternalErrorContext
+from app.contracts.http import build_http_exception
 from app.contracts.projections import project_public_error
 from app.db import get_session
 from app.db.models import (
@@ -60,6 +62,9 @@ from app.tools.mcp_client import (
     execute_mcp_tool,
     read_mcp_resource,
 )
+from app.tools.mcp_oauth_service import MCPGrantTokenStorage
+from app.tools.mcp_sdk_adapter import MCPAdapterError, MCPSDKAdapter
+from app.tools.tool_executor import _run_coroutine
 from app.tools.tool_schema import (
     MCPAppResourceRead,
     MCPAppToolCallRequest,
@@ -732,6 +737,7 @@ def test_tool(
         request.tenant_id,
         ToolCall(name=row.name, arguments=request.arguments),
         agent_id=agent_id,
+        user_id=current_user.id,
     )
 
 
@@ -992,6 +998,10 @@ def mcp_server_read(row: MCPServer, db: Session) -> MCPServerRead:
         bucket=row.bucket or "MCP 工具",
         connection=_server_connection(row),
         apps_mode=row.apps_mode or "disabled",
+        auth_mode=row.auth_mode or "none",
+        oauth_client_id=row.oauth_client_id,
+        oauth_client_metadata_url=row.oauth_client_metadata_url,
+        oauth_redirect_uri=row.oauth_redirect_uri,
         apps_negotiated=_apps_negotiated(row.negotiated_capabilities_json or {}),
         negotiated_capabilities=dict(row.negotiated_capabilities_json or {}),
         capability_scope=normalize_capability_scope(row.capability_scope),
@@ -1060,6 +1070,10 @@ def create_mcp_server(
         env_json=conn.env,
         cwd=conn.cwd,
         apps_mode=request.apps_mode,
+        auth_mode=request.auth_mode,
+        oauth_client_id=request.oauth_client_id,
+        oauth_client_metadata_url=request.oauth_client_metadata_url,
+        oauth_redirect_uri=request.oauth_redirect_uri,
         negotiated_capabilities_json={},
         capability_scope=request.capability_scope,
         enabled=request.enabled,
@@ -1098,12 +1112,21 @@ def get_mcp_app_resource(
         raise _tool_http_error(status_code=404, detail="MCP App resource is not declared by a tool")
     _ensure_tool_visible(db, tenant_id, tool, agent_id)
     try:
-        result = read_mcp_resource(
-            _server_client_config(server),
-            uri,
-            timeout_seconds=get_settings().tool_timeout_seconds,
+        result = (
+            _read_protected_resource(server, current_user.id, db, uri)
+            if server.auth_mode == "oauth_personal"
+            else read_mcp_resource(
+                _server_client_config(server),
+                uri,
+                timeout_seconds=get_settings().tool_timeout_seconds,
+            )
         )
         content, meta = _extract_app_resource(result, uri)
+    except MCPAdapterError as exc:
+        entry = ERROR_REGISTRY.get(exc.code)
+        if entry is None or entry.visibility is not ErrorVisibility.PUBLIC:
+            entry = ERROR_REGISTRY.require("INTERNAL_ERROR")
+        raise build_http_exception(entry.code) from exc
     except MCPClientError as exc:
         raise _tool_http_error(status_code=502, detail=str(exc)) from exc
     return MCPAppResourceRead(
@@ -1155,6 +1178,7 @@ def call_mcp_app_tool(
         active_skill_id=request.active_skill_id,
         agent_id=request.agent_id,
         session_id=request.session_id,
+        user_id=current_user.id,
     )
     if result.mcp_app is not None:
         # Nested App views are not rendered inside another App. Keep the tool
@@ -1205,6 +1229,10 @@ def update_mcp_server(
     if row.apps_mode != request.apps_mode:
         row.negotiated_capabilities_json = {}
     row.apps_mode = request.apps_mode
+    row.auth_mode = request.auth_mode
+    row.oauth_client_id = request.oauth_client_id
+    row.oauth_client_metadata_url = request.oauth_client_metadata_url
+    row.oauth_redirect_uri = request.oauth_redirect_uri
     if request.capability_scope is not None:
         row.capability_scope = request.capability_scope
         _update_inherited_mcp_tool_scopes(db, row)
@@ -1271,11 +1299,14 @@ def discover_mcp_tools(
     ensure_open_gallery_admin(request.tenant_id, current_user)
     if agent_id and get_agent(db, request.tenant_id, agent_id) is None:
         raise _tool_http_error(status_code=404, detail="Agent not found")
-    connection = request.connection or _server_connection(row)
-    response = _discover_response(
-        connection,
-        apps_mode=request.apps_mode if request.connection is not None else row.apps_mode,
-    )
+    if row.auth_mode == "oauth_personal":
+        response = _discover_protected_server(row, current_user.id, db)
+    else:
+        connection = request.connection or _server_connection(row)
+        response = _discover_response(
+            connection,
+            apps_mode=request.apps_mode if request.connection is not None else row.apps_mode,
+        )
     if response.success:
         row.discovered_tools_json = [tool.model_dump() for tool in response.tools]
         row.negotiated_capabilities_json = dict(response.server_capabilities)
@@ -1319,8 +1350,11 @@ def sync_mcp_tools(
     """把发现到的工具落成 Tool 行（新建/更新 schema），可选择导入的子集。"""
     row = _get_mcp_server(db, request.tenant_id, server_id)
     ensure_open_gallery_admin(request.tenant_id, current_user)
-    connection = _server_connection(row)
-    discovery = _discover_response(connection, apps_mode=row.apps_mode)
+    discovery = (
+        _discover_protected_server(row, current_user.id, db)
+        if row.auth_mode == "oauth_personal"
+        else _discover_response(_server_connection(row), apps_mode=row.apps_mode)
+    )
     if not discovery.success:
         return MCPSyncResponse(success=False, error=_discovery_error(discovery))
 
@@ -1464,6 +1498,112 @@ def _discover_response(
             if item.get("name")
         ],
     )
+
+
+def _discover_protected_server(
+    server: MCPServer,
+    user_id: str,
+    db: Session,
+) -> MCPDiscoverResponse:
+    """Discover one saved protected server through the current user's official SDK grant."""
+    bind = db.get_bind()
+    if (
+        not isinstance(bind, Engine)
+        or server.transport != "streamable_http"
+        or not server.url
+        or not server.oauth_redirect_uri
+    ):
+        return MCPDiscoverResponse(
+            success=False,
+            error=_typed_tool_error("MCP_OAUTH_PROVIDER_UNSUPPORTED"),
+        )
+    storage = MCPGrantTokenStorage(
+        bind,
+        server.tenant_id,
+        server.id,
+        user_id,
+        public_client_id=server.oauth_client_id,
+        redirect_uri=server.oauth_redirect_uri,
+    )
+    status = storage.read_status()
+    if status.state != "connected":
+        code = (
+            "MCP_TOKEN_REFRESH_FAILED"
+            if status.state == "reconnect_required"
+            else "MCP_AUTHORIZATION_REQUIRED"
+        )
+        return MCPDiscoverResponse(success=False, error=_typed_tool_error(code))
+    adapter = MCPSDKAdapter(
+        server_url=server.url,
+        headers=dict(server.headers_json or {}),
+        storage=storage,
+        redirect_uri=server.oauth_redirect_uri,
+        client_metadata_url=server.oauth_client_metadata_url,
+        timeout_seconds=get_settings().tool_timeout_seconds,
+    )
+    try:
+        discovery = _run_coroutine(adapter.discover())
+    except MCPAdapterError as exc:
+        if exc.code == "MCP_TOKEN_REFRESH_FAILED":
+            storage.mark_reconnect_required()
+        return MCPDiscoverResponse(success=False, error=_typed_tool_error(exc.code))
+    return MCPDiscoverResponse(
+        success=True,
+        server_capabilities=discovery.get("server_capabilities", {}),
+        server_info=discovery.get("server_info", {}),
+        tools=[
+            MCPDiscoveredTool(**item)
+            for item in discovery.get("tools", [])
+            if isinstance(item, dict) and item.get("name")
+        ],
+    )
+
+
+def _read_protected_resource(
+    server: MCPServer,
+    user_id: str,
+    db: Session,
+    uri: str,
+) -> dict[str, Any]:
+    """Read one MCP Apps resource with the signed-in user's OAuth grant."""
+    bind = db.get_bind()
+    if (
+        not isinstance(bind, Engine)
+        or server.transport != "streamable_http"
+        or not server.url
+        or not server.oauth_redirect_uri
+    ):
+        raise MCPAdapterError("MCP_OAUTH_PROVIDER_UNSUPPORTED")
+    storage = MCPGrantTokenStorage(
+        bind,
+        server.tenant_id,
+        server.id,
+        user_id,
+        public_client_id=server.oauth_client_id,
+        redirect_uri=server.oauth_redirect_uri,
+    )
+    status = storage.read_status()
+    if status.state != "connected":
+        code = (
+            "MCP_TOKEN_REFRESH_FAILED"
+            if status.state == "reconnect_required"
+            else "MCP_AUTHORIZATION_REQUIRED"
+        )
+        raise MCPAdapterError(code)
+    adapter = MCPSDKAdapter(
+        server_url=server.url,
+        headers=dict(server.headers_json or {}),
+        storage=storage,
+        redirect_uri=server.oauth_redirect_uri,
+        client_metadata_url=server.oauth_client_metadata_url,
+        timeout_seconds=get_settings().tool_timeout_seconds,
+    )
+    try:
+        return _run_coroutine(adapter.read_resource(uri))
+    except MCPAdapterError as exc:
+        if exc.code == "MCP_TOKEN_REFRESH_FAILED":
+            storage.mark_reconnect_required()
+        raise
 
 
 def _synced_mcp_tool_config(tool: MCPDiscoveredTool) -> dict[str, Any]:

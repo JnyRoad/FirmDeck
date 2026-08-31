@@ -1,5 +1,6 @@
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
@@ -9,8 +10,8 @@ from sqlmodel import Session, SQLModel, create_engine, select
 from app.api.tools import (
     MCP_APP_RESOURCE_MAX_BYTES,
     _extract_app_resource,
-    create_mcp_server,
     call_mcp_app_tool,
+    create_mcp_server,
     delete_mcp_server,
     discover_mcp_tools,
     discover_mcp_tools_adhoc,
@@ -18,18 +19,17 @@ from app.api.tools import (
     list_tools,
     sync_mcp_tools,
 )
-from app.db.models import MCPServer, Tenant, Tool, User
-from app.db.models import AgentProfile, AgentResourceBinding
-from app.tools.tool_executor import ToolExecutor
+from app.db.models import AgentProfile, AgentResourceBinding, MCPServer, Tenant, Tool, User
 from app.tools.mcp_client import (
     MCPClientError,
     discover_mcp_server,
     execute_mcp_tool_result,
     read_mcp_resource,
 )
+from app.tools.tool_executor import ToolExecutor
 from app.tools.tool_schema import (
-    MCPDiscoverRequest,
     MCPAppToolCallRequest,
+    MCPDiscoverRequest,
     MCPServerConnection,
     MCPServerCreateRequest,
     MCPSyncRequest,
@@ -237,6 +237,120 @@ def test_synced_mcp_app_renders_and_calls_read_only_tool() -> None:
         assert app_call.result is not None
         assert app_call.result.data == {"message": "from app"}
         assert app_call.result.mcp_app is None
+
+
+def test_protected_mcp_app_resource_uses_current_users_sdk_grant(monkeypatch) -> None:
+    """Catch protected resources falling back to the unauthenticated legacy client."""
+    captured: dict[str, object] = {}
+
+    class FakeStorage:
+        """Expose a connected current-user projection without storing credentials."""
+
+        def __init__(self, engine, tenant_id, server_id, user_id, **kwargs) -> None:
+            """Capture the grant owner selected by the API boundary."""
+            del engine, kwargs
+            captured["owner"] = (tenant_id, server_id, user_id)
+
+        def read_status(self):
+            """Mark the fake owner grant connected."""
+            return SimpleNamespace(state="connected")
+
+    class FakeAdapter:
+        """Return a protected resource through the official-SDK adapter contract."""
+
+        def __init__(self, **kwargs) -> None:
+            """Capture public provider policy without secrets."""
+            captured["adapter"] = kwargs
+
+        async def read_resource(self, uri: str) -> dict[str, object]:
+            """Return the requested MCP Apps resource envelope."""
+            captured["uri"] = uri
+            return {
+                "contents": [
+                    {
+                        "uri": uri,
+                        "mimeType": "text/html;profile=mcp-app",
+                        "text": "<main>Protected app</main>",
+                    }
+                ]
+            }
+
+    def legacy_read(*args, **kwargs):
+        """Fail if the OAuth route reaches the custom no-auth client."""
+        del args, kwargs
+        raise AssertionError("protected resource used legacy client")
+
+    monkeypatch.setattr("app.api.tools.MCPGrantTokenStorage", FakeStorage)
+    monkeypatch.setattr("app.api.tools.MCPSDKAdapter", FakeAdapter)
+    monkeypatch.setattr("app.api.tools.read_mcp_resource", legacy_read)
+
+    with _test_session() as db:
+        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.add(
+            AgentProfile(
+                id="agent_overall",
+                tenant_id="tenant_demo",
+                name="Overall",
+                is_overall=True,
+            )
+        )
+        server = MCPServer(
+            id="server_oauth_app",
+            tenant_id="tenant_demo",
+            name="oauth_app",
+            transport="streamable_http",
+            url="https://mcp.example.test/mcp",
+            apps_mode="auto",
+            auth_mode="oauth_personal",
+            oauth_client_id="staffdeck-public",
+            oauth_redirect_uri=(
+                "https://staffdeck.example.test/"
+                "api/enterprise/mcp-servers/oauth/callback"
+            ),
+            enabled=True,
+        )
+        db.add(server)
+        tool = Tool(
+            id="tool_oauth_app",
+            tenant_id="tenant_demo",
+            name="oauth_app.render",
+            tool_type="mcp",
+            method="POST",
+            url="mcp://oauth_app/render",
+            mcp_server_id=server.id,
+            config_json={
+                "tool": "render",
+                "mcp_apps": {
+                    "resource_uri": "ui://protected/app",
+                    "visibility": ["model", "app"],
+                },
+            },
+            enabled=True,
+        )
+        db.add(tool)
+        db.add(
+            AgentResourceBinding(
+                tenant_id="tenant_demo",
+                agent_id="agent_overall",
+                resource_type="tool",
+                resource_id=tool.id,
+                status="active",
+            )
+        )
+        db.commit()
+
+        resource = get_mcp_app_resource(
+            server.id,
+            "tenant_demo",
+            "ui://protected/app",
+            "agent_overall",
+            db,
+            _admin_user(),
+        )
+
+    assert resource.text == "<main>Protected app</main>"
+    assert captured["owner"] == ("tenant_demo", "server_oauth_app", "user_admin")
+    assert captured["uri"] == "ui://protected/app"
 
 
 def test_mcp_app_side_effect_call_requires_confirmation() -> None:

@@ -465,6 +465,26 @@ def _migrate_sqlite_skill_schema() -> None:
                         "WHERE negotiated_capabilities_json IS NULL"
                     )
                 )
+            if "auth_mode" not in mcp_server_columns:
+                conn.execute(
+                    text(
+                        "ALTER TABLE mcp_servers ADD COLUMN auth_mode "
+                        "VARCHAR NOT NULL DEFAULT 'none'"
+                    )
+                )
+            if "oauth_client_id" not in mcp_server_columns:
+                conn.execute(text("ALTER TABLE mcp_servers ADD COLUMN oauth_client_id VARCHAR"))
+            if "oauth_client_metadata_url" not in mcp_server_columns:
+                conn.execute(
+                    text(
+                        "ALTER TABLE mcp_servers ADD COLUMN "
+                        "oauth_client_metadata_url VARCHAR"
+                    )
+                )
+            if "oauth_redirect_uri" not in mcp_server_columns:
+                conn.execute(
+                    text("ALTER TABLE mcp_servers ADD COLUMN oauth_redirect_uri VARCHAR")
+                )
 
         if "agent_profiles" in tables:
             agent_columns = {

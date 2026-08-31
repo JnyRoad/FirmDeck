@@ -96,6 +96,7 @@ plus /workspace/gallery before reporting success.
     - [4. Verify the Installation](#4-verify-the-installation)
     - [Useful Commands](#useful-commands)
       - [Unified Python Entry](#unified-python-entry)
+  - [MCP OAuth 2.1 + PKCE](#mcp-oauth-21--pkce)
   - [Core Workflows](#core-workflows)
   - [Project Structure](#project-structure)
   - [FAQ](#faq)
@@ -167,6 +168,33 @@ models can coexist. Signing out signs the local Codex CLI out of ChatGPT, affect
 subscription model and potentially other applications on the same computer that share that Codex
 login. This flow requires a local Codex CLI that can open a browser; it is not supported from
 remote or headless deployments.
+
+## MCP OAuth 2.1 + PKCE
+
+Saved Streamable HTTP MCP servers can opt in to per-user OAuth from the MCP server editor. StaffDeck
+uses the pinned official Python MCP SDK for protected discovery and invocation while preserving the
+existing client for no-auth, stdio, builtin, and legacy SSE connections.
+
+- Configure only public client data: either a pre-registered public client ID or a provider-supported
+  client metadata document URL, plus the exact redirect URI. Do not paste access tokens, refresh
+  tokens, PKCE verifiers, or client secrets into headers or the editor.
+- Each signed-in user connects and disconnects independently. SDK token and dynamic client models are
+  encrypted at rest and are never returned by server/status APIs.
+- The configured redirect URI must be HTTPS in deployed environments (loopback HTTP is allowed for
+  local development) and must route to
+  `/api/enterprise/mcp-servers/oauth/callback` on the same running StaffDeck instance.
+- An unfinished browser authorization expires after 10 minutes and cannot resume after a process
+  restart; start a new authorization instead.
+- Refresh operations are serialized per tenant/server/user in the current process and guarded by an
+  optimistic database version. Multi-worker deployments do not have a distributed refresh lock, so
+  route one user's OAuth work to a single process or add a distributed lock before scaling this path.
+- Frozen builds collect the `mcp` package modules and distribution metadata because the adapter checks
+  the reviewed SDK version at runtime.
+
+Provider registration remains external: the provider must accept the StaffDeck redirect URI and the
+configured public client identity, CIMD document, or SDK-supported dynamic registration. Live-provider
+interoperability is not implied by the controlled tests and must be validated separately with an
+approved StaffDeck client registration.
 
 ### 3. Launch the Web Demo
 

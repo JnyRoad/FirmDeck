@@ -59,12 +59,13 @@ datas = [
     (str(BACKEND / "app" / "llm" / "prompts"), "app/llm/prompts"),
     (str(BACKEND / "app" / "db" / "seed_fixtures"), "app/db/seed_fixtures"),
     (str(BACKEND / "mock_servers"), "mock_servers"),
-] + collect_data_files("tzdata") + copy_metadata("lark-channel-sdk")
+] + collect_data_files("tzdata") + copy_metadata("lark-channel-sdk") + copy_metadata("mcp")
 
 hiddenimports = (
     collect_submodules("uvicorn")
     + collect_submodules("sqlmodel")
     + collect_submodules("lark_channel")
+    + collect_submodules("mcp")
     + collect_submodules("app")
     + [
         # 顶层单文件模块：uvicorn 用字符串 "single_port_app:app" 运行时动态 import
