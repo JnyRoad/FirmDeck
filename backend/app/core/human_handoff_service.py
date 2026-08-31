@@ -56,6 +56,8 @@ class HumanHandoffService:
             legacy_ui_locale=None,
             legacy_agent_reply_locale=chat_session.agent_reply_locale,
         )
+        current_step = current_step_resolver()
+        pending_question_text = pending_question(current_step, step_result)
         existing = self.db.exec(
             select(HumanHandoffRequest)
             .where(HumanHandoffRequest.tenant_id == tenant_id)
@@ -63,8 +65,15 @@ class HumanHandoffService:
             .where(HumanHandoffRequest.status == "pending")
         ).first()
         if existing:
-            # Do not mutate a legacy duplicate unless the caller already has an
-            # explicit source snapshot; the compatibility path stays observable.
+            # Preserve the latest durable step metadata when concurrent execution
+            # observes the same pending request; this keeps resume context current.
+            existing.metadata_json = {
+                **dict(existing.metadata_json or {}),
+                "step": current_step or {},
+                "step_reply": step_result.reply,
+                "step_handoff": step_result.handoff,
+            }
+            existing.updated_at = utc_now()
             if language_context is not None:
                 existing_context = resolve_compatible_language_context(
                     snapshot=existing.language_context_json,
@@ -85,8 +94,6 @@ class HumanHandoffService:
             chat_session.updated_at = utc_now()
             return existing
 
-        current_step = current_step_resolver()
-        pending_question_text = pending_question(current_step, step_result)
         # Assignee 优先级:SOP 节点指定 → 当前渠道默认处理人 → 数字员工负责人 → 租户管理员。
         # 不再从知识库 Contact 概念推断 assignee(知识内容变化会导致处理人不稳定,
         # 且缺少权限/审计入口)。
@@ -126,6 +133,12 @@ class HumanHandoffService:
                 "active_step_id": chat_session.active_step_id,
                 "slots": chat_session.slots_json or {},
                 "pending_tasks": chat_session.pending_tasks_json or [],
+                # Resume runs use an internal channel marker. Keep the original
+                # external route so group handoffs return to the same chat.
+                "channel": chat_session.channel,
+                "channel_binding_id": chat_session.channel_binding_id,
+                "channel_account_key": chat_session.channel_account_key,
+                "channel_target": dict(chat_session.channel_target_json or {}),
             },
             metadata_json={
                 "step": current_step or {},

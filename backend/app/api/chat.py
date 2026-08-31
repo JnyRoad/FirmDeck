@@ -560,9 +560,9 @@ def _apply_handoff_reply(
 ) -> None:
     """把一条 pending handoff 置为 answered 并触发 SOP 恢复。
 
-    供网页 API(reply_human_handoff)与飞书 intake 回复分支复用。
+    供网页 API 与飞书/企微 intake 回复分支复用。
     调用前需已完成权限校验与状态校验;本函数负责落库 + 事件 + 异步恢复。
-    source: "web" 或 "feishu",由调用方显式指定(不再靠 user_id 前缀推断)。
+    source: "web"、"feishu" 或 "wecom",由调用方显式指定(不再靠 user_id 前缀推断)。
     """
     now = utc_now()
     row.status = "answered"
@@ -588,6 +588,11 @@ def _apply_handoff_reply(
     if chat_session and chat_session.tenant_id == row.tenant_id:
         chat_session.status = "active"
         chat_session.awaiting_input_json = None
+        chat_session.slots_json = {
+            **dict(chat_session.slots_json or {}),
+            "handoff_requested": False,
+            "handoff_completed": True,
+        }
         summary_prefix = localized_compat_text(
             language_context,
             zh_cn="最近回复：",
@@ -637,6 +642,28 @@ def _resume_human_handoff_worker(handoff_id: str) -> None:
             chat_session = db.get(ChatSession, handoff.session_id)
             if not chat_session or chat_session.tenant_id != handoff.tenant_id:
                 return
+            resume_payload = dict(handoff.resume_payload_json or {})
+            original_channel = str(resume_payload.get("channel") or "").strip()
+            original_binding_id = str(
+                resume_payload.get("channel_binding_id") or ""
+            ).strip()
+            original_account_key = str(
+                resume_payload.get("channel_account_key") or ""
+            ).strip()
+            original_target = resume_payload.get("channel_target")
+            if original_channel:
+                chat_session.channel = original_channel
+            if original_binding_id:
+                chat_session.channel_binding_id = original_binding_id
+            if original_account_key:
+                chat_session.channel_account_key = original_account_key
+            if isinstance(original_target, dict) and original_target:
+                chat_session.channel_target_json = dict(original_target)
+            elif chat_session.channel_target_json:
+                # Legacy handoffs predate the target snapshot; preserve the
+                # already anchored target, especially a WeCom group chatid.
+                chat_session.channel_target_json = dict(chat_session.channel_target_json)
+            db.add(chat_session)
             language_context = resolve_compatible_language_context(
                 snapshot=handoff.language_context_json,
                 legacy_ui_locale=None,

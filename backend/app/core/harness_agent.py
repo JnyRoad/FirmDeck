@@ -844,11 +844,9 @@ def _finish_result(
     next_step_id = str(action.next_step_id or "").strip() or None
     if next_step_id and next_step_id not in allowed_next_steps:
         next_step_id = None
-    # Merely allowing the optional handoff_human action must not turn an otherwise
-    # successful SOP step into a handoff. Even a dedicated handoff node may have a
-    # valid non-handoff transition chosen by the model; only a terminal handoff node
-    # with no selected successor is coerced to the handoff status.
-    if step_type == "handoff" and status == "completed" and next_step_id is None:
+    # A dedicated terminal handoff node owns the routing decision; normalize any
+    # model status to the durable handoff state when no successor is selected.
+    if step_type == "handoff" and next_step_id is None:
         status = "handoff"
     return TaskExecutionResult(
         task_frame_id=requirement.task_frame_id,

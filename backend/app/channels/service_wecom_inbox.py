@@ -99,6 +99,17 @@ def stage_wecom_inbound(
                 "to_user_id": inbound.conv_key if inbound.is_group else inbound.from_user_id,
                 "context_token": inbound.context_token,
             }
+            if inbound.is_group:
+                target.update(
+                    {
+                        "reply_to_user_id": inbound.from_user_id,
+                        "is_group": True,
+                        "reply_quote": {
+                            "sender_name": inbound.sender_name or inbound.from_user_id,
+                            "text": inbound.text,
+                        },
+                    }
+                )
             event = ChannelInboundEvent(
                 id=new_id("chevt"),
                 tenant_id=binding.tenant_id,

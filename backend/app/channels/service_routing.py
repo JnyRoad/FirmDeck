@@ -133,6 +133,32 @@ _NOTICE_TEXT: dict[str, dict[SupportedLocale, str]] = {
             "You can also reply directly to the quoted human handoff notice."
         ),
     },
+    "handoff.wecom_command_usage": {
+        SupportedLocale.ZH_CN: (
+            "用法：/回复反馈 <handoff_id> <答复内容>\n"
+            "请使用通知中的 handoff ID 精确回复人工转接请求。"
+        ),
+        SupportedLocale.EN_US: (
+            "Usage: /handoff_reply <handoff_id> <response>\n"
+            "Use the handoff ID from the notice to answer the exact request."
+        ),
+    },
+    "handoff.wecom_placeholder": {
+        SupportedLocale.ZH_CN: "请把 <答复内容> 替换成实际回复文本。",
+        SupportedLocale.EN_US: "Replace <response> with the actual human response.",
+    },
+    "handoff.wecom_id_missing": {
+        SupportedLocale.ZH_CN: "未找到分配给你的待处理人工转接请求，请检查 handoff ID。",
+        SupportedLocale.EN_US: "No pending handoff assigned to you was found. Check the handoff ID.",
+    },
+    "handoff.wecom_reply_required": {
+        SupportedLocale.ZH_CN: "请在 handoff ID 后提供人工答复内容。",
+        SupportedLocale.EN_US: "Provide the human response after the handoff ID.",
+    },
+    "handoff.wecom_notice_missing": {
+        SupportedLocale.ZH_CN: "该人工转接请求未投递给你的当前企业微信账号。",
+        SupportedLocale.EN_US: "This handoff request was not delivered to your current WeCom account.",
+    },
     "handoff.identity_missing": {
         SupportedLocale.ZH_CN: "未找到待处理的人工转接请求。或当前渠道账号未绑定到 StaffDeck 处理人身份。",
         SupportedLocale.EN_US: "No pending human handoff request was found, or this channel account is not linked to the assigned StaffDeck user.",
@@ -204,6 +230,10 @@ _NOTICE_TEXT: dict[str, dict[SupportedLocale, str]] = {
     "handoff.reply_instructions": {
         SupportedLocale.ZH_CN: "如需答复，请直接回复本条消息（引用后输入答复内容）；也可发送 /回复反馈 <答复内容>。",
         SupportedLocale.EN_US: "Reply directly to this message with the response, or send /handoff_reply <response>.",
+    },
+    "handoff.reply_instructions_wecom": {
+        SupportedLocale.ZH_CN: "请发送 /回复反馈 {handoff_id} <答复内容> 精确回复此请求。",
+        SupportedLocale.EN_US: "Send /handoff_reply {handoff_id} <response> to answer this exact request.",
     },
     "handoff.default_problem": {
         SupportedLocale.ZH_CN: "当前 SOP 需要人工确认后继续执行。",
@@ -344,6 +374,93 @@ _NOTICE_TEXT: dict[str, dict[SupportedLocale, str]] = {
     "trace.skill.reason_completed": {
         SupportedLocale.ZH_CN: "全部步骤已完成",
         SupportedLocale.EN_US: "All steps completed",
+    },
+    # WeCom stream progress uses the same immutable reply-locale contract as
+    # Feishu trace cards.  The values are product chrome; names and intent are
+    # explicitly supplied raw parameters and are never translated here.
+    "wecom.progress.thinking": {
+        SupportedLocale.ZH_CN: "{icon} 正在思考…",
+        SupportedLocale.EN_US: "{icon} Thinking…",
+    },
+    "wecom.progress.intent": {
+        SupportedLocale.ZH_CN: "✅ 已判断意图：{intent}",
+        SupportedLocale.EN_US: "✅ Intent identified: {intent}",
+    },
+    "wecom.progress.skill_started": {
+        SupportedLocale.ZH_CN: "⏳ 进入流程：{skill_name}…",
+        SupportedLocale.EN_US: "⏳ Entering workflow: {skill_name}…",
+    },
+    "wecom.progress.skill_resumed": {
+        SupportedLocale.ZH_CN: "⏳ 恢复流程：{skill_name}…",
+        SupportedLocale.EN_US: "⏳ Resuming workflow: {skill_name}…",
+    },
+    "wecom.progress.step": {
+        SupportedLocale.ZH_CN: "⏳ 推进流程：{step_name}…",
+        SupportedLocale.EN_US: "⏳ Advancing workflow: {step_name}…",
+    },
+    "wecom.progress.task": {
+        SupportedLocale.ZH_CN: "⏳ 正在处理：{task_name}…",
+        SupportedLocale.EN_US: "⏳ Processing: {task_name}…",
+    },
+    "wecom.progress.task_default": {
+        SupportedLocale.ZH_CN: "⏳ 正在处理当前任务…",
+        SupportedLocale.EN_US: "⏳ Processing the current task…",
+    },
+    "wecom.progress.tool_started": {
+        SupportedLocale.ZH_CN: "⏳ 调用工具：{tool_name}…",
+        SupportedLocale.EN_US: "⏳ Calling capability: {tool_name}…",
+    },
+    "wecom.progress.tool_started_default": {
+        SupportedLocale.ZH_CN: "⏳ 调用工具…",
+        SupportedLocale.EN_US: "⏳ Calling capability…",
+    },
+    "wecom.progress.tool_completed": {
+        SupportedLocale.ZH_CN: "✅ 能力调用完成：{tool_name}",
+        SupportedLocale.EN_US: "✅ Capability completed: {tool_name}",
+    },
+    "wecom.progress.tool_completed_default": {
+        SupportedLocale.ZH_CN: "✅ 能力调用完成",
+        SupportedLocale.EN_US: "✅ Capability completed",
+    },
+    "wecom.progress.tool_failed": {
+        SupportedLocale.ZH_CN: "❌ 能力调用失败：{tool_name}",
+        SupportedLocale.EN_US: "❌ Capability failed: {tool_name}",
+    },
+    "wecom.progress.tool_failed_default": {
+        SupportedLocale.ZH_CN: "❌ 能力调用失败",
+        SupportedLocale.EN_US: "❌ Capability failed",
+    },
+    "wecom.progress.knowledge_started": {
+        SupportedLocale.ZH_CN: "⏳ 查询业务资料：{query}…",
+        SupportedLocale.EN_US: "⏳ Searching business material: {query}…",
+    },
+    "wecom.progress.knowledge_started_default": {
+        SupportedLocale.ZH_CN: "⏳ 查询业务资料…",
+        SupportedLocale.EN_US: "⏳ Searching business material…",
+    },
+    "wecom.progress.knowledge_completed": {
+        SupportedLocale.ZH_CN: "✅ 读取业务资料完成（{count} 个资料片段）",
+        SupportedLocale.EN_US: "✅ Business material read ({count} excerpts)",
+    },
+    "wecom.progress.handoff": {
+        SupportedLocale.ZH_CN: "⏳ 转接人工处理…",
+        SupportedLocale.EN_US: "⏳ Handing off to a person…",
+    },
+    "wecom.progress.awaiting_user": {
+        SupportedLocale.ZH_CN: "📖 流程已暂停，等待补充信息",
+        SupportedLocale.EN_US: "📖 Workflow paused, waiting for more information",
+    },
+    "wecom.progress.skill_completed": {
+        SupportedLocale.ZH_CN: "✅ 完成流程",
+        SupportedLocale.EN_US: "✅ Workflow completed",
+    },
+    "wecom.progress.error": {
+        SupportedLocale.ZH_CN: "❌ 流程未完成，正在整理结果…",
+        SupportedLocale.EN_US: "❌ Workflow incomplete, preparing the result…",
+    },
+    "wecom.progress.finished": {
+        SupportedLocale.ZH_CN: "✅ 流程已结束",
+        SupportedLocale.EN_US: "✅ Workflow finished",
     },
 }
 
