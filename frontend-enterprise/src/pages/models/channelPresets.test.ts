@@ -127,6 +127,21 @@ describe('buildModelConfigPayload', () => {
 });
 
 describe('fetchProviderModels', () => {
+  it('uses the caller tenant for both the list-models query and request body', async () => {
+    mockedPost.mockResolvedValueOnce({ success: true, models: [] });
+
+    await fetchProviderModels({
+      tenantId: 'tenant-isolated',
+      apiProtocol: 'openai_chat_completions',
+      baseUrl: 'https://api.openai.com/v1',
+      apiKey: 'sk-test',
+    });
+
+    const [url, body] = mockedPost.mock.calls[0] as [string, Record<string, unknown>];
+    expect(url).toContain('tenant_id=tenant-isolated');
+    expect(body.tenant_id).toBe('tenant-isolated');
+  });
+
   it('posts protocol/base_url/api_key and returns the normalized result on success', async () => {
     mockedPost.mockResolvedValueOnce({
       success: true,
@@ -134,6 +149,7 @@ describe('fetchProviderModels', () => {
     });
 
     const result = await fetchProviderModels({
+      tenantId: 'tenant_demo',
       apiProtocol: 'openai_chat_completions',
       baseUrl: 'https://api.openai.com/v1',
       apiKey: 'sk-test',
@@ -154,7 +170,7 @@ describe('fetchProviderModels', () => {
       models: [{ id: 'gpt-5.6-terra', label: 'GPT-5.6-Terra' }],
     });
 
-    const result = await fetchProviderModels({ apiProtocol: 'codex_app_server' });
+    const result = await fetchProviderModels({ tenantId: 'tenant_demo', apiProtocol: 'codex_app_server' });
 
     const [, body] = mockedPost.mock.calls[0] as [string, Record<string, unknown>];
     expect(body.api_protocol).toBe('codex_app_server');
@@ -167,6 +183,7 @@ describe('fetchProviderModels', () => {
     mockedPost.mockRejectedValueOnce(new Error('network down'));
 
     const result = await fetchProviderModels({
+      tenantId: 'tenant_demo',
       apiProtocol: 'openai_chat_completions',
       baseUrl: 'https://api.openai.com/v1',
       apiKey: 'sk-test',

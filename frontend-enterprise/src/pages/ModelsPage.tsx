@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { Check, FlaskConical, LoaderCircle, Trash2 } from 'lucide-react';
 
 import { api, ApiError, TENANT_ID } from '../api/client';
@@ -28,11 +28,12 @@ import IconRefresh from '../assets/icons/refresh.svg?react';
 import IconSearch from '../assets/icons/search.svg?react';
 import { StatusBadge } from './scheduled-tasks/StatusBadge';
 import { useClientPagination } from '../hooks/useClientPagination';
-import type { CodexSubscriptionAccountRead, ModelAuthMode, ModelConfigRead } from '../types';
+import type { ModelAuthMode, ModelConfigRead } from '../types';
 import { OPEN_MODEL_CREATE_EVENT } from '@/components/QuickStartGuide';
 import ModelSetupWizard from './models/ModelSetupWizard';
 import ModelEditDialog from './models/ModelEditDialog';
 import type { ApiKeyProtocol } from './models/channelPresets';
+import { useCodexSubscriptionAccount } from './models/useCodexSubscriptionAccount';
 
 const MODEL_PAGE_SIZE = 8;
 const MODEL_TEST_UI_TIMEOUT_MS = 100_000;
@@ -179,6 +180,7 @@ export function modelActionError(error: unknown, fallback: string): string {
 }
 const MODEL_CONFIGS_UPDATED_EVENT = 'ultrarag-enterprise-model-configs-updated';
 
+/** 展示当前租户的模型配置，并复用统一向导与订阅账号状态。 */
 export default function ModelsPage({
   currentUser,
   onLogout,
@@ -193,12 +195,17 @@ export default function ModelsPage({
   const [wizardOpen, setWizardOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<ModelConfigRead | null>(null);
   const [deleting, setDeleting] = useState(false);
-  const [subscriptionAccount, setSubscriptionAccount] = useState<CodexSubscriptionAccountRead | null>(null);
-  const [subscriptionLoading, setSubscriptionLoading] = useState(false);
   const [subscriptionLogoutConfirmOpen, setSubscriptionLogoutConfirmOpen] = useState(false);
   const testingModelIdsRef = useRef(new Set<string>());
   const [testingModelIds, setTestingModelIds] = useState<Set<string>>(new Set());
   const [availableProtocols, setAvailableProtocols] = useState<ApiKeyProtocol[]>(['openai_chat_completions']);
+  const {
+    account: subscriptionAccount,
+    loading: subscriptionLoading,
+    startLogin: startSubscriptionLogin,
+    cancelLogin: cancelSubscriptionLogin,
+    logout: logoutSubscription,
+  } = useCodexSubscriptionAccount({ tenantId: TENANT_ID });
 
   const load = (showLoading = true) => {
     if (showLoading) setLoading(true);
@@ -214,30 +221,12 @@ export default function ModelsPage({
       });
   };
 
-  const loadSubscriptionAccount = useCallback(async () => {
-    try {
-      const account = await api.get<CodexSubscriptionAccountRead>(
-        `/api/enterprise/model-configs/codex-subscription/account?tenant_id=${TENANT_ID}`,
-      );
-      setSubscriptionAccount(account);
-    } catch (error) {
-      notify.error(apiErrorMessage(error, '无法读取 ChatGPT 订阅状态'));
-    }
-  }, []);
-
   useEffect(() => {
     void load();
     void api
       .get<{ protocols: ApiKeyProtocol[] }>(`/api/enterprise/model-configs/protocols?tenant_id=${TENANT_ID}`)
       .then((result) => setAvailableProtocols(result.protocols));
-    void loadSubscriptionAccount();
-  }, [loadSubscriptionAccount]);
-
-  useEffect(() => {
-    if (subscriptionAccount?.status !== 'pending') return;
-    const intervalId = window.setInterval(() => void loadSubscriptionAccount(), 2_000);
-    return () => window.clearInterval(intervalId);
-  }, [loadSubscriptionAccount, subscriptionAccount?.status]);
+  }, []);
 
   useEffect(() => {
     const openCreate = () => setWizardOpen(true);
@@ -261,39 +250,15 @@ export default function ModelsPage({
   const defaultRow = rows.find((item) => item.is_default);
   const providerCount = new Set(rows.map((item) => item.api_protocol).filter(Boolean)).size;
 
-  async function updateSubscriptionAccount(
-    action: 'login' | 'login/cancel' | 'logout',
-    fallback: string,
-  ) {
-    setSubscriptionLoading(true);
-    try {
-      const account = await api.post<CodexSubscriptionAccountRead>(
-        `/api/enterprise/model-configs/codex-subscription/${action}?tenant_id=${TENANT_ID}`,
-      );
-      setSubscriptionAccount(account);
-      notify.success(account.message);
-    } catch (error) {
-      notify.error(apiErrorMessage(error, fallback));
-    } finally {
-      setSubscriptionLoading(false);
-    }
-  }
-
-  function startSubscriptionLogin() {
-    void updateSubscriptionAccount('login', '无法启动本机 Codex 登录');
-  }
-
-  function cancelSubscriptionLogin() {
-    void updateSubscriptionAccount('login/cancel', '无法取消本机 Codex 登录');
-  }
-
+  /** 打开退出本机 Codex 的影响确认。 */
   function requestSubscriptionLogout() {
     setSubscriptionLogoutConfirmOpen(true);
   }
 
+  /** 确认退出后关闭提示，并交由共享订阅账号逻辑执行。 */
   function confirmSubscriptionLogout() {
     setSubscriptionLogoutConfirmOpen(false);
-    void updateSubscriptionAccount('logout', '无法退出 ChatGPT 订阅');
+    void logoutSubscription();
   }
 
   async function confirmDelete() {
@@ -571,6 +536,7 @@ export default function ModelsPage({
 
       <ModelSetupWizard
         open={wizardOpen}
+        tenantId={TENANT_ID}
         onOpenChange={setWizardOpen}
         onCreated={(model, options) => {
           void load();

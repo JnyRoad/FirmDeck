@@ -21,6 +21,8 @@ vi.mock('@/api/client', async (importOriginal) => {
 const mockedPost = vi.mocked(api.post);
 const mockedPut = vi.mocked(api.put);
 
+type TenantAwareWizardProps = ModelSetupWizardProps & { tenantId: string };
+
 function stubSelectPointerCapture() {
   if (!Element.prototype.hasPointerCapture) {
     Element.prototype.hasPointerCapture = () => false;
@@ -33,9 +35,11 @@ function stubSelectPointerCapture() {
   }
 }
 
-function renderWizard(overrides: Partial<ModelSetupWizardProps> = {}) {
-  const props: ModelSetupWizardProps = {
+/** 使用显式租户和默认依赖渲染模型创建向导。 */
+function renderWizard(overrides: Partial<TenantAwareWizardProps> = {}) {
+  const props: TenantAwareWizardProps = {
     open: true,
+    tenantId: 'tenant-isolated',
     onOpenChange: vi.fn(),
     onCreated: vi.fn(),
     availableProtocols: ['openai_chat_completions', 'anthropic_messages', 'gemini_generate_content'],
@@ -191,6 +195,7 @@ describe('ModelSetupWizard — vendor branch (US1)', () => {
     expect(body.api_key).toBe('sk-test-123');
     expect(body.model).toBe('gpt-4o');
     expect(body.enabled).toBe(true);
+    expect(body.tenant_id).toBe('tenant-isolated');
 
     // A passing test already means the model is saved — the wizard closes
     // itself instead of showing a banner that needs a "完成" click.
@@ -341,6 +346,8 @@ describe('ModelSetupWizard — auto-fetching the model list', () => {
     expect(await screen.findByText(/已自动获取到 1 个模型/)).toBeTruthy();
     const [url, body] = mockedPost.mock.calls[0] as [string, Record<string, unknown>];
     expect(url).toContain('/list-models');
+    expect(url).toContain('tenant_id=tenant-isolated');
+    expect(body.tenant_id).toBe('tenant-isolated');
     expect(body.api_protocol).toBe('openai_chat_completions');
     expect(body.base_url).toBe('https://api.openai.com/v1');
     expect(body.api_key).toBe('sk-real-key');
@@ -667,6 +674,7 @@ describe('ModelSetupWizard — closing mid-flow discards unsaved input', () => {
 
     rerender(createElement(I18nProvider, null, createElement(ModelSetupWizard, {
       open: true,
+      tenantId: 'tenant-isolated',
       onOpenChange,
       onCreated: vi.fn(),
       availableProtocols: ['openai_chat_completions'],
