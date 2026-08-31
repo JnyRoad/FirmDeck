@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import re
@@ -7,9 +8,10 @@ import secrets
 import threading
 import time
 from datetime import datetime, timedelta
+from typing import Annotated
 from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile
 from fastapi.responses import Response as FastAPIResponse
 from sqlalchemy import case, or_, text, update
 from sqlalchemy.exc import IntegrityError
@@ -31,6 +33,12 @@ from app.channels.adapters.feishu import (
     validate_feishu_credentials,
 )
 from app.channels.adapters.wechat import WeChatClient, sanitize_wechat_baseurl, validate_wechat_host
+from app.channels.adapters.wechat_kf import (
+    WeChatKfAdapter,
+    WeChatKfPermanentError,
+    WeChatKfTokenProvider,
+    WeChatKfTransientError,
+)
 from app.channels.crypto import decrypt_channel_secret, encrypt_channel_secret
 from app.channels.schema import (
     ChannelBindCodeRead,
@@ -54,6 +62,11 @@ from app.channels.schema import (
     DingTalkCredentialsRequest,
     FeishuCredentialsRequest,
     MyIdentityBindingRead,
+    WeChatKfAccountCreateRequest,
+    WeChatKfAccountSelectRequest,
+    WeChatKfAccountUpdateRequest,
+    WeChatKfCallbackConfigRequest,
+    WeChatKfCredentialsRequest,
     WeComCredentialsRequest,
     channel_binding_agents_read,
     channel_binding_read,
@@ -90,6 +103,7 @@ from app.db.models import (
     Message,
     Team,
     User,
+    WeChatKfAccount,
     utc_now,
 )
 from app.security.auth import get_current_user
@@ -185,10 +199,16 @@ def _patch_binding_config_key(
     if result.rowcount != 1:
         raise _channel_http_error(status_code=404, detail="渠道绑定不存在")
 
-SUPPORTED_CHANNELS = {"wechat", "wecom", "feishu", "dingtalk"}
+SUPPORTED_CHANNELS = {"wechat", "wechat_kf", "wecom", "feishu", "dingtalk"}
 INGRESS_QUIESCE_TIMEOUT_SECONDS = 5.0
 # 渠道中文名:错误信息与通知文案共用
-_CHANNEL_LABELS = {"wechat": "微信", "wecom": "企业微信", "feishu": "飞书", "dingtalk": "钉钉"}
+_CHANNEL_LABELS = {
+    "wechat": "微信",
+    "wechat_kf": "微信客服",
+    "wecom": "企业微信",
+    "feishu": "飞书",
+    "dingtalk": "钉钉",
+}
 # 接入显示名长度上限(前后端一致)
 BINDING_NAME_MAX_LENGTH = 50
 
@@ -213,6 +233,16 @@ def _validated_binding_name(raw: str | None, *, default: str | None = None) -> s
 
 # 渠道描述:前端接入页据此渲染渠道卡片与凭证表单,新渠道只加条目不动页面骨架
 CHANNEL_META = [
+    {
+        "channel": "wechat_kf",
+        "name": "微信客服",
+        "setup": "wechat_kf",
+        "credential_fields": [
+            {"key": "corp_id", "label": "企业 ID", "placeholder": "ww...", "secret": False},
+            {"key": "secret", "label": "微信客服应用 Secret", "secret": True},
+        ],
+        "capabilities": ["text", "callback"],
+    },
     {
         "channel": "wechat",
         "name": "微信",
@@ -802,6 +832,7 @@ def delete_channel_binding(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_session),
 ) -> Response:
+    """Delete one authorized binding after ingress and intake generation quiesce."""
     ensure_current_user_tenant(tenant_id, current_user)
     binding = _get_binding(db, tenant_id, binding_id)
     _ensure_binding_manager(db, tenant_id, binding, current_user)
@@ -888,6 +919,10 @@ def delete_channel_binding(
                 select(ChannelConvState).where(ChannelConvState.binding_id == binding.id)
             ).all():
                 db.delete(state)
+            for account in db.exec(
+                select(WeChatKfAccount).where(WeChatKfAccount.binding_id == binding.id)
+            ).all():
+                db.delete(account)
             db.delete(binding)
             db.commit()
         except Exception:
@@ -1378,6 +1413,510 @@ def save_wecom_credentials(
             raise
         _resume_binding(channel, binding_id, start=True)
     return channel_binding_read(db, binding, current_user)
+
+
+def _validated_wechat_kf_credentials(
+    request: WeChatKfCredentialsRequest,
+    existing: dict[str, object],
+) -> tuple[str, dict[str, str]]:
+    """校验并合并微信客服凭据；不写数据库或访问 provider。"""
+    corp_id = request.corp_id.strip()
+    secret = request.secret.strip()
+    callback_token = request.callback_token.strip() or str(
+        existing.get("callback_token") or ""
+    ).strip()
+    encoding_aes_key = request.encoding_aes_key.strip() or str(
+        existing.get("encoding_aes_key") or ""
+    ).strip()
+    if not re.fullmatch(r"ww[A-Za-z0-9_-]{1,126}", corp_id):
+        raise _channel_http_error(400, "wechat kf corp id invalid")
+    if not secret or len(secret) > 512:
+        raise _channel_http_error(400, "wechat kf secret invalid")
+    if not callback_token or len(callback_token) > 256:
+        raise _channel_http_error(400, "wechat kf callback token invalid")
+    try:
+        aes_bytes = base64.urlsafe_b64decode(encoding_aes_key + "=")
+    except ValueError as exc:
+        raise _channel_http_error(400, exc) from exc
+    if len(encoding_aes_key) != 43 or len(aes_bytes) != 32:
+        raise _channel_http_error(400, "wechat kf AES key invalid")
+    return corp_id, {
+        "secret": secret,
+        "callback_token": callback_token,
+        "encoding_aes_key": encoding_aes_key,
+    }
+
+
+def _wechat_kf_existing_credentials(binding: ChannelBinding) -> dict[str, object]:
+    """解密已有微信客服凭据供安全合并；失败根因只进入私有错误上下文。"""
+    if not binding.credentials_enc:
+        return {}
+    try:
+        value = json.loads(decrypt_channel_secret(binding.credentials_enc))
+    except (ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise _channel_http_error(400, exc) from exc
+    if not isinstance(value, dict):
+        raise _channel_http_error(400, "wechat kf credentials are not an object")
+    return value
+
+
+def _wechat_kf_management_binding(
+    db: Session,
+    tenant_id: str,
+    binding_id: str,
+    current_user: User,
+) -> ChannelBinding:
+    """读取并授权微信客服管理绑定；数据库只读。"""
+    ensure_current_user_tenant(tenant_id, current_user)
+    binding = _get_binding(db, tenant_id, binding_id)
+    _ensure_binding_manager(
+        db,
+        tenant_id,
+        binding,
+        current_user,
+        action=_MANAGER_ACTION_CREDENTIALS,
+    )
+    if binding.channel != "wechat_kf":
+        raise _channel_http_error(400, "binding is not wechat kf")
+    return binding
+
+
+def _raise_wechat_kf_provider_error(exc: Exception) -> None:
+    """把 provider 异常投影为注册公共错误，原始异常仅保留为私有诊断。"""
+    if isinstance(exc, WeChatKfPermanentError):
+        raise _channel_http_error(400, exc) from exc
+    raise _channel_http_error(502, exc) from exc
+
+
+@router.post("/{binding_id}/wechat_kf/callback-config")
+def prepare_wechat_kf_callback_config(
+    binding_id: str,
+    request: WeChatKfCallbackConfigRequest,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_session)],
+) -> dict[str, str]:
+    """生成并加密回调凭据；会更新绑定代际但不要求 provider Secret。"""
+    # 先完成权限、渠道和 corp 输入校验，再进入 binding 生命周期锁。
+    binding = _wechat_kf_management_binding(
+        db, request.tenant_id, binding_id, current_user
+    )
+    corp_id = request.corp_id.strip()
+    if not re.fullmatch(r"ww[A-Za-z0-9_-]{1,126}", corp_id):
+        raise _channel_http_error(400, "wechat kf corp id invalid")
+    db.rollback()
+    with binding_lifecycle_lock(binding_id):
+        binding = _wechat_kf_management_binding(
+            db, request.tenant_id, binding_id, current_user
+        )
+        config = dict(binding.config_json or {})
+        old_corp_id = str(config.get("corp_id") or "").strip()
+        if old_corp_id and old_corp_id != corp_id:
+            raise _channel_http_error(409, "wechat kf corp identity is immutable")
+        callback_token = secrets.token_hex(24)
+        encoding_aes_key = secrets.token_urlsafe(32)
+        credentials = {
+            "secret": str(_wechat_kf_existing_credentials(binding).get("secret") or ""),
+            "callback_token": callback_token,
+            "encoding_aes_key": encoding_aes_key,
+        }
+        config.update(
+            {
+                "corp_id": corp_id,
+                "callback_ready": True,
+                "bound_at": utc_now().isoformat(),
+            }
+        )
+        account_key = external_account_key("wechat_kf", config)
+        if not account_key:
+            raise _channel_http_error(400, "wechat kf account key invalid")
+        _ensure_external_account_available(db, account_key, binding_id)
+        binding.config_json = config
+        binding.credentials_enc = encrypt_channel_secret(
+            json.dumps(credentials, separators=(",", ":"))
+        )
+        binding.identity_scope_key = corp_id
+        binding.external_account_key = account_key
+        binding.config_revision += 1
+        binding.status = "pending" if not credentials["secret"] else binding.status
+        binding.connected = False
+        binding.updated_at = utc_now()
+        db.add(binding)
+        try:
+            db.commit()
+        except IntegrityError as exc:
+            db.rollback()
+            raise _channel_http_error(409, exc) from exc
+    callback_path = f"/api/channels/wechat-kf/{binding_id}/callback"
+    return {
+        "callback_url": callback_path,
+        "callback_path": callback_path,
+        "callback_token": callback_token,
+        "encoding_aes_key": encoding_aes_key,
+    }
+
+
+@router.post("/{binding_id}/wechat_kf/credentials", response_model=ChannelBindingRead)
+def save_wechat_kf_credentials(
+    binding_id: str,
+    request: WeChatKfCredentialsRequest,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_session)],
+) -> ChannelBindingRead:
+    """验证并加密保存微信客服凭据；会切换绑定代际和连接状态。"""
+    # 先读取当前回调凭据并校验 prospective 配置，任何无效输入都不访问 provider。
+    binding = _wechat_kf_management_binding(
+        db, request.tenant_id, binding_id, current_user
+    )
+    corp_id, credentials = _validated_wechat_kf_credentials(
+        request, _wechat_kf_existing_credentials(binding)
+    )
+    db.rollback()
+    with binding_lifecycle_lock(binding_id):
+        binding = _wechat_kf_management_binding(
+            db, request.tenant_id, binding_id, current_user
+        )
+        corp_id, credentials = _validated_wechat_kf_credentials(
+            request, _wechat_kf_existing_credentials(binding)
+        )
+        expected_revision = binding.config_revision
+        should_run = bool(binding.status == "active" and binding.credentials_enc)
+        config = dict(binding.config_json or {})
+        old_corp_id = str(config.get("corp_id") or "").strip()
+        if old_corp_id and old_corp_id != corp_id:
+            raise _channel_http_error(409, "wechat kf corp identity is immutable")
+        config.update(
+            {
+                "corp_id": corp_id,
+                "callback_ready": True,
+                "bound_at": utc_now().isoformat(),
+            }
+        )
+        encrypted = encrypt_channel_secret(json.dumps(credentials, separators=(",", ":")))
+        account_key = external_account_key("wechat_kf", config)
+        if not account_key:
+            raise _channel_http_error(400, "wechat kf account key invalid")
+        _ensure_external_account_available(db, account_key, binding_id)
+
+        # 使用新代际的内存副本验证 token，验证失败不得覆盖旧凭据。
+        probe = ChannelBinding(
+            id=binding.id,
+            tenant_id=binding.tenant_id,
+            agent_id=binding.agent_id,
+            channel=binding.channel,
+            status="active",
+            config_json=config,
+            credentials_enc=encrypted,
+            config_revision=expected_revision + 1,
+        )
+        try:
+            WeChatKfTokenProvider().get(probe)
+        except (WeChatKfPermanentError, WeChatKfTransientError) as exc:
+            _raise_wechat_kf_provider_error(exc)
+
+        # provider 验证通过后暂停旧代际，并在同一事务内复核 revision 后提交。
+        db.rollback()
+        _quiesce_binding_or_409("wechat_kf", binding_id, should_run=should_run)
+        try:
+            binding = _wechat_kf_management_binding(
+                db, request.tenant_id, binding_id, current_user
+            )
+            _ensure_revision(binding, expected_revision)
+            _ensure_external_account_available(db, account_key, binding_id)
+            binding.config_json = config
+            binding.credentials_enc = encrypted
+            binding.external_account_key = account_key
+            binding.identity_scope_key = corp_id
+            binding.config_revision += 1
+            binding.status = "active"
+            binding.connected = False
+            binding.updated_at = utc_now()
+            db.add(binding)
+            adopt_orphan_channel_sessions(db, binding)
+            db.commit()
+            db.refresh(binding)
+        except IntegrityError as exc:
+            db.rollback()
+            _resume_binding("wechat_kf", binding_id, start=should_run)
+            raise _channel_http_error(409, exc) from exc
+        except Exception:
+            db.rollback()
+            _resume_binding("wechat_kf", binding_id, start=should_run)
+            raise
+        _resume_binding("wechat_kf", binding_id, start=True)
+    return channel_binding_read(db, binding, current_user)
+
+
+def _ensure_wechat_kf_account_binding(
+    db: Session,
+    binding: ChannelBinding,
+    open_kfid: str,
+    *,
+    name: str = "",
+) -> WeChatKfAccount:
+    """在 tenant/account 唯一约束内建立本地路由；会写当前数据库事务。"""
+    normalized = open_kfid.strip()
+    if not normalized or len(normalized) > 128:
+        raise _channel_http_error(400, "wechat kf account id invalid")
+    existing = db.exec(
+        select(WeChatKfAccount).where(
+            WeChatKfAccount.tenant_id == binding.tenant_id,
+            WeChatKfAccount.open_kfid == normalized,
+        )
+    ).first()
+    if existing and existing.binding_id != binding.id:
+        raise _channel_http_error(409, "wechat kf account already bound")
+    if existing:
+        if name:
+            existing.name = name.strip()
+            existing.updated_at = utc_now()
+            db.add(existing)
+        return existing
+    account = WeChatKfAccount(
+        tenant_id=binding.tenant_id,
+        binding_id=binding.id,
+        open_kfid=normalized,
+        name=name.strip(),
+        agent_id=binding.agent_id if not binding.team_id else None,
+        team_id=binding.team_id,
+    )
+    db.add(account)
+    return account
+
+
+@router.get("/{binding_id}/wechat_kf/accounts")
+def list_wechat_kf_accounts(
+    binding_id: str,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_session)],
+    tenant_id: str = Query(...),
+) -> dict[str, list[dict[str, object]]]:
+    """列出 provider 可管理账号及当前租户绑定状态；数据库只读。"""
+    binding = _wechat_kf_management_binding(db, tenant_id, binding_id, current_user)
+    if not binding.credentials_enc:
+        raise _channel_http_error(400, "wechat kf credentials missing")
+    try:
+        accounts = WeChatKfAdapter().list_accounts(binding)
+    except (WeChatKfPermanentError, WeChatKfTransientError) as exc:
+        _raise_wechat_kf_provider_error(exc)
+    mappings = {
+        row.open_kfid: row
+        for row in db.exec(
+            select(WeChatKfAccount).where(WeChatKfAccount.tenant_id == tenant_id)
+        ).all()
+    }
+    return {
+        "accounts": [
+            {
+                "open_kfid": str(item.get("open_kfid") or ""),
+                "name": str(item.get("name") or ""),
+                "avatar": str(item.get("avatar") or ""),
+                "manage_privilege": item.get("manage_privilege") is not False,
+                "bound": str(item.get("open_kfid") or "") in mappings,
+                "bound_binding_id": (
+                    mappings[str(item.get("open_kfid") or "")].binding_id
+                    if str(item.get("open_kfid") or "") in mappings
+                    else None
+                ),
+            }
+            for item in accounts
+            if isinstance(item, dict) and str(item.get("open_kfid") or "").strip()
+        ]
+    }
+
+
+@router.post("/{binding_id}/wechat_kf/account", response_model=ChannelBindingRead)
+def select_wechat_kf_account(
+    binding_id: str,
+    request: WeChatKfAccountSelectRequest,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_session)],
+) -> ChannelBindingRead:
+    """选择 provider 可管理账号并建立本地路由；会更新 binding 代际。"""
+    with binding_lifecycle_lock(binding_id):
+        binding = _wechat_kf_management_binding(
+            db, request.tenant_id, binding_id, current_user
+        )
+        try:
+            provider_accounts = WeChatKfAdapter().list_accounts(binding)
+        except (WeChatKfPermanentError, WeChatKfTransientError) as exc:
+            _raise_wechat_kf_provider_error(exc)
+        match = next(
+            (
+                item
+                for item in provider_accounts
+                if str(item.get("open_kfid") or "").strip() == request.open_kfid.strip()
+                and item.get("manage_privilege") is not False
+            ),
+            None,
+        )
+        if match is None:
+            raise _channel_http_error(404, "wechat kf account not manageable")
+        _ensure_wechat_kf_account_binding(
+            db, binding, request.open_kfid, name=str(match.get("name") or "")
+        )
+        binding.config_revision += 1
+        binding.updated_at = utc_now()
+        db.add(binding)
+        db.commit()
+        db.refresh(binding)
+    return channel_binding_read(db, binding, current_user)
+
+
+@router.post("/{binding_id}/wechat_kf/accounts", response_model=ChannelBindingRead)
+def create_wechat_kf_account(
+    binding_id: str,
+    request: WeChatKfAccountCreateRequest,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_session)],
+) -> ChannelBindingRead:
+    """在 provider 创建客服账号并建立本地路由；会执行一次远端写入。"""
+    with binding_lifecycle_lock(binding_id):
+        binding = _wechat_kf_management_binding(
+            db, request.tenant_id, binding_id, current_user
+        )
+        try:
+            open_kfid = WeChatKfAdapter().create_account_with_avatar(
+                binding, request.name, request.media_id
+            )
+        except (WeChatKfPermanentError, WeChatKfTransientError) as exc:
+            _raise_wechat_kf_provider_error(exc)
+        _ensure_wechat_kf_account_binding(db, binding, open_kfid, name=request.name)
+        binding.config_revision += 1
+        binding.updated_at = utc_now()
+        db.add(binding)
+        try:
+            db.commit()
+        except IntegrityError as exc:
+            db.rollback()
+            raise _channel_http_error(409, exc) from exc
+        db.refresh(binding)
+    return channel_binding_read(db, binding, current_user)
+
+
+@router.patch("/{binding_id}/wechat_kf/account", response_model=ChannelBindingRead)
+def update_wechat_kf_account(
+    binding_id: str,
+    request: WeChatKfAccountUpdateRequest,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_session)],
+) -> ChannelBindingRead:
+    """更新 provider 与本地客服账号资料；会执行一次远端写入。"""
+    with binding_lifecycle_lock(binding_id):
+        binding = _wechat_kf_management_binding(
+            db, request.tenant_id, binding_id, current_user
+        )
+        account = db.exec(
+            select(WeChatKfAccount).where(
+                WeChatKfAccount.binding_id == binding.id,
+                WeChatKfAccount.open_kfid == request.open_kfid.strip(),
+                WeChatKfAccount.status == "active",
+            )
+        ).first()
+        if account is None:
+            raise _channel_http_error(404, "wechat kf account not bound")
+        try:
+            WeChatKfAdapter().update_account(
+                binding, account.open_kfid, request.name, request.media_id
+            )
+        except (WeChatKfPermanentError, WeChatKfTransientError) as exc:
+            _raise_wechat_kf_provider_error(exc)
+        account.name = request.name.strip()
+        account.updated_at = utc_now()
+        binding.config_revision += 1
+        binding.updated_at = utc_now()
+        db.add(account)
+        db.add(binding)
+        db.commit()
+        db.refresh(binding)
+    return channel_binding_read(db, binding, current_user)
+
+
+@router.delete("/{binding_id}/wechat_kf/account/{open_kfid}", response_model=ChannelBindingRead)
+def delete_wechat_kf_account(
+    binding_id: str,
+    open_kfid: str,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_session)],
+    tenant_id: str = Query(...),
+) -> ChannelBindingRead:
+    """删除 provider 客服账号并释放本地唯一绑定；会执行一次远端写入。"""
+    with binding_lifecycle_lock(binding_id):
+        binding = _wechat_kf_management_binding(db, tenant_id, binding_id, current_user)
+        account = db.exec(
+            select(WeChatKfAccount).where(
+                WeChatKfAccount.binding_id == binding.id,
+                WeChatKfAccount.open_kfid == open_kfid.strip(),
+                WeChatKfAccount.status == "active",
+            )
+        ).first()
+        if account is None:
+            raise _channel_http_error(404, "wechat kf account not bound")
+        try:
+            WeChatKfAdapter().delete_account(binding, account.open_kfid)
+        except (WeChatKfPermanentError, WeChatKfTransientError) as exc:
+            _raise_wechat_kf_provider_error(exc)
+        db.delete(account)
+        binding.config_revision += 1
+        binding.updated_at = utc_now()
+        db.add(binding)
+        db.commit()
+        db.refresh(binding)
+    return channel_binding_read(db, binding, current_user)
+
+
+@router.post("/{binding_id}/wechat_kf/avatar")
+def upload_wechat_kf_avatar(
+    binding_id: str,
+    file: Annotated[UploadFile, File(...)],
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_session)],
+    tenant_id: str = Query(...),
+) -> dict[str, str]:
+    """上传有界 JPG/PNG 头像并仅返回 media ID；会执行一次远端写入。"""
+    binding = _wechat_kf_management_binding(db, tenant_id, binding_id, current_user)
+    content_type = str(file.content_type or "").lower()
+    if content_type not in {"image/jpeg", "image/png"}:
+        raise _channel_http_error(400, "wechat kf avatar content type invalid")
+    content = file.file.read(2 * 1024 * 1024 + 1)
+    if not content or len(content) > 2 * 1024 * 1024:
+        raise _channel_http_error(400, "wechat kf avatar size invalid")
+    try:
+        media_id = WeChatKfAdapter().upload_avatar(
+            binding,
+            content,
+            file.filename or "avatar.jpg",
+            content_type,
+        )
+    except (WeChatKfPermanentError, WeChatKfTransientError) as exc:
+        _raise_wechat_kf_provider_error(exc)
+    return {"media_id": media_id}
+
+
+@router.post("/{binding_id}/wechat_kf/contact-way")
+def create_wechat_kf_contact_way(
+    binding_id: str,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_session)],
+    tenant_id: str = Query(...),
+    scene: str = Query("staffdeck", min_length=1, max_length=32, pattern=r"^[A-Za-z0-9_-]+$"),
+    open_kfid: str = Query(..., min_length=1, max_length=128),
+) -> dict[str, str]:
+    """为已绑定账号创建咨询链接；会执行一次远端写入且不记录 provider URL。"""
+    binding = _wechat_kf_management_binding(db, tenant_id, binding_id, current_user)
+    account = db.exec(
+        select(WeChatKfAccount).where(
+            WeChatKfAccount.binding_id == binding.id,
+            WeChatKfAccount.open_kfid == open_kfid,
+            WeChatKfAccount.status == "active",
+        )
+    ).first()
+    if account is None:
+        raise _channel_http_error(404, "wechat kf account not bound")
+    try:
+        url = WeChatKfAdapter().contact_way(binding, open_kfid=open_kfid, scene=scene)
+    except (WeChatKfPermanentError, WeChatKfTransientError) as exc:
+        _raise_wechat_kf_provider_error(exc)
+    return {"url": url}
 
 
 @router.post("/{binding_id}/feishu/credentials", response_model=ChannelBindingRead)

@@ -7,6 +7,7 @@ from sqlmodel import Session, SQLModel, create_engine, select
 
 from app.channels.adapters import base as adapter_registry
 from app.channels.adapters.base import register_channel_adapter
+from app.channels.crypto import encrypt_channel_secret
 from app.channels.service_durable_inbox import reaction_target
 from app.channels.service_outbox import (
     cleanup_channel_reactions_before_binding_delete,
@@ -15,7 +16,6 @@ from app.channels.service_outbox import (
     stage_channel_delivery,
 )
 from app.config import get_settings
-from app.channels.crypto import encrypt_channel_secret
 from app.db.models import (
     ChannelBinding,
     ChannelDelivery,
@@ -306,6 +306,37 @@ def test_channel_staging_copies_message_language_snapshot_and_raw_reply() -> Non
         assert delivery.language_context_json == _language_snapshot()
         assert delivery.text == "外部回复《保持原样》"
         assert message.content == "外部回复《保持原样》"
+
+
+def test_wechat_kf_staging_uses_account_target_and_stable_nonempty_key() -> None:
+    """Stage WeChat客服 replies without a legacy context token and keep the locale snapshot."""
+    engine = _test_engine()
+    with Session(engine) as db:
+        binding = _seed_binding(db, channel="wechat_kf")
+        chat_session = _channel_session(binding)
+        chat_session.channel_target_json = {
+            "to_user_id": "external-user-1",
+            "open_kfid": "wk-account-1",
+        }
+        message = _assistant_message(
+            chat_session.id,
+            "msg_wechat_kf_language",
+            "回复《保持原样》",
+        )
+        message.metadata_json = {"language_context": _language_snapshot()}
+        db.add(chat_session)
+        db.add(message)
+        db.commit()
+
+        stage_channel_delivery(db, chat_session, message)
+        db.commit()
+
+        delivery = db.exec(select(ChannelDelivery)).one()
+        assert delivery.status == "pending"
+        assert delivery.target_json == chat_session.channel_target_json
+        assert delivery.idempotency_key == message.id
+        assert delivery.idempotency_key
+        assert delivery.language_context_json == _language_snapshot()
 
 
 def test_channel_staging_without_snapshot_uses_controlled_legacy_context() -> None:

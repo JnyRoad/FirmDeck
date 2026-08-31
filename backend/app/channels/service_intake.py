@@ -8,6 +8,7 @@ from datetime import timedelta
 
 from sqlalchemy import or_, update
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import object_session
 from sqlmodel import Session, select
 
 from app.channels.adapters.base import (
@@ -51,6 +52,7 @@ from app.db.models import (
     Message,
     Team,
     User,
+    WeChatKfAccount,
     new_id,
     utc_now,
 )
@@ -596,9 +598,26 @@ def _build_name_resolver(binding: ChannelBinding):
 
 
 def _valid_notice_target(channel: str, target: dict) -> bool:
+    """Validate the immutable outbound target fields required by one channel."""
     if channel == "feishu":
         return bool(target.get("message_id") or target.get("receive_id"))
+    if channel == "wechat_kf":
+        return bool(target.get("to_user_id") and target.get("open_kfid"))
     return bool(target.get("to_user_id") and target.get("context_token"))
+
+
+def _resolved_inbound_account_scope(
+    binding: ChannelBinding,
+    inbound: ChannelInbound,
+) -> str:
+    """Resolve processing scope while preserving WeChat客服 account isolation."""
+    if binding.channel != "wechat_kf":
+        return external_account_scope(None, binding)
+    corp_id = str((binding.config_json or {}).get("corp_id") or "").strip()
+    expected_scope = f"{corp_id}:{inbound.to_user_id}" if corp_id else ""
+    if not expected_scope or inbound.account_scope != expected_scope:
+        raise ValueError("wechat_kf_account_scope_mismatch")
+    return expected_scope
 
 
 def _reaction_staging_enabled(channel: str) -> bool:
@@ -1229,7 +1248,7 @@ def process_inbound(
     if inbound is None:
         return False
     # 作用域以绑定配置为准(适配器侧可能拿的是启动时旧值):统一覆盖后再使用
-    scope = external_account_scope(None, binding)
+    scope = _resolved_inbound_account_scope(binding, inbound)
     inbound.account_scope = scope
     command = parse_command(inbound.text)
     target = {
@@ -1745,7 +1764,7 @@ def process_staged_inbound(event_pk: str, *, db_engine=None) -> bool:
                 update(ChannelInboundEvent)
                 .where(
                     ChannelInboundEvent.id == event_pk,
-                    ChannelInboundEvent.channel.in_({"feishu", "wecom", "dingtalk"}),
+                    ChannelInboundEvent.channel.in_({"feishu", "wecom", "dingtalk", "wechat_kf"}),
                     ChannelInboundEvent.status == "processing",
                     ChannelInboundEvent.processor_run_id == current_processor_run_id(),
                 )
@@ -1763,6 +1782,7 @@ def process_staged_inbound(event_pk: str, *, db_engine=None) -> bool:
 
 
 def _process_claimed_staged_inbound(event_pk: str, *, db_engine=None) -> bool:
+    """Decode one claimed durable event and hand it to the normal intake transaction."""
     use_engine = db_engine or engine
     with Session(use_engine) as db:
         event = db.get(ChannelInboundEvent, event_pk)
@@ -1836,6 +1856,7 @@ def run_staged_inbound_daemon(
     poll_seconds: float = 1.0,
     db_engine=None,
 ) -> None:
+    """Poll supported durable inbox lanes and dispatch each claimed event once."""
     use_engine = db_engine or engine
     while True:
         try:
@@ -1843,7 +1864,9 @@ def run_staged_inbound_daemon(
                 event_ids = db.exec(
                     select(ChannelInboundEvent.id)
                     .where(
-                        ChannelInboundEvent.channel.in_({"feishu", "wecom", "dingtalk"}),
+                        ChannelInboundEvent.channel.in_(
+                            {"feishu", "wecom", "dingtalk", "wechat_kf"}
+                        ),
                         ChannelInboundEvent.status == "received",
                     )
                     .order_by(ChannelInboundEvent.created_at)
@@ -1891,6 +1914,7 @@ def _decode_and_validate_staged_event(
     event: ChannelInboundEvent,
     binding: ChannelBinding,
 ) -> ChannelInbound:
+    """Decode one durable envelope and revalidate its immutable provider account scope."""
     payload = event.payload_json or {}
     account = payload.get("account") if isinstance(payload, dict) else None
     if event.tenant_id != binding.tenant_id or event.channel != binding.channel:
@@ -1941,10 +1965,36 @@ def _decode_and_validate_staged_event(
         ):
             raise ValueError("replay_account_mismatch")
         return inbound
+    if event.channel == "wechat_kf":
+        from app.channels.service_wechat_kf_inbox import decode_replay_envelope
+
+        if event.config_revision != binding.config_revision:
+            raise ValueError("replay_account_mismatch")
+        inbound = decode_replay_envelope(payload)
+        scope = str((account or {}).get("scope") or "").strip()
+        corp_id = str((binding.config_json or {}).get("corp_id") or "").strip()
+        expected_scope = f"{corp_id}:{inbound.to_user_id}" if corp_id else ""
+        if not scope or scope != expected_scope:
+            raise ValueError("replay_account_mismatch")
+        replay_db = object_session(event)
+        if replay_db is None:
+            raise ValueError("replay_account_mismatch")
+        account_row = replay_db.exec(
+            select(WeChatKfAccount).where(
+                WeChatKfAccount.tenant_id == binding.tenant_id,
+                WeChatKfAccount.binding_id == binding.id,
+                WeChatKfAccount.open_kfid == inbound.to_user_id,
+                WeChatKfAccount.status == "active",
+            )
+        ).first()
+        if account_row is None:
+            raise ValueError("replay_account_mismatch")
+        return inbound
     raise ValueError("unsupported_envelope_channel")
 
 
 def _recover_stale_durable_event(event_pk: str, *, db_engine=None) -> bool:
+    """Recover one stale processing event without rebuilding its language snapshot."""
     use_engine = db_engine or engine
     with Session(use_engine) as db:
         event = db.get(ChannelInboundEvent, event_pk)
