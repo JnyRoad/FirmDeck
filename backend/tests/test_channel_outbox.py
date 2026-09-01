@@ -5,11 +5,13 @@ import pytest
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
+from app.channels import service_outbox as outbox_service
 from app.channels.adapters import base as adapter_registry
 from app.channels.adapters.base import register_channel_adapter
 from app.channels.crypto import encrypt_channel_secret
 from app.channels.service_durable_inbox import reaction_target
 from app.channels.service_outbox import (
+    _finish_delivery_claim,
     cleanup_channel_reactions_before_binding_delete,
     run_delivery_daemon,
     run_reaction_delivery_daemon,
@@ -132,6 +134,32 @@ def _seed_binding(db: Session, *, channel: str = "fake", status: str = "active")
     db.add(binding)
     db.commit()
     return binding
+
+
+def _set_tenant_lifecycle(engine, *, status: str, version: int) -> None:
+    """Set the authoritative tenant lifecycle state for one isolated outbox test."""
+    with Session(engine) as db:
+        tenant = db.get(Tenant, "tenant_demo")
+        assert tenant is not None
+        tenant.status = status
+        tenant.lifecycle_version = version
+        db.add(tenant)
+        db.commit()
+
+
+def _file_engine(tmp_path, name: str = "channel-lifecycle.db"):
+    """Create a file-backed SQLite engine so lifecycle races use separate connections."""
+    engine = create_engine(
+        f"sqlite:///{tmp_path / name}",
+        connect_args={"check_same_thread": False, "timeout": 30},
+    )
+    with engine.connect() as connection:
+        # WAL keeps concurrent claim readers independent while SQLite serializes writers.
+        connection.exec_driver_sql("PRAGMA journal_mode=WAL")
+        connection.exec_driver_sql("PRAGMA busy_timeout=30000")
+        connection.commit()
+    SQLModel.metadata.create_all(engine)
+    return engine
 
 
 def _channel_session(binding: ChannelBinding) -> ChatSession:
@@ -566,6 +594,57 @@ def test_channel_staging_failure_propagates() -> None:
     message = _assistant_message("session_chan", "msg_x")
     with pytest.raises(RuntimeError, match="db 炸了"):
         stage_channel_delivery(BrokenDb(), chat_session, message)
+
+
+def test_duck_typed_channel_staging_uses_baseline_lifecycle_version(monkeypatch) -> None:
+    """Keep legacy db doubles usable when they intentionally expose exec but not get."""
+
+    class EmptyResult:
+        def first(self):
+            return None
+
+    class DuckDb:
+        def exec(self, _statement):
+            return EmptyResult()
+
+        def add(self, _row):
+            pass
+
+        def flush(self):
+            pass
+
+    binding = ChannelBinding(
+        id="binding_duck",
+        tenant_id="tenant_demo",
+        agent_id="agent_1",
+        channel="fake",
+        status="active",
+        external_account_key="fake:account",
+    )
+    chat_session = ChatSession(
+        id="session_duck",
+        tenant_id="tenant_demo",
+        agent_id="agent_1",
+        channel="fake",
+        external_conv_id="duck-conversation",
+        channel_account_key="fake:account",
+    )
+    message = _assistant_message(chat_session.id, "msg_duck")
+    captured: dict[str, int] = {}
+    monkeypatch.setattr(outbox_service, "_find_active_binding_for_agent", lambda *_args: binding)
+    monkeypatch.setattr(outbox_service, "_immutable_delivery_target", lambda *_args: {})
+    monkeypatch.setattr(outbox_service, "_reply_idempotency_key", lambda *_args: "duck-key")
+    monkeypatch.setattr(
+        outbox_service,
+        "_stage_failed_delivery",
+        lambda *_args, tenant_lifecycle_version, **_kwargs: captured.update(
+            version=tenant_lifecycle_version
+        ),
+    )
+
+    stage_channel_delivery(DuckDb(), chat_session, message)
+
+    assert captured == {"version": 1}
 
 
 def test_legacy_session_claim_conflict_fails_channel_transaction() -> None:
@@ -1377,11 +1456,7 @@ def test_dingtalk_binding_delete_cleanup_recalls_without_query(monkeypatch) -> N
 def test_two_workers_atomically_claim_one_delivery(tmp_path) -> None:
     import app.channels.service_outbox as outbox
 
-    engine = create_engine(
-        f"sqlite:///{tmp_path / 'outbox.db'}",
-        connect_args={"check_same_thread": False},
-    )
-    SQLModel.metadata.create_all(engine)
+    engine = _file_engine(tmp_path, "outbox.db")
     adapter = FakeAdapter()
     register_channel_adapter("fake", adapter)
     with Session(engine) as db:
@@ -1406,27 +1481,32 @@ def test_two_workers_atomically_claim_one_delivery(tmp_path) -> None:
 
     barrier = threading.Barrier(2)
     claimed: list[bool] = []
+    thread_errors: list[BaseException] = []
 
     def worker() -> None:
-        with Session(engine) as db:
-            barrier.wait(timeout=5.0)
-            delivery = outbox._claim_delivery(
-                db,
-                delivery_id,
-                now=utc_now(),
-                reaction_lane=False,
-            )
-            claimed.append(delivery is not None)
-            if delivery:
-                outbox._deliver_one(db, delivery)
+        try:
+            barrier.wait(timeout=10.0)
+            with Session(engine) as db:
+                delivery = outbox._claim_delivery(
+                    db,
+                    delivery_id,
+                    now=utc_now(),
+                    reaction_lane=False,
+                )
+                claimed.append(delivery is not None)
+                if delivery:
+                    outbox._deliver_one(db, delivery)
+        except BaseException as exc:  # noqa: BLE001 - surface worker failures in the test thread
+            thread_errors.append(exc)
 
     threads = [threading.Thread(target=worker) for _ in range(2)]
     for thread in threads:
         thread.start()
     for thread in threads:
-        thread.join(timeout=5.0)
+        thread.join(timeout=35.0)
 
     assert all(not thread.is_alive() for thread in threads)
+    assert thread_errors == []
     assert sorted(claimed) == [False, True]
     assert len(adapter.sent) == 1
     with Session(engine) as db:
@@ -1452,11 +1532,7 @@ def test_concurrent_daemons_claim_disjoint_deliveries(tmp_path) -> None:
 
     import app.channels.service_outbox as outbox
 
-    engine = create_engine(
-        f"sqlite:///{tmp_path / 'outbox_claim.db'}",
-        connect_args={"check_same_thread": False, "timeout": 30},
-    )
-    SQLModel.metadata.create_all(engine)
+    engine = _file_engine(tmp_path, "outbox_claim.db")
     with Session(engine) as db:
         binding = _seed_binding(db)
         all_ids = set()
@@ -1465,25 +1541,33 @@ def test_concurrent_daemons_claim_disjoint_deliveries(tmp_path) -> None:
             all_ids.add(delivery.id)
 
     claimed: list[set] = []
+    thread_errors: list[BaseException] = []
     barrier = threading.Barrier(3)
 
     def claim() -> None:
-        barrier.wait()
-        mine: set[str] = set()
-        with Session(engine) as db:
-            for delivery_id in sorted(all_ids):
-                if outbox._claim_delivery(db, delivery_id, now=utc_now(), reaction_lane=False):
-                    mine.add(delivery_id)
-        claimed.append(mine)
+        try:
+            barrier.wait(timeout=10.0)
+            mine: set[str] = set()
+            with Session(engine) as db:
+                for delivery_id in sorted(all_ids):
+                    if outbox._claim_delivery(db, delivery_id, now=utc_now(), reaction_lane=False):
+                        mine.add(delivery_id)
+            claimed.append(mine)
+        except BaseException as exc:  # noqa: BLE001 - surface worker failures in the test thread
+            thread_errors.append(exc)
 
     threads = [threading.Thread(target=claim) for _ in range(2)]
     for thread in threads:
         thread.start()
-    barrier.wait()
+    try:
+        barrier.wait(timeout=10.0)
+    except BaseException as exc:  # noqa: BLE001 - make a broken barrier an assertion failure
+        thread_errors.append(exc)
     for thread in threads:
-        thread.join(timeout=30)
+        thread.join(timeout=35.0)
 
     assert len(claimed) == 2
+    assert thread_errors == []
     # 两个并发守护拿到互不重叠的行集,且合起来覆盖全部到期投递
     assert claimed[0].isdisjoint(claimed[1])
     assert claimed[0] | claimed[1] == all_ids
@@ -1625,6 +1709,182 @@ def test_notify_skips_when_creator_has_no_identity() -> None:
     with Session(engine) as db:
         assert db.exec(select(ChannelDelivery)).all() == []
         assert db.get(ChannelBinding, binding_id).status == "expired"
+
+
+# ---------- Phase 6: tenant lifecycle gates at channel outbox ----------
+
+
+def test_suspended_tenant_cannot_stage_a_pending_channel_delivery() -> None:
+    """A suspended tenant must not create a sendable provider output in the outbox."""
+    engine = _test_engine()
+    with Session(engine) as db:
+        binding = _seed_binding(db)
+        chat_session = _channel_session(binding)
+        message = _assistant_message(chat_session.id, "msg_suspended_stage")
+        db.add(chat_session)
+        db.add(message)
+        db.commit()
+
+    _set_tenant_lifecycle(engine, status="suspended", version=2)
+    with Session(engine) as db:
+        chat_session = db.get(ChatSession, "session_chan")
+        message = db.get(Message, "msg_suspended_stage")
+        assert chat_session is not None
+        assert message is not None
+        stage_channel_delivery(db, chat_session, message)
+        db.commit()
+
+    with Session(engine) as db:
+        deliveries = db.exec(select(ChannelDelivery)).all()
+        assert all(row.status != "pending" for row in deliveries)
+        assert all(row.next_attempt_at is None for row in deliveries)
+        if deliveries:
+            assert all(row.last_error == "TENANT_SUSPENDED" for row in deliveries)
+
+
+def test_suspend_after_delivery_claim_blocks_provider_send(monkeypatch, tmp_path) -> None:
+    """A claim made before suspension must be rechecked before the provider call."""
+    import app.channels.service_outbox as outbox_module
+
+    engine = _file_engine(tmp_path, "claim-fence.db")
+    adapter = FakeAdapter()
+    register_channel_adapter("fake", adapter)
+    with Session(engine) as db:
+        binding = _seed_binding(db)
+        delivery = _make_delivery(db, binding, message_id="msg_claim_fence", idempotency_key="msg_claim_fence")
+        delivery_id = delivery.id
+
+    original_deliver_one = outbox_module._deliver_one
+
+    def suspend_before_provider(db, delivery):
+        _set_tenant_lifecycle(engine, status="suspended", version=2)
+        return original_deliver_one(db, delivery)
+
+    monkeypatch.setattr(outbox_module, "_deliver_one", suspend_before_provider)
+    run_delivery_daemon(once=True, db_engine=engine)
+
+    assert adapter.sent == []
+    with Session(engine) as db:
+        delivery = db.get(ChannelDelivery, delivery_id)
+        assert delivery is not None
+        assert delivery.status == "failed"
+        assert delivery.last_error == "TENANT_SUSPENDED"
+        assert delivery.next_attempt_at is None
+
+
+def test_suspend_during_provider_send_records_unknown_terminal_outcome(tmp_path) -> None:
+    """A provider call already in flight must become unknown and never retry after suspension."""
+    engine = _file_engine(tmp_path, "send-race.db")
+
+    class BlockingAdapter(FakeAdapter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = threading.Event()
+            self.release = threading.Event()
+
+        def send(self, binding, target, text, *, idempotency_key=None):
+            self.started.set()
+            assert self.release.wait(timeout=5.0)
+            return super().send(binding, target, text, idempotency_key=idempotency_key)
+
+    adapter = BlockingAdapter()
+    register_channel_adapter("fake", adapter)
+    with Session(engine) as db:
+        binding = _seed_binding(db)
+        delivery = _make_delivery(
+            db,
+            binding,
+            message_id="msg_send_race",
+            idempotency_key="msg_send_race",
+        )
+        delivery_id = delivery.id
+
+    worker = threading.Thread(
+        target=run_delivery_daemon,
+        kwargs={"once": True, "db_engine": engine},
+    )
+    worker.start()
+    assert adapter.started.wait(timeout=5.0)
+    _set_tenant_lifecycle(engine, status="suspended", version=2)
+    adapter.release.set()
+    worker.join(timeout=10.0)
+    assert not worker.is_alive()
+    assert len(adapter.sent) == 1
+
+    with Session(engine) as db:
+        delivery = db.get(ChannelDelivery, delivery_id)
+        assert delivery is not None
+        assert delivery.status == "failed"
+        assert delivery.last_error == "remote_state_unknown"
+        assert delivery.next_attempt_at is None
+
+
+def test_stale_delivery_retry_completion_cannot_requeue_after_lifecycle_transition() -> None:
+    """A claimed delivery must not become retryable after tenant suspension."""
+    engine = _test_engine()
+    with Session(engine) as db:
+        binding = _seed_binding(db)
+        delivery = _make_delivery(
+            db,
+            binding,
+            status="sending",
+            next_attempt_at=None,
+            sending_since=utc_now(),
+            delivery_owner="delivery-owner-stale",
+            delivery_generation=1,
+            tenant_lifecycle_version=1,
+            idempotency_key="stale-retry-completion",
+        )
+        delivery_id = delivery.id
+
+    _set_tenant_lifecycle(engine, status="suspended", version=2)
+    with Session(engine) as db:
+        delivery = db.get(ChannelDelivery, delivery_id)
+        assert delivery is not None
+        assert (
+            _finish_delivery_claim(
+                db,
+                delivery,
+                status="pending",
+                last_error="temporary provider failure",
+                next_attempt_at=utc_now(),
+            )
+            is False
+        )
+
+    with Session(engine) as db:
+        delivery = db.get(ChannelDelivery, delivery_id)
+        assert delivery is not None
+        assert delivery.status != "pending"
+
+
+def test_reactivated_tenant_does_not_replay_old_pending_delivery(tmp_path) -> None:
+    """A fast suspend/reactivate cycle must not make pre-transition outbox work sendable again."""
+    engine = _file_engine(tmp_path, "outbox-no-replay.db")
+    adapter = FakeAdapter()
+    register_channel_adapter("fake", adapter)
+    with Session(engine) as db:
+        binding = _seed_binding(db)
+        delivery = _make_delivery(
+            db,
+            binding,
+            message_id="msg_no_replay",
+            idempotency_key="msg_no_replay",
+            tenant_lifecycle_version=1,
+        )
+        delivery_id = delivery.id
+
+    _set_tenant_lifecycle(engine, status="suspended", version=2)
+    _set_tenant_lifecycle(engine, status="active", version=3)
+    run_delivery_daemon(once=True, db_engine=engine)
+
+    assert adapter.sent == []
+    with Session(engine) as db:
+        delivery = db.get(ChannelDelivery, delivery_id)
+        assert delivery is not None
+        assert delivery.status == "failed"
+        assert delivery.last_error == "TENANT_SUSPENDED"
+        assert delivery.next_attempt_at is None
 
 
 def test_notify_uses_identity_basics_without_session() -> None:

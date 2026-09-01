@@ -22,8 +22,9 @@ import { useAppIntl } from '@/i18n/useAppIntl';
 import type { MessageId } from '@/i18n/types';
 import { backendErrorMessageDescriptor } from '@/lib/apiErrorMessages';
 import { SELECT_TRIGGER_CLASS } from '@/lib/enterprise-ui';
-import { api, TENANT_ID } from '../api/client';
+import { createTenantClient } from '../api/tenant-client';
 import type { EnterpriseAuthUser } from '../auth';
+import { useTenantSession } from '../contexts/TenantSessionContext';
 import { employeeDisplayName, employeeProfile } from '../employee';
 import type { AgentProfileRead } from '../types';
 import EmployeeAvatar from './EmployeeAvatar';
@@ -107,6 +108,8 @@ export default function EmployeeProfileEditor({
 }) {
   const { t } = useAppIntl();
   const toast = createToastNotifier({ t });
+  const tenantContext = useTenantSession();
+  const tenantApi = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
   const [form, setForm] = useState<EmployeeProfileFormValues>(BLANK_FORM);
   const [saving, setSaving] = useState(false);
   const profile = useMemo(() => employeeProfile(agent), [agent]);
@@ -134,7 +137,9 @@ export default function EmployeeProfileEditor({
 
   /** Persist the profile and route validation/API failures through stable localized descriptors. */
   async function save() {
-    if (!agent) return;
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!agent || !context || generation === undefined) return;
     if (!form.name.trim()) {
       toast.error(createMessageDescriptor('employeeProfile.validation.nameRequired'));
       return;
@@ -162,8 +167,7 @@ export default function EmployeeProfileEditor({
         delete metadata.gallery_published_by;
       }
 
-      const saved = await api.put<AgentProfileRead>(`/api/enterprise/agents/${agent.id}`, {
-        tenant_id: TENANT_ID,
+      const saved = await tenantApi.put<AgentProfileRead>(`/api/enterprise/agents/${agent.id}`, {
         name: form.name.trim(),
         description: form.description.trim(),
         persona_prompt: form.personaPrompt.trim(),
@@ -171,17 +175,19 @@ export default function EmployeeProfileEditor({
         harness_max_actions: Math.max(1, Math.min(100, form.harnessMaxActions || 32)),
         metadata,
       });
+      if (!context.isCurrentGeneration(generation)) return;
       toast.success(createMessageDescriptor('employeeProfile.toast.updated'));
       onSaved?.(saved);
       onClose();
       window.dispatchEvent(new Event('ultrarag-enterprise-agent-scope-refresh'));
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       const descriptor = backendErrorMessageDescriptor(error);
       toast.error(descriptor
         ? { id: descriptor.messageId, values: descriptor.values }
         : createMessageDescriptor('employeeProfile.toast.saveFailed'));
     } finally {
-      setSaving(false);
+      if (context.isCurrentGeneration(generation)) setSaving(false);
     }
   }
 

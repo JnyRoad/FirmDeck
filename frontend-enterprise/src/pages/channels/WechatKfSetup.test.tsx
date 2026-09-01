@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -622,6 +622,42 @@ describe('WechatKfSetup', () => {
 
     await waitFor(() => expect(screen.queryByText(staleAccount.open_kfid)).toBeNull());
     expect(screen.getByText(currentAccount.open_kfid)).toBeTruthy();
+  });
+
+  it('ignores an older callback response after the binding changes', async () => {
+    const user = userEvent.setup();
+    const oldBinding = { ...ownerBinding, corp_id: null };
+    const newBinding = { ...ownerBinding, id: 'binding-new', corp_id: 'wwOldCorp' };
+    let releaseOldPrepare: ((response: Response) => void) | undefined;
+    const oldPrepare = new Promise<Response>((resolve) => {
+      releaseOldPrepare = resolve;
+    });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => (
+      String(input).includes('/binding-kf/') ? oldPrepare : jsonResponse({})
+    ));
+    vi.stubGlobal('fetch', fetchMock);
+    const view = renderSetup('en-US', oldBinding);
+    const corpInput = screen.getByLabelText('Corp ID');
+    await user.type(corpInput, 'wwOldCorp');
+    await user.click(screen.getByRole('button', { name: 'Prepare callback' }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+
+    view.rerender(
+      <AppIntlProvider initialLocale="en-US">
+        <WechatKfSetup binding={newBinding} onChanged={vi.fn()} />
+      </AppIntlProvider>,
+    );
+    await act(async () => {
+      releaseOldPrepare?.(jsonResponse({
+        callback_url: '/old/callback',
+        callback_path: '/old/callback',
+        callback_token: 'old-callback-token',
+        encoding_aes_key: 'old-aes-key',
+      }));
+      await oldPrepare;
+    });
+    expect(screen.queryByText('old-callback-token')).toBeNull();
+    expect(screen.queryByText('/old/callback')).toBeNull();
   });
 
   it('generates and copies a raw contact URL while keeping provider error text out of the UI', async () => {

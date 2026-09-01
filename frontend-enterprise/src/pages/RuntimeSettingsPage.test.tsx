@@ -1,12 +1,13 @@
 // @vitest-environment jsdom
 
 import type { InputHTMLAttributes, TextareaHTMLAttributes } from 'react';
-import { cleanup, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { notify } from '@/components/ui';
 import { AppIntlProvider, I18nProvider, type AppLocale } from '@/i18n';
+import type { TenantSessionContextValue } from '@/contexts/TenantSessionContext';
 
 import RuntimeSettingsPage, {
   buildApiEndpointLinks,
@@ -39,13 +40,13 @@ vi.mock('@/components/ui/textarea', async () => {
 const mocks = vi.hoisted(() => ({
   get: vi.fn(),
   put: vi.fn(),
+  currentContext: null as TenantSessionContextValue | null,
 }));
 
 vi.mock('../api/client', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../api/client')>();
   return {
     ...actual,
-    TENANT_ID: 'tenant_demo',
     api: {
       ...actual.api,
       get: mocks.get,
@@ -53,6 +54,17 @@ vi.mock('../api/client', async (importOriginal) => {
     },
   };
 });
+
+vi.mock('../api/tenant-client', () => ({
+  createTenantClient: () => ({
+    get: mocks.get,
+    put: mocks.put,
+  }),
+}));
+
+vi.mock('../contexts/TenantSessionContext', () => ({
+  useTenantSession: () => mocks.currentContext,
+}));
 
 const validForm = {
   show_thinking_trace: true,
@@ -112,6 +124,32 @@ const networkSettings = {
   restart_required: false,
 };
 
+function makeTenantContext(generation = 1): TenantSessionContextValue {
+  const controller = new AbortController();
+  return {
+    tenantId: 'tenant_demo',
+    tenantSlug: 'tenant-demo',
+    userId: 'admin_demo',
+    generation,
+    signal: controller.signal,
+    session: {
+      token: 'test-token',
+      scope: 'tenant',
+      tenant: { id: 'tenant_demo', slug: 'tenant-demo', display_name: 'Tenant Demo' },
+      user: {
+        id: 'admin_demo',
+        tenant_id: 'tenant_demo',
+        username: 'admin',
+        display_name: 'Admin',
+        role: 'admin',
+        must_change_password: false,
+        avatar_url: null,
+      },
+    },
+    isCurrentGeneration: (candidate) => candidate === generation && !controller.signal.aborted,
+  };
+}
+
 const semanticRuntimeCopy = {
   'zh-CN': {
     adminHint: '仅管理员可修改。打开或关闭后保存将自动重启 StaffDeck。默认关闭。',
@@ -159,6 +197,7 @@ function renderSemanticRuntimeSettings(locale: AppLocale): void {
 }
 
 beforeEach(() => {
+  mocks.currentContext = makeTenantContext();
   mocks.get.mockReset();
   mocks.put.mockReset();
   mocks.get.mockImplementation((path: string) => {
@@ -247,6 +286,12 @@ describe('Harness workspace settings', () => {
         '/api/enterprise/ui-config',
         expect.objectContaining({ harness_storage_path: '/Volumes/work/harness' }),
       );
+    const [path, body] = mocks.put.mock.calls[mocks.put.mock.calls.length - 1] as [
+      string,
+      Record<string, unknown>,
+    ];
+      expect(path).not.toContain('tenant_demo');
+      expect(body).not.toHaveProperty('tenant_id');
     });
   });
 
@@ -351,4 +396,53 @@ describe('sandbox diagnostic contract', () => {
       expect(screen.queryByText('RAW_SETUP_TEXT_MUST_NOT_REACH_UI')).toBeNull();
     });
   }
+
+  it('does not toast but clears save loading when an old generation rejects', async () => {
+    const user = userEvent.setup();
+    const context = mocks.currentContext as TenantSessionContextValue;
+    let rejectSave: ((reason?: unknown) => void) | undefined;
+    mocks.put.mockImplementation(() => new Promise((_resolve, reject) => {
+      rejectSave = reject;
+    }));
+    const notifyError = vi.spyOn(notify, 'error');
+
+    renderSemanticRuntimeSettings('en-US');
+    await screen.findByText('Runtime settings');
+    await user.click(screen.getByRole('button', { name: 'Save settings' }));
+    await waitFor(() => expect(mocks.put).toHaveBeenCalledTimes(1));
+
+    context.isCurrentGeneration = () => false;
+    rejectSave?.(new DOMException('aborted', 'AbortError'));
+    await waitFor(() => expect(notifyError).not.toHaveBeenCalled());
+    expect((screen.getByRole('button', { name: 'Save settings' }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it('clears network save loading when an old generation resolves', async () => {
+    const user = userEvent.setup();
+    const context = mocks.currentContext as TenantSessionContextValue;
+    let resolveNetwork: ((value: typeof networkSettings) => void) | undefined;
+    mocks.put.mockImplementation((path: string) => {
+      if (path.includes('/network-settings')) {
+        return new Promise<typeof networkSettings>((resolve) => {
+          resolveNetwork = resolve;
+        });
+      }
+      return Promise.resolve(runtimeSettings);
+    });
+
+    renderSemanticRuntimeSettings('en-US');
+    const saveNetworkButton = await screen.findByRole('button', { name: 'Save next-launch settings' });
+    await user.click(saveNetworkButton);
+    await waitFor(() => expect(mocks.put).toHaveBeenCalledWith(
+      '/api/enterprise/network-settings',
+      expect.any(Object),
+    ));
+
+    context.isCurrentGeneration = () => false;
+    await act(async () => {
+      resolveNetwork?.(networkSettings);
+      await Promise.resolve();
+    });
+    await waitFor(() => expect((saveNetworkButton as HTMLButtonElement).disabled).toBe(false));
+  });
 });

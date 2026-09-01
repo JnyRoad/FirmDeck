@@ -13,6 +13,7 @@ from app.db.models import (
     AgentResourceBinding,
     AgentSkillBranch,
     AgentSkillBranchVersion,
+    KnowledgeBase,
     KnowledgeBaseVersion,
     KnowledgeBucket,
     KnowledgeChunk,
@@ -89,6 +90,37 @@ def test_staffdeck_seed_reads_fixture_as_utf8(monkeypatch) -> None:
 def test_staffdeck_seed_requires_every_bundled_fixture(tmp_path) -> None:
     with pytest.raises(FileNotFoundError):
         staffdeck_seed._load_seed_fixtures((tmp_path / "missing-fixture.json",))
+
+
+def test_knowledge_branch_fallback_uses_a_seeded_version_without_documents() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as db:
+        db.add(Tenant(id=staffdeck_seed.TENANT_ID, name="StaffDeck"))
+        db.add(
+            KnowledgeBase(
+                id="kb-seeded-version",
+                tenant_id=staffdeck_seed.TENANT_ID,
+                name="Seeded version",
+                metadata_json={"current_version": "1.0.0"},
+            )
+        )
+        db.add(
+            KnowledgeBaseVersion(
+                id="kbver-seeded-version",
+                tenant_id=staffdeck_seed.TENANT_ID,
+                knowledge_base_id="kb-seeded-version",
+                version="2.7.0",
+                name="Seeded version 2.7.0",
+            )
+        )
+        db.commit()
+
+        resolved = staffdeck_seed._knowledge_version_with_seed_content(
+            db, "kb-seeded-version", "agent-without-document"
+        )
+
+    assert resolved == "2.7.0"
 
 
 def test_expanded_staffdeck_skills_match_runtime_schema() -> None:

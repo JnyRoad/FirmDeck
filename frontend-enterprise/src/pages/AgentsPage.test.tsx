@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import type { ReactNode } from 'react';
-import { cleanup, render, screen } from '@testing-library/react';
+import { cleanup, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -10,8 +10,54 @@ import { AppIntlProvider } from '@/i18n/provider';
 import type { AppLocale } from '@/i18n/locales';
 import { I18nProvider } from '@/i18n';
 import { TooltipProvider } from '@/components/ui/tooltip';
-import { ENTERPRISE_AGENT_STORAGE_KEY } from '@/lib/agent-scope-storage';
+import { tenantUserStorageKey } from '@/lib/tenant-storage';
 import type { AgentProfileRead } from '@/types';
+
+const tenantContextMock = vi.hoisted(() => {
+  const controller = new AbortController();
+  return {
+    context: {
+      session: {
+        token: 'tenant-demo-token',
+        scope: 'tenant' as const,
+        tenant: { id: 'tenant_demo', slug: 'tenant-demo', display_name: 'Tenant Demo' },
+        user: {
+          id: 'user-1',
+          tenant_id: 'tenant_demo',
+          username: 'demo',
+          display_name: 'Demo',
+          role: 'admin' as const,
+          must_change_password: false,
+          avatar_url: null,
+        },
+      },
+      tenantId: 'tenant_demo',
+      tenantSlug: 'tenant-demo',
+      userId: 'user-1',
+      generation: 1,
+      signal: controller.signal,
+      isCurrentGeneration: (generation: number) => generation === 1,
+    },
+  };
+});
+
+const notifyMock = vi.hoisted(() => ({
+  dismiss: vi.fn(),
+  error: vi.fn(),
+  info: vi.fn(),
+  loading: vi.fn(),
+  success: vi.fn(),
+  warning: vi.fn(),
+}));
+
+vi.mock('@/components/ui/app-toast', async () => {
+  const actual = await vi.importActual<typeof import('@/components/ui/app-toast')>('@/components/ui/app-toast');
+  return { ...actual, notify: notifyMock };
+});
+
+vi.mock('../contexts/TenantSessionContext', () => ({
+  useTenantSession: () => tenantContextMock.context,
+}));
 
 /** 隔离仍使用 legacy locale 的全局页头，使语义矩阵不依赖 DOM observer。 */
 vi.mock('../components/AppHeader', () => ({
@@ -145,13 +191,37 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  vi.clearAllMocks();
   vi.unstubAllGlobals();
   window.localStorage.clear();
 });
 
+describe('AgentsPage localized API error fallback', () => {
+  it('uses the page fallback when apiErrorMessage returns localized generic text', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      throw new Error('network unavailable');
+    }));
+
+    render(
+      <AppIntlProvider initialLocale="en-US">
+        <MemoryRouter>
+          <AgentsPage
+            currentUser={{ id: 'user-1', tenant_id: 'tenant_demo', username: 'demo', role: 'admin' }}
+          />
+        </MemoryRouter>
+      </AppIntlProvider>,
+    );
+
+    await waitFor(() => expect(notifyMock.error).toHaveBeenCalledWith('Failed to load employees'));
+  });
+});
+
 describe('AgentsPage team scope compatibility', () => {
   it('renders gracefully when the stored scope is a team', async () => {
-    window.localStorage.setItem(ENTERPRISE_AGENT_STORAGE_KEY, 'team:team-1');
+    window.localStorage.setItem(
+      tenantUserStorageKey('tenant_demo', 'user-1', 'selected-agent'),
+      'team:team-1',
+    );
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.includes('/api/enterprise/agents')) return jsonResponse([agent]);

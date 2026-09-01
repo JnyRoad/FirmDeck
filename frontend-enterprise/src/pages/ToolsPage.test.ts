@@ -20,6 +20,38 @@ const toastSpies = vi.hoisted(() => ({
   dismiss: vi.fn(),
 }));
 
+const tenantContextMock = vi.hoisted(() => {
+  const controller = new AbortController();
+  return {
+    context: {
+      session: {
+        token: 'tenant-demo-token',
+        scope: 'tenant' as const,
+        tenant: { id: 'tenant_demo', slug: 'tenant-demo', display_name: 'Tenant Demo' },
+        user: {
+          id: 'user-1',
+          tenant_id: 'tenant_demo',
+          username: 'demo',
+          display_name: 'Demo',
+          role: 'admin' as const,
+          must_change_password: false,
+          avatar_url: null,
+        },
+      },
+      tenantId: 'tenant_demo',
+      tenantSlug: 'tenant-demo',
+      userId: 'user-1',
+      generation: 1,
+      signal: controller.signal,
+      isCurrentGeneration: (generation: number) => generation === 1,
+    },
+  };
+});
+
+vi.mock('../contexts/TenantSessionContext', () => ({
+  useTenantSession: () => tenantContextMock.context,
+}));
+
 /** Capture the localized toast text emitted by OAuth callback recovery handling. */
 vi.mock('@/components/ui/app-toast', () => ({
   createToastNotifier: (translator: { t: (id: string) => string }) => ({
@@ -40,7 +72,7 @@ vi.mock('../components/AppHeader', () => ({
 }));
 
 import { parseMcpArgs } from './ToolsPage';
-import ToolsPage, { McpServerEditPage, ToolNewPage } from './ToolsPage';
+import ToolsPage, { McpServerEditPage, ToolNewPage, ToolTestPage } from './ToolsPage';
 
 const overallAgent: AgentProfileRead = {
   id: 'agent-overall',
@@ -200,14 +232,14 @@ function renderSemanticTools(
 }
 
 /** 渲染真实新建工具表单，验证原生 datalist 的本地化展示与空业务值边界。 */
-function renderSemanticToolEditor(locale: AppLocale): void {
+function renderSemanticToolEditor(locale: AppLocale, toolType: 'http' | 'a2a' = 'http'): void {
   const SemanticToolNewPage = ToolNewPage as ComponentType<NonNullable<Parameters<typeof ToolNewPage>[0]>>;
   render(
     createElement(AppIntlProvider, {
       initialLocale: locale,
       children: createElement(TooltipProvider, {
         children: createElement(MemoryRouter, {
-          initialEntries: ['/enterprise/tools/new?type=http'],
+          initialEntries: [`/enterprise/tools/new?type=${toolType}`],
           children: createElement(SemanticToolNewPage, {
             currentUser: { id: 'user-1', tenant_id: 'tenant_demo', username: 'demo', role: 'admin' },
           }),
@@ -247,10 +279,34 @@ function renderSemanticMcpEditor(locale: AppLocale): void {
   );
 }
 
+/** 渲染已保存的 A2A 工具测试页，覆盖租户连接状态与安全摘要边界。 */
+function renderSemanticToolTest(locale: AppLocale, toolId: string): void {
+  const SemanticToolTestPage = ToolTestPage as ComponentType<NonNullable<Parameters<typeof ToolTestPage>[0]>>;
+  render(
+    createElement(AppIntlProvider, {
+      initialLocale: locale,
+      children: createElement(TooltipProvider, {
+        children: createElement(MemoryRouter, {
+          initialEntries: [`/enterprise/tools/${toolId}/test`],
+          children: createElement(Routes, {
+            children: createElement(Route, {
+              path: '/enterprise/tools/:toolId/test',
+              element: createElement(SemanticToolTestPage, {
+                currentUser: { id: 'user-1', tenant_id: 'tenant_demo', username: 'demo', role: 'admin' },
+              }),
+            }),
+          }),
+        }),
+      }),
+    }),
+  );
+}
+
 beforeEach(() => {
   stubBrowserApis();
   stubToolsFetch();
   Object.values(toastSpies).forEach((spy) => spy.mockClear());
+  tenantContextMock.context.isCurrentGeneration = (generation: number) => generation === 1;
   window.localStorage.clear();
 });
 
@@ -274,6 +330,128 @@ describe('parseMcpArgs', () => {
       'my_mcp.server',
       '--label=customer support',
     ]);
+  });
+});
+
+describe('ToolsPage stale requests', () => {
+  it('does not toast or clear saving state when a tool save rejects after a tenant switch', async () => {
+    const user = userEvent.setup();
+    let rejectSave!: (reason?: unknown) => void;
+    const pendingSave = new Promise<Response>((_resolve, reject) => {
+      rejectSave = reject;
+    });
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (init?.method === 'POST' && url.includes('/api/enterprise/tools')) return pendingSave;
+      return jsonResponse([]);
+    }));
+
+    renderSemanticToolEditor('zh-CN');
+    await user.type(await screen.findByLabelText('工具名称'), 'stale_tool');
+    await user.type(screen.getByLabelText('URL'), 'https://tools.example.test/stale');
+    const saveButton = screen.getByRole('button', { name: '保存' }) as HTMLButtonElement;
+    await user.click(saveButton);
+    await waitFor(() => expect(saveButton.disabled).toBe(true));
+
+    tenantContextMock.context.isCurrentGeneration = (_generation: number): _generation is 1 => false;
+    rejectSave(new Error('stale tool save rejection'));
+    await waitFor(() => expect(saveButton.disabled).toBe(true));
+
+    expect(toastSpies.error).not.toHaveBeenCalled();
+  });
+});
+
+describe('Codex A2A adapter availability contract', () => {
+  it('shows an available adapter and enables the connection action using only the new contract', async () => {
+    const adapter = {
+      available: true,
+      endpoint_url: 'https://codex.example.test/a2a',
+      agent_card_url: 'https://codex.example.test/.well-known/agent-card.json',
+      timeout_seconds: 60,
+      // These legacy fields must not control or leak into the tenant connector UI.
+      enabled: false,
+      command: 'SECRET_CODEX_COMMAND',
+      token_configured: true,
+      workspace_root: 'SECRET_CODEX_WORKSPACE',
+    };
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/api/enterprise/tools/a2a/codex-adapter')) return jsonResponse(adapter);
+      if (url.includes('/api/enterprise/tools')) return jsonResponse([]);
+      return jsonResponse([]);
+    }));
+
+    const user = userEvent.setup();
+    renderSemanticToolEditor('en-US', 'a2a');
+
+    await user.click(screen.getByRole('button', { name: /A2A Agent/ }));
+    const connectButton = await screen.findByRole('button', { name: 'Connect local Codex' }) as HTMLButtonElement;
+    expect(connectButton.disabled).toBe(false);
+    expect(screen.queryByText('SECRET_CODEX_COMMAND')).toBeNull();
+    expect(screen.queryByText('SECRET_CODEX_WORKSPACE')).toBeNull();
+  });
+
+  it('shows an unavailable adapter and disables the connection action using available=false', async () => {
+    const adapter = {
+      available: false,
+      endpoint_url: 'https://codex.example.test/a2a',
+      agent_card_url: 'https://codex.example.test/.well-known/agent-card.json',
+      timeout_seconds: 60,
+      // A stale enabled=true value must not re-enable the action.
+      enabled: true,
+      command: 'SECRET_CODEX_COMMAND',
+      token_configured: true,
+      workspace_root: 'SECRET_CODEX_WORKSPACE',
+    };
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/api/enterprise/tools/a2a/codex-adapter')) return jsonResponse(adapter);
+      if (url.includes('/api/enterprise/tools')) return jsonResponse([]);
+      return jsonResponse([]);
+    }));
+
+    const user = userEvent.setup();
+    renderSemanticToolEditor('en-US', 'a2a');
+
+    await user.click(screen.getByRole('button', { name: /A2A Agent/ }));
+    const disabledButton = await screen.findByRole('button', { name: 'Codex Adapter not enabled' }) as HTMLButtonElement;
+    expect(disabledButton.disabled).toBe(true);
+    expect(screen.queryByText('SECRET_CODEX_COMMAND')).toBeNull();
+    expect(screen.queryByText('SECRET_CODEX_WORKSPACE')).toBeNull();
+  });
+
+  it('keeps adapter command, credential, and workspace metadata out of saved A2A UI', async () => {
+    const a2aTool: ToolRead = {
+      ...rawTool,
+      id: 'a2a-tool-1',
+      tool_type: 'a2a',
+      url: new URL('/api/a2a/codex', window.location.origin).toString(),
+    };
+    const adapter = {
+      available: true,
+      endpoint_url: '/api/a2a/codex',
+      agent_card_url: '/.well-known/agent-card.json',
+      timeout_seconds: 60,
+      command: 'SECRET_CODEX_COMMAND',
+      token_configured: true,
+      workspace_root: 'SECRET_CODEX_WORKSPACE',
+    };
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/a2a-runs')) return jsonResponse([]);
+      if (url.includes('/api/enterprise/tools/a2a/codex-adapter')) return jsonResponse(adapter);
+      if (url.includes('/api/enterprise/tools/a2a-tool-1')) return jsonResponse(a2aTool);
+      if (url.includes('/api/enterprise/tools')) return jsonResponse([]);
+      return jsonResponse([]);
+    }));
+
+    renderSemanticToolTest('en-US', a2aTool.id);
+
+    expect(await screen.findByText('Persistent A2A tasks')).toBeTruthy();
+    expect(await screen.findByText('Connected')).toBeTruthy();
+    expect(screen.queryByText('SECRET_CODEX_COMMAND')).toBeNull();
+    expect(screen.queryByText('SECRET_CODEX_WORKSPACE')).toBeNull();
+    expect(screen.queryByText('Credentials configured')).toBeNull();
   });
 });
 

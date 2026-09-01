@@ -1,6 +1,7 @@
 import os
 import threading
 import time
+from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -10,20 +11,37 @@ from sqlmodel import Session, SQLModel, create_engine, select
 import app.channels.service_intake as intake_module
 import app.core.agent_loop as agent_loop_module
 from app.channels.adapters.base import ChannelInbound, ChannelInboundAttachment
+from app.channels.service_dingtalk_inbox import (
+    dingtalk_account_key,
+    dingtalk_identity_scope,
+    stage_dingtalk_inbound,
+)
+from app.channels.service_durable_inbox import StageDisposition
+from app.channels.service_feishu_inbox import (
+    feishu_account_key,
+    feishu_identity_scope,
+    stage_feishu_inbound,
+)
 from app.channels.service_identity import channel_username
 from app.channels.service_intake import (
     _message_text,
     _session_lock,
+    claim_staged_inbound,
     process_inbound,
+    process_staged_inbound,
+    sweep_stale_inbound_events,
 )
 from app.channels.service_intake import (
     _send_wechat_typing as _real_send_wechat_typing,
 )
+from app.channels.service_wecom_inbox import stage_wecom_inbound
 from app.db.models import (
     ChannelBinding,
     ChannelDelivery,
+    ChannelIdentity,
     ChannelInboundEvent,
     ChatSession,
+    HumanHandoffRequest,
     Message,
     Tenant,
     User,
@@ -107,6 +125,136 @@ def _load_binding(engine, binding_id: str) -> ChannelBinding:
         binding = db.get(ChannelBinding, binding_id)
         db.expunge(binding)
         return binding
+
+
+def _set_tenant_lifecycle(engine, *, status: str, version: int) -> None:
+    """Set the authoritative tenant state for a lifecycle boundary test without provider I/O."""
+    with Session(engine) as db:
+        tenant = db.get(Tenant, "tenant_demo")
+        assert tenant is not None
+        tenant.status = status
+        tenant.lifecycle_version = version
+        db.add(tenant)
+        db.commit()
+
+
+def _wecom_inbound(event_id: str, text: str = "hello") -> ChannelInbound:
+    """Build one normalized WeCom callback payload whose provider account is test-controlled."""
+    return ChannelInbound(
+        channel="wecom",
+        event_id=event_id,
+        from_user_id="wecom-user-1",
+        to_user_id="aib_bot1",
+        session_id="wecom-user-1",
+        group_id="",
+        context_token="wecom-context-1",
+        text=text,
+        is_group=False,
+        raw={"msgid": event_id},
+        account_scope="corp-a",
+    )
+
+
+def _feishu_inbound(event_id: str, text: str = "hello") -> ChannelInbound:
+    """Build a normalized Feishu callback payload for provider staging contracts."""
+    return ChannelInbound(
+        channel="feishu",
+        event_id=event_id,
+        from_user_id="ou_user_a",
+        to_user_id="ou_bot_a",
+        session_id="oc_chat_a",
+        group_id="",
+        context_token="om_message_a",
+        text=text,
+        is_group=False,
+        raw={"event": {"message": {"message_id": event_id}}},
+        account_scope="",
+    )
+
+
+def _dingtalk_inbound(event_id: str, text: str = "hello") -> ChannelInbound:
+    """Build a normalized DingTalk callback payload for provider staging contracts."""
+    return ChannelInbound(
+        channel="dingtalk",
+        event_id=event_id,
+        from_user_id="staff-1",
+        to_user_id="robot-1",
+        session_id="conv-1",
+        group_id="",
+        context_token="https://example.test/reply",
+        text=text,
+        is_group=False,
+        raw={"msgId": event_id},
+        account_scope="tenant-a",
+    )
+
+
+def _provider_binding(engine, channel: str) -> str:
+    """Seed one provider binding with all account-scope fields already pinned."""
+    if channel == "wecom":
+        return _seed_binding(
+            engine,
+            channel="wecom",
+            config_json={"bot_id": "aib_bot1", "corp_id": "corp-a"},
+        )
+    if channel == "feishu":
+        app_id, tenant_key = "cli_app_a", "tenant-a"
+        return _seed_binding(
+            engine,
+            channel="feishu",
+            config_json={"app_id": app_id},
+            external_account_key=feishu_account_key(app_id),
+            provider_tenant_key=tenant_key,
+            identity_scope_key=feishu_identity_scope(app_id, tenant_key),
+        )
+    if channel == "dingtalk":
+        client_id, tenant_key = "client-a", "tenant-a"
+        return _seed_binding(
+            engine,
+            channel="dingtalk",
+            config_json={"client_id": client_id},
+            external_account_key=dingtalk_account_key(client_id),
+            provider_tenant_key=tenant_key,
+            identity_scope_key=dingtalk_identity_scope(client_id, tenant_key),
+        )
+    raise AssertionError(f"unsupported provider channel: {channel}")
+
+
+def _stage_provider_callback(engine, channel: str, binding_id: str, event_id: str):
+    """Invoke one provider staging function with its normal account-boundary arguments."""
+    if channel == "wecom":
+        return stage_wecom_inbound(
+            db_engine=engine,
+            binding_id=binding_id,
+            expected_revision=0,
+            account_scope="corp-a",
+            inbound=_wecom_inbound(event_id),
+        )
+    if channel == "feishu":
+        return stage_feishu_inbound(
+            db_engine=engine,
+            binding_id=binding_id,
+            expected_revision=0,
+            event_app_id="cli_app_a",
+            tenant_key="tenant-a",
+            inbound=_feishu_inbound(event_id),
+            target={
+                "message_id": event_id,
+                "reply_in_thread": False,
+                "receive_id_type": "open_id",
+                "receive_id": "ou_user_a",
+            },
+        )
+    if channel == "dingtalk":
+        return stage_dingtalk_inbound(
+            db_engine=engine,
+            binding_id=binding_id,
+            expected_revision=0,
+            client_id="client-a",
+            tenant_key="tenant-a",
+            inbound=_dingtalk_inbound(event_id),
+        )
+    raise AssertionError(f"unsupported provider channel: {channel}")
 
 
 def test_channel_only_attachment_uses_default_message_intent() -> None:
@@ -1411,3 +1559,468 @@ def test_inbound_with_attachments_passes_them_to_request(monkeypatch) -> None:
     assert len(request.attachments) == 1
     assert request.attachments[0].filename == "img.jpg"
     assert request.attachments[0].sha256 == "abc"
+
+
+# ---------- Phase 6: tenant lifecycle gates at channel ingress ----------
+
+
+def _stage_wecom_event(engine, event_id: str) -> tuple[str, str]:
+    """Stage one provider event for lifecycle tests and return its binding/event primary keys."""
+    binding_id = _seed_binding(
+        engine,
+        channel="wecom",
+        config_json={"bot_id": "aib_bot1", "corp_id": "corp-a"},
+    )
+    result = stage_wecom_inbound(
+        db_engine=engine,
+        binding_id=binding_id,
+        expected_revision=0,
+        account_scope="corp-a",
+        inbound=_wecom_inbound(event_id),
+    )
+    assert result.disposition is StageDisposition.STAGED
+    assert result.event_pk is not None
+    return binding_id, result.event_pk
+
+
+def test_suspended_provider_callback_is_acknowledged_and_security_dropped() -> None:
+    """A suspended tenant must ACK the provider while persisting no executable inbox event."""
+    engine = _test_engine()
+    binding_id = _seed_binding(
+        engine,
+        channel="wecom",
+        config_json={"bot_id": "aib_bot1", "corp_id": "corp-a"},
+    )
+    _set_tenant_lifecycle(engine, status="suspended", version=2)
+
+    result = stage_wecom_inbound(
+        db_engine=engine,
+        binding_id=binding_id,
+        expected_revision=0,
+        account_scope="corp-a",
+        inbound=_wecom_inbound("evt_suspended_callback"),
+    )
+
+    assert result.disposition is StageDisposition.SECURITY_DROP
+    assert result.should_ack is True
+    assert result.error_code == "TENANT_SUSPENDED"
+    with Session(engine) as db:
+        assert db.exec(select(ChannelInboundEvent)).all() == []
+        assert db.exec(select(ChatSession)).all() == []
+        assert db.exec(select(Message)).all() == []
+
+
+def test_suspended_direct_ingress_audit_scrubs_raw_payload_and_context_token() -> None:
+    """Lifecycle-denied direct ingress must retain no provider body or reply token."""
+    engine = _test_engine()
+    binding_id = _seed_binding(engine)
+    binding = _load_binding(engine, binding_id)
+    raw = _p2p_message("evt_direct_denied", "private provider message")
+    raw["provider_secret"] = "provider-secret-sentinel"
+    _set_tenant_lifecycle(engine, status="suspended", version=2)
+
+    assert process_inbound(binding, raw, db_engine=engine) is False
+
+    with Session(engine) as db:
+        event = db.exec(select(ChannelInboundEvent)).one()
+        assert event.status == "security_drop"
+        assert "provider-secret-sentinel" not in str(event.payload_json)
+        assert "private provider message" not in str(event.payload_json)
+        assert "ctx_evt_direct_denied" not in str(event.target_json)
+        assert "context_token" not in event.target_json
+
+
+@pytest.mark.parametrize("channel", ("feishu", "dingtalk"))
+def test_suspended_provider_callbacks_are_acknowledged_and_security_dropped(channel: str) -> None:
+    """Every provider callback must drop suspended tenant work before durable inbox creation."""
+    engine = _test_engine()
+    binding_id = _provider_binding(engine, channel)
+    _set_tenant_lifecycle(engine, status="suspended", version=2)
+
+    result = _stage_provider_callback(engine, channel, binding_id, f"evt_{channel}_suspended")
+
+    assert result.disposition is StageDisposition.SECURITY_DROP
+    assert result.should_ack is True
+    assert result.error_code == "TENANT_SUSPENDED"
+    with Session(engine) as db:
+        assert db.exec(select(ChannelInboundEvent)).all() == []
+        assert db.exec(select(ChatSession)).all() == []
+        assert db.exec(select(Message)).all() == []
+
+
+@pytest.mark.parametrize("channel", ("wecom", "feishu", "dingtalk"))
+def test_active_provider_admission_persists_tenant_lifecycle_version(channel: str) -> None:
+    """A provider event records the exact active lifecycle generation used for admission."""
+    engine = _test_engine()
+    binding_id = _provider_binding(engine, channel)
+    _set_tenant_lifecycle(engine, status="active", version=7)
+
+    result = _stage_provider_callback(engine, channel, binding_id, f"evt_{channel}_versioned")
+
+    assert result.disposition is StageDisposition.STAGED
+    assert result.event_pk is not None
+    with Session(engine) as db:
+        event = db.get(ChannelInboundEvent, result.event_pk)
+        assert event is not None
+        assert event.tenant_lifecycle_version == 7
+
+
+@pytest.mark.parametrize("channel", ("wecom", "feishu", "dingtalk"))
+def test_provider_staging_rechecks_binding_revision_before_event_insert(
+    monkeypatch,
+    channel: str,
+) -> None:
+    """A binding change after admission must reject the callback before durable staging."""
+    engine = _test_engine()
+    binding_id = _provider_binding(engine, channel)
+    original_admit = intake_module.admit_channel_lifecycle
+
+    def mutate_binding_after_admission(db, **kwargs):
+        decision = original_admit(db, **kwargs)
+        binding = db.get(ChannelBinding, binding_id)
+        assert binding is not None
+        binding.status = "disabled"
+        binding.config_revision = 1
+        db.add(binding)
+        db.flush()
+        return decision
+
+    monkeypatch.setattr(intake_module, "admit_channel_lifecycle", mutate_binding_after_admission)
+    result = _stage_provider_callback(engine, channel, binding_id, f"evt_{channel}_stale_binding")
+
+    assert result.disposition is StageDisposition.SECURITY_DROP
+    with Session(engine) as db:
+        assert db.exec(select(ChannelInboundEvent)).all() == []
+
+
+def test_suspend_after_inbound_claim_terminalizes_event_before_agent_loop(monkeypatch) -> None:
+    """A lifecycle transition after processor claim must stop the turn before any AgentLoop call."""
+    engine = _test_engine()
+    _binding_id, event_pk = _stage_wecom_event(engine, "evt_claim_suspend")
+    original_process = intake_module.process_inbound
+
+    def suspend_before_processing(binding, inbound, **kwargs):
+        _set_tenant_lifecycle(engine, status="suspended", version=2)
+        return original_process(binding, inbound, **kwargs)
+
+    monkeypatch.setattr(intake_module, "process_inbound", suspend_before_processing)
+
+    assert process_staged_inbound(event_pk, db_engine=engine) is False
+    assert RecordingAgentLoop.calls == []
+    with Session(engine) as db:
+        event = db.get(ChannelInboundEvent, event_pk)
+        assert event is not None
+        assert event.status == "security_drop"
+        assert event.error == "TENANT_SUSPENDED"
+        assert db.exec(select(ChatSession)).all() == []
+        assert db.exec(select(Message)).all() == []
+
+
+def test_suspended_handoff_reply_does_not_resume_the_old_turn(monkeypatch) -> None:
+    """A channel handoff reply must remain pending and avoid resume work after suspension."""
+    from app.channels.service_feishu_inbox import feishu_identity_scope
+
+    engine = _test_engine()
+    with Session(engine) as db:
+        db.add(
+            Tenant(
+                id="tenant_demo",
+                name="Demo",
+                status="suspended",
+                lifecycle_version=2,
+            )
+        )
+        binding = ChannelBinding(
+            id="binding-feishu-handoff",
+            tenant_id="tenant_demo",
+            agent_id="agent_1",
+            channel="feishu",
+            status="active",
+            config_json={"app_id": "cli_app_a"},
+            external_account_key="feishu:app:10:cli_app_a",
+            identity_scope_key=feishu_identity_scope("cli_app_a", "tenant-a"),
+            provider_tenant_key="tenant-a",
+        )
+        session = ChatSession(
+            id="session-handoff",
+            tenant_id="tenant_demo",
+            user_id="requester",
+            agent_id="agent_1",
+            channel="feishu",
+            status="handoff",
+            external_conv_id="feishu_p2p_requester",
+            channel_binding_id=binding.id,
+            channel_account_key=binding.external_account_key,
+        )
+        handoff = HumanHandoffRequest(
+            id="handoff-suspended",
+            tenant_id="tenant_demo",
+            session_id=session.id,
+            agent_id="agent_1",
+            requester_user_id="requester",
+            assignee_user_id="assignee",
+            status="pending",
+            pending_question="请确认处理结果",
+        )
+        notice = ChannelDelivery(
+            id="delivery-handoff-notice",
+            tenant_id="tenant_demo",
+            binding_id=binding.id,
+            session_id=f"handoff:{handoff.id}",
+            message_id="feishu-notice-1",
+            target_json={
+                "receive_id_type": "open_id",
+                "receive_id": "assignee-open-id",
+                "handoff_id": handoff.id,
+            },
+            kind="handoff_notice",
+            text="handoff",
+            status="delivered",
+            idempotency_key="handoff-notice-1",
+        )
+        db.add_all(
+            [
+                binding,
+                session,
+                handoff,
+                notice,
+                ChannelIdentity(
+                    tenant_id="tenant_demo",
+                    channel="feishu",
+                    external_account_scope=binding.identity_scope_key,
+                    external_user_id="assignee-open-id",
+                    staffdeck_user_id="assignee",
+                ),
+            ]
+        )
+        db.commit()
+
+    inbound = ChannelInbound(
+        channel="feishu",
+        event_id="feishu-handoff-reply-1",
+        from_user_id="assignee-open-id",
+        to_user_id="bot-open-id",
+        session_id="assignee-open-id",
+        group_id="",
+        context_token="",
+        text="已处理",
+        is_group=False,
+        parent_id="feishu-notice-1",
+        raw={},
+    )
+    applied: list[str] = []
+
+    def record_resume(*_args, **_kwargs):
+        applied.append("resume")
+
+    import app.api.chat as chat_api
+
+    monkeypatch.setattr(chat_api, "_apply_handoff_reply", record_resume)
+    binding = _load_binding(engine, "binding-feishu-handoff")
+
+    assert process_inbound(binding, inbound, db_engine=engine) is False
+    assert applied == []
+    assert RecordingAgentLoop.calls == []
+    with Session(engine) as db:
+        event = db.exec(select(ChannelInboundEvent)).one()
+        assert event.status == "security_drop"
+        assert event.error == "TENANT_SUSPENDED"
+        assert db.get(HumanHandoffRequest, "handoff-suspended").status == "pending"
+        assert db.exec(select(ChannelDelivery).where(ChannelDelivery.kind == "handoff_ack")).all() == []
+
+
+def test_handoff_resume_does_not_replay_after_fast_reactivation(monkeypatch) -> None:
+    """A handoff admitted before suspension must not resume its old AgentLoop generation."""
+    import app.api.chat as chat_api
+
+    engine = _test_engine()
+    binding_id = "binding-feishu-fast-reactivation"
+    with Session(engine) as db:
+        db.add(Tenant(id="tenant_demo", name="Demo"))
+        binding = ChannelBinding(
+            id=binding_id,
+            tenant_id="tenant_demo",
+            agent_id="agent_1",
+            channel="feishu",
+            status="active",
+            config_json={"app_id": "cli_app_a"},
+            external_account_key="feishu:app:10:cli_app_a",
+            identity_scope_key=feishu_identity_scope("cli_app_a", "tenant-a"),
+            provider_tenant_key="tenant-a",
+        )
+        session = ChatSession(
+            id="session-fast-reactivation",
+            tenant_id="tenant_demo",
+            user_id="requester",
+            agent_id="agent_1",
+            channel="feishu",
+            status="handoff",
+            external_conv_id="feishu_p2p_requester",
+            channel_binding_id=binding.id,
+            channel_account_key=binding.external_account_key,
+        )
+        handoff = HumanHandoffRequest(
+            id="handoff-fast-reactivation",
+            tenant_id="tenant_demo",
+            session_id=session.id,
+            agent_id="agent_1",
+            requester_user_id="requester",
+            assignee_user_id="assignee",
+            status="pending",
+            pending_question="请确认处理结果",
+        )
+        notice = ChannelDelivery(
+            id="delivery-fast-reactivation",
+            tenant_id="tenant_demo",
+            binding_id=binding.id,
+            session_id=f"handoff:{handoff.id}",
+            message_id="feishu-notice-fast-reactivation",
+            target_json={
+                "receive_id_type": "open_id",
+                "receive_id": "assignee-open-id",
+                "handoff_id": handoff.id,
+            },
+            kind="handoff_notice",
+            text="handoff",
+            status="delivered",
+            idempotency_key="handoff-notice-fast-reactivation",
+        )
+        db.add_all(
+            [
+                binding,
+                session,
+                handoff,
+                notice,
+                ChannelIdentity(
+                    tenant_id="tenant_demo",
+                    channel="feishu",
+                    external_account_scope=binding.identity_scope_key,
+                    external_user_id="assignee-open-id",
+                    staffdeck_user_id="assignee",
+                ),
+            ]
+        )
+        db.commit()
+
+    pending_resume_ids: list[str] = []
+    monkeypatch.setattr(chat_api, "engine", engine)
+    monkeypatch.setattr(
+        chat_api,
+        "_resume_human_handoff_async",
+        lambda handoff_id: pending_resume_ids.append(handoff_id),
+    )
+    monkeypatch.setattr(chat_api, "AgentLoop", RecordingAgentLoop)
+
+    inbound = ChannelInbound(
+        channel="feishu",
+        event_id="feishu-handoff-fast-reactivation",
+        from_user_id="assignee-open-id",
+        to_user_id="bot-open-id",
+        session_id="assignee-open-id",
+        group_id="",
+        context_token="",
+        text="已处理",
+        is_group=False,
+        parent_id="feishu-notice-fast-reactivation",
+        raw={},
+    )
+    binding = _load_binding(engine, binding_id)
+
+    assert process_inbound(binding, inbound, db_engine=engine) is False
+    assert pending_resume_ids == ["handoff-fast-reactivation"]
+    assert RecordingAgentLoop.calls == []
+
+    _set_tenant_lifecycle(engine, status="suspended", version=2)
+    _set_tenant_lifecycle(engine, status="active", version=3)
+    chat_api._resume_human_handoff_worker(pending_resume_ids[0])
+
+    assert RecordingAgentLoop.calls == []
+
+
+def test_stale_inbound_completion_cannot_mark_done_after_lifecycle_transition() -> None:
+    """A claimed inbound row must reject stale success after tenant version changes."""
+    engine = _test_engine()
+    binding_id = _seed_binding(engine)
+    with Session(engine) as db:
+        event = ChannelInboundEvent(
+            tenant_id="tenant_demo",
+            tenant_lifecycle_version=1,
+            binding_id=binding_id,
+            channel="wechat",
+            event_id="evt_stale_completion",
+            payload_json={},
+            target_json={},
+            status="processing",
+            processor_run_id=intake_module.current_processor_run_id(),
+        )
+        db.add(event)
+        db.commit()
+        event_id = event.id
+
+    _set_tenant_lifecycle(engine, status="suspended", version=2)
+    with Session(engine) as db:
+        assert (
+            intake_module._finish_owned_inbound(
+                db,
+                event_id,
+                status="done",
+                processed=True,
+            )
+            is False
+        )
+
+    with Session(engine) as db:
+        event = db.get(ChannelInboundEvent, event_id)
+        assert event is not None
+        assert event.status != "done"
+
+
+def test_inbound_side_effects_recheck_lifecycle_before_typing_cleanup(monkeypatch) -> None:
+    """Typing cleanup must not call the provider after the turn crosses suspension."""
+    engine = _test_engine()
+    binding_id = _seed_binding(engine)
+    binding = _load_binding(engine, binding_id)
+
+    class SuspendingAgentLoop(RecordingAgentLoop):
+        """Finish the local fake turn, then suspend before intake cleanup side effects."""
+
+        def handle_turn(self, request):
+            response = super().handle_turn(request)
+            _set_tenant_lifecycle(engine, status="suspended", version=2)
+            return response
+
+    monkeypatch.setattr(agent_loop_module, "AgentLoop", SuspendingAgentLoop)
+
+    assert process_inbound(binding, _p2p_message("evt_typing_after_suspend"), db_engine=engine) is False
+    assert TypingRecorder.calls == [1]
+
+    with Session(engine) as db:
+        event = db.exec(select(ChannelInboundEvent)).one()
+        assert event.status == "security_drop"
+
+
+def test_stale_inbound_recovery_does_not_replay_after_fast_reactivation() -> None:
+    """Recovery must terminalize old ingress at its admission version across suspend/reactivate."""
+    engine = _test_engine()
+    _binding_id, event_pk = _stage_wecom_event(engine, "evt_fast_reactivation")
+    assert claim_staged_inbound(event_pk, db_engine=engine) is True
+    with Session(engine) as db:
+        event = db.get(ChannelInboundEvent, event_pk)
+        assert event is not None
+        event.processor_run_id = "dead-processor"
+        event.processor_lease_expires_at = utc_now() - timedelta(seconds=1)
+        db.add(event)
+        db.commit()
+
+    _set_tenant_lifecycle(engine, status="suspended", version=2)
+    _set_tenant_lifecycle(engine, status="active", version=3)
+
+    assert sweep_stale_inbound_events(db_engine=engine) == 0
+    assert RecordingAgentLoop.calls == []
+    with Session(engine) as db:
+        event = db.get(ChannelInboundEvent, event_pk)
+        assert event is not None
+        assert event.status == "security_drop"
+        assert event.error == "TENANT_SUSPENDED"
+        assert db.exec(select(ChatSession)).all() == []
+        assert db.exec(select(Message)).all() == []

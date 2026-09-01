@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import {
   Clock,
@@ -39,9 +39,11 @@ import { backendEventMessage } from '@/lib/backendEventMessages';
 import { cn } from '@/lib/utils';
 import { SELECT_TRIGGER_CLASS, formatDateTime } from '@/lib/enterprise-ui';
 import { isTeamScope, readEmployeeScope } from '@/lib/agent-scope-storage';
+import { tenantUserStorageKey } from '@/lib/tenant-storage';
 import { MarkdownMessage } from '../chat/chatHelpers';
 
-import { api, TENANT_ID } from '../../api/client';
+import { createTenantClient } from '../../api/tenant-client';
+import { useTenantSession } from '../../contexts/TenantSessionContext';
 import IconCalendar from '../../assets/icons/profile-calendar.svg?react';
 import { employeeDisplayNameWithCreator } from '../../employee';
 import { useClientPagination } from '../../hooks/useClientPagination';
@@ -68,6 +70,63 @@ import { employeeDashboardMetrics } from './employeeDashboardMetrics';
 
 const FEEDBACK_PAGE_SIZE = 10;
 const ALL_CONVERSATION_USERS = '__all_conversation_users__';
+const CONVERSATION_LOG_FILTER_FEATURE = 'conversation-log-filter';
+
+const CONVERSATION_LOG_FILTERS = new Set<ConversationLogFilter>([
+  'all',
+  'up',
+  'down',
+  'unrated',
+  'ability',
+  'tool',
+  'knowledge',
+  'sop',
+]);
+
+type StoredConversationLogFilter = {
+  filter: ConversationLogFilter;
+  userId: string;
+};
+
+/** Generate the tenant/user namespace for conversation-log view preferences. */
+function conversationLogFilterStorageKey(tenantId: string, userId: string): string {
+  return tenantUserStorageKey(tenantId, userId, CONVERSATION_LOG_FILTER_FEATURE);
+}
+
+/** Read only the validated conversation-log filter for one tenant/user pair. */
+function readConversationLogFilter(tenantId: string, userId: string): StoredConversationLogFilter | null {
+  try {
+    const raw = window.localStorage.getItem(conversationLogFilterStorageKey(tenantId, userId));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    if (
+      !parsed
+      || typeof parsed !== 'object'
+      || typeof parsed.userId !== 'string'
+      || typeof parsed.filter !== 'string'
+      || !CONVERSATION_LOG_FILTERS.has(parsed.filter as ConversationLogFilter)
+    ) return null;
+    return { filter: parsed.filter as ConversationLogFilter, userId: parsed.userId };
+  } catch {
+    return null;
+  }
+}
+
+/** Persist the filter selection in the verified tenant/user namespace only. */
+function persistConversationLogFilter(
+  tenantId: string,
+  userId: string,
+  value: StoredConversationLogFilter,
+): void {
+  try {
+    window.localStorage.setItem(
+      conversationLogFilterStorageKey(tenantId, userId),
+      JSON.stringify(value),
+    );
+  } catch {
+    // A blocked or full browser store must not affect server-backed log views.
+  }
+}
 
 type ConversationDetail = {
   session: Record<string, unknown>;
@@ -286,6 +345,21 @@ function formatMetricPercent(value: number, locale: string): string {
 
 export default function ConversationLogsTab() {
   const { locale, t } = useAppIntl();
+  const tenantContext = useTenantSession();
+  const tenantClient = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
+  const tenantId = tenantContext?.tenantId || '';
+  const userId = tenantContext?.userId || '';
+  const tenantScopeKey = tenantContext
+    ? `${tenantId}:${userId}:${tenantContext.generation}`
+    : '';
+  const scopeKeyRef = useRef('');
+  const agentIdRef = useRef('');
+  const lastAgentIdRef = useRef('');
+  const scopeRevisionRef = useRef(0);
+  const actionControllersRef = useRef(new Set<AbortController>());
+  const previousAgentIdRef = useRef<string | null>(null);
+  const [scopeReady, setScopeReady] = useState(false);
+  const loadControllerRef = useRef<AbortController | null>(null);
   const feedbackTranslate: FeedbackTranslate = (id, values) => {
     switch (id) {
       case 'dashboard.conversationLogs.bucket.modelIssue':
@@ -335,7 +409,7 @@ export default function ConversationLogsTab() {
     }
   };
   const [searchParams] = useSearchParams();
-  const [scopedAgentId, setScopedAgentId] = useState(readEmployeeScope);
+  const [scopedAgentId, setScopedAgentId] = useState('');
   const agentId = searchParams.get('agent_id') || scopedAgentId;
   const [sessions, setSessions] = useState<EnterpriseChatSessionRead[]>([]);
   const [downRows, setDownRows] = useState<FeedbackSessionRead[]>([]);
@@ -350,31 +424,121 @@ export default function ConversationLogsTab() {
   const [reanalyzingId, setReanalyzingId] = useState<string | null>(null);
   const [selectedSessionIds, setSelectedSessionIds] = useState<Set<string>>(() => new Set());
   const [exportingKey, setExportingKey] = useState('');
+  // Keep the latest effective employee visible to in-flight callbacks before passive effects run.
+  agentIdRef.current = agentId;
+
+  /** Abort detail, feedback, and export actions when the employee scope changes or the view unmounts. */
+  function cancelActionControllers() {
+    actionControllersRef.current.forEach((controller) => controller.abort());
+    actionControllersRef.current.clear();
+  }
+
+  /** Advance the scope revision synchronously so no action can publish into a replaced employee view. */
+  function updateAgentScope(nextAgentId: string) {
+    agentIdRef.current = nextAgentId;
+    lastAgentIdRef.current = nextAgentId;
+    scopeRevisionRef.current += 1;
+    cancelActionControllers();
+    setSessions([]);
+    setDownRows([]);
+    setUpRows([]);
+    setSummary(null);
+    setExportingKey('');
+    setDetailLoading(false);
+    setReanalyzingId(null);
+    setDetail(null);
+    setSelectedSessionIds(new Set());
+    setScopedAgentId(nextAgentId);
+  }
+
+  useEffect(() => {
+    if (lastAgentIdRef.current === agentId) return;
+    lastAgentIdRef.current = agentId;
+    scopeRevisionRef.current += 1;
+    cancelActionControllers();
+    setSessions([]);
+    setDownRows([]);
+    setUpRows([]);
+    setSummary(null);
+    setExportingKey('');
+    setDetailLoading(false);
+    setReanalyzingId(null);
+    setDetail(null);
+    setSelectedSessionIds(new Set());
+  }, [agentId]);
+
+  useEffect(() => () => cancelActionControllers(), [tenantContext?.generation]);
   const filterTabs = useMemo<UnderlineTabItem<ConversationLogFilter>[]>(
     () => FILTER_TAB_DEFINITIONS.map((item) => ({ value: item.value, label: t(item.labelId) })),
     [t],
   );
 
   useEffect(() => {
+    if (!tenantContext || !tenantId || !userId) {
+      scopeKeyRef.current = '';
+      agentIdRef.current = '';
+      lastAgentIdRef.current = '';
+      scopeRevisionRef.current += 1;
+      cancelActionControllers();
+      previousAgentIdRef.current = null;
+      setScopeReady(false);
+      setScopedAgentId('');
+      setFilter('all');
+      setConversationUserId(ALL_CONVERSATION_USERS);
+      return;
+    }
+    scopeKeyRef.current = tenantScopeKey;
+    const nextAgentId = readEmployeeScope(tenantId, userId);
+    agentIdRef.current = nextAgentId;
+    lastAgentIdRef.current = nextAgentId;
+    scopeRevisionRef.current += 1;
+    cancelActionControllers();
+    setScopedAgentId(nextAgentId);
+    const stored = readConversationLogFilter(tenantId, userId);
+    setFilter(stored?.filter || 'all');
+    setConversationUserId(stored?.userId || ALL_CONVERSATION_USERS);
+    setScopeReady(true);
+  }, [tenantContext, tenantId, tenantScopeKey, userId]);
+
+  useEffect(() => {
     const onScopeChange = (event: Event) => {
       const next = (event as CustomEvent<{ agentId?: string }>).detail?.agentId || '';
-      setScopedAgentId(next && !isTeamScope(next) ? next : readEmployeeScope());
+      if (!tenantContext || !tenantId || !userId || scopeKeyRef.current !== tenantScopeKey) return;
+      updateAgentScope(next && !isTeamScope(next) ? next : readEmployeeScope(tenantId, userId));
     };
     window.addEventListener('ultrarag-enterprise-agent-scope-change', onScopeChange);
     return () => window.removeEventListener('ultrarag-enterprise-agent-scope-change', onScopeChange);
-  }, []);
+  }, [tenantContext, tenantId, tenantScopeKey, userId]);
 
-  const load = async () => {
+  const load = useCallback(async () => {
+    if (!tenantContext || !tenantId || !userId || !scopeReady || scopeKeyRef.current !== tenantScopeKey) return;
+    loadControllerRef.current?.abort();
+    const requestController = new AbortController();
+    loadControllerRef.current = requestController;
+    const generation = tenantContext.generation;
+    const capturedAgentId = agentId;
+    const capturedScopeRevision = scopeRevisionRef.current;
+    const isCurrent = () => (
+      !requestController.signal.aborted
+      && tenantContext.isCurrentGeneration(generation)
+      && scopeKeyRef.current === tenantScopeKey
+      && agentIdRef.current === capturedAgentId
+      && scopeRevisionRef.current === capturedScopeRevision
+    );
     setLoading(true);
     const agentQuery = agentId ? `&agent_id=${encodeURIComponent(agentId)}` : '';
     // Load each source independently so one failing endpoint doesn't blank the whole tab.
     const [sessionResult, downResult, upResult, summaryResult, agentResult] = await Promise.allSettled([
-      api.get<EnterpriseChatSessionRead[]>(`/api/enterprise/sessions?tenant_id=${TENANT_ID}${agentQuery}`),
-      api.get<FeedbackSessionRead[]>(`/api/enterprise/feedback/sessions?tenant_id=${TENANT_ID}&rating=down${agentQuery}`),
-      api.get<FeedbackSessionRead[]>(`/api/enterprise/feedback/sessions?tenant_id=${TENANT_ID}&rating=up${agentQuery}`),
-      api.get<FeedbackSummaryRead>(`/api/enterprise/feedback/summary?tenant_id=${TENANT_ID}${agentQuery}`),
-      api.get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${TENANT_ID}`),
+      tenantClient.get<EnterpriseChatSessionRead[]>(
+        `/api/enterprise/sessions${agentId ? `?agent_id=${encodeURIComponent(agentId)}` : ''}`,
+        { signal: requestController.signal },
+      ),
+      tenantClient.get<FeedbackSessionRead[]>(`/api/enterprise/feedback/sessions?rating=down${agentQuery}`, { signal: requestController.signal }),
+      tenantClient.get<FeedbackSessionRead[]>(`/api/enterprise/feedback/sessions?rating=up${agentQuery}`, { signal: requestController.signal }),
+      tenantClient.get<FeedbackSummaryRead>(`/api/enterprise/feedback/summary${agentId ? `?agent_id=${encodeURIComponent(agentId)}` : ''}`, { signal: requestController.signal }),
+      tenantClient.get<AgentProfileRead[]>('/api/enterprise/agents', { signal: requestController.signal }),
     ]);
+    if (!isCurrent()) return;
     if (sessionResult.status === 'fulfilled') setSessions(sessionResult.value);
     if (downResult.status === 'fulfilled') setDownRows(downResult.value);
     if (upResult.status === 'fulfilled') setUpRows(upResult.value);
@@ -386,17 +550,63 @@ export default function ConversationLogsTab() {
     if (failure) {
       notify.error(conversationLogErrorMessage(failure.reason, 'dashboard.conversationLogs.error.partialLoad', t));
     }
-    setLoading(false);
-  };
+    if (loadControllerRef.current === requestController) {
+      loadControllerRef.current = null;
+      setLoading(false);
+    }
+  }, [agentId, scopeReady, t, tenantClient, tenantContext, tenantId, tenantScopeKey, userId]);
 
   useEffect(() => {
     void load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [agentId]);
+    return () => {
+      loadControllerRef.current?.abort();
+    };
+  }, [load]);
 
   useEffect(() => {
+    if (!tenantContext || !tenantId || !userId || !scopeReady || scopeKeyRef.current !== tenantScopeKey) {
+      previousAgentIdRef.current = null;
+      return;
+    }
+    // The first scoped render has already hydrated the persisted user filter;
+    // only a later employee-scope change should clear an incompatible user.
+    if (previousAgentIdRef.current === null) {
+      previousAgentIdRef.current = agentId;
+      return;
+    }
+    if (previousAgentIdRef.current === agentId) return;
+    previousAgentIdRef.current = agentId;
     setConversationUserId(ALL_CONVERSATION_USERS);
-  }, [agentId]);
+  }, [agentId, scopeReady, tenantContext, tenantId, tenantScopeKey, userId]);
+
+  useEffect(() => {
+    if (!tenantContext || !tenantId || !userId || !scopeReady || scopeKeyRef.current !== tenantScopeKey) return;
+    persistConversationLogFilter(tenantId, userId, {
+      filter,
+      userId: conversationUserId,
+    });
+  }, [conversationUserId, filter, scopeReady, tenantContext, tenantId, tenantScopeKey, userId]);
+
+  /** Create a request fence that rejects late results after tenant or view replacement. */
+  const beginRequestFence = () => {
+    if (!tenantContext || !tenantId || !userId || !scopeReady || scopeKeyRef.current !== tenantScopeKey) return null;
+    const requestController = new AbortController();
+    actionControllersRef.current.add(requestController);
+    const generation = tenantContext.generation;
+    const capturedAgentId = agentId;
+    const capturedScopeRevision = scopeRevisionRef.current;
+    return {
+      signal: requestController.signal,
+      isCurrent: () => (
+        !requestController.signal.aborted
+        && tenantContext.isCurrentGeneration(generation)
+        && scopeKeyRef.current === tenantScopeKey
+        && agentIdRef.current === capturedAgentId
+        && scopeRevisionRef.current === capturedScopeRevision
+      ),
+      release: () => actionControllersRef.current.delete(requestController),
+    };
+  };
 
   const rows = useMemo<ConversationLogRow[]>(() => {
     const downBySession = new Map(downRows.map((item) => [item.session_id, item]));
@@ -492,48 +702,70 @@ export default function ConversationLogsTab() {
   };
 
   const exportSingleSession = async (row: ConversationLogRow) => {
+    const fence = beginRequestFence();
+    if (!fence) return;
     setExportingKey(row.id);
     try {
-      const blob = await api.blob(
-        `/api/enterprise/sessions/${encodeURIComponent(row.id)}/export?tenant_id=${TENANT_ID}`,
+      const blob = await tenantClient.blob(
+        `/api/enterprise/sessions/${encodeURIComponent(row.id)}/export`,
+        { signal: fence.signal },
       );
+      if (!fence.isCurrent()) return;
       downloadBlob(blob, `staffdeck-conversation-log-${safeFilenamePart(row.id)}.json`);
       notify.success(t('dashboard.conversationLogs.toast.exportSingleSuccess'));
     } catch (error) {
-      notify.error(conversationLogErrorMessage(error, 'dashboard.conversationLogs.error.exportSingle', t));
+      if (fence.isCurrent()) {
+        notify.error(conversationLogErrorMessage(error, 'dashboard.conversationLogs.error.exportSingle', t));
+      }
     } finally {
-      setExportingKey('');
+      if (fence.isCurrent()) setExportingKey('');
+      fence.release();
     }
   };
 
   const exportBatch = async () => {
+    const fence = beginRequestFence();
+    if (!fence) return;
     const sessionIds = batchRows.map((row) => row.id);
-    if (sessionIds.length === 0) return;
+    if (sessionIds.length === 0) {
+      fence.release();
+      return;
+    }
     if (sessionIds.length > 500) {
       notify.error(t('dashboard.conversationLogs.error.exportBatchLimit', { count: 500 }));
+      fence.release();
       return;
     }
     setExportingKey('batch');
     try {
-      const blob = await api.postBlob(
-        `/api/enterprise/sessions/export?tenant_id=${TENANT_ID}`,
+      const blob = await tenantClient.postBlob(
+        '/api/enterprise/sessions/export',
         { session_ids: sessionIds },
+        { signal: fence.signal },
       );
+      if (!fence.isCurrent()) return;
       downloadBlob(blob, `staffdeck-conversation-logs-${filenameTimestamp()}.json`);
       notify.success(t('dashboard.conversationLogs.toast.exportBatchSuccess', { count: sessionIds.length }));
     } catch (error) {
-      notify.error(conversationLogErrorMessage(error, 'dashboard.conversationLogs.error.exportBatch', t));
+      if (fence.isCurrent()) {
+        notify.error(conversationLogErrorMessage(error, 'dashboard.conversationLogs.error.exportBatch', t));
+      }
     } finally {
-      setExportingKey('');
+      if (fence.isCurrent()) setExportingKey('');
+      fence.release();
     }
   };
 
   const openDetail = async (row: ConversationLogRow) => {
+    const fence = beginRequestFence();
+    if (!fence) return;
     setDetailLoading(true);
     try {
-      const sessionDetail = await api.get<EnterpriseSessionDetailRead>(
-        `/api/enterprise/sessions/${row.id}?tenant_id=${TENANT_ID}`,
+      const sessionDetail = await tenantClient.get<EnterpriseSessionDetailRead>(
+        `/api/enterprise/sessions/${row.id}`,
+        { signal: fence.signal },
       );
+      if (!fence.isCurrent()) return;
       setDetail({
         session: sessionDetail.session,
         messages: sessionDetail.messages,
@@ -543,9 +775,12 @@ export default function ConversationLogsTab() {
         toolInvocations: sessionDetail.tool_invocations || [],
       });
     } catch (error) {
-      notify.error(conversationLogErrorMessage(error, 'dashboard.conversationLogs.error.loadDetail', t));
+      if (fence.isCurrent()) {
+        notify.error(conversationLogErrorMessage(error, 'dashboard.conversationLogs.error.loadDetail', t));
+      }
     } finally {
-      setDetailLoading(false);
+      if (fence.isCurrent()) setDetailLoading(false);
+      fence.release();
     }
   };
 
@@ -557,16 +792,27 @@ export default function ConversationLogsTab() {
   };
 
   const reanalyzeFeedback = async (feedbackId: string) => {
+    const fence = beginRequestFence();
+    if (!fence) return;
     setReanalyzingId(feedbackId);
     try {
-      await api.post(`/api/enterprise/feedback/${feedbackId}/reanalyze?tenant_id=${TENANT_ID}`);
+      await tenantClient.post(
+        `/api/enterprise/feedback/${feedbackId}/reanalyze`,
+        undefined,
+        { signal: fence.signal },
+      );
+      if (!fence.isCurrent()) return;
       notify.success(t('dashboard.conversationLogs.toast.reanalyzeSuccess'));
       await reloadCurrentDetail();
+      if (!fence.isCurrent()) return;
       await load();
     } catch (error) {
-      notify.error(conversationLogErrorMessage(error, 'dashboard.conversationLogs.error.reanalyze', t));
+      if (fence.isCurrent()) {
+        notify.error(conversationLogErrorMessage(error, 'dashboard.conversationLogs.error.reanalyze', t));
+      }
     } finally {
-      setReanalyzingId(null);
+      if (fence.isCurrent()) setReanalyzingId(null);
+      fence.release();
     }
   };
 

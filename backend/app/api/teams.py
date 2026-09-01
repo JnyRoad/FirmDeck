@@ -47,7 +47,13 @@ from app.knowledge.errors import KnowledgeError
 from app.knowledge.service import IngestPayload, KnowledgeService
 from app.security.auth import get_current_user
 from app.security.permissions import is_admin_user as _is_admin_user
-from app.security.tenant import ensure_tenant
+from app.security.tenant import (
+    TenantExecutionKind,
+    TenantLifecycleDenied,
+    ensure_tenant,
+    require_active_tenant,
+    require_matching_admission_version,
+)
 from app.session.message_read import message_read
 from app.session.message_visibility import visible_message_content, visible_message_rows
 from app.session.session_kinds import (
@@ -242,6 +248,29 @@ def _ensure_team_manager(team: Team, user: User) -> None:
     """写操作权限:团队创建者(owner)或管理员。"""
     if team.owner_user_id != user.id and not _is_admin_user(user):
         raise _team_api_error("TEAM_MANAGE_FORBIDDEN", 403)
+
+
+def _require_team_execution_admission(
+    db: Session,
+    team: Team,
+    *,
+    correlation_id: str,
+    persisted_version: object | None = None,
+) -> int:
+    """Gate team execution writes and return the immutable tenant version."""
+    try:
+        decision = require_active_tenant(
+            db,
+            team.tenant_id,
+            TenantExecutionKind.JOB_CLAIM,
+            correlation_id,
+        )
+        if persisted_version is not None:
+            require_matching_admission_version(decision, persisted_version)
+    except TenantLifecycleDenied as exc:
+        status_code = 403 if exc.code == "TENANT_SUSPENDED" else 409
+        raise _team_api_error(exc.code, status_code) from None
+    return decision.lifecycle_version
 
 
 def _member_read(db: Session, member) -> TeamMemberRead:
@@ -702,6 +731,11 @@ def tl_chat_endpoint(
     ensure_tenant(db, request.tenant_id)
     _ensure_request_tenant(request.tenant_id, current_user)
     team = get_team(db, request.tenant_id, team_id)
+    _require_team_execution_admission(
+        db,
+        team,
+        correlation_id=team.id,
+    )
     if not request.message.strip():
         raise _team_api_error("TEAM_MESSAGE_REQUIRED", 400)
     leader = get_team_leader(db, team.id)
@@ -748,6 +782,11 @@ def tl_chat_endpoint(
         interaction_mode="team_tl",
     )
     response = AgentLoop(db).handle_turn(turn)
+    _require_team_execution_admission(
+        db,
+        team,
+        correlation_id=turn.client_turn_id,
+    )
     reply = response.reply or ""
     created = process_tl_reply(
         db,
@@ -777,6 +816,11 @@ def tl_session_endpoint(
     ensure_tenant(db, request.tenant_id)
     _ensure_request_tenant(request.tenant_id, current_user)
     team = get_team(db, request.tenant_id, team_id)
+    _require_team_execution_admission(
+        db,
+        team,
+        correlation_id=team.id,
+    )
     leader = get_team_leader(db, team.id)
     if leader is None:
         raise _team_api_error("TEAM_LEADER_REQUIRED", 400)
@@ -1073,6 +1117,11 @@ def create_team_task_endpoint(
     _ensure_request_tenant(request.tenant_id, current_user)
     team = get_team(db, request.tenant_id, team_id)
     _ensure_team_manager(team, current_user)
+    admission_version = _require_team_execution_admission(
+        db,
+        team,
+        correlation_id=team.id,
+    )
     title = request.title.strip()
     if not title:
         raise _team_api_error("TEAM_TASK_TITLE_REQUIRED", 400)
@@ -1084,6 +1133,7 @@ def create_team_task_endpoint(
     task = TeamTask(
         team_id=team.id,
         tenant_id=team.tenant_id,
+        tenant_lifecycle_version=admission_version,
         title=title,
         description=request.description,
         priority=request.priority or "normal",
@@ -1276,6 +1326,12 @@ def override_task_award(
     team = get_team(db, request.tenant_id, team_id)
     _ensure_team_manager(team, current_user)
     task = _get_team_task(db, team, task_id)
+    _require_team_execution_admission(
+        db,
+        team,
+        correlation_id=task.id,
+        persisted_version=task.tenant_lifecycle_version,
+    )
     if task.status not in AWARD_OVERRIDABLE_STATUSES:
         raise _team_api_error("TEAM_TASK_AWARD_OVERRIDE_FORBIDDEN", 409)
     member_ids = {item.agent_id for item in list_team_members(db, team.id)}
@@ -1325,6 +1381,12 @@ def override_task_review(
     team = get_team(db, request.tenant_id, team_id)
     _ensure_team_manager(team, current_user)
     task = _get_team_task(db, team, task_id)
+    _require_team_execution_admission(
+        db,
+        team,
+        correlation_id=task.id,
+        persisted_version=task.tenant_lifecycle_version,
+    )
     if task.status not in OVERRIDABLE_STATUSES:
         raise _team_api_error("TEAM_TASK_REVIEW_OVERRIDE_FORBIDDEN", 409)
     target = VERDICT_TARGET_STATUS[request.verdict]
@@ -1393,6 +1455,12 @@ def resume_team_task(
     _ensure_request_tenant(request.tenant_id, current_user)
     team = get_team(db, request.tenant_id, team_id)
     task = _get_team_task(db, team, task_id)
+    _require_team_execution_admission(
+        db,
+        team,
+        correlation_id=task.id,
+        persisted_version=task.tenant_lifecycle_version,
+    )
     if task.created_by_user_id != current_user.id:
         _ensure_team_manager(team, current_user)
     answer = request.answer.strip()

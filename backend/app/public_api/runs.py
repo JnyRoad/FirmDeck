@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import mimetypes
 import re
 import threading
+from collections.abc import Iterator
 from typing import Any
 from urllib.parse import quote
 
@@ -28,6 +30,7 @@ from app.db.models import (
     APIClient,
     APICredential,
     APIJob,
+    APIJobEvent,
     ChatSession,
     HarnessInvocationRecord,
     HarnessTaskFrameRecord,
@@ -42,16 +45,19 @@ from app.i18n.language_context import (
     resolve_compatible_language_context,
     resolve_language_context,
 )
+from app.public_api import jobs as public_jobs
 from app.public_api.auth import PublicPrincipal, enforce_agent_access, require_scopes
 from app.public_api.errors import PublicAPIError
 from app.public_api.idempotency import replay_idempotent_response, store_idempotent_response
 from app.public_api.jobs import (
     _project_source_event_data,
+    _require_job_execution_fence,
+    _require_job_lifecycle,
     create_job,
     ensure_not_cancelled,
     job_read,
+    mark_side_effect_started,
     register_job_handler,
-    stream_job_events,
     update_job,
 )
 from app.public_api.schemas import AgentRunCreate, PublicSessionCreate
@@ -60,9 +66,16 @@ from app.public_api.sessions import (
     ensure_public_agent,
     owned_public_session,
 )
+from app.security.tenant import (
+    TenantExecutionKind,
+    TenantLifecycleDenied,
+    require_active_tenant,
+    require_matching_admission_version,
+)
 from app.session.session_schema import ChatAttachmentRead, ChatTurnRequest, ChatTurnResponse
 
 router = APIRouter(tags=["runs"])
+_DEFAULT_PUBLIC_RUN_ENGINE = engine
 
 _TRACE_EVENT_MAP = {
     "stream_status": "run.status",
@@ -104,6 +117,89 @@ _SENSITIVE_KEYS = {
     "system_prompt",
     "tool_credentials",
 }
+
+
+def _public_run_stream_engine():
+    """Use the stream/job engine seam while honoring direct runs-module test overrides."""
+    if public_jobs.engine is not _DEFAULT_PUBLIC_RUN_ENGINE:
+        return public_jobs.engine
+    return engine
+
+
+def _public_run_stream_lifecycle_active(
+    tenant_id: str,
+    admission_version: int,
+    correlation_id: str,
+) -> bool:
+    """Recheck the authoritative tenant state before a public run stream emits one chunk."""
+    try:
+        with Session(_public_run_stream_engine()) as lifecycle_db:
+            decision = require_active_tenant(
+                lifecycle_db,
+                tenant_id,
+                TenantExecutionKind.JOB_CLAIM,
+                correlation_id,
+            )
+            require_matching_admission_version(decision, admission_version)
+    except Exception:  # noqa: BLE001 - lifecycle reads fail closed for any backend failure.
+        return False
+    return True
+
+
+def _require_public_run_stream_lifecycle(
+    tenant_id: str,
+    admission_version: int | None,
+    correlation_id: str,
+) -> None:
+    """Reject a public run stream before headers or durable stream work are exposed."""
+    try:
+        with Session(_public_run_stream_engine()) as lifecycle_db:
+            decision = require_active_tenant(
+                lifecycle_db,
+                tenant_id,
+                TenantExecutionKind.JOB_CLAIM,
+                correlation_id,
+            )
+            if admission_version is not None:
+                require_matching_admission_version(decision, admission_version)
+    except TenantLifecycleDenied as exc:
+        if exc.code == "TENANT_SUSPENDED":
+            raise PublicAPIError(403, "TENANT_SUSPENDED", "The tenant is suspended.") from None
+        raise PublicAPIError(
+            503,
+            "TENANT_LIFECYCLE_CHECK_FAILED",
+            "The tenant lifecycle is unavailable.",
+        ) from None
+    except Exception:  # noqa: BLE001 - project every lifecycle backend failure to one safe code.
+        raise PublicAPIError(
+            503,
+            "TENANT_LIFECYCLE_CHECK_FAILED",
+            "The tenant lifecycle is unavailable.",
+        ) from None
+
+
+def _require_public_run_replay_lifecycle(db: Session, tenant_id: str) -> None:
+    """Recheck a run's tenant immediately before returning an idempotent replay."""
+    # Authentication and replay lookup may have opened a read transaction.  The replay
+    # decision must use a fresh authoritative snapshot so a concurrent suspension wins.
+    db.rollback()
+    try:
+        require_active_tenant(
+            db,
+            tenant_id,
+            TenantExecutionKind.JOB_CLAIM,
+            "public-run-replay",
+        )
+    except TenantLifecycleDenied as exc:
+        if exc.code == "TENANT_SUSPENDED":
+            raise PublicAPIError(403, "TENANT_SUSPENDED", "The tenant is suspended.") from None
+        raise PublicAPIError(
+            503,
+            "TENANT_LIFECYCLE_CHECK_FAILED",
+            "The tenant lifecycle is unavailable.",
+        ) from None
+    finally:
+        db.rollback()
 
 
 def _redact(value: Any) -> Any:
@@ -254,6 +350,13 @@ def execute_run(db: Session, job: APIJob) -> dict[str, Any]:
     """Execute one public run and persist only safe nested error projections."""
     credential, actor = _job_actor(db, job)
     payload = dict(job.request_json or {})
+    # Establish the first durable boundary before mutating the job snapshot or
+    # creating a public session. The rollback intentionally precedes all local
+    # preparation so it cannot discard the session/language fields persisted
+    # below in the progress update.
+    _require_job_execution_fence(db, job)
+    _require_job_lifecycle(db, job)
+    db.rollback()
     language_context = resolve_compatible_language_context(
         snapshot=job.language_context_json,
         legacy_ui_locale=None,
@@ -341,13 +444,30 @@ def execute_run(db: Session, job: APIJob) -> dict[str, Any]:
             worker_done.set()
 
     thread = threading.Thread(target=execute_harness, name=f"public-run-{job.id}", daemon=True)
+    # Local session/request preparation above may be lengthy.  Re-evaluate the
+    # authoritative lifecycle immediately before handing control to AgentLoop.
+    _require_job_execution_fence(db, job)
+    _require_job_lifecycle(db, job)
+    db.rollback()
+    # AgentLoop owns the provider/tool boundary for a public run.  Record the
+    # boundary before handing control to the worker thread so a later worker
+    # exception is treated as an uncertain remote outcome.
+    mark_side_effect_started(db)
     thread.start()
     while not worker_done.is_set():
+        # The poller owns a separate Session from the worker.  Close any read
+        # transaction opened by the cancellation/lifecycle/event checks before
+        # waiting on a provider-backed worker, and again after the wait, so the
+        # main connection never pins a stale SQLite snapshot across that wait.
         ensure_not_cancelled(db, job)
         _relay_agent_events(db, job, session_id, seen_event_ids)
+        db.rollback()
         worker_done.wait(0.1)
+        db.rollback()
     thread.join(timeout=1)
+    db.rollback()
     _relay_agent_events(db, job, session_id, seen_event_ids)
+    db.rollback()
     if "error" in worker_result:
         raise worker_result["error"]
     result = ChatTurnResponse.model_validate(worker_result.get("response"))
@@ -519,6 +639,12 @@ def _relay_agent_events(
                 )
                 if citations:
                     event_data["citations"] = _redact(citations)
+            # Relaying an AgentEvent is an independent durable public side effect;
+            # a provider-backed run may have crossed a lifecycle transition since
+            # the previous poll, so repeat admission immediately before writing it.
+            _require_job_execution_fence(db, job)
+            _require_job_lifecycle(db, job)
+            db.rollback()
             update_job(
                 db,
                 job,
@@ -579,6 +705,7 @@ def create_run_route(
         session, _ = owned_public_session(db, principal, agent_id, body.session_id)
     replay = replay_idempotent_response(db, principal, request, body.model_dump(mode="json"))
     if replay:
+        _require_public_run_replay_lifecycle(db, principal.tenant_id)
         response.status_code = replay[0]
         return replay[1]
     language_context = _resolve_run_language_context(principal, body, session)
@@ -614,6 +741,7 @@ def create_run_stream_route(
     db: Session = Depends(get_session),
 ) -> StreamingResponse:
     """Create a durable run and stream its public events in the same request."""
+    _require_public_run_stream_lifecycle(principal.tenant_id, None, "public-run-create")
     enforce_agent_access(principal, agent_id)
     ensure_public_agent(db, principal, agent_id)
     session = None
@@ -646,7 +774,7 @@ def create_run_stream_route(
             status_code=202,
             resource_id=job.id,
         )
-    stream = stream_job_events(job.id, request, 0, None, principal, db)
+    stream = _public_run_event_stream(job, request, 0, None, principal)
     stream.headers["X-Run-ID"] = job.id
     stream.headers["Cache-Control"] = "no-cache, no-transform"
     stream.headers["X-Accel-Buffering"] = "no"
@@ -660,6 +788,92 @@ def _owned_run(db: Session, principal: PublicPrincipal, run_id: str) -> APIJob:
     if principal.agent_id and row.agent_id != principal.agent_id:
         raise PublicAPIError(404, "RUN_NOT_FOUND", "Run not found.")
     return row
+
+
+def _public_run_event_stream(
+    run: APIJob,
+    request: Request,
+    after: int,
+    last_event_id: str | None,
+    principal: PublicPrincipal,
+) -> StreamingResponse:
+    """Stream one run with a lifecycle checkpoint before every public SSE chunk."""
+    del request, principal
+    if last_event_id and last_event_id.isdigit():
+        after = max(after, int(last_event_id))
+    correlation_id = f"public-run-stream:{run.id}"
+    _require_public_run_stream_lifecycle(
+        run.tenant_id,
+        run.tenant_lifecycle_version,
+        correlation_id,
+    )
+
+    def events() -> Iterator[str]:
+        cursor = max(0, after)
+        idle_ticks = 0
+        while True:
+            if not _public_run_stream_lifecycle_active(
+                run.tenant_id,
+                run.tenant_lifecycle_version,
+                correlation_id,
+            ):
+                return
+            with Session(_public_run_stream_engine()) as event_db:
+                current = event_db.get(APIJob, run.id)
+                if not current or current.tenant_id != run.tenant_id:
+                    return
+                rows = event_db.exec(
+                    select(APIJobEvent).where(
+                        APIJobEvent.job_id == run.id,
+                        APIJobEvent.sequence > cursor,
+                        APIJobEvent.public == True,
+                    ).order_by(APIJobEvent.sequence)
+                ).all()
+                chunks = [
+                    (
+                        item.sequence,
+                        (
+                            f"id: {item.sequence}\nevent: {item.event_type}\ndata: "
+                            f"{json.dumps(item.data_json or {}, ensure_ascii=False)}\n\n"
+                        ),
+                    )
+                    for item in rows
+                ]
+                terminal = current.status in {"succeeded", "failed", "cancelled"}
+            # The database Session is closed before any chunk is gated or yielded.
+            for sequence, chunk in chunks:
+                if not _public_run_stream_lifecycle_active(
+                    run.tenant_id,
+                    run.tenant_lifecycle_version,
+                    correlation_id,
+                ):
+                    return
+                cursor = sequence
+                yield chunk
+            if terminal and not chunks:
+                return
+            idle_ticks += 1
+            if idle_ticks % 100 == 0:
+                if not _public_run_stream_lifecycle_active(
+                    run.tenant_id,
+                    run.tenant_lifecycle_version,
+                    correlation_id,
+                ):
+                    return
+                yield ": keepalive\n\n"
+            # Keep the existing public-job polling hook so tests and deployments retain one
+            # bounded cadence while the lifecycle check above remains authoritative.
+            public_jobs.sleep(0.15)
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 @router.get("/runs/{run_id}", response_model=dict)
@@ -693,8 +907,8 @@ def stream_run_events(
     principal: PublicPrincipal = Depends(require_scopes("runs:read")),
     db: Session = Depends(get_session),
 ) -> StreamingResponse:
-    _owned_run(db, principal, run_id)
-    return stream_job_events(run_id, request, after, last_event_id, principal, db)
+    row = _owned_run(db, principal, run_id)
+    return _public_run_event_stream(row, request, after, last_event_id, principal)
 
 
 @router.post("/runs/{run_id}:cancel", response_model=dict)

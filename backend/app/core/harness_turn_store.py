@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from collections.abc import Callable
 from datetime import timedelta
 from typing import Any
 
@@ -15,6 +16,7 @@ from app.contracts.errors import ErrorDescriptor, InternalErrorContext
 from app.db.models import (
     ChatSession,
     HarnessTurnRecord,
+    Tenant,
     User,
     new_id,
     utc_now,
@@ -26,10 +28,37 @@ from app.i18n.language_context import (
     normalize_locale,
     resolve_language_context,
 )
+from app.security.tenant import (
+    TenantExecutionKind,
+    TenantLifecycleDecision,
+    require_active_tenant,
+    require_matching_admission_version,
+)
 from app.session.session_schema import ChatTurnRequest, ChatTurnResponse
 
 TURN_LEASE_SECONDS = 900
 logger = logging.getLogger(__name__)
+
+
+def _optional_tenant_admission(
+    db: Session,
+    tenant_id: str,
+    correlation_id: str,
+) -> TenantLifecycleDecision | None:
+    """Return the authoritative Harness admission when a tenant row exists.
+
+    A few trusted pre-migration unit callers construct an in-memory session without
+    its Tenant row.  Those callers retain the historical version-one receipt shape;
+    every real tenant row still goes through the central fail-closed lifecycle gate.
+    """
+    if db.get(Tenant, tenant_id) is None:
+        return None
+    return require_active_tenant(
+        db,
+        tenant_id,
+        TenantExecutionKind.JOB_CLAIM,
+        correlation_id,
+    )
 
 
 def _turn_error_payload(code: object, message: object, *, status: str) -> dict[str, object]:
@@ -86,8 +115,14 @@ class HarnessTurnClaim:
 class HarnessTurnStore:
     """Durable exactly-once receipts keyed by the caller's client_turn_id."""
 
-    def __init__(self, db: Session) -> None:
+    def __init__(
+        self,
+        db: Session,
+        *,
+        admission_check: Callable[[], None] | None = None,
+    ) -> None:
         self.db = db
+        self.admission_check = admission_check
 
     def claim(
         self,
@@ -96,7 +131,17 @@ class HarnessTurnStore:
     ) -> HarnessTurnClaim:
         """Resolve the immutable locale snapshot before creating or replaying a turn receipt."""
         client_turn_id = str(request.client_turn_id or "").strip()
+        admission = _optional_tenant_admission(
+            self.db,
+            session.tenant_id,
+            client_turn_id or session.id,
+        )
         existing = self._find(session, client_turn_id) if client_turn_id else None
+        if admission is not None and existing is not None:
+            require_matching_admission_version(
+                admission,
+                existing.tenant_lifecycle_version,
+            )
         _prepare_turn_language_context(self.db, session, request, existing=existing)
         if not client_turn_id:
             return HarnessTurnClaim(record=None)
@@ -110,6 +155,9 @@ class HarnessTurnStore:
             session_id=session.id,
             client_turn_id=client_turn_id,
             request_digest=digest,
+            tenant_lifecycle_version=(
+                admission.lifecycle_version if admission is not None else 1
+            ),
             lease_owner=new_id("hturnlease"),
             lease_expires_at=now + timedelta(seconds=TURN_LEASE_SECONDS),
             language_context_json=request.language_context.model_dump(mode="json")
@@ -118,6 +166,7 @@ class HarnessTurnStore:
         )
         self.db.add(record)
         try:
+            self._check_admission()
             self.db.commit()
         except IntegrityError:
             self.db.rollback()
@@ -317,9 +366,16 @@ class HarnessTurnStore:
             self.db.rollback()
             self.db.refresh(record)
             return False
+        self._check_admission()
         self.db.commit()
         self.db.refresh(record)
         return True
+
+    def _check_admission(self) -> None:
+        """Run the enclosing wake fence immediately before a receipt commit."""
+        check = self.admission_check
+        if callable(check):
+            check()
 
 
 def _request_digest(request: ChatTurnRequest) -> str:

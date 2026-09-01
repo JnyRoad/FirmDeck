@@ -1,7 +1,8 @@
 import json
 from types import SimpleNamespace
 
-from fastapi import FastAPI
+import pytest
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
@@ -14,6 +15,19 @@ from app.i18n.language_context import (
     SupportedLocale,
 )
 from app.tools.a2a_client import A2AClientError
+
+_TEST_CODEX_A2A_TOKEN = "test-only-codex-a2a-token"
+
+
+def _fresh_engine():
+    """Create an isolated in-memory schema for one adapter test."""
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    SQLModel.metadata.create_all(engine)
+    return engine
 
 
 def test_a2a_client_error_keeps_remote_message_private() -> None:
@@ -44,8 +58,11 @@ def test_server_task_payload_projects_error_json_without_raw_message() -> None:
     """Keep a failed server task's diagnostic private while exposing its stable machine code."""
     raw_provider_error = "Codex stderr leaked credential=do-not-publish"
     task = A2ATaskRun(
-        tenant_id="tenant_demo",
+        owner_scope="system",
         direction="server",
+        tenant_id=None,
+        system_runtime_key="codex_a2a",
+        tenant_lifecycle_version=None,
         endpoint_url="local://codex",
         status="failed",
         error_json={"code": "A2A_TASK_FAILED", "message": raw_provider_error},
@@ -68,8 +85,11 @@ def test_server_task_payload_fails_closed_for_unknown_error_code() -> None:
     """Replace an unknown durable A2A code before it reaches a task response or replay."""
     raw_provider_error = "unknown provider detail token=do-not-publish"
     task = A2ATaskRun(
-        tenant_id="tenant_demo",
+        owner_scope="system",
         direction="server",
+        tenant_id=None,
+        system_runtime_key="codex_a2a",
+        tenant_lifecycle_version=None,
         endpoint_url="local://codex",
         status="failed",
         error_json={"code": "UNREGISTERED_PROVIDER_ERROR", "message": raw_provider_error},
@@ -83,15 +103,10 @@ def test_server_task_payload_fails_closed_for_unknown_error_code() -> None:
 
 
 def _client(monkeypatch, tmp_path) -> tuple[TestClient, object]:
-    engine = create_engine(
-        "sqlite://",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
-    )
-    SQLModel.metadata.create_all(engine)
+    engine = _fresh_engine()
     settings = SimpleNamespace(
         codex_a2a_enabled=True,
-        codex_a2a_token="",
+        codex_a2a_token=_TEST_CODEX_A2A_TOKEN,
         codex_a2a_workspace_root=str(tmp_path / "workspaces"),
         codex_a2a_command="codex",
         codex_a2a_timeout_seconds=30,
@@ -101,7 +116,10 @@ def _client(monkeypatch, tmp_path) -> tuple[TestClient, object]:
     monkeypatch.setattr(codex_adapter, "_launch", lambda *args, **kwargs: None)
     app = FastAPI()
     app.include_router(codex_adapter.router)
-    return TestClient(app), engine
+    return TestClient(
+        app,
+        headers={"Authorization": f"Bearer {_TEST_CODEX_A2A_TOKEN}"},
+    ), engine
 
 
 def test_codex_a2a_unknown_method_preserves_jsonrpc_code_and_hides_method(
@@ -168,7 +186,7 @@ def test_codex_a2a_disabled_keeps_http_status_and_uses_specific_code(
     monkeypatch.setattr(
         codex_adapter,
         "get_settings",
-        lambda: SimpleNamespace(codex_a2a_enabled=False),
+        lambda: SimpleNamespace(codex_a2a_enabled=False, codex_a2a_token=""),
     )
     app = FastAPI()
     app.include_router(codex_adapter.router)
@@ -178,6 +196,253 @@ def test_codex_a2a_disabled_keeps_http_status_and_uses_specific_code(
     assert response.status_code == 404
     assert response.json()["detail"]["code"] == "A2A_DISABLED"
     assert "Codex A2A adapter is disabled" not in response.text
+
+
+@pytest.mark.parametrize(
+    ("enabled", "token"),
+    [
+        (False, _TEST_CODEX_A2A_TOKEN),
+        (True, ""),
+        (True, " \t "),
+        (True, " token"),
+        (True, "token "),
+        (True, "\ttoken"),
+        (True, "token\n"),
+    ],
+)
+def test_codex_a2a_unavailable_configuration_rejects_every_admission_boundary(
+    monkeypatch,
+    enabled,
+    token,
+) -> None:
+    """Reject card, RPC, and artifact admission unless enabled and credentialed."""
+    engine = _fresh_engine()
+    monkeypatch.setattr(codex_adapter, "engine", engine)
+    monkeypatch.setattr(
+        codex_adapter,
+        "get_settings",
+        lambda: SimpleNamespace(codex_a2a_enabled=enabled, codex_a2a_token=token),
+    )
+    app = FastAPI()
+    app.include_router(codex_adapter.router)
+    client = TestClient(app)
+
+    responses = [
+        client.get("/.well-known/agent-card.json"),
+        client.post(
+            "/api/a2a/codex",
+            json={"jsonrpc": "2.0", "id": "request-gated", "method": "ListTasks"},
+        ),
+        client.get("/api/a2a/codex/tasks/task-gated/artifacts/result.txt"),
+    ]
+
+    assert [(response.status_code, response.json()["detail"]["code"]) for response in responses] == [
+        (404, "A2A_DISABLED"),
+        (404, "A2A_DISABLED"),
+        (404, "A2A_DISABLED"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("enabled", "token"),
+    [
+        (False, _TEST_CODEX_A2A_TOKEN),
+        (True, ""),
+        (True, " \n "),
+        (True, " token"),
+        (True, "token "),
+        (True, "\ttoken"),
+        (True, "token\n"),
+    ],
+)
+def test_codex_a2a_unavailable_configuration_launches_zero_recovery_tasks(
+    monkeypatch,
+    enabled,
+    token,
+) -> None:
+    """Skip every recoverable task before launch when the runtime is unavailable."""
+    engine = _fresh_engine()
+    with Session(engine) as db:
+        db.add(
+            A2ATaskRun(
+                owner_scope="system",
+                direction="server",
+                tenant_id=None,
+                system_runtime_key="codex_a2a",
+                tenant_lifecycle_version=None,
+                endpoint_url="local://codex",
+                status="working",
+            )
+        )
+        db.commit()
+    launches: list[tuple[str, bool]] = []
+    monkeypatch.setattr(codex_adapter, "engine", engine)
+    monkeypatch.setattr(
+        codex_adapter,
+        "get_settings",
+        lambda: SimpleNamespace(codex_a2a_enabled=enabled, codex_a2a_token=token),
+    )
+    monkeypatch.setattr(
+        codex_adapter,
+        "_launch",
+        lambda task_id, recovery=False: launches.append((task_id, recovery)),
+    )
+
+    codex_adapter.recover_codex_a2a_tasks()
+
+    assert launches == []
+
+
+def test_codex_a2a_configured_runtime_requires_exact_bearer_without_disclosure(
+    monkeypatch,
+) -> None:
+    """Require the exact configured Bearer value and keep both credentials out of responses."""
+    expected_token = "test-only-expected-codex-token"
+    supplied_token = "test-only-wrong-codex-token"
+    engine = _fresh_engine()
+    monkeypatch.setattr(codex_adapter, "engine", engine)
+    monkeypatch.setattr(
+        codex_adapter,
+        "get_settings",
+        lambda: SimpleNamespace(codex_a2a_enabled=True, codex_a2a_token=expected_token),
+    )
+    app = FastAPI()
+    app.include_router(codex_adapter.router)
+    client = TestClient(app)
+    payload = {"jsonrpc": "2.0", "id": "request-auth", "method": "ListTasks"}
+
+    missing = client.post("/api/a2a/codex", json=payload)
+    wrong = client.post(
+        "/api/a2a/codex",
+        json=payload,
+        headers={"Authorization": f"Bearer {supplied_token}"},
+    )
+    exact = client.post(
+        "/api/a2a/codex",
+        json=payload,
+        headers={"Authorization": f"Bearer {expected_token}"},
+    )
+
+    assert missing.status_code == 401
+    assert wrong.status_code == 401
+    assert exact.status_code == 200
+    assert expected_token not in missing.text + wrong.text
+    assert supplied_token not in missing.text + wrong.text
+
+
+def test_codex_a2a_configured_artifact_requires_exact_bearer(monkeypatch) -> None:
+    """Protect artifact lookup with the same exact installation credential as RPC."""
+    expected_token = "test-only-artifact-token"
+    supplied_token = "test-only-wrong-artifact-token"
+    monkeypatch.setattr(codex_adapter, "engine", _fresh_engine())
+    monkeypatch.setattr(
+        codex_adapter,
+        "get_settings",
+        lambda: SimpleNamespace(codex_a2a_enabled=True, codex_a2a_token=expected_token),
+    )
+    app = FastAPI()
+    app.include_router(codex_adapter.router)
+    client = TestClient(app)
+    path = "/api/a2a/codex/tasks/task-auth/artifacts/result.txt"
+
+    missing = client.get(path)
+    wrong = client.get(path, headers={"Authorization": f"Bearer {supplied_token}"})
+    exact = client.get(path, headers={"Authorization": f"Bearer {expected_token}"})
+
+    assert missing.status_code == 401
+    assert wrong.status_code == 401
+    assert exact.status_code == 404
+    assert expected_token not in missing.text + wrong.text + exact.text
+    assert supplied_token not in missing.text + wrong.text + exact.text
+
+
+def test_codex_a2a_configured_agent_card_exposes_scheme_without_token(monkeypatch) -> None:
+    """Advertise Bearer authentication without returning its configured credential."""
+    expected_token = "test-only-agent-card-token"
+    monkeypatch.setattr(
+        codex_adapter,
+        "get_settings",
+        lambda: SimpleNamespace(codex_a2a_enabled=True, codex_a2a_token=expected_token),
+    )
+    app = FastAPI()
+    app.include_router(codex_adapter.router)
+
+    response = TestClient(app).get("/.well-known/agent-card.json")
+
+    assert response.status_code == 200
+    assert response.json()["securitySchemes"] == {
+        "bearer": {"type": "http", "scheme": "bearer"}
+    }
+    assert expected_token not in response.text
+
+
+def test_codex_a2a_configured_recovery_launches_discovered_task(monkeypatch) -> None:
+    """Preserve recovery launch behavior when both enablement and credential checks pass."""
+    engine = _fresh_engine()
+    with Session(engine) as db:
+        task = A2ATaskRun(
+            owner_scope="system",
+            direction="server",
+            tenant_id=None,
+            system_runtime_key="codex_a2a",
+            tenant_lifecycle_version=None,
+            endpoint_url="local://codex",
+            status="submitted",
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+        task_id = task.id
+    launches: list[tuple[str, bool]] = []
+    monkeypatch.setattr(codex_adapter, "engine", engine)
+    monkeypatch.setattr(
+        codex_adapter,
+        "get_settings",
+        lambda: SimpleNamespace(
+            codex_a2a_enabled=True,
+            codex_a2a_token=_TEST_CODEX_A2A_TOKEN,
+        ),
+    )
+    monkeypatch.setattr(
+        codex_adapter,
+        "_launch",
+        lambda recovered_id, recovery=False: launches.append((recovered_id, recovery)),
+    )
+
+    codex_adapter.recover_codex_a2a_tasks()
+
+    assert launches == [(task_id, True)]
+
+
+@pytest.mark.parametrize(
+    ("expected", "authorization"),
+    [
+        ("", None),
+        ("", "Bearer "),
+        (" \t", "Bearer  \t"),
+        (" token", "Bearer  token"),
+        ("token ", "Bearer token "),
+        ("\ttoken", "Bearer \ttoken"),
+        ("token\n", "Bearer token\n"),
+    ],
+)
+def test_codex_a2a_authorization_never_accepts_an_empty_expected_credential(
+    expected,
+    authorization,
+) -> None:
+    """Fail closed in the authorization layer even if its availability precondition is bypassed."""
+    with pytest.raises(HTTPException) as error:
+        codex_adapter._authorize(expected, authorization)
+
+    assert getattr(error.value, "status_code", None) == 401
+
+
+def test_codex_a2a_authorization_rejects_non_ascii_bearer_with_stable_401() -> None:
+    """A malformed Unicode bearer credential must be rejected without a comparison TypeError."""
+    with pytest.raises(HTTPException) as error:
+        codex_adapter._authorize(_TEST_CODEX_A2A_TOKEN, "Bearer 密码")
+
+    assert getattr(error.value, "status_code", None) == 401
 
 
 def test_codex_a2a_uses_public_task_id_and_supports_continuation(monkeypatch, tmp_path) -> None:
@@ -307,6 +572,116 @@ def test_codex_a2a_get_cancel_and_list_tasks(monkeypatch, tmp_path) -> None:
     )
     assert canceled.status_code == 200
     assert canceled.json()["result"]["status"]["state"] == "canceled"
+
+
+def test_codex_cancel_after_completion_is_idempotent(monkeypatch, tmp_path) -> None:
+    """Canceling a terminal completed task must preserve its completed protocol state."""
+    client, engine = _client(monkeypatch, tmp_path)
+    submitted = client.post(
+        "/api/a2a/codex",
+        json={
+            "jsonrpc": "2.0",
+            "id": "request-completed-cancel",
+            "method": "SendMessage",
+            "params": {
+                "message": {
+                    "messageId": "message-completed-cancel",
+                    "role": "ROLE_USER",
+                    "parts": [{"text": "Complete first"}],
+                }
+            },
+        },
+    ).json()["result"]
+    with Session(engine) as db:
+        task = db.exec(select(A2ATaskRun)).one()
+        task.status = "completed"
+        task.result_json = {"text": "already complete"}
+        db.add(task)
+        db.commit()
+
+    canceled = client.post(
+        "/api/a2a/codex",
+        json={
+            "jsonrpc": "2.0",
+            "id": "request-cancel-completed",
+            "method": "CancelTask",
+            "params": {"id": submitted["id"]},
+        },
+    )
+
+    assert canceled.status_code == 200
+    assert canceled.json()["result"]["status"]["state"] == "completed"
+    with Session(engine) as db:
+        stored = db.exec(select(A2ATaskRun)).one()
+        assert stored.status == "completed"
+
+
+def test_codex_worker_completion_cannot_overwrite_concurrent_cancel(monkeypatch, tmp_path) -> None:
+    """A cancellation committed after process exit must win over the worker completion write."""
+    engine = _fresh_engine()
+    settings = SimpleNamespace(
+        codex_a2a_enabled=True,
+        codex_a2a_token=_TEST_CODEX_A2A_TOKEN,
+        codex_a2a_workspace_root=str(tmp_path / "workspaces"),
+        codex_a2a_command="codex",
+        codex_a2a_timeout_seconds=30,
+    )
+    monkeypatch.setattr(codex_adapter, "engine", engine)
+    monkeypatch.setattr(codex_adapter, "get_settings", lambda: settings)
+    workspace = tmp_path / "task-workspace"
+    with Session(engine) as db:
+        task = A2ATaskRun(
+            owner_scope="system",
+            direction="server",
+            tenant_id=None,
+            system_runtime_key="codex_a2a",
+            tenant_lifecycle_version=None,
+            endpoint_url="local://codex",
+            remote_task_id="task-cancel-race",
+            status="submitted",
+            request_json={
+                "prompt": "race",
+                "workspace": str(workspace),
+                "resume": False,
+            },
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+        task_id = task.id
+
+    class ExitedProcess:
+        """Represent a Codex child that has exited before the completion write."""
+
+        stdout = iter(())
+
+        def poll(self) -> int:
+            """Report an exited child to the worker loop."""
+            return 0
+
+        def wait(self, timeout: float | None = None) -> int:
+            """Return a successful child exit code."""
+            del timeout
+            return 0
+
+        def terminate(self) -> None:
+            """Accept the cancellation signal issued by the race fixture."""
+            return
+
+    monkeypatch.setattr(codex_adapter.subprocess, "Popen", lambda *_args, **_kwargs: ExitedProcess())
+
+    def cancel_before_completion(_root, _before) -> list[dict[str, object]]:
+        """Use the real CancelTask state transition immediately before worker finalization."""
+        codex_adapter._cancel(task_id)
+        return []
+
+    monkeypatch.setattr(codex_adapter, "_collect_artifacts", cancel_before_completion)
+    codex_adapter._run_codex_task(task_id)
+
+    with Session(engine) as db:
+        stored = db.get(A2ATaskRun, task_id)
+        assert stored is not None
+        assert stored.status == "canceled"
 
 
 def test_codex_a2a_message_id_is_idempotent(monkeypatch, tmp_path) -> None:
@@ -522,8 +897,11 @@ def test_codex_a2a_run_uses_bound_reply_locale_in_cli_prompt_and_keeps_output_ra
 def test_codex_a2a_legacy_task_payload_backfills_controlled_default_snapshot() -> None:
     """Expose a deterministic zh-CN snapshot for pre-migration tasks with no locale column."""
     task = A2ATaskRun(
-        tenant_id="a2a_codex",
+        owner_scope="system",
         direction="server",
+        tenant_id=None,
+        system_runtime_key="codex_a2a",
+        tenant_lifecycle_version=None,
         endpoint_url="local://codex",
         remote_task_id="legacy-task",
         status="completed",

@@ -22,7 +22,8 @@ import {
   Trash2,
 } from 'lucide-react';
 
-import { api, TENANT_ID } from '../api/client';
+import { createTenantClient } from '../api/tenant-client';
+import { useTenantSession } from '../contexts/TenantSessionContext';
 import { employeeDisplayName } from '../employee';
 import { copyTextToClipboard } from '../lib/clipboard';
 import type { AgentProfileRead } from '../types';
@@ -94,6 +95,8 @@ export default function EmployeeApiKeyDialog({
   onClose: () => void;
 }) {
   const { locale, t } = useEmployeeApiKeyIntl();
+  const tenantContext = useTenantSession();
+  const tenantApi = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
   const [credentials, setCredentials] = useState<AgentApiCredential[]>([]);
   const [loading, setLoading] = useState(false);
   const [creating, setCreating] = useState<KeyAccess | null>(null);
@@ -107,38 +110,63 @@ export default function EmployeeApiKeyDialog({
   const displayName = useMemo(() => (agent ? employeeDisplayName(agent) : '数字员工'), [agent]);
   const closeBlocked = creating || actingId || revealingId || pendingRevoke || pendingDelete;
 
+  // Secrets and credential rows are tenant-bound UI state. Drop them during
+  // the provider's replacement gap so a new tenant can never inherit the
+  // previous tenant's list or transient plaintext key.
+  useEffect(() => {
+    if (tenantContext) return;
+    setCredentials([]);
+    setRevealed(null);
+    setCopied(false);
+    setLoading(false);
+    setCreating(null);
+    setActingId(null);
+    setRevealingId(null);
+    setPendingRevoke(null);
+    setPendingDelete(null);
+  }, [tenantContext]);
+
   /** 读取指定员工的 API 密钥列表；失败时仅显示安全文案或既有错误消息。 */
   async function load() {
-    if (!agent) return;
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!agent || !context || generation === undefined) return;
     setLoading(true);
     try {
-      const rows = await api.get<AgentApiCredential[]>(
-        `/api/enterprise/agents/${encodeURIComponent(agent.id)}/api-credentials?tenant_id=${encodeURIComponent(TENANT_ID)}`,
+      const rows = await tenantApi.get<AgentApiCredential[]>(
+        `/api/enterprise/agents/${encodeURIComponent(agent.id)}/api-credentials`,
       );
+      if (!context.isCurrentGeneration(generation)) return;
       setCredentials(rows);
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       notify.error(error instanceof Error ? error.message : t('employeeApiKey.toast.loadFailed'));
     } finally {
-      setLoading(false);
+      if (context.isCurrentGeneration(generation)) setLoading(false);
     }
   }
 
   useEffect(() => {
-    if (!open || !agent) return;
+    if (!open || !agent) {
+      setRevealed(null);
+      setCopied(false);
+      return;
+    }
     setRevealed(null);
     setCopied(false);
     void load();
-  }, [agent, open]);
+  }, [agent, open, tenantApi]);
 
   /** 为指定员工创建新的运行密钥，并仅在受控状态中短暂展示完整值。 */
   async function createCredential(access: KeyAccess) {
-    if (!agent) return;
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!agent || !context || generation === undefined) return;
     setCreating(access);
     try {
-      const created = await api.post<AgentApiCredentialCreated>(
+      const created = await tenantApi.post<AgentApiCredentialCreated>(
         `/api/enterprise/agents/${encodeURIComponent(agent.id)}/api-credentials`,
         {
-          tenant_id: TENANT_ID,
           name: t('employeeApiKey.nameTemplate', {
             name: displayName,
             accessLabel: accessLabel(access, t),
@@ -146,102 +174,134 @@ export default function EmployeeApiKeyDialog({
           access,
         },
       );
+      if (!context.isCurrentGeneration(generation)) return;
       setRevealed(created);
       setCopied(false);
       await load();
+      if (!context.isCurrentGeneration(generation)) return;
       notify.success(t('employeeApiKey.toast.createSuccess'));
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       notify.error(error instanceof Error ? error.message : t('employeeApiKey.toast.createFailed'));
     } finally {
-      setCreating(null);
+      if (context.isCurrentGeneration(generation)) setCreating(null);
     }
   }
 
   /** 轮换已有员工密钥，并让旧密钥立即失效。 */
   async function rotateCredential(row: AgentApiCredential) {
-    if (!agent) return;
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!agent || !context || generation === undefined) return;
     setActingId(row.id);
     try {
-      const rotated = await api.post<AgentApiCredentialCreated>(
-        `/api/enterprise/agents/${encodeURIComponent(agent.id)}/api-credentials/${encodeURIComponent(row.id)}/rotate?tenant_id=${encodeURIComponent(TENANT_ID)}`,
+      const rotated = await tenantApi.post<AgentApiCredentialCreated>(
+        `/api/enterprise/agents/${encodeURIComponent(agent.id)}/api-credentials/${encodeURIComponent(row.id)}/rotate`,
         {},
       );
+      if (!context.isCurrentGeneration(generation)) return;
       setRevealed(rotated);
       setCopied(false);
       await load();
+      if (!context.isCurrentGeneration(generation)) return;
       notify.success(t('employeeApiKey.toast.rotateSuccess'));
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       notify.error(error instanceof Error ? error.message : t('employeeApiKey.toast.rotateFailed'));
     } finally {
-      setActingId(null);
+      if (context.isCurrentGeneration(generation)) setActingId(null);
     }
   }
 
   /** 通过单把密钥的受授权读取操作复制完整值，不把完整密钥写回列表状态。 */
   async function revealAndCopyCredential(row: AgentApiCredential) {
-    if (!agent) return;
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!agent || !context || generation === undefined) return;
     setRevealingId(row.id);
     try {
-      const revealedKey = await api.post<AgentApiCredentialReveal>(
-        `/api/enterprise/agents/${encodeURIComponent(agent.id)}/api-credentials/${encodeURIComponent(row.id)}/reveal?tenant_id=${encodeURIComponent(TENANT_ID)}`,
+      const revealedKey = await tenantApi.post<AgentApiCredentialReveal>(
+        `/api/enterprise/agents/${encodeURIComponent(agent.id)}/api-credentials/${encodeURIComponent(row.id)}/reveal`,
         {},
       );
+      if (!context.isCurrentGeneration(generation)) return;
       await copyTextToClipboard(revealedKey.api_key);
+      if (!context.isCurrentGeneration(generation)) return;
       notify.success(t('employeeApiKey.toast.copyFullSuccess'));
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       notify.error(error instanceof Error ? error.message : t('employeeApiKey.toast.copyFullFailed'));
     } finally {
-      setRevealingId(null);
+      if (context.isCurrentGeneration(generation)) setRevealingId(null);
     }
   }
 
   /** 在明确确认后禁用指定员工密钥，并刷新列表中的持久化状态。 */
   async function revokeCredential(row: AgentApiCredential) {
-    if (!agent) return;
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!agent || !context || generation === undefined) return;
     setActingId(row.id);
     try {
-      await api.post(
-        `/api/enterprise/agents/${encodeURIComponent(agent.id)}/api-credentials/${encodeURIComponent(row.id)}/revoke?tenant_id=${encodeURIComponent(TENANT_ID)}`,
+      await tenantApi.post(
+        `/api/enterprise/agents/${encodeURIComponent(agent.id)}/api-credentials/${encodeURIComponent(row.id)}/revoke`,
         {},
       );
+      if (!context.isCurrentGeneration(generation)) return;
       if (revealed?.id === row.id) setRevealed(null);
       await load();
+      if (!context.isCurrentGeneration(generation)) return;
       notify.success(t('employeeApiKey.toast.revokeSuccess'));
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       notify.error(error instanceof Error ? error.message : t('employeeApiKey.toast.revokeFailed'));
     } finally {
-      setActingId(null);
-      setPendingRevoke(null);
+      if (context.isCurrentGeneration(generation)) {
+        setActingId(null);
+        setPendingRevoke(null);
+      }
     }
   }
 
   /** 在明确确认后永久删除指定员工密钥，并移除可能展示的明文。 */
   async function deleteCredential(row: AgentApiCredential) {
-    if (!agent) return;
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!agent || !context || generation === undefined) return;
     setActingId(row.id);
     try {
-      await api.delete(
-        `/api/enterprise/agents/${encodeURIComponent(agent.id)}/api-credentials/${encodeURIComponent(row.id)}?tenant_id=${encodeURIComponent(TENANT_ID)}`,
+      await tenantApi.delete(
+        `/api/enterprise/agents/${encodeURIComponent(agent.id)}/api-credentials/${encodeURIComponent(row.id)}`,
       );
+      if (!context.isCurrentGeneration(generation)) return;
       if (revealed?.id === row.id) setRevealed(null);
       await load();
+      if (!context.isCurrentGeneration(generation)) return;
       notify.success(t('employeeApiKey.toast.deleteSuccess'));
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       notify.error(error instanceof Error ? error.message : t('employeeApiKey.toast.deleteFailed'));
     } finally {
-      setActingId(null);
-      setPendingDelete(null);
+      if (context.isCurrentGeneration(generation)) {
+        setActingId(null);
+        setPendingDelete(null);
+      }
     }
   }
 
   /** 复制新创建或轮换后返回的完整密钥；浏览器拒绝时回退到选中文本。 */
   async function copyKey() {
-    if (!revealed?.api_key) return;
+    const context = tenantContext;
+    const generation = context?.generation;
+    const key = revealed?.api_key;
+    if (!key || !context || generation === undefined) return;
     try {
-      await copyTextToClipboard(revealed.api_key);
+      await copyTextToClipboard(key);
+      if (!context.isCurrentGeneration(generation)) return;
       setCopied(true);
       notify.success(t('employeeApiKey.toast.copySuccess'));
     } catch {
+      if (!context.isCurrentGeneration(generation)) return;
       revealedKeyRef.current?.focus();
       revealedKeyRef.current?.select();
       setCopied(false);

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ComponentType, ReactNode, SVGProps } from 'react';
 import { useNavigate } from 'react-router-dom';
 
@@ -7,8 +7,9 @@ import { RawContent, RawIdentifier } from '@/i18n/RawContent';
 import { useAppIntl } from '@/i18n/useAppIntl';
 import { apiErrorMessage } from '@/lib/apiErrorMessages';
 
-import { api, TENANT_ID } from '../../api/client';
+import { createTenantClient } from '../../api/tenant-client';
 import type { EnterpriseAuthUser } from '../../auth';
+import { useTenantSession } from '../../contexts/TenantSessionContext';
 import IconChat from '../../assets/icons/chat.svg?react';
 import IconEdit from '../../assets/icons/edit.svg?react';
 import IconProfileAlarm from '../../assets/icons/profile-alarm.svg?react';
@@ -32,7 +33,12 @@ import {
   staffdeckDisplayText,
 } from '../../employee';
 import { EnterpriseRoute } from '../../enums/routes';
-import { isTeamScope, readEmployeeScope } from '../../lib/agent-scope-storage';
+import {
+  emitAgentScopeChange,
+  isTeamScope,
+  persistSharedAgentScope,
+  readEmployeeScope,
+} from '../../lib/agent-scope-storage';
 import { parseBackendDateTime } from '../../lib/timezone';
 import type {
   AgentProfileRead,
@@ -53,8 +59,6 @@ import MemoriesTab from './MemoriesTab';
 import ScheduledTasksTab from './ScheduledTasksTab';
 import WorkRecordTab from './WorkRecordTab';
 import { employeeDashboardMetrics } from './employeeDashboardMetrics';
-
-const ENTERPRISE_AGENT_STORAGE_KEY = 'ultrarag_enterprise_agent_scope';
 
 type ProfileTabKey = 'work' | 'scheduled' | 'memories' | 'logs';
 
@@ -102,6 +106,15 @@ export default function DashboardPage({
 }) {
   const { locale, t } = useAppIntl();
   const navigate = useNavigate();
+  const tenantContext = useTenantSession();
+  const tenantClient = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
+  const tenantId = tenantContext?.tenantId || '';
+  const userId = tenantContext?.userId || '';
+  const tenantScopeKey = tenantContext
+    ? `${tenantId}:${userId}:${tenantContext.generation}`
+    : '';
+  const scopeKeyRef = useRef('');
+  const [scopeReady, setScopeReady] = useState(false);
   const [agents, setAgents] = useState<AgentProfileRead[]>([]);
   const [skills, setSkills] = useState<SkillRead[]>([]);
   const [generalSkills, setGeneralSkills] = useState<GeneralSkillRead[]>([]);
@@ -112,43 +125,75 @@ export default function DashboardPage({
   const [feedbackSummary, setFeedbackSummary] = useState<FeedbackSummaryRead | null>(null);
   const [scheduledTasks, setScheduledTasks] = useState<ScheduledTaskRead[]>([]);
   const [activityEvents, setActivityEvents] = useState<AgentWorkRecordEventRead[]>([]);
-  const [agentId, setAgentId] = useState(readEmployeeScope);
+  const [agentId, setAgentId] = useState('');
   const [avatarEditorOpen, setAvatarEditorOpen] = useState(false);
   const [profileEditorOpen, setProfileEditorOpen] = useState(false);
   const [loaded, setLoaded] = useState(false);
 
   useEffect(() => {
+    if (!tenantContext || !tenantId || !userId) {
+      scopeKeyRef.current = '';
+      setScopeReady(false);
+      setAgentId('');
+      return;
+    }
+    scopeKeyRef.current = tenantScopeKey;
+    setAgentId(readEmployeeScope(tenantId, userId));
+    setScopeReady(true);
+  }, [tenantContext, tenantId, tenantScopeKey, userId]);
+
+  useEffect(() => {
     const onScopeChange = (event: Event) => {
       const next = (event as CustomEvent<{ agentId?: string }>).detail?.agentId || '';
-      setAgentId(next && !isTeamScope(next) ? next : readEmployeeScope());
+      if (!tenantContext || !tenantId || !userId || scopeKeyRef.current !== tenantScopeKey) return;
+      setAgentId(next && !isTeamScope(next) ? next : readEmployeeScope(tenantId, userId));
     };
     window.addEventListener('ultrarag-enterprise-agent-scope-change', onScopeChange);
     return () => window.removeEventListener('ultrarag-enterprise-agent-scope-change', onScopeChange);
-  }, []);
+  }, [tenantContext, tenantId, tenantScopeKey, userId]);
 
   useEffect(() => {
-    let cancelled = false;
+    if (!tenantContext || !tenantId || !userId || !scopeReady || scopeKeyRef.current !== tenantScopeKey) return;
+    const requestController = new AbortController();
+    const generation = tenantContext.generation;
+    const isCurrent = () => (
+      !requestController.signal.aborted
+      && tenantContext.isCurrentGeneration(generation)
+      && scopeKeyRef.current === tenantScopeKey
+    );
     let switchingAgent = false;
     setLoaded(false);
-    Promise.all([
-      api.get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${TENANT_ID}`),
-      api.get<SkillRead[]>(`/api/enterprise/skills?tenant_id=${TENANT_ID}${agentId ? `&agent_id=${encodeURIComponent(agentId)}` : ''}`),
-      api.get<GeneralSkillRead[]>(`/api/enterprise/general-skills?tenant_id=${TENANT_ID}${agentId ? `&agent_id=${encodeURIComponent(agentId)}` : ''}`),
-      api.get<KnowledgeBaseRead[]>(`/api/enterprise/knowledge-bases?tenant_id=${TENANT_ID}${agentId ? `&agent_id=${encodeURIComponent(agentId)}` : ''}`),
-      api.get<ModelConfigRead[]>(`/api/enterprise/model-configs?tenant_id=${TENANT_ID}`),
-      api.get<ToolRead[]>(`/api/enterprise/tools?tenant_id=${TENANT_ID}${agentId ? `&agent_id=${encodeURIComponent(agentId)}` : ''}`),
-      api.get<EnterpriseChatSessionRead[]>(`/api/enterprise/sessions?tenant_id=${TENANT_ID}${agentId ? `&agent_id=${encodeURIComponent(agentId)}` : ''}`),
-      api.get<FeedbackSummaryRead>(`/api/enterprise/feedback/summary?tenant_id=${TENANT_ID}${agentId ? `&agent_id=${encodeURIComponent(agentId)}` : ''}`),
-      api.get<ScheduledTaskRead[]>(`/api/enterprise/scheduled-tasks?tenant_id=${TENANT_ID}${agentId ? `&agent_id=${encodeURIComponent(agentId)}` : ''}`),
+    setAgents([]);
+    setSkills([]);
+    setGeneralSkills([]);
+    setKnowledgeBases([]);
+    setModels([]);
+    setTools([]);
+    setSessions([]);
+    setFeedbackSummary(null);
+    setScheduledTasks([]);
+    const agentQuery = agentId ? `?agent_id=${encodeURIComponent(agentId)}` : '';
+    Promise.allSettled([
+      tenantClient.get<AgentProfileRead[]>('/api/enterprise/agents', { signal: requestController.signal }),
+      tenantClient.get<SkillRead[]>(`/api/enterprise/skills${agentQuery}`, { signal: requestController.signal }),
+      tenantClient.get<GeneralSkillRead[]>(`/api/enterprise/general-skills${agentQuery}`, { signal: requestController.signal }),
+      tenantClient.get<KnowledgeBaseRead[]>(`/api/enterprise/knowledge-bases${agentQuery}`, { signal: requestController.signal }),
+      tenantClient.get<ModelConfigRead[]>('/api/enterprise/model-configs', { signal: requestController.signal }),
+      tenantClient.get<ToolRead[]>(`/api/enterprise/tools${agentQuery}`, { signal: requestController.signal }),
+      tenantClient.get<EnterpriseChatSessionRead[]>(`/api/enterprise/sessions${agentQuery}`, { signal: requestController.signal }),
+      tenantClient.get<FeedbackSummaryRead>(`/api/enterprise/feedback/summary${agentQuery}`, { signal: requestController.signal }),
+      tenantClient.get<ScheduledTaskRead[]>(`/api/enterprise/scheduled-tasks${agentQuery}`, { signal: requestController.signal }),
     ])
-      .then(([agentRows, skillRows, generalSkillRows, kbRows, modelRows, toolRows, sessionRows, feedbackRows, taskRows]) => {
-        if (cancelled) return;
-        const visibleAgents = agentRows.filter((item) => canSelectCurrentEmployeeAgent(item, currentUser, {
+      .then(([agentResult, skillResult, generalSkillResult, kbResult, modelResult, toolResult, sessionResult, feedbackResult, taskResult]) => {
+        if (!isCurrent()) return;
+        const visibleAgents = agentResult.status === 'fulfilled'
+          ? agentResult.value.filter((item) => canSelectCurrentEmployeeAgent(item, currentUser, {
           activeOnly: true,
-        }));
+          }))
+          : [];
         setAgents(visibleAgents);
-        setModels(modelRows);
-        if (!agentId || !visibleAgents.some((item) => item.id === agentId)) {
+        if (modelResult.status === 'fulfilled') setModels(modelResult.value);
+        if (agentResult.status === 'fulfilled' && (!agentId || !visibleAgents.some((item) => item.id === agentId))) {
           const manageableAgents = visibleAgents.filter((item) => canManageEmployeeAgent(item, currentUser));
           const next = isAdmin
             ? preferredEmployeeAgent(visibleAgents)?.id || ''
@@ -157,29 +202,34 @@ export default function DashboardPage({
               || '';
           if (next) {
             switchingAgent = true;
-            window.localStorage.setItem(ENTERPRISE_AGENT_STORAGE_KEY, next);
-            window.dispatchEvent(new CustomEvent('ultrarag-enterprise-agent-scope-change', { detail: { agentId: next } }));
+            persistSharedAgentScope(next, tenantId, userId);
+            emitAgentScopeChange(next);
             setAgentId(next);
             return;
           }
         }
-        setSkills(skillRows);
-        setGeneralSkills(generalSkillRows);
-        setKnowledgeBases(kbRows);
-        setTools(toolRows);
-        setSessions(sessionRows);
-        setFeedbackSummary(feedbackRows);
-        setScheduledTasks(taskRows.filter((item) => item.status !== 'archived'));
-        setLoaded(true);
+        if (skillResult.status === 'fulfilled') setSkills(skillResult.value);
+        if (generalSkillResult.status === 'fulfilled') setGeneralSkills(generalSkillResult.value);
+        if (kbResult.status === 'fulfilled') setKnowledgeBases(kbResult.value);
+        if (toolResult.status === 'fulfilled') setTools(toolResult.value);
+        if (sessionResult.status === 'fulfilled') setSessions(sessionResult.value);
+        if (feedbackResult.status === 'fulfilled') setFeedbackSummary(feedbackResult.value);
+        if (taskResult.status === 'fulfilled') {
+          setScheduledTasks(taskResult.value.filter((item) => item.status !== 'archived'));
+        }
+        const failure = [agentResult, skillResult, generalSkillResult, kbResult, modelResult, toolResult, sessionResult, feedbackResult, taskResult]
+          .find((item) => item.status === 'rejected');
+        if (failure) {
+          notify.error(t('dashboard.page.toast.loadProfileFailed'));
+        }
       })
-      .catch((error) => notify.error(dashboardErrorMessage(error, t('dashboard.page.toast.loadProfileFailed'), t('common.error.generic'))))
       .finally(() => {
-        if (!cancelled && !switchingAgent) setLoaded(true);
+        if (isCurrent() && !switchingAgent) setLoaded(true);
       });
     return () => {
-      cancelled = true;
+      requestController.abort();
     };
-  }, [agentId, currentUser, isAdmin, t]);
+  }, [agentId, currentUser, isAdmin, scopeReady, t, tenantClient, tenantContext, tenantId, tenantScopeKey, userId]);
 
   const selectedAgent = agents.find((item) => item.id === agentId)
     || agents.find((item) => !item.is_overall)
@@ -189,30 +239,38 @@ export default function DashboardPage({
     : sessions.filter((item) => item.agent_id === selectedAgent?.id);
 
   useEffect(() => {
-    let cancelled = false;
+    if (!tenantContext || !tenantId || !userId || !scopeReady || scopeKeyRef.current !== tenantScopeKey) return;
+    const requestController = new AbortController();
+    const generation = tenantContext.generation;
+    const isCurrent = () => (
+      !requestController.signal.aborted
+      && tenantContext.isCurrentGeneration(generation)
+      && scopeKeyRef.current === tenantScopeKey
+    );
     async function loadWorkRecord() {
       if (!selectedAgent || selectedAgent.is_overall) {
-        setActivityEvents([]);
+        if (isCurrent()) setActivityEvents([]);
         return;
       }
       try {
         const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'Asia/Shanghai';
-        const workRecord = await api.get<AgentWorkRecordRead>(
-          `/api/enterprise/agents/${encodeURIComponent(selectedAgent.id)}/work-record?tenant_id=${TENANT_ID}&timezone=${encodeURIComponent(timezone)}`,
+        const workRecord = await tenantClient.get<AgentWorkRecordRead>(
+          `/api/enterprise/agents/${encodeURIComponent(selectedAgent.id)}/work-record?timezone=${encodeURIComponent(timezone)}`,
+          { signal: requestController.signal },
         );
-        if (cancelled) return;
+        if (!isCurrent()) return;
         setActivityEvents(workRecord.events);
       } catch (error) {
-        if (cancelled) return;
+        if (!isCurrent()) return;
         setActivityEvents([]);
         notify.error(dashboardErrorMessage(error, t('dashboard.page.toast.loadWorkRecordFailed'), t('common.error.generic')));
       }
     }
     void loadWorkRecord();
     return () => {
-      cancelled = true;
+      requestController.abort();
     };
-  }, [selectedAgent?.id, selectedAgent?.is_overall, t]);
+  }, [scopeReady, selectedAgent?.id, selectedAgent?.is_overall, t, tenantClient, tenantContext, tenantId, tenantScopeKey, userId]);
 
   const defaultModel = models.find((item) => item.is_default);
   const totalCalls = skills.reduce((sum, item) => sum + (item.total_call_count || item.call_count || 0), 0);

@@ -1,7 +1,9 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { Check, FlaskConical, LoaderCircle, Trash2 } from 'lucide-react';
 
-import { api, ApiError, TENANT_ID } from '../api/client';
+import { ApiError } from '../api/client';
+import { createTenantClient } from '../api/tenant-client';
+import { useTenantSession } from '../contexts/TenantSessionContext';
 import type { EnterpriseAuthUser } from '../auth';
 import AppHeader from '@/components/AppHeader';
 import { DataTable, type DataTableColumn } from '@/components/DataTable';
@@ -40,6 +42,15 @@ import { useCodexSubscriptionAccount } from './models/useCodexSubscriptionAccoun
 const MODEL_PAGE_SIZE = 8;
 const MODEL_TEST_UI_TIMEOUT_MS = 100_000;
 const STABLE_MODEL_ERROR_CODE_PATTERN = /^[A-Z][A-Z0-9_]+$/;
+type ModelsTenantContext = NonNullable<ReturnType<typeof useTenantSession>>;
+
+/** Prevent stale tenant generations from publishing model state or toasts. */
+function isCurrentTenantGeneration(
+  context: ModelsTenantContext | null,
+  generation: number,
+): context is ModelsTenantContext {
+  return Boolean(context && !context.signal.aborted && context.isCurrentGeneration(generation));
+}
 
 export type ModelProviderErrorDetail = {
   code: string;
@@ -225,15 +236,24 @@ export default function ModelsPage({
   onLogout?: () => void;
 } = {}) {
   const { t } = useAppIntl();
+  const tenantContext = useTenantSession();
+  const tenantApi = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
   const [rows, setRows] = useState<ModelConfigRead[]>([]);
   const [loading, setLoading] = useState(false);
   const [searchText, setSearchText] = useState('');
   const [editingModel, setEditingModel] = useState<ModelConfigRead | null>(null);
+  const [editingModelGeneration, setEditingModelGeneration] = useState<number | null>(null);
   const [wizardOpen, setWizardOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<ModelConfigRead | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [subscriptionLogoutConfirmOpen, setSubscriptionLogoutConfirmOpen] = useState(false);
+  const [subscriptionExplicitTenantId, setSubscriptionExplicitTenantId] = useState<string | null>(null);
+  const [subscriptionExplicitGeneration, setSubscriptionExplicitGeneration] = useState<number | null>(null);
+  const previousTenantGenerationRef = useRef<number | null>(tenantContext?.generation ?? null);
+  const loadingRequestOwnerRef = useRef(0);
   const testingModelIdsRef = useRef(new Set<string>());
+  const testingModelRequestOwnersRef = useRef(new Map<string, number>());
+  const testingRequestOwnerRef = useRef(0);
   const [testingModelIds, setTestingModelIds] = useState<Set<string>>(new Set());
   const [availableProtocols, setAvailableProtocols] = useState<ApiKeyProtocol[]>(['openai_chat_completions']);
   const {
@@ -242,28 +262,103 @@ export default function ModelsPage({
     startLogin: startSubscriptionLogin,
     cancelLogin: cancelSubscriptionLogin,
     logout: logoutSubscription,
-  } = useCodexSubscriptionAccount({ tenantId: TENANT_ID });
+  } = useCodexSubscriptionAccount({
+    enabled: Boolean(
+      wizardOpen
+      && tenantContext?.tenantId === subscriptionExplicitTenantId
+      && tenantContext.generation === subscriptionExplicitGeneration,
+    ) || Boolean(
+      editingModel?.auth_mode === 'chatgpt_subscription'
+      && tenantContext?.generation === editingModelGeneration,
+    ),
+  });
+
+  /** 仅在订阅渠道被选中时查询当前租户账户，离开渠道后立即停用。 */
+  function setSubscriptionChannelSelected(selected: boolean) {
+    setSubscriptionExplicitTenantId(selected && tenantContext ? tenantContext.tenantId : null);
+    setSubscriptionExplicitGeneration(selected && tenantContext ? tenantContext.generation : null);
+  }
+
+  /** 打开模型编辑并绑定当前租户代次；无返回值、不发请求，仅更新本地编辑状态。 */
+  function openModelEditor(row: ModelConfigRead) {
+    setEditingModel(row);
+    setEditingModelGeneration(tenantContext?.generation ?? null);
+  }
+
+  /** 清理编辑目标及其租户代次资格；无返回值、不发请求，仅修改本地 React 状态。 */
+  function clearModelEditor() {
+    setEditingModel(null);
+    setEditingModelGeneration(null);
+  }
 
   const load = (showLoading = true) => {
+    const context = tenantContext;
+    if (!context) return Promise.resolve();
+    const generation = context.generation;
+    const requestOwner = showLoading ? ++loadingRequestOwnerRef.current : null;
     if (showLoading) setLoading(true);
-    return api
-      .get<ModelConfigRead[]>(`/api/enterprise/model-configs?tenant_id=${TENANT_ID}`)
+    return tenantApi
+      .get<ModelConfigRead[]>('/api/enterprise/model-configs')
       .then((items) => {
+        if (!isCurrentTenantGeneration(context, generation)) return;
         setRows(items);
         window.dispatchEvent(new CustomEvent(MODEL_CONFIGS_UPDATED_EVENT, { detail: { models: items } }));
       })
-      .catch((error) => notify.error(modelActionError(error, t('modelsPage.toast.loadFailed'))))
+      .catch((error) => {
+        if (!isCurrentTenantGeneration(context, generation)) return;
+        notify.error(modelActionError(error, t('modelsPage.toast.loadFailed')));
+      })
       .finally(() => {
-        if (showLoading) setLoading(false);
+        if (showLoading && requestOwner === loadingRequestOwnerRef.current) setLoading(false);
       });
   };
 
   useEffect(() => {
+    const nextGeneration = tenantContext?.generation ?? null;
+    const previousGeneration = previousTenantGenerationRef.current;
+    previousTenantGenerationRef.current = nextGeneration;
+    if (previousGeneration === null || previousGeneration === nextGeneration) {
+      return;
+    }
+    // Tenant generation is a hard UI isolation boundary: no modal target or
+    // explicit subscription check may survive into the next tenant context.
+    setWizardOpen(false);
+    clearModelEditor();
+    setDeleteTarget(null);
+    setDeleting(false);
+    setSubscriptionLogoutConfirmOpen(false);
+    setSubscriptionExplicitTenantId(null);
+    setSubscriptionExplicitGeneration(null);
+    loadingRequestOwnerRef.current += 1;
+    testingModelRequestOwnersRef.current.clear();
+    testingModelIdsRef.current.clear();
+    setLoading(false);
+    setTestingModelIds(new Set());
+  }, [tenantContext?.generation]);
+
+  useEffect(() => {
+    const context = tenantContext;
+    if (!context) return;
+    const generation = context.generation;
     void load();
-    void api
-      .get<{ protocols: ApiKeyProtocol[] }>(`/api/enterprise/model-configs/protocols?tenant_id=${TENANT_ID}`)
-      .then((result) => setAvailableProtocols(result.protocols));
-  }, []);
+    void tenantApi
+      .get<{ protocols: ApiKeyProtocol[] }>('/api/enterprise/model-configs/protocols')
+      .then((result) => {
+        if (!isCurrentTenantGeneration(context, generation)) return;
+        setAvailableProtocols(result.protocols);
+      })
+      .catch(() => {
+        // Protocol discovery is an optional enhancement; an abort or stale
+        // tenant generation must never become an unhandled rejection/toast.
+      });
+  }, [tenantApi, tenantContext]);
+
+  useEffect(() => {
+    if (!wizardOpen) {
+      setSubscriptionExplicitTenantId(null);
+      setSubscriptionExplicitGeneration(null);
+    }
+  }, [wizardOpen]);
 
   useEffect(() => {
     const openCreate = () => setWizardOpen(true);
@@ -301,41 +396,57 @@ export default function ModelsPage({
   async function confirmDelete() {
     const row = deleteTarget;
     if (!row || deleting) return;
+    const context = tenantContext;
+    if (!context) return;
+    const generation = context.generation;
     setDeleting(true);
     try {
-      await api.delete(`/api/enterprise/model-configs/${row.id}?tenant_id=${TENANT_ID}`);
+      await tenantApi.delete(`/api/enterprise/model-configs/${row.id}`);
+      if (!isCurrentTenantGeneration(context, generation)) return;
       notify.success(t('modelsPage.toast.deleted'));
       setDeleteTarget(null);
       await load();
     } catch (error) {
+      if (!isCurrentTenantGeneration(context, generation)) return;
       notify.error(modelActionError(error, t('modelsPage.toast.deleteFailed')));
     } finally {
-      setDeleting(false);
+      if (isCurrentTenantGeneration(context, generation)) setDeleting(false);
     }
   }
 
   async function setDefault(row: ModelConfigRead) {
+    const context = tenantContext;
+    if (!context) return;
+    const generation = context.generation;
     try {
-      await api.post(`/api/enterprise/model-configs/${row.id}/set-default?tenant_id=${TENANT_ID}`);
+      await tenantApi.post(`/api/enterprise/model-configs/${row.id}/set-default`);
+      if (!isCurrentTenantGeneration(context, generation)) return;
       notify.success(t('modelsPage.toast.setDefault'));
       await load();
     } catch (error) {
+      if (!isCurrentTenantGeneration(context, generation)) return;
       notify.error(modelActionError(error, t('modelsPage.toast.setDefaultFailed')));
     }
   }
 
   async function test(row: ModelConfigRead): Promise<boolean> {
     if (testingModelIdsRef.current.has(row.id)) return false;
+    const context = tenantContext;
+    if (!context) return false;
+    const generation = context.generation;
+    const requestOwner = ++testingRequestOwnerRef.current;
+    testingModelRequestOwnersRef.current.set(row.id, requestOwner);
     testingModelIdsRef.current.add(row.id);
     setTestingModelIds(new Set(testingModelIdsRef.current));
     const controller = new AbortController();
     const timeoutId = window.setTimeout(() => controller.abort(), MODEL_TEST_UI_TIMEOUT_MS);
     try {
-      const result = await api.postWithSignal<ModelTestResponse>(
-        `/api/enterprise/model-configs/${row.id}/test?tenant_id=${TENANT_ID}&activate_if_initial=true`,
+      const result = await tenantApi.postWithSignal<ModelTestResponse>(
+        `/api/enterprise/model-configs/${row.id}/test?activate_if_initial=true`,
         {},
         controller.signal,
       );
+      if (!isCurrentTenantGeneration(context, generation)) return false;
       if (result.success) {
         if (!result.activated) notify.success(result.output || result.message);
         return true;
@@ -346,6 +457,7 @@ export default function ModelsPage({
       }
       return false;
     } catch (error) {
+      if (!isCurrentTenantGeneration(context, generation)) return false;
       notify.error(
         error instanceof DOMException && error.name === 'AbortError'
           ? t('modelsPage.error.testTimeout')
@@ -354,9 +466,12 @@ export default function ModelsPage({
       return false;
     } finally {
       window.clearTimeout(timeoutId);
-      testingModelIdsRef.current.delete(row.id);
-      setTestingModelIds(new Set(testingModelIdsRef.current));
-      void load(false);
+      if (testingModelRequestOwnersRef.current.get(row.id) === requestOwner) {
+        testingModelRequestOwnersRef.current.delete(row.id);
+        testingModelIdsRef.current.delete(row.id);
+        setTestingModelIds(new Set(testingModelIdsRef.current));
+        if (isCurrentTenantGeneration(context, generation)) void load(false);
+      }
     }
   }
 
@@ -371,7 +486,7 @@ export default function ModelsPage({
           {isTesting ? <LoaderCircle className="size-3.5 animate-spin" /> : <IconMore className="size-3.5" />}
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end" className={MENU_CONTENT_CLASS}>
-          <DropdownMenuItem className={MENU_ITEM_CLASS} disabled={isTesting} onSelect={() => setEditingModel(row)}>
+          <DropdownMenuItem className={MENU_ITEM_CLASS} disabled={isTesting} onSelect={() => openModelEditor(row)}>
             <IconEdit />
             {t('modelsPage.actions.edit')}
           </DropdownMenuItem>
@@ -571,19 +686,15 @@ export default function ModelsPage({
 
       <ModelSetupWizard
         open={wizardOpen}
-        tenantId={TENANT_ID}
         onOpenChange={setWizardOpen}
-        onCreated={(model, options) => {
+        onCreated={(model) => {
           void load();
-          notify.success(
-            options?.tested
-              ? t('modelsPage.toast.createdTested', { name: model.name })
-              : t('modelsPage.toast.createdDraft', { name: model.name }),
-          );
+          notify.success(t('modelsPage.toast.createdTested', { name: model.name }));
         }}
         availableProtocols={availableProtocols}
         subscriptionAccount={subscriptionAccount}
         subscriptionLoading={subscriptionLoading}
+        onSubscriptionSelected={setSubscriptionChannelSelected}
         onStartSubscriptionLogin={startSubscriptionLogin}
         onCancelSubscriptionLogin={cancelSubscriptionLogin}
         onRequestSubscriptionLogout={requestSubscriptionLogout}
@@ -598,7 +709,7 @@ export default function ModelsPage({
         onStartSubscriptionLogin={startSubscriptionLogin}
         onCancelSubscriptionLogin={cancelSubscriptionLogin}
         onRequestSubscriptionLogout={requestSubscriptionLogout}
-        onOpenChange={(open) => !open && setEditingModel(null)}
+        onOpenChange={(open) => !open && clearModelEditor()}
         onSaved={() => void load()}
       />
 

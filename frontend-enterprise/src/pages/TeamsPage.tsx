@@ -19,8 +19,9 @@ import { RawContent, RawIdentifier } from '@/i18n/RawContent';
 import IconPlus from '../assets/icons/plus.svg?react';
 import IconTrash from '../assets/icons/trash.svg?react';
 
-import { api, TENANT_ID } from '../api/client';
+import { createTenantClient } from '../api/tenant-client';
 import type { EnterpriseAuthUser } from '../auth';
+import { useTenantSession } from '../contexts/TenantSessionContext';
 import AppHeader from '../components/AppHeader';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import EmployeeAvatar from '../components/EmployeeAvatar';
@@ -172,6 +173,8 @@ export default function TeamsPage({
   isAdmin?: boolean;
   onLogout?: () => void;
 }) {
+  const tenantContext = useTenantSession();
+  const tenantApi = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
   const [teams, setTeams] = useState<TeamRead[]>([]);
   const [threads, setThreads] = useState<TeamThreadRead[]>([]);
   const [agents, setAgents] = useState<AgentProfileRead[]>([]);
@@ -249,37 +252,60 @@ export default function TeamsPage({
   }
 
   async function load() {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     setLoading(true);
     try {
-      const rows = await api.get<TeamRead[]>(`/api/enterprise/teams?tenant_id=${TENANT_ID}`);
+      const rows = await tenantApi.get<TeamRead[]>('/api/enterprise/teams');
+      if (!context.isCurrentGeneration(generation)) return;
       setTeams(rows);
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       toast.error(createMessageDescriptor('teamsPage.toast.loadFailed'));
     } finally {
-      setLoading(false);
+      if (context.isCurrentGeneration(generation)) setLoading(false);
     }
   }
 
   useEffect(() => {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return undefined;
     void load();
     void loadThreads();
     // 员工列表仅用于团队卡片的成员头像映射，失败不影响主流程
-    api
-      .get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${TENANT_ID}`)
-      .then(setAgents)
-      .catch(() => setAgents([]));
-    api
-      .get<KnowledgeBaseRead[]>(`/api/enterprise/knowledge-bases?tenant_id=${TENANT_ID}`)
-      .then((rows) => setSharedKnowledgeBases(rows.filter((row) => row.mode === 'shared')))
-      .catch(() => setSharedKnowledgeBases([]));
-  }, [toast]);
+    tenantApi
+      .get<AgentProfileRead[]>('/api/enterprise/agents')
+      .then((rows) => {
+        if (context.isCurrentGeneration(generation)) setAgents(rows);
+      })
+      .catch(() => {
+        if (context.isCurrentGeneration(generation)) setAgents([]);
+      });
+    tenantApi
+      .get<KnowledgeBaseRead[]>('/api/enterprise/knowledge-bases')
+      .then((rows) => {
+        if (context.isCurrentGeneration(generation)) {
+          setSharedKnowledgeBases(rows.filter((row) => row.mode === 'shared'));
+        }
+      })
+      .catch(() => {
+        if (context.isCurrentGeneration(generation)) setSharedKnowledgeBases([]);
+      });
+    return undefined;
+  }, [tenantApi, tenantContext, toast]);
 
   async function loadThreads() {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     try {
-      const rows = await api.get<TeamThreadRead[]>(`/api/enterprise/team-threads?tenant_id=${TENANT_ID}`);
+      const rows = await tenantApi.get<TeamThreadRead[]>('/api/enterprise/team-threads');
+      if (!context.isCurrentGeneration(generation)) return;
       setThreads(rows);
     } catch {
-      setThreads([]);
+      if (context.isCurrentGeneration(generation)) setThreads([]);
     }
   }
 
@@ -294,22 +320,29 @@ export default function TeamsPage({
 
   async function startTeamChat(team: TeamRead) {
     if (startingTeamId) return;
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     setStartingTeamId(team.id);
     try {
-      const result = await api.post<{ session_id: string }>(
+      const result = await tenantApi.post<{ session_id: string }>(
         `/api/enterprise/teams/${team.id}/tl/session`,
-        { tenant_id: TENANT_ID },
       );
+      if (!context.isCurrentGeneration(generation)) return;
       if (!result.session_id) throw new Error('TEAM_SESSION_MISSING');
       navigate(`${EnterpriseRoute.Chat}/${result.session_id}`);
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       toast.error(createMessageDescriptor('teamsPage.toast.startFailed'));
     } finally {
-      setStartingTeamId('');
+      if (context.isCurrentGeneration(generation)) setStartingTeamId('');
     }
   }
 
   async function createTeam() {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     const trimmed = name.trim();
     if (!trimmed) {
       toast.error(createMessageDescriptor('teamsPage.toast.createRequired'));
@@ -332,12 +365,12 @@ export default function TeamsPage({
           is_default: defaultKnowledgeSelection === 'new',
         });
       }
-      await api.post<TeamRead>('/api/enterprise/teams', {
-        tenant_id: TENANT_ID,
+      await tenantApi.post<TeamRead>('/api/enterprise/teams', {
         name: trimmed,
         description: description.trim() || undefined,
         knowledge_bases: knowledgeBases,
       });
+      if (!context.isCurrentGeneration(generation)) return;
       toast.success(createMessageDescriptor('teamsPage.toast.created'));
       setCreateOpen(false);
       setName('');
@@ -347,25 +380,31 @@ export default function TeamsPage({
       setNewSharedKnowledgeName('');
       await load();
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       toast.error(createMessageDescriptor('teamsPage.toast.createFailed'));
     } finally {
-      setCreating(false);
+      if (context.isCurrentGeneration(generation)) setCreating(false);
     }
   }
 
   async function confirmDelete() {
     const target = deleteTarget;
     if (!target) return;
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     setDeleting(true);
     try {
-      await api.delete(`/api/enterprise/teams/${target.id}?tenant_id=${TENANT_ID}`);
+      await tenantApi.delete(`/api/enterprise/teams/${target.id}`);
+      if (!context.isCurrentGeneration(generation)) return;
       toast.success(createMessageDescriptor('teamsPage.toast.deleted'));
       setDeleteTarget(null);
       await load();
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       toast.error(createMessageDescriptor('teamsPage.toast.deleteFailed'));
     } finally {
-      setDeleting(false);
+      if (context.isCurrentGeneration(generation)) setDeleting(false);
     }
   }
 

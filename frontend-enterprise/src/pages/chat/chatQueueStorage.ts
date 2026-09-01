@@ -4,10 +4,11 @@ import {
   parseLanguageContextSnapshot,
   type LanguageContextSnapshot,
 } from '@/i18n/languagePreferences';
+import { isTenantUserStorageKey, tenantUserStorageKey } from '@/lib/tenant-storage';
 
 import type { ComposerInteractionMode } from './chatTypes';
 
-const CHAT_QUEUE_STORAGE_PREFIX = 'skill_agent_chat_queue';
+const CHAT_QUEUE_STORAGE_FEATURE = 'chat-queue';
 const INTERACTION_MODES = new Set<ComposerInteractionMode>(['normal', 'scheduled_task']);
 
 type ChatQueueStorage = Pick<Storage, 'getItem' | 'setItem' | 'removeItem'>;
@@ -82,15 +83,19 @@ function parsePreparedChatTurn(value: unknown): PreparedChatTurn | null {
   };
 }
 
-/** 生成租户和用户隔离的会话队列键；空标识使用固定兼容命名空间。 */
+/**
+ * 生成租户和用户隔离的会话队列键；身份缺失时抛错，不再回退到 default/anonymous 或旧无租户键。
+ * 返回值只用于当前已验证租户用户的会话队列。
+ */
 export function chatQueueStorageKey(tenantId: string, userId: string): string {
-  return `${CHAT_QUEUE_STORAGE_PREFIX}:${tenantId || 'default'}:${userId || 'anonymous'}`;
+  return tenantUserStorageKey(tenantId, userId, CHAT_QUEUE_STORAGE_FEATURE);
 }
 
 /**
  * 读取、校验并去重持久化 turn；损坏项被移除，旧项补齐语言快照后立即回写，存储异常时清空。
  */
 export function readQueuedChatTurns(storage: ChatQueueStorage, key: string): PreparedChatTurn[] {
+  if (!isTenantUserStorageKey(key)) return [];
   try {
     const raw = storage.getItem(key);
     if (!raw) return [];
@@ -135,6 +140,7 @@ export function writeQueuedChatTurns(
   key: string,
   turns: PreparedChatTurn[],
 ): boolean {
+  if (!isTenantUserStorageKey(key)) return false;
   try {
     if (turns.length === 0) {
       storage.removeItem(key);

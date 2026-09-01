@@ -6,11 +6,13 @@ import threading
 import time
 import uuid
 from collections.abc import Iterator
+from datetime import timedelta
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 from pydantic import ValidationError
+from sqlalchemy import update
 from sqlmodel import Session, select
 
 from app.config import get_settings
@@ -21,18 +23,33 @@ from app.contracts.errors import (
     InternalErrorContext,
     JsonValue,
 )
-from app.db.models import A2ATaskEvent, A2ATaskRun, Tool, utc_now
+from app.db.models import A2ATaskEvent, A2ATaskRun, Tenant, Tool, utc_now
 from app.i18n.language_context import (
     LanguageContext,
     LanguageContextInputs,
     resolve_compatible_language_context,
     resolve_language_context,
 )
+from app.security.tenant import (
+    TenantExecutionKind,
+    TenantLifecycleDecision,
+    TenantLifecycleDenied,
+    require_active_tenant,
+    require_matching_admission_version,
+)
 
 _TERMINAL_STATES = {"completed", "failed", "canceled", "cancelled", "rejected"}
 _INTERRUPTED_STATES = {"input-required", "auth-required"}
+_LIFECYCLE_ERROR_CODES = {
+    "TENANT_SUSPENDED",
+    "TENANT_NOT_FOUND",
+    "TENANT_LIFECYCLE_CHECK_FAILED",
+    "TENANT_WORK_TERMINALIZED",
+    "EXTERNAL_OUTCOME_UNKNOWN",
+}
 _RUN_LOCKS: dict[str, threading.RLock] = {}
 _RUN_LOCKS_GUARD = threading.Lock()
+_WORKER_LEASE_SECONDS = 15 * 60
 
 
 class A2AClientError(RuntimeError):
@@ -107,6 +124,8 @@ class A2AClient:
         session_id: str | None = None,
         invocation_id: str | None = None,
         language_context: LanguageContext | dict[str, Any] | None = None,
+        worker_owner: str | None = None,
+        worker_generation: int | None = None,
     ) -> None:
         """Bind one A2A client to an immutable locale snapshot for all sends and retries."""
         self.db = db
@@ -133,6 +152,8 @@ class A2AClient:
         self.session_id = session_id
         self.invocation_id = invocation_id
         self.language_context = _coerce_language_context(language_context)
+        self.worker_owner = worker_owner
+        self.worker_generation = worker_generation
         self.endpoint_url = tool.url
         self.protocol_binding = "JSONRPC"
         self.protocol_version = str(self.config.get("a2a_version") or "1.0")
@@ -149,12 +170,19 @@ class A2AClient:
         existing = self._existing_invocation()
         if existing is not None:
             return self._resume_existing(existing)
+        # Check before discovery so a suspended tenant cannot contact an Agent Card endpoint.
+        admission_version = self._require_new_admission()
         self._discover_agent()
+        # Re-read after discovery so a concurrent lifecycle transition cannot admit a new run.
+        admission_version = self._require_new_admission()
         continuation = self._continuation(arguments)
         message = self._message(arguments, continuation)
         run = A2ATaskRun(
+            owner_scope="tenant",
             direction="client",
             tenant_id=self.tool.tenant_id,
+            system_runtime_key=None,
+            tenant_lifecycle_version=admission_version,
             tool_id=self.tool.id,
             agent_id=self.agent_id,
             session_id=self.session_id,
@@ -178,20 +206,23 @@ class A2AClient:
 
         deadline = time.monotonic() + self.timeout_seconds
         try:
+            # Recheck immediately before the first outbound provider side effect.
+            self._require_run_admission(run)
             result = self._send(run, message, deadline=deadline)
             return self._finalize(run, result)
         except A2AClientError as exc:
-            run.status = "failed"
-            run.error_json = exc.to_public_payload(
+            self._persist_run_error(run, exc, event_type="failed")
+            raise
+        except httpx.HTTPError as exc:
+            unknown = A2AClientError(
+                "EXTERNAL_OUTCOME_UNKNOWN",
+                str(exc),
+                retryable=False,
                 request_id=self.invocation_id,
                 trace_id=self.session_id,
             )
-            run.finished_at = utc_now()
-            run.updated_at = utc_now()
-            self.db.add(run)
-            self.db.commit()
-            self._event(run, "failed", run.error_json)
-            raise
+            self._persist_run_error(run, unknown, event_type="failed")
+            raise unknown from exc
 
     def _existing_invocation(self) -> A2ATaskRun | None:
         if not self.invocation_id:
@@ -200,6 +231,7 @@ class A2AClient:
             select(A2ATaskRun)
             .where(
                 A2ATaskRun.direction == "client",
+                A2ATaskRun.owner_scope == "tenant",
                 A2ATaskRun.tenant_id == self.tool.tenant_id,
                 A2ATaskRun.tool_id == self.tool.id,
                 A2ATaskRun.invocation_id == self.invocation_id,
@@ -220,8 +252,6 @@ class A2AClient:
             run.updated_at = utc_now()
             self.db.add(run)
             self.db.commit()
-        if not self.agent_card:
-            self._discover_agent()
 
         if run.status in _TERMINAL_STATES | _INTERRUPTED_STATES:
             if run.status in {"failed", "rejected"}:
@@ -253,6 +283,13 @@ class A2AClient:
         )
         deadline = time.monotonic() + self.timeout_seconds
         try:
+            # An existing unfinished run can only resume with the exact owner admission that created it.
+            self._require_run_admission(run)
+            if not self.agent_card:
+                # Discovery is itself a provider request, so fence it independently of later sends.
+                self._require_run_admission(run)
+                self._discover_agent()
+                self._require_run_admission(run)
             if run.remote_task_id:
                 seed = run.result_json if isinstance(run.result_json, dict) else {}
                 if not _task_state(seed):
@@ -268,17 +305,18 @@ class A2AClient:
                 result = self._send(run, message, deadline=deadline)
             return self._finalize(run, result)
         except A2AClientError as exc:
-            run.status = "failed"
-            run.error_json = exc.to_public_payload(
+            self._persist_run_error(run, exc, event_type="recovery_failed")
+            raise
+        except httpx.HTTPError as exc:
+            unknown = A2AClientError(
+                "EXTERNAL_OUTCOME_UNKNOWN",
+                str(exc),
+                retryable=False,
                 request_id=self.invocation_id,
                 trace_id=self.session_id,
             )
-            run.finished_at = utc_now()
-            run.updated_at = utc_now()
-            self.db.add(run)
-            self.db.commit()
-            self._event(run, "recovery_failed", run.error_json)
-            raise
+            self._persist_run_error(run, unknown, event_type="recovery_failed")
+            raise unknown from exc
 
     def _response_from_run(self, run: A2ATaskRun) -> dict[str, Any]:
         """Return a replay-safe response with the durable locale metadata extension."""
@@ -294,6 +332,171 @@ class A2AClient:
             "artifacts": list(run.artifacts_json or []),
             "metadata": _language_metadata(self.language_context),
         }
+
+    def _require_new_admission(self) -> int:
+        """Admit a new tenant-owned call and return its authoritative lifecycle version."""
+        try:
+            decision = self._read_active_tenant(
+                TenantExecutionKind.A2A_CLIENT_SUBMIT,
+                self.invocation_id or self.tool.id,
+            )
+        except TenantLifecycleDenied as denied:
+            self._raise_lifecycle_error(denied)
+        return decision.lifecycle_version
+
+    def _require_run_admission(
+        self,
+        run: A2ATaskRun,
+        *,
+        execution_kind: TenantExecutionKind = TenantExecutionKind.A2A_CLIENT_SUBMIT,
+        denial_code: str = "TENANT_WORK_TERMINALIZED",
+    ) -> None:
+        """Require the durable run's tenant and lifecycle version before an outbound side effect."""
+        self._renew_worker_claim(run)
+        try:
+            decision = self._read_active_tenant(execution_kind, run.invocation_id or run.id)
+            require_matching_admission_version(decision, run.tenant_lifecycle_version)
+        except TenantLifecycleDenied as denied:
+            self._raise_lifecycle_error(denied, code=denial_code)
+
+    def _read_active_tenant(
+        self,
+        execution_kind: TenantExecutionKind,
+        correlation_id: str,
+    ) -> TenantLifecycleDecision:
+        """Refresh the local session and read one current active tenant decision without side effects."""
+        # Provider callbacks may update the tenant through another database connection; expire the
+        # identity map so each boundary observes that committed state rather than a cached row.
+        self.db.expire_all()
+        return require_active_tenant(
+            self.db,
+            self.tool.tenant_id,
+            execution_kind,
+            correlation_id,
+        )
+
+    def _raise_lifecycle_error(
+        self,
+        denied: TenantLifecycleDenied,
+        *,
+        code: str | None = None,
+    ) -> None:
+        """Convert a central lifecycle denial into a public-safe A2A error without raw evidence."""
+        resolved_code = code or denied.code
+        raise A2AClientError(
+            resolved_code,
+            resolved_code,
+            retryable=False,
+            request_id=self.invocation_id,
+            trace_id=self.session_id,
+        ) from None
+
+    def _check_run_admission(
+        self,
+        run: A2ATaskRun,
+        *,
+        execution_kind: TenantExecutionKind = TenantExecutionKind.A2A_CLIENT_SUBMIT,
+    ) -> None:
+        """Perform a raw lifecycle decision for callers that classify an already-started outcome."""
+        self._renew_worker_claim(run)
+        decision = self._read_active_tenant(execution_kind, run.invocation_id or run.id)
+        require_matching_admission_version(decision, run.tenant_lifecycle_version)
+
+    def _renew_worker_claim(self, run: A2ATaskRun) -> None:
+        """Renew the durable recovery claim and reject a stale worker generation."""
+        if self.worker_owner is None or self.worker_generation is None:
+            return
+        lease_until = utc_now() + timedelta(seconds=_WORKER_LEASE_SECONDS)
+        result = self.db.exec(
+            update(A2ATaskRun)
+            .where(
+                A2ATaskRun.id == run.id,
+                A2ATaskRun.worker_owner == self.worker_owner,
+                A2ATaskRun.worker_generation == self.worker_generation,
+                A2ATaskRun.cancel_requested == False,
+            )
+            .values(worker_lease_until=lease_until, updated_at=utc_now())
+        )
+        self.db.commit()
+        if getattr(result, "rowcount", 0) != 1:
+            raise A2AClientError(
+                "TENANT_WORK_TERMINALIZED",
+                "A2A recovery worker no longer owns this run.",
+                retryable=False,
+                request_id=self.invocation_id,
+                trace_id=self.session_id,
+            )
+        run.worker_lease_until = lease_until
+
+    def _worker_owned_update(self, statement: Any) -> Any:
+        """Bind a durable update to this recovery worker when one is present."""
+        if self.worker_owner is None or self.worker_generation is None:
+            return statement
+        return statement.where(
+            A2ATaskRun.worker_owner == self.worker_owner,
+            A2ATaskRun.worker_generation == self.worker_generation,
+        )
+
+    def _persist_run_error(
+        self,
+        run: A2ATaskRun,
+        error: A2AClientError,
+        *,
+        event_type: str,
+    ) -> None:
+        """Terminalize this worker's non-cancelled run without overwriting another terminal owner."""
+        payload = error.to_public_payload(
+            request_id=self.invocation_id,
+            trace_id=self.session_id,
+        )
+        now = utc_now()
+        statement = update(A2ATaskRun).where(
+            A2ATaskRun.id == run.id,
+            A2ATaskRun.status.not_in(["failed", "rejected", "canceled", "cancelled"]),
+        )
+        statement = self._worker_owned_update(statement).values(
+            status="failed",
+            error_json=payload,
+            finished_at=now,
+            updated_at=now,
+            worker_owner=None,
+            worker_lease_until=None,
+        )
+        result = self.db.exec(statement)
+        self.db.commit()
+        if getattr(result, "rowcount", 0) != 1:
+            return
+        self.db.expire_all()
+        persisted = self.db.get(A2ATaskRun, run.id)
+        if persisted is not None:
+            self._event(persisted, event_type, payload)
+
+    def _persist_active_result(
+        self,
+        run: A2ATaskRun,
+        *,
+        values: dict[str, Any],
+    ) -> bool:
+        """CAS one result write against the current tenant lifecycle and worker generation."""
+        active_tenant = select(Tenant.id).where(
+            Tenant.id == run.tenant_id,
+            Tenant.status == "active",
+            Tenant.lifecycle_version == run.tenant_lifecycle_version,
+        ).exists()
+        statement = update(A2ATaskRun).where(
+            A2ATaskRun.id == run.id,
+            A2ATaskRun.owner_scope == "tenant",
+            A2ATaskRun.direction == "client",
+            A2ATaskRun.tenant_id == run.tenant_id,
+            A2ATaskRun.tenant_lifecycle_version == run.tenant_lifecycle_version,
+            A2ATaskRun.cancel_requested == False,
+            A2ATaskRun.status.not_in(["failed", "rejected", "canceled", "cancelled"]),
+            active_tenant,
+        )
+        statement = self._worker_owned_update(statement).values(**values)
+        result = self.db.exec(statement)
+        self.db.commit()
+        return getattr(result, "rowcount", 0) == 1
 
     def _invocation_lock_key(self) -> str:
         identity = self.invocation_id or uuid.uuid4().hex
@@ -360,11 +563,31 @@ class A2AClient:
                 )
                 if last is not None:
                     return self._wait_if_needed(run, last, deadline=deadline)
-            except (A2AClientError, httpx.HTTPError):
-                if self.config.get("require_streaming") is True:
+            except (A2AClientError, httpx.HTTPError) as exc:
+                if isinstance(exc, A2AClientError) and exc.code in _LIFECYCLE_ERROR_CODES:
                     raise
-                self._event(run, "stream_fallback", {})
-        result = self._rpc("SendMessage", self._send_params(message), deadline=deadline)
+                # Once SendStreamingMessage starts, the provider may have accepted the business
+                # request. A second SendMessage would be a replay, not a safe capability fallback.
+                raise A2AClientError(
+                    "EXTERNAL_OUTCOME_UNKNOWN",
+                    str(exc),
+                    retryable=False,
+                    request_id=self.invocation_id,
+                    trace_id=self.session_id,
+                ) from exc
+            raise A2AClientError(
+                "EXTERNAL_OUTCOME_UNKNOWN",
+                "A2A streaming send ended without a result.",
+                retryable=False,
+                request_id=self.invocation_id,
+                trace_id=self.session_id,
+            )
+        result = self._rpc(
+            "SendMessage",
+            self._send_params(message),
+            deadline=deadline,
+            run=run,
+        )
         self._record_result(run, result, event_type="message_result")
         return self._wait_if_needed(run, result, deadline=deadline)
 
@@ -399,7 +622,10 @@ class A2AClient:
                     streamed_task = _task_from_event(streamed) or streamed
                     if _task_state(streamed_task) in _TERMINAL_STATES | _INTERRUPTED_STATES:
                         return streamed_task
-            except (A2AClientError, httpx.HTTPError):
+            except (A2AClientError, httpx.HTTPError) as exc:
+                # Do not hide a lifecycle fence as an ordinary streaming capability fallback.
+                if isinstance(exc, A2AClientError) and exc.code in _LIFECYCLE_ERROR_CODES:
+                    raise
                 self._event(run, "subscribe_fallback", {})
 
         while time.monotonic() < deadline:
@@ -407,7 +633,12 @@ class A2AClient:
             if run.cancel_requested:
                 self._cancel_remote(run, deadline=deadline)
                 raise A2AClientError("A2A_CANCELLED", "A2A 任务已取消。")
-            polled = self._rpc("GetTask", {"id": run.remote_task_id}, deadline=deadline)
+            polled = self._rpc(
+                "GetTask",
+                {"id": run.remote_task_id},
+                deadline=deadline,
+                run=run,
+            )
             self._record_result(run, polled, event_type="task_polled")
             task = _task_from_event(polled) or polled
             self._update_task_identity(run, task)
@@ -425,6 +656,8 @@ class A2AClient:
         *,
         deadline: float,
     ) -> dict[str, Any] | None:
+        # Streaming opens a remote request, so admission must be checked immediately before it.
+        self._require_run_admission(run)
         payload = self._payload(method, params)
         headers = dict(self.headers)
         headers["Accept"] = "text/event-stream"
@@ -465,7 +698,17 @@ class A2AClient:
                             return accumulated_task
         return accumulated_task or last
 
-    def _rpc(self, method: str, params: dict[str, Any], *, deadline: float) -> dict[str, Any]:
+    def _rpc(
+        self,
+        method: str,
+        params: dict[str, Any],
+        *,
+        deadline: float,
+        run: A2ATaskRun | None = None,
+    ) -> dict[str, Any]:
+        """Send one JSON-RPC request after rechecking tenant ownership and lifecycle admission."""
+        if run is not None:
+            self._require_run_admission(run)
         timeout = max(deadline - time.monotonic(), 0.1)
         with httpx.Client(timeout=timeout) as client:
             response = client.post(
@@ -491,8 +734,17 @@ class A2AClient:
         if not run.remote_task_id:
             return
         try:
-            result = self._rpc("CancelTask", {"id": run.remote_task_id}, deadline=deadline)
+            result = self._rpc(
+                "CancelTask",
+                {"id": run.remote_task_id},
+                deadline=deadline,
+                run=run,
+            )
             self._record_result(run, result, event_type="cancelled")
+        except A2AClientError as exc:
+            # A lifecycle error is authoritative even on a best-effort timeout cancellation.
+            if not best_effort or exc.code in _LIFECYCLE_ERROR_CODES:
+                raise
         except Exception:
             if not best_effort:
                 raise
@@ -501,16 +753,49 @@ class A2AClient:
         """Persist a successful A2A result and return raw business output plus stable metadata."""
         task = _task_from_event(result) or result
         state = _task_state(task) or "completed"
+        try:
+            # A remote response has already been received; a changed lifecycle makes its outcome
+            # unsafe to report as an ordinary success or retryable failure.
+            self._check_run_admission(run)
+        except TenantLifecycleDenied as denied:
+            self._raise_lifecycle_error(denied, code="EXTERNAL_OUTCOME_UNKNOWN")
         artifacts = _artifacts(task)
-        artifacts = self._hydrate_artifacts(artifacts)
-        run.status = state
-        run.result_json = task
-        run.artifacts_json = artifacts
-        run.finished_at = utc_now() if state in _TERMINAL_STATES | _INTERRUPTED_STATES else None
-        run.updated_at = utc_now()
-        self._update_task_identity(run, task, commit=False)
-        self.db.add(run)
-        self.db.commit()
+        artifacts = self._hydrate_artifacts(run, artifacts)
+        now = utc_now()
+        remote_task_id = str(task.get("id") or task.get("taskId") or run.remote_task_id or "") or None
+        context_id = str(task.get("contextId") or run.context_id or "") or None
+        if not self._persist_active_result(
+            run,
+            values={
+                "status": state,
+                "result_json": task,
+                "artifacts_json": artifacts,
+                "remote_task_id": remote_task_id,
+                "context_id": context_id,
+                "finished_at": (
+                    now if state in _TERMINAL_STATES | _INTERRUPTED_STATES else None
+                ),
+                "updated_at": now,
+                "worker_owner": None if state in _TERMINAL_STATES | _INTERRUPTED_STATES else run.worker_owner,
+                "worker_lease_until": (
+                    None if state in _TERMINAL_STATES | _INTERRUPTED_STATES else run.worker_lease_until
+                ),
+            },
+        ):
+            unknown = A2AClientError(
+                "EXTERNAL_OUTCOME_UNKNOWN",
+                "A2A result lost its lifecycle or worker fence before persistence.",
+                retryable=False,
+                request_id=self.invocation_id,
+                trace_id=self.session_id,
+            )
+            self._persist_run_error(run, unknown, event_type="failed")
+            raise unknown
+        self.db.expire_all()
+        persisted = self.db.get(A2ATaskRun, run.id)
+        if persisted is None:
+            raise A2AClientError("A2A_TASK_FAILED", "A2A durable run disappeared.")
+        run = persisted
         self._event(run, state, {"task": task, "artifacts": artifacts})
         if state in {"failed", "rejected"}:
             message = _status_message(task) or f"A2A Task {state}。"
@@ -601,14 +886,45 @@ class A2AClient:
         event_id: str | None = None,
     ) -> None:
         task = _task_from_event(result)
+        state = _task_state(task) if task is not None else ""
+        try:
+            self._check_run_admission(run)
+        except TenantLifecycleDenied as denied:
+            # A provider response with a known non-terminal Task can be terminalized safely; a
+            # terminal/shape-less response cannot prove what happened after suspension.
+            code = (
+                "TENANT_WORK_TERMINALIZED"
+                if state and state not in _TERMINAL_STATES
+                else "EXTERNAL_OUTCOME_UNKNOWN"
+            )
+            self._raise_lifecycle_error(denied, code=code)
+        values: dict[str, Any] = {"updated_at": utc_now()}
         if task:
-            self._update_task_identity(run, task, commit=False)
-            state = _task_state(task)
+            values["remote_task_id"] = (
+                str(task.get("id") or task.get("taskId") or run.remote_task_id or "") or None
+            )
+            values["context_id"] = str(task.get("contextId") or run.context_id or "") or None
             if state:
-                run.status = state
-        run.updated_at = utc_now()
-        self.db.add(run)
-        self.db.commit()
+                values["status"] = state
+        if not self._persist_active_result(run, values=values):
+            code = (
+                "TENANT_WORK_TERMINALIZED"
+                if state and state not in _TERMINAL_STATES
+                else "EXTERNAL_OUTCOME_UNKNOWN"
+            )
+            error = A2AClientError(
+                code,
+                code,
+                retryable=False,
+                request_id=self.invocation_id,
+                trace_id=self.session_id,
+            )
+            self._persist_run_error(run, error, event_type="failed")
+            raise error
+        self.db.expire_all()
+        persisted = self.db.get(A2ATaskRun, run.id)
+        if persisted is not None:
+            run = persisted
         self._event(run, event_type, result, event_id=event_id)
 
     def _update_task_identity(
@@ -645,7 +961,6 @@ class A2AClient:
         ).first()
         self.db.add(
             A2ATaskEvent(
-                tenant_id=run.tenant_id,
                 run_id=run.id,
                 sequence=(last.sequence + 1) if last else 1,
                 external_event_id=event_id,
@@ -655,7 +970,12 @@ class A2AClient:
         )
         self.db.commit()
 
-    def _hydrate_artifacts(self, artifacts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _hydrate_artifacts(
+        self,
+        run: A2ATaskRun,
+        artifacts: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Fetch remote artifact bytes only while the tenant run remains admitted."""
         hydrated: list[dict[str, Any]] = []
         max_bytes = int(self.config.get("artifact_max_bytes") or 25 * 1024 * 1024)
         for artifact in artifacts:
@@ -669,10 +989,21 @@ class A2AClient:
                 uri = str(file_part.get("uri") or "").strip()
                 if not uri or urlsplit(uri).scheme not in {"http", "https"}:
                     continue
+                try:
+                    # Artifact hydration is another provider request and must not cross a lifecycle fence.
+                    self._check_run_admission(run)
+                except TenantLifecycleDenied as denied:
+                    self._raise_lifecycle_error(denied, code="EXTERNAL_OUTCOME_UNKNOWN")
                 with httpx.Client(timeout=min(self.timeout_seconds, 60.0)) as client:
                     response = client.get(uri, headers=self.headers)
                     response.raise_for_status()
                     content = response.content
+                try:
+                    # The GET itself is an external boundary; a transition during download must
+                    # prevent these bytes from being attached to an ordinary completed result.
+                    self._check_run_admission(run)
+                except TenantLifecycleDenied as denied:
+                    self._raise_lifecycle_error(denied, code="EXTERNAL_OUTCOME_UNKNOWN")
                 if len(content) > max_bytes:
                     raise A2AClientError("A2A_ARTIFACT_TOO_LARGE", "A2A Artifact 超过大小限制。")
                 file_part["bytes"] = base64.b64encode(content).decode("ascii")

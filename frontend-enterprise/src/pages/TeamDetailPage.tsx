@@ -24,8 +24,9 @@ import { createUiSinks } from '@/i18n/sinks';
 import { backendEventMessageDescriptor } from '@/lib/backendEventMessages';
 import { cn } from '@/lib/utils';
 
-import { api, TENANT_ID } from '../api/client';
+import { createTenantClient } from '../api/tenant-client';
 import type { EnterpriseAuthUser } from '../auth';
+import { useTenantSession } from '../contexts/TenantSessionContext';
 import AppHeader from '../components/AppHeader';
 import BiddingArena from '../components/BiddingArena';
 import EmployeeAvatar from '../components/EmployeeAvatar';
@@ -223,6 +224,17 @@ type TeamLogPayload = {
   sessions?: TeamLogSession[];
 };
 
+type TeamRouteFence = {
+  teamId: string;
+  routeRevision: number;
+  signal: AbortSignal;
+  isCurrent: () => boolean;
+};
+
+type TeamActionFence = TeamRouteFence & {
+  release: () => void;
+};
+
 /** 将业务优先级枚举映射为本地化产品标签；未知值原样保留以避免翻译业务数据。 */
 export function taskPriorityLabel(
   priority: string,
@@ -289,10 +301,13 @@ export default function TeamDetailPage({
   const { teamId = '' } = useParams<{ teamId: string }>();
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
+  const taskParam = searchParams.get('task');
   const { locale, t: appT } = useAppIntl();
   const t = useMemo(() => createTeamDetailTranslator({ t: appT }), [appT]);
   const toast = useMemo(() => createToastNotifier({ t: appT }), [appT]);
   const uiSinks = useMemo(() => createUiSinks({ t: appT }), [appT]);
+  const tenantContext = useTenantSession();
+  const tenantApi = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
   const [team, setTeam] = useState<TeamRead | null>(null);
   const [tasks, setTasks] = useState<TeamTaskRead[]>([]);
   const [agents, setAgents] = useState<AgentProfileRead[]>([]);
@@ -334,6 +349,89 @@ export default function TeamDetailPage({
   const [knowledgeBusyIds, setKnowledgeBusyIds] = useState<Set<string>>(() => new Set());
   const [addKnowledgeBaseId, setAddKnowledgeBaseId] = useState('');
   const [newSharedKnowledgeName, setNewSharedKnowledgeName] = useState('');
+  const routeKey = `${teamId}|${taskParam ?? ''}`;
+  const routeRevisionRef = useRef({ key: routeKey, revision: 0 });
+  if (routeRevisionRef.current.key !== routeKey) {
+    routeRevisionRef.current = {
+      key: routeKey,
+      revision: routeRevisionRef.current.revision + 1,
+    };
+  }
+  const routeRevision = routeRevisionRef.current.revision;
+  const teamIdRef = useRef(teamId);
+  teamIdRef.current = teamId;
+  const routeAbortControllerRef = useRef<AbortController | null>(null);
+  const actionControllersRef = useRef<Set<AbortController>>(new Set());
+
+  /** Abort every mutation controller captured by the previous team route. */
+  function cancelRouteActionControllers() {
+    actionControllersRef.current.forEach((actionController) => actionController.abort());
+    actionControllersRef.current.clear();
+  }
+
+  // Abort every route-bound request/action before the next route can publish
+  // anything. The route revision remains the logical fence; this controller
+  // also stops fetch work that is still in flight.
+  useEffect(() => {
+    const controller = new AbortController();
+    const previousController = routeAbortControllerRef.current;
+    routeAbortControllerRef.current = controller;
+    previousController?.abort();
+    cancelRouteActionControllers();
+    return () => {
+      controller.abort();
+      cancelRouteActionControllers();
+      if (routeAbortControllerRef.current === controller) routeAbortControllerRef.current = null;
+    };
+  }, [routeKey]);
+
+  /** Capture the current team route and reject snapshots after route changes. */
+  function captureTeamRouteFence(): TeamRouteFence | null {
+    const controller = routeAbortControllerRef.current;
+    if (!controller || controller.signal.aborted) return null;
+    const capturedTeamId = teamIdRef.current;
+    const capturedRouteRevision = routeRevisionRef.current.revision;
+    return {
+      teamId: capturedTeamId,
+      routeRevision: capturedRouteRevision,
+      signal: controller.signal,
+      isCurrent: () => (
+        !controller.signal.aborted
+        && routeAbortControllerRef.current?.signal === controller.signal
+        && teamIdRef.current === capturedTeamId
+        && routeRevisionRef.current.revision === capturedRouteRevision
+      ),
+    };
+  }
+
+  /** Capture one route action, including an abortable controller for its request. */
+  function beginTeamActionFence(): TeamActionFence | null {
+    const context = tenantContext;
+    const generation = context?.generation;
+    const routeFence = captureTeamRouteFence();
+    if (!context || generation === undefined || !routeFence || !routeFence.isCurrent()) return null;
+
+    const actionController = new AbortController();
+    const abortAction = () => actionController.abort();
+    routeFence.signal.addEventListener('abort', abortAction, { once: true });
+    actionControllersRef.current.add(actionController);
+
+    return {
+      teamId: routeFence.teamId,
+      routeRevision: routeFence.routeRevision,
+      signal: actionController.signal,
+      isCurrent: () => (
+        !actionController.signal.aborted
+        && context.isCurrentGeneration(generation)
+        && routeFence.isCurrent()
+      ),
+      release: () => {
+        routeFence.signal.removeEventListener('abort', abortAction);
+        actionControllersRef.current.delete(actionController);
+      },
+    };
+  }
+
   const openedTaskParamRef = useRef<string | null>(null);
   const memberScrollRef = useRef<HTMLDivElement | null>(null);
   const [memberScrollEdges, setMemberScrollEdges] = useState({
@@ -389,88 +487,147 @@ export default function TeamDetailPage({
   }, [teamMemberKey, updateMemberScrollEdges]);
 
   /** 加载团队概要；错误只展示受控产品消息，不把异常正文作为 UI 文案。 */
-  const loadTeam = useCallback(async () => {
+  const loadTeam = useCallback(async (expectedRouteFence?: TeamRouteFence) => {
+    const context = tenantContext;
+    const generation = context?.generation;
+    const routeFence = expectedRouteFence || captureTeamRouteFence();
+    if (!context || generation === undefined || !routeFence) return;
     try {
-      const detail = await api.get<TeamRead>(`/api/enterprise/teams/${teamId}?tenant_id=${TENANT_ID}`);
+      const detail = await tenantApi.get<TeamRead>(
+        `/api/enterprise/teams/${routeFence.teamId}`,
+        { signal: routeFence.signal },
+      );
+      if (!context.isCurrentGeneration(generation) || !routeFence.isCurrent()) return;
       setTeam(detail);
     } catch {
-      toast.error(createMessageDescriptor('teamDetailPage.toast.loadTeam'));
+      if (context.isCurrentGeneration(generation) && routeFence.isCurrent()) {
+        toast.error(createMessageDescriptor('teamDetailPage.toast.loadTeam'));
+      }
     }
-  }, [teamId, toast]);
+  }, [tenantApi, teamId, tenantContext, toast]);
 
   /** 加载任务看板数据；后端任务标题和描述仍作为业务原文保留。 */
-  const loadTasks = useCallback(async () => {
+  const loadTasks = useCallback(async (expectedRouteFence?: TeamRouteFence) => {
+    const context = tenantContext;
+    const generation = context?.generation;
+    const routeFence = expectedRouteFence || captureTeamRouteFence();
+    if (!context || generation === undefined || !routeFence) return;
     try {
-      const rows = await api.get<TeamTaskRead[]>(`/api/enterprise/teams/${teamId}/tasks?tenant_id=${TENANT_ID}`);
+      const rows = await tenantApi.get<TeamTaskRead[]>(
+        `/api/enterprise/teams/${routeFence.teamId}/tasks`,
+        { signal: routeFence.signal },
+      );
+      if (!context.isCurrentGeneration(generation) || !routeFence.isCurrent()) return;
       setTasks(rows);
     } catch {
-      toast.error(createMessageDescriptor('teamDetailPage.toast.loadTasks'));
+      if (context.isCurrentGeneration(generation) && routeFence.isCurrent()) {
+        toast.error(createMessageDescriptor('teamDetailPage.toast.loadTasks'));
+      }
     }
-  }, [teamId, toast]);
+  }, [tenantApi, teamId, tenantContext, toast]);
 
   /** 加载团队黑板；网络或服务端错误采用稳定 fallback。 */
-  const loadBoard = useCallback(async () => {
+  const loadBoard = useCallback(async (expectedRouteFence?: TeamRouteFence) => {
+    const context = tenantContext;
+    const generation = context?.generation;
+    const routeFence = expectedRouteFence || captureTeamRouteFence();
+    if (!context || generation === undefined || !routeFence) return;
     try {
-      const rows = await api.get<TeamBlackboardEntryRead[]>(
-        `/api/enterprise/teams/${teamId}/blackboard?tenant_id=${TENANT_ID}&status=active`,
+      const rows = await tenantApi.get<TeamBlackboardEntryRead[]>(
+        `/api/enterprise/teams/${routeFence.teamId}/blackboard?status=active`,
+        { signal: routeFence.signal },
       );
+      if (!context.isCurrentGeneration(generation) || !routeFence.isCurrent()) return;
       setBoardEntries(rows);
     } catch {
-      toast.error(createMessageDescriptor('teamDetailPage.toast.loadBlackboard'));
+      if (context.isCurrentGeneration(generation) && routeFence.isCurrent()) {
+        toast.error(createMessageDescriptor('teamDetailPage.toast.loadBlackboard'));
+      }
     }
-  }, [teamId, toast]);
+  }, [tenantApi, teamId, tenantContext, toast]);
 
-  const loadEvents = useCallback(async () => {
+  const loadEvents = useCallback(async (expectedRouteFence?: TeamRouteFence) => {
+    const context = tenantContext;
+    const generation = context?.generation;
+    const routeFence = expectedRouteFence || captureTeamRouteFence();
+    if (!context || generation === undefined || !routeFence) return;
     try {
-      const rows = await api.get<TeamEventRead[]>(
-        `/api/enterprise/teams/${teamId}/events?tenant_id=${TENANT_ID}&limit=50`,
+      const rows = await tenantApi.get<TeamEventRead[]>(
+        `/api/enterprise/teams/${routeFence.teamId}/events?limit=50`,
+        { signal: routeFence.signal },
       );
+      if (!context.isCurrentGeneration(generation) || !routeFence.isCurrent()) return;
       setTeamEvents(rows);
     } catch {
-      setTeamEvents([]);
+      if (context.isCurrentGeneration(generation) && routeFence.isCurrent()) setTeamEvents([]);
     }
-  }, [teamId]);
+  }, [tenantApi, teamId, tenantContext]);
 
   /** 加载团队知识库绑定；权限矩阵只接收服务器数据，不翻译知识库名称。 */
-  const loadKnowledgeBindings = useCallback(async () => {
+  const loadKnowledgeBindings = useCallback(async (expectedRouteFence?: TeamRouteFence) => {
     /** Load team-local binding revisions and permission matrices. */
+    const context = tenantContext;
+    const generation = context?.generation;
+    const routeFence = expectedRouteFence || captureTeamRouteFence();
+    if (!context || generation === undefined || !routeFence) return;
     try {
-      const rows = await api.get<TeamKnowledgeBindingRead[]>(
-        `/api/enterprise/teams/${teamId}/knowledge-bases?tenant_id=${TENANT_ID}`,
+      const rows = await tenantApi.get<TeamKnowledgeBindingRead[]>(
+        `/api/enterprise/teams/${routeFence.teamId}/knowledge-bases`,
+        { signal: routeFence.signal },
       );
+      if (!context.isCurrentGeneration(generation) || !routeFence.isCurrent()) return;
       setKnowledgeBindings(rows.filter((row) => row.status === 'active'));
     } catch {
-      toast.error(createMessageDescriptor('teamDetailPage.toast.loadKnowledge'));
-      setKnowledgeBindings([]);
+      if (context.isCurrentGeneration(generation) && routeFence.isCurrent()) {
+        toast.error(createMessageDescriptor('teamDetailPage.toast.loadKnowledge'));
+        setKnowledgeBindings([]);
+      }
     }
-  }, [teamId, toast]);
+  }, [tenantApi, teamId, tenantContext, toast]);
 
-  const loadAvailableSharedKnowledge = useCallback(async () => {
+  const loadAvailableSharedKnowledge = useCallback(async (expectedRouteFence?: TeamRouteFence) => {
     /** Load reusable shared bases that may be added to this team. */
+    const context = tenantContext;
+    const generation = context?.generation;
+    const routeFence = expectedRouteFence || captureTeamRouteFence();
+    if (!context || generation === undefined || !routeFence) return;
     try {
-      const rows = await api.get<KnowledgeBaseRead[]>(
-        `/api/enterprise/knowledge-bases?tenant_id=${TENANT_ID}`,
+      const rows = await tenantApi.get<KnowledgeBaseRead[]>(
+        '/api/enterprise/knowledge-bases',
+        { signal: routeFence.signal },
       );
+      if (!context.isCurrentGeneration(generation) || !routeFence.isCurrent()) return;
       setAvailableSharedKnowledge(rows.filter((row) => row.mode === 'shared'));
     } catch {
-      setAvailableSharedKnowledge([]);
+      if (context.isCurrentGeneration(generation) && routeFence.isCurrent()) setAvailableSharedKnowledge([]);
     }
-  }, []);
+  }, [teamId, tenantApi, tenantContext]);
 
   useEffect(() => {
+    const context = tenantContext;
+    const generation = context?.generation;
+    const routeFence = captureTeamRouteFence();
+    if (!context || generation === undefined || !routeFence) return undefined;
     setLoading(true);
     void Promise.all([
-      loadTeam(),
-      loadTasks(),
-      loadBoard(),
-      loadEvents(),
-      loadKnowledgeBindings(),
-      loadAvailableSharedKnowledge(),
-      api
-        .get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${TENANT_ID}`)
-        .then(setAgents)
-        .catch(() => setAgents([])),
-    ]).finally(() => setLoading(false));
+      loadTeam(routeFence),
+      loadTasks(routeFence),
+      loadBoard(routeFence),
+      loadEvents(routeFence),
+      loadKnowledgeBindings(routeFence),
+      loadAvailableSharedKnowledge(routeFence),
+      tenantApi
+        .get<AgentProfileRead[]>('/api/enterprise/agents', { signal: routeFence.signal })
+        .then((rows) => {
+          if (context.isCurrentGeneration(generation) && routeFence.isCurrent()) setAgents(rows);
+        })
+        .catch(() => {
+          if (context.isCurrentGeneration(generation) && routeFence.isCurrent()) setAgents([]);
+        }),
+    ]).finally(() => {
+      if (context.isCurrentGeneration(generation) && routeFence.isCurrent()) setLoading(false);
+    });
+    return undefined;
   }, [
     loadAvailableSharedKnowledge,
     loadBoard,
@@ -478,7 +635,73 @@ export default function TeamDetailPage({
     loadKnowledgeBindings,
     loadTasks,
     loadTeam,
+    routeRevision,
+    teamId,
+    tenantApi,
+    tenantContext,
   ]);
+
+  // A provider replacement briefly exposes no context. Clear all resource
+  // state at that boundary so a tenant-A detail page cannot remain visible
+  // while tenant-B verification is in flight.
+  useEffect(() => {
+    if (tenantContext) return;
+    setTeam(null);
+    setTasks([]);
+    setAgents([]);
+    setBoardEntries([]);
+    setTeamEvents([]);
+    setKnowledgeBindings([]);
+    setAvailableSharedKnowledge([]);
+    setTeamLog(null);
+    setTeamLogOpen(false);
+    setLoadingTeamLog(false);
+    setActiveTask(null);
+    setEditingEntry(null);
+    setTaskDialogOpen(false);
+    setAddingMember(false);
+    setCreatingTask(false);
+    setPostingEntry(false);
+    setSavingEntry(false);
+    setOverriding(false);
+    setAwarding(false);
+    setSavingConfig(false);
+    setStartingChat(false);
+    setPromotingEntryId(null);
+    setKnowledgeBusyIds(new Set());
+    setLoading(false);
+    openedTaskParamRef.current = null;
+  }, [tenantContext]);
+
+  // A route replacement keeps this component mounted. Clear the previous
+  // team's resources immediately so its detail, tasks, or dialogs cannot
+  // remain visible while the new team request is in flight.
+  useEffect(() => {
+    setTeam(null);
+    setTasks([]);
+    setAgents([]);
+    setBoardEntries([]);
+    setTeamEvents([]);
+    setKnowledgeBindings([]);
+    setAvailableSharedKnowledge([]);
+    setTeamLog(null);
+    setTeamLogOpen(false);
+    setLoadingTeamLog(false);
+    setActiveTask(null);
+    setEditingEntry(null);
+    setTaskDialogOpen(false);
+    setAddingMember(false);
+    setCreatingTask(false);
+    setPostingEntry(false);
+    setSavingEntry(false);
+    setOverriding(false);
+    setAwarding(false);
+    setSavingConfig(false);
+    setStartingChat(false);
+    setPromotingEntryId(null);
+    setKnowledgeBusyIds(new Set());
+    openedTaskParamRef.current = null;
+  }, [routeKey]);
 
   useEffect(() => {
     const config = team?.config || {};
@@ -487,14 +710,23 @@ export default function TeamDetailPage({
     setConfigBidRounds(String(config.bid_rebuttal_rounds ?? 1));
   }, [team]);
 
-  const taskParam = searchParams.get('task');
   useEffect(() => {
-    if (!taskParam || openedTaskParamRef.current === taskParam) return;
+    if (!tenantContext) {
+      openedTaskParamRef.current = null;
+      setActiveTask(null);
+      return;
+    }
+    if (!taskParam) {
+      openedTaskParamRef.current = null;
+      setActiveTask(null);
+      return;
+    }
+    if (openedTaskParamRef.current === taskParam) return;
     const target = tasks.find((item) => item.id === taskParam);
     if (!target) return;
     openedTaskParamRef.current = taskParam;
-    void openTask(target);
-  }, [taskParam, tasks]);
+    void openTask(target, routeRevision);
+  }, [routeRevision, taskParam, tasks, tenantContext]);
 
   const memberNameByAgentId = useMemo(() => {
     const map = new Map<string, string>();
@@ -524,44 +756,67 @@ export default function TeamDetailPage({
       toast.error(createMessageDescriptor('teamDetailPage.toast.addMemberRequired'));
       return;
     }
+    const fence = beginTeamActionFence();
+    if (!fence) return;
     setAddingMember(true);
     try {
-      await api.post(`/api/enterprise/teams/${teamId}/members`, {
-        tenant_id: TENANT_ID,
+      await tenantApi.post(`/api/enterprise/teams/${fence.teamId}/members`, {
         agent_id: addAgentId,
-      });
+      }, { signal: fence.signal });
+      if (!fence.isCurrent()) return;
       toast.success(createMessageDescriptor('teamDetailPage.toast.memberAdded'));
       setAddAgentId('');
-      await Promise.all([loadTeam(), loadKnowledgeBindings()]);
+      if (!fence.isCurrent()) return;
+      await Promise.all([loadTeam(fence), loadKnowledgeBindings(fence)]);
     } catch {
-      toast.error(createMessageDescriptor('teamDetailPage.toast.addMemberFailed'));
+      if (fence.isCurrent()) {
+        toast.error(createMessageDescriptor('teamDetailPage.toast.addMemberFailed'));
+      }
     } finally {
-      setAddingMember(false);
+      if (fence.isCurrent()) setAddingMember(false);
+      fence.release();
     }
   }
 
   /** 从团队移除员工；agentId 是业务标识，不作为产品文本翻译。 */
   async function removeMember(agentId: string) {
+    const fence = beginTeamActionFence();
+    if (!fence) return;
     try {
-      await api.delete(`/api/enterprise/teams/${teamId}/members/${agentId}?tenant_id=${TENANT_ID}`);
+      await tenantApi.delete(`/api/enterprise/teams/${fence.teamId}/members/${agentId}`, undefined, {
+        signal: fence.signal,
+      });
+      if (!fence.isCurrent()) return;
       toast.success(createMessageDescriptor('teamDetailPage.toast.memberRemoved'));
-      await Promise.all([loadTeam(), loadKnowledgeBindings()]);
+      if (!fence.isCurrent()) return;
+      await Promise.all([loadTeam(fence), loadKnowledgeBindings(fence)]);
     } catch {
-      toast.error(createMessageDescriptor('teamDetailPage.toast.removeMemberFailed'));
+      if (fence.isCurrent()) {
+        toast.error(createMessageDescriptor('teamDetailPage.toast.removeMemberFailed'));
+      }
+    } finally {
+      fence.release();
     }
   }
 
   /** 将指定成员提升为项目领导；保留员工名称等原始业务数据。 */
   async function promoteLeader(agentId: string) {
+    const fence = beginTeamActionFence();
+    if (!fence) return;
     try {
-      await api.put(`/api/enterprise/teams/${teamId}/leader`, {
-        tenant_id: TENANT_ID,
+      await tenantApi.put(`/api/enterprise/teams/${fence.teamId}/leader`, {
         agent_id: agentId,
-      });
+      }, { signal: fence.signal });
+      if (!fence.isCurrent()) return;
       toast.success(createMessageDescriptor('teamDetailPage.toast.leaderChanged'));
-      await loadTeam();
+      if (!fence.isCurrent()) return;
+      await loadTeam(fence);
     } catch {
-      toast.error(createMessageDescriptor('teamDetailPage.toast.changeLeaderFailed'));
+      if (fence.isCurrent()) {
+        toast.error(createMessageDescriptor('teamDetailPage.toast.changeLeaderFailed'));
+      }
+    } finally {
+      fence.release();
     }
   }
 
@@ -573,62 +828,82 @@ export default function TeamDetailPage({
       return;
     }
     if (creatingTask) return;
+    const fence = beginTeamActionFence();
+    if (!fence) return;
     setCreatingTask(true);
     try {
-      await api.post<TeamTaskRead>(`/api/enterprise/teams/${teamId}/tasks`, {
-        tenant_id: TENANT_ID,
+      await tenantApi.post<TeamTaskRead>(`/api/enterprise/teams/${fence.teamId}/tasks`, {
         title,
         description: newTaskDescription.trim() || undefined,
         priority: newTaskPriority,
         assignee_agent_id: newTaskAssignee === POOL_ASSIGNEE_VALUE ? undefined : newTaskAssignee,
-      });
+      }, { signal: fence.signal });
+      if (!fence.isCurrent()) return;
       toast.success(createMessageDescriptor('teamDetailPage.toast.taskCreated'));
       setTaskDialogOpen(false);
       setNewTaskTitle('');
       setNewTaskDescription('');
       setNewTaskPriority('medium');
       setNewTaskAssignee(POOL_ASSIGNEE_VALUE);
-      await loadTasks();
+      if (!fence.isCurrent()) return;
+      await loadTasks(fence);
     } catch {
-      toast.error(createMessageDescriptor('teamDetailPage.toast.createTaskFailed'));
+      if (fence.isCurrent()) {
+        toast.error(createMessageDescriptor('teamDetailPage.toast.createTaskFailed'));
+      }
     } finally {
-      setCreatingTask(false);
+      if (fence.isCurrent()) setCreatingTask(false);
+      fence.release();
     }
   }
 
   /** 创建团队领导会话并跳转到群聊；异常正文不会直接展示给用户。 */
   async function startTeamChat() {
     if (!teamId || startingChat) return;
+    const fence = beginTeamActionFence();
+    if (!fence) return;
     setStartingChat(true);
     try {
-      const result = await api.post<{ session_id: string }>(
-        `/api/enterprise/teams/${teamId}/tl/session`,
-        { tenant_id: TENANT_ID },
+      const result = await tenantApi.post<{ session_id: string }>(
+        `/api/enterprise/teams/${fence.teamId}/tl/session`,
+        undefined,
+        { signal: fence.signal },
       );
+      if (!fence.isCurrent()) return;
       if (!result.session_id) throw new Error('TEAM_SESSION_MISSING');
       navigate(`${EnterpriseRoute.Chat}/${result.session_id}`);
     } catch {
-      toast.error(createMessageDescriptor('teamDetailPage.toast.startChatFailed'));
+      if (fence.isCurrent()) {
+        toast.error(createMessageDescriptor('teamDetailPage.toast.startChatFailed'));
+      }
     } finally {
-      setStartingChat(false);
+      if (fence.isCurrent()) setStartingChat(false);
+      fence.release();
     }
   }
 
   /** 打开完整团队日志对话框；日志内容保持 raw 诊断数据，仅状态文本本地化。 */
   async function openTeamLog() {
     if (!teamId || loadingTeamLog) return;
+    const fence = beginTeamActionFence();
+    if (!fence) return;
     setTeamLogOpen(true);
     setLoadingTeamLog(true);
     try {
-      const payload = await api.get<TeamLogPayload>(
-        `/api/enterprise/teams/${teamId}/export?tenant_id=${encodeURIComponent(TENANT_ID)}`,
+      const payload = await tenantApi.get<TeamLogPayload>(
+        `/api/enterprise/teams/${fence.teamId}/export`,
+        { signal: fence.signal },
       );
+      if (!fence.isCurrent()) return;
       setTeamLog(payload);
     } catch {
-      setTeamLogOpen(false);
-      toast.error(createMessageDescriptor('teamDetailPage.toast.logLoadFailed'));
+      if (fence.isCurrent()) {
+        setTeamLogOpen(false);
+        toast.error(createMessageDescriptor('teamDetailPage.toast.logLoadFailed'));
+      }
     } finally {
-      setLoadingTeamLog(false);
+      if (fence.isCurrent()) setLoadingTeamLog(false);
+      fence.release();
     }
   }
 
@@ -654,37 +929,50 @@ export default function TeamDetailPage({
       return;
     }
     if (postingEntry) return;
+    const fence = beginTeamActionFence();
+    if (!fence) return;
     setPostingEntry(true);
     try {
-      await api.post(`/api/enterprise/teams/${teamId}/blackboard`, {
-        tenant_id: TENANT_ID,
+      await tenantApi.post(`/api/enterprise/teams/${fence.teamId}/blackboard`, {
         content,
         tags: parseTags(boardTags),
-      });
+      }, { signal: fence.signal });
+      if (!fence.isCurrent()) return;
       toast.success(createMessageDescriptor('teamDetailPage.toast.boardAdded'));
       setBoardContent('');
       setBoardTags('');
-      await loadBoard();
+      if (!fence.isCurrent()) return;
+      await loadBoard(fence);
     } catch {
-      toast.error(createMessageDescriptor('teamDetailPage.toast.boardAddFailed'));
+      if (fence.isCurrent()) {
+        toast.error(createMessageDescriptor('teamDetailPage.toast.boardAddFailed'));
+      }
     } finally {
-      setPostingEntry(false);
+      if (fence.isCurrent()) setPostingEntry(false);
+      fence.release();
     }
   }
 
   /** 切换黑板条目置顶状态；仅状态动作文本使用当前 UI locale。 */
   async function togglePinEntry(entry: TeamBlackboardEntryRead) {
+    const fence = beginTeamActionFence();
+    if (!fence) return;
     try {
-      await api.put(`/api/enterprise/teams/${teamId}/blackboard/${entry.id}`, {
-        tenant_id: TENANT_ID,
+      await tenantApi.put(`/api/enterprise/teams/${fence.teamId}/blackboard/${entry.id}`, {
         pinned: !entry.pinned,
-      });
+      }, { signal: fence.signal });
+      if (!fence.isCurrent()) return;
       toast.success(createMessageDescriptor(
         (entry.pinned ? 'teamDetailPage.toast.boardUnpinned' : 'teamDetailPage.toast.boardPinned'),
       ));
-      await loadBoard();
+      if (!fence.isCurrent()) return;
+      await loadBoard(fence);
     } catch {
-      toast.error(createMessageDescriptor('teamDetailPage.toast.boardUpdateFailed'));
+      if (fence.isCurrent()) {
+        toast.error(createMessageDescriptor('teamDetailPage.toast.boardUpdateFailed'));
+      }
+    } finally {
+      fence.release();
     }
   }
 
@@ -703,34 +991,50 @@ export default function TeamDetailPage({
       toast.error(createMessageDescriptor('teamDetailPage.toast.boardContentRequired'));
       return;
     }
+    const fence = beginTeamActionFence();
+    if (!fence) return;
     setSavingEntry(true);
     try {
-      await api.put(`/api/enterprise/teams/${teamId}/blackboard/${entry.id}`, {
-        tenant_id: TENANT_ID,
+      await tenantApi.put(`/api/enterprise/teams/${fence.teamId}/blackboard/${entry.id}`, {
         content,
         tags: parseTags(editTags),
-      });
+      }, { signal: fence.signal });
+      if (!fence.isCurrent()) return;
       toast.success(createMessageDescriptor('teamDetailPage.toast.boardUpdated'));
       setEditingEntry(null);
-      await loadBoard();
+      if (!fence.isCurrent()) return;
+      await loadBoard(fence);
     } catch {
-      toast.error(createMessageDescriptor('teamDetailPage.toast.boardUpdateFailed'));
+      if (fence.isCurrent()) {
+        toast.error(createMessageDescriptor('teamDetailPage.toast.boardUpdateFailed'));
+      }
     } finally {
-      setSavingEntry(false);
+      if (fence.isCurrent()) setSavingEntry(false);
+      fence.release();
     }
   }
 
   /** 归档黑板条目；确认对话框文案通过 descriptor 本地化。 */
   async function archiveBoardEntry(entry: TeamBlackboardEntryRead) {
     if (!uiSinks.confirm(createMessageDescriptor('teamDetailPage.confirm.archiveDescription'))) return;
+    const fence = beginTeamActionFence();
+    if (!fence) return;
     try {
-      await api.post(`/api/enterprise/teams/${teamId}/blackboard/${entry.id}/archive`, {
-        tenant_id: TENANT_ID,
-      });
+      await tenantApi.post(
+        `/api/enterprise/teams/${fence.teamId}/blackboard/${entry.id}/archive`,
+        undefined,
+        { signal: fence.signal },
+      );
+      if (!fence.isCurrent()) return;
       toast.success(createMessageDescriptor('teamDetailPage.toast.boardArchived'));
-      await loadBoard();
+      if (!fence.isCurrent()) return;
+      await loadBoard(fence);
     } catch {
-      toast.error(createMessageDescriptor('teamDetailPage.toast.boardArchiveFailed'));
+      if (fence.isCurrent()) {
+        toast.error(createMessageDescriptor('teamDetailPage.toast.boardArchiveFailed'));
+      }
+    } finally {
+      fence.release();
     }
   }
 
@@ -747,17 +1051,26 @@ export default function TeamDetailPage({
   /** 将黑板条目沉淀到知识库；服务端错误正文不透传至产品 toast。 */
   async function promoteBoardEntry(entry: TeamBlackboardEntryRead) {
     if (promotingEntryId) return;
+    const fence = beginTeamActionFence();
+    if (!fence) return;
     setPromotingEntryId(entry.id);
     try {
-      await api.post(`/api/enterprise/teams/${teamId}/blackboard/${entry.id}/promote`, {
-        tenant_id: TENANT_ID,
-      });
+      await tenantApi.post(
+        `/api/enterprise/teams/${fence.teamId}/blackboard/${entry.id}/promote`,
+        undefined,
+        { signal: fence.signal },
+      );
+      if (!fence.isCurrent()) return;
       toast.success(createMessageDescriptor('teamDetailPage.toast.boardPromoted'));
-      await loadBoard();
+      if (!fence.isCurrent()) return;
+      await loadBoard(fence);
     } catch {
-      toast.error(createMessageDescriptor('teamDetailPage.toast.boardPromoteFailed'));
+      if (fence.isCurrent()) {
+        toast.error(createMessageDescriptor('teamDetailPage.toast.boardPromoteFailed'));
+      }
     } finally {
-      setPromotingEntryId(null);
+      if (fence.isCurrent()) setPromotingEntryId(null);
+      fence.release();
     }
   }
 
@@ -767,63 +1080,80 @@ export default function TeamDetailPage({
     grants: TeamKnowledgeGrantInput[],
   ) {
     /** Save the complete displayed matrix under the binding's optimistic-lock revision. */
+    const fence = beginTeamActionFence();
+    if (!fence) return;
     setKnowledgeBusyIds((current) => new Set(current).add(binding.id));
     try {
-      const updated = await api.put<TeamKnowledgeBindingRead>(
-        `/api/enterprise/teams/${teamId}/knowledge-bases/${binding.knowledge_base_id}/grants`,
+      const updated = await tenantApi.put<TeamKnowledgeBindingRead>(
+        `/api/enterprise/teams/${fence.teamId}/knowledge-bases/${binding.knowledge_base_id}/grants`,
         {
-          tenant_id: TENANT_ID,
           expected_revision: binding.revision,
           grants,
         },
+        { signal: fence.signal },
       );
+      if (!fence.isCurrent()) return;
       setKnowledgeBindings((current) => current.map((row) => (
         row.id === updated.id ? updated : row
       )));
       toast.success(createMessageDescriptor('teamDetailPage.toast.knowledgeSaved'));
     } catch (error) {
+      if (!fence.isCurrent()) return;
       const errorMessageId = apiErrorCode(error) === 'KNOWLEDGE_BINDING_REVISION_CONFLICT'
         ? 'teamDetailPage.toast.knowledgeRevisionConflict'
         : 'teamDetailPage.toast.knowledgeSaveFailed';
       toast.error(createMessageDescriptor(errorMessageId));
       if (apiErrorCode(error) === 'KNOWLEDGE_BINDING_REVISION_CONFLICT') {
-        await loadKnowledgeBindings();
+        if (!fence.isCurrent()) return;
+        await loadKnowledgeBindings(fence);
       }
     } finally {
-      setKnowledgeBusyIds((current) => {
-        const next = new Set(current);
-        next.delete(binding.id);
-        return next;
-      });
+      if (fence.isCurrent()) {
+        setKnowledgeBusyIds((current) => {
+          const next = new Set(current);
+          next.delete(binding.id);
+          return next;
+        });
+      }
+      fence.release();
     }
   }
 
   /** 将团队默认写入目标切换到指定共享知识库。 */
   async function setDefaultKnowledgeBase(binding: TeamKnowledgeBindingRead) {
     /** Select one bound shared base as the team's default write target. */
+    const fence = beginTeamActionFence();
+    if (!fence) return;
     setKnowledgeBusyIds((current) => new Set(current).add(binding.id));
     try {
-      await api.put<TeamKnowledgeBindingRead>(
-        `/api/enterprise/teams/${teamId}/knowledge-bases/${binding.knowledge_base_id}`,
+      await tenantApi.put<TeamKnowledgeBindingRead>(
+        `/api/enterprise/teams/${fence.teamId}/knowledge-bases/${binding.knowledge_base_id}`,
         {
-          tenant_id: TENANT_ID,
           expected_revision: binding.revision,
           is_default: true,
         },
+        { signal: fence.signal },
       );
+      if (!fence.isCurrent()) return;
       toast.success(createMessageDescriptor('teamDetailPage.toast.defaultKnowledgeUpdated'));
-      await Promise.all([loadTeam(), loadKnowledgeBindings()]);
+      if (!fence.isCurrent()) return;
+      await Promise.all([loadTeam(fence), loadKnowledgeBindings(fence)]);
     } catch (error) {
+      if (!fence.isCurrent()) return;
       toast.error(createMessageDescriptor('teamDetailPage.toast.defaultKnowledgeFailed'));
       if (apiErrorCode(error) === 'KNOWLEDGE_BINDING_REVISION_CONFLICT') {
-        await loadKnowledgeBindings();
+        if (!fence.isCurrent()) return;
+        await loadKnowledgeBindings(fence);
       }
     } finally {
-      setKnowledgeBusyIds((current) => {
-        const next = new Set(current);
-        next.delete(binding.id);
-        return next;
-      });
+      if (fence.isCurrent()) {
+        setKnowledgeBusyIds((current) => {
+          const next = new Set(current);
+          next.delete(binding.id);
+          return next;
+        });
+      }
+      fence.release();
     }
   }
 
@@ -833,28 +1163,37 @@ export default function TeamDetailPage({
     if (!uiSinks.confirm(createMessageDescriptor('teamDetailPage.confirm.removeKnowledge', {
       knowledgeBaseName: binding.knowledge_base_name,
     }))) return;
+    const fence = beginTeamActionFence();
+    if (!fence) return;
     setKnowledgeBusyIds((current) => new Set(current).add(binding.id));
     try {
-      await api.delete(
-        `/api/enterprise/teams/${teamId}/knowledge-bases/${binding.knowledge_base_id}`,
+      await tenantApi.delete(
+        `/api/enterprise/teams/${fence.teamId}/knowledge-bases/${binding.knowledge_base_id}`,
         {
-          tenant_id: TENANT_ID,
           expected_revision: binding.revision,
         },
+        { signal: fence.signal },
       );
+      if (!fence.isCurrent()) return;
       toast.success(createMessageDescriptor('teamDetailPage.toast.knowledgeRemoved'));
-      await Promise.all([loadTeam(), loadKnowledgeBindings()]);
+      if (!fence.isCurrent()) return;
+      await Promise.all([loadTeam(fence), loadKnowledgeBindings(fence)]);
     } catch (error) {
+      if (!fence.isCurrent()) return;
       toast.error(createMessageDescriptor('teamDetailPage.toast.removeKnowledgeFailed'));
       if (apiErrorCode(error) === 'KNOWLEDGE_BINDING_REVISION_CONFLICT') {
-        await loadKnowledgeBindings();
+        if (!fence.isCurrent()) return;
+        await loadKnowledgeBindings(fence);
       }
     } finally {
-      setKnowledgeBusyIds((current) => {
-        const next = new Set(current);
-        next.delete(binding.id);
-        return next;
-      });
+      if (fence.isCurrent()) {
+        setKnowledgeBusyIds((current) => {
+          const next = new Set(current);
+          next.delete(binding.id);
+          return next;
+        });
+      }
+      fence.release();
     }
   }
 
@@ -862,27 +1201,36 @@ export default function TeamDetailPage({
   async function bindExistingKnowledgeBase() {
     /** Bind one reusable shared base selected from the tenant management list. */
     if (!addKnowledgeBaseId) return;
+    const fence = beginTeamActionFence();
+    if (!fence) return;
     setKnowledgeBusyIds((current) => new Set(current).add('add-existing'));
     try {
-      await api.post<TeamKnowledgeBindingRead>(
-        `/api/enterprise/teams/${teamId}/knowledge-bases`,
+      await tenantApi.post<TeamKnowledgeBindingRead>(
+        `/api/enterprise/teams/${fence.teamId}/knowledge-bases`,
         {
-          tenant_id: TENANT_ID,
           existing_knowledge_base_id: addKnowledgeBaseId,
           is_default: false,
         },
+        { signal: fence.signal },
       );
+      if (!fence.isCurrent()) return;
       setAddKnowledgeBaseId('');
       toast.success(createMessageDescriptor('teamDetailPage.toast.knowledgeBound'));
-      await loadKnowledgeBindings();
+      if (!fence.isCurrent()) return;
+      await loadKnowledgeBindings(fence);
     } catch {
-      toast.error(createMessageDescriptor('teamDetailPage.toast.bindKnowledgeFailed'));
+      if (fence.isCurrent()) {
+        toast.error(createMessageDescriptor('teamDetailPage.toast.bindKnowledgeFailed'));
+      }
     } finally {
-      setKnowledgeBusyIds((current) => {
-        const next = new Set(current);
-        next.delete('add-existing');
-        return next;
-      });
+      if (fence.isCurrent()) {
+        setKnowledgeBusyIds((current) => {
+          const next = new Set(current);
+          next.delete('add-existing');
+          return next;
+        });
+      }
+      fence.release();
     }
   }
 
@@ -891,27 +1239,36 @@ export default function TeamDetailPage({
     /** Create a generic shared base and bind it to this team in one request. */
     const name = newSharedKnowledgeName.trim();
     if (!name) return;
+    const fence = beginTeamActionFence();
+    if (!fence) return;
     setKnowledgeBusyIds((current) => new Set(current).add('create-shared'));
     try {
-      await api.post<TeamKnowledgeBindingRead>(
-        `/api/enterprise/teams/${teamId}/knowledge-bases`,
+      await tenantApi.post<TeamKnowledgeBindingRead>(
+        `/api/enterprise/teams/${fence.teamId}/knowledge-bases`,
         {
-          tenant_id: TENANT_ID,
           create_shared: { name },
           is_default: false,
         },
+        { signal: fence.signal },
       );
+      if (!fence.isCurrent()) return;
       setNewSharedKnowledgeName('');
       toast.success(createMessageDescriptor('teamDetailPage.toast.knowledgeCreated'));
-      await Promise.all([loadKnowledgeBindings(), loadAvailableSharedKnowledge()]);
+      if (!fence.isCurrent()) return;
+      await Promise.all([loadKnowledgeBindings(fence), loadAvailableSharedKnowledge(fence)]);
     } catch {
-      toast.error(createMessageDescriptor('teamDetailPage.toast.createKnowledgeFailed'));
+      if (fence.isCurrent()) {
+        toast.error(createMessageDescriptor('teamDetailPage.toast.createKnowledgeFailed'));
+      }
     } finally {
-      setKnowledgeBusyIds((current) => {
-        const next = new Set(current);
-        next.delete('create-shared');
-        return next;
-      });
+      if (fence.isCurrent()) {
+        setKnowledgeBusyIds((current) => {
+          const next = new Set(current);
+          next.delete('create-shared');
+          return next;
+        });
+      }
+      fence.release();
     }
   }
 
@@ -941,36 +1298,55 @@ export default function TeamDetailPage({
       toast.error(createMessageDescriptor('teamDetailPage.toast.invalidNumber'));
       return;
     }
+    const fence = beginTeamActionFence();
+    if (!fence) return;
     setSavingConfig(true);
     try {
-      await api.put(`/api/enterprise/teams/${teamId}`, {
-        tenant_id: TENANT_ID,
+      await tenantApi.put(`/api/enterprise/teams/${fence.teamId}`, {
         config: {
           ...(team.config || {}),
           member_concurrency: concurrency,
           task_timeout_minutes: timeoutMinutes,
           bid_rebuttal_rounds: rebuttalRounds,
         },
-      });
+      }, { signal: fence.signal });
+      if (!fence.isCurrent()) return;
       toast.success(createMessageDescriptor('teamDetailPage.toast.settingsSaved'));
-      await loadTeam();
+      if (!fence.isCurrent()) return;
+      await loadTeam(fence);
     } catch {
-      toast.error(createMessageDescriptor('teamDetailPage.toast.settingsFailed'));
+      if (fence.isCurrent()) {
+        toast.error(createMessageDescriptor('teamDetailPage.toast.settingsFailed'));
+      }
     } finally {
-      setSavingConfig(false);
+      if (fence.isCurrent()) setSavingConfig(false);
+      fence.release();
     }
   }
 
   /** 打开任务详情并刷新完整任务记录；标题、报告与评论保持 raw。 */
-  async function openTask(task: TeamTaskRead) {
+  async function openTask(task: TeamTaskRead, expectedRouteRevision = routeRevisionRef.current.revision) {
+    const context = tenantContext;
+    const generation = context?.generation;
+    const routeFence = captureTeamRouteFence();
+    if (
+      !context
+      || generation === undefined
+      || !routeFence
+      || routeFence.routeRevision !== expectedRouteRevision
+      || !routeFence.isCurrent()
+    ) return;
+    const isCurrent = () => context.isCurrentGeneration(generation) && routeFence.isCurrent();
     setActiveTask(task);
     setOverrideComment('');
     setAwardAgentId('');
     setAwardComment('');
     try {
-      const detail = await api.get<TeamTaskRead>(
-        `/api/enterprise/teams/${teamId}/tasks/${task.id}?tenant_id=${TENANT_ID}`,
+      const detail = await tenantApi.get<TeamTaskRead>(
+        `/api/enterprise/teams/${routeFence.teamId}/tasks/${task.id}`,
+        { signal: routeFence.signal },
       );
+      if (!isCurrent()) return;
       setActiveTask(detail);
     } catch {
       // 详情加载失败时保留列表中的概要数据
@@ -985,23 +1361,30 @@ export default function TeamDetailPage({
       toast.error(createMessageDescriptor('teamDetailPage.toast.executorRequired'));
       return;
     }
+    const fence = beginTeamActionFence();
+    if (!fence) return;
     setAwarding(true);
     try {
-      await api.post<TeamTaskRead>(
-        `/api/enterprise/teams/${teamId}/tasks/${task.id}/award-override`,
+      await tenantApi.post<TeamTaskRead>(
+        `/api/enterprise/teams/${fence.teamId}/tasks/${task.id}/award-override`,
         {
-          tenant_id: TENANT_ID,
           agent_id: awardAgentId,
           comment: awardComment.trim() || undefined,
         },
+        { signal: fence.signal },
       );
+      if (!fence.isCurrent()) return;
       toast.success(createMessageDescriptor('teamDetailPage.toast.overrideSubmitted'));
       setActiveTask(null);
-      await loadTasks();
+      if (!fence.isCurrent()) return;
+      await loadTasks(fence);
     } catch {
-      toast.error(createMessageDescriptor('teamDetailPage.toast.overrideFailed'));
+      if (fence.isCurrent()) {
+        toast.error(createMessageDescriptor('teamDetailPage.toast.overrideFailed'));
+      }
     } finally {
-      setAwarding(false);
+      if (fence.isCurrent()) setAwarding(false);
+      fence.release();
     }
   }
 
@@ -1009,23 +1392,30 @@ export default function TeamDetailPage({
   async function overrideTask(verdict: TeamReviewVerdict) {
     const task = activeTask;
     if (!task || overriding) return;
+    const fence = beginTeamActionFence();
+    if (!fence) return;
     setOverriding(true);
     try {
-      await api.post<TeamTaskRead>(
-        `/api/enterprise/teams/${teamId}/tasks/${task.id}/override`,
+      await tenantApi.post<TeamTaskRead>(
+        `/api/enterprise/teams/${fence.teamId}/tasks/${task.id}/override`,
         {
-          tenant_id: TENANT_ID,
           verdict,
           comment: overrideComment.trim() || undefined,
         },
+        { signal: fence.signal },
       );
+      if (!fence.isCurrent()) return;
       toast.success(createMessageDescriptor('teamDetailPage.toast.overrideSubmitted'));
       setActiveTask(null);
-      await loadTasks();
+      if (!fence.isCurrent()) return;
+      await loadTasks(fence);
     } catch {
-      toast.error(createMessageDescriptor('teamDetailPage.toast.overrideFailed'));
+      if (fence.isCurrent()) {
+        toast.error(createMessageDescriptor('teamDetailPage.toast.overrideFailed'));
+      }
     } finally {
-      setOverriding(false);
+      if (fence.isCurrent()) setOverriding(false);
+      fence.release();
     }
   }
 

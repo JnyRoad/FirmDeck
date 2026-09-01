@@ -7,6 +7,38 @@ import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { AppIntlProvider, I18nProvider } from '@/i18n';
 import type { KnowledgeBaseRead, KnowledgeBaseVersionRead } from '@/types';
 
+const tenantContextMock = vi.hoisted(() => {
+  const controller = new AbortController();
+  return {
+    context: {
+      session: {
+        token: 'tenant-demo-token',
+        scope: 'tenant' as const,
+        tenant: { id: 'tenant_demo', slug: 'tenant-demo', display_name: 'Tenant Demo' },
+        user: {
+          id: 'user-admin',
+          tenant_id: 'tenant_demo',
+          username: 'admin',
+          display_name: 'Admin',
+          role: 'admin' as const,
+          must_change_password: false,
+          avatar_url: null,
+        },
+      },
+      tenantId: 'tenant_demo',
+      tenantSlug: 'tenant-demo',
+      userId: 'user-admin',
+      generation: 1,
+      signal: controller.signal,
+      isCurrentGeneration: (generation: number) => generation === 1,
+    },
+  };
+});
+
+vi.mock('@/contexts/TenantSessionContext', () => ({
+  useTenantSession: () => tenantContextMock.context,
+}));
+
 import { SharedKnowledgeVersionsDialog } from './SharedKnowledgeVersionsDialog';
 
 const knowledgeBase: KnowledgeBaseRead = {
@@ -209,7 +241,7 @@ describe('SharedKnowledgeVersionsDialog', () => {
 
     await waitFor(() => {
       const call = fetchMock.mock.calls.find(([input, init]) => (
-        String(input).endsWith('/knowledge-bases/kb-shared/drafts')
+        new URL(String(input), window.location.origin).pathname === '/api/enterprise/knowledge-bases/kb-shared/drafts'
         && init?.method === 'POST'
       ));
       expect(JSON.parse(String(call?.[1]?.body))).toEqual({
@@ -225,7 +257,7 @@ describe('SharedKnowledgeVersionsDialog', () => {
     const user = userEvent.setup();
     let versionReads = 0;
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      if (init?.method === 'POST' && String(input).endsWith('/versions/kbver-draft/publish')) {
+      if (init?.method === 'POST' && new URL(String(input), window.location.origin).pathname === '/api/enterprise/knowledge-bases/kb-shared/versions/kbver-draft/publish') {
         return conflictResponse();
       }
       if (String(input).includes('/audit-events')) return jsonResponse(auditPage);

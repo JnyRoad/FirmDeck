@@ -1,7 +1,7 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { AlertCircle } from 'lucide-react';
 
-import { api } from '@/api/client';
+import { createTenantClient } from '@/api/tenant-client';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
 import {
   Dialog,
@@ -13,6 +13,7 @@ import {
 } from '@/components/ui';
 import { notify } from '@/components/ui/app-toast';
 import { Button } from '@/components/ui/button';
+import { useTenantSession } from '@/contexts/TenantSessionContext';
 import { useAppIntl } from '@/i18n';
 import { apiErrorMessage } from '@/lib/apiErrorMessages';
 import type { ModelConfigRead } from '@/types';
@@ -22,7 +23,6 @@ import { useCodexSubscriptionAccount } from '@/pages/models/useCodexSubscription
 
 export type ChatModelSetupGateProps = {
   open: boolean;
-  tenantId: string;
   canConfigure: boolean;
   onOpenChange: (open: boolean) => void;
   onConfigured: (model: ModelConfigRead) => void;
@@ -31,12 +31,13 @@ export type ChatModelSetupGateProps = {
 /** 在聊天无可用模型时，为管理员展示共享向导，为其他用户保留只读权限提示。 */
 export default function ChatModelSetupGate({
   open,
-  tenantId,
   canConfigure,
   onOpenChange,
   onConfigured,
 }: ChatModelSetupGateProps) {
   const { t } = useAppIntl();
+  const tenantContext = useTenantSession();
+  const tenantApi = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
   const [availableProtocols, setAvailableProtocols] = useState<ApiKeyProtocol[]>(['openai_chat_completions']);
   const [logoutConfirmOpen, setLogoutConfirmOpen] = useState(false);
   const {
@@ -45,25 +46,30 @@ export default function ChatModelSetupGate({
     startLogin,
     cancelLogin,
     logout,
-  } = useCodexSubscriptionAccount({ tenantId, enabled: open && canConfigure });
+  } = useCodexSubscriptionAccount({ enabled: open && canConfigure });
 
   useEffect(() => {
-    if (!open || !canConfigure) return;
+    if (!open || !canConfigure || !tenantContext) return;
     let cancelled = false;
-    void api
+    const generation = tenantContext.generation;
+    void tenantApi
       .get<{ protocols: ApiKeyProtocol[] }>(
-        `/api/enterprise/model-configs/protocols?tenant_id=${encodeURIComponent(tenantId)}`,
+        '/api/enterprise/model-configs/protocols',
       )
       .then((result) => {
-        if (!cancelled) setAvailableProtocols(result.protocols);
+        if (!cancelled && tenantContext.isCurrentGeneration(generation)) {
+          setAvailableProtocols(result.protocols);
+        }
       })
       .catch((error) => {
-        if (!cancelled) notify.error(apiErrorMessage(error, t('chat.modelSetup.protocolLoadFailed')));
+        if (!cancelled && tenantContext.isCurrentGeneration(generation)) {
+          notify.error(apiErrorMessage(error, t('chat.modelSetup.protocolLoadFailed')));
+        }
       });
     return () => {
       cancelled = true;
     };
-  }, [canConfigure, open, t, tenantId]);
+  }, [canConfigure, open, t, tenantApi, tenantContext]);
 
   if (!canConfigure) {
     return (
@@ -93,7 +99,6 @@ export default function ChatModelSetupGate({
     <>
       <ModelSetupWizard
         open={open}
-        tenantId={tenantId}
         onOpenChange={onOpenChange}
         onCreated={(model, options) => {
           if (options?.tested) onConfigured(model);
@@ -104,7 +109,6 @@ export default function ChatModelSetupGate({
         onStartSubscriptionLogin={() => void startLogin()}
         onCancelSubscriptionLogin={() => void cancelLogin()}
         onRequestSubscriptionLogout={() => setLogoutConfirmOpen(true)}
-        requireVerified
       />
 
       <ConfirmDialog

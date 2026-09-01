@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { createToastNotifier } from '@/components/ui/app-toast';
 
 import { Input } from '@/components/ui';
@@ -10,7 +10,8 @@ import { useAppIntl } from '@/i18n/useAppIntl';
 import type { MessageId } from '@/i18n/types';
 import { backendErrorMessageDescriptor } from '@/lib/apiErrorMessages';
 
-import { api, TENANT_ID } from '../../api/client';
+import { createTenantClient } from '../../api/tenant-client';
+import { useTenantSession } from '../../contexts/TenantSessionContext';
 import { InfoCircleOutlined } from '../../icons';
 import type { ChannelBindingRead } from '../../types';
 import { StatusBadge } from '../scheduled-tasks/StatusBadge';
@@ -55,6 +56,16 @@ function errorDescriptor(error: unknown, fallbackId: MessageId): MessageDescript
   return descriptor
     ? { id: descriptor.messageId, values: descriptor.values }
     : createMessageDescriptor(fallbackId);
+}
+
+type FeishuTenantContext = NonNullable<ReturnType<typeof useTenantSession>>;
+
+/** Prevent a stale tenant generation from publishing credential state or toasts. */
+function isCurrentTenantGeneration(
+  context: FeishuTenantContext | null,
+  generation: number,
+): context is FeishuTenantContext {
+  return Boolean(context && !context.signal.aborted && context.isCurrentGeneration(generation));
 }
 
 /** 渲染飞书权限说明；权限标签产品化，scope 字符串保持 provider raw 标识。 */
@@ -124,6 +135,8 @@ export default function FeishuSetup({
 }) {
   const { t } = useAppIntl();
   const toast = createToastNotifier({ t });
+  const tenantContext = useTenantSession();
+  const tenantApi = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
   const configuredAppId = binding.app_id || '';
   const [editing, setEditing] = useState(!configuredAppId);
   const [appId, setAppId] = useState(configuredAppId);
@@ -136,24 +149,28 @@ export default function FeishuSetup({
       toast.error(createMessageDescriptor('channels.credentials.completeRequired'));
       return;
     }
+    const context = tenantContext;
+    if (!context) return;
+    const generation = context.generation;
     setSaving(true);
     try {
-      const updated = await api.post<ChannelBindingRead>(
+      const updated = await tenantApi.post<ChannelBindingRead>(
         `/api/enterprise/channels/${binding.id}/feishu/credentials`,
         {
-          tenant_id: TENANT_ID,
           app_id: appId.trim(),
           app_secret: appSecret.trim(),
         },
       );
+      if (!isCurrentTenantGeneration(context, generation)) return;
       setAppSecret('');
       setEditing(false);
       onChanged(updated);
       toast.success(createMessageDescriptor('channels.toast.saved'));
     } catch (error) {
+      if (!isCurrentTenantGeneration(context, generation)) return;
       toast.error(errorDescriptor(error, 'channels.credentials.saveFailed'));
     } finally {
-      setSaving(false);
+      if (isCurrentTenantGeneration(context, generation)) setSaving(false);
     }
   }
 

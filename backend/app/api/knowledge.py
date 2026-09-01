@@ -1206,6 +1206,7 @@ def job_read(row: KnowledgeIngestJob) -> KnowledgeIngestJobRead:
     return KnowledgeIngestJobRead(
         id=row.id,
         tenant_id=row.tenant_id,
+        tenant_lifecycle_version=row.tenant_lifecycle_version,
         knowledge_base_id=row.knowledge_base_id,
         document_id=row.document_id,
         filename=row.filename,

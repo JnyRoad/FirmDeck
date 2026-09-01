@@ -1,20 +1,25 @@
-export const ENTERPRISE_AGENT_STORAGE_KEY = 'ultrarag_enterprise_agent_scope';
-export const SELECTED_AGENT_STORAGE_KEY = ENTERPRISE_AGENT_STORAGE_KEY;
-export const SESSION_FILTER_STORAGE_PREFIX = 'skill_agent_session_filter';
+import { tenantUserStorageKey } from './tenant-storage';
 
-export function sessionFilterStorageKey(userId: string): string {
-  return `${SESSION_FILTER_STORAGE_PREFIX}:${userId || 'anonymous'}`;
+/** Generate a session-filter key only from verified tenant and user identity. */
+export function sessionFilterStorageKey(tenantId: string, userId: string): string {
+  return tenantUserStorageKey(tenantId, userId, 'session-filter');
 }
 
-export function persistSharedAgentScope(agentId: string, userId?: string): void {
-  void userId;
+/** Persist an employee/team scope only under explicit tenant and user identity. */
+export function persistSharedAgentScope(
+  agentId: string,
+  tenantId: string,
+  userId: string,
+): void {
   if (!agentId) return;
-  window.localStorage.setItem(ENTERPRISE_AGENT_STORAGE_KEY, agentId);
+  const key = tenantUserStorageKey(tenantId, userId, 'selected-agent');
+  window.localStorage.setItem(key, agentId);
 }
 
-export function clearSharedAgentScope(userId?: string): void {
-  void userId;
-  window.localStorage.removeItem(ENTERPRISE_AGENT_STORAGE_KEY);
+/** Clear only the employee/team scope for the explicit tenant and user. */
+export function clearSharedAgentScope(tenantId: string, userId: string): void {
+  const key = tenantUserStorageKey(tenantId, userId, 'selected-agent');
+  window.localStorage.removeItem(key);
 }
 
 // Team scopes share the same storage slot as employee agent ids, prefixed so
@@ -35,10 +40,15 @@ export function teamIdFromScope(value: string | null | undefined): string {
   return isTeamScope(value) ? String(value).slice(TEAM_SCOPE_PREFIX.length) : '';
 }
 
-/** 读取共享作用域；团队作用域对员工向页面视为"未选员工"，返回空串。 */
-export function readEmployeeScope(): string {
-  const raw = window.localStorage.getItem(ENTERPRISE_AGENT_STORAGE_KEY) || '';
-  return isTeamScope(raw) ? '' : raw;
+/** Read only the explicit tenant/user scope; team scopes appear empty to employee-only pages. */
+export function readEmployeeScope(tenantId: string, userId: string): string {
+  try {
+    const scopedKey = tenantUserStorageKey(tenantId, userId, 'selected-agent');
+    const raw = window.localStorage.getItem(scopedKey) || '';
+    return isTeamScope(raw) ? '' : raw;
+  } catch {
+    return '';
+  }
 }
 
 export function emitAgentScopeChange(agentId: string): void {

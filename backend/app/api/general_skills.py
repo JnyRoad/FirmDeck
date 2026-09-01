@@ -74,7 +74,12 @@ from app.security.permissions import (
     ensure_open_gallery_admin,
     require_agent_scope_viewer,
 )
-from app.security.tenant import ensure_tenant
+from app.security.tenant import (
+    TenantExecutionKind,
+    TenantLifecycleDenied,
+    ensure_tenant,
+    require_active_tenant,
+)
 from app.session.session_kinds import SESSION_KIND_SKILL_TEST
 from app.session.session_schema import ChatTurnRequest, ChatTurnResponse
 
@@ -97,6 +102,39 @@ SKILLHUB_HOSTS = {"skillhub.ai", "www.skillhub.ai"}
 REMOTE_SKILLHUB_HOSTS = CLAWHUB_HOSTS | SKILLHUB_HOSTS
 CLAWHUB_DOWNLOAD_ENDPOINT = "https://wry-manatee-359.convex.site/api/v1/download"
 LOCAL_REFERENCE_PATTERN = re.compile(r"(?<![\w./-])(?:\./)?references/[^\s`'\"<>|]+")
+
+
+def _general_skill_stream_lifecycle_active(tenant_id: str, correlation_id: str) -> bool:
+    """Recheck the authoritative tenant state before a General Skill stream event or side effect."""
+    try:
+        with Session(engine) as lifecycle_db:
+            require_active_tenant(
+                lifecycle_db,
+                tenant_id,
+                TenantExecutionKind.JOB_CLAIM,
+                correlation_id,
+            )
+    except Exception:  # noqa: BLE001 - lifecycle reads fail closed for any backend failure.
+        return False
+    return True
+
+
+def _require_general_skill_stream_lifecycle(tenant_id: str, correlation_id: str) -> None:
+    """Reject a General Skill stream before its worker or first business event starts."""
+    try:
+        with Session(engine) as lifecycle_db:
+            require_active_tenant(
+                lifecycle_db,
+                tenant_id,
+                TenantExecutionKind.JOB_CLAIM,
+                correlation_id,
+            )
+    except TenantLifecycleDenied as exc:
+        if exc.code == "TENANT_SUSPENDED":
+            raise _general_skill_error("TENANT_SUSPENDED", 403) from None
+        raise _general_skill_error("TENANT_LIFECYCLE_CHECK_FAILED", 503) from None
+    except Exception:  # noqa: BLE001 - project every lifecycle backend failure to one safe code.
+        raise _general_skill_error("TENANT_LIFECYCLE_CHECK_FAILED", 503) from None
 
 
 def _general_skill_error(
@@ -759,6 +797,21 @@ def run_general_skill_stream(
 ) -> StreamingResponse:
     """Stream one General Skill test run while fail-closing worker failures to a safe error payload."""
     request = _general_skill_request_with_language_context(request)
+    stream_correlation_id = f"general-skill-stream:{current_user.id}"
+    lifecycle_enforced = isinstance(current_user, User)
+
+    def stream_lifecycle_active() -> bool:
+        """Keep direct unit callers compatible while FastAPI-authenticated streams stay fenced."""
+        return (
+            not lifecycle_enforced
+            or _general_skill_stream_lifecycle_active(
+                request.tenant_id,
+                stream_correlation_id,
+            )
+        )
+
+    if lifecycle_enforced:
+        _require_general_skill_stream_lifecycle(request.tenant_id, stream_correlation_id)
     skill = _get_general_skill(db, request.tenant_id, slug)
     if skill.status != "published":
         raise _general_skill_error("GENERAL_SKILL_NOT_PUBLISHED", 400)
@@ -772,12 +825,16 @@ def run_general_skill_stream(
         model_config = _get_request_model(db, request.tenant_id, request.model_config_id)
 
         def read_stream_events() -> Iterator[str]:
+            if not stream_lifecycle_active():
+                return
             response = _run_general_skill_operation(
                 skill_snapshot,
                 request,
                 model_config,
                 current_user.id,
             )
+            if not stream_lifecycle_active():
+                return
             yield _sse("complete", response.model_dump(mode="json"))
 
         return StreamingResponse(read_stream_events(), media_type="text/event-stream")
@@ -828,6 +885,7 @@ def run_general_skill_stream(
 
     def stream_events() -> Iterator[str]:
         terminal: queue.Queue[tuple[str, object]] = queue.Queue(maxsize=1)
+        worker_done = threading.Event()
 
         def safe_stream_error_payload(*, retryable: bool) -> dict[str, object]:
             """Return one stable stream error payload without exposing worker exception text."""
@@ -845,6 +903,8 @@ def run_general_skill_stream(
         def worker() -> None:
             try:
                 with Session(engine) as worker_db:
+                    if not stream_lifecycle_active():
+                        return
                     response = AgentLoop(worker_db).handle_turn(harness_request)
                     assistant = worker_db.exec(
                         select(Message)
@@ -866,8 +926,12 @@ def run_general_skill_stream(
                             ),
                         )
                     )
-            except Exception:  # noqa: BLE001 - defensive stream boundary
+            except Exception:  # noqa: BLE001 - stream only the stable, secret-free error contract.
                 terminal.put(("error", safe_stream_error_payload(retryable=True)))
+            finally:
+                # The terminal item can be visible just before the worker Session context exits.
+                # Signal only after every worker-side connection/transaction has been released.
+                worker_done.set()
 
         threading.Thread(target=worker, daemon=True).start()
         stream_started_payload: dict[str, object] = {
@@ -882,55 +946,90 @@ def run_general_skill_stream(
             stream_started_payload["language_context"] = request.language_context.model_dump(
                 mode="json"
             )
+        if not stream_lifecycle_active():
+            return
         yield _sse("stream_started", stream_started_payload)
         last_event_at = time.monotonic()
         last_heartbeat_at = 0.0
         cursor: tuple[object, str] | None = None
         pending_terminal: tuple[str, object] | None = None
-        with Session(engine) as poll_db:
-            while True:
+        while True:
+            if not stream_lifecycle_active():
+                return
+            # Never retain a database transaction across an SSE yield.  Apart from
+            # avoiding connection starvation in production, this lets in-memory
+            # StaticPool tests observe the worker's latest committed trace batch.
+            with Session(engine) as poll_db:
                 rows = _skill_debug_events_after(
                     poll_db,
                     request.tenant_id,
                     session_id,
                     cursor,
                 )
-                for row in rows:
-                    cursor = (row.created_at, row.id)
-                    last_event_at = time.monotonic()
-                    yield _sse("trace", _skill_debug_trace(row))
-
-                if pending_terminal is None:
-                    try:
-                        pending_terminal = terminal.get_nowait()
-                    except queue.Empty:
-                        # The worker is still running; keep polling persisted trace events.
-                        pass
-                if pending_terminal is not None and not rows:
-                    event, payload = pending_terminal
-                    if isinstance(payload, GeneralSkillRunResponse):
-                        payload = payload.model_dump(mode="json")
-                    yield _sse(event, payload)
+            for row in rows:
+                if not stream_lifecycle_active():
                     return
+                cursor = (row.created_at, row.id)
+                last_event_at = time.monotonic()
+                yield _sse("trace", _skill_debug_trace(row))
 
-                now = time.monotonic()
-                if now - last_event_at > GENERAL_SKILL_STREAM_IDLE_TIMEOUT_SECONDS:
-                    yield _sse(
-                        "error",
-                        safe_stream_error_payload(retryable=True),
+            if pending_terminal is None:
+                try:
+                    pending_terminal = terminal.get_nowait()
+                except queue.Empty:
+                    # The worker is still running; keep polling persisted trace events.
+                    pass
+            if pending_terminal is not None and not rows:
+                # The worker commits trace events before publishing the terminal
+                # result, but it can do so between this loop's first SELECT and
+                # ``terminal.get_nowait``.  Wait for the worker Session to close,
+                # then drain that final batch in a new read transaction.
+                worker_done.wait(timeout=1.0)
+                with Session(engine) as terminal_db:
+                    terminal_rows = _skill_debug_events_after(
+                        terminal_db,
+                        request.tenant_id,
+                        session_id,
+                        cursor,
                     )
+                if terminal_rows:
+                    for row in terminal_rows:
+                        if not stream_lifecycle_active():
+                            return
+                        cursor = (row.created_at, row.id)
+                        last_event_at = time.monotonic()
+                        yield _sse("trace", _skill_debug_trace(row))
+                    continue
+                if not stream_lifecycle_active():
                     return
-                if now - last_heartbeat_at >= 5:
-                    last_heartbeat_at = now
-                    yield _sse(
-                        "heartbeat",
-                        {
-                            "phase": "harness_v2",
-                            "session_id": session_id,
-                            "client_turn_id": client_turn_id,
-                        },
-                    )
-                time.sleep(0.1)
+                event, payload = pending_terminal
+                if isinstance(payload, GeneralSkillRunResponse):
+                    payload = payload.model_dump(mode="json")
+                yield _sse(event, payload)
+                return
+
+            now = time.monotonic()
+            if now - last_event_at > GENERAL_SKILL_STREAM_IDLE_TIMEOUT_SECONDS:
+                if not stream_lifecycle_active():
+                    return
+                yield _sse(
+                    "error",
+                    safe_stream_error_payload(retryable=True),
+                )
+                return
+            if now - last_heartbeat_at >= 5:
+                if not stream_lifecycle_active():
+                    return
+                last_heartbeat_at = now
+                yield _sse(
+                    "heartbeat",
+                    {
+                        "phase": "harness_v2",
+                        "session_id": session_id,
+                        "client_turn_id": client_turn_id,
+                    },
+                )
+            time.sleep(0.1)
 
     return StreamingResponse(stream_events(), media_type="text/event-stream")
 

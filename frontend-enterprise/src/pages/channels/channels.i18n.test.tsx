@@ -13,6 +13,19 @@ import BindingManagers from './BindingManagers';
 import FeishuSetup from './FeishuSetup';
 import WechatSetup from './WechatSetup';
 
+vi.mock('../../contexts/TenantSessionContext', () => {
+  const context = {
+    tenantId: 'tenant_demo',
+    tenantSlug: 'tenant-demo',
+    userId: 'user-1',
+    generation: 1,
+    signal: new AbortController().signal,
+    session: { token: 'test-token' },
+    isCurrentGeneration: () => true,
+  };
+  return { useTenantSession: () => context };
+});
+
 const pageCopy = {
   'zh-CN': {
     title: '渠道接入',

@@ -158,7 +158,7 @@ def test_classify_without_model_config_stays(monkeypatch) -> None:
 
 def _seed_binding(engine, *, auto_route=None, single_mount=False) -> str:
     with Session(engine) as db:
-        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.add(Tenant(id="tenant_demo", name="Demo", status="active", lifecycle_version=1))
         db.add(
             AgentProfile(
                 id="agent_xz",
@@ -701,7 +701,7 @@ def _make_api_client(engine):
 
 def _seed_api_users(engine) -> dict[str, User]:
     with Session(engine) as db:
-        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.add(Tenant(id="tenant_demo", name="Demo", status="active", lifecycle_version=1))
         owner = User(id="user_owner", tenant_id="tenant_demo", username="owner", password_hash="x")
         db.add(owner)
         db.add(

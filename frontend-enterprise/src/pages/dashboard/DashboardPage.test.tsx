@@ -9,7 +9,8 @@ import { AppIntlProvider } from '@/i18n/provider';
 import type { AppLocale } from '@/i18n/locales';
 import { I18nProvider } from '@/i18n';
 import { TooltipProvider } from '@/components/ui/tooltip';
-import { ENTERPRISE_AGENT_STORAGE_KEY } from '@/lib/agent-scope-storage';
+import { TenantSessionProvider } from '@/contexts/TenantSessionContext';
+import { persistSharedAgentScope } from '@/lib/agent-scope-storage';
 import type { AgentProfileRead } from '@/types';
 
 /** 隔离仍使用 legacy locale 的全局页头，使仪表盘矩阵只依赖语义 Provider。 */
@@ -80,19 +81,50 @@ const semanticDashboardCopy = {
   },
 } as const satisfies Record<AppLocale, Record<string, string>>;
 
+let activeDashboardUser = {
+  id: 'user-1',
+  tenant_id: 'tenant_demo',
+  username: 'demo',
+  role: 'admin' as 'admin' | 'member',
+};
+
 function jsonResponse(body: unknown): Response {
   return {
     ok: true,
     status: 200,
     statusText: 'OK',
+    json: async () => body ?? {},
     text: async () => JSON.stringify(body ?? {}),
   } as Response;
+}
+
+/** Build the fully validated tenant session used by the dashboard test harness. */
+function dashboardSession(user: { id: string; tenant_id: string; username: string; role: 'admin' | 'member' }) {
+  return {
+    token: `token-${user.id}`,
+    scope: 'tenant' as const,
+    tenant: { id: user.tenant_id, slug: 'demo', display_name: 'Demo tenant' },
+    user: {
+      ...user,
+      display_name: null,
+      must_change_password: false,
+      avatar_url: null,
+    },
+  };
 }
 
 /** 为仪表盘提供确定性的员工、统计、工作记录和空资源响应。 */
 function stubSemanticDashboardFetch(rows: AgentProfileRead[] = [dashboardAgent]): void {
   vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input);
+    if (url.includes('/api/auth/me')) {
+      return jsonResponse({
+        ...activeDashboardUser,
+        display_name: null,
+        must_change_password: false,
+        avatar_url: null,
+      });
+    }
     if (url.includes('/work-record')) {
       return jsonResponse({ reply_stats: { total: 0, today: 0, by_day: {} }, events: [] });
     }
@@ -114,11 +146,14 @@ function renderSemanticDashboard(
     role: 'admin',
   },
 ): void {
-  window.localStorage.setItem(ENTERPRISE_AGENT_STORAGE_KEY, dashboardAgent.id);
+  activeDashboardUser = currentUser;
+  persistSharedAgentScope(dashboardAgent.id, currentUser.tenant_id, currentUser.id);
   render(
     <AppIntlProvider initialLocale={locale}>
       <MemoryRouter>
-        <DashboardPage currentUser={currentUser} isAdmin={currentUser.role === 'admin'} />
+        <TenantSessionProvider session={dashboardSession(currentUser)}>
+          <DashboardPage currentUser={currentUser} isAdmin={currentUser.role === 'admin'} />
+        </TenantSessionProvider>
       </MemoryRouter>
     </AppIntlProvider>,
   );
@@ -157,13 +192,27 @@ afterEach(() => {
 
 describe('DashboardPage team scope compatibility', () => {
   it('never sends the team scope as an agent_id query param', async () => {
-    window.localStorage.setItem(ENTERPRISE_AGENT_STORAGE_KEY, 'team:team-1');
+    activeDashboardUser = {
+      id: 'user-1', tenant_id: 'tenant_demo', username: 'demo', role: 'admin',
+    };
+    persistSharedAgentScope('team:team-1', 'tenant_demo', 'user-1');
     const fetchedUrls: string[] = [];
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
       fetchedUrls.push(url);
       if (url.includes('/work-record')) {
         return jsonResponse({ reply_stats: { total: 0, today: 0, by_day: {} }, events: [] });
+      }
+      if (url.includes('/api/auth/me')) {
+        return jsonResponse({
+          id: 'user-1',
+          tenant_id: 'tenant_demo',
+          username: 'demo',
+          display_name: null,
+          role: 'admin',
+          must_change_password: false,
+          avatar_url: null,
+        });
       }
       if (url.includes('/api/enterprise/agents')) return jsonResponse([agent]);
       if (url.includes('/api/enterprise/feedback/summary')) {
@@ -173,14 +222,20 @@ describe('DashboardPage team scope compatibility', () => {
     }));
 
     render(
-      <I18nProvider>
-        <TooltipProvider>
-          <MemoryRouter>
-            <DashboardPage
-              currentUser={{ id: 'user-1', tenant_id: 'tenant_demo', username: 'demo', role: 'admin' }}
-              isAdmin
-            />
-          </MemoryRouter>
+        <I18nProvider>
+          <TooltipProvider>
+            <MemoryRouter>
+              <TenantSessionProvider
+                session={dashboardSession({
+                  id: 'user-1', tenant_id: 'tenant_demo', username: 'demo', role: 'admin',
+                })}
+              >
+                <DashboardPage
+                  currentUser={{ id: 'user-1', tenant_id: 'tenant_demo', username: 'demo', role: 'admin' }}
+                  isAdmin
+                />
+              </TenantSessionProvider>
+            </MemoryRouter>
         </TooltipProvider>
       </I18nProvider>,
     );

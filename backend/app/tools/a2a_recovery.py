@@ -1,18 +1,35 @@
 from __future__ import annotations
 
 import threading
+import uuid
+from datetime import timedelta
 
+from sqlalchemy import or_, update
 from sqlmodel import Session, select
 
 from app.contracts.error_registry import ERROR_REGISTRY, ErrorContractViolation, ErrorVisibility
 from app.contracts.errors import ErrorDescriptor
 from app.db import engine
-from app.db.models import A2ATaskRun, ChatSession, HarnessInvocationRecord, Tool, utc_now
+from app.db.models import (
+    A2ATaskEvent,
+    A2ATaskRun,
+    ChatSession,
+    HarnessInvocationRecord,
+    Tool,
+    utc_now,
+)
 from app.i18n.language_context import resolve_compatible_language_context
+from app.security.tenant import (
+    TenantExecutionKind,
+    TenantLifecycleDenied,
+    require_active_tenant,
+    require_matching_admission_version,
+)
 from app.tools.tool_executor import ToolExecutor
 from app.tools.tool_schema import ToolCall
 
 _RECOVERABLE_STATES = {"submitted", "working"}
+_WORKER_LEASE_SECONDS = 15 * 60
 
 
 def _recovery_error_payload(
@@ -50,6 +67,8 @@ def recover_a2a_client_tasks() -> None:
             db.exec(
                 select(A2ATaskRun.id).where(
                     A2ATaskRun.direction == "client",
+                    A2ATaskRun.owner_scope == "tenant",
+                    A2ATaskRun.tenant_id.is_not(None),
                     A2ATaskRun.status.in_(_RECOVERABLE_STATES),
                 )
             ).all()
@@ -65,25 +84,30 @@ def recover_a2a_client_tasks() -> None:
 
 def _recover_one(run_id: str) -> None:
     with Session(engine) as db:
-        run = db.get(A2ATaskRun, run_id)
-        if run is None or run.direction != "client" or run.status not in _RECOVERABLE_STATES:
+        claimed = _claim_recovery_run(db, run_id)
+        if claimed is None:
             return
+        run, worker_owner, worker_generation = claimed
         if not run.tool_id or not run.invocation_id:
-            run.status = "failed"
-            run.error_json = _recovery_error_payload("A2A_RECOVERY_INVALID")
-            run.finished_at = utc_now()
-            run.updated_at = utc_now()
-            db.add(run)
-            db.commit()
+            _terminalize_run(db, run, "A2A_RECOVERY_INVALID")
+            return
+        try:
+            # Recovery discovery is not admission: re-read current state and require the exact
+            # lifecycle version before any ToolExecutor redispatch can reach a provider.
+            db.expire_all()
+            decision = require_active_tenant(
+                db,
+                run.tenant_id,
+                TenantExecutionKind.A2A_CLIENT_RECOVERY,
+                run.invocation_id,
+            )
+            require_matching_admission_version(decision, run.tenant_lifecycle_version)
+        except TenantLifecycleDenied:
+            _terminalize_run(db, run, "TENANT_WORK_TERMINALIZED")
             return
         tool = db.get(Tool, run.tool_id)
         if tool is None:
-            run.status = "failed"
-            run.error_json = _recovery_error_payload("A2A_RECOVERY_TOOL_MISSING")
-            run.finished_at = utc_now()
-            run.updated_at = utc_now()
-            db.add(run)
-            db.commit()
+            _terminalize_run(db, run, "A2A_RECOVERY_TOOL_MISSING")
             return
         invocation = db.exec(
             select(HarnessInvocationRecord)
@@ -135,4 +159,79 @@ def _recover_one(run_id: str) -> None:
             invocation_id=run.invocation_id,
             language_context=language_context,
             user_id=session.user_id if session is not None else None,
+            a2a_worker_owner=worker_owner,
+            a2a_worker_generation=worker_generation,
         )
+
+
+def _claim_recovery_run(
+    db: Session,
+    run_id: str,
+) -> tuple[A2ATaskRun, str, int] | None:
+    """CAS one recoverable tenant run to a durable worker generation."""
+    now = utc_now()
+    worker_owner = f"a2a-recovery-{uuid.uuid4().hex}"
+    result = db.exec(
+        update(A2ATaskRun)
+        .where(
+            A2ATaskRun.id == run_id,
+            A2ATaskRun.owner_scope == "tenant",
+            A2ATaskRun.direction == "client",
+            A2ATaskRun.tenant_id.is_not(None),
+            A2ATaskRun.status.in_(_RECOVERABLE_STATES),
+            or_(
+                A2ATaskRun.worker_owner.is_(None),
+                A2ATaskRun.worker_lease_until.is_(None),
+                A2ATaskRun.worker_lease_until < now,
+            ),
+        )
+        .values(
+            worker_owner=worker_owner,
+            worker_generation=A2ATaskRun.worker_generation + 1,
+            worker_lease_until=now + timedelta(seconds=_WORKER_LEASE_SECONDS),
+            updated_at=now,
+        )
+    )
+    db.commit()
+    if getattr(result, "rowcount", 0) != 1:
+        return None
+    db.expire_all()
+    run = db.get(A2ATaskRun, run_id)
+    if run is None or run.worker_owner != worker_owner:
+        return None
+    return run, worker_owner, run.worker_generation
+
+
+def _terminalize_run(db: Session, run: A2ATaskRun, code: str) -> None:
+    """Persist one non-retryable recovery terminal state and a secret-free lifecycle event."""
+    run.status = "failed"
+    run.error_json = _recovery_error_payload(code)
+    run.finished_at = utc_now()
+    run.updated_at = utc_now()
+    db.add(run)
+    db.commit()
+    previous = db.exec(
+        select(A2ATaskEvent)
+        .where(A2ATaskEvent.run_id == run.id)
+        .order_by(A2ATaskEvent.sequence.desc())
+    ).first()
+    event_data: dict[str, object] = {"error": dict(run.error_json)}
+    try:
+        context = resolve_compatible_language_context(
+            snapshot=run.language_context_json,
+            legacy_ui_locale=None,
+            legacy_agent_reply_locale=None,
+        )
+    except (TypeError, ValueError):
+        context = None
+    if context is not None:
+        event_data["metadata"] = {"language_context": context.model_dump(mode="json")}
+    db.add(
+        A2ATaskEvent(
+            run_id=run.id,
+            sequence=(previous.sequence + 1) if previous else 1,
+            event_type="recovery_failed",
+            data_json=event_data,
+        )
+    )
+    db.commit()

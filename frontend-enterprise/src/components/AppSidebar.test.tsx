@@ -207,6 +207,32 @@ describe('AppSidebar semantic navigation matrix', () => {
       expect(screen.getByRole('button', { name: copy.chatSwitcher })).toBeTruthy();
     },
   );
+
+  it('never exposes system tenant management from the ordinary tenant-admin sidebar', async () => {
+    const user = userEvent.setup();
+    const view = renderSemanticSidebar('zh-CN');
+
+    expect(screen.queryByText('租户管理')).toBeNull();
+    expect(screen.queryByText('系统管理员')).toBeNull();
+    expect(screen.getByText('账号管理')).toBeTruthy();
+    expect(view.container.innerHTML).not.toContain('/system/');
+
+    await user.click(screen.getByRole('button', { name: '收起边栏' }));
+    expect(view.container.innerHTML).not.toContain('/system/');
+    expect(screen.queryByText('租户管理')).toBeNull();
+  });
+
+  it('never exposes system tenant management from an ordinary tenant-member sidebar', async () => {
+    const user = userEvent.setup();
+    const view = renderSidebar({ selectedAgentId: 'agent-1' });
+
+    expect(screen.queryByText('租户管理')).toBeNull();
+    expect(screen.queryByText('系统管理员')).toBeNull();
+    expect(view.container.innerHTML).not.toContain('/system/');
+    await user.click(screen.getByRole('button', { name: '收起边栏' }));
+    expect(view.container.innerHTML).not.toContain('/system/');
+    expect(screen.queryByText('租户管理')).toBeNull();
+  });
 });
 
 describe('AppSidebar chat variant group conversations', () => {

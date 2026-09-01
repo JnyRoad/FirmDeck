@@ -244,6 +244,7 @@ class KnowledgeDocumentUploadRequest(BaseModel):
 class KnowledgeIngestJobRead(BaseModel):
     id: str
     tenant_id: str
+    tenant_lifecycle_version: int = 1
     knowledge_base_id: str
     document_id: Optional[str] = None
     filename: str

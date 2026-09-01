@@ -702,6 +702,14 @@ export const BACKEND_ERROR_CONTRACT = {
     "status": 401,
     "visibility": "public"
   },
+  "AUTH_PASSWORD_POLICY_VIOLATION": {
+    "code": "AUTH_PASSWORD_POLICY_VIOLATION",
+    "message_key": "errors.auth.passwordPolicyViolation",
+    "params": {},
+    "retryable": false,
+    "status": 400,
+    "visibility": "public"
+  },
   "AUTH_SELF_ROLE_CHANGE_FORBIDDEN": {
     "code": "AUTH_SELF_ROLE_CHANGE_FORBIDDEN",
     "message_key": "errors.auth.selfRoleChangeForbidden",
@@ -1080,6 +1088,14 @@ export const BACKEND_ERROR_CONTRACT = {
     "params": {},
     "retryable": false,
     "status": 404,
+    "visibility": "public"
+  },
+  "EXTERNAL_OUTCOME_UNKNOWN": {
+    "code": "EXTERNAL_OUTCOME_UNKNOWN",
+    "message_key": "errors.tenant.externalOutcomeUnknown",
+    "params": {},
+    "retryable": false,
+    "status": 409,
     "visibility": "public"
   },
   "EXTERNAL_SESSION_CONFLICT": {
@@ -2820,6 +2836,38 @@ export const BACKEND_ERROR_CONTRACT = {
     "status": 404,
     "visibility": "public"
   },
+  "SYSTEM_ADMIN_DISABLED": {
+    "code": "SYSTEM_ADMIN_DISABLED",
+    "message_key": "errors.system.adminDisabled",
+    "params": {},
+    "retryable": false,
+    "status": 401,
+    "visibility": "public"
+  },
+  "SYSTEM_AUTH_INVALID_CREDENTIALS": {
+    "code": "SYSTEM_AUTH_INVALID_CREDENTIALS",
+    "message_key": "errors.systemAuth.invalidCredentials",
+    "params": {},
+    "retryable": false,
+    "status": 401,
+    "visibility": "public"
+  },
+  "SYSTEM_AUTH_UNAVAILABLE": {
+    "code": "SYSTEM_AUTH_UNAVAILABLE",
+    "message_key": "errors.system.authUnavailable",
+    "params": {},
+    "retryable": false,
+    "status": 503,
+    "visibility": "public"
+  },
+  "SYSTEM_CONTROL_CONFLICT": {
+    "code": "SYSTEM_CONTROL_CONFLICT",
+    "message_key": "errors.system.controlConflict",
+    "params": {},
+    "retryable": false,
+    "status": 409,
+    "visibility": "public"
+  },
   "TEAM_AGENT_INACTIVE": {
     "code": "TEAM_AGENT_INACTIVE",
     "message_key": "errors.team.agentInactive",
@@ -3030,12 +3078,28 @@ export const BACKEND_ERROR_CONTRACT = {
     "status": 400,
     "visibility": "public"
   },
+  "TEMPORARY_PASSWORD_CHANGE_REQUIRED": {
+    "code": "TEMPORARY_PASSWORD_CHANGE_REQUIRED",
+    "message_key": "errors.auth.temporaryPasswordChangeRequired",
+    "params": {},
+    "retryable": false,
+    "status": 403,
+    "visibility": "public"
+  },
   "TENANT_KEY_REQUIRED": {
     "code": "TENANT_KEY_REQUIRED",
     "message_key": "errors.publicApi.tenantKeyRequired",
     "params": {},
     "retryable": false,
     "status": 403,
+    "visibility": "public"
+  },
+  "TENANT_LIFECYCLE_CHECK_FAILED": {
+    "code": "TENANT_LIFECYCLE_CHECK_FAILED",
+    "message_key": "errors.tenant.lifecycleCheckFailed",
+    "params": {},
+    "retryable": false,
+    "status": 503,
     "visibility": "public"
   },
   "TENANT_MISMATCH": {
@@ -3054,6 +3118,22 @@ export const BACKEND_ERROR_CONTRACT = {
     },
     "retryable": false,
     "status": 404,
+    "visibility": "public"
+  },
+  "TENANT_SUSPENDED": {
+    "code": "TENANT_SUSPENDED",
+    "message_key": "errors.tenant.suspended",
+    "params": {},
+    "retryable": false,
+    "status": 403,
+    "visibility": "public"
+  },
+  "TENANT_WORK_TERMINALIZED": {
+    "code": "TENANT_WORK_TERMINALIZED",
+    "message_key": "errors.tenant.workTerminalized",
+    "params": {},
+    "retryable": false,
+    "status": 409,
     "visibility": "public"
   },
   "TIMEOUT": {
@@ -3798,6 +3878,28 @@ export const BACKEND_EVENT_CONTRACT = {
     "requires_language_context": true,
     "visibility": "public"
   },
+  "system.auth.rejected": {
+    "event_code": "system.auth.rejected",
+    "legacy_event_type": null,
+    "message_key": null,
+    "params": {
+      "reason_code": "string"
+    },
+    "raw_source_allowed": false,
+    "requires_language_context": false,
+    "visibility": "internal"
+  },
+  "system.control.conflict": {
+    "event_code": "system.control.conflict",
+    "legacy_event_type": null,
+    "message_key": null,
+    "params": {
+      "action": "string"
+    },
+    "raw_source_allowed": false,
+    "requires_language_context": false,
+    "visibility": "internal"
+  },
   "team.blackboard.entry.skipped": {
     "event_code": "team.blackboard.entry.skipped",
     "legacy_event_type": "blackboard_entry_skipped",
@@ -3887,6 +3989,69 @@ export const BACKEND_EVENT_CONTRACT = {
     "raw_source_allowed": false,
     "requires_language_context": true,
     "visibility": "public"
+  },
+  "tenant.lifecycle.check.failed": {
+    "event_code": "tenant.lifecycle.check.failed",
+    "legacy_event_type": null,
+    "message_key": null,
+    "params": {
+      "correlation_id": "string",
+      "execution_kind": "string",
+      "tenant_id": "string"
+    },
+    "raw_source_allowed": false,
+    "requires_language_context": false,
+    "visibility": "internal"
+  },
+  "tenant.lifecycle.suspended": {
+    "event_code": "tenant.lifecycle.suspended",
+    "legacy_event_type": null,
+    "message_key": null,
+    "params": {
+      "correlation_id": "string",
+      "execution_kind": "string",
+      "tenant_id": "string"
+    },
+    "raw_source_allowed": false,
+    "requires_language_context": false,
+    "visibility": "internal"
+  },
+  "tenant.password.change.required": {
+    "event_code": "tenant.password.change.required",
+    "legacy_event_type": null,
+    "message_key": null,
+    "params": {
+      "tenant_id": "string"
+    },
+    "raw_source_allowed": false,
+    "requires_language_context": false,
+    "visibility": "internal"
+  },
+  "tenant.work.outcome.unknown": {
+    "event_code": "tenant.work.outcome.unknown",
+    "legacy_event_type": null,
+    "message_key": null,
+    "params": {
+      "correlation_id": "string",
+      "execution_kind": "string",
+      "tenant_id": "string"
+    },
+    "raw_source_allowed": false,
+    "requires_language_context": false,
+    "visibility": "internal"
+  },
+  "tenant.work.terminalized": {
+    "event_code": "tenant.work.terminalized",
+    "legacy_event_type": null,
+    "message_key": null,
+    "params": {
+      "execution_kind": "string",
+      "reason_code": "string",
+      "tenant_id": "string"
+    },
+    "raw_source_allowed": false,
+    "requires_language_context": false,
+    "visibility": "internal"
   },
   "trace.harness.model.decision": {
     "event_code": "trace.harness.model.decision",

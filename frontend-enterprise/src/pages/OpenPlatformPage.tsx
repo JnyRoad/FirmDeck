@@ -13,7 +13,8 @@ import { apiErrorMessage } from '@/lib/apiErrorMessages';
 import type { ComponentType, ReactNode, SVGProps } from 'react';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
-import { api, TENANT_ID } from '../api/client';
+import { createTenantClient } from '../api/tenant-client';
+import { useTenantSession } from '../contexts/TenantSessionContext';
 import { isGalleryEmployee, type EnterpriseAuthUser } from '../auth';
 import EmployeeAvatar from '../components/EmployeeAvatar';
 import IconAgents from '../assets/icons/nav-agents.svg?react';
@@ -47,9 +48,7 @@ import {
   type PlatformStat,
   type PlatformTabItem,
 } from '@/components/openPlatform';
-import { isTeamScope, readEmployeeScope } from '@/lib/agent-scope-storage';
-
-const ENTERPRISE_AGENT_STORAGE_KEY = 'ultrarag_enterprise_agent_scope';
+import { isTeamScope, persistSharedAgentScope, readEmployeeScope } from '@/lib/agent-scope-storage';
 
 type PlatformConfig = {
   kind: PlatformKind;
@@ -74,6 +73,16 @@ type PlatformItem = {
   tags: string[];
   agent?: AgentProfileRead;
 };
+
+type OpenPlatformTenantContext = NonNullable<ReturnType<typeof useTenantSession>>;
+
+/** Prevent stale tenant generations from publishing marketplace state or toasts. */
+function isCurrentTenantGeneration(
+  context: OpenPlatformTenantContext | null,
+  generation: number,
+): context is OpenPlatformTenantContext {
+  return Boolean(context && !context.signal.aborted && context.isCurrentGeneration(generation));
+}
 
 /** 构造开放广场页的语义文案与平台配置，避免 file-local locale copy 常量继续扩散。 */
 function buildOpenPlatformCopy(
@@ -456,6 +465,8 @@ export default function OpenPlatformPage({
   const copy = useOpenPlatformCopy();
   const navigate = useNavigate();
   const { kind } = useParams<{ kind?: PlatformKind }>();
+  const tenantContext = useTenantSession();
+  const tenantApi = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
   const platformConfigList = useMemo(() => platformConfigs(copy), [copy]);
   const platformByKind = useMemo(
     () => new Map(platformConfigList.map((item) => [item.kind, item])),
@@ -469,46 +480,63 @@ export default function OpenPlatformPage({
   const [tools, setTools] = useState<ToolRead[]>([]);
   const [loading, setLoading] = useState(false);
   const [deletingItemKey, setDeletingItemKey] = useState('');
-  const [agentId, setAgentId] = useState(readEmployeeScope);
+  const [agentId, setAgentId] = useState('');
   const [detailItem, setDetailItem] = useState<{ kind: PlatformKind; item: PlatformItem } | null>(null);
   const [confirmTarget, setConfirmTarget] = useState<{ kind: PlatformKind; item: PlatformItem } | null>(null);
   const [activeKind, setActiveKind] = useState<PlatformKind>('agents');
   const [searchText, setSearchText] = useState('');
 
   useEffect(() => {
+    if (!tenantContext) {
+      setAgentId('');
+      return undefined;
+    }
+    setAgentId(readEmployeeScope(tenantContext.tenantId, tenantContext.userId));
+    return undefined;
+  }, [tenantContext?.generation, tenantContext?.tenantId, tenantContext?.userId]);
+
+  useEffect(() => {
     const onScopeChange = (event: Event) => {
       const next = (event as CustomEvent<{ agentId?: string }>).detail?.agentId || '';
-      setAgentId(next && !isTeamScope(next) ? next : readEmployeeScope());
+      const scopedAgentId = tenantContext
+        ? readEmployeeScope(tenantContext.tenantId, tenantContext.userId)
+        : '';
+      setAgentId(next && !isTeamScope(next) ? next : scopedAgentId);
     };
     window.addEventListener('ultrarag-enterprise-agent-scope-change', onScopeChange);
     return () => window.removeEventListener('ultrarag-enterprise-agent-scope-change', onScopeChange);
-  }, []);
+  }, [tenantContext?.tenantId, tenantContext?.userId]);
 
   const loadPlatformData = useCallback(async () => {
+    const context = tenantContext;
+    if (!context) return;
+    const generation = context.generation;
     setLoading(true);
     try {
-      const agentRows = await api.get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${TENANT_ID}`);
+      const agentRows = await tenantApi.get<AgentProfileRead[]>('/api/enterprise/agents');
       const overall = agentRows.find((item) => item.is_overall);
-      const overallSuffix = overall ? `&agent_id=${encodeURIComponent(overall.id)}` : '';
+      const overallSuffix = overall ? `?agent_id=${encodeURIComponent(overall.id)}` : '';
       const [kbRows, generalRows, skillRows, toolRows] = await Promise.all([
-        api.get<KnowledgeBaseRead[]>(`/api/enterprise/knowledge-bases?tenant_id=${TENANT_ID}${overallSuffix}`),
-        api.get<GeneralSkillRead[]>(`/api/enterprise/general-skills?tenant_id=${TENANT_ID}${overallSuffix}`),
+        tenantApi.get<KnowledgeBaseRead[]>(`/api/enterprise/knowledge-bases${overallSuffix}`),
+        tenantApi.get<GeneralSkillRead[]>(`/api/enterprise/general-skills${overallSuffix}`),
         overall
-          ? api.get<SkillRead[]>(`/api/enterprise/agents/${overall.id}/skills?tenant_id=${TENANT_ID}`)
+          ? tenantApi.get<SkillRead[]>(`/api/enterprise/agents/${overall.id}/skills`)
           : Promise.resolve([]),
-        api.get<ToolRead[]>(`/api/enterprise/tools?tenant_id=${TENANT_ID}${overallSuffix}`),
+        tenantApi.get<ToolRead[]>(`/api/enterprise/tools${overallSuffix}`),
       ]);
+      if (!isCurrentTenantGeneration(context, generation)) return;
       setAgents(agentRows);
       setKnowledgeBases(kbRows);
       setGeneralSkills(generalRows);
       setSkills(skillRows);
       setTools(toolRows);
     } catch (error) {
+      if (!isCurrentTenantGeneration(context, generation)) return;
       notify.error(platformErrorMessage(error, copy.loadFailed));
     } finally {
-      setLoading(false);
+      if (isCurrentTenantGeneration(context, generation)) setLoading(false);
     }
-  }, [copy.loadFailed]);
+  }, [copy.loadFailed, tenantApi, tenantContext]);
 
   useEffect(() => {
     void loadPlatformData();
@@ -590,23 +618,28 @@ export default function OpenPlatformPage({
   }));
 
   function ensureTargetEmployee(): boolean {
+    if (!tenantContext) return false;
     if (!targetEmployee) {
       notify.warning(copy.selectEmployeeFirst);
       return false;
     }
     if (targetEmployee.id !== agentId) {
-      window.localStorage.setItem(ENTERPRISE_AGENT_STORAGE_KEY, targetEmployee.id);
+      persistSharedAgentScope(targetEmployee.id, tenantContext.tenantId, tenantContext.userId);
       window.dispatchEvent(new CustomEvent('ultrarag-enterprise-agent-scope-change', { detail: { agentId: targetEmployee.id } }));
       setAgentId(targetEmployee.id);
     }
     return true;
   }
 
-  async function markPlatformAgentUsed(agent: AgentProfileRead) {
+  async function markPlatformAgentUsed(agent: AgentProfileRead): Promise<boolean> {
+    const context = tenantContext;
+    if (!context) return false;
+    const requestGeneration = context.generation;
     const metadata = agent.metadata || {};
     if (metadata.used_by_current_user !== true && metadata.chat_used_by_current_user !== true) {
-      await api.post<AgentProfileRead>(`/api/chat/agents/${agent.id}/use?tenant_id=${TENANT_ID}`, {});
+      await tenantApi.post<AgentProfileRead>(`/api/chat/agents/${agent.id}/use`, {});
     }
+    if (!isCurrentTenantGeneration(context, requestGeneration)) return false;
     setAgents((current) => current.map((item) => (
       item.id === agent.id
         ? {
@@ -619,10 +652,11 @@ export default function OpenPlatformPage({
         }
         : item
     )));
-    window.localStorage.setItem(ENTERPRISE_AGENT_STORAGE_KEY, agent.id);
+    persistSharedAgentScope(agent.id, context.tenantId, context.userId);
     window.dispatchEvent(new Event('ultrarag-enterprise-agent-scope-refresh'));
     window.dispatchEvent(new CustomEvent('ultrarag-enterprise-agent-scope-change', { detail: { agentId: agent.id } }));
     setAgentId(agent.id);
+    return true;
   }
 
   async function usePlatformItem(platformKind: PlatformKind, itemId?: string) {
@@ -632,10 +666,15 @@ export default function OpenPlatformPage({
         notify.warning(copy.noAgent);
         return;
       }
+      const context = tenantContext;
+      if (!context) return;
+      const generation = context.generation;
       try {
-        await markPlatformAgentUsed(agent);
+        const used = await markPlatformAgentUsed(agent);
+        if (!used) return;
         navigate('/enterprise/dashboard');
       } catch (error) {
+        if (!isCurrentTenantGeneration(context, generation)) return;
         notify.error(platformErrorMessage(error, copy.useAgentFailed));
       }
       return;
@@ -654,29 +693,32 @@ export default function OpenPlatformPage({
 
   function platformDeleteUrl(platformKind: PlatformKind, item: PlatformItem): string {
     const resourceKey = encodeURIComponent(item.deleteKey || item.id);
-    const overallSuffix = overallAgent ? `&agent_id=${encodeURIComponent(overallAgent.id)}` : '';
-    if (platformKind === 'agents') return `/api/enterprise/agents/${resourceKey}?tenant_id=${TENANT_ID}`;
-    if (platformKind === 'knowledge') return `/api/enterprise/knowledge-bases/${resourceKey}?tenant_id=${TENANT_ID}${overallSuffix}`;
-    if (platformKind === 'general-skills') return `/api/enterprise/general-skills/${resourceKey}?tenant_id=${TENANT_ID}${overallSuffix}`;
-    if (platformKind === 'skills') return `/api/enterprise/skills/${resourceKey}?tenant_id=${TENANT_ID}${overallSuffix}`;
-    return `/api/enterprise/tools/${resourceKey}?tenant_id=${TENANT_ID}${overallSuffix}`;
+    const overallSuffix = overallAgent ? `?agent_id=${encodeURIComponent(overallAgent.id)}` : '';
+    if (platformKind === 'agents') return `/api/enterprise/agents/${resourceKey}`;
+    if (platformKind === 'knowledge') return `/api/enterprise/knowledge-bases/${resourceKey}${overallSuffix}`;
+    if (platformKind === 'general-skills') return `/api/enterprise/general-skills/${resourceKey}${overallSuffix}`;
+    if (platformKind === 'skills') return `/api/enterprise/skills/${resourceKey}${overallSuffix}`;
+    return `/api/enterprise/tools/${resourceKey}${overallSuffix}`;
   }
 
   async function runDelete() {
-    if (!confirmTarget) return;
+    const context = tenantContext;
+    if (!confirmTarget || !context) return;
+    const generation = context.generation;
     const { kind: platformKind, item } = confirmTarget;
     const key = platformItemDeleteKey(platformKind, item);
     setDeletingItemKey(key);
     try {
       if (platformKind === 'agents' && item.agent) {
-        await api.post<AgentProfileRead>(
-          `/api/enterprise/agents/${encodeURIComponent(item.agent.id)}/gallery:unpublish?tenant_id=${encodeURIComponent(TENANT_ID)}`,
+        await tenantApi.post<AgentProfileRead>(
+          `/api/enterprise/agents/${encodeURIComponent(item.agent.id)}/gallery:unpublish`,
           {},
         );
         window.dispatchEvent(new Event('ultrarag-enterprise-agent-scope-refresh'));
       } else {
-        await api.delete(platformDeleteUrl(platformKind, item));
+        await tenantApi.delete(platformDeleteUrl(platformKind, item));
       }
+      if (!isCurrentTenantGeneration(context, generation)) return;
       notify.success(platformKind === 'agents' ? copy.unpublishSuccess : copy.removeSuccess);
       setDetailItem((current) => (
         current && current.kind === platformKind && current.item.id === item.id ? null : current
@@ -684,9 +726,10 @@ export default function OpenPlatformPage({
       setConfirmTarget(null);
       await loadPlatformData();
     } catch (error) {
+      if (!isCurrentTenantGeneration(context, generation)) return;
       notify.error(platformErrorMessage(error, platformKind === 'agents' ? copy.unpublishFailed : copy.deleteFailed));
     } finally {
-      setDeletingItemKey('');
+      if (isCurrentTenantGeneration(context, generation)) setDeletingItemKey('');
     }
   }
 
@@ -836,7 +879,9 @@ export default function OpenPlatformPage({
               notify.error(copy.missingOverall);
               return;
             }
-            window.localStorage.setItem(ENTERPRISE_AGENT_STORAGE_KEY, overall.id);
+            if (tenantContext) {
+              persistSharedAgentScope(overall.id, tenantContext.tenantId, tenantContext.userId);
+            }
             window.dispatchEvent(new CustomEvent('ultrarag-enterprise-agent-scope-change', {
               detail: { agentId: overall.id },
             }));

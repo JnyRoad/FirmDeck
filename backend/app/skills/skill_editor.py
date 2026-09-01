@@ -22,6 +22,8 @@ from app.skills.skill_distiller import (
     _tool_resolution_warnings,
 )
 from app.skills.skill_reflection import (
+    ExecutionFence,
+    fenced_provider_call,
     reflect_skill_response,
     reflect_skill_response_stream,
     skill_status_event,
@@ -100,13 +102,20 @@ def _localized_skill_text(
 
 class SkillEditor:
     def rewrite(
-        self, request: SkillRewriteRequest, model_config: ModelConfig
+        self,
+        request: SkillRewriteRequest,
+        model_config: ModelConfig,
+        *,
+        execution_fence: ExecutionFence | None = None,
     ) -> SkillRewriteResponse:
         """Rewrite a Skill Card synchronously under one immutable request language snapshot."""
         request = self._with_language_context(request)
         client = LLMClient(skill_model_config(model_config))
         payload = self._payload(request)
-        raw = client.generate_json(PROMPT_PATH.read_text(encoding="utf-8"), payload)
+        raw = fenced_provider_call(
+            lambda: client.generate_json(PROMPT_PATH.read_text(encoding="utf-8"), payload),
+            execution_fence,
+        )
         response = self._normalize_response(raw, request)
         return reflect_skill_response(
             client=client,
@@ -118,10 +127,15 @@ class SkillEditor:
             tool_suggestions=response.tool_suggestions,
             normalize_response=lambda review_raw: self._normalize_response(review_raw, request),
             language_context=request.language_context,
+            execution_fence=execution_fence,
         )
 
     def stream_text(
-        self, request: SkillRewriteRequest, model_config: ModelConfig
+        self,
+        request: SkillRewriteRequest,
+        model_config: ModelConfig,
+        *,
+        execution_fence: ExecutionFence | None = None,
     ) -> Iterator[dict[str, object]]:
         """Yield rewrite progress and approved raw output with locale-bound status metadata."""
         request = self._with_language_context(request)
@@ -138,8 +152,14 @@ class SkillEditor:
                 ),
                 request.language_context,
             )
-            for chunk in client.generate_text_stream(prompt, payload):
-                chunks.append(chunk)
+            if execution_fence is not None:
+                execution_fence()
+            try:
+                for chunk in client.generate_text_stream(prompt, payload):
+                    chunks.append(chunk)
+            finally:
+                if execution_fence is not None:
+                    execution_fence()
             yield skill_status_event(
                 _localized_skill_text(
                     request.language_context,
@@ -160,19 +180,20 @@ class SkillEditor:
                     ),
                     request.language_context,
                 )
-                repair_text = client.generate_text(
-                    prompt,
-                    {
-                        **payload,
-                        "previous_output": "".join(chunks),
-                        # Keep the repair prompt deterministic; the raw provider/parser cause
-                        # remains available only in the private exception log above.
-                        "previous_error_code": "SKILL_REWRITE_OUTPUT_INVALID",
-                        "repair_instruction": (
-                            "请基于 current_skill、instruction 和 target_paths 修复上一次输出。"
-                            "只输出合法 JSON，可以使用 patches 做局部修改，或返回完整 draft_skill。"
-                        ),
-                    },
+                repair_payload = {
+                    **payload,
+                    "previous_output": "".join(chunks),
+                    # Keep the repair prompt deterministic; the raw provider/parser cause
+                    # remains available only in the private exception log above.
+                    "previous_error_code": "SKILL_REWRITE_OUTPUT_INVALID",
+                    "repair_instruction": (
+                        "请基于 current_skill、instruction 和 target_paths 修复上一次输出。"
+                        "只输出合法 JSON，可以使用 patches 做局部修改，或返回完整 draft_skill。"
+                    ),
+                }
+                repair_text = fenced_provider_call(
+                    lambda: client.generate_text(prompt, repair_payload),
+                    execution_fence,
                 )
                 response = self._response_from_text(repair_text, request)
             except (LLMError, json.JSONDecodeError, TypeError, ValueError):
@@ -220,6 +241,7 @@ class SkillEditor:
             tool_suggestions=response.tool_suggestions,
             normalize_response=lambda review_raw: self._normalize_response(review_raw, request),
             language_context=request.language_context,
+            execution_fence=execution_fence,
         )
         yield skill_status_event(
             _localized_skill_text(

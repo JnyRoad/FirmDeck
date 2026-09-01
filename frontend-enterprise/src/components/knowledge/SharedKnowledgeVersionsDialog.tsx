@@ -2,9 +2,10 @@
  * 共享知识库历史面板：管理全局版本生命周期，并按来源与权限变化复盘只追加审计事件。
  */
 
-import { useContext, useEffect, useMemo, useState } from 'react';
+import { useContext, useEffect, useMemo, useRef, useState } from 'react';
 
-import { api, TENANT_ID } from '@/api/client';
+import { createTenantClient } from '@/api/tenant-client';
+import { useTenantSession } from '@/contexts/TenantSessionContext';
 import {
   Dialog,
   DialogContent,
@@ -182,7 +183,6 @@ function formatAuditTime(
 function buildAuditQuery(offset: number, filters: AuditFilters) {
   /** 只发送已填写的审计筛选，并固定每页二十条。 */
   const params = new URLSearchParams({
-    tenant_id: TENANT_ID,
     offset: String(offset),
     limit: '20',
   });
@@ -203,6 +203,10 @@ export function SharedKnowledgeVersionsDialog({
 }: SharedKnowledgeVersionsDialogProps) {
   /** 管理一个共享库的全局草稿、发布、驳回与回滚生命周期。 */
   const { locale, t } = useSharedKnowledgeVersionsIntl();
+  const tenantContext = useTenantSession();
+  const tenantClient = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
+  const tenantId = tenantContext?.tenantId || '';
+  const requestControllerRef = useRef<AbortController | null>(null);
   const [versions, setVersions] = useState<KnowledgeBaseVersionRead[]>([]);
   const [selectedTeamId, setSelectedTeamId] = useState('');
   const [reason, setReason] = useState('');
@@ -252,7 +256,17 @@ export function SharedKnowledgeVersionsDialog({
   }, [auditPage.items]);
 
   useEffect(() => {
-    if (!open || !knowledgeBase) return;
+    requestControllerRef.current?.abort();
+    const controller = new AbortController();
+    requestControllerRef.current = controller;
+    return () => {
+      controller.abort();
+      if (requestControllerRef.current === controller) requestControllerRef.current = null;
+    };
+  }, [open, knowledgeBase?.id, tenantContext]);
+
+  useEffect(() => {
+    if (!open || !knowledgeBase || !tenantContext) return;
     setSelectedTeamId((current) => (
       teamOptions.some((team) => team.id === current) ? current : teamOptions[0]?.id || ''
     ));
@@ -263,10 +277,10 @@ export function SharedKnowledgeVersionsDialog({
     setAuditFilters(EMPTY_AUDIT_FILTERS);
     setAuditErrorMessage('');
     void loadVersions();
-  }, [open, knowledgeBase?.id, teamOptions.map((team) => team.id).join('|')]);
+  }, [open, knowledgeBase?.id, teamOptions.map((team) => team.id).join('|'), tenantClient, tenantContext, tenantId]);
 
   useEffect(() => {
-    if (!open || !knowledgeBase || activeView !== 'audit') return;
+    if (!open || !knowledgeBase || activeView !== 'audit' || !tenantContext) return;
     void loadAuditEvents(0, auditFilters, false);
   }, [
     open,
@@ -277,23 +291,33 @@ export function SharedKnowledgeVersionsDialog({
     auditFilters.actorType,
     auditFilters.actorId,
     auditFilters.versionId,
+    tenantClient,
+    tenantContext,
+    tenantId,
   ]);
 
   async function loadVersions() {
     /** 重新读取服务端正式指针和历史，避免继续使用冲突前的本地状态。 */
-    if (!knowledgeBase) return;
+    if (!knowledgeBase || !tenantContext) return;
+    const context = tenantContext;
+    const generation = context.generation;
+    const controller = requestControllerRef.current;
+    if (!controller) return;
     setLoading(true);
     try {
-      const rows = await api.get<KnowledgeBaseVersionRead[]>(
-        `/api/enterprise/knowledge-bases/${knowledgeBase.id}/versions?tenant_id=${TENANT_ID}`,
+      const rows = await tenantClient.get<KnowledgeBaseVersionRead[]>(
+        `/api/enterprise/knowledge-bases/${knowledgeBase.id}/versions?tenant_id=${tenantId}`,
+        { signal: controller.signal },
       );
+      if (controller.signal.aborted || !context.isCurrentGeneration(generation)) return;
       setVersions(rows);
     } catch (error) {
+      if (controller.signal.aborted || !context.isCurrentGeneration(generation)) return;
       const message = apiErrorMessage(error, 'sharedKnowledgeVersions.error.loadVersions', { t });
       setErrorMessage(message);
       notify.error(message);
     } finally {
-      setLoading(false);
+      if (!controller.signal.aborted && context.isCurrentGeneration(generation)) setLoading(false);
     }
   }
 
@@ -303,24 +327,31 @@ export function SharedKnowledgeVersionsDialog({
     append: boolean,
   ) {
     /** 按当前筛选读取审计页；追加模式用于加载更多且保留既有证据顺序。 */
-    if (!knowledgeBase) return;
+    if (!knowledgeBase || !tenantContext) return;
+    const context = tenantContext;
+    const generation = context.generation;
+    const controller = requestControllerRef.current;
+    if (!controller) return;
     setAuditLoading(true);
     setAuditErrorMessage('');
     try {
-      const page = await api.get<KnowledgeBaseAuditPageRead>(
+      const page = await tenantClient.get<KnowledgeBaseAuditPageRead>(
         `/api/enterprise/knowledge-bases/${knowledgeBase.id}/audit-events?${buildAuditQuery(offset, filters)}`,
+        { signal: controller.signal },
       );
+      if (controller.signal.aborted || !context.isCurrentGeneration(generation)) return;
       setAuditPage((current) => (
         append
           ? { ...page, items: [...current.items, ...page.items] }
           : page
       ));
     } catch (error) {
+      if (controller.signal.aborted || !context.isCurrentGeneration(generation)) return;
       const message = apiErrorMessage(error, 'sharedKnowledgeVersions.error.loadAudit', { t });
       setAuditErrorMessage(message);
       notify.error(message);
     } finally {
-      setAuditLoading(false);
+      if (!controller.signal.aborted && context.isCurrentGeneration(generation)) setAuditLoading(false);
     }
   }
 
@@ -340,16 +371,22 @@ export function SharedKnowledgeVersionsDialog({
     successMessage: string,
   ) {
     /** 串行执行生命周期动作；冲突时强制刷新正式指针后再让用户确认。 */
-    if (!knowledgeBase || !selectedTeamId || !reason.trim()) return;
+    if (!knowledgeBase || !selectedTeamId || !reason.trim() || !tenantContext) return;
+    const context = tenantContext;
+    const generation = context.generation;
+    const controller = requestControllerRef.current;
+    if (!controller) return;
     setActing(true);
     setErrorMessage('');
     try {
       await action();
+      if (controller.signal.aborted || !context.isCurrentGeneration(generation)) return;
       notify.success(successMessage);
       setReason('');
       await loadVersions();
       await onChanged?.();
     } catch (error) {
+      if (controller.signal.aborted || !context.isCurrentGeneration(generation)) return;
       const message = apiErrorMessage(error, 'sharedKnowledgeVersions.error.mutation', { t });
       setErrorMessage(message);
       notify.error(message);
@@ -357,7 +394,7 @@ export function SharedKnowledgeVersionsDialog({
         await loadVersions();
       }
     } finally {
-      setActing(false);
+      if (!controller.signal.aborted && context.isCurrentGeneration(generation)) setActing(false);
     }
   }
 
@@ -366,8 +403,8 @@ export function SharedKnowledgeVersionsDialog({
     if (!knowledgeBase) return;
     const expectedHead = publishedHead?.id || knowledgeBase.published_version_id;
     void runMutation(
-      () => api.post(`/api/enterprise/knowledge-bases/${knowledgeBase.id}/drafts`, {
-        tenant_id: TENANT_ID,
+      () => tenantClient.post(`/api/enterprise/knowledge-bases/${knowledgeBase.id}/drafts`, {
+        tenant_id: tenantId,
         team_id: selectedTeamId,
         change_reason: reason.trim(),
         expected_published_version_id: expectedHead,
@@ -380,10 +417,10 @@ export function SharedKnowledgeVersionsDialog({
     /** 以当前正式指针作为 CAS 预期值发布所选草稿。 */
     if (!knowledgeBase || !publishedHead) return;
     void runMutation(
-      () => api.post(
+      () => tenantClient.post(
         `/api/enterprise/knowledge-bases/${knowledgeBase.id}/versions/${version.id}/publish`,
         {
-          tenant_id: TENANT_ID,
+          tenant_id: tenantId,
           team_id: selectedTeamId,
           expected_published_version_id: publishedHead.id,
           change_reason: reason.trim(),
@@ -397,10 +434,10 @@ export function SharedKnowledgeVersionsDialog({
     /** 驳回草稿并保留历史快照。 */
     if (!knowledgeBase) return;
     void runMutation(
-      () => api.post(
+      () => tenantClient.post(
         `/api/enterprise/knowledge-bases/${knowledgeBase.id}/versions/${version.id}/reject`,
         {
-          tenant_id: TENANT_ID,
+          tenant_id: tenantId,
           team_id: selectedTeamId,
           change_reason: reason.trim(),
         },
@@ -413,8 +450,8 @@ export function SharedKnowledgeVersionsDialog({
     /** 只移动正式指针到历史发布快照，不删除任何后来版本。 */
     if (!knowledgeBase || !publishedHead) return;
     void runMutation(
-      () => api.post(`/api/enterprise/knowledge-bases/${knowledgeBase.id}/rollback`, {
-        tenant_id: TENANT_ID,
+      () => tenantClient.post(`/api/enterprise/knowledge-bases/${knowledgeBase.id}/rollback`, {
+        tenant_id: tenantId,
         team_id: selectedTeamId,
         target_version_id: version.id,
         expected_published_version_id: publishedHead.id,

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { createToastNotifier } from '@/components/ui/app-toast';
 import { getClientTimeZone } from '@/lib/timezone';
@@ -24,11 +24,12 @@ import { cn } from '@/lib/utils';
 import { useAppIntl } from '@/i18n';
 import { backendErrorMessageDescriptor } from '@/lib/apiErrorMessages';
 
-import { api, TENANT_ID } from '../../api/client';
+import { createTenantClient } from '../../api/tenant-client';
 import IconArrowRight from '../../assets/icons/arrow-right.svg?react';
 import IconAlarm from '../../assets/icons/profile-alarm.svg?react';
 import type { EnterpriseAuthUser } from '../../auth';
-import { isTeamScope, readEmployeeScope } from '../../lib/agent-scope-storage';
+import { useTenantSession } from '../../contexts/TenantSessionContext';
+import { isTeamScope, persistSharedAgentScope, readEmployeeScope } from '../../lib/agent-scope-storage';
 import type { ScheduledTaskRead, SkillRead } from '../../types';
 import {
   INITIAL_VALUES,
@@ -71,16 +72,26 @@ function editorErrorDescriptor(error: unknown, fallbackId: MessageId): MessageDe
 }
 
 /** 加载并保存定时任务编辑表单，同时将产品界面文案交给当前 locale 的 runtime。 */
-function ScheduledTaskEditorPage({
+export default function ScheduledTaskEditorPage({
   mode,
   currentUser,
   onLogout,
 }: { mode: 'new' | 'edit' } & ScheduledTaskPageProps) {
+  const tenantContext = useTenantSession();
+  const tenantClient = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
+  const tenantId = tenantContext?.tenantId || '';
+  const userId = tenantContext?.userId || '';
+  const tenantScopeKey = tenantContext
+    ? `${tenantId}:${userId}:${tenantContext.generation}`
+    : '';
+  const scopeKeyRef = useRef('');
+  const establishedScopeRef = useRef(false);
+  const [scopeReady, setScopeReady] = useState(false);
   const [values, setValues] = useState<TaskFormValues>(INITIAL_VALUES);
   const [errors, setErrors] = useState<FormErrors>({});
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
-  const [agentId, setAgentId] = useState(readEmployeeScope);
+  const [agentId, setAgentId] = useState('');
   const [sops, setSops] = useState<SkillRead[]>([]);
   const [taskMetadata, setTaskMetadata] = useState<Record<string, unknown>>({});
   const navigate = useNavigate();
@@ -88,12 +99,54 @@ function ScheduledTaskEditorPage({
   const { locale, t: translate } = useAppIntl();
   const toast = useMemo(() => createToastNotifier({ t: translate }), [translate]);
   const isEdit = mode === 'edit';
+  const routeIdentity = `${isEdit ? 'edit' : 'new'}:${taskId || ''}`;
+  const agentIdRef = useRef('');
+  const scopeRevisionRef = useRef(0);
+  const actionControllersRef = useRef(new Set<AbortController>());
+  const taskIdRef = useRef(taskId || '');
+  const routeIdentityRef = useRef(routeIdentity);
+  const lastRouteIdentityRef = useRef(routeIdentity);
+  const routeRevisionRef = useRef(0);
   const scheduleType = values.schedule_type;
   const localizedWeekdayOptions = weekdayOptions({ locale, t: translate });
   const pinnedSopVersion =
     typeof taskMetadata.sop_version === 'string' && taskMetadata.sop_version
       ? taskMetadata.sop_version
       : undefined;
+  const tenantScopeTransition = establishedScopeRef.current && scopeKeyRef.current !== tenantScopeKey;
+
+  // Keep route and employee identity current before passive effects run so late callbacks
+  // cannot publish into a newly mounted task editor.
+  agentIdRef.current = agentId;
+  taskIdRef.current = taskId || '';
+  routeIdentityRef.current = routeIdentity;
+
+  /** Abort editor actions when tenant/employee scope or the task route changes. */
+  function cancelActionControllers() {
+    actionControllersRef.current.forEach((controller) => controller.abort());
+    actionControllersRef.current.clear();
+  }
+
+  /** Advance the employee scope revision synchronously and clear stale request busy state. */
+  function updateAgentScope(nextAgentId: string) {
+    agentIdRef.current = nextAgentId;
+    scopeRevisionRef.current += 1;
+    cancelActionControllers();
+    setAgentId(nextAgentId);
+    setLoading(false);
+    setSaving(false);
+  }
+
+  useEffect(() => {
+    if (lastRouteIdentityRef.current === routeIdentity) return;
+    lastRouteIdentityRef.current = routeIdentity;
+    routeRevisionRef.current += 1;
+    cancelActionControllers();
+    setSaving(false);
+    setLoading(false);
+  }, [routeIdentity]);
+
+  useEffect(() => () => cancelActionControllers(), [tenantContext?.generation]);
 
   /** 更新表单字段；调用方负责提供与字段键匹配的值。 */
   function update<K extends keyof TaskFormValues>(key: K, value: TaskFormValues[K]) {
@@ -101,53 +154,129 @@ function ScheduledTaskEditorPage({
   }
 
   useEffect(() => {
+    if (!tenantContext || !tenantId || !userId) {
+      scopeKeyRef.current = '';
+      establishedScopeRef.current = false;
+      agentIdRef.current = '';
+      scopeRevisionRef.current += 1;
+      cancelActionControllers();
+      setScopeReady(false);
+      setAgentId('');
+      setValues(INITIAL_VALUES);
+      setErrors({});
+      setSops([]);
+      setTaskMetadata({});
+      setLoading(false);
+      setSaving(false);
+      return;
+    }
+    const scopeChanged = scopeKeyRef.current !== tenantScopeKey;
+    scopeKeyRef.current = tenantScopeKey;
+    establishedScopeRef.current = true;
+    const nextAgentId = readEmployeeScope(tenantId, userId);
+    agentIdRef.current = nextAgentId;
+    scopeRevisionRef.current += 1;
+    cancelActionControllers();
+    setAgentId(nextAgentId);
+    setScopeReady(true);
+    if (scopeChanged) {
+      setValues(INITIAL_VALUES);
+      setErrors({});
+      setSops([]);
+      setTaskMetadata({});
+      setLoading(false);
+      setSaving(false);
+    }
+  }, [tenantContext, tenantId, tenantScopeKey, userId]);
+
+  useEffect(() => {
     const onScopeChange = (event: Event) => {
       const next = (event as CustomEvent<{ agentId?: string }>).detail?.agentId || '';
-      setAgentId(next && !isTeamScope(next) ? next : readEmployeeScope());
+      if (!tenantContext || !tenantId || !userId || scopeKeyRef.current !== tenantScopeKey) return;
+      updateAgentScope(next && !isTeamScope(next) ? next : readEmployeeScope(tenantId, userId));
     };
     window.addEventListener('ultrarag-enterprise-agent-scope-change', onScopeChange);
     return () => window.removeEventListener('ultrarag-enterprise-agent-scope-change', onScopeChange);
-  }, []);
+  }, [tenantContext, tenantId, tenantScopeKey, userId]);
 
   useEffect(() => {
+    if (tenantScopeTransition || !tenantContext || !tenantId || !userId || !scopeReady || scopeKeyRef.current !== tenantScopeKey) return;
     if (!isEdit) {
       setValues(INITIAL_VALUES);
       return;
     }
     if (!taskId) return;
+    const requestController = new AbortController();
+    const generation = tenantContext.generation;
+    const capturedAgentId = agentId;
+    const capturedScopeRevision = scopeRevisionRef.current;
+    const capturedTaskId = taskId || '';
+    const capturedRouteIdentity = routeIdentity;
+    const capturedRouteRevision = routeRevisionRef.current;
+    const isCurrent = () => (
+      !requestController.signal.aborted
+      && tenantContext.isCurrentGeneration(generation)
+      && scopeKeyRef.current === tenantScopeKey
+      && agentIdRef.current === capturedAgentId
+      && scopeRevisionRef.current === capturedScopeRevision
+      && taskIdRef.current === capturedTaskId
+      && routeIdentityRef.current === capturedRouteIdentity
+      && routeRevisionRef.current === capturedRouteRevision
+    );
     setLoading(true);
-    api
-      .get<ScheduledTaskRead>(`/api/enterprise/scheduled-tasks/${taskId}?tenant_id=${TENANT_ID}`)
+    tenantClient
+      .get<ScheduledTaskRead>(`/api/enterprise/scheduled-tasks/${taskId}`, { signal: requestController.signal })
       .then((row) => {
-        setAgentId(row.agent_id);
+        if (!isCurrent()) return;
+        if (row.tenant_id && row.tenant_id !== tenantId) return;
+        if (row.agent_id !== agentIdRef.current) updateAgentScope(row.agent_id);
+        else setAgentId(row.agent_id);
+        persistSharedAgentScope(row.agent_id, tenantId, userId);
         setTaskMetadata(row.metadata || {});
         setValues(taskToFormValues(row));
       })
-      .catch((error) => toast.error(editorErrorDescriptor(error, 'scheduledTasksPage.editor.toast.loadFailed')))
-      .finally(() => setLoading(false));
-  }, [isEdit, taskId, toast]);
+      .catch((error) => {
+        if (isCurrent()) toast.error(editorErrorDescriptor(error, 'scheduledTasksPage.editor.toast.loadFailed'));
+      })
+      .finally(() => {
+        if (isCurrent()) setLoading(false);
+      });
+    return () => requestController.abort();
+  }, [isEdit, scopeReady, taskId, tenantClient, tenantContext, tenantId, tenantScopeKey, tenantScopeTransition, toast, userId]);
 
   useEffect(() => {
+    if (tenantScopeTransition || !tenantContext || !tenantId || !userId || !scopeReady || scopeKeyRef.current !== tenantScopeKey) return;
     if (!agentId) {
       setSops([]);
       return;
     }
-    let cancelled = false;
-    api
+    const requestController = new AbortController();
+    const generation = tenantContext.generation;
+    const capturedAgentId = agentId;
+    const capturedScopeRevision = scopeRevisionRef.current;
+    const isCurrent = () => (
+      !requestController.signal.aborted
+      && tenantContext.isCurrentGeneration(generation)
+      && scopeKeyRef.current === tenantScopeKey
+      && agentIdRef.current === capturedAgentId
+      && scopeRevisionRef.current === capturedScopeRevision
+    );
+    tenantClient
       .get<SkillRead[]>(
-        `/api/enterprise/skills?tenant_id=${TENANT_ID}&agent_id=${encodeURIComponent(agentId)}`,
+        `/api/enterprise/skills?agent_id=${encodeURIComponent(agentId)}`,
+        { signal: requestController.signal },
       )
       .then((rows) => {
-        if (cancelled) return;
+        if (!isCurrent()) return;
         setSops(scheduledTaskSopOptions(rows));
       })
       .catch(() => {
-        if (!cancelled) setSops([]);
+        if (isCurrent()) setSops([]);
       });
     return () => {
-      cancelled = true;
+      requestController.abort();
     };
-  }, [agentId]);
+  }, [agentId, scopeReady, tenantClient, tenantContext, tenantId, tenantScopeKey, tenantScopeTransition, userId]);
 
   /** 校验必填排程字段并返回表单是否可提交，副作用是更新字段错误状态。 */
   function validate(): boolean {
@@ -174,6 +303,7 @@ function ScheduledTaskEditorPage({
 
   /** 将已校验表单提交到后端，失败时只通过稳定错误 descriptor 呈现公共信息。 */
   async function save() {
+    if (!tenantContext || !tenantId || !userId || !scopeReady || scopeKeyRef.current !== tenantScopeKey) return;
     if (!validate()) return;
     if (!agentId) {
       toast.error(createMessageDescriptor('scheduledTasksPage.editor.validation.agentRequired'));
@@ -194,7 +324,6 @@ function ScheduledTaskEditorPage({
       delete metadata.sop_version;
     }
     const payload = {
-      tenant_id: TENANT_ID,
       agent_id: agentId,
       title: values.title.trim(),
       prompt: values.prompt.trim(),
@@ -208,12 +337,35 @@ function ScheduledTaskEditorPage({
       max_runs: values.max_runs || undefined,
       metadata,
     };
+    const requestController = new AbortController();
+    actionControllersRef.current.add(requestController);
+    const generation = tenantContext.generation;
+    const capturedAgentId = agentId;
+    const capturedScopeRevision = scopeRevisionRef.current;
+    const capturedTaskId = taskId || '';
+    const capturedRouteIdentity = routeIdentity;
+    const capturedRouteRevision = routeRevisionRef.current;
+    const isCurrent = () => (
+      !requestController.signal.aborted
+      && tenantContext.isCurrentGeneration(generation)
+      && scopeKeyRef.current === tenantScopeKey
+      && agentIdRef.current === capturedAgentId
+      && scopeRevisionRef.current === capturedScopeRevision
+      && taskIdRef.current === capturedTaskId
+      && routeIdentityRef.current === capturedRouteIdentity
+      && routeRevisionRef.current === capturedRouteRevision
+    );
     setSaving(true);
     try {
       const saved =
         isEdit && taskId
-          ? await api.put<ScheduledTaskRead>(`/api/enterprise/scheduled-tasks/${taskId}`, payload)
-          : await api.post<ScheduledTaskRead>('/api/enterprise/scheduled-tasks', payload);
+          ? await tenantClient.put<ScheduledTaskRead>(`/api/enterprise/scheduled-tasks/${taskId}`, payload, {
+            signal: requestController.signal,
+          })
+          : await tenantClient.post<ScheduledTaskRead>('/api/enterprise/scheduled-tasks', payload, {
+            signal: requestController.signal,
+          });
+      if (!isCurrent()) return;
       toast.success(createMessageDescriptor('scheduledTasksPage.editor.toast.saved'));
       if (!isEdit) {
         navigate(`/enterprise/scheduled-tasks/${saved.id}/edit`, { replace: true });
@@ -222,9 +374,10 @@ function ScheduledTaskEditorPage({
         setValues(taskToFormValues(saved));
       }
     } catch (error) {
-      toast.error(editorErrorDescriptor(error, 'scheduledTasksPage.editor.toast.saveFailed'));
+      if (isCurrent()) toast.error(editorErrorDescriptor(error, 'scheduledTasksPage.editor.toast.saveFailed'));
     } finally {
-      setSaving(false);
+      if (isCurrent()) setSaving(false);
+      actionControllersRef.current.delete(requestController);
     }
   }
 
@@ -236,6 +389,10 @@ function ScheduledTaskEditorPage({
         : prev.weekdays.filter((item) => item !== day);
       return { ...prev, weekdays: next.sort((a, b) => a - b) };
     });
+  }
+
+  if (tenantScopeTransition) {
+    return <div className="min-h-full" aria-busy="true" />;
   }
 
   return (

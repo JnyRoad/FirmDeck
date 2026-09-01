@@ -4,9 +4,11 @@ import hashlib
 import json
 import logging
 import time
+from collections.abc import Callable
 from copy import deepcopy
 from typing import Any
 
+from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import select
 
@@ -61,18 +63,27 @@ from app.core.task_request_compiler import (
 from app.core.turn_planner import TurnPlanner, turn_plan_router_decision
 from app.db.models import (
     ChatSession,
+    HarnessAgentLoopRecord,
     HarnessRunRecord,
     HarnessTaskFrameRecord,
     HarnessTurnRecord,
     Message,
     Skill,
     Team,
+    utc_now,
 )
 from app.i18n.language_context import LanguageContext
 from app.knowledge.access import KnowledgeAccessService
 from app.knowledge.citations import compact_knowledge_citation_labels
 from app.llm.prompts.language import localized_compat_text
 from app.memory.service import memory_read
+from app.security.tenant import (
+    TenantExecutionKind,
+    TenantLifecycleDecision,
+    TenantLifecycleDenied,
+    require_active_tenant,
+    require_matching_admission_version,
+)
 from app.session.helpers import public_session
 from app.session.session_schema import (
     ChatTurnRequest,
@@ -264,28 +275,77 @@ class HarnessV2Engine:
         self.slash_command: SlashCommandSelection | None = None
         self.turn_knowledge_versions: dict[str, str] | None = None
         self.language_context: LanguageContext | None = None
+        self.tenant_admission: TenantLifecycleDecision | None = None
+        self.lifecycle_denial: TenantLifecycleDenied | None = None
         self._session_lock: Any | None = None
         self._session_lock_id: str | None = None
+        self.wake_admission_check: Callable[[], None] | None = None
 
-    def run(self, request: ChatTurnRequest) -> ChatTurnResponse:
+    def run(
+        self,
+        request: ChatTurnRequest,
+        *,
+        wake_admission_check: Callable[[], None] | None = None,
+    ) -> ChatTurnResponse:
         """执行一轮对话，并在任何规划或能力调用前冻结该轮可读知识版本。"""
+        self.wake_admission_check = wake_admission_check
+        self.turn_store.admission_check = wake_admission_check
+        self._require_wake_admission()
         session_request = _with_recoverable_first_session(request)
+        # Reject before get-or-create so a suspended tenant cannot even create a
+        # new chat session or execution lease for a denied turn.
+        self.tenant_admission = self._optional_tenant_admission(
+            tenant_id=request.tenant_id,
+            correlation_id=(
+                str(request.client_turn_id or "").strip()
+                or session_request.session_id
+                or "harness-admission"
+            ),
+        )
         if session_request.session_id:
             self._session_lock_id = session_request.session_id
             self._session_lock = acquire_harness_session(
                 session_request.session_id
             )
+        self._require_wake_admission()
         session = self._get_or_create_session(session_request)
         self.session = session
+        self._require_wake_admission()
         self.language_context = request.language_context
         if self._session_lock is None:
             self._session_lock_id = session.id
             self._session_lock = acquire_harness_session(session.id)
+        self._require_wake_admission()
         self.session_lease = self.session_leases.acquire(session)
+        self._require_wake_admission()
         turn_claim = self.turn_store.claim(session, request)
+        self._require_wake_admission()
         self.turn_record = turn_claim.record
         if turn_claim.replay is not None:
+            # Replay lookup may have opened a read transaction before a concurrent
+            # lifecycle transition; require a fresh authoritative admission snapshot.
+            self.db.rollback()
+            self._require_current_tenant_admission(
+                persisted_version=(
+                    self.turn_record.tenant_lifecycle_version
+                    if self.turn_record is not None
+                    else None
+                ),
+                correlation_id=session.id,
+            )
             return turn_claim.replay
+        self.tenant_admission = self._optional_tenant_admission(
+            tenant_id=request.tenant_id,
+            correlation_id=(
+                str(request.client_turn_id or "").strip() or session.id
+            ),
+            persisted_version=(
+                self.turn_record.tenant_lifecycle_version
+                if self.turn_record is not None
+                else None
+            ),
+        )
+        self._require_current_tenant_admission(correlation_id=session.id)
         self.turn_knowledge_versions = self._freeze_turn_knowledge_versions(
             request.tenant_id,
             session,
@@ -380,9 +440,11 @@ class HarnessV2Engine:
                     "execution_engine": "harness_v2",
                 },
             )
+        self._require_wake_admission()
         self.db.commit()
         self.db.refresh(session)
         self._raise_if_cancelled(request, session)
+        self._require_current_tenant_admission(correlation_id=session.id)
         conversation_context = self.owner._conversation_context(
             session, model_config=model_config
         )
@@ -427,9 +489,11 @@ class HarnessV2Engine:
                 interaction_mode=request.interaction_mode,
                 team_context=team_context,
                 language_context=request.language_context,
+                admission_check=wake_admission_check,
             )
         self._renew_session_lease()
         self._raise_if_cancelled(request, session)
+        self._require_current_tenant_admission(correlation_id=session.id)
         slot_hydration = SlotHydrationPolicy.hydrate_plan(
             session,
             plan,
@@ -499,6 +563,7 @@ class HarnessV2Engine:
                 }
             )
         if plan.decision == "complete_task":
+            self._require_wake_admission()
             active_task_frame_id = self.store.active_task_frame_id(session)
             self.store.complete_active_frame(
                 session,
@@ -513,6 +578,7 @@ class HarnessV2Engine:
                 )
             ):
                 self.owner.runtime.complete_current_skill(session)
+            self._require_wake_admission()
             self.events.record_legacy_event(
                 request.tenant_id,
                 session.id,
@@ -525,6 +591,7 @@ class HarnessV2Engine:
             )
 
         pre_turn_state = _session_state(session)
+        self._require_wake_admission()
         records = self.store.persist_plan(
             session,
             user_message.id,
@@ -540,6 +607,7 @@ class HarnessV2Engine:
         )
         records = _dependency_order(records)
         known_record_ids = {row.task_id for row in records}
+        self._require_wake_admission()
         self.db.commit()
         self.db.refresh(session)
 
@@ -572,6 +640,7 @@ class HarnessV2Engine:
                         "execution_engine": "harness_v2",
                     },
                 )
+                self._require_wake_admission()
                 self.db.commit()
                 break
             self._raise_if_cancelled(request, session)
@@ -638,6 +707,7 @@ class HarnessV2Engine:
                     slots=dict(row.slots_json or {}),
                     result=failed.model_dump(mode="json"),
                 )
+                self._require_wake_admission()
                 execution_results.append(failed)
                 execution_payloads.append(
                     _response_task_payload(
@@ -707,9 +777,12 @@ class HarnessV2Engine:
             pre_turn_state,
         )
         self.store.project_session(session)
+        self._require_wake_admission()
         self.db.commit()
         self.db.refresh(session)
         self._raise_if_cancelled(request, session)
+        self._require_current_tenant_admission(correlation_id=session.id)
+        self._require_wake_admission()
         citations = _globalize_citations(execution_results)
         for payload, result in zip(
             execution_payloads,
@@ -750,6 +823,13 @@ class HarnessV2Engine:
                     streamed_reply += chunk
                     self.owner.stream_sink.on_delta(chunk)
         elif reply is None:
+            # Response-skill/persona preparation can race a lifecycle transition. Fence the exact
+            # provider call, not only the earlier frame/session setup.
+            self._require_current_tenant_admission(
+                persisted_version=self.turn_record.tenant_lifecycle_version,
+                correlation_id=session.id,
+            )
+            self._require_wake_admission()
             response_args = (
                 execution_request.message,
                 session,
@@ -778,6 +858,7 @@ class HarnessV2Engine:
                     *response_args,
                     language_context=request.language_context,
                 )
+            self._require_wake_admission()
         elif self.owner.stream_sink is not None:
             for chunk in self.owner.response_generator.chunk_text(reply):
                 streamed_reply += chunk
@@ -809,6 +890,8 @@ class HarnessV2Engine:
         # Cancellation and normal projection compete for this durable receipt.
         # Only the winner may append a terminal assistant message.
         self._raise_if_cancelled(request, session)
+        self._require_current_tenant_admission(correlation_id=session.id)
+        self._require_wake_admission()
         if self.owner.stream_sink is not None:
             # Reserve a deferred outbox row before projection.  The provider
             # terminal frame is sent only after the assistant message and turn
@@ -816,6 +899,7 @@ class HarnessV2Engine:
             self.owner.stream_delivery_succeeded = False
             self.owner.stream_delivery_pending = True
         self.turn_store.begin_completion(self.turn_record)
+        self._require_wake_admission()
         reply = self.owner._finalize_turn(
             session,
             request.tenant_id,
@@ -825,6 +909,7 @@ class HarnessV2Engine:
             user_message_id=user_message.id,
             assistant_metadata_override=assistant_metadata,
         )
+        self._require_wake_admission()
         if self.owner.stream_sink is not None:
             self.owner._prepare_stream_delivery(reply, streamed_reply)
         response = ChatTurnResponse(
@@ -835,12 +920,14 @@ class HarnessV2Engine:
             tool_result=None,
             session_state=public_session(session),
         )
+        self._require_wake_admission()
         self.turn_store.complete(self.turn_record, response)
         self.db.commit()
         self.db.refresh(session)
         if self.owner.stream_sink is not None:
             self.owner._complete_stream_delivery()
         if request.message_visibility == "visible":
+            self._require_wake_admission()
             self.owner._enqueue_memory_capture(
                 request,
                 session,
@@ -865,6 +952,13 @@ class HarnessV2Engine:
         self,
         request: ChatTurnRequest,
     ) -> ChatSession:
+        wake_admission_check = getattr(self, "wake_admission_check", None)
+        if callable(wake_admission_check):
+            return get_or_create_harness_session(
+                self.owner,
+                request,
+                admission_check=wake_admission_check,
+            )
         return get_or_create_harness_session(self.owner, request)
 
     def _freeze_turn_knowledge_versions(
@@ -886,8 +980,13 @@ class HarnessV2Engine:
         }
 
     def _renew_session_lease(self) -> None:
+        # Lease renewal is itself a durable write.  A team wake that lost its
+        # owner/heartbeat must not keep extending a Harness turn while its
+        # enclosing worker is already orphaned.
+        self._require_wake_admission()
         self.session_leases.renew(self.session_lease)
         self.turn_store.renew(self.turn_record)
+        self._require_wake_admission()
         self.db.commit()
 
     def _renew_execution_leases(
@@ -901,6 +1000,7 @@ class HarnessV2Engine:
                 "Harness TaskFrame lease token is missing."
             )
         try:
+            self._require_wake_admission()
             self.session_leases.renew(self.session_lease)
             self.turn_store.renew(self.turn_record)
             self.store.renew_running_lease(
@@ -910,7 +1010,220 @@ class HarnessV2Engine:
             )
         except (HarnessSessionLeaseLost, TaskFrameClaimConflict) as exc:
             raise HarnessExecutionFenced(str(exc)) from exc
+        self._require_wake_admission()
         self.db.commit()
+
+    def _optional_tenant_admission(
+        self,
+        *,
+        tenant_id: str,
+        correlation_id: str,
+        persisted_version: object | None = None,
+    ) -> TenantLifecycleDecision | None:
+        """Admit a Harness boundary through the authoritative Tenant lifecycle."""
+        decision = require_active_tenant(
+            self.db,
+            tenant_id,
+            TenantExecutionKind.JOB_CLAIM,
+            correlation_id,
+        )
+        if persisted_version is not None:
+            require_matching_admission_version(decision, persisted_version)
+        return decision
+
+    def _require_wake_admission(self) -> None:
+        """Fail closed when the enclosing team wake lost its heartbeat/claim."""
+        check = getattr(self, "wake_admission_check", None)
+        if callable(check):
+            check()
+
+    def _require_current_tenant_admission(
+        self,
+        *,
+        persisted_version: object | None = None,
+        correlation_id: str | None = None,
+    ) -> TenantLifecycleDecision | None:
+        """Recheck active status and the original turn generation before side effects."""
+        self._require_wake_admission()
+        admitted = self.tenant_admission
+        if admitted is None:
+            return None
+        current = self._optional_tenant_admission(
+            tenant_id=admitted.tenant_id,
+            correlation_id=(
+                correlation_id
+                or self.active_run_id
+                or self.active_frame_id
+                or self.user_message_id
+                or self.session.id
+                if self.session is not None
+                else correlation_id or admitted.correlation_id
+            ),
+            persisted_version=(
+                persisted_version
+                if persisted_version is not None
+                else admitted.lifecycle_version
+            ),
+        )
+        if current is not None:
+            require_matching_admission_version(current, admitted.lifecycle_version)
+        return current
+
+    def _terminalize_lifecycle_frame(
+        self,
+        row: HarnessTaskFrameRecord,
+        code: str,
+    ) -> None:
+        """Persist a pre-model lifecycle denial as a terminal frame without AgentLoop creation."""
+        now = utc_now()
+        reason = {
+            "code": code,
+            "message": code,
+            "retryable": False,
+            "outcome_unknown": False,
+        }
+        row.status = "failed"
+        row.result_json = {
+            "task_frame_id": row.task_id,
+            "status": "failed",
+            "task_summary": code,
+            "error": reason,
+        }
+        row.error_json = dict(reason)
+        row.lease_owner = None
+        row.lease_expires_at = None
+        row.updated_at = now
+        row.state_version = max(1, int(row.state_version or 0) + 1)
+        self.db.add(row)
+        self.db.commit()
+
+    def mark_lifecycle_denied(self, code: str) -> None:
+        """Terminalize a stale Harness attempt without requeueing executable work."""
+        self.db.rollback()
+        now = utc_now()
+        reason = {
+            "code": code,
+            "message": code,
+            "retryable": False,
+            "outcome_unknown": True,
+        }
+        expected_owner = str(self.active_frame_lease_owner or "").strip()
+        expected_attempt = self.active_frame_attempt_no
+        attempt_owned = True
+        if self.active_run_id:
+            run = self.db.get(HarnessRunRecord, self.active_run_id)
+            if run is not None and run.status == "running":
+                if not expected_owner or expected_attempt is None:
+                    attempt_owned = False
+                else:
+                    result = self.db.exec(
+                        update(HarnessRunRecord)
+                        .where(
+                            HarnessRunRecord.id == run.id,
+                            HarnessRunRecord.status == "running",
+                            HarnessRunRecord.lease_owner == expected_owner,
+                            HarnessRunRecord.attempt_no == int(expected_attempt),
+                            HarnessRunRecord.lease_expires_at > now,
+                            *(
+                                [
+                                    HarnessRunRecord.task_frame_record_id
+                                    == self.active_frame_id
+                                ]
+                                if self.active_frame_id
+                                else []
+                            ),
+                        )
+                        .values(
+                            status="abandoned",
+                            result_json={
+                                "status": "abandoned",
+                                "task_summary": code,
+                                "error": dict(reason),
+                            },
+                            finished_at=now,
+                            updated_at=now,
+                            lease_owner=None,
+                            lease_expires_at=None,
+                        )
+                    )
+                    attempt_owned = getattr(result, "rowcount", 0) == 1
+        if self.active_frame_id:
+            row = self.db.get(HarnessTaskFrameRecord, self.active_frame_id)
+            if row is not None and row.status == "running":
+                if not expected_owner or expected_attempt is None:
+                    attempt_owned = False
+                else:
+                    result = self.db.exec(
+                        update(HarnessTaskFrameRecord)
+                        .where(
+                            HarnessTaskFrameRecord.id == row.id,
+                            HarnessTaskFrameRecord.status == "running",
+                            HarnessTaskFrameRecord.lease_owner == expected_owner,
+                            HarnessTaskFrameRecord.attempt_no == int(expected_attempt),
+                            HarnessTaskFrameRecord.lease_expires_at > now,
+                        )
+                        .values(
+                            status="failed",
+                            result_json={
+                                "task_frame_id": row.task_id,
+                                "status": "failed",
+                                "task_summary": code,
+                                "error": dict(reason),
+                            },
+                            error_json=dict(reason),
+                            lease_owner=None,
+                            lease_expires_at=None,
+                            updated_at=now,
+                            state_version=HarnessTaskFrameRecord.state_version + 1,
+                        )
+                    )
+                    if getattr(result, "rowcount", 0) != 1:
+                        attempt_owned = False
+                    elif row.agent_loop_id:
+                        loop = self.db.get(HarnessAgentLoopRecord, row.agent_loop_id)
+                        if loop is not None and loop.status not in {
+                            "completed",
+                            "cancelled",
+                            "failed",
+                        }:
+                            self.db.exec(
+                                update(HarnessAgentLoopRecord)
+                                .where(
+                                    HarnessAgentLoopRecord.id == loop.id,
+                                    HarnessAgentLoopRecord.owner_task_frame_record_id
+                                    == row.id,
+                                    HarnessAgentLoopRecord.state_version
+                                    == int(loop.state_version or 0),
+                                )
+                                .values(
+                                    status="suspended",
+                                    updated_at=now,
+                                    state_version=HarnessAgentLoopRecord.state_version
+                                    + 1,
+                                )
+                            )
+        if not attempt_owned:
+            # A successor owns at least one part of this attempt.  Roll back
+            # any partial CAS update and leave the successor's durable rows
+            # untouched; its worker will perform its own lifecycle handling.
+            self.db.rollback()
+        elif self.turn_record is not None:
+            self.turn_store.finish_with_error(
+                self.turn_record,
+                status="failed",
+                code=code,
+                message=code,
+            )
+        if attempt_owned and self.session is not None:
+            self.session.status = "active"
+            self.session.updated_at = now
+            self.db.add(self.session)
+        if attempt_owned:
+            self.db.commit()
+        self.active_run_id = None
+        self.active_frame_id = None
+        self.active_frame_lease_owner = None
+        self.active_frame_attempt_no = None
 
     def _run_frame(
         self,
@@ -925,12 +1238,28 @@ class HarnessV2Engine:
         max_actions: int,
     ) -> tuple[TaskExecutionResult, StepAgentResult]:
         """执行一个任务帧，并在重复动作循环中复用当前轮冻结的知识版本映射。"""
+        wake_admission_check = getattr(self, "wake_admission_check", None)
+        try:
+            # This is deliberately before mark_running()/ensure_agent_loop(): a
+            # suspended or stale frame must not create any executable AgentLoop.
+            self._require_current_tenant_admission(
+                persisted_version=row.tenant_lifecycle_version,
+                correlation_id=row.task_id,
+            )
+        except TenantLifecycleDenied as exc:
+            self._terminalize_lifecycle_frame(row, exc.code)
+            self.lifecycle_denial = exc
+            raise
+        self._require_wake_admission()
         self.store.mark_running(row)
-        agent_loop = self.store.ensure_agent_loop(row)
-        loop_checkpoint = dict(agent_loop.checkpoint_json or {})
+        # Publish the frame lease token before the next admission check so a
+        # failed wake can terminalize this exact running frame during recovery.
         self.active_frame_id = row.id
         self.active_frame_lease_owner = row.lease_owner
         self.active_frame_attempt_no = row.attempt_no
+        self._require_wake_admission()
+        agent_loop = self.store.ensure_agent_loop(row)
+        loop_checkpoint = dict(agent_loop.checkpoint_json or {})
         attachment_descriptors = materialize_task_attachments(
             request.attachments,
             tenant_id=request.tenant_id,
@@ -951,6 +1280,7 @@ class HarnessV2Engine:
             if frame.kind == "sop"
             else None
         )
+        self._require_wake_admission()
         self.events.record_legacy_event(
             request.tenant_id,
             session.id,
@@ -974,6 +1304,7 @@ class HarnessV2Engine:
         run: HarnessRunRecord | None = None
 
         while remaining_actions > 0:
+            self._require_wake_admission()
             self._raise_if_cancelled(request, session)
             step_deadline_monotonic = (
                 time.monotonic() + step_timeout_seconds
@@ -1025,13 +1356,16 @@ class HarnessV2Engine:
                     model_manifest,
                     forced,
                 )
+            self._require_wake_admission()
             self.store.save_requirement(
                 row,
                 requirement.model_dump(mode="json"),
                 lease_owner=self.active_frame_lease_owner,
                 attempt_no=self.active_frame_attempt_no,
             )
+            self._require_wake_admission()
             if run is None:
+                self._require_wake_admission()
                 run = self.store.start_run(
                     row,
                     requirement=requirement.model_dump(mode="json"),
@@ -1040,6 +1374,7 @@ class HarnessV2Engine:
                     attempt_no=self.active_frame_attempt_no,
                     language_context=request.language_context,
                 )
+                self._require_wake_admission()
                 self.store.save_agent_loop_checkpoint(
                     agent_loop,
                     loop_checkpoint,
@@ -1047,12 +1382,14 @@ class HarnessV2Engine:
                     last_run_id=run.id,
                 )
             else:
+                self._require_wake_admission()
                 self.store.update_run_context(
                     run,
                     requirement=requirement.model_dump(mode="json"),
                     capability_snapshot=manifest.model_dump(mode="json"),
                 )
             self.active_run_id = run.id
+            self._require_wake_admission()
             self.db.commit()
             harness_run_id = run.id
 
@@ -1064,6 +1401,7 @@ class HarnessV2Engine:
                 _task_frame_id: str = row.task_id,
                 _agent_loop_id: str = agent_loop.id,
             ) -> None:
+                self._require_wake_admission()
                 projected_payload = _project_harness_trace(payload)
                 self.events.record_legacy_event(
                     request.tenant_id,
@@ -1080,6 +1418,7 @@ class HarnessV2Engine:
                 # Harness runs execute outside the response generator. Commit
                 # each trace checkpoint so the stream relay can expose the
                 # running TaskFrame instead of revealing it only at the end.
+                self._require_wake_admission()
                 self.db.commit()
 
             invoker = HarnessCapabilityInvoker(
@@ -1099,8 +1438,19 @@ class HarnessV2Engine:
                 trace_sink=trace,
                 step_deadline_monotonic=step_deadline_monotonic,
                 language_context=request.language_context,
+                admission_check=wake_admission_check,
             )
 
+            try:
+                # Invoker construction and capability discovery may perform local setup. Re-read
+                # immediately before the task agent can issue its first model request.
+                self._require_current_tenant_admission(
+                    persisted_version=row.tenant_lifecycle_version,
+                    correlation_id=run.id,
+                )
+            except TenantLifecycleDenied as exc:
+                self.lifecycle_denial = exc
+                raise
             result = self.task_agent.run(
                 requirement,
                 model_config,
@@ -1113,7 +1463,16 @@ class HarnessV2Engine:
                 step_timeout_seconds=step_timeout_seconds,
                 checkpoint=loop_checkpoint,
                 language_context=request.language_context,
+                admission_check=wake_admission_check,
             )
+            try:
+                self._require_current_tenant_admission(
+                    persisted_version=row.tenant_lifecycle_version,
+                    correlation_id=run.id,
+                )
+            except TenantLifecycleDenied as exc:
+                self.lifecycle_denial = exc
+                raise
             if request.channel == "human_handoff_resume" and result.status == "handoff":
                 # The human reply is already the handoff completion signal. Do not
                 # re-enter the same terminal handoff node during the resume turn.
@@ -1139,12 +1498,14 @@ class HarnessV2Engine:
             loop_checkpoint = dict(result.loop_checkpoint or {})
             _merge_discovered_artifacts(result, invoker.discover_artifacts())
             loop_checkpoint["artifacts"] = list(result.artifacts)
+            self._require_wake_admission()
             self.store.save_agent_loop_checkpoint(
                 agent_loop,
                 loop_checkpoint,
                 status="active",
                 last_run_id=run.id,
             )
+            self._require_wake_admission()
             results.append(result)
             remaining_actions -= max(1, result.action_count)
 
@@ -1209,6 +1570,7 @@ class HarnessV2Engine:
                 last_step_result,
                 active_skill,
             )
+            self._require_wake_admission()
             finalize_state = self.owner._finalize_execution_after_reply(
                 request.tenant_id,
                 session,
@@ -1254,12 +1616,21 @@ class HarnessV2Engine:
             if not continue_frame:
                 break
 
+        try:
+            self._require_current_tenant_admission(
+                persisted_version=row.tenant_lifecycle_version,
+                correlation_id=run.id if run is not None else row.task_id,
+            )
+        except TenantLifecycleDenied as exc:
+            self.lifecycle_denial = exc
+            raise
         combined = _combine_results(
             row.task_id,
             results,
             language_context=request.language_context,
         )
         if run is not None:
+            self._require_wake_admission()
             self.store.finish_run(
                 run,
                 status=combined.status,
@@ -1273,6 +1644,7 @@ class HarnessV2Engine:
         preserve_agent_loop = _is_recoverable_action_protocol_failure(combined)
         if row_status == "action_budget" or preserve_agent_loop:
             row_status = "queued"
+        self._require_wake_admission()
         self.store.finish_frame(
             row,
             status=row_status,
@@ -1288,6 +1660,7 @@ class HarnessV2Engine:
             checkpoint=loop_checkpoint,
             last_run_id=run.id if run is not None else None,
         )
+        self._require_wake_admission()
         self.events.record_legacy_event(
             request.tenant_id,
             session.id,
@@ -1306,6 +1679,7 @@ class HarnessV2Engine:
                 "execution_engine": "harness_v2",
             },
         )
+        self._require_wake_admission()
         self.db.commit()
         self.active_frame_id = None
         self.active_frame_lease_owner = None
@@ -2092,12 +2466,16 @@ def _with_recoverable_first_session(
 def get_or_create_harness_session(
     owner: Any,
     request: ChatTurnRequest,
+    *,
+    admission_check: Callable[[], None] | None = None,
 ) -> ChatSession:
     """Create or recover one Harness session and fence untrusted team-mode fallbacks."""
 
     db = owner.db
     try:
         session = owner._get_or_create_session(request)
+        if callable(admission_check):
+            admission_check()
         db.commit()
     except IntegrityError:
         # Two workers may race to create the same deterministic first-turn
@@ -2129,6 +2507,8 @@ def get_or_create_harness_session(
     if request.agent_id and not session.agent_id:
         session.agent_id = request.agent_id
         db.add(session)
+        if callable(admission_check):
+            admission_check()
         db.commit()
     # Team execution must be anchored to a persisted server-side team id. If
     # it is absent, do not silently fall back to the employee's dedicated KB.

@@ -9,8 +9,9 @@ import IconSearch from '../assets/icons/search.svg?react';
 import { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 
-import { api, TENANT_ID } from '../api/client';
+import { createTenantClient } from '../api/tenant-client';
 import { isGalleryEmployee, type EnterpriseAuthUser } from '../auth';
+import { useTenantSession } from '../contexts/TenantSessionContext';
 
 import AppHeader from '../components/AppHeader';
 import { ConfirmDialog } from '../components/ConfirmDialog';
@@ -26,9 +27,8 @@ import {
   isMyEmployeeAgent,
   visibleEmployeeAgents,
 } from '../employee';
+import { clearSharedAgentScope, persistSharedAgentScope, readEmployeeScope } from '../lib/agent-scope-storage';
 import type { AgentProfileRead, TeamRead } from '../types';
-
-const ENTERPRISE_AGENT_STORAGE_KEY = 'ultrarag_enterprise_agent_scope';
 
 type GalleryScope = 'all' | 'mine' | 'teams' | 'gallery';
 
@@ -52,6 +52,8 @@ export default function EmployeeGalleryPage({
   onLogout?: () => void;
 }) {
   const { t } = useAppIntl();
+  const tenantContext = useTenantSession();
+  const tenantApi = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
   const [agents, setAgents] = useState<AgentProfileRead[]>([]);
   const [teams, setTeams] = useState<TeamRead[]>([]);
   const [teamsLoadFailed, setTeamsLoadFailed] = useState(false);
@@ -67,23 +69,33 @@ export default function EmployeeGalleryPage({
   const navigate = useNavigate();
 
   async function load() {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     setLoading(true);
     try {
-      const rows = await api.get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${TENANT_ID}`);
+      const rows = await tenantApi.get<AgentProfileRead[]>('/api/enterprise/agents');
+      if (!context.isCurrentGeneration(generation)) return;
       setAgents(rows);
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       notify.error(galleryErrorMessage(error, t('employeeGalleryPage.toast.loadEmployeesFailed')));
     } finally {
-      setLoading(false);
+      if (context.isCurrentGeneration(generation)) setLoading(false);
     }
   }
 
   async function loadTeams() {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     try {
-      const rows = await api.get<TeamRead[]>(`/api/enterprise/teams?tenant_id=${TENANT_ID}`);
+      const rows = await tenantApi.get<TeamRead[]>('/api/enterprise/teams');
+      if (!context.isCurrentGeneration(generation)) return;
       setTeams(rows);
       setTeamsLoadFailed(false);
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       setTeamsLoadFailed(true);
       notify.error(galleryErrorMessage(error, t('employeeGalleryPage.toast.loadTeamsFailed')));
     }
@@ -92,7 +104,26 @@ export default function EmployeeGalleryPage({
   useEffect(() => {
     void load();
     void loadTeams();
-  }, []);
+  }, [tenantApi]);
+
+  useEffect(() => {
+    setDeleting(false);
+    setStartingAgentId(null);
+    setStartingTeamId(null);
+  }, [tenantContext?.generation]);
+
+  // Clear tenant-A records and editor state while the replacement tenant is
+  // still being verified by TenantSessionProvider.
+  useEffect(() => {
+    if (tenantContext) return;
+    setAgents([]);
+    setTeams([]);
+    setTeamsLoadFailed(false);
+    setAvatarAgent(null);
+    setProfileAgent(null);
+    setDeleteTarget(null);
+    setLoading(false);
+  }, [tenantContext]);
 
   // Keep these tabs aligned with the rest of the app:
   // - 所有员工: employees the current user can access and chat with
@@ -144,44 +175,57 @@ export default function EmployeeGalleryPage({
 
   async function startEmployeeChat(row: AgentProfileRead) {
     if (startingAgentId) return;
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     setStartingAgentId(row.id);
     try {
       if (onStartChat) {
         await onStartChat(row);
+        if (!context.isCurrentGeneration(generation)) return;
         return;
       }
+      if (!context.isCurrentGeneration(generation)) return;
       navigate(`/workspace/chat/draft/${row.id}`);
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       notify.error(galleryErrorMessage(error, t('employeeGalleryPage.toast.startChatFailed')));
     } finally {
-      setStartingAgentId(null);
+      if (context.isCurrentGeneration(generation)) setStartingAgentId(null);
     }
   }
 
   async function startTeamChat(team: TeamRead) {
     if (startingTeamId) return;
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     setStartingTeamId(team.id);
     try {
-      const result = await api.post<{ session_id: string }>(
+      const result = await tenantApi.post<{ session_id: string }>(
         `/api/enterprise/teams/${team.id}/tl/session`,
-        { tenant_id: TENANT_ID },
       );
+      if (!context.isCurrentGeneration(generation)) return;
       if (!result.session_id) throw new Error(t('employeeGalleryPage.error.missingTeamSession'));
       navigate(`/workspace/chat/${result.session_id}`);
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       notify.error(galleryErrorMessage(error, t('employeeGalleryPage.toast.startTeamChatFailed')));
     } finally {
-      setStartingTeamId(null);
+      if (context.isCurrentGeneration(generation)) setStartingTeamId(null);
     }
   }
 
   async function updateStatus(row: AgentProfileRead, status: 'active' | 'archived') {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     try {
-      await api.put<AgentProfileRead>(`/api/enterprise/agents/${row.id}`, {
-        tenant_id: TENANT_ID,
+      await tenantApi.put<AgentProfileRead>(`/api/enterprise/agents/${row.id}`, {
         status,
         metadata: row.metadata || {},
       });
+      if (!context.isCurrentGeneration(generation)) return;
       notify.success(
         status === 'active'
           ? t('employeeGalleryPage.toast.published')
@@ -190,11 +234,15 @@ export default function EmployeeGalleryPage({
       await load();
       window.dispatchEvent(new Event('ultrarag-enterprise-agent-scope-refresh'));
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       notify.error(galleryErrorMessage(error, t('employeeGalleryPage.toast.updateStatusFailed')));
     }
   }
 
   async function updateGalleryState(row: AgentProfileRead, published: boolean) {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     try {
       const metadata: Record<string, unknown> = {
         ...(row.metadata || {}),
@@ -206,10 +254,10 @@ export default function EmployeeGalleryPage({
         delete metadata.gallery_unpublished_at;
         delete metadata.gallery_unpublished_by;
       }
-      await api.put<AgentProfileRead>(`/api/enterprise/agents/${row.id}`, {
-        tenant_id: TENANT_ID,
+      await tenantApi.put<AgentProfileRead>(`/api/enterprise/agents/${row.id}`, {
         metadata,
       });
+      if (!context.isCurrentGeneration(generation)) return;
       notify.success(
         published
           ? t('employeeGalleryPage.toast.marketplacePublished')
@@ -218,6 +266,7 @@ export default function EmployeeGalleryPage({
       await load();
       window.dispatchEvent(new Event('ultrarag-enterprise-agent-scope-refresh'));
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       notify.error(galleryErrorMessage(error, t('employeeGalleryPage.toast.updateGalleryFailed')));
     }
   }
@@ -225,17 +274,21 @@ export default function EmployeeGalleryPage({
   async function confirmDelete() {
     const row = deleteTarget;
     if (!row) return;
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     setDeleting(true);
     try {
-      await api.delete(`/api/enterprise/agents/${row.id}?tenant_id=${TENANT_ID}`);
-      if (window.localStorage.getItem(ENTERPRISE_AGENT_STORAGE_KEY) === row.id) {
+      await tenantApi.delete(`/api/enterprise/agents/${row.id}`);
+      if (!context.isCurrentGeneration(generation)) return;
+      if (readEmployeeScope(context.tenantId, context.userId) === row.id) {
         const nextAgent = availableAgents.find((item) => item.id !== row.id && item.status === 'active')
           || availableAgents.find((item) => item.id !== row.id);
         if (nextAgent) {
-          window.localStorage.setItem(ENTERPRISE_AGENT_STORAGE_KEY, nextAgent.id);
+          persistSharedAgentScope(nextAgent.id, context.tenantId, context.userId);
           window.dispatchEvent(new CustomEvent('ultrarag-enterprise-agent-scope-change', { detail: { agentId: nextAgent.id } }));
         } else {
-          window.localStorage.removeItem(ENTERPRISE_AGENT_STORAGE_KEY);
+          clearSharedAgentScope(context.tenantId, context.userId);
           window.dispatchEvent(new CustomEvent('ultrarag-enterprise-agent-scope-change', { detail: { agentId: '' } }));
         }
       }
@@ -244,9 +297,10 @@ export default function EmployeeGalleryPage({
       await load();
       window.dispatchEvent(new Event('ultrarag-enterprise-agent-scope-refresh'));
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       notify.error(galleryErrorMessage(error, t('employeeGalleryPage.toast.deleteFailed')));
     } finally {
-      setDeleting(false);
+      if (context.isCurrentGeneration(generation)) setDeleting(false);
     }
   }
 

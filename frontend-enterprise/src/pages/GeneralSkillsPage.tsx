@@ -15,8 +15,10 @@ import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { Ban, ChevronRight, CircleCheck, Copy, Eye, EyeOff, FilePlus2, FolderPlus, Users } from 'lucide-react';
 import { ContextMenu } from 'radix-ui';
 
-import { api, streamPost, TENANT_ID } from '../api/client';
+import { API_BASE, ApiError } from '../api/client';
+import { createTenantClient } from '../api/tenant-client';
 import { isEnterpriseAdmin, type EnterpriseAuthUser } from '../auth';
+import { useTenantSession, type TenantSessionContextValue } from '../contexts/TenantSessionContext';
 import AppHeader from '@/components/AppHeader';
 import CapabilityScopeLoading from '@/components/CapabilityScopeLoading';
 import {
@@ -53,7 +55,12 @@ import { Button as UIButton } from '@/components/ui/button';
 import { notify } from '@/components/ui/app-toast';
 import { apiErrorMessage } from '@/lib/apiErrorMessages';
 import { cn } from '@/lib/utils';
-import { isTeamScope, readEmployeeScope } from '@/lib/agent-scope-storage';
+import {
+  isTeamScope,
+  persistSharedAgentScope,
+  readEmployeeScope,
+} from '@/lib/agent-scope-storage';
+import { tenantUserStorageKey } from '@/lib/tenant-storage';
 import {
   MENU_CONTENT_CLASS,
   MENU_ITEM_CLASS,
@@ -66,6 +73,143 @@ import { StatCard } from '@/components/StatCard';
 import { ResourceImportDialog } from '@/components/ResourceImportDialog';
 import CodeBlock, { renderCodeTokens } from '../components/CodeBlock';
 import { renderMarkdownBlocks } from './chat/chatHelpers';
+
+type TenantStreamEvent = {
+  event: string;
+  data: Record<string, unknown>;
+};
+
+/** 只有请求所属租户代次仍然有效时，异步回调才允许触碰页面状态或提示。 */
+function isCurrentTenantRequest(
+  context: TenantSessionContextValue | null,
+  generation: number,
+  controller: AbortController,
+): boolean {
+  return Boolean(
+    context
+    && !controller.signal.aborted
+    && !context.signal.aborted
+    && context.isCurrentGeneration(generation),
+  );
+}
+
+/** Build a stream URL from the verified tenant and reject caller-supplied mismatches. */
+function tenantStreamUrl(path: string, tenantId: string): string {
+  const hasAbsoluteBase = /^(?:https?:|blob:)/i.test(path);
+  const url = new URL(hasAbsoluteBase ? path : `${API_BASE}${path}`, window.location.origin);
+  const requestedTenantIds = url.searchParams.getAll('tenant_id');
+  if (requestedTenantIds.some((value) => value !== tenantId)) {
+    throw new Error('租户请求上下文不匹配');
+  }
+  url.searchParams.set('tenant_id', tenantId);
+  return !API_BASE && !hasAbsoluteBase
+    ? `${url.pathname}${url.search}${url.hash}`
+    : url.toString();
+}
+
+/** Link a request abort signal to the verified tenant generation signal. */
+function combineTenantStreamSignals(
+  tenantSignal: AbortSignal,
+  requestSignal?: AbortSignal,
+): { signal: AbortSignal; cleanup: () => void } {
+  if (!requestSignal || requestSignal === tenantSignal) {
+    return { signal: tenantSignal, cleanup: () => undefined };
+  }
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  if (tenantSignal.aborted || requestSignal.aborted) controller.abort();
+  else {
+    tenantSignal.addEventListener('abort', abort, { once: true });
+    requestSignal.addEventListener('abort', abort, { once: true });
+  }
+  return {
+    signal: controller.signal,
+    cleanup: () => {
+      tenantSignal.removeEventListener('abort', abort);
+      requestSignal.removeEventListener('abort', abort);
+    },
+  };
+}
+
+/** Parse one SSE block while keeping malformed payloads diagnosable to callers. */
+function parseTenantSseBlock(block: string): TenantStreamEvent | null {
+  const lines = block.split('\n').map((line) => line.trimEnd());
+  const eventLine = lines.find((line) => line.startsWith('event:'));
+  const dataLines = lines.filter((line) => line.startsWith('data:'));
+  if (!eventLine || dataLines.length === 0) return null;
+  const event = eventLine.replace(/^event:\s*/, '');
+  const rawData = dataLines.map((line) => line.replace(/^data:\s*/, '')).join('\n');
+  try {
+    return { event, data: JSON.parse(rawData) as Record<string, unknown> };
+  } catch {
+    return { event, data: { raw: rawData } };
+  }
+}
+
+/** Stream an enterprise endpoint with the verified bearer, tenant query and generation fence. */
+async function streamTenantPost(
+  context: TenantSessionContextValue | null,
+  path: string,
+  body: Record<string, unknown>,
+  onEvent: (item: TenantStreamEvent) => void,
+  requestSignal?: AbortSignal,
+): Promise<void> {
+  if (!context) throw new Error('租户请求上下文不可用');
+  const generation = context.generation;
+  const combined = combineTenantStreamSignals(context.signal, requestSignal);
+  const isCurrent = () => (
+    !combined.signal.aborted
+    && !context.signal.aborted
+    && context.isCurrentGeneration(generation)
+  );
+  try {
+    if (!isCurrent()) return;
+    if (body.tenant_id !== undefined && body.tenant_id !== context.tenantId) {
+      throw new Error('租户请求上下文不匹配');
+    }
+    const response = await fetch(tenantStreamUrl(path, context.tenantId), {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${context.session.token}`,
+      },
+      body: JSON.stringify({ ...body, tenant_id: context.tenantId }),
+      signal: combined.signal,
+    });
+    if (!isCurrent()) return;
+    if (!response.ok) {
+      const text = await response.text();
+      if (!isCurrent()) return;
+      throw new ApiError(response.status, text, response.statusText);
+    }
+    if (!response.body) throw new Error('当前浏览器不支持流式响应');
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder('utf-8');
+    let buffer = '';
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!isCurrent()) {
+        await reader.cancel().catch(() => undefined);
+        return;
+      }
+      buffer += decoder.decode(value, { stream: true });
+      const blocks = buffer.split('\n\n');
+      buffer = blocks.pop() || '';
+      blocks.forEach((block) => {
+        if (!isCurrent()) return;
+        const parsed = parseTenantSseBlock(block);
+        if (parsed) onEvent(parsed);
+      });
+    }
+    if (!isCurrent()) return;
+    buffer += decoder.decode();
+    const parsed = parseTenantSseBlock(buffer);
+    if (parsed && isCurrent()) onEvent(parsed);
+  } finally {
+    combined.cleanup();
+  }
+}
 import IconAdd from '../assets/icons/add.svg?react';
 import IconArrowRight from '../assets/icons/arrow-right.svg?react';
 import IconFolder from '../assets/icons/cap-folder.svg?react';
@@ -460,7 +604,6 @@ function TraceDisclosureLabel() {
   );
 }
 
-const ENTERPRISE_AGENT_STORAGE_KEY = 'ultrarag_enterprise_agent_scope';
 const GENERAL_SKILL_RUN_IDLE_TIMEOUT_MS = 600_000;
 const FOLDER_INPUT_PROPS = {
   webkitdirectory: '',
@@ -606,8 +749,21 @@ export function GeneralSkillEditPage(props: GeneralSkillPageProps = {}) {
   return <GeneralSkillEditorPage mode="edit" {...props} />;
 }
 
-export default function GeneralSkillsPage({ embedded = false, currentUser, onLogout }: { embedded?: boolean } & GeneralSkillPageProps) {
+/** 按租户会话代次隔离技能列表状态，切换租户时先卸载旧内容再加载新数据。 */
+export default function GeneralSkillsPage(props: { embedded?: boolean } & GeneralSkillPageProps) {
+  const tenantContext = useTenantSession();
+  const tenantScopeKey = tenantContext
+    ? tenantContext.tenantId
+    : 'no-tenant';
+  return <GeneralSkillsPageContent key={tenantScopeKey} {...props} />;
+}
+
+function GeneralSkillsPageContent({ embedded = false, currentUser, onLogout }: { embedded?: boolean } & GeneralSkillPageProps) {
   const { t } = useAppIntl();
+  const tenantContext = useTenantSession();
+  const tenantClient = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
+  const tenantId = tenantContext?.tenantId || '';
+  const userId = tenantContext?.userId || '';
   const copy = useGeneralSkillsCopy();
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -615,7 +771,9 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
   const [loading, setLoading] = useState(false);
   const [searchText, setSearchText] = useState('');
   const [statusFilter, setStatusFilter] = useState<'all' | GeneralSkillRead['status']>('all');
-  const [agentId, setAgentId] = useState(readEmployeeScope);
+  const [agentId, setAgentId] = useState(
+    () => tenantId && userId ? readEmployeeScope(tenantId, userId) : '',
+  );
   const [isOverallAgent, setIsOverallAgent] = useState(true);
   const [agents, setAgents] = useState<AgentProfileRead[]>([]);
   const [clawhubModalOpen, setClawhubModalOpen] = useState(false);
@@ -632,48 +790,144 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
   const [agentScopeLoaded, setAgentScopeLoaded] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<GeneralSkillRead | null>(null);
   const [deleting, setDeleting] = useState(false);
+  const listLoadControllerRef = useRef<AbortController | null>(null);
+  const listAgentScopeControllerRef = useRef<AbortController | null>(null);
+  const listPublishControllerRef = useRef<AbortController | null>(null);
+  const listDeleteControllerRef = useRef<AbortController | null>(null);
+  const listImportAgentsControllerRef = useRef<AbortController | null>(null);
+  const listImportSourceControllerRef = useRef<AbortController | null>(null);
+  const listImportSubmitControllerRef = useRef<AbortController | null>(null);
+  const tenantScopeKey = tenantContext
+    ? `${tenantId}:${userId}:${tenantContext.generation}`
+    : 'no-tenant';
+  const [stateScopeKey, setStateScopeKey] = useState(tenantScopeKey);
+  const hasCurrentTenantState = stateScopeKey === tenantScopeKey;
 
-  const pageTitle = isOverallAgent ? copy.pageTitle : copy.scopedPageTitle;
-  const listLabel = isOverallAgent ? copy.listOverall : copy.listScoped;
-  const currentAgent = useMemo(() => agents.find((item) => item.id === agentId), [agents, agentId]);
+  useEffect(() => {
+    if (hasCurrentTenantState) return;
+    setRows([]);
+    setAgents([]);
+    setAgentScopeLoaded(false);
+    setSearchText('');
+    setStatusFilter('all');
+    setAgentId(tenantId && userId ? readEmployeeScope(tenantId, userId) : '');
+    setIsOverallAgent(true);
+    setDeleting(false);
+    setLoading(false);
+    setAgentImportLoading(false);
+    setAgentImportMode('plaza');
+    setAgentImportAgents([]);
+    setAgentImportSourceAgentId('');
+    setAgentImportSourceSkills([]);
+    setAgentImportSelectedSkillIds([]);
+    setAgentImportOpen(false);
+    setClawhubLoading(false);
+    setClawhubSource('');
+    setClawhubModalOpen(false);
+    setDeleteTarget(null);
+    setStateScopeKey(tenantScopeKey);
+  }, [hasCurrentTenantState, tenantId, tenantScopeKey, userId]);
+
+  useEffect(() => {
+    setDeleting(false);
+    setAgentImportLoading(false);
+    return () => {
+      [
+        listLoadControllerRef,
+        listAgentScopeControllerRef,
+        listPublishControllerRef,
+        listDeleteControllerRef,
+        clawhubAbortRef,
+        listImportAgentsControllerRef,
+        listImportSourceControllerRef,
+        listImportSubmitControllerRef,
+      ].forEach((ref) => ref.current?.abort());
+    };
+  }, [tenantContext?.tenantId, tenantContext?.generation]);
+
+  useEffect(() => {
+    setAgentId(tenantId && userId ? readEmployeeScope(tenantId, userId) : '');
+    setRows([]);
+    setAgents([]);
+    setAgentScopeLoaded(false);
+  }, [tenantId, userId]);
+
+  const scopedRows = hasCurrentTenantState ? rows : [];
+  const scopedAgents = hasCurrentTenantState ? agents : [];
+  const scopedAgentId = hasCurrentTenantState ? agentId : '';
+  const scopedIsOverallAgent = hasCurrentTenantState ? isOverallAgent : true;
+  const pageTitle = scopedIsOverallAgent ? copy.pageTitle : copy.scopedPageTitle;
+  const listLabel = scopedIsOverallAgent ? copy.listOverall : copy.listScoped;
+  const currentAgent = useMemo(() => scopedAgents.find((item) => item.id === scopedAgentId), [scopedAgents, scopedAgentId]);
   const canManageCurrentScope = currentAgent
     ? canManageEmployeeAgent(currentAgent, currentUser)
-    : isEnterpriseAdmin(currentUser) && isOverallAgent;
+    : isEnterpriseAdmin(currentUser) && scopedIsOverallAgent;
 
   const load = () => {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return Promise.resolve();
     const agentSuffix = agentId ? `&agent_id=${encodeURIComponent(agentId)}` : '';
+    listLoadControllerRef.current?.abort();
+    const controller = new AbortController();
+    listLoadControllerRef.current = controller;
     setLoading(true);
-    return api
-      .get<GeneralSkillRead[]>(`/api/enterprise/general-skills?tenant_id=${TENANT_ID}${agentSuffix}`)
-      .then(setRows)
-      .catch((error) => notify.error(generalSkillsPageErrorMessage(error, copy.loadFailed, t)))
-      .finally(() => setLoading(false));
+    return tenantClient
+      .get<GeneralSkillRead[]>(`/api/enterprise/general-skills?tenant_id=${tenantId}${agentSuffix}`, {
+        signal: controller.signal,
+      })
+      .then((items) => {
+        if (isCurrentTenantRequest(context, generation, controller)) setRows(items);
+      })
+      .catch((error) => {
+        if (isCurrentTenantRequest(context, generation, controller)) {
+          notify.error(generalSkillsPageErrorMessage(error, copy.loadFailed, t));
+        }
+      })
+      .finally(() => {
+        if (listLoadControllerRef.current === controller) listLoadControllerRef.current = null;
+        if (isCurrentTenantRequest(context, generation, controller)) setLoading(false);
+      });
   };
 
   useEffect(() => {
+    if (!hasCurrentTenantState) return;
     void load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [agentId]);
+  }, [agentId, hasCurrentTenantState, tenantContext, tenantClient, tenantId, tenantScopeKey]);
 
   useEffect(() => {
-    api
-      .get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${TENANT_ID}`)
+    if (!tenantContext || !hasCurrentTenantState) return;
+    const context = tenantContext;
+    const generation = context.generation;
+    listAgentScopeControllerRef.current?.abort();
+    const controller = new AbortController();
+    listAgentScopeControllerRef.current = controller;
+    tenantClient
+      .get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${tenantId}`, { signal: controller.signal })
       .then((items) => {
+        if (!isCurrentTenantRequest(context, generation, controller)) return;
         setAgents(items);
         setIsOverallAgent(Boolean(items.find((item) => item.id === agentId)?.is_overall ?? true));
         setAgentScopeLoaded(true);
       })
       .catch(() => {
+        if (!isCurrentTenantRequest(context, generation, controller)) return;
         setIsOverallAgent(true);
         setAgentScopeLoaded(true);
+      })
+      .finally(() => {
+        if (listAgentScopeControllerRef.current === controller) listAgentScopeControllerRef.current = null;
       });
-  }, [agentId]);
+    return () => controller.abort();
+  }, [agentId, hasCurrentTenantState, tenantContext, tenantClient, tenantId, tenantScopeKey]);
 
   useEffect(() => {
+    if (!hasCurrentTenantState) return;
     if (searchParams.get('add') !== 'plaza') return;
     if (!agentScopeLoaded) return;
     const resourceId = searchParams.get('resourceId') || undefined;
-    if (isOverallAgent) {
+    if (scopedIsOverallAgent) {
       notify.warning(copy.plazaCopyRequiresEmployee);
     } else {
       void requestAgentImport('plaza', resourceId);
@@ -683,20 +937,20 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
     next.delete('resourceId');
     setSearchParams(next, { replace: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [agentScopeLoaded, isOverallAgent, searchParams, setSearchParams]);
+  }, [agentScopeLoaded, hasCurrentTenantState, scopedIsOverallAgent, searchParams, setSearchParams]);
 
   useEffect(() => {
     const onScopeChange = (event: Event) => {
       const next = (event as CustomEvent<{ agentId?: string }>).detail?.agentId || '';
-      setAgentId(next && !isTeamScope(next) ? next : readEmployeeScope());
+      setAgentId(next && !isTeamScope(next) ? next : readEmployeeScope(tenantId, userId));
     };
     window.addEventListener('ultrarag-enterprise-agent-scope-change', onScopeChange);
     return () => window.removeEventListener('ultrarag-enterprise-agent-scope-change', onScopeChange);
-  }, []);
+  }, [tenantId, userId]);
 
   const filteredRows = useMemo(() => {
     const keyword = searchText.trim().toLowerCase();
-    return rows.filter((row) => {
+    return scopedRows.filter((row) => {
       const matchesStatus = statusFilter === 'all' || row.status === statusFilter;
       const haystack = [
         row.name,
@@ -707,58 +961,95 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
       ].filter(Boolean).join(' ').toLowerCase();
       return matchesStatus && (!keyword || haystack.includes(keyword));
     });
-  }, [rows, searchText, statusFilter]);
+  }, [scopedRows, searchText, statusFilter]);
 
   const pagination = useClientPagination(filteredRows, GENERAL_SKILL_PAGE_SIZE, `${searchText}|${statusFilter}`);
 
   const stats = useMemo(() => ({
-    total: rows.length,
-    published: rows.filter((row) => row.status === 'published').length,
-    draft: rows.filter((row) => row.status === 'draft').length,
-    archived: rows.filter((row) => row.status === 'archived').length,
-  }), [rows]);
+    total: scopedRows.length,
+    published: scopedRows.filter((row) => row.status === 'published').length,
+    draft: scopedRows.filter((row) => row.status === 'draft').length,
+    archived: scopedRows.filter((row) => row.status === 'archived').length,
+  }), [scopedRows]);
 
   async function setSkillPublished(row: GeneralSkillRead, published: boolean) {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
+    listPublishControllerRef.current?.abort();
+    const controller = new AbortController();
+    listPublishControllerRef.current = controller;
     try {
       const agentSuffix = agentId ? `&agent_id=${encodeURIComponent(agentId)}` : '';
-      const next = await api.post<GeneralSkillRead>(
-        `/api/enterprise/general-skills/${row.slug}/${published ? 'publish' : 'archive'}?tenant_id=${TENANT_ID}${agentSuffix}`,
+      const next = await tenantClient.post<GeneralSkillRead>(
+        `/api/enterprise/general-skills/${row.slug}/${published ? 'publish' : 'archive'}?tenant_id=${tenantId}${agentSuffix}`,
+        undefined,
+        { signal: controller.signal },
       );
+      if (!isCurrentTenantRequest(context, generation, controller)) return;
       setRows((current) => current.map((item) => (item.id === next.id ? next : item)));
       notify.success(published ? copy.enabledSuccess : copy.archivedSuccess);
     } catch (error) {
+      if (!isCurrentTenantRequest(context, generation, controller)) return;
       notify.error(generalSkillsPageErrorMessage(error, published ? copy.enableFailed : copy.archiveFailed, t));
+    } finally {
+      if (listPublishControllerRef.current === controller) listPublishControllerRef.current = null;
     }
   }
 
   async function publishSkillToGallery(row: GeneralSkillRead) {
     if (!agentId) return;
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
+    listPublishControllerRef.current?.abort();
+    const controller = new AbortController();
+    listPublishControllerRef.current = controller;
     try {
-      const next = await api.post<GeneralSkillRead>(
-        `/api/enterprise/general-skills/${encodeURIComponent(row.slug)}/publish-to-gallery?tenant_id=${TENANT_ID}&agent_id=${encodeURIComponent(agentId)}`,
+      const next = await tenantClient.post<GeneralSkillRead>(
+        `/api/enterprise/general-skills/${encodeURIComponent(row.slug)}/publish-to-gallery?tenant_id=${tenantId}&agent_id=${encodeURIComponent(agentId)}`,
+        undefined,
+        { signal: controller.signal },
       );
+      if (!isCurrentTenantRequest(context, generation, controller)) return;
       setRows((current) => current.map((item) => (item.id === next.id ? next : item)));
       notify.success(copy.publishToMarketplaceSuccess);
     } catch (error) {
+      if (!isCurrentTenantRequest(context, generation, controller)) return;
       notify.error(generalSkillsPageErrorMessage(error, copy.publishToMarketplaceFailed, t));
+    } finally {
+      if (listPublishControllerRef.current === controller) listPublishControllerRef.current = null;
     }
   }
 
   async function confirmDeleteSkill() {
     const row = deleteTarget;
-    if (!row) return;
-    const branchMode = !isOverallAgent;
+    if (!row || !row.id || !row.slug) return;
+    const branchMode = !scopedIsOverallAgent;
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
+    listDeleteControllerRef.current?.abort();
+    const controller = new AbortController();
+    listDeleteControllerRef.current = controller;
     setDeleting(true);
     try {
       const agentSuffix = agentId ? `&agent_id=${encodeURIComponent(agentId)}` : '';
-      await api.delete(`/api/enterprise/general-skills/${row.slug}?tenant_id=${TENANT_ID}${agentSuffix}`);
+      await tenantClient.delete(
+        `/api/enterprise/general-skills/${row.slug}?tenant_id=${tenantId}${agentSuffix}`,
+        undefined,
+        { signal: controller.signal },
+      );
+      if (!isCurrentTenantRequest(context, generation, controller)) return;
       setRows((current) => current.filter((item) => item.id !== row.id));
       notify.success(branchMode ? copy.removedSuccess : copy.deletedSuccess);
       setDeleteTarget(null);
     } catch (error) {
+      if (!isCurrentTenantRequest(context, generation, controller)) return;
       notify.error(generalSkillsPageErrorMessage(error, branchMode ? copy.removeFailed : copy.deleteSkillFailed, t));
     } finally {
-      setDeleting(false);
+      if (listDeleteControllerRef.current === controller) listDeleteControllerRef.current = null;
+      if (isCurrentTenantRequest(context, generation, controller)) setDeleting(false);
     }
   }
 
@@ -778,8 +1069,17 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
   }
 
   async function requestAgentImport(mode: GeneralSkillImportMode, selectedResourceId?: string) {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
+    listImportAgentsControllerRef.current?.abort();
+    const controller = new AbortController();
+    listImportAgentsControllerRef.current = controller;
     try {
-      const agents = await api.get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${TENANT_ID}`);
+      const agents = await tenantClient.get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${tenantId}`, {
+        signal: controller.signal,
+      });
+      if (!isCurrentTenantRequest(context, generation, controller)) return;
       const firstSource = mode === 'plaza'
         ? openGalleryAgentId(agents)
         : visibleEmployeeAgents(agents, currentUser, { activeOnly: true, excludeAgentId: agentId })[0]?.id || '';
@@ -790,6 +1090,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
       setAgentImportOpen(true);
       if (firstSource) {
         const sourceRows = await loadAgentImportSourceSkills(firstSource);
+        if (!isCurrentTenantRequest(context, generation, controller)) return;
         if (selectedResourceId && sourceRows.some((item) => item.id === selectedResourceId)) {
           setAgentImportSelectedSkillIds([selectedResourceId]);
         }
@@ -797,29 +1098,49 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
         setAgentImportSourceSkills([]);
       }
     } catch (error) {
+      if (!isCurrentTenantRequest(context, generation, controller)) return;
       notify.error(generalSkillsPageErrorMessage(error, copy.loadAgentsFailed, t));
+    } finally {
+      if (listImportAgentsControllerRef.current === controller) listImportAgentsControllerRef.current = null;
     }
   }
 
   async function loadAgentImportSourceSkills(sourceAgentId: string): Promise<GeneralSkillRead[]> {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return [];
+    listImportSourceControllerRef.current?.abort();
+    const controller = new AbortController();
+    listImportSourceControllerRef.current = controller;
     setAgentImportSourceSkills([]);
     setAgentImportSelectedSkillIds([]);
-    if (!sourceAgentId) return [];
+    if (!sourceAgentId) {
+      listImportSourceControllerRef.current = null;
+      return [];
+    }
     try {
-      const sourceRows = await api.get<GeneralSkillRead[]>(
-        `/api/enterprise/general-skills?tenant_id=${TENANT_ID}&agent_id=${encodeURIComponent(sourceAgentId)}`,
+      const sourceRows = await tenantClient.get<GeneralSkillRead[]>(
+        `/api/enterprise/general-skills?tenant_id=${tenantId}&agent_id=${encodeURIComponent(sourceAgentId)}`,
+        { signal: controller.signal },
       );
+      if (!isCurrentTenantRequest(context, generation, controller)) return [];
       const existingIds = new Set(rows.map((item) => item.id));
       const publishedRows = sourceRows.filter((item) => item.status === 'published' && !existingIds.has(item.id));
       setAgentImportSourceSkills(publishedRows);
       return publishedRows;
     } catch (error) {
+      if (!isCurrentTenantRequest(context, generation, controller)) return [];
       notify.error(generalSkillsPageErrorMessage(error, copy.loadSourceSkillsFailed, t));
       return [];
+    } finally {
+      if (listImportSourceControllerRef.current === controller) listImportSourceControllerRef.current = null;
     }
   }
 
   async function submitAgentImportSkills() {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     if (!agentId) {
       notify.warning(copy.selectEmployeeFirst);
       return;
@@ -832,21 +1153,27 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
       notify.warning(copy.selectSkillsFirst);
       return;
     }
+    listImportSubmitControllerRef.current?.abort();
+    const controller = new AbortController();
+    listImportSubmitControllerRef.current = controller;
     setAgentImportLoading(true);
     try {
-      await api.post(`/api/enterprise/agents/${encodeURIComponent(agentId)}/resources/import`, {
-        tenant_id: TENANT_ID,
+      await tenantClient.post(`/api/enterprise/agents/${encodeURIComponent(agentId)}/resources/import`, {
+        tenant_id: tenantId,
         source_agent_id: agentImportSourceAgentId,
         resource_type: 'general_skill',
         resource_ids: agentImportSelectedSkillIds,
-      });
+      }, { signal: controller.signal });
+      if (!isCurrentTenantRequest(context, generation, controller)) return;
       notify.success(interpolate(copy.copiedSkillsSuccess, { count: agentImportSelectedSkillIds.length }));
       setAgentImportOpen(false);
       await load();
     } catch (error) {
+      if (!isCurrentTenantRequest(context, generation, controller)) return;
       notify.error(generalSkillsPageErrorMessage(error, copy.copySkillsFailed, t));
     } finally {
-      setAgentImportLoading(false);
+      if (listImportSubmitControllerRef.current === controller) listImportSubmitControllerRef.current = null;
+      if (isCurrentTenantRequest(context, generation, controller)) setAgentImportLoading(false);
     }
   }
 
@@ -855,23 +1182,27 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
       notify.warning(copy.enterOpenSourceUrl);
       return;
     }
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     const controller = new AbortController();
     clawhubAbortRef.current?.abort();
     clawhubAbortRef.current = controller;
     setClawhubLoading(true);
     try {
-      const row = await api.postWithSignal<GeneralSkillRead>('/api/enterprise/general-skills/import-skillhub', {
-        tenant_id: TENANT_ID,
-        agent_id: !isOverallAgent && agentId ? agentId : undefined,
+      const row = await tenantClient.postWithSignal<GeneralSkillRead>('/api/enterprise/general-skills/import-skillhub', {
+        tenant_id: tenantId,
+        agent_id: !scopedIsOverallAgent && scopedAgentId ? scopedAgentId : undefined,
         source: clawhubSource.trim(),
         status: 'published',
       }, controller.signal);
-      if (controller.signal.aborted) return;
+      if (!isCurrentTenantRequest(context, generation, controller)) return;
       notify.success(interpolate(copy.importedOpenSourceSuccess, { name: row.name }));
       setRows((current) => [row, ...current.filter((item) => item.id !== row.id && item.slug !== row.slug)]);
       setClawhubModalOpen(false);
       navigate(`/enterprise/general-skills/${encodeURIComponent(row.slug)}/edit`);
     } catch (error) {
+      if (!isCurrentTenantRequest(context, generation, controller)) return;
       if (isAbortError(error)) {
         notify.info(copy.importCanceled);
         return;
@@ -880,14 +1211,14 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
     } finally {
       if (clawhubAbortRef.current === controller) {
         clawhubAbortRef.current = null;
-        setClawhubLoading(false);
+        if (isCurrentTenantRequest(context, generation, controller)) setClawhubLoading(false);
       }
     }
   }
 
   function renderActions(row: GeneralSkillRead) {
     const published = row.status === 'published';
-    if (isOverallAgent && !canManageCurrentScope) {
+    if (scopedIsOverallAgent && !canManageCurrentScope) {
       return null;
     }
     return (
@@ -904,7 +1235,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
             onSelect={() => navigate(`/enterprise/general-skills/${encodeURIComponent(row.slug)}/edit`)}
           >
             <IconEdit />
-            {isOverallAgent ? copy.actionEdit : copy.actionEditLocal}
+            {scopedIsOverallAgent ? copy.actionEdit : copy.actionEditLocal}
           </DropdownMenuItem>
           {published ? (
             <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => void setSkillPublished(row, false)}>
@@ -917,7 +1248,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
               {copy.actionPublish}
             </DropdownMenuItem>
           )}
-          {!isOverallAgent && row.metadata?.scope === 'agent_private' && (
+          {!scopedIsOverallAgent && row.metadata?.scope === 'agent_private' && (
             <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => void publishSkillToGallery(row)}>
               <UploadOutlined />
               {copy.publishToMarketplaceAction}
@@ -930,7 +1261,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
             onSelect={() => setDeleteTarget(row)}
           >
             <IconTrash />
-            {isOverallAgent ? copy.actionDelete : copy.actionRemove}
+            {scopedIsOverallAgent ? copy.actionDelete : copy.actionRemove}
           </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
@@ -1040,7 +1371,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
     );
   };
 
-  const listEmptyText = isOverallAgent
+  const listEmptyText = scopedIsOverallAgent
     ? canManageCurrentScope ? copy.emptyManage : copy.emptyReadonly
     : copy.emptyScoped;
 
@@ -1073,7 +1404,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
                     <IconAdd />
                     {copy.create}
                   </DropdownMenuItem>
-                  {!isOverallAgent && (
+                  {!scopedIsOverallAgent && (
                     <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => void requestAgentImport('plaza')}>
                       <Copy />
                       {copy.copyFromMarketplace}
@@ -1083,7 +1414,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
                     <GithubOutlined />
                     {copy.importFromOpenSource}
                   </DropdownMenuItem>
-                  {!isOverallAgent && (
+                  {!scopedIsOverallAgent && (
                     <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => void requestAgentImport('employee')}>
                       <Users />
                       {copy.copyFromEmployee}
@@ -1231,15 +1562,15 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
         loading={deleting}
         title={deleteTarget
           ? copy.deleteTitle
-            .replace('{action}', isOverallAgent ? copy.actionDelete : copy.actionRemove)
+            .replace('{action}', scopedIsOverallAgent ? copy.actionDelete : copy.actionRemove)
             .replace('{name}', deleteTarget.name)
           : ''}
         description={
-          isOverallAgent
+          scopedIsOverallAgent
             ? copy.deleteDescriptionOverall
             : copy.deleteDescriptionScoped
         }
-        confirmText={isOverallAgent ? copy.actionDelete : copy.actionRemove}
+        confirmText={scopedIsOverallAgent ? copy.actionDelete : copy.actionRemove}
         onConfirm={() => void confirmDeleteSkill()}
       />
     </div>
@@ -1701,8 +2032,21 @@ function Field({ label, children }: { label: string; children: ReactNode }) {
   );
 }
 
-function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'edit' } & GeneralSkillPageProps) {
+/** 按租户会话代次隔离技能编辑器状态，防止草稿、文件和运行结果跨租户复用。 */
+function GeneralSkillEditorPage(props: { mode: 'new' | 'edit' } & GeneralSkillPageProps) {
+  const tenantContext = useTenantSession();
+  const tenantScopeKey = tenantContext
+    ? `${tenantContext.tenantId}:${tenantContext.userId}:${tenantContext.generation}`
+    : 'no-tenant';
+  return <GeneralSkillEditorPageContent key={tenantScopeKey} {...props} />;
+}
+
+function GeneralSkillEditorPageContent({ mode, currentUser, onLogout }: { mode: 'new' | 'edit' } & GeneralSkillPageProps) {
   const { t } = useAppIntl();
+  const tenantContext = useTenantSession();
+  const tenantClient = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
+  const tenantId = tenantContext?.tenantId || '';
+  const userId = tenantContext?.userId || '';
   const copy = useGeneralSkillsCopy();
   const navigate = useNavigate();
   const { slug: routeSlug } = useParams();
@@ -1730,7 +2074,9 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
   const [resultExpanded, setResultExpanded] = useState(false);
   const [modelConfigs, setModelConfigs] = useState<ModelConfigRead[]>([]);
   const [selectedRunModelId, setSelectedRunModelId] = useState(
-    () => window.localStorage.getItem(`${GENERAL_SKILL_RUN_MODEL_STORAGE_KEY}:${TENANT_ID}`) || '',
+    () => tenantId && userId
+      ? window.localStorage.getItem(tenantUserStorageKey(tenantId, userId, GENERAL_SKILL_RUN_MODEL_STORAGE_KEY)) || ''
+      : '',
   );
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -1748,7 +2094,9 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
   const [agentImportSourceAgentId, setAgentImportSourceAgentId] = useState('');
   const [agentImportSourceSkills, setAgentImportSourceSkills] = useState<GeneralSkillRead[]>([]);
   const [agentImportSelectedSkillIds, setAgentImportSelectedSkillIds] = useState<string[]>([]);
-  const [agentId, setAgentId] = useState(readEmployeeScope);
+  const [agentId, setAgentId] = useState(
+    () => tenantId && userId ? readEmployeeScope(tenantId, userId) : '',
+  );
   const [isOverallAgent, setIsOverallAgent] = useState(true);
   const [agents, setAgents] = useState<AgentProfileRead[]>([]);
   const [deleteSkillTarget, setDeleteSkillTarget] = useState<GeneralSkillRead | null>(null);
@@ -1765,6 +2113,32 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
   const clawhubAbortRef = useRef<AbortController | null>(null);
   const importPrepareActionRef = useRef<null | (() => void | Promise<void>)>(null);
   const knownFolderPathsRef = useRef<Set<string>>(new Set());
+  const editorLoadControllerRef = useRef<AbortController | null>(null);
+  const editorAgentScopeControllerRef = useRef<AbortController | null>(null);
+  const editorModelControllerRef = useRef<AbortController | null>(null);
+  const editorSaveControllerRef = useRef<AbortController | null>(null);
+  const editorPublishControllerRef = useRef<AbortController | null>(null);
+  const editorDeleteControllerRef = useRef<AbortController | null>(null);
+  const editorImportAgentsControllerRef = useRef<AbortController | null>(null);
+  const editorImportSourceControllerRef = useRef<AbortController | null>(null);
+  const editorImportSubmitControllerRef = useRef<AbortController | null>(null);
+  const editorRunControllerRef = useRef<AbortController | null>(null);
+
+  useEffect(() => () => {
+    [
+      editorLoadControllerRef,
+      editorAgentScopeControllerRef,
+      editorModelControllerRef,
+      editorSaveControllerRef,
+      editorPublishControllerRef,
+      editorDeleteControllerRef,
+      clawhubAbortRef,
+      editorImportAgentsControllerRef,
+      editorImportSourceControllerRef,
+      editorImportSubmitControllerRef,
+      editorRunControllerRef,
+    ].forEach((ref) => ref.current?.abort());
+  }, [tenantContext?.tenantId, tenantContext?.generation]);
 
   const selectedSkill = useMemo(
     () => rows.find((row) => row.slug === selectedSlug),
@@ -1796,10 +2170,19 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
     : (isNew ? copy.pageDescriptionScopedNew : copy.pageDescriptionScopedEdit);
 
   const load = () => {
+    if (!tenantContext) return Promise.resolve();
+    const context = tenantContext;
+    const generation = context.generation;
     const agentSuffix = agentId ? `&agent_id=${encodeURIComponent(agentId)}` : '';
-    return api
-      .get<GeneralSkillRead[]>(`/api/enterprise/general-skills?tenant_id=${TENANT_ID}${agentSuffix}`)
+    editorLoadControllerRef.current?.abort();
+    const controller = new AbortController();
+    editorLoadControllerRef.current = controller;
+    return tenantClient
+      .get<GeneralSkillRead[]>(`/api/enterprise/general-skills?tenant_id=${tenantId}${agentSuffix}`, {
+        signal: controller.signal,
+      })
       .then((items) => {
+        if (!isCurrentTenantRequest(context, generation, controller)) return;
         setRows(items);
         if (mode === 'edit') {
           const target = items.find((item) => item.slug === routeSlug);
@@ -1810,7 +2193,14 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
           }
         }
       })
-      .catch((error) => notify.error(generalSkillsPageErrorMessage(error, copy.loadFailed, t)));
+      .catch((error) => {
+        if (isCurrentTenantRequest(context, generation, controller)) {
+          notify.error(generalSkillsPageErrorMessage(error, copy.loadFailed, t));
+        }
+      })
+      .finally(() => {
+        if (editorLoadControllerRef.current === controller) editorLoadControllerRef.current = null;
+      });
   };
 
   useEffect(() => {
@@ -1818,58 +2208,85 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
   }, [mode]);
 
   useEffect(() => {
-    if (mode === 'new' || (forceGalleryScope && !agentScopeLoaded)) return;
+    if (!tenantContext || mode === 'new' || (forceGalleryScope && !agentScopeLoaded)) return;
     void load();
-  }, [agentId, mode, routeSlug, forceGalleryScope, agentScopeLoaded]);
+  }, [agentId, mode, routeSlug, forceGalleryScope, agentScopeLoaded, tenantContext, tenantClient, tenantId]);
 
   useEffect(() => {
-    api
-      .get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${TENANT_ID}`)
+    if (!tenantContext) return;
+    const context = tenantContext;
+    const generation = context.generation;
+    editorAgentScopeControllerRef.current?.abort();
+    const controller = new AbortController();
+    editorAgentScopeControllerRef.current = controller;
+    tenantClient
+      .get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${tenantId}`, { signal: controller.signal })
       .then((items) => {
+        if (!isCurrentTenantRequest(context, generation, controller)) return;
         setAgents(items);
         const scopedAgent = forceGalleryScope
           ? items.find((item) => item.is_overall)
           : items.find((item) => item.id === agentId);
         if (scopedAgent && scopedAgent.id !== agentId) {
-          window.localStorage.setItem(ENTERPRISE_AGENT_STORAGE_KEY, scopedAgent.id);
+          persistSharedAgentScope(scopedAgent.id, tenantId, userId);
           setAgentId(scopedAgent.id);
         }
         setIsOverallAgent(Boolean(scopedAgent?.is_overall ?? true));
         setAgentScopeLoaded(true);
       })
       .catch(() => {
+        if (!isCurrentTenantRequest(context, generation, controller)) return;
         setIsOverallAgent(true);
         setAgentScopeLoaded(true);
+      })
+      .finally(() => {
+        if (editorAgentScopeControllerRef.current === controller) editorAgentScopeControllerRef.current = null;
       });
-  }, [agentId, forceGalleryScope]);
+    return () => controller.abort();
+  }, [agentId, forceGalleryScope, tenantClient, tenantContext, tenantId, userId]);
 
   useEffect(() => {
-    api
-      .get<ModelConfigRead[]>(`/api/enterprise/model-configs?tenant_id=${TENANT_ID}`)
+    if (!tenantContext) return;
+    const context = tenantContext;
+    const generation = context.generation;
+    editorModelControllerRef.current?.abort();
+    const controller = new AbortController();
+    editorModelControllerRef.current = controller;
+    tenantClient
+      .get<ModelConfigRead[]>(`/api/enterprise/model-configs?tenant_id=${tenantId}`, { signal: controller.signal })
       .then((items) => {
+        if (!isCurrentTenantRequest(context, generation, controller)) return;
         const enabled = items.filter((item) => item.enabled);
         setModelConfigs(enabled);
         setSelectedRunModelId((current) => {
           if (current && enabled.some((item) => item.id === current)) return current;
           const fallback = enabled.find((item) => item.is_default)?.id || enabled[0]?.id || '';
           if (fallback) {
-            window.localStorage.setItem(`${GENERAL_SKILL_RUN_MODEL_STORAGE_KEY}:${TENANT_ID}`, fallback);
+            window.localStorage.setItem(
+              tenantUserStorageKey(tenantId, userId, GENERAL_SKILL_RUN_MODEL_STORAGE_KEY),
+              fallback,
+            );
           }
           return fallback;
         });
       })
-      .catch(() => setModelConfigs([]));
-  }, []);
+      .catch(() => {
+        if (isCurrentTenantRequest(context, generation, controller)) setModelConfigs([]);
+      })
+      .finally(() => {
+        if (editorModelControllerRef.current === controller) editorModelControllerRef.current = null;
+      });
+  }, [tenantClient, tenantContext, tenantId, userId]);
 
   useEffect(() => {
     const onScopeChange = (event: Event) => {
       if (forceGalleryScope) return;
       const next = (event as CustomEvent<{ agentId?: string }>).detail?.agentId || '';
-      setAgentId(next && !isTeamScope(next) ? next : readEmployeeScope());
+      setAgentId(next && !isTeamScope(next) ? next : readEmployeeScope(tenantId, userId));
     };
     window.addEventListener('ultrarag-enterprise-agent-scope-change', onScopeChange);
     return () => window.removeEventListener('ultrarag-enterprise-agent-scope-change', onScopeChange);
-  }, [forceGalleryScope]);
+  }, [forceGalleryScope, tenantId, userId]);
 
   useEffect(() => {
     folderInputRef.current?.setAttribute('webkitdirectory', '');
@@ -1941,10 +2358,16 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
       notify.warning(copy.missingSkillMarkdown);
       return null;
     }
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return null;
+    editorSaveControllerRef.current?.abort();
+    const controller = new AbortController();
+    editorSaveControllerRef.current = controller;
     setSaving(true);
     try {
-      const row = await api.post<GeneralSkillRead>('/api/enterprise/general-skills/import', {
-        tenant_id: TENANT_ID,
+      const row = await tenantClient.post<GeneralSkillRead>('/api/enterprise/general-skills/import', {
+        tenant_id: tenantId,
         agent_id: !isOverallAgent && agentId ? agentId : undefined,
         name: skillName.trim() || undefined,
         slug: editingSlug || skillSlug.trim() || undefined,
@@ -1956,7 +2379,8 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
         directories: skillDirectories,
         status: 'published',
         original_slug: editingSlug || undefined,
-      });
+      }, { signal: controller.signal });
+      if (!isCurrentTenantRequest(context, generation, controller)) return null;
       notify.success(interpolate(editingSlug ? copy.saveUpdated : copy.saveCreated, { name: row.name }));
       setSelectedSlug(row.slug);
       setEditingSlug(row.slug);
@@ -1978,10 +2402,13 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
       navigate(`/enterprise/general-skills/${encodeURIComponent(row.slug)}/edit${scopeQuery}`, { replace: !editingSlug });
       return row;
     } catch (error) {
-      notify.error(generalSkillsPageErrorMessage(error, copy.saveFailed, t));
+      if (isCurrentTenantRequest(context, generation, controller)) {
+        notify.error(generalSkillsPageErrorMessage(error, copy.saveFailed, t));
+      }
       return null;
     } finally {
-      setSaving(false);
+      if (editorSaveControllerRef.current === controller) editorSaveControllerRef.current = null;
+      if (isCurrentTenantRequest(context, generation, controller)) setSaving(false);
     }
   }
 
@@ -2046,15 +2473,28 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
       notify.error(copy.adminOnlyEdit);
       return;
     }
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
+    editorPublishControllerRef.current?.abort();
+    const controller = new AbortController();
+    editorPublishControllerRef.current = controller;
     try {
       const agentSuffix = agentId ? `&agent_id=${encodeURIComponent(agentId)}` : '';
-      const next = await api.post<GeneralSkillRead>(
-        `/api/enterprise/general-skills/${row.slug}/${published ? 'publish' : 'archive'}?tenant_id=${TENANT_ID}${agentSuffix}`,
+      const next = await tenantClient.post<GeneralSkillRead>(
+        `/api/enterprise/general-skills/${row.slug}/${published ? 'publish' : 'archive'}?tenant_id=${tenantId}${agentSuffix}`,
+        undefined,
+        { signal: controller.signal },
       );
+      if (!isCurrentTenantRequest(context, generation, controller)) return;
       replaceRow(next);
       notify.success(published ? copy.enabledSuccess : copy.archivedSuccess);
     } catch (error) {
-      notify.error(generalSkillsPageErrorMessage(error, published ? copy.enableFailed : copy.archiveFailed, t));
+      if (isCurrentTenantRequest(context, generation, controller)) {
+        notify.error(generalSkillsPageErrorMessage(error, published ? copy.enableFailed : copy.archiveFailed, t));
+      }
+    } finally {
+      if (editorPublishControllerRef.current === controller) editorPublishControllerRef.current = null;
     }
   }
 
@@ -2066,9 +2506,20 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
       return;
     }
     const branchMode = !isOverallAgent;
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
+    editorDeleteControllerRef.current?.abort();
+    const controller = new AbortController();
+    editorDeleteControllerRef.current = controller;
     try {
       const agentSuffix = agentId ? `&agent_id=${encodeURIComponent(agentId)}` : '';
-      await api.delete(`/api/enterprise/general-skills/${row.slug}?tenant_id=${TENANT_ID}${agentSuffix}`);
+      await tenantClient.delete(
+        `/api/enterprise/general-skills/${row.slug}?tenant_id=${tenantId}${agentSuffix}`,
+        undefined,
+        { signal: controller.signal },
+      );
+      if (!isCurrentTenantRequest(context, generation, controller)) return;
       const nextRows = rows.filter((item) => item.id !== row.id);
       setRows(nextRows);
       if (selectedSlug === row.slug || editingSlug === row.slug) {
@@ -2083,9 +2534,12 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
       }
       notify.success(branchMode ? copy.removedSuccess : copy.deletedSuccess);
     } catch (error) {
-      notify.error(generalSkillsPageErrorMessage(error, branchMode ? copy.removeFailed : copy.deleteSkillFailed, t));
+      if (isCurrentTenantRequest(context, generation, controller)) {
+        notify.error(generalSkillsPageErrorMessage(error, branchMode ? copy.removeFailed : copy.deleteSkillFailed, t));
+      }
     } finally {
-      setDeleteSkillTarget(null);
+      if (editorDeleteControllerRef.current === controller) editorDeleteControllerRef.current = null;
+      if (isCurrentTenantRequest(context, generation, controller)) setDeleteSkillTarget(null);
     }
   }
 
@@ -2151,8 +2605,17 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
 
   function requestAgentImport(mode: GeneralSkillImportMode) {
     void withImportPreparation(async () => {
+      const context = tenantContext;
+      const generation = context?.generation;
+      if (!context || generation === undefined) return;
+      editorImportAgentsControllerRef.current?.abort();
+      const controller = new AbortController();
+      editorImportAgentsControllerRef.current = controller;
       try {
-        const agents = await api.get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${TENANT_ID}`);
+        const agents = await tenantClient.get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${tenantId}`, {
+          signal: controller.signal,
+        });
+        if (!isCurrentTenantRequest(context, generation, controller)) return;
         const firstSource = mode === 'plaza'
           ? openGalleryAgentId(agents)
           : visibleEmployeeAgents(agents, currentUser, { activeOnly: true, excludeAgentId: agentId })[0]?.id || '';
@@ -2163,31 +2626,57 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
         setAgentImportOpen(true);
         if (firstSource) {
           await loadAgentImportSourceSkills(firstSource);
+          if (!isCurrentTenantRequest(context, generation, controller)) return;
         } else {
           setAgentImportSourceSkills([]);
         }
       } catch (error) {
-        notify.error(generalSkillsPageErrorMessage(error, copy.loadAgentsFailed, t));
+        if (isCurrentTenantRequest(context, generation, controller)) {
+          notify.error(generalSkillsPageErrorMessage(error, copy.loadAgentsFailed, t));
+        }
+      } finally {
+        if (editorImportAgentsControllerRef.current === controller) editorImportAgentsControllerRef.current = null;
       }
     });
   }
 
   async function loadAgentImportSourceSkills(sourceAgentId: string) {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return [];
+    editorImportSourceControllerRef.current?.abort();
+    const controller = new AbortController();
+    editorImportSourceControllerRef.current = controller;
     setAgentImportSourceSkills([]);
     setAgentImportSelectedSkillIds([]);
-    if (!sourceAgentId) return;
+    if (!sourceAgentId) {
+      editorImportSourceControllerRef.current = null;
+      return [];
+    }
     try {
-      const sourceRows = await api.get<GeneralSkillRead[]>(
-        `/api/enterprise/general-skills?tenant_id=${TENANT_ID}&agent_id=${encodeURIComponent(sourceAgentId)}`,
+      const sourceRows = await tenantClient.get<GeneralSkillRead[]>(
+        `/api/enterprise/general-skills?tenant_id=${tenantId}&agent_id=${encodeURIComponent(sourceAgentId)}`,
+        { signal: controller.signal },
       );
+      if (!isCurrentTenantRequest(context, generation, controller)) return [];
       const existingIds = new Set(rows.map((item) => item.id));
-      setAgentImportSourceSkills(sourceRows.filter((item) => item.status === 'published' && !existingIds.has(item.id)));
+      const publishedRows = sourceRows.filter((item) => item.status === 'published' && !existingIds.has(item.id));
+      setAgentImportSourceSkills(publishedRows);
+      return publishedRows;
     } catch (error) {
-      notify.error(generalSkillsPageErrorMessage(error, copy.loadSourceSkillsFailed, t));
+      if (isCurrentTenantRequest(context, generation, controller)) {
+        notify.error(generalSkillsPageErrorMessage(error, copy.loadSourceSkillsFailed, t));
+      }
+      return [];
+    } finally {
+      if (editorImportSourceControllerRef.current === controller) editorImportSourceControllerRef.current = null;
     }
   }
 
   async function submitAgentImportSkills() {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     if (!agentId) {
       notify.warning(copy.selectEmployeeFirst);
       return;
@@ -2200,21 +2689,28 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
       notify.warning(copy.selectSkillsFirst);
       return;
     }
+    editorImportSubmitControllerRef.current?.abort();
+    const controller = new AbortController();
+    editorImportSubmitControllerRef.current = controller;
     setAgentImportLoading(true);
     try {
-      await api.post(`/api/enterprise/agents/${encodeURIComponent(agentId)}/resources/import`, {
-        tenant_id: TENANT_ID,
+      await tenantClient.post(`/api/enterprise/agents/${encodeURIComponent(agentId)}/resources/import`, {
+        tenant_id: tenantId,
         source_agent_id: agentImportSourceAgentId,
         resource_type: 'general_skill',
         resource_ids: agentImportSelectedSkillIds,
-      });
+      }, { signal: controller.signal });
+      if (!isCurrentTenantRequest(context, generation, controller)) return;
       notify.success(interpolate(copy.copiedSkillsSuccess, { count: agentImportSelectedSkillIds.length }));
       setAgentImportOpen(false);
       await load();
     } catch (error) {
-      notify.error(generalSkillsPageErrorMessage(error, copy.copySkillsFailed, t));
+      if (isCurrentTenantRequest(context, generation, controller)) {
+        notify.error(generalSkillsPageErrorMessage(error, copy.copySkillsFailed, t));
+      }
     } finally {
-      setAgentImportLoading(false);
+      if (editorImportSubmitControllerRef.current === controller) editorImportSubmitControllerRef.current = null;
+      if (isCurrentTenantRequest(context, generation, controller)) setAgentImportLoading(false);
     }
   }
 
@@ -2223,18 +2719,21 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
       notify.warning(copy.enterOpenSourceUrl);
       return;
     }
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     const controller = new AbortController();
     clawhubAbortRef.current?.abort();
     clawhubAbortRef.current = controller;
     setClawhubLoading(true);
     try {
-      const row = await api.postWithSignal<GeneralSkillRead>('/api/enterprise/general-skills/import-skillhub', {
-        tenant_id: TENANT_ID,
+      const row = await tenantClient.postWithSignal<GeneralSkillRead>('/api/enterprise/general-skills/import-skillhub', {
+        tenant_id: tenantId,
         agent_id: !isOverallAgent && agentId ? agentId : undefined,
         source: clawhubSource.trim(),
         status: 'published',
       }, controller.signal);
-      if (controller.signal.aborted) return;
+      if (!isCurrentTenantRequest(context, generation, controller)) return;
       notify.success(interpolate(copy.importedOpenSourceSuccess, { name: row.name }));
       setRows((current) => [row, ...current.filter((item) => item.id !== row.id && item.slug !== row.slug)]);
       setSelectedSlug(row.slug);
@@ -2242,6 +2741,7 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
       setClawhubModalOpen(false);
       void load();
     } catch (error) {
+      if (!isCurrentTenantRequest(context, generation, controller)) return;
       if (isAbortError(error)) {
         notify.info(copy.importCanceled);
         return;
@@ -2250,27 +2750,30 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
     } finally {
       if (clawhubAbortRef.current === controller) {
         clawhubAbortRef.current = null;
-        setClawhubLoading(false);
+        if (isCurrentTenantRequest(context, generation, controller)) setClawhubLoading(false);
       }
     }
   }
 
   async function importSkillPackageFile(file: File) {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     const controller = new AbortController();
     clawhubAbortRef.current?.abort();
     clawhubAbortRef.current = controller;
     setClawhubLoading(true);
     try {
       const contentBase64 = await fileToBase64(file);
-      if (controller.signal.aborted) return;
-      const row = await api.postWithSignal<GeneralSkillRead>('/api/enterprise/general-skills/import-package', {
-        tenant_id: TENANT_ID,
+      if (!isCurrentTenantRequest(context, generation, controller)) return;
+      const row = await tenantClient.postWithSignal<GeneralSkillRead>('/api/enterprise/general-skills/import-package', {
+        tenant_id: tenantId,
         agent_id: !isOverallAgent && agentId ? agentId : undefined,
         filename: file.name,
         content_base64: contentBase64,
         status: 'published',
       }, controller.signal);
-      if (controller.signal.aborted) return;
+      if (!isCurrentTenantRequest(context, generation, controller)) return;
       notify.success(interpolate(copy.uploadPackageSuccess, { name: row.name }));
       setRows((current) => [row, ...current.filter((item) => item.id !== row.id && item.slug !== row.slug)]);
       setSelectedSlug(row.slug);
@@ -2278,6 +2781,7 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
       setClawhubModalOpen(false);
       void load();
     } catch (error) {
+      if (!isCurrentTenantRequest(context, generation, controller)) return;
       if (isAbortError(error)) {
         notify.info(copy.importCanceled);
         return;
@@ -2286,7 +2790,7 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
     } finally {
       if (clawhubAbortRef.current === controller) {
         clawhubAbortRef.current = null;
-        setClawhubLoading(false);
+        if (isCurrentTenantRequest(context, generation, controller)) setClawhubLoading(false);
       }
     }
   }
@@ -2512,6 +3016,16 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
       notify.warning(copy.enterTestQuery);
       return;
     }
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
+    editorRunControllerRef.current?.abort();
+    const controller = new AbortController();
+    editorRunControllerRef.current = controller;
+    const isCurrentGeneration = () => (
+      !context.signal.aborted && context.isCurrentGeneration(generation)
+    );
+    const isCurrentRequest = () => isCurrentTenantRequest(context, generation, controller);
     setResultExpanded(true);
     setLoading(true);
     setRunResult(null);
@@ -2524,21 +3038,22 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
       structured_result: {},
       reply: '',
     });
-    const controller = new AbortController();
     let timedOut = false;
     let debugSessionId = '';
     let debugTurnId = '';
     const receivedTrace: Record<string, unknown>[] = [];
     let timeoutId = 0;
     const resetIdleTimeout = () => {
+      if (!isCurrentRequest()) return;
       window.clearTimeout(timeoutId);
       timeoutId = window.setTimeout(() => {
+        if (!isCurrentGeneration()) return;
         timedOut = true;
         if (debugSessionId && debugTurnId) {
-          void api.post(`/api/chat/sessions/${debugSessionId}/cancel`, {
-            tenant_id: TENANT_ID,
+          void tenantClient.post(`/api/chat/sessions/${debugSessionId}/cancel`, {
+            tenant_id: tenantId,
             turn_id: debugTurnId,
-          }).catch(() => undefined);
+          }, { signal: controller.signal }).catch(() => undefined);
         }
         controller.abort();
       }, GENERAL_SKILL_RUN_IDLE_TIMEOUT_MS);
@@ -2546,17 +3061,19 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
     resetIdleTimeout();
     try {
       let completed = false;
-      await streamPost(
+      await streamTenantPost(
+        context,
         `/api/enterprise/general-skills/${slug}/run/stream`,
         {
-          tenant_id: TENANT_ID,
+          tenant_id: tenantId,
           agent_id: agentId || undefined,
-          user_id: 'enterprise_demo',
+          user_id: userId,
           query,
           model_config_id: selectedRunModelId || undefined,
           max_attempts: 10,
         },
         (item) => {
+          if (!isCurrentRequest()) return;
           resetIdleTimeout();
           if (item.event === 'stream_started') {
             debugSessionId = typeof item.data.session_id === 'string' ? item.data.session_id : '';
@@ -2616,23 +3133,29 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
         },
         controller.signal,
       );
-      if (!completed) {
+      if (!completed && isCurrentRequest()) {
         notify.warning(copy.runStreamEnded);
       }
     } catch (error) {
+      if (!isCurrentGeneration() || controller.signal.aborted) return;
       const text = timedOut
         ? copy.runTimedOut
         : generalSkillsPageErrorMessage(error, copy.runFailed, t);
-      setLiveResult((current) => ({
-        ...(current || { skill_slug: slug, execution_trace: [] }),
-        stderr: text,
-        structured_result: { success: false, error: text },
-        reply: copy.runFailed,
-      }));
-      notify.error(text);
+      if (isCurrentRequest()) {
+        setLiveResult((current) => ({
+          ...(current || { skill_slug: slug, execution_trace: [] }),
+          stderr: text,
+          structured_result: { success: false, error: text },
+          reply: copy.runFailed,
+        }));
+        notify.error(text);
+      }
     } finally {
       window.clearTimeout(timeoutId);
-      setLoading(false);
+      if (editorRunControllerRef.current === controller) {
+        editorRunControllerRef.current = null;
+        if (isCurrentGeneration()) setLoading(false);
+      }
     }
   }
 
@@ -2879,7 +3402,10 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
                   value={selectedRunModelId}
                   onChange={(modelId) => {
                     setSelectedRunModelId(modelId);
-                    window.localStorage.setItem(`${GENERAL_SKILL_RUN_MODEL_STORAGE_KEY}:${TENANT_ID}`, modelId);
+                    window.localStorage.setItem(
+                      tenantUserStorageKey(tenantId, userId, GENERAL_SKILL_RUN_MODEL_STORAGE_KEY),
+                      modelId,
+                    );
                   }}
                 />
                 <UIButton disabled={loading || !selectedSkill?.slug} className={PRIMARY_BUTTON_CLASS} onClick={() => void runSkill()}>

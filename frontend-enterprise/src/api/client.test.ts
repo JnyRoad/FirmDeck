@@ -2,7 +2,34 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { ApiError, GENERIC_ERROR_MESSAGE, wechatKfApi } from './client';
+import { ENTERPRISE_AUTH_STORAGE_KEY } from '../auth';
+import {
+  ApiError,
+  GENERIC_ERROR_MESSAGE,
+  api,
+  streamPost,
+  uploadChatAttachments,
+  wechatKfApi,
+} from './client';
+
+const strictTenantSession = {
+  token: 'tenant-token-a',
+  scope: 'tenant' as const,
+  tenant: {
+    id: 'tenant-a',
+    slug: 'alpha-lab',
+    display_name: 'Alpha Lab',
+  },
+  user: {
+    id: 'tenant-a-admin',
+    tenant_id: 'tenant-a',
+    username: 'admin',
+    display_name: 'Alpha Operator',
+    role: 'admin' as const,
+    must_change_password: false,
+    avatar_url: null,
+  },
+};
 
 type ErrorField = 'params' | 'retryable' | 'request_id' | 'trace_id';
 
@@ -144,6 +171,7 @@ describe('ApiError', () => {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  window.localStorage.clear();
 });
 
 describe('WeChat Customer Service API client', () => {
@@ -222,5 +250,106 @@ describe('WeChat Customer Service API client', () => {
     expect(calls[7]?.body).toBeInstanceOf(FormData);
     expect(calls[7]?.headers).not.toHaveProperty('Content-Type');
     expect(calls[7]?.credentials).toBe('include');
+  });
+});
+
+describe('common API transport', () => {
+  it('preserves server-derived login fields without appending the deployment tenant constant', async () => {
+    const payload = {
+      tenant_slug: 'alpha-lab',
+      username: 'admin',
+      password: 'opaque password bytes  \u0000  preserved',
+    };
+    const fetchMock = vi.fn<typeof fetch>(async () => ({
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      text: async () => JSON.stringify({ token: 'tenant-token' }),
+    } as Response));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await api.post('/api/auth/login', payload);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/auth/login');
+    const init = fetchMock.mock.calls[0][1] as RequestInit;
+    expect(init.body).toBe(JSON.stringify(payload));
+    expect(String(init.body)).not.toContain('tenant_demo');
+  });
+
+  it('uses the verified tenant identity for attachment uploads without the deployment tenant constant', async () => {
+    window.localStorage.setItem(ENTERPRISE_AUTH_STORAGE_KEY, JSON.stringify(strictTenantSession));
+    const fetchMock = vi.fn<typeof fetch>(async () => ({
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      json: async () => [],
+    } as Response));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await uploadChatAttachments(
+      'tenant-a',
+      [new File(['tenant A attachment'], 'a.txt', { type: 'text/plain' })],
+    );
+
+    const [input, init] = fetchMock.mock.calls[0];
+    const parsed = new URL(String(input), window.location.origin);
+    expect(parsed.pathname).toBe('/api/chat/attachments');
+    expect(parsed.searchParams.get('tenant_id')).toBe('tenant-a');
+    expect(String(input)).not.toContain('tenant_demo');
+    expect(init?.headers).toEqual(expect.objectContaining({
+      Authorization: 'Bearer tenant-token-a',
+    }));
+    expect(init?.body).toBeInstanceOf(FormData);
+  });
+
+  it('uses the verified tenant identity for chat streams without appending the deployment tenant constant', async () => {
+    window.localStorage.setItem(ENTERPRISE_AUTH_STORAGE_KEY, JSON.stringify(strictTenantSession));
+    const reader = { read: vi.fn().mockResolvedValue({ done: true, value: undefined }) };
+    const fetchMock = vi.fn<typeof fetch>(async () => ({
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      body: { getReader: () => reader },
+    } as unknown as Response));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await streamPost(
+      '/api/chat/stream',
+      { tenant_id: 'tenant-a', message: 'tenant A message' },
+      vi.fn(),
+    );
+
+    const [input, init] = fetchMock.mock.calls[0];
+    expect(input).toBe('/api/chat/stream');
+    expect(init?.headers).toEqual(expect.objectContaining({
+      Authorization: 'Bearer tenant-token-a',
+    }));
+    expect(JSON.parse(String(init?.body))).toEqual({
+      tenant_id: 'tenant-a',
+      message: 'tenant A message',
+    });
+    expect(String(init?.body)).not.toContain('tenant_demo');
+  });
+
+  it('does not authorize a common request from a malformed legacy token-only session', async () => {
+    window.localStorage.setItem(ENTERPRISE_AUTH_STORAGE_KEY, JSON.stringify({
+      token: 'legacy-token',
+      user: { tenant_id: 'tenant-a' },
+    }));
+    const fetchMock = vi.fn<typeof fetch>(async () => ({
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      text: async () => JSON.stringify({ ok: true }),
+    } as Response));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await api.get('/api/enterprise/agents');
+
+    const init = fetchMock.mock.calls[0]?.[1] as RequestInit;
+    expect(init.headers).not.toEqual(expect.objectContaining({
+      Authorization: 'Bearer legacy-token',
+    }));
   });
 });

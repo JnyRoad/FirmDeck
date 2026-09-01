@@ -11,8 +11,9 @@ import IconSearch from '../assets/icons/search.svg?react';
 import { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 
-import { api, TENANT_ID } from '../api/client';
+import { createTenantClient } from '../api/tenant-client';
 import { type EnterpriseAuthUser } from '../auth';
+import { useTenantSession } from '../contexts/TenantSessionContext';
 
 import AppHeader from '../components/AppHeader';
 import { ConfirmDialog } from '../components/ConfirmDialog';
@@ -27,10 +28,8 @@ import {
   employeeDisplayNameWithCreator,
   employeeProfile,
 } from '../employee';
-import { emitAgentScopeChange, isTeamScope, persistSharedAgentScope, readEmployeeScope } from '../lib/agent-scope-storage';
+import { clearSharedAgentScope, emitAgentScopeChange, isTeamScope, persistSharedAgentScope, readEmployeeScope } from '../lib/agent-scope-storage';
 import type { AgentProfileRead } from '../types';
-
-const ENTERPRISE_AGENT_STORAGE_KEY = 'ultrarag_enterprise_agent_scope';
 
 /** 按 locale 生成统计卡片的次级计数字符串，不把数字硬编码到固定语言片段里。 */
 function onlineSummary(count: number, translate: ReturnType<typeof useAppIntl>['t']): string {
@@ -49,6 +48,8 @@ export default function AgentsPage({
   onLogout?: () => void;
 }) {
   const { t } = useAppIntl();
+  const tenantContext = useTenantSession();
+  const tenantApi = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
   const [agents, setAgents] = useState<AgentProfileRead[]>([]);
   const [loading, setLoading] = useState(false);
   const [avatarAgent, setAvatarAgent] = useState<AgentProfileRead | null>(null);
@@ -59,37 +60,64 @@ export default function AgentsPage({
   const [selectingAgentId, setSelectingAgentId] = useState<string | null>(null);
   const [searchTerm, setSearchTerm] = useState('');
   const [employeeFilter, setEmployeeFilter] = useState<'all' | 'online' | 'offline' | 'pending'>('all');
-  const [selectedAgentId, setSelectedAgentId] = useState<string | null>(
-    () => readEmployeeScope() || null,
-  );
+  const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
   const navigate = useNavigate();
 
   async function load() {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     setLoading(true);
     try {
-      const rows = await api.get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${TENANT_ID}`);
+      const rows = await tenantApi.get<AgentProfileRead[]>('/api/enterprise/agents');
+      if (!context.isCurrentGeneration(generation)) return;
       setAgents(rows);
     } catch (error) {
-      notify.error(apiErrorMessage(error, 'common.error.generic') === 'common.error.generic'
+      if (!context.isCurrentGeneration(generation)) return;
+      const message = apiErrorMessage(error, 'common.error.generic', { t });
+      notify.error(message === t('common.error.generic')
         ? t('agentsPage.toast.loadFailed')
-        : apiErrorMessage(error, 'common.error.generic'));
+        : message);
     } finally {
-      setLoading(false);
+      if (context.isCurrentGeneration(generation)) setLoading(false);
     }
   }
 
   useEffect(() => {
     void load();
-  }, []);
+  }, [tenantApi]);
+
+  // Do not keep tenant-A employees or open editors visible during the
+  // provider's verification gap when the tenant session is replaced.
+  useEffect(() => {
+    if (tenantContext) return;
+    setAgents([]);
+    setSelectedAgentId(null);
+    setAvatarAgent(null);
+    setProfileAgent(null);
+    setApiKeyAgent(null);
+    setDeleteTarget(null);
+    setLoading(false);
+  }, [tenantContext]);
 
   useEffect(() => {
+    if (!tenantContext) {
+      setSelectedAgentId(null);
+      return undefined;
+    }
+    const context = tenantContext;
+    setSelectedAgentId(readEmployeeScope(context.tenantId, context.userId) || null);
     const handler = (event: Event) => {
       const next = (event as CustomEvent<{ agentId?: string }>).detail?.agentId || '';
-      setSelectedAgentId(next && !isTeamScope(next) ? next : readEmployeeScope() || null);
+      setSelectedAgentId(
+        next && !isTeamScope(next)
+          ? next
+          : readEmployeeScope(context.tenantId, context.userId) || null,
+      );
     };
     window.addEventListener('ultrarag-enterprise-agent-scope-change', handler);
     return () => window.removeEventListener('ultrarag-enterprise-agent-scope-change', handler);
-  }, []);
+  }, [tenantContext]);
 
   const employees = useMemo(
     () => agents.filter((item) => !item.is_overall && canManageEmployeeAgent(item, currentUser)),
@@ -124,26 +152,33 @@ export default function AgentsPage({
 
   async function selectEmployee(row: AgentProfileRead) {
     if (selectingAgentId) return;
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     setSelectingAgentId(row.id);
     try {
       let selectedRow = row;
       if (!canSelectCurrentEmployeeAgent(row, currentUser, { activeOnly: true })) {
-        selectedRow = await api.post<AgentProfileRead>(
-          `/api/chat/agents/${encodeURIComponent(row.id)}/use?tenant_id=${TENANT_ID}`,
+        selectedRow = await tenantApi.post<AgentProfileRead>(
+          `/api/chat/agents/${encodeURIComponent(row.id)}/use`,
           {},
         );
+        if (!context.isCurrentGeneration(generation)) return;
         updateAgentInList(selectedRow);
       }
+      if (!context.isCurrentGeneration(generation)) return;
       setSelectedAgentId(selectedRow.id);
-      persistSharedAgentScope(selectedRow.id, currentUser?.id);
+      persistSharedAgentScope(selectedRow.id, context.tenantId, context.userId);
       emitAgentScopeChange(selectedRow.id);
       navigate('/enterprise/dashboard');
     } catch (error) {
-      notify.error(apiErrorMessage(error, 'common.error.generic') === 'common.error.generic'
+      if (!context.isCurrentGeneration(generation)) return;
+      const message = apiErrorMessage(error, 'common.error.generic', { t });
+      notify.error(message === t('common.error.generic')
         ? t('agentsPage.toast.loadFailed')
-        : apiErrorMessage(error, 'common.error.generic'));
+        : message);
     } finally {
-      setSelectingAgentId(null);
+      if (context.isCurrentGeneration(generation)) setSelectingAgentId(null);
     }
   }
 
@@ -152,23 +187,31 @@ export default function AgentsPage({
   }
 
   async function updateStatus(row: AgentProfileRead, status: 'active' | 'archived') {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     try {
-      await api.put<AgentProfileRead>(`/api/enterprise/agents/${row.id}`, {
-        tenant_id: TENANT_ID,
+      await tenantApi.put<AgentProfileRead>(`/api/enterprise/agents/${row.id}`, {
         status,
         metadata: row.metadata || {},
       });
+      if (!context.isCurrentGeneration(generation)) return;
       notify.success(status === 'active' ? t('agentsPage.toast.published') : t('agentsPage.toast.archived'));
       await load();
       window.dispatchEvent(new Event('ultrarag-enterprise-agent-scope-refresh'));
     } catch (error) {
-      notify.error(apiErrorMessage(error, 'common.error.generic') === 'common.error.generic'
+      if (!context.isCurrentGeneration(generation)) return;
+      const message = apiErrorMessage(error, 'common.error.generic', { t });
+      notify.error(message === t('common.error.generic')
         ? t('agentsPage.toast.updateStatusFailed')
-        : apiErrorMessage(error, 'common.error.generic'));
+        : message);
     }
   }
 
   async function updateGalleryState(row: AgentProfileRead, published: boolean) {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     try {
       const metadata = {
         ...(row.metadata || {}),
@@ -176,10 +219,10 @@ export default function AgentsPage({
         gallery_published_at: published ? new Date().toISOString() : undefined,
         gallery_published_by: published ? currentUser?.username : undefined,
       };
-      await api.put<AgentProfileRead>(`/api/enterprise/agents/${row.id}`, {
-        tenant_id: TENANT_ID,
+      await tenantApi.put<AgentProfileRead>(`/api/enterprise/agents/${row.id}`, {
         metadata,
       });
+      if (!context.isCurrentGeneration(generation)) return;
       notify.success(
         published
           ? t('agentsPage.toast.marketplacePublished')
@@ -188,26 +231,32 @@ export default function AgentsPage({
       await load();
       window.dispatchEvent(new Event('ultrarag-enterprise-agent-scope-refresh'));
     } catch (error) {
-      notify.error(apiErrorMessage(error, 'common.error.generic') === 'common.error.generic'
+      if (!context.isCurrentGeneration(generation)) return;
+      const message = apiErrorMessage(error, 'common.error.generic', { t });
+      notify.error(message === t('common.error.generic')
         ? t('agentsPage.toast.updateMarketplaceFailed')
-        : apiErrorMessage(error, 'common.error.generic'));
+        : message);
     }
   }
 
   async function confirmDelete() {
     const row = deleteTarget;
     if (!row) return;
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     setDeleting(true);
     try {
-      await api.delete(`/api/enterprise/agents/${row.id}?tenant_id=${TENANT_ID}`);
-      if (readEmployeeScope() === row.id) {
+      await tenantApi.delete(`/api/enterprise/agents/${row.id}`);
+      if (!context.isCurrentGeneration(generation)) return;
+      if (readEmployeeScope(context.tenantId, context.userId) === row.id) {
         const nextAgent = employees.find((item) => item.id !== row.id && item.status === 'active')
           || employees.find((item) => item.id !== row.id);
         if (nextAgent) {
-          window.localStorage.setItem(ENTERPRISE_AGENT_STORAGE_KEY, nextAgent.id);
+          persistSharedAgentScope(nextAgent.id, context.tenantId, context.userId);
           window.dispatchEvent(new CustomEvent('ultrarag-enterprise-agent-scope-change', { detail: { agentId: nextAgent.id } }));
         } else {
-          window.localStorage.removeItem(ENTERPRISE_AGENT_STORAGE_KEY);
+          clearSharedAgentScope(context.tenantId, context.userId);
           window.dispatchEvent(new CustomEvent('ultrarag-enterprise-agent-scope-change', { detail: { agentId: '' } }));
         }
       }
@@ -216,11 +265,13 @@ export default function AgentsPage({
       await load();
       window.dispatchEvent(new Event('ultrarag-enterprise-agent-scope-refresh'));
     } catch (error) {
-      notify.error(apiErrorMessage(error, 'common.error.generic') === 'common.error.generic'
+      if (!context.isCurrentGeneration(generation)) return;
+      const message = apiErrorMessage(error, 'common.error.generic', { t });
+      notify.error(message === t('common.error.generic')
         ? t('agentsPage.toast.deleteFailed')
-        : apiErrorMessage(error, 'common.error.generic'));
+        : message);
     } finally {
-      setDeleting(false);
+      if (context.isCurrentGeneration(generation)) setDeleting(false);
     }
   }
 

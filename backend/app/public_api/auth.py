@@ -1,23 +1,23 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import hashlib
 import hmac
 import secrets
+from dataclasses import dataclass
 from typing import Annotated, Callable
 
-from fastapi import Depends, Request
+from fastapi import Depends, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlmodel import Session, select
 
 from app.config import get_settings
 from app.db import get_session
-from app.db.models import APIClient, APICredential, AgentProfile, User, utc_now
+from app.db.models import AgentProfile, APIClient, APICredential, User, utc_now
 from app.public_api.credential_profiles import USER_FULL_ACCESS_SCOPES
 from app.public_api.errors import PublicAPIError
-from app.security.auth import _decode_token
+from app.security.auth import authenticate_tenant_token
 from app.security.permissions import agent_owned_by_user, is_admin_user
-
+from app.security.tenant import TenantExecutionKind, TenantLifecycleDenied, require_active_tenant
 
 PUBLIC_KEY_PREFIX = "sd_live_"
 _security = HTTPBearer(auto_error=False)
@@ -78,6 +78,30 @@ def _api_key_principal(token: str, db: Session) -> PublicPrincipal:
     actor = db.get(User, client.created_by_user_id or "")
     if not actor or actor.tenant_id != client.tenant_id:
         raise PublicAPIError(401, "API_CLIENT_OWNER_MISSING", "The API client owner is unavailable.")
+    try:
+        require_active_tenant(
+            db,
+            client.tenant_id,
+            TenantExecutionKind.JOB_CLAIM,
+            f"public-api-key:{credential.id}",
+        )
+    except TenantLifecycleDenied as exc:
+        # The lifecycle decision must precede last_used_at mutation.  Keep suspension explicit,
+        # while storage/corrupt-state failures fail closed without revealing tenant internals.
+        if exc.code == "TENANT_SUSPENDED":
+            raise PublicAPIError(403, "TENANT_SUSPENDED", "The tenant is suspended.") from None
+        if exc.code == "TENANT_NOT_FOUND":
+            raise PublicAPIError(
+                403,
+                "TENANT_NOT_FOUND",
+                "The tenant is unavailable.",
+                params={"tenant_id": client.tenant_id},
+            ) from None
+        raise PublicAPIError(
+            503,
+            "TENANT_LIFECYCLE_CHECK_FAILED",
+            "The tenant lifecycle is unavailable.",
+        ) from None
     credential.last_used_at = now
     credential.updated_at = now
     db.add(credential)
@@ -144,10 +168,23 @@ def _agent_access_sets(
 
 
 def _bootstrap_principal(token: str, db: Session) -> PublicPrincipal:
-    payload = _decode_token(token)
-    user = db.get(User, str(payload.get("user_id") or ""))
-    if not user or user.tenant_id != payload.get("tenant_id"):
-        raise PublicAPIError(401, "INVALID_USER_TOKEN", "The user token is invalid.")
+    try:
+        user = authenticate_tenant_token(token, db)
+    except HTTPException as exc:
+        code = exc.detail.get("code") if isinstance(exc.detail, dict) else None
+        if code == "TEMPORARY_PASSWORD_CHANGE_REQUIRED":
+            raise PublicAPIError(
+                exc.status_code,
+                "TEMPORARY_PASSWORD_CHANGE_REQUIRED",
+                "TEMPORARY_PASSWORD_CHANGE_REQUIRED",
+            ) from None
+        if code == "TENANT_SUSPENDED":
+            raise PublicAPIError(
+                exc.status_code,
+                "TENANT_SUSPENDED",
+                "TENANT_SUSPENDED",
+            ) from None
+        raise PublicAPIError(401, "INVALID_USER_TOKEN", "The user token is invalid.") from None
     if not is_admin_user(user):
         raise PublicAPIError(403, "ADMIN_REQUIRED", "Tenant administrator access is required.")
     return PublicPrincipal(

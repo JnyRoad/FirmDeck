@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import pytest
 from sqlalchemy.pool import StaticPool
-from sqlmodel import Session, SQLModel, create_engine
+from sqlmodel import Session, SQLModel, create_engine, select
 
 from app.core.harness_turn_store import (
     HarnessTurnConflict,
@@ -9,7 +10,7 @@ from app.core.harness_turn_store import (
     _request_digest,
 )
 from app.core.harness_v2_engine import _with_recoverable_first_session
-from app.db.models import ChatSession
+from app.db.models import ChatSession, HarnessTurnRecord, Tenant
 from app.i18n.language_context import SupportedLocale
 from app.session.session_schema import (
     ChatTurnRequest,
@@ -294,3 +295,53 @@ def test_legacy_turn_request_remains_usable_without_explicit_locale_fields() -> 
             "ui_locale_source": "legacy_default",
             "agent_reply_locale_source": "legacy_default",
         }
+
+
+def test_turn_receipt_claim_binds_the_authoritative_tenant_lifecycle_version() -> None:
+    """A durable turn receipt must retain the active tenant version used at admission."""
+    engine = _engine()
+    with Session(engine) as db:
+        db.add(
+            Tenant(
+                id="tenant-demo",
+                name="Demo",
+                status="active",
+                lifecycle_version=7,
+            )
+        )
+        session = ChatSession(id="session-1", tenant_id="tenant-demo")
+        db.add(session)
+        db.commit()
+
+        claim = HarnessTurnStore(db).claim(session, _request()).record
+
+        assert claim is not None
+        assert claim.tenant_lifecycle_version == 7
+
+
+def test_suspended_tenant_cannot_create_a_new_turn_receipt() -> None:
+    """Suspension must deny turn admission before a receipt or session mutation is committed."""
+    engine = _engine()
+    with Session(engine) as db:
+        db.add(
+            Tenant(
+                id="tenant-demo",
+                name="Demo",
+                status="suspended",
+                lifecycle_version=8,
+            )
+        )
+        session = ChatSession(id="session-1", tenant_id="tenant-demo")
+        db.add(session)
+        db.commit()
+
+        with pytest.raises(Exception) as denied:
+            HarnessTurnStore(db).claim(session, _request())
+
+        assert getattr(denied.value, "code", None) == "TENANT_SUSPENDED"
+        assert db.exec(
+            select(HarnessTurnRecord).where(
+                HarnessTurnRecord.session_id == session.id,
+                HarnessTurnRecord.client_turn_id == "turn-client-1",
+            )
+        ).all() == []

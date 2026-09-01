@@ -13,7 +13,7 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime
 
-from sqlalchemy import delete
+from sqlalchemy import delete, or_, update
 from sqlmodel import Session, select
 
 from app.contracts.events import EventVisibility
@@ -27,6 +27,7 @@ from app.db.models import (
     HarnessTaskFrameRecord,
     HarnessTurnRecord,
     Message,
+    Tenant,
     utc_now,
 )
 from app.i18n.language_context import (
@@ -36,6 +37,12 @@ from app.i18n.language_context import (
 from app.llm.prompts.language import localized_recovery_reply
 from app.observability.event_log import EventLog
 from app.observability.product_events import record_product_event
+from app.security.tenant import (
+    TenantExecutionKind,
+    TenantLifecycleDenied,
+    require_active_tenant,
+    require_matching_admission_version,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +51,221 @@ ACTIVE_TURN_STATUSES = {"started", "finalizing"}
 # Compatibility export for older internal readers; persisted replies use the
 # immutable snapshot through ``localized_recovery_reply`` below.
 RECOVERY_REPLY = localized_recovery_reply(None)
+
+
+def _lifecycle_failure_code(
+    db: Session,
+    *,
+    tenant_id: str,
+    persisted_version: object,
+    correlation_id: str,
+) -> str | None:
+    """Return a stable lifecycle error for one orphan row, if its tenant is known.
+
+    Pre-migration fixtures can contain durable Harness rows without a Tenant row;
+    those rows retain the historical INTERNAL_ERROR recovery path.  Once the
+    authoritative tenant exists, recovery is fail-closed and never requeues work
+    whose admission is suspended or from an older lifecycle generation.
+    """
+    if db.get(Tenant, tenant_id) is None:
+        return None
+    try:
+        decision = require_active_tenant(
+            db,
+            tenant_id,
+            TenantExecutionKind.JOB_CLAIM,
+            correlation_id,
+        )
+        require_matching_admission_version(decision, persisted_version)
+    except TenantLifecycleDenied as exc:
+        return exc.code
+    return None
+
+
+def _recovery_reason(code: str) -> dict[str, object]:
+    """Build one public recovery reason, disabling retry for lifecycle fences."""
+    return {
+        "code": code,
+        "message": code,
+        "retryable": code == "INTERNAL_ERROR",
+        "outcome_unknown": True,
+    }
+
+
+def _lease_owner_predicate(column: object, owner: str | None):
+    """Build a SQL predicate that keeps a nullable lease owner exact."""
+    return column.is_(None) if owner is None else column == owner
+
+
+def _lease_expiry_predicate(column: object, expires_at: datetime | None):
+    """Build a SQL predicate that detects a renewal between snapshot and write."""
+    return column.is_(None) if expires_at is None else column == expires_at
+
+
+def _cas_recover_run(
+    db: Session,
+    row: HarnessRunRecord,
+    *,
+    reason: dict[str, object],
+    now: datetime,
+) -> bool:
+    """Terminalize one orphan run only if its snapshot still owns the attempt."""
+    result = db.exec(
+        update(HarnessRunRecord)
+        .where(
+            HarnessRunRecord.id == row.id,
+            HarnessRunRecord.status == "running",
+            HarnessRunRecord.attempt_no == int(row.attempt_no or 0),
+            _lease_owner_predicate(HarnessRunRecord.lease_owner, row.lease_owner),
+            _lease_expiry_predicate(
+                HarnessRunRecord.lease_expires_at,
+                row.lease_expires_at,
+            ),
+        )
+        .values(
+            status="abandoned",
+            result_json={
+                "status": "abandoned",
+                "task_summary": reason.get("code") or "INTERNAL_ERROR",
+                "error": dict(reason),
+            },
+            finished_at=now,
+            updated_at=now,
+            lease_owner=None,
+            lease_expires_at=None,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    return getattr(result, "rowcount", 0) == 1
+
+
+def _cas_recover_frame(
+    db: Session,
+    row: HarnessTaskFrameRecord,
+    *,
+    reason: dict[str, object],
+    lifecycle_denied: bool,
+    now: datetime,
+) -> bool:
+    """Requeue/terminalize one orphan frame under its exact lease snapshot."""
+    status = "failed" if lifecycle_denied else "queued"
+    result_status = "failed" if lifecycle_denied else "interrupted"
+    result = db.exec(
+        update(HarnessTaskFrameRecord)
+        .where(
+            HarnessTaskFrameRecord.id == row.id,
+            HarnessTaskFrameRecord.status == "running",
+            HarnessTaskFrameRecord.attempt_no == int(row.attempt_no or 0),
+            _lease_owner_predicate(HarnessTaskFrameRecord.lease_owner, row.lease_owner),
+            _lease_expiry_predicate(
+                HarnessTaskFrameRecord.lease_expires_at,
+                row.lease_expires_at,
+            ),
+        )
+        .values(
+            status=status,
+            result_json={
+                "task_frame_id": row.task_id,
+                "status": result_status,
+                "task_summary": reason.get("code") or "INTERNAL_ERROR",
+                "error": dict(reason),
+            },
+            error_json=dict(reason),
+            lease_owner=None,
+            lease_expires_at=None,
+            updated_at=now,
+            state_version=HarnessTaskFrameRecord.state_version + 1,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    return getattr(result, "rowcount", 0) == 1
+
+
+def _cas_recover_turn(
+    db: Session,
+    row: HarnessTurnRecord,
+    *,
+    reason: dict[str, object],
+    now: datetime,
+) -> bool:
+    """Close an orphan receipt only while its original owner still holds it."""
+    result = db.exec(
+        update(HarnessTurnRecord)
+        .where(
+            HarnessTurnRecord.id == row.id,
+            HarnessTurnRecord.status.in_(sorted(ACTIVE_TURN_STATUSES)),
+            HarnessTurnRecord.lease_owner == row.lease_owner,
+            HarnessTurnRecord.lease_expires_at == row.lease_expires_at,
+        )
+        .values(
+            status="failed",
+            error_json=dict(reason),
+            finished_at=now,
+            updated_at=now,
+            lease_expires_at=now,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    return getattr(result, "rowcount", 0) == 1
+
+
+def _has_running_attempt(
+    db: Session,
+    *,
+    tenant_id: str,
+    session_id: str,
+) -> bool:
+    """Avoid closing a turn/session while a successor attempt is still running."""
+    return (
+        db.exec(
+            select(HarnessTaskFrameRecord.id).where(
+                HarnessTaskFrameRecord.tenant_id == tenant_id,
+                HarnessTaskFrameRecord.session_id == session_id,
+                HarnessTaskFrameRecord.status == "running",
+            )
+        ).first()
+        is not None
+        or db.exec(
+            select(HarnessRunRecord.id).where(
+                HarnessRunRecord.tenant_id == tenant_id,
+                HarnessRunRecord.session_id == session_id,
+                HarnessRunRecord.status == "running",
+            )
+        ).first()
+        is not None
+    )
+
+
+def _cas_suspend_agent_loop(
+    db: Session,
+    frame: HarnessTaskFrameRecord,
+    *,
+    now: datetime,
+) -> None:
+    """Suspend a loop checkpoint only if this frame still owns its snapshot."""
+    if not frame.agent_loop_id:
+        return
+    loop = db.get(HarnessAgentLoopRecord, frame.agent_loop_id)
+    if loop is None or loop.status in {"completed", "cancelled", "failed"}:
+        return
+    db.exec(
+        update(HarnessAgentLoopRecord)
+        .where(
+            HarnessAgentLoopRecord.id == loop.id,
+            or_(
+                HarnessAgentLoopRecord.owner_task_frame_record_id == frame.id,
+                HarnessAgentLoopRecord.owner_task_frame_record_id.is_(None),
+            ),
+            HarnessAgentLoopRecord.state_version == int(loop.state_version or 0),
+            HarnessAgentLoopRecord.status.notin_({"completed", "cancelled", "failed"}),
+        )
+        .values(
+            status="suspended",
+            updated_at=now,
+            state_version=HarnessAgentLoopRecord.state_version + 1,
+        )
+        .execution_options(synchronize_session=False)
+    )
 
 
 def _recovery_language_context(
@@ -160,66 +382,142 @@ def recover_orphan_harness_runs(
         return HarnessRecoveryResult()
 
     code = "INTERNAL_ERROR"
-    reason = {
-        "code": code,
-        "message": code,
-        "retryable": True,
-        "outcome_unknown": True,
+    run_lifecycle_codes = {
+        row.id: _lifecycle_failure_code(
+            db,
+            tenant_id=row.tenant_id,
+            persisted_version=row.tenant_lifecycle_version,
+            correlation_id=row.id,
+        )
+        for row in orphan_runs
     }
+    frame_lifecycle_codes = {
+        row.id: _lifecycle_failure_code(
+            db,
+            tenant_id=row.tenant_id,
+            persisted_version=row.tenant_lifecycle_version,
+            correlation_id=row.id,
+        )
+        for row in active_frames
+    }
+    turn_lifecycle_codes: dict[str, str | None] = {}
+    for turn in orphan_turns:
+        turn_code = _lifecycle_failure_code(
+            db,
+            tenant_id=turn.tenant_id,
+            persisted_version=turn.tenant_lifecycle_version,
+            correlation_id=turn.id,
+        )
+        if turn_code is None:
+            related_frame_ids = {
+                row.id
+                for row in active_frames
+                if (
+                    row.tenant_id == turn.tenant_id
+                    and row.session_id == turn.session_id
+                    and row.source_turn_id == turn.user_message_id
+                )
+            }
+            related_run_codes = [
+                run_lifecycle_codes.get(row.id)
+                for row in orphan_runs
+                if (
+                    row.tenant_id == turn.tenant_id
+                    and row.session_id == turn.session_id
+                    and (
+                        row.source_turn_id == turn.user_message_id
+                        or row.task_frame_record_id in related_frame_ids
+                    )
+                )
+            ]
+            related_frame_codes = [
+                frame_lifecycle_codes.get(row.id)
+                for row in active_frames
+                if row.id in related_frame_ids
+            ]
+            turn_code = next(
+                (item for item in [*related_run_codes, *related_frame_codes] if item),
+                None,
+            )
+        turn_lifecycle_codes[turn.id] = turn_code
 
+    recovered_run_ids: set[str] = set()
     for run in orphan_runs:
-        run.status = "abandoned"
-        run.result_json = {
-            "status": "abandoned",
-            "task_summary": code,
-            "error": dict(reason),
-        }
-        run.finished_at = now
-        run.updated_at = now
-        run.lease_owner = None
-        run.lease_expires_at = None
-        db.add(run)
+        run_code = run_lifecycle_codes.get(run.id)
+        run_reason = _recovery_reason(run_code or code)
+        if _cas_recover_run(db, run, reason=run_reason, now=now):
+            recovered_run_ids.add(run.id)
 
+    recovered_frame_ids: set[str] = set()
     orphan_frame_ids = {row.id for row in orphan_frames}
-    orphan_frame_ids.update(row.task_frame_record_id for row in orphan_runs)
     frames_by_id = {row.id: row for row in active_frames}
     recovered_frame_count = 0
     for frame_id in orphan_frame_ids:
         frame = frames_by_id.get(frame_id) or db.get(HarnessTaskFrameRecord, frame_id)
         if frame is None or frame.status != "running":
             continue
-        # Keep the current step, slots and checkpoint.  The next user turn can
-        # claim this frame again, but this vanished attempt is never replayed.
-        frame.status = "queued"
-        frame.result_json = {
-            "task_frame_id": frame.task_id,
-            "status": "interrupted",
-            "task_summary": code,
-            "error": dict(reason),
-        }
-        frame.error_json = dict(reason)
-        frame.lease_owner = None
-        frame.lease_expires_at = None
-        frame.updated_at = now
-        frame.state_version = max(1, int(frame.state_version or 0) + 1)
-        db.add(frame)
-        recovered_frame_count += 1
-        if frame.agent_loop_id:
-            loop = db.get(HarnessAgentLoopRecord, frame.agent_loop_id)
-            if loop is not None and loop.status not in {"completed", "cancelled", "failed"}:
-                loop.status = "suspended"
-                loop.updated_at = now
-                loop.state_version = max(1, int(loop.state_version or 0) + 1)
-                db.add(loop)
+        frame_code = frame_lifecycle_codes.get(frame.id)
+        if frame_code is None:
+            frame_code = next(
+                (
+                    run_lifecycle_codes.get(run.id)
+                    for run in orphan_runs
+                    if run.task_frame_record_id == frame.id
+                ),
+                None,
+            )
+        frame_reason = _recovery_reason(frame_code or code)
+        # Keep the current step, slots and checkpoint.  A normal vanished
+        # attempt may be retried; lifecycle-fenced work is terminal and can
+        # never be replayed after a fast suspend/reactivate cycle.  The
+        # conditional write protects a successor claim made after the scan.
+        if _cas_recover_frame(
+            db,
+            frame,
+            reason=frame_reason,
+            lifecycle_denied=frame_code is not None,
+            now=now,
+        ):
+            recovered_frame_ids.add(frame.id)
+            recovered_frame_count += 1
+            _cas_suspend_agent_loop(db, frame, now=now)
 
+    recovered_session_keys = {
+        (row.tenant_id, row.session_id)
+        for row in orphan_runs
+        if row.id in recovered_run_ids
+    }
+    recovered_session_keys.update(
+        (row.tenant_id, row.session_id)
+        for row in orphan_frames
+        if row.id in recovered_frame_ids
+    )
+    recovered_turn_ids: set[str] = set()
     message_count = 0
-    for turn in orphan_turns:
-        turn.status = "failed"
-        turn.error_json = dict(reason)
-        turn.finished_at = now
-        turn.updated_at = now
-        turn.lease_expires_at = now
-        db.add(turn)
+    for turn_snapshot in orphan_turns:
+        # A successor frame/run claim keeps the enclosing turn alive even if
+        # this scan observed the old attempt as expired.  Do not publish a
+        # recovery message or mutate the receipt in that case.
+        if _has_running_attempt(
+            db,
+            tenant_id=turn_snapshot.tenant_id,
+            session_id=turn_snapshot.session_id,
+        ):
+            continue
+        turn_code = turn_lifecycle_codes.get(turn_snapshot.id) or code
+        turn_reason = _recovery_reason(turn_code)
+        if not _cas_recover_turn(
+            db,
+            turn_snapshot,
+            reason=turn_reason,
+            now=now,
+        ):
+            continue
+        recovered_turn_ids.add(turn_snapshot.id)
+        recovered_session_keys.add(
+            (turn_snapshot.tenant_id, turn_snapshot.session_id)
+        )
+        turn = db.get(HarnessTurnRecord, turn_snapshot.id) or turn_snapshot
         session = db.get(ChatSession, turn.session_id)
         if session is None:
             continue
@@ -238,30 +536,34 @@ def recover_orphan_harness_runs(
             row.id
             for row in active_frames
             if (
-                source_turn_id
+                row.id in recovered_frame_ids
+                and source_turn_id
                 and row.tenant_id == turn.tenant_id
                 and row.session_id == turn.session_id
                 and row.source_turn_id == source_turn_id
             )
         }
         related_rows = [
-            row
-            for row in active_frames
-            if row.id in related_frame_ids
+            db.get(HarnessTaskFrameRecord, row_id)
+            for row_id in related_frame_ids
         ]
+        related_rows = [row for row in related_rows if row is not None]
         related_rows.extend(
-            row
-            for row in active_runs
-            if (
-                source_turn_id
+            db.get(HarnessRunRecord, row_id)
+            for row_id in recovered_run_ids
+            if any(
+                row.id == row_id
+                and source_turn_id
                 and row.tenant_id == turn.tenant_id
                 and row.session_id == turn.session_id
                 and (
                     row.source_turn_id == source_turn_id
                     or row.task_frame_record_id in related_frame_ids
                 )
+                for row in active_runs
             )
         )
+        related_rows = [row for row in related_rows if row is not None]
         for row in [*related_rows, turn]:
             if getattr(row, "language_context_json", None) is None:
                 row.language_context_json = language_context.model_dump(mode="json")
@@ -272,15 +574,26 @@ def recover_orphan_harness_runs(
             db,
             session,
             turn,
-            code=code,
+            code=turn_code,
+            retryable=bool(turn_reason.get("retryable")),
             now=now,
             language_context=language_context,
         ):
             message_count += 1
 
     # A corrupt or partially persisted execution may have a Run/TaskFrame but
-    # no turn receipt.  It must still release the chat session for a new turn.
-    for tenant_id, session_id in affected_session_keys:
+    # no turn receipt.  It must still release the chat session for a new turn,
+    # but only after all successor-attempt checks pass.
+    safe_session_keys = {
+        key
+        for key in recovered_session_keys
+        if not _has_running_attempt(
+            db,
+            tenant_id=key[0],
+            session_id=key[1],
+        )
+    }
+    for tenant_id, session_id in safe_session_keys:
         session = db.get(ChatSession, session_id)
         if session is None or session.tenant_id != tenant_id:
             continue
@@ -289,7 +602,7 @@ def recover_orphan_harness_runs(
         db.add(session)
 
     # A dead owner must never keep blocking the next turn.
-    for tenant_id, session_id in affected_session_keys:
+    for tenant_id, session_id in safe_session_keys:
         db.exec(
             delete(HarnessSessionLeaseRecord).where(
                 HarnessSessionLeaseRecord.tenant_id == tenant_id,
@@ -298,10 +611,10 @@ def recover_orphan_harness_runs(
         )
     db.commit()
     return HarnessRecoveryResult(
-        run_count=len(orphan_runs),
+        run_count=len(recovered_run_ids),
         frame_count=recovered_frame_count,
-        turn_count=len(orphan_turns),
-        session_count=len(affected_session_keys),
+        turn_count=len(recovered_turn_ids),
+        session_count=len(safe_session_keys),
         message_count=message_count,
     )
 
@@ -312,6 +625,7 @@ def _append_recovery_message(
     turn: HarnessTurnRecord,
     *,
     code: str,
+    retryable: bool = True,
     now: datetime,
     language_context: LanguageContext,
 ) -> bool:
@@ -347,7 +661,7 @@ def _append_recovery_message(
         "harness_turn_id": turn.id,
         "status": "failed",
         "error_code": code,
-        "retryable": True,
+        "retryable": retryable,
         "language_context": language_context.model_dump(mode="json"),
     }
     if visibility != "visible":

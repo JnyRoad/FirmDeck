@@ -29,7 +29,7 @@ import { apiErrorMessage } from '@/lib/apiErrorMessages';
 import { MENU_CONTENT_CLASS, MENU_ITEM_CLASS, MENU_ITEM_DANGER_CLASS, MOBILE_CARD_CLASS, formatDateTime } from '@/lib/enterprise-ui';
 import { cn } from '@/lib/utils';
 
-import { api, TENANT_ID } from '../api/client';
+import { createTenantClient } from '../api/tenant-client';
 import IconAdd from '../assets/icons/add.svg?react';
 import IconAccounts from '../assets/icons/sys-accounts.svg?react';
 import IconClear from '../assets/icons/field-clear.svg?react';
@@ -39,6 +39,7 @@ import IconRefresh from '../assets/icons/refresh.svg?react';
 import IconSearch from '../assets/icons/search.svg?react';
 import IconTrash from '../assets/icons/trash.svg?react';
 import type { EnterpriseAuthUser } from '../auth';
+import { useTenantSession } from '../contexts/TenantSessionContext';
 import { useClientPagination } from '../hooks/useClientPagination';
 import { StatusBadge } from './scheduled-tasks/StatusBadge';
 
@@ -109,6 +110,8 @@ export default function AccountsPage({
   onLogout?: () => void;
 } = {}) {
   const { t } = currentAccountsTranslator();
+  const tenantContext = useTenantSession();
+  const tenantApi = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
   const [rows, setRows] = useState<EmployeeAccount[]>([]);
   const [loading, setLoading] = useState(false);
   const [searchText, setSearchText] = useState('');
@@ -128,20 +131,25 @@ export default function AccountsPage({
 
   /** 读取当前租户账号列表；未知错误不展示原始异常正文。 */
   async function load() {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     setLoading(true);
     try {
-      const result = await api.get<EmployeeAccount[]>(`/api/auth/users?tenant_id=${TENANT_ID}`);
+      const result = await tenantApi.get<EmployeeAccount[]>('/api/auth/users');
+      if (!context.isCurrentGeneration(generation)) return;
       setRows(result);
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       notify.error(accountPageErrorMessage(error, 'accountsPage.toast.loadFailed'));
     } finally {
-      setLoading(false);
+      if (context.isCurrentGeneration(generation)) setLoading(false);
     }
   }
 
   useEffect(() => {
     void load();
-  }, []);
+  }, [tenantApi]);
 
   const filteredRows = useMemo(() => {
     const keyword = searchText.trim().toLowerCase();
@@ -168,6 +176,9 @@ export default function AccountsPage({
 
   /** 创建账号；前端只做最小必填校验，其余使用后端稳定错误码。 */
   async function saveCreate() {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     const username = createDraft.username.trim();
     const password = createDraft.password.trim();
     if (!username || !password) {
@@ -176,41 +187,46 @@ export default function AccountsPage({
     }
     setCreating(true);
     try {
-      await api.post('/api/auth/users', {
-        tenant_id: TENANT_ID,
+      await tenantApi.post('/api/auth/users', {
         username,
         password,
         display_name: createDraft.displayName.trim() || username,
         role: createDraft.role,
       });
+      if (!context.isCurrentGeneration(generation)) return;
       notify.success(t('accountsPage.toast.created'));
       setCreateOpen(false);
       await load();
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       notify.error(accountPageErrorMessage(error, 'accountsPage.toast.createFailed'));
     } finally {
-      setCreating(false);
+      if (context.isCurrentGeneration(generation)) setCreating(false);
     }
   }
 
   /** 保存账号编辑；密码留空时保留现有值。 */
   async function saveEdit() {
     if (!editing) return;
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     setSaving(true);
     try {
-      await api.put(`/api/auth/users/${editing.id}`, {
-        tenant_id: TENANT_ID,
+      await tenantApi.put(`/api/auth/users/${editing.id}`, {
         display_name: draft.displayName.trim() || editing.username,
         password: draft.password.trim() || undefined,
         role: draft.role,
       });
+      if (!context.isCurrentGeneration(generation)) return;
       notify.success(t('accountsPage.toast.saved'));
       setEditing(null);
       await load();
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       notify.error(accountPageErrorMessage(error, 'accountsPage.toast.saveFailed'));
     } finally {
-      setSaving(false);
+      if (context.isCurrentGeneration(generation)) setSaving(false);
     }
   }
 
@@ -218,16 +234,21 @@ export default function AccountsPage({
   async function confirmDelete() {
     const row = deleteTarget;
     if (!row) return;
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     setDeleting(true);
     try {
-      await api.delete(`/api/auth/users/${row.id}?tenant_id=${TENANT_ID}`);
+      await tenantApi.delete(`/api/auth/users/${row.id}`);
+      if (!context.isCurrentGeneration(generation)) return;
       notify.success(t('accountsPage.toast.deleted'));
       setDeleteTarget(null);
       await load();
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       notify.error(accountPageErrorMessage(error, 'accountsPage.toast.deleteFailed'));
     } finally {
-      setDeleting(false);
+      if (context.isCurrentGeneration(generation)) setDeleting(false);
     }
   }
 

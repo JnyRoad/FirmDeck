@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from copy import deepcopy
 from typing import Any
 
@@ -12,6 +13,7 @@ from app.core.context_projection import (
     compact_pending_tasks,
 )
 from app.core.graph_rules import GraphRules
+from app.core.harness_agent import HarnessExecutionFenced
 from app.core.task_frame_store import MAX_TASK_FRAMES_PER_TURN
 from app.db.models import ChatSession, ModelConfig, Skill, new_id
 from app.i18n.language_context import LanguageContext
@@ -55,6 +57,7 @@ class TurnPlanner:
         interaction_mode: str = "normal",
         team_context: TeamPlannerContext | None = None,
         language_context: LanguageContext | None = None,
+        admission_check: Callable[[], None] | None = None,
     ) -> TurnPlan:
         """Plan task frames while keeping source text raw and generated fields in reply locale."""
         # Workflow: construct one bounded planner payload with immutable language and raw markers.
@@ -118,8 +121,11 @@ class TurnPlanner:
                     client,
                     unified_system_prompt(),
                     payload,
+                    admission_check=admission_check,
                 )
         except Exception as exc:
+            if isinstance(exc, HarnessExecutionFenced):
+                raise
             if isinstance(exc, LLMError):
                 raise
             raise LLMError(f"Turn Planner returned invalid JSON schema: {exc}") from exc
@@ -138,6 +144,7 @@ class TurnPlanner:
         client: LLMClient,
         system_prompt: str,
         payload: dict[str, Any],
+        admission_check: Callable[[], None] | None = None,
     ) -> TurnPlan:
         base_payload = deepcopy(payload)
         next_payload = payload
@@ -148,7 +155,13 @@ class TurnPlanner:
                 schema_retry_count=attempt,
                 schema_max_attempts=max_attempts,
             ):
-                raw = client.generate_json(system_prompt, next_payload)
+                if callable(admission_check):
+                    admission_check()
+                try:
+                    raw = client.generate_json(system_prompt, next_payload)
+                finally:
+                    if callable(admission_check):
+                        admission_check()
             try:
                 return TurnPlan.model_validate(raw)
             except ValidationError as exc:

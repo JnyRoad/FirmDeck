@@ -20,8 +20,10 @@ import {
 import type { HTMLAttributes, ReactNode } from 'react';
 import { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
-import { api, ApiError, TENANT_ID } from '../api/client';
+import { ApiError } from '../api/client';
+import { createTenantClient } from '../api/tenant-client';
 import { isEnterpriseAdmin, type EnterpriseAuthUser } from '../auth';
+import { useTenantSession } from '../contexts/TenantSessionContext';
 import AppHeader from '@/components/AppHeader';
 import CapabilityScopeLoading from '@/components/CapabilityScopeLoading';
 import {
@@ -84,6 +86,7 @@ import {
   persistSharedAgentScope,
   readEmployeeScope,
 } from '@/lib/agent-scope-storage';
+import { tenantUserStorageKey } from '@/lib/tenant-storage';
 import IconAdd from '../assets/icons/add.svg?react';
 import IconChevronDown from '../assets/icons/chevron-down.svg?react';
 import IconClear from '../assets/icons/field-clear.svg?react';
@@ -269,6 +272,10 @@ function effectiveKnowledgeAgentId(rows: AgentProfileRead[], agentId: string): s
 
 export default function KnowledgeManagePage({ currentUser, onLogout }: KnowledgePageProps = {}) {
   const { locale, t } = useAppIntl();
+  const tenantContext = useTenantSession();
+  const tenantClient = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
+  const tenantId = tenantContext?.tenantId || '';
+  const userId = tenantContext?.userId || '';
   const uiSinks = useMemo(() => createUiSinks({ t }), [t]);
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -277,7 +284,9 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
   const [selectedDocument, setSelectedDocument] = useState<KnowledgeDocumentRead | null>(null);
   const [buckets, setBuckets] = useState<KnowledgeBucketRead[]>([]);
   const [loading, setLoading] = useState(false);
-  const [agentId, setAgentId] = useState(readEmployeeScope);
+  const [agentId, setAgentId] = useState(
+    () => tenantId && userId ? readEmployeeScope(tenantId, userId) : '',
+  );
   const [agentScopeLoaded, setAgentScopeLoaded] = useState(false);
   const [agents, setAgents] = useState<AgentProfileRead[]>([]);
   const [importOpen, setImportOpen] = useState(false);
@@ -313,7 +322,9 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
   const [searchResult, setSearchResult] = useState<KnowledgeSearchResponse | null>(null);
   const [modelConfigs, setModelConfigs] = useState<ModelConfigRead[]>([]);
   const [selectedSearchModelId, setSelectedSearchModelId] = useState(
-    () => window.localStorage.getItem(`${KNOWLEDGE_SEARCH_MODEL_STORAGE_KEY}:${TENANT_ID}`) || '',
+    () => tenantId && userId
+      ? window.localStorage.getItem(tenantUserStorageKey(tenantId, userId, KNOWLEDGE_SEARCH_MODEL_STORAGE_KEY)) || ''
+      : '',
   );
   const [okfConcepts, setOkfConcepts] = useState<KnowledgeConceptRead[]>([]);
   const [okfLoading, setOkfLoading] = useState(false);
@@ -396,8 +407,15 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
   const pagination = useClientPagination(filteredKnowledgeBases, KNOWLEDGE_PAGE_SIZE, documentSearch);
 
   useEffect(() => {
+    setAgentId(tenantId && userId ? readEmployeeScope(tenantId, userId) : '');
+    setAgentScopeLoaded(false);
+    clearKnowledgeViewState();
+  }, [tenantId, userId]);
+
+  useEffect(() => {
+    if (!tenantContext) return;
     void loadAgentScope();
-  }, [currentUser?.id]);
+  }, [currentUser?.id, tenantContext]);
 
   useEffect(() => {
     if (!agentScopeLoaded) return;
@@ -412,25 +430,34 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
       return;
     }
     void refresh(effectiveKnowledgeAgentId(agents, resolvedAgentId));
-  }, [agentScopeLoaded, agentId, agents, currentUser?.id]);
+  }, [agentScopeLoaded, agentId, agents, currentUser?.id, tenantContext, tenantId, userId]);
 
   useEffect(() => {
-    api
-      .get<ModelConfigRead[]>(`/api/enterprise/model-configs?tenant_id=${TENANT_ID}`)
+    if (!tenantContext) return;
+    const context = tenantContext;
+    const generation = context.generation;
+    tenantClient
+      .get<ModelConfigRead[]>(`/api/enterprise/model-configs?tenant_id=${tenantId}`)
       .then((items) => {
+        if (!context.isCurrentGeneration(generation)) return;
         const enabled = items.filter((item) => item.enabled);
         setModelConfigs(enabled);
         setSelectedSearchModelId((current) => {
           if (current && enabled.some((item) => item.id === current)) return current;
           const fallback = enabled.find((item) => item.is_default)?.id || enabled[0]?.id || '';
           if (fallback) {
-            window.localStorage.setItem(`${KNOWLEDGE_SEARCH_MODEL_STORAGE_KEY}:${TENANT_ID}`, fallback);
+            window.localStorage.setItem(
+              tenantUserStorageKey(tenantId, userId, KNOWLEDGE_SEARCH_MODEL_STORAGE_KEY),
+              fallback,
+            );
           }
           return fallback;
         });
       })
-      .catch(() => setModelConfigs([]));
-  }, []);
+      .catch(() => {
+        if (context.isCurrentGeneration(generation)) setModelConfigs([]);
+      });
+  }, [tenantClient, tenantContext, tenantId, userId]);
 
   useEffect(() => {
     if (searchParams.get('add') !== 'plaza') return;
@@ -456,18 +483,18 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
   useEffect(() => {
     const onScopeChange = (event: Event) => {
       const next = (event as CustomEvent<{ agentId?: string }>).detail?.agentId || '';
-      setAgentId(next && !isTeamScope(next) ? next : readEmployeeScope());
+      setAgentId(next && !isTeamScope(next) ? next : readEmployeeScope(tenantId, userId));
     };
     window.addEventListener('ultrarag-enterprise-agent-scope-change', onScopeChange);
     return () => window.removeEventListener('ultrarag-enterprise-agent-scope-change', onScopeChange);
-  }, []);
+  }, [tenantId, userId]);
 
   function applyResolvedAgentScope(nextAgentId: string) {
     if (nextAgentId === agentId) return;
     if (nextAgentId) {
-      persistSharedAgentScope(nextAgentId, currentUser?.id);
+      persistSharedAgentScope(nextAgentId, tenantId, userId);
     } else {
-      clearSharedAgentScope(currentUser?.id);
+      clearSharedAgentScope(tenantId, userId);
     }
     setAgentId(nextAgentId);
     emitAgentScopeChange(nextAgentId);
@@ -484,9 +511,13 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
   }
 
   async function loadAgentScope() {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     setAgentScopeLoaded(false);
     try {
-      const agentRows = await api.get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${TENANT_ID}`);
+      const agentRows = await tenantClient.get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${tenantId}`);
+      if (!context.isCurrentGeneration(generation)) return;
       setAgents(agentRows);
       const resolvedAgentId = resolveKnowledgeAgentScope(agentRows, currentUser, agentId);
       if (resolvedAgentId !== agentId) {
@@ -495,6 +526,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
       }
       setAgentScopeLoaded(true);
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       clearKnowledgeViewState();
       notify.error(knowledgeErrorMessage(error, 'knowledgePage.error.loadAgents'));
       setAgentScopeLoaded(true);
@@ -505,6 +537,9 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
     scopedAgentId = effectiveAgentId,
     preferredDocument: KnowledgeDocumentRead | null = selectedDocument,
   ) {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     if (!agentScopeLoaded) return;
     if (!isEnterpriseAdmin(currentUser) && !scopedAgentId) {
       clearKnowledgeViewState();
@@ -514,9 +549,10 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
     try {
       const suffix = scopedAgentId ? `&agent_id=${encodeURIComponent(scopedAgentId)}` : '';
       const [docRows, kbRows] = await Promise.all([
-        api.get<KnowledgeDocumentRead[]>(`/api/enterprise/knowledge/documents?tenant_id=${TENANT_ID}${suffix}`),
-        api.get<KnowledgeBaseRead[]>(`/api/enterprise/knowledge-bases?tenant_id=${TENANT_ID}${suffix}`),
+        tenantClient.get<KnowledgeDocumentRead[]>(`/api/enterprise/knowledge/documents?tenant_id=${tenantId}${suffix}`),
+        tenantClient.get<KnowledgeBaseRead[]>(`/api/enterprise/knowledge-bases?tenant_id=${tenantId}${suffix}`),
       ]);
+      if (!context.isCurrentGeneration(generation)) return;
       setDocuments(docRows);
       setKnowledgeBases(kbRows);
       const scopedDocRows =
@@ -535,39 +571,50 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
       setSelectedDocument(current);
       if (current) {
         await loadBuckets(current, false);
+        if (!context.isCurrentGeneration(generation)) return;
       } else {
         setBuckets([]);
         const visibleKbRows = kbRows.filter((item) => !isEmptyDefaultKnowledgeBase(item));
         const fallbackKnowledgeBaseId =
           knowledgeBaseFilter !== '__all__' ? knowledgeBaseFilter : visibleKbRows[0]?.id || '';
         await loadOkfConcepts(fallbackKnowledgeBaseId, false);
+        if (!context.isCurrentGeneration(generation)) return;
       }
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       notify.error(knowledgeErrorMessage(error, 'knowledgePage.error.refresh'));
     } finally {
-      setLoading(false);
+      if (context.isCurrentGeneration(generation)) setLoading(false);
     }
   }
 
   async function loadBuckets(document: KnowledgeDocumentRead, select = true) {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     if (select) setSelectedDocument(document);
     setBuckets([]);
     setSearchResult(null);
     try {
       const [rows] = await Promise.all([
-        api.get<KnowledgeBucketRead[]>(
-          `/api/enterprise/knowledge/documents/${document.id}/buckets?tenant_id=${TENANT_ID}${effectiveAgentId ? `&agent_id=${encodeURIComponent(effectiveAgentId)}` : ''}`,
+        tenantClient.get<KnowledgeBucketRead[]>(
+          `/api/enterprise/knowledge/documents/${document.id}/buckets?tenant_id=${tenantId}${effectiveAgentId ? `&agent_id=${encodeURIComponent(effectiveAgentId)}` : ''}`,
         ),
         loadOkfConcepts(document.knowledge_base_id, false),
       ]);
+      if (!context.isCurrentGeneration(generation)) return;
       setBuckets(rows);
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       setBuckets([]);
       notify.error(knowledgeErrorMessage(error, 'knowledgePage.error.loadBuckets'));
     }
   }
 
   async function loadOkfConcepts(knowledgeBaseId?: string, showLoading = true) {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     if (!knowledgeBaseId) {
       setOkfConcepts([]);
       setOkfLintIssues([]);
@@ -576,12 +623,14 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
     if (showLoading) setOkfLoading(true);
     const suffix = effectiveAgentId ? `&agent_id=${encodeURIComponent(effectiveAgentId)}` : '';
     try {
-      const rows = await api.get<KnowledgeConceptRead[]>(
-        `/api/enterprise/knowledge-bases/${knowledgeBaseId}/okf/concepts?tenant_id=${TENANT_ID}${suffix}`,
+      const rows = await tenantClient.get<KnowledgeConceptRead[]>(
+        `/api/enterprise/knowledge-bases/${knowledgeBaseId}/okf/concepts?tenant_id=${tenantId}${suffix}`,
       );
+      if (!context.isCurrentGeneration(generation)) return;
       setOkfConcepts(rows);
       setOkfLintIssues([]);
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       setOkfConcepts([]);
       if (error instanceof ApiError && error.status === 404) {
         setOkfLintIssues([]);
@@ -589,7 +638,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
       }
       notify.error(knowledgeErrorMessage(error, 'knowledgePage.error.loadGraph'));
     } finally {
-      if (showLoading) setOkfLoading(false);
+      if (showLoading && context.isCurrentGeneration(generation)) setOkfLoading(false);
     }
   }
 
@@ -610,6 +659,9 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
   }
 
   async function runKnowledgeSearch() {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     const query = searchQuery.trim();
     if (!query) {
       notify.warning(t('knowledgePage.toast.enterSearchQuery'));
@@ -617,8 +669,8 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
     }
     setSearchLoading(true);
     try {
-      const response = await api.post<KnowledgeSearchResponse>('/api/enterprise/knowledge/search', {
-        tenant_id: TENANT_ID,
+      const response = await tenantClient.post<KnowledgeSearchResponse>('/api/enterprise/knowledge/search', {
+        tenant_id: tenantId,
         agent_id: effectiveAgentId || undefined,
         knowledge_base_ids:
           knowledgeBaseFilter !== '__all__'
@@ -632,17 +684,23 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
         max_depth: 3,
         need_evidence_pack: true,
       });
+      if (!context.isCurrentGeneration(generation)) return;
       setSearchResult(response);
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       notify.error(knowledgeErrorMessage(error, 'knowledgePage.error.search'));
     } finally {
-      setSearchLoading(false);
+      if (context.isCurrentGeneration(generation)) setSearchLoading(false);
     }
   }
 
   async function openImportKnowledgeBases(mode: 'plaza' | 'employee' = 'plaza', selectedResourceId?: string) {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     try {
-      const agentRows = agents.length ? agents : await api.get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${TENANT_ID}`);
+      const agentRows = agents.length ? agents : await tenantClient.get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${tenantId}`);
+      if (!context.isCurrentGeneration(generation)) return;
       setAgents(agentRows);
       setImportMode(mode);
       const firstSource = mode === 'plaza'
@@ -653,6 +711,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
       setImportOpen(true);
       if (firstSource) {
         const sourceRows = await loadImportSourceKnowledgeBases(firstSource);
+        if (!context.isCurrentGeneration(generation)) return;
         if (selectedResourceId && sourceRows.some((item) => item.id === selectedResourceId)) {
           setImportSelectedKnowledgeBaseIds([selectedResourceId]);
         }
@@ -660,28 +719,37 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
         setImportSourceKnowledgeBases([]);
       }
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       notify.error(knowledgeErrorMessage(error, 'knowledgePage.error.loadAgents'));
     }
   }
 
   async function loadImportSourceKnowledgeBases(sourceAgentId: string): Promise<KnowledgeBaseRead[]> {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return [];
     setImportSourceKnowledgeBases([]);
     setImportSelectedKnowledgeBaseIds([]);
     if (!sourceAgentId) return [];
     try {
-      const rows = await api.get<KnowledgeBaseRead[]>(
-        `/api/enterprise/knowledge-bases?tenant_id=${TENANT_ID}&agent_id=${encodeURIComponent(sourceAgentId)}`,
+      const rows = await tenantClient.get<KnowledgeBaseRead[]>(
+        `/api/enterprise/knowledge-bases?tenant_id=${tenantId}&agent_id=${encodeURIComponent(sourceAgentId)}`,
       );
+      if (!context.isCurrentGeneration(generation)) return [];
       const activeRows = rows.filter((item) => item.status === 'active');
       setImportSourceKnowledgeBases(activeRows);
       return activeRows;
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return [];
       notify.error(knowledgeErrorMessage(error, 'knowledgePage.error.loadSourceKnowledgeBases'));
       return [];
     }
   }
 
   async function submitImportKnowledgeBases() {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     if (!agentId) {
       notify.warning(t('knowledgePage.toast.selectEmployee'));
       return;
@@ -698,24 +766,26 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
     }
     setImportLoading(true);
     try {
-      const result = await api.post<{ imported: Array<Record<string, unknown>>; missing: Array<Record<string, unknown>> }>(
+      const result = await tenantClient.post<{ imported: Array<Record<string, unknown>>; missing: Array<Record<string, unknown>> }>(
         `/api/enterprise/agents/${agentId}/resources/import`,
         {
-          tenant_id: TENANT_ID,
+          tenant_id: tenantId,
           source_agent_id: importSourceAgentId,
           resource_type: 'knowledge_base',
           resource_ids: importSelectedKnowledgeBaseIds,
         },
       );
+      if (!context.isCurrentGeneration(generation)) return;
       const importedCount = result.imported?.length || 0;
       const missingCount = result.missing?.length || 0;
       notify.success(t('knowledgePage.toast.importedKnowledgeBases', { importedCount, missingCount }));
       setImportOpen(false);
       await refresh();
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       notify.error(knowledgeErrorMessage(error, 'knowledgePage.error.importKnowledgeBases'));
     } finally {
-      setImportLoading(false);
+      if (context.isCurrentGeneration(generation)) setImportLoading(false);
     }
   }
 
@@ -738,36 +808,45 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
   }
 
   async function importOkfFile(file: File) {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     setOkfImporting(true);
     try {
       const contentBase64 = await fileToBase64(file);
-      await api.post('/api/enterprise/knowledge/okf/import', {
-        tenant_id: TENANT_ID,
+      await tenantClient.post('/api/enterprise/knowledge/okf/import', {
+        tenant_id: tenantId,
         agent_id: effectiveAgentId || undefined,
         knowledge_base_id: selectedKnowledgeBase?.id,
         filename: file.name,
         content_base64: contentBase64,
       });
+      if (!context.isCurrentGeneration(generation)) return;
       notify.success(t('knowledgePage.toast.importedBackup'));
       setOkfImportOpen(false);
       await refresh();
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       notify.error(knowledgeErrorMessage(error, 'knowledgePage.error.importBackup'));
     } finally {
-      setOkfImporting(false);
+      if (context.isCurrentGeneration(generation)) setOkfImporting(false);
     }
   }
 
   async function exportOkfBundle(targetKnowledgeBase = selectedKnowledgeBase) {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     if (!targetKnowledgeBase) {
       notify.warning(t('knowledgePage.toast.selectKnowledgeBase'));
       return;
     }
     const suffix = effectiveAgentId ? `&agent_id=${encodeURIComponent(effectiveAgentId)}` : '';
     try {
-      const blob = await api.blob(
-        `/api/enterprise/knowledge-bases/${targetKnowledgeBase.id}/okf/export?tenant_id=${TENANT_ID}${suffix}`,
+      const blob = await tenantClient.blob(
+        `/api/enterprise/knowledge-bases/${targetKnowledgeBase.id}/okf/export?tenant_id=${tenantId}${suffix}`,
       );
+      if (!context.isCurrentGeneration(generation)) return;
       uiSinks.download(
         blob,
         createMessageDescriptor('knowledgePage.download.backupPrefix'),
@@ -776,11 +855,15 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
       );
       notify.success(t('knowledgePage.toast.exportedBackup'));
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       notify.error(knowledgeErrorMessage(error, 'knowledgePage.error.exportBackup'));
     }
   }
 
   async function lintOkfBundle(targetKnowledgeBase = selectedKnowledgeBase) {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     if (!targetKnowledgeBase) {
       notify.warning(t('knowledgePage.toast.selectKnowledgeBase'));
       return;
@@ -791,9 +874,10 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
     const suffix = effectiveAgentId ? `&agent_id=${encodeURIComponent(effectiveAgentId)}` : '';
     setOkfLoading(true);
     try {
-      const result = await api.post<{ status: string; issue_count: number; issues: OkfLintIssue[] }>(
-        `/api/enterprise/knowledge-bases/${targetKnowledgeBase.id}/okf/lint?tenant_id=${TENANT_ID}${suffix}`,
+      const result = await tenantClient.post<{ status: string; issue_count: number; issues: OkfLintIssue[] }>(
+        `/api/enterprise/knowledge-bases/${targetKnowledgeBase.id}/okf/lint?tenant_id=${tenantId}${suffix}`,
       );
+      if (!context.isCurrentGeneration(generation)) return;
       setOkfLintIssues(result.issues || []);
       setOkfLintKnowledgeBase(targetKnowledgeBase);
       setOkfLintReportOpen(true);
@@ -801,9 +885,10 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
         ? t('knowledgePage.toast.graphLintIssues', { count: result.issue_count })
         : t('knowledgePage.toast.graphLintPassed'));
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       notify.error(knowledgeErrorMessage(error, 'knowledgePage.error.lintGraph'));
     } finally {
-      setOkfLoading(false);
+      if (context.isCurrentGeneration(generation)) setOkfLoading(false);
     }
   }
 
@@ -825,22 +910,27 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
 
   async function saveConcept() {
     if (!editingConcept || !selectedKnowledgeBase) return;
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     const suffix = effectiveAgentId ? `?agent_id=${encodeURIComponent(effectiveAgentId)}` : '';
     try {
-      const next = await api.put<KnowledgeConceptRead>(
+      const next = await tenantClient.put<KnowledgeConceptRead>(
         `/api/enterprise/knowledge-bases/${selectedKnowledgeBase.id}/okf/concepts/${conceptPath(editingConcept.concept_id)}${suffix}`,
         {
-          tenant_id: TENANT_ID,
+          tenant_id: tenantId,
           document_id: editingConcept.document_id,
           content_md: conceptDraft,
           status: editingConcept.status,
         },
       );
+      if (!context.isCurrentGeneration(generation)) return;
       setOkfConcepts((current) => current.map((item) => (item.id === next.id ? next : item)));
       setEditingConcept(null);
       notify.success(t('knowledgePage.toast.savedGraph'));
       await loadOkfConcepts(selectedKnowledgeBase.id, false);
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       notify.error(knowledgeErrorMessage(error, 'knowledgePage.error.saveGraph'));
     }
   }
@@ -857,35 +947,45 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
 
   async function saveKnowledgeBase() {
     if (!editingKnowledgeBase) return;
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     const suffix = effectiveAgentId ? `?agent_id=${encodeURIComponent(effectiveAgentId)}` : '';
     try {
-      const next = await api.put<KnowledgeBaseRead>(`/api/enterprise/knowledge-bases/${editingKnowledgeBase.id}${suffix}`, {
-        tenant_id: TENANT_ID,
+      const next = await tenantClient.put<KnowledgeBaseRead>(`/api/enterprise/knowledge-bases/${editingKnowledgeBase.id}${suffix}`, {
+        tenant_id: tenantId,
         name: knowledgeBaseDraft.name,
         description: knowledgeBaseDraft.description,
         status: knowledgeBaseDraft.status,
         capability_scope: knowledgeBaseDraft.capability_scope,
       });
+      if (!context.isCurrentGeneration(generation)) return;
       setKnowledgeBases((current) => current.map((item) => (item.id === next.id ? next : item)));
       setEditingKnowledgeBase(null);
       notify.success(t('knowledgePage.toast.savedKnowledgeBase'));
       await refresh();
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       notify.error(knowledgeErrorMessage(error, 'knowledgePage.error.saveKnowledgeBase'));
     }
   }
 
   async function setKnowledgeBaseStatus(row: KnowledgeBaseRead, active: boolean) {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     const suffix = effectiveAgentId ? `?agent_id=${encodeURIComponent(effectiveAgentId)}` : '';
     try {
-      const next = await api.put<KnowledgeBaseRead>(`/api/enterprise/knowledge-bases/${row.id}${suffix}`, {
-        tenant_id: TENANT_ID,
+      const next = await tenantClient.put<KnowledgeBaseRead>(`/api/enterprise/knowledge-bases/${row.id}${suffix}`, {
+        tenant_id: tenantId,
         status: active ? 'active' : 'archived',
       });
+      if (!context.isCurrentGeneration(generation)) return;
       setKnowledgeBases((current) => current.map((item) => (item.id === next.id ? next : item)));
       notify.success(active ? t('knowledgePage.toast.publishedKnowledgeBase') : t('knowledgePage.toast.archivedKnowledgeBase'));
       await refresh();
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       notify.error(knowledgeErrorMessage(error, active ? 'knowledgePage.error.publishKnowledgeBase' : 'knowledgePage.error.archiveKnowledgeBase'));
     }
   }
@@ -898,45 +998,57 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
     const row = deleteKbTarget;
     if (!row) return;
     const branchMode = !isOverallAgent;
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     const suffix = effectiveAgentId ? `&agent_id=${encodeURIComponent(effectiveAgentId)}` : '';
     try {
-      await api.delete(`/api/enterprise/knowledge-bases/${row.id}?tenant_id=${TENANT_ID}${suffix}`);
+      await tenantClient.delete(`/api/enterprise/knowledge-bases/${row.id}?tenant_id=${tenantId}${suffix}`);
+      if (!context.isCurrentGeneration(generation)) return;
       notify.success(branchMode ? t('knowledgePage.toast.removedKnowledgeBase') : t('knowledgePage.toast.deletedKnowledgeBase'));
       setDeleteKbTarget(null);
       await refresh();
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       notify.error(knowledgeErrorMessage(error, 'knowledgePage.error.deleteKnowledgeBase'));
     }
   }
 
   async function loadSharedVersionTeams(row: KnowledgeBaseRead) {
     /** 找出当前账号可管理且已绑定此共享库的团队，供生命周期动作选择。 */
-    return api.get<Array<{ id: string; name: string }>>(
-      `/api/enterprise/knowledge-bases/${row.id}/teams?tenant_id=${TENANT_ID}`,
+    return tenantClient.get<Array<{ id: string; name: string }>>(
+      `/api/enterprise/knowledge-bases/${row.id}/teams?tenant_id=${tenantId}`,
     );
   }
 
   async function openKnowledgeBaseVersions(row: KnowledgeBaseRead) {
     /** 共享库进入全局生命周期面板，专用库继续使用员工分支版本表。 */
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     if (row.mode === 'shared') {
       try {
         const teamOptions = await loadSharedVersionTeams(row);
+        if (!context.isCurrentGeneration(generation)) return;
         setVersionTeamOptions(teamOptions);
         setVersionKnowledgeBase(row);
       } catch (error) {
+        if (!context.isCurrentGeneration(generation)) return;
         notify.error(knowledgeErrorMessage(error, 'knowledgePage.error.loadVersionTeams'));
       }
       return;
     }
     const suffix = effectiveAgentId ? `&agent_id=${encodeURIComponent(effectiveAgentId)}` : '';
     try {
-      const versions = await api.get<KnowledgeBaseVersionRead[]>(
-        `/api/enterprise/knowledge-bases/${row.id}/versions?tenant_id=${TENANT_ID}${suffix}`,
+      const versions = await tenantClient.get<KnowledgeBaseVersionRead[]>(
+        `/api/enterprise/knowledge-bases/${row.id}/versions?tenant_id=${tenantId}${suffix}`,
       );
+      if (!context.isCurrentGeneration(generation)) return;
       setVersionTeamOptions([]);
       setVersionKnowledgeBase(row);
       setKnowledgeBaseVersions(versions);
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       notify.error(knowledgeErrorMessage(error, 'knowledgePage.error.loadVersions'));
     }
   }
@@ -946,11 +1058,16 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
       notify.warning(t('knowledgePage.toast.selectEmployeeShort'));
       return;
     }
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     try {
-      await api.post(`/api/enterprise/knowledge-bases/${row.id}/sync-from-overall?tenant_id=${TENANT_ID}&agent_id=${encodeURIComponent(agentId)}`);
+      await tenantClient.post(`/api/enterprise/knowledge-bases/${row.id}/sync-from-overall?tenant_id=${tenantId}&agent_id=${encodeURIComponent(agentId)}`);
+      if (!context.isCurrentGeneration(generation)) return;
       notify.success(t('knowledgePage.toast.syncedFromMarketplace'));
       await refresh();
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       notify.error(knowledgeErrorMessage(error, 'knowledgePage.error.syncFromMarketplace'));
     }
   }
@@ -960,27 +1077,38 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
       notify.warning(t('knowledgePage.toast.selectEmployeeShort'));
       return;
     }
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     try {
-      await api.post(`/api/enterprise/knowledge-bases/${row.id}/promote-to-overall?tenant_id=${TENANT_ID}&agent_id=${encodeURIComponent(agentId)}`);
+      await tenantClient.post(`/api/enterprise/knowledge-bases/${row.id}/promote-to-overall?tenant_id=${tenantId}&agent_id=${encodeURIComponent(agentId)}`);
+      if (!context.isCurrentGeneration(generation)) return;
       notify.success(t('knowledgePage.toast.publishedToMarketplace'));
       await refresh();
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       notify.error(knowledgeErrorMessage(error, 'knowledgePage.error.publishToMarketplace'));
     }
   }
 
   async function rollbackKnowledgeBaseVersion(version: KnowledgeBaseVersionRead) {
     if (!versionKnowledgeBase || !effectiveAgentId) return;
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     try {
-      await api.post(`/api/enterprise/knowledge-bases/${versionKnowledgeBase.id}/rollback`, {
-        tenant_id: TENANT_ID,
+      await tenantClient.post(`/api/enterprise/knowledge-bases/${versionKnowledgeBase.id}/rollback`, {
+        tenant_id: tenantId,
         agent_id: effectiveAgentId,
         version: version.version,
       });
+      if (!context.isCurrentGeneration(generation)) return;
       notify.success(t('knowledgePage.toast.rolledBackVersion', { version: version.version }));
       await openKnowledgeBaseVersions(versionKnowledgeBase);
+      if (!context.isCurrentGeneration(generation)) return;
       await refresh();
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       notify.error(knowledgeErrorMessage(error, 'knowledgePage.error.rollbackVersion'));
     }
   }
@@ -1034,68 +1162,88 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
       notify.warning(t('knowledgePage.toast.documentContentRequired'));
       return;
     }
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     setContentSaving(true);
     try {
       const query = effectiveAgentId ? `?agent_id=${encodeURIComponent(effectiveAgentId)}` : '';
-      const next = await api.put<KnowledgeDocumentRead>(
+      const next = await tenantClient.put<KnowledgeDocumentRead>(
         `/api/enterprise/knowledge/documents/${editingDocument.id}${query}`,
         {
-          tenant_id: TENANT_ID,
+          tenant_id: tenantId,
           title: documentDraft.title,
           status: documentDraft.status,
           content_md: documentDraft.content_md,
           expected_updated_at: editingDocument.updated_at,
         },
       );
+      if (!context.isCurrentGeneration(generation)) return;
       setEditingDocument(null);
       await refresh(effectiveAgentId, next);
+      if (!context.isCurrentGeneration(generation)) return;
       notify.success(t('knowledgePage.toast.savedDocument'));
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       notify.error(knowledgeErrorMessage(error, 'knowledgePage.error.saveDocument'));
     } finally {
-      setContentSaving(false);
+      if (context.isCurrentGeneration(generation)) setContentSaving(false);
     }
   }
 
   async function openBucketEditor(row: KnowledgeBucketRead) {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     setEditingBucket(row);
     setBucketDraft({ title: row.title, summary: row.summary });
     try {
-      const chunks = await api.get<KnowledgeChunkRead[]>(
-        `/api/enterprise/knowledge/buckets/${row.id}/chunks?tenant_id=${TENANT_ID}${effectiveAgentId ? `&agent_id=${encodeURIComponent(effectiveAgentId)}` : ''}`,
+      const chunks = await tenantClient.get<KnowledgeChunkRead[]>(
+        `/api/enterprise/knowledge/buckets/${row.id}/chunks?tenant_id=${tenantId}${effectiveAgentId ? `&agent_id=${encodeURIComponent(effectiveAgentId)}` : ''}`,
       );
+      if (!context.isCurrentGeneration(generation)) return;
       setBucketChunks(chunks);
       setChunkDrafts(
         Object.fromEntries(chunks.map((chunk) => [chunk.id, { content: chunk.content, summary: chunk.summary || '' }])),
       );
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       notify.error(knowledgeErrorMessage(error, 'knowledgePage.error.loadCitations'));
     }
   }
 
   async function saveBucketAndChunks() {
     if (!editingBucket) return;
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     setContentSaving(true);
     try {
-      await api.put<KnowledgeBucketRead>(`/api/enterprise/knowledge/buckets/${editingBucket.id}`, {
-        tenant_id: TENANT_ID,
+      await tenantClient.put<KnowledgeBucketRead>(`/api/enterprise/knowledge/buckets/${editingBucket.id}`, {
+        tenant_id: tenantId,
         title: bucketDraft.title,
         summary: bucketDraft.summary,
       });
       for (const chunk of bucketChunks) {
-        await api.put<KnowledgeChunkRead>(`/api/enterprise/knowledge/chunks/${chunk.id}`, {
-          tenant_id: TENANT_ID,
+        await tenantClient.put<KnowledgeChunkRead>(`/api/enterprise/knowledge/chunks/${chunk.id}`, {
+          tenant_id: tenantId,
           content: chunkDrafts[chunk.id]?.content ?? chunk.content,
           summary: chunkDrafts[chunk.id]?.summary ?? chunk.summary,
         });
+        if (!context.isCurrentGeneration(generation)) return;
       }
+      if (!context.isCurrentGeneration(generation)) return;
       notify.success(t('knowledgePage.toast.savedKnowledgeContent'));
       setEditingBucket(null);
-      if (selectedDocument) await loadBuckets(selectedDocument, false);
+      if (selectedDocument) {
+        await loadBuckets(selectedDocument, false);
+        if (!context.isCurrentGeneration(generation)) return;
+      }
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       notify.error(knowledgeErrorMessage(error, 'knowledgePage.error.saveKnowledgeContent'));
     } finally {
-      setContentSaving(false);
+      if (context.isCurrentGeneration(generation)) setContentSaving(false);
     }
   }
 
@@ -1460,7 +1608,10 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
                 value={selectedSearchModelId}
                 onChange={(modelId) => {
                   setSelectedSearchModelId(modelId);
-                  window.localStorage.setItem(`${KNOWLEDGE_SEARCH_MODEL_STORAGE_KEY}:${TENANT_ID}`, modelId);
+                  window.localStorage.setItem(
+                    tenantUserStorageKey(tenantId, userId, KNOWLEDGE_SEARCH_MODEL_STORAGE_KEY),
+                    modelId,
+                  );
                 }}
                 buttonClassName="h-[34px]"
               />
@@ -1931,6 +2082,10 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
 
 export function KnowledgeAddPage({ currentUser }: KnowledgePageProps = {}) {
   const { t } = useAppIntl();
+  const tenantContext = useTenantSession();
+  const tenantClient = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
+  const tenantId = tenantContext?.tenantId || '';
+  const userId = tenantContext?.userId || '';
   const navigate = useNavigate();
   const [knowledgeBases, setKnowledgeBases] = useState<KnowledgeBaseRead[]>([]);
   const [capabilityScope, setCapabilityScope] = useState<CapabilityScope>('general');
@@ -1939,7 +2094,9 @@ export function KnowledgeAddPage({ currentUser }: KnowledgePageProps = {}) {
   const [newBaseDescription, setNewBaseDescription] = useState('');
   const [creatingBase, setCreatingBase] = useState(false);
   const [jobs, setJobs] = useState<Record<string, KnowledgeIngestJobRead>>({});
-  const [agentId, setAgentId] = useState(readEmployeeScope);
+  const [agentId, setAgentId] = useState(
+    () => tenantId && userId ? readEmployeeScope(tenantId, userId) : '',
+  );
   const [agentScopeLoaded, setAgentScopeLoaded] = useState(false);
   const [checkedDiscoveryJobIds, setCheckedDiscoveryJobIds] = useState<string[]>([]);
   const [pendingDiscoveries, setPendingDiscoveries] = useState<KnowledgeDiscoveryRead[]>([]);
@@ -1962,17 +2119,29 @@ export function KnowledgeAddPage({ currentUser }: KnowledgePageProps = {}) {
   );
 
   useEffect(() => {
+    setAgentId(tenantId && userId ? readEmployeeScope(tenantId, userId) : '');
+    setAgentScopeLoaded(false);
+    setKnowledgeBases([]);
+    setJobs({});
+    setPendingDiscoveries([]);
+    setCheckedDiscoveryJobIds([]);
+  }, [tenantId, userId]);
+
+  useEffect(() => {
+    if (!tenantContext) return;
+    const context = tenantContext;
+    const generation = context.generation;
     let active = true;
-    api
-      .get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${TENANT_ID}`)
+    tenantClient
+      .get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${tenantId}`)
       .then((agentRows) => {
-        if (!active) return;
+        if (!active || !context.isCurrentGeneration(generation)) return;
         const resolvedAgentId = resolveKnowledgeAgentScope(agentRows, currentUser, agentId);
         if (resolvedAgentId !== agentId) {
           if (resolvedAgentId) {
-            persistSharedAgentScope(resolvedAgentId, currentUser?.id);
+            persistSharedAgentScope(resolvedAgentId, tenantId, userId);
           } else {
-            clearSharedAgentScope(currentUser?.id);
+            clearSharedAgentScope(tenantId, userId);
           }
           setAgentId(resolvedAgentId);
           emitAgentScopeChange(resolvedAgentId);
@@ -1980,37 +2149,42 @@ export function KnowledgeAddPage({ currentUser }: KnowledgePageProps = {}) {
         setAgentScopeLoaded(true);
       })
       .catch(() => {
-        if (active) setAgentScopeLoaded(true);
+        if (active && context.isCurrentGeneration(generation)) setAgentScopeLoaded(true);
       });
     return () => {
       active = false;
     };
-  }, [currentUser?.id]);
+  }, [currentUser?.id, tenantContext, tenantId, userId]);
 
   useEffect(() => {
+    if (!tenantContext) return;
     if (!agentScopeLoaded) return;
     void refreshKnowledgeBases();
     void loadRecentJobs();
-  }, [agentId, agentScopeLoaded]);
+  }, [agentId, agentScopeLoaded, tenantContext]);
 
   useEffect(() => {
     const onScopeChange = (event: Event) => {
       const next = (event as CustomEvent<{ agentId?: string }>).detail?.agentId || '';
-      setAgentId(next && !isTeamScope(next) ? next : readEmployeeScope());
+      setAgentId(next && !isTeamScope(next) ? next : readEmployeeScope(tenantId, userId));
     };
     window.addEventListener('ultrarag-enterprise-agent-scope-change', onScopeChange);
     return () => window.removeEventListener('ultrarag-enterprise-agent-scope-change', onScopeChange);
-  }, []);
+  }, [tenantId, userId]);
 
   useEffect(() => {
+    if (!tenantContext) return;
     if (activeJobs.length === 0) return;
+    const context = tenantContext;
+    const generation = context.generation;
     const timer = window.setInterval(() => {
       activeJobs.forEach((job) => {
-        void api
+        void tenantClient
           .get<KnowledgeIngestJobRead>(
-            `/api/enterprise/knowledge/jobs/${job.id}?tenant_id=${TENANT_ID}${agentId ? `&agent_id=${encodeURIComponent(agentId)}` : ''}`,
+            `/api/enterprise/knowledge/jobs/${job.id}?tenant_id=${tenantId}${agentId ? `&agent_id=${encodeURIComponent(agentId)}` : ''}`,
           )
           .then((next) => {
+            if (!context.isCurrentGeneration(generation)) return;
             setJobs((prev) => ({ ...prev, [next.id]: next }));
             if (TERMINAL_KNOWLEDGE_JOB_STATUSES.has(next.status)) {
               setCancellingJobIds((current) => current.filter((id) => id !== next.id));
@@ -2022,47 +2196,61 @@ export function KnowledgeAddPage({ currentUser }: KnowledgePageProps = {}) {
       });
     }, 1400);
     return () => window.clearInterval(timer);
-  }, [activeJobs]);
+  }, [activeJobs, tenantClient, tenantContext, tenantId]);
 
   useEffect(() => {
+    if (!tenantContext) return;
     sortedJobs
       .filter((job) => job.status === 'succeeded' && !checkedDiscoveryJobIds.includes(job.id))
       .forEach((job) => {
         void loadDiscoveriesForJob(job);
       });
-  }, [sortedJobs, checkedDiscoveryJobIds, agentId]);
+  }, [sortedJobs, checkedDiscoveryJobIds, agentId, tenantContext]);
 
   async function refreshKnowledgeBases() {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     if (!isEnterpriseAdmin(currentUser) && !agentId) {
       setKnowledgeBases([]);
       return;
     }
     try {
       const suffix = agentId ? `&agent_id=${encodeURIComponent(agentId)}` : '';
-      const rows = await api.get<KnowledgeBaseRead[]>(`/api/enterprise/knowledge-bases?tenant_id=${TENANT_ID}${suffix}`);
+      const rows = await tenantClient.get<KnowledgeBaseRead[]>(`/api/enterprise/knowledge-bases?tenant_id=${tenantId}${suffix}`);
+      if (!context.isCurrentGeneration(generation)) return;
       setKnowledgeBases(rows);
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       notify.error(apiErrorMessage(error, 'knowledgePage.add.error.loadKnowledgeBases', { t }));
     }
   }
 
   async function loadRecentJobs() {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     if (!isEnterpriseAdmin(currentUser) && !agentId) {
       setJobs({});
       return;
     }
     try {
       const suffix = agentId ? `&agent_id=${encodeURIComponent(agentId)}` : '';
-      const rows = await api.get<KnowledgeIngestJobRead[]>(
-        `/api/enterprise/knowledge/jobs?tenant_id=${TENANT_ID}${suffix}&limit=8`,
+      const rows = await tenantClient.get<KnowledgeIngestJobRead[]>(
+        `/api/enterprise/knowledge/jobs?tenant_id=${tenantId}${suffix}&limit=8`,
       );
+      if (!context.isCurrentGeneration(generation)) return;
       setJobs(Object.fromEntries(rows.map((job) => [job.id, job])));
     } catch {
+      if (!context.isCurrentGeneration(generation)) return;
       setJobs({});
     }
   }
 
   async function createEmptyKnowledgeBase() {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     /** 创建显式类型的空知识库；共享库后续由团队详情绑定并配置权限。 */
     const name = newBaseName.trim();
     if (!name) {
@@ -2075,67 +2263,87 @@ export function KnowledgeAddPage({ currentUser }: KnowledgePageProps = {}) {
     }
     setCreatingBase(true);
     try {
-      await api.post<KnowledgeBaseRead>('/api/enterprise/knowledge-bases', {
-        tenant_id: TENANT_ID,
+      await tenantClient.post<KnowledgeBaseRead>('/api/enterprise/knowledge-bases', {
+        tenant_id: tenantId,
         name,
         description: newBaseDescription.trim() || undefined,
         mode: newBaseMode,
         agent_id: newBaseMode === 'dedicated' && agentId ? agentId : undefined,
         capability_scope: capabilityScope,
       });
+      if (!context.isCurrentGeneration(generation)) return;
       notify.success(newBaseMode === 'shared' ? t('knowledgePage.add.toast.createdShared') : t('knowledgePage.add.toast.createdDedicated'));
       navigate('/enterprise/knowledge');
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       notify.error(apiErrorMessage(error, 'knowledgePage.add.error.createKnowledgeBase', { t }));
     } finally {
-      setCreatingBase(false);
+      if (context.isCurrentGeneration(generation)) setCreatingBase(false);
     }
   }
 
   async function uploadFile(file: File) {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     if (!isEnterpriseAdmin(currentUser) && !agentId) {
       notify.warning(t('knowledgePage.toast.selectEmployee'));
       return;
     }
     try {
       const contentBase64 = await fileToBase64(file);
+      if (!context.isCurrentGeneration(generation)) return;
       const suffix = agentId ? `?agent_id=${encodeURIComponent(agentId)}` : '';
-      const job = await api.post<KnowledgeIngestJobRead>(`/api/enterprise/knowledge/documents${suffix}`, {
-        tenant_id: TENANT_ID,
+      const job = await tenantClient.post<KnowledgeIngestJobRead>(`/api/enterprise/knowledge/documents${suffix}`, {
+        tenant_id: tenantId,
         filename: file.name,
         title: file.name.replace(/\.[^.]+$/, ''),
         content_base64: contentBase64,
         capability_scope: capabilityScope,
       });
+      if (!context.isCurrentGeneration(generation)) return;
       setJobs((prev) => ({ ...prev, [job.id]: job }));
       await refreshKnowledgeBases();
+      if (!context.isCurrentGeneration(generation)) return;
       notify.success(t('knowledgePage.add.toast.createdJob'));
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       notify.error(apiErrorMessage(error, 'knowledgePage.add.error.upload', { t }));
     }
   }
 
   async function cancelJob(job: KnowledgeIngestJobRead) {
     if (!['queued', 'running', 'cancel_requested'].includes(job.status)) return;
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     setCancellingJobIds((current) => (current.includes(job.id) ? current : [...current, job.id]));
     try {
-      const next = await api.post<KnowledgeIngestJobRead>(
-        `/api/enterprise/knowledge/jobs/${job.id}/cancel?tenant_id=${TENANT_ID}`,
+      const next = await tenantClient.post<KnowledgeIngestJobRead>(
+        `/api/enterprise/knowledge/jobs/${job.id}/cancel?tenant_id=${tenantId}`,
       );
+      if (!context.isCurrentGeneration(generation)) return;
       setJobs((prev) => ({ ...prev, [next.id]: next }));
       notify.success(next.status === 'cancelled' ? t('knowledgePage.add.toast.cancelledJob') : t('knowledgePage.add.toast.cancelRequested'));
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       notify.error(apiErrorMessage(error, 'knowledgePage.add.error.cancelJob', { t }));
     } finally {
-      setCancellingJobIds((current) => current.filter((id) => id !== job.id));
+      if (context.isCurrentGeneration(generation)) {
+        setCancellingJobIds((current) => current.filter((id) => id !== job.id));
+      }
     }
   }
 
   async function loadDiscoveriesForJob(job: KnowledgeIngestJobRead) {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     setCheckedDiscoveryJobIds((prev) => (prev.includes(job.id) ? prev : [...prev, job.id]));
     try {
       const suffix = agentId ? `&agent_id=${encodeURIComponent(agentId)}` : '';
-      const rows = await api.get<KnowledgeDiscoveryRead[]>(`/api/enterprise/knowledge/discoveries?tenant_id=${TENANT_ID}${suffix}`);
+      const rows = await tenantClient.get<KnowledgeDiscoveryRead[]>(`/api/enterprise/knowledge/discoveries?tenant_id=${tenantId}${suffix}`);
+      if (!context.isCurrentGeneration(generation)) return;
       const next = rows.filter(
         (item) =>
           item.status === 'pending' &&
@@ -2150,27 +2358,38 @@ export function KnowledgeAddPage({ currentUser }: KnowledgePageProps = {}) {
       });
       setDiscoveryModalOpen(true);
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       notify.warning(apiErrorMessage(error, 'knowledgePage.add.error.loadDiscoveries', { t }));
     }
   }
 
   async function confirmDiscovery(item: KnowledgeDiscoveryRead) {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     try {
-      await api.post(`/api/enterprise/knowledge/discoveries/${item.id}/confirm?tenant_id=${TENANT_ID}`);
+      await tenantClient.post(`/api/enterprise/knowledge/discoveries/${item.id}/confirm?tenant_id=${tenantId}`);
+      if (!context.isCurrentGeneration(generation)) return;
       notify.success(t('knowledgePage.add.toast.confirmedSuggestion'));
       setPendingDiscoveries((current) => current.filter((entry) => entry.id !== item.id));
       await refreshKnowledgeBases();
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       notify.error(apiErrorMessage(error, 'knowledgePage.add.error.confirmSuggestion', { t }));
     }
   }
 
   async function rejectDiscovery(item: KnowledgeDiscoveryRead) {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     try {
-      await api.post(`/api/enterprise/knowledge/discoveries/${item.id}/reject?tenant_id=${TENANT_ID}`);
+      await tenantClient.post(`/api/enterprise/knowledge/discoveries/${item.id}/reject?tenant_id=${tenantId}`);
+      if (!context.isCurrentGeneration(generation)) return;
       notify.success(t('knowledgePage.add.toast.rejectedSuggestion'));
       setPendingDiscoveries((current) => current.filter((entry) => entry.id !== item.id));
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       notify.error(apiErrorMessage(error, 'knowledgePage.add.error.rejectSuggestion', { t }));
     }
   }

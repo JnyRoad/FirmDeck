@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from pydantic import ValidationError
-from sqlalchemy import delete
+from sqlalchemy import delete, or_, update
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
@@ -28,7 +28,9 @@ from app.db.models import (
     KnowledgeIngestJob,
     ModelConfig,
     Skill,
+    Tenant,
     Tool,
+    new_id,
     utc_now,
 )
 from app.knowledge.access import KnowledgeAccessService
@@ -53,6 +55,12 @@ from app.knowledge.schema import (
 from app.llm import LLMClient, LLMError
 from app.llm.model_config_resolver import resolve_model_config_for_runtime
 from app.observability.spans import llm_operation, observed_span
+from app.security.tenant import (
+    TenantExecutionKind,
+    TenantLifecycleDenied,
+    require_active_tenant,
+    require_matching_admission_version,
+)
 from app.skills.skill_schema import SkillCard, SkillGraphEdge, SkillGraphNode
 
 PROMPT_DIR = paths.resource_dir() / "app" / "llm" / "prompts"
@@ -69,7 +77,9 @@ SEARCH_DOCUMENT_ROUTE_LIMIT = 120
 SEARCH_BUCKET_ROUTE_LIMIT = 160
 TERMINAL_INGEST_STATUSES = {"succeeded", "failed", "cancelled"}
 CANCELLING_INGEST_STATUSES = {"cancel_requested", "cancelled"}
+FENCED_INGEST_STATUSES = {"running", "cancel_requested"}
 CANCEL_REQUEST_STALE_AFTER = timedelta(seconds=15)
+INGEST_JOB_LEASE_SECONDS = 15 * 60
 SEARCH_MIN_DOCUMENT_SCORE = 2.0
 SEARCH_MIN_BUCKET_SCORE = 2.0
 SEARCH_MIN_CHUNK_SCORE = 2.0
@@ -267,13 +277,26 @@ class KnowledgeIngestCancelled(RuntimeError):
     """Raised inside the ingest worker when a persisted job is cancelled."""
 
 
+class KnowledgeIngestExecutionFenceLost(RuntimeError):
+    """Raised when another worker or cancellation has replaced this ingest generation."""
+
+
 class KnowledgeService:
     def __init__(self, db: Session):
         self.db = db
+        self._execution_owner: str | None = None
+        self._execution_generation: int | None = None
 
     def create_ingest_job(self, payload: IngestPayload) -> KnowledgeIngestJob:
+        admission = require_active_tenant(
+            self.db,
+            tenant_id=payload.tenant_id,
+            execution_kind=TenantExecutionKind.JOB_CLAIM,
+            correlation_id="knowledge-ingest-admission",
+        )
         job = KnowledgeIngestJob(
             tenant_id=payload.tenant_id,
+            tenant_lifecycle_version=admission.lifecycle_version,
             knowledge_base_id=payload.knowledge_base_id,
             knowledge_base_version_id=payload.knowledge_base_version_id
             or _default_knowledge_base_version_id(payload.knowledge_base_id),
@@ -459,6 +482,252 @@ class KnowledgeService:
         self._finalize_cancelled_job(job)
         return job
 
+    def _claim_ingest_job(
+        self,
+        job_id: str,
+        owner: str,
+    ) -> KnowledgeIngestJob | None:
+        """Claim one queued ingest generation after a fresh tenant admission read."""
+        self.db.rollback()
+        candidate = self.db.get(KnowledgeIngestJob, job_id)
+        if candidate is None or candidate.status in TERMINAL_INGEST_STATUSES:
+            return None
+        if candidate.status in CANCELLING_INGEST_STATUSES:
+            self._finalize_cancelled_job(candidate)
+            return None
+        try:
+            decision = require_active_tenant(
+                self.db,
+                tenant_id=candidate.tenant_id,
+                execution_kind=TenantExecutionKind.JOB_CLAIM,
+                correlation_id=job_id,
+            )
+            require_matching_admission_version(
+                decision,
+                candidate.tenant_lifecycle_version,
+            )
+        except TenantLifecycleDenied as denial:
+            self.db.rollback()
+            current = self.db.get(KnowledgeIngestJob, job_id)
+            if current is not None and current.status in {"queued", "running"}:
+                self._terminalize_ingest_denial(
+                    current,
+                    denial,
+                    owner=None,
+                    generation=current.execution_generation,
+                )
+            return None
+
+        # End the authoritative read transaction before attempting the claim CAS.
+        self.db.rollback()
+        now = utc_now()
+        claim = self.db.exec(
+            update(KnowledgeIngestJob)
+            .where(
+                KnowledgeIngestJob.id == job_id,
+                or_(
+                    KnowledgeIngestJob.status == "queued",
+                    (KnowledgeIngestJob.status == "running")
+                    & KnowledgeIngestJob.execution_owner.is_(None),
+                ),
+                KnowledgeIngestJob.tenant_lifecycle_version
+                == candidate.tenant_lifecycle_version,
+                select(Tenant.id)
+                .where(
+                    Tenant.id == KnowledgeIngestJob.tenant_id,
+                    Tenant.status == "active",
+                    Tenant.lifecycle_version
+                    == KnowledgeIngestJob.tenant_lifecycle_version,
+                )
+                .exists(),
+            )
+            .values(
+                status="running",
+                execution_owner=owner,
+                execution_generation=KnowledgeIngestJob.execution_generation + 1,
+                lease_expires_at=now + timedelta(seconds=INGEST_JOB_LEASE_SECONDS),
+                started_at=now,
+                updated_at=now,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        if getattr(claim, "rowcount", 0) != 1:
+            self.db.rollback()
+            return None
+        self.db.commit()
+        claimed = self.db.get(KnowledgeIngestJob, job_id)
+        if claimed is None:
+            return None
+        self._execution_owner = owner
+        self._execution_generation = claimed.execution_generation
+        return claimed
+
+    def _require_ingest_execution_fence(self, job: KnowledgeIngestJob) -> None:
+        """Require the worker's owner/generation and exact active tenant version."""
+        owner = self._execution_owner
+        generation = self._execution_generation
+        if owner is None or generation is None:
+            raise KnowledgeIngestExecutionFenceLost("ingest worker claim is missing")
+        self.db.rollback()
+        current = self.db.get(KnowledgeIngestJob, job.id)
+        if (
+            current is None
+            or current.status not in FENCED_INGEST_STATUSES
+            or current.execution_owner != owner
+            or current.execution_generation != generation
+        ):
+            raise KnowledgeIngestExecutionFenceLost("ingest worker claim was replaced")
+        decision = require_active_tenant(
+            self.db,
+            tenant_id=current.tenant_id,
+            execution_kind=TenantExecutionKind.JOB_CLAIM,
+            correlation_id=current.id,
+        )
+        require_matching_admission_version(
+            decision,
+            current.tenant_lifecycle_version,
+        )
+        self.db.rollback()
+
+    def _commit_ingest_fenced(self, job: KnowledgeIngestJob) -> None:
+        """Commit local writes only while this owner/generation still holds the active lease."""
+        if self._execution_owner is None or self._execution_generation is None:
+            if job.status in TERMINAL_INGEST_STATUSES:
+                job.execution_owner = None
+                job.lease_expires_at = None
+                self.db.add(job)
+            self.db.commit()
+            self.db.refresh(job)
+            return
+        # Cancellation may be observed after the API has moved a claimed row to
+        # ``cancel_requested``.  That row is still owned by this generation until
+        # the terminal CAS below releases it, so permit the same fenced cleanup
+        # transaction to advance from either in-flight status.
+        claimable_statuses = ("running", "cancel_requested")
+        # Terminal status changes are pending on ``job`` before the CAS.  Keep
+        # them unflushed while checking the still-running owner row, then flush
+        # the guarded local write only after the conditional update succeeds.
+        terminal_transition = job.status in TERMINAL_INGEST_STATUSES
+        terminal_values = {
+            "execution_owner": None,
+            "lease_expires_at": None,
+        } if terminal_transition else {}
+        where = (
+            update(KnowledgeIngestJob)
+            .where(
+                KnowledgeIngestJob.id == job.id,
+                KnowledgeIngestJob.status.in_(claimable_statuses),
+                KnowledgeIngestJob.execution_owner == self._execution_owner,
+                KnowledgeIngestJob.execution_generation == self._execution_generation,
+                KnowledgeIngestJob.tenant_lifecycle_version
+                == job.tenant_lifecycle_version,
+                select(Tenant.id)
+                .where(
+                    Tenant.id == KnowledgeIngestJob.tenant_id,
+                    Tenant.status == "active",
+                    Tenant.lifecycle_version
+                    == KnowledgeIngestJob.tenant_lifecycle_version,
+                )
+                .exists(),
+            )
+            .values(updated_at=utc_now(), **terminal_values)
+            .execution_options(synchronize_session=False)
+        )
+        if terminal_transition:
+            with self.db.no_autoflush:
+                result = self.db.exec(where)
+        else:
+            self.db.flush()
+            result = self.db.exec(where)
+        if getattr(result, "rowcount", 0) != 1:
+            self.db.rollback()
+            current = self.db.get(KnowledgeIngestJob, job.id)
+            if current is not None and current.status in FENCED_INGEST_STATUSES:
+                # Re-raise the authoritative lifecycle denial when that is the reason for
+                # the CAS miss; otherwise the owner/generation fence is simply lost.
+                self._require_ingest_execution_fence(current)
+            raise KnowledgeIngestExecutionFenceLost("ingest commit fence was lost")
+        if terminal_transition:
+            self.db.flush()
+        self.db.commit()
+        self.db.refresh(job)
+
+    def _terminalize_ingest_denial(
+        self,
+        job: KnowledgeIngestJob,
+        denial: TenantLifecycleDenied,
+        *,
+        owner: str | None,
+        generation: int,
+    ) -> KnowledgeIngestJob | None:
+        """Terminalize a denied claim without creating a replayable queued row."""
+        self.db.rollback()
+        current = self.db.get(KnowledgeIngestJob, job.id)
+        if current is None or current.status not in {"queued", *FENCED_INGEST_STATUSES}:
+            return None
+        if current.execution_generation != generation:
+            return None
+        if owner is None:
+            owner_predicate = KnowledgeIngestJob.execution_owner.is_(None)
+        else:
+            owner_predicate = KnowledgeIngestJob.execution_owner == owner
+        if current.document_id:
+            for model in (
+                KnowledgeDiscoverySuggestion,
+                KnowledgeConcept,
+                KnowledgeChunk,
+                KnowledgeBucket,
+            ):
+                self.db.exec(delete(model).where(model.document_id == current.document_id))
+            document = self.db.get(KnowledgeDocument, current.document_id)
+            if document is not None:
+                self.db.delete(document)
+        metadata = dict(current.metadata_json or {})
+        metadata.pop("content_base64", None)
+        metadata.pop("stage_label", None)
+        metadata["stage_code"] = "cancelled"
+        metadata["stage_params"] = {}
+        metadata["stage_detail"] = _knowledge_stage_descriptor(denial.code)
+        metadata["cancelled_at"] = utc_now().isoformat()
+        result = self.db.exec(
+            update(KnowledgeIngestJob)
+            .where(
+                KnowledgeIngestJob.id == current.id,
+                KnowledgeIngestJob.status.in_(["queued", *FENCED_INGEST_STATUSES]),
+                owner_predicate,
+                KnowledgeIngestJob.execution_generation == generation,
+            )
+            .values(
+                status="cancelled",
+                stage="cancelled",
+                progress=float(current.progress or 0.0),
+                error=json.dumps(
+                    {
+                        "code": denial.code,
+                        "params": {},
+                        "retryable": False,
+                        "request_id": None,
+                        "trace_id": None,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                metadata_json=metadata,
+                document_id=None,
+                finished_at=utc_now(),
+                updated_at=utc_now(),
+                execution_owner=None,
+                execution_generation=generation + 1,
+                lease_expires_at=None,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        if getattr(result, "rowcount", 0) != 1:
+            self.db.rollback()
+            return None
+        self.db.commit()
+        return self.db.get(KnowledgeIngestJob, current.id)
+
     def run_ingest_job(self, job_id: str) -> None:
         with Session(engine) as db:
             service = KnowledgeService(db)
@@ -468,6 +737,15 @@ class KnowledgeService:
         """Execute one ingest job and persist only canonical failure payloads on error."""
         job = self.db.get(KnowledgeIngestJob, job_id)
         if not job:
+            return
+        if job.status in TERMINAL_INGEST_STATUSES:
+            return
+        if job.status in CANCELLING_INGEST_STATUSES:
+            self._finalize_cancelled_job(job)
+            return
+        owner = new_id("kjoblease")
+        job = self._claim_ingest_job(job_id, owner)
+        if job is None:
             return
         try:
             self._update_ingest_stage(
@@ -526,12 +804,14 @@ class KnowledgeService:
                     },
                 },
             )
+            self._require_ingest_execution_fence(job)
             self.db.add(document)
-            self.db.commit()
+            self.db.flush()
             self.db.refresh(document)
             job.document_id = document.id
             self.db.add(job)
-            self.db.commit()
+            self._commit_ingest_fenced(job)
+            self.db.refresh(job)
             self.db.refresh(job)
             self._update_ingest_stage(
                 job,
@@ -566,12 +846,14 @@ class KnowledgeService:
             self._raise_if_ingest_cancelled(job)
             okf_concepts = build_okf_for_document(document, section_nodes, buckets)
             self._raise_if_ingest_cancelled(job)
+            self._require_ingest_execution_fence(job)
             concept_rows = upsert_concepts(
                 self.db,
                 job.tenant_id,
                 job.knowledge_base_id,
                 document.knowledge_base_version_id,
                 okf_concepts,
+                commit=False,
             )
 
             document.bucket_count = len(buckets)
@@ -601,6 +883,7 @@ class KnowledgeService:
             }
             document.updated_at = utc_now()
             self.db.add(document)
+            self._commit_ingest_fenced(job)
             self._update_ingest_stage(
                 job,
                 "summarizing",
@@ -615,6 +898,7 @@ class KnowledgeService:
             )
 
             self._discover_from_document(job.tenant_id, job.knowledge_base_id, document, buckets, job)
+            self._clear_embedded_content(job)
             self._update_ingest_stage(
                 job,
                 "done",
@@ -627,28 +911,63 @@ class KnowledgeService:
                     "chunk_count": chunk_count,
                 },
             )
-            self._clear_embedded_content(job)
         except KnowledgeIngestCancelled:
-            self._finalize_cancelled_job(job)
+            try:
+                self._finalize_cancelled_job(job)
+            except TenantLifecycleDenied as denial:
+                if self._execution_generation is not None:
+                    self._terminalize_ingest_denial(
+                        job,
+                        denial,
+                        owner=self._execution_owner,
+                        generation=self._execution_generation,
+                    )
+            except KnowledgeIngestExecutionFenceLost:
+                self.db.rollback()
+        except TenantLifecycleDenied as denial:
+            if self._execution_generation is not None:
+                self._terminalize_ingest_denial(
+                    job,
+                    denial,
+                    owner=self._execution_owner,
+                    generation=self._execution_generation,
+                )
+        except KnowledgeIngestExecutionFenceLost:
+            self.db.rollback()
+            return
         except Exception as exc:  # noqa: BLE001 - persist stable job failure.
             logger.exception("Knowledge ingest job %s failed", job_id)
+            self.db.rollback()
+            current = self.db.get(KnowledgeIngestJob, job_id)
+            if (
+                current is None
+                or current.execution_owner != self._execution_owner
+                or current.execution_generation != self._execution_generation
+                or current.status not in {"running", "cancel_requested"}
+            ):
+                return
+            job = current
             public_error = serialize_knowledge_error(raw_context=exc)
-            if job.document_id:
-                document = self.db.get(KnowledgeDocument, job.document_id)
-                if document:
-                    document.status = "failed"
-                    document.error = public_error
-                    document.updated_at = utc_now()
-                    self.db.add(document)
-            self._update_ingest_stage(
-                job,
-                "failed",
-                status="failed",
-                error=public_error,
-                finished_at=utc_now(),
-                detail_code="failed",
-            )
-            self._clear_embedded_content(job)
+            try:
+                self._clear_embedded_content(job)
+                if job.document_id:
+                    document = self.db.get(KnowledgeDocument, job.document_id)
+                    if document:
+                        document.status = "failed"
+                        document.error = public_error
+                        document.updated_at = utc_now()
+                        self.db.add(document)
+                self._update_ingest_stage(
+                    job,
+                    "failed",
+                    status="failed",
+                    error=public_error,
+                    finished_at=utc_now(),
+                    detail_code="failed",
+                )
+            except (TenantLifecycleDenied, KnowledgeIngestExecutionFenceLost):
+                self.db.rollback()
+                return
 
     def search(
         self,
@@ -1029,10 +1348,12 @@ class KnowledgeService:
         *,
         use_llm: bool = True,
     ) -> list[KnowledgeBucket]:
+        if job is not None and self._execution_owner is not None:
+            self._require_ingest_execution_fence(job)
         model_config = self._default_model_config(tenant_id)
         structure_buckets = _structure_bucket_specs(section_nodes)
         llm_buckets = (
-            self._bucket_with_llm(section_nodes, model_config)
+            self._bucket_with_llm(section_nodes, model_config, job=job)
             if use_llm and model_config
             else []
         )
@@ -1084,7 +1405,10 @@ class KnowledgeService:
             )
             self.db.add(row)
             rows.append(row)
-        self.db.commit()
+        if job is not None and self._execution_owner is not None:
+            self._commit_ingest_fenced(job)
+        else:
+            self.db.commit()
         for row in rows:
             self.db.refresh(row)
         return rows
@@ -1098,6 +1422,8 @@ class KnowledgeService:
         section_nodes: list[dict[str, Any]],
         job: KnowledgeIngestJob | None,
     ) -> int:
+        if job is not None and self._execution_owner is not None:
+            self._require_ingest_execution_fence(job)
         count = 0
         chunk_ids_by_bucket: dict[str, list[str]] = {}
         section_by_id = {str(node.get("section_id")): node for node in section_nodes}
@@ -1205,7 +1531,10 @@ class KnowledgeService:
             bucket.metadata_json = metadata
             bucket.updated_at = utc_now()
             self.db.add(bucket)
-        self.db.commit()
+        if job is not None and self._execution_owner is not None:
+            self._commit_ingest_fenced(job)
+        else:
+            self.db.commit()
         return count
 
     def _discover_from_document(
@@ -1220,6 +1549,8 @@ class KnowledgeService:
         if not model_config:
             return
         self._raise_if_ingest_cancelled(job)
+        if self._execution_owner is not None:
+            self._require_ingest_execution_fence(job)
         payload = {
             "document": {
                 "id": document.id,
@@ -1238,12 +1569,18 @@ class KnowledgeService:
             ],
         }
         try:
-            with llm_operation("knowledge.discovery", bucket_count=len(buckets)):
-                raw = LLMClient(model_config).generate_json(
-                    DISCOVERY_PROMPT.read_text(encoding="utf-8"), payload
-                )
-        except (LLMError, Exception):
-            return
+            try:
+                with llm_operation("knowledge.discovery", bucket_count=len(buckets)):
+                    raw = LLMClient(model_config).generate_json(
+                        DISCOVERY_PROMPT.read_text(encoding="utf-8"), payload
+                    )
+            except TenantLifecycleDenied:
+                raise
+            except (LLMError, Exception):
+                return
+        finally:
+            if self._execution_owner is not None:
+                self._require_ingest_execution_fence(job)
         self._raise_if_ingest_cancelled(job)
         discoveries = raw.get("discoveries") if isinstance(raw, dict) else None
         if not isinstance(discoveries, list):
@@ -1293,13 +1630,22 @@ class KnowledgeService:
                 reason=reason,
             )
             self.db.add(row)
-        self.db.commit()
+        if self._execution_owner is not None:
+            self._commit_ingest_fenced(job)
+        else:
+            self.db.commit()
 
     def _bucket_with_llm(
-        self, section_nodes: list[dict[str, Any]], model_config: ModelConfig | None
+        self,
+        section_nodes: list[dict[str, Any]],
+        model_config: ModelConfig | None,
+        *,
+        job: KnowledgeIngestJob | None = None,
     ) -> list[dict[str, Any]]:
         if not model_config:
             return []
+        if job is not None and self._execution_owner is not None:
+            self._require_ingest_execution_fence(job)
         payload = {
             "sections": [
                 {
@@ -1313,12 +1659,18 @@ class KnowledgeService:
             ]
         }
         try:
-            with llm_operation("knowledge.ingest_bucket", section_count=len(section_nodes)):
-                raw = LLMClient(model_config).generate_json(
-                    BUCKET_PROMPT.read_text(encoding="utf-8"), payload
-                )
-        except (LLMError, Exception):
-            return []
+            try:
+                with llm_operation("knowledge.ingest_bucket", section_count=len(section_nodes)):
+                    raw = LLMClient(model_config).generate_json(
+                        BUCKET_PROMPT.read_text(encoding="utf-8"), payload
+                    )
+            except TenantLifecycleDenied:
+                raise
+            except (LLMError, Exception):
+                return []
+        finally:
+            if job is not None and self._execution_owner is not None:
+                self._require_ingest_execution_fence(job)
         buckets = raw.get("buckets") if isinstance(raw, dict) else None
         return [item for item in buckets if isinstance(item, dict)] if isinstance(buckets, list) else []
 
@@ -1544,8 +1896,7 @@ class KnowledgeService:
             setattr(job, key, value)
         job.updated_at = utc_now()
         self.db.add(job)
-        self.db.commit()
-        self.db.refresh(job)
+        self._commit_ingest_fenced(job)
 
     def _raise_if_ingest_cancelled(self, job: KnowledgeIngestJob | None) -> None:
         if job is None:
@@ -1591,7 +1942,7 @@ class KnowledgeService:
             self.db.delete(document)
         job.document_id = None
         self.db.add(job)
-        self.db.commit()
+        self._commit_ingest_fenced(job)
 
     def _update_ingest_stage(
         self,
@@ -1604,6 +1955,7 @@ class KnowledgeService:
     ) -> None:
         """Persist one ingest stage using stable codes while keeping diagnostics out of metadata."""
         if changes.get("status") not in {"failed", "cancelled"}:
+            self._require_ingest_execution_fence(job)
             self._raise_if_ingest_cancelled(job)
         stage_def = INGEST_STAGE_BY_KEY.get(stage)
         progress = float(stage_def["progress"]) if stage_def else float(job.progress or 0.0)
@@ -1622,12 +1974,14 @@ class KnowledgeService:
         self._update_job(job, stage=stage, progress=progress, **changes)
 
     def _clear_embedded_content(self, job: KnowledgeIngestJob) -> None:
+        if self._execution_owner is not None:
+            self._require_ingest_execution_fence(job)
         metadata = dict(job.metadata_json or {})
         metadata.pop("content_base64", None)
         job.metadata_json = metadata
         job.updated_at = utc_now()
         self.db.add(job)
-        self.db.commit()
+        self._commit_ingest_fenced(job)
 
 
 def bucket_read(row: KnowledgeBucket) -> KnowledgeBucketRead:

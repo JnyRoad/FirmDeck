@@ -5,24 +5,27 @@ import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { AppIntlProvider, type AppLocale } from '@/i18n';
+import type { TenantSessionContextValue } from '@/contexts/TenantSessionContext';
 
 import type { ChatTurnResponse } from '../types';
 import DebugPage from './DebugPage';
 
 const mocks = vi.hoisted(() => ({
-  post: vi.fn(),
+  tenantPost: vi.fn(),
   notifyError: vi.fn(),
   notifySuccess: vi.fn(),
+  currentContext: null as TenantSessionContextValue | null,
 }));
 
-vi.mock('../api/client', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('../api/client')>();
-  return {
-    ...actual,
-    api: { ...actual.api, post: mocks.post },
-    TENANT_ID: 'tenant_demo',
-  };
-});
+vi.mock('../api/tenant-client', () => ({
+  createTenantClient: () => ({
+    post: mocks.tenantPost,
+  }),
+}));
+
+vi.mock('../contexts/TenantSessionContext', () => ({
+  useTenantSession: () => mocks.currentContext,
+}));
 
 vi.mock('@/components/ui/app-toast', () => ({
   notify: {
@@ -61,7 +64,8 @@ const copy = {
 } as const satisfies Record<AppLocale, Record<string, string>>;
 
 beforeEach(() => {
-  mocks.post.mockReset();
+  mocks.currentContext = makeTenantContext();
+  mocks.tenantPost.mockReset();
   mocks.notifyError.mockReset();
   mocks.notifySuccess.mockReset();
 });
@@ -91,6 +95,32 @@ function successfulTurn(reply: string, sessionId: string): ChatTurnResponse {
   };
 }
 
+function makeTenantContext(generation = 1): TenantSessionContextValue {
+  const controller = new AbortController();
+  return {
+    tenantId: 'tenant_demo',
+    tenantSlug: 'tenant-demo',
+    userId: 'user_demo',
+    generation,
+    signal: controller.signal,
+    session: {
+      token: 'test-token',
+      scope: 'tenant',
+      tenant: { id: 'tenant_demo', slug: 'tenant-demo', display_name: 'Tenant Demo' },
+      user: {
+        id: 'user_demo',
+        tenant_id: 'tenant_demo',
+        username: 'demo',
+        display_name: 'Demo',
+        role: 'admin',
+        must_change_password: false,
+        avatar_url: null,
+      },
+    },
+    isCurrentGeneration: (candidate) => candidate === generation && !controller.signal.aborted,
+  };
+}
+
 describe('DebugPage semantic locale matrix', () => {
   it.each(['zh-CN', 'en-US'] as const)(
     'localizes product chrome and accessible names in %s',
@@ -116,14 +146,14 @@ describe('DebugPage semantic locale matrix', () => {
   it('projects a failed turn to a stable descriptor without exposing the raw exception', async () => {
     const user = userEvent.setup();
     const rawProviderError = 'provider secret: connection refused at 10.0.0.8';
-    mocks.post.mockRejectedValue(new Error(rawProviderError));
+    mocks.tenantPost.mockRejectedValue(new Error(rawProviderError));
     renderDebug('en-US');
 
     await user.type(screen.getByPlaceholderText(copy['en-US'].input), 'probe');
     await user.click(screen.getByRole('button', { name: copy['en-US'].send }));
 
     await waitFor(() => {
-      expect(mocks.notifyError).toHaveBeenCalledWith({ id: 'chat.error.replyFailed' });
+    expect(mocks.notifyError).toHaveBeenCalledWith({ id: 'chat.error.replyFailed' });
     });
     expect(JSON.stringify(mocks.notifyError.mock.calls)).not.toContain(rawProviderError);
   });
@@ -132,7 +162,7 @@ describe('DebugPage semantic locale matrix', () => {
     const user = userEvent.setup();
     const rawReply = 'Agent raw output: 中文业务内容 / keep verbatim';
     const rawSessionId = 'session/raw-中文-42';
-    mocks.post.mockResolvedValue(successfulTurn(rawReply, rawSessionId));
+    mocks.tenantPost.mockResolvedValue(successfulTurn(rawReply, rawSessionId));
 
     for (const locale of ['zh-CN', 'en-US'] as const) {
       const view = renderDebug(locale);
@@ -150,5 +180,41 @@ describe('DebugPage semantic locale matrix', () => {
       expect(rawNodes.some((node) => node.textContent?.includes('session state: keep verbatim'))).toBe(true);
       view.unmount();
     }
+  });
+
+  it('sends debug turns through the verified tenant client without a caller-selected tenant id', async () => {
+    const user = userEvent.setup();
+    mocks.tenantPost.mockResolvedValue(successfulTurn('reply', 'session-tenant'));
+    renderDebug('en-US');
+
+    await user.type(screen.getByPlaceholderText(copy['en-US'].input), 'probe');
+    await user.click(screen.getByRole('button', { name: copy['en-US'].send }));
+
+    await waitFor(() => expect(mocks.tenantPost).toHaveBeenCalledTimes(1));
+    const [path, body] = mocks.tenantPost.mock.calls[0] as [string, Record<string, unknown>];
+    expect(path).toBe('/api/chat/turn');
+    expect(body).not.toHaveProperty('tenant_id');
+    expect(body).not.toHaveProperty('user_id');
+    expect(JSON.stringify(mocks.tenantPost.mock.calls)).not.toContain('tenant_demo');
+  });
+
+  it('does not toast or clear loading when an old generation rejects', async () => {
+    const user = userEvent.setup();
+    const context = mocks.currentContext as TenantSessionContextValue;
+    let rejectRequest: ((reason?: unknown) => void) | undefined;
+    mocks.tenantPost.mockImplementation(() => new Promise((_resolve, reject) => {
+      rejectRequest = reject;
+    }));
+    renderDebug('en-US');
+
+    await user.type(screen.getByPlaceholderText(copy['en-US'].input), 'probe');
+    await user.click(screen.getByRole('button', { name: copy['en-US'].send }));
+
+    await waitFor(() => expect(mocks.tenantPost).toHaveBeenCalledTimes(1));
+    context.isCurrentGeneration = () => false;
+    rejectRequest?.(new DOMException('aborted', 'AbortError'));
+    await waitFor(() => expect(mocks.notifyError).not.toHaveBeenCalled());
+    expect(mocks.notifyError).not.toHaveBeenCalled();
+    expect((screen.getByRole('button', { name: copy['en-US'].send }) as HTMLButtonElement).disabled).toBe(true);
   });
 });

@@ -344,6 +344,7 @@ def build_default_error_registry() -> ErrorRegistry:
 
     auth_entries = (
         ("AUTH_LOGIN_FIELDS_REQUIRED", "loginFieldsRequired", 400, False, {}),
+        ("AUTH_PASSWORD_POLICY_VIOLATION", "passwordPolicyViolation", 400, False, {}),
         ("AUTH_INVALID_CREDENTIALS", "invalidCredentials", 401, False, {}),
         ("AUTH_AVATAR_NOT_FOUND", "avatarNotFound", 404, False, {}),
         ("AUTH_AVATAR_TOO_LARGE", "avatarTooLarge", 413, False, {}),
@@ -364,6 +365,13 @@ def build_default_error_registry() -> ErrorRegistry:
         ("AUTH_INTERNAL_SERVICE_REQUIRED", "internalServiceRequired", 401, False, {}),
         ("AUTH_ADMIN_REQUIRED", "adminRequired", 403, False, {}),
         ("AUTH_TENANT_MISMATCH", "tenantMismatch", 403, False, {}),
+        (
+            "TEMPORARY_PASSWORD_CHANGE_REQUIRED",
+            "temporaryPasswordChangeRequired",
+            403,
+            False,
+            {},
+        ),
         ("AUTH_CREDENTIAL_NOT_FOUND", "credentialNotFound", 404, False, {}),
         ("AUTH_CREDENTIAL_RECOVERY_FAILED", "credentialRecoveryFailed", 409, False, {}),
     )
@@ -379,8 +387,42 @@ def build_default_error_registry() -> ErrorRegistry:
             )
         )
 
+    system_entries = (
+        ("SYSTEM_AUTH_UNAVAILABLE", "errors.system.authUnavailable", 503, False, {}),
+        (
+            "SYSTEM_AUTH_INVALID_CREDENTIALS",
+            "errors.systemAuth.invalidCredentials",
+            401,
+            False,
+            {},
+        ),
+        ("SYSTEM_ADMIN_DISABLED", "errors.system.adminDisabled", 401, False, {}),
+        ("SYSTEM_CONTROL_CONFLICT", "errors.system.controlConflict", 409, False, {}),
+    )
+    for code, message_key, status, retryable, params_schema in system_entries:
+        registry.register(
+            ErrorRegistryEntry(
+                code=code,
+                message_key=message_key,
+                default_http_status=status,
+                retryable_default=retryable,
+                params_schema=params_schema,
+                visibility=ErrorVisibility.PUBLIC,
+            )
+        )
+
     security_entries = (
         ("TENANT_NOT_FOUND", "errors.tenant.notFound", 404, False, {"tenant_id": "string"}),
+        ("TENANT_SUSPENDED", "errors.tenant.suspended", 403, False, {}),
+        (
+            "TENANT_LIFECYCLE_CHECK_FAILED",
+            "errors.tenant.lifecycleCheckFailed",
+            503,
+            False,
+            {},
+        ),
+        ("TENANT_WORK_TERMINALIZED", "errors.tenant.workTerminalized", 409, False, {}),
+        ("EXTERNAL_OUTCOME_UNKNOWN", "errors.tenant.externalOutcomeUnknown", 409, False, {}),
         ("TENANT_MISMATCH", "errors.tenant.mismatch", 403, False, {}),
         ("AGENT_NOT_FOUND", "errors.agent.notFound", 404, False, {}),
         ("PERMISSION_TENANT_ADMIN_REQUIRED", "errors.permission.tenantAdminRequired", 403, False, {}),

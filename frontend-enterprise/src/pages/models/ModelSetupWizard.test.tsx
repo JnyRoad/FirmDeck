@@ -5,23 +5,53 @@ import { act, cleanup, render, screen, waitFor, within } from '@testing-library/
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { api } from '@/api/client';
+import type { TenantSessionContextValue } from '@/contexts/TenantSessionContext';
 import { I18nProvider } from '@/i18n';
 import type { ModelConfigRead } from '@/types';
 import ModelSetupWizard, { type ModelSetupWizardProps } from './ModelSetupWizard';
 
-vi.mock('@/api/client', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('@/api/client')>();
+const testState = vi.hoisted(() => ({
+  mockedPost: vi.fn(),
+  currentContext: null as TenantSessionContextValue | null,
+}));
+
+vi.mock('@/api/tenant-client', () => ({
+  createTenantClient: vi.fn(() => ({
+    post: testState.mockedPost,
+  })),
+}));
+
+vi.mock('@/contexts/TenantSessionContext', () => ({
+  useTenantSession: () => testState.currentContext,
+}));
+
+const mockedPost = testState.mockedPost;
+
+function makeTenantContext(tenantId: string, generation = 1): TenantSessionContextValue {
+  const controller = new AbortController();
   return {
-    ...actual,
-    api: { ...actual.api, post: vi.fn(), put: vi.fn() },
+    session: {
+      token: `token-${tenantId}`,
+      scope: 'tenant',
+      tenant: { id: tenantId, slug: tenantId, display_name: tenantId },
+      user: {
+        id: 'user-1',
+        tenant_id: tenantId,
+        username: 'test-user',
+        display_name: 'Test User',
+        role: 'admin',
+        must_change_password: false,
+        avatar_url: null,
+      },
+    },
+    tenantId,
+    tenantSlug: tenantId,
+    userId: 'user-1',
+    generation,
+    signal: controller.signal,
+    isCurrentGeneration: (candidate) => candidate === generation && !controller.signal.aborted,
   };
-});
-
-const mockedPost = vi.mocked(api.post);
-const mockedPut = vi.mocked(api.put);
-
-type TenantAwareWizardProps = ModelSetupWizardProps & { tenantId: string };
+}
 
 function stubSelectPointerCapture() {
   if (!Element.prototype.hasPointerCapture) {
@@ -35,11 +65,10 @@ function stubSelectPointerCapture() {
   }
 }
 
-/** 使用显式租户和默认依赖渲染模型创建向导。 */
-function renderWizard(overrides: Partial<TenantAwareWizardProps> = {}) {
-  const props: TenantAwareWizardProps = {
+/** 使用已验证租户上下文和默认依赖渲染模型创建向导。 */
+function renderWizard(overrides: Partial<ModelSetupWizardProps> = {}) {
+  const props: ModelSetupWizardProps = {
     open: true,
-    tenantId: 'tenant-isolated',
     onOpenChange: vi.fn(),
     onCreated: vi.fn(),
     availableProtocols: ['openai_chat_completions', 'anthropic_messages', 'gemini_generate_content'],
@@ -65,15 +94,13 @@ function nextButton(): HTMLButtonElement {
   return screen.getByRole('button', { name: '下一步' }) as HTMLButtonElement;
 }
 
-function testButton(): HTMLButtonElement {
-  return screen.getByRole('button', { name: '测试' }) as HTMLButtonElement;
-}
-
-function draftSaveButton(): HTMLButtonElement {
+/** 返回会先验证连接再持久化配置的主保存按钮。 */
+function saveButton(): HTMLButtonElement {
   return screen.getByRole('button', { name: '保存' }) as HTMLButtonElement;
 }
 
-// API Key fields fetch the model list on blur, which also calls api.post — this
+// API Key fields fetch the model list on blur, which also calls the tenant
+// client — this
 // keeps that call harmlessly "unsupported" so tests can assert on the save/test
 // calls (queued via `then`) without the two interleaving.
 function stubApiPost(...then: Array<() => Promise<unknown>>) {
@@ -95,8 +122,8 @@ function findNonListModelsCall(): [string, Record<string, unknown>] {
 
 beforeEach(() => {
   stubSelectPointerCapture();
+  testState.currentContext = makeTenantContext('tenant-isolated');
   mockedPost.mockReset();
-  mockedPut.mockReset();
   stubApiPost(); // safe default: list-models routes to "unsupported", anything else rejects loudly
 });
 
@@ -164,16 +191,17 @@ describe('ModelSetupWizard — vendor branch (US1)', () => {
     expect(screen.getByText(/api\.openai\.com/)).toBeTruthy();
   });
 
-  it('keeps 测试 and 保存 disabled until API Key and model are filled', async () => {
+  it('keeps 保存 disabled until API Key and model are filled', async () => {
     const user = userEvent.setup();
     renderWizard();
     await selectChannelAndAdvance(user, 'OpenAI');
 
-    expect(testButton().disabled).toBe(true);
-    expect(draftSaveButton().disabled).toBe(true);
+    expect(saveButton().disabled).toBe(true);
+    expect(screen.queryByRole('button', { name: '测试' })).toBeNull();
+    expect(screen.queryByText('启用')).toBeNull();
   });
 
-  it('测试 verifies and activates in one call, then closes the wizard — no extra confirmation click needed', async () => {
+  it('保存 verifies and activates in one call, then closes the wizard', async () => {
     const fakeModel = { id: 'model-1', name: 'OpenAI · GPT-4o' } as ModelConfigRead;
     stubApiPost(() => Promise.resolve(fakeModel));
     const onCreated = vi.fn();
@@ -184,7 +212,7 @@ describe('ModelSetupWizard — vendor branch (US1)', () => {
     await user.type(screen.getByPlaceholderText('sk-...'), 'sk-test-123');
     await user.type(screen.getByPlaceholderText('选择或输入模型'), 'gpt-4o');
 
-    await user.click(testButton());
+    await user.click(saveButton());
 
     await waitFor(() => expect(mockedPost).toHaveBeenCalled());
     const [url, body] = findNonListModelsCall();
@@ -195,63 +223,14 @@ describe('ModelSetupWizard — vendor branch (US1)', () => {
     expect(body.api_key).toBe('sk-test-123');
     expect(body.model).toBe('gpt-4o');
     expect(body.enabled).toBe(true);
-    expect(body.tenant_id).toBe('tenant-isolated');
+    expect(body).not.toHaveProperty('tenant_id');
 
-    // A passing test already means the model is saved — the wizard closes
-    // itself instead of showing a banner that needs a "完成" click.
+    // 保存先完成连接验证，验证通过后已持久化并可直接关闭向导。
     await waitFor(() => expect(props.onOpenChange).toHaveBeenCalledWith(false));
     expect(onCreated).toHaveBeenCalledWith(fakeModel, { tested: true });
   });
 
-  it('保存 persists a disabled draft without verifying, and does not close the wizard', async () => {
-    const fakeDraft = { id: 'model-1', name: 'OpenAI · GPT-4o' } as ModelConfigRead;
-    stubApiPost(() => Promise.resolve(fakeDraft));
-    const onCreated = vi.fn();
-    const user = userEvent.setup();
-    const { props } = renderWizard({ onCreated });
-
-    await selectChannelAndAdvance(user, 'OpenAI');
-    await user.type(screen.getByPlaceholderText('sk-...'), 'sk-test-123');
-    await user.type(screen.getByPlaceholderText('选择或输入模型'), 'gpt-4o');
-
-    await user.click(draftSaveButton());
-
-    await waitFor(() => expect(mockedPost).toHaveBeenCalled());
-    const [url, body] = findNonListModelsCall();
-    expect(url).toBe('/api/enterprise/model-configs'); // no ?verify_before_save=true
-    expect(body.enabled).toBe(false);
-    expect(body.is_default).toBe(false);
-
-    expect(onCreated).toHaveBeenCalledWith(fakeDraft, { tested: false });
-    expect(props.onOpenChange).not.toHaveBeenCalled();
-    expect(await screen.findByText(/已保存为草稿/)).toBeTruthy();
-  });
-
-  it('a second 保存 after the first PUT-updates the same draft row instead of creating a duplicate', async () => {
-    const fakeDraft = { id: 'model-1', name: 'OpenAI · GPT-4o' } as ModelConfigRead;
-    stubApiPost(() => Promise.resolve(fakeDraft));
-    mockedPut.mockResolvedValue(fakeDraft);
-    const user = userEvent.setup();
-    renderWizard();
-
-    await selectChannelAndAdvance(user, 'OpenAI');
-    await user.type(screen.getByPlaceholderText('sk-...'), 'sk-test-123');
-    await user.type(screen.getByPlaceholderText('选择或输入模型'), 'gpt-4o');
-    await user.click(draftSaveButton());
-    await screen.findByText(/已保存为草稿/);
-
-    await user.click(draftSaveButton());
-
-    // The first save has no id yet, so it POSTs; the second reuses the id
-    // returned from the first and PUTs to the same row instead of creating
-    // a duplicate.
-    await waitFor(() => expect(mockedPut).toHaveBeenCalledTimes(1));
-    const [url] = mockedPut.mock.calls[0] as [string, Record<string, unknown>];
-    expect(url).toBe(`/api/enterprise/model-configs/${fakeDraft.id}`);
-    expect(mockedPost.mock.calls.filter(([callUrl]) => !String(callUrl).includes('/list-models'))).toHaveLength(1);
-  });
-
-  it('shows the failure reason and keeps the wizard open — does not call onCreated or close when 测试 fails', async () => {
+  it('保存时连接测试失败则提示原因、保持向导打开且不创建模型', async () => {
     stubApiPost(() => Promise.reject(new Error('boom')));
     const onCreated = vi.fn();
     const user = userEvent.setup();
@@ -261,17 +240,15 @@ describe('ModelSetupWizard — vendor branch (US1)', () => {
     await user.type(screen.getByPlaceholderText('sk-...'), 'sk-test-123');
     await user.type(screen.getByPlaceholderText('选择或输入模型'), 'gpt-4o');
 
-    await user.click(testButton());
+    await user.click(saveButton());
 
     expect(await screen.findByText('模型保存或连接测试失败，请检查配置后重试。')).toBeTruthy();
     expect(onCreated).not.toHaveBeenCalled();
     expect(props.onOpenChange).not.toHaveBeenCalled();
-    // Both buttons must still be there so the user can fix the problem and retry.
-    expect(testButton()).toBeTruthy();
-    expect(draftSaveButton()).toBeTruthy();
+    expect(saveButton()).toBeTruthy();
   });
 
-  it('keeps 测试 and 保存 disabled when the config name is cleared', async () => {
+  it('keeps 保存 disabled when the config name is cleared', async () => {
     const user = userEvent.setup();
     renderWizard();
 
@@ -282,8 +259,7 @@ describe('ModelSetupWizard — vendor branch (US1)', () => {
     const nameInput = screen.getByDisplayValue('OpenAI · gpt-4o');
     await user.clear(nameInput);
 
-    expect(testButton().disabled).toBe(true);
-    expect(draftSaveButton().disabled).toBe(true);
+    expect(saveButton().disabled).toBe(true);
   });
 
   it('caps 配置名称 at 30 characters so a long vendor/model combo cannot overflow the stat card and table', async () => {
@@ -325,18 +301,18 @@ describe('ModelSetupWizard — vendor branch (US1)', () => {
 });
 
 describe('ModelSetupWizard — auto-fetching the model list', () => {
-  it('ignores a pending model-list response after switching tenants and refetches for the new tenant', async () => {
+  it('ignores a pending model-list response and closes when the tenant changes', async () => {
     let resolveFirstTenant:
       | ((value: { success: boolean; models: Array<{ id: string; label: string }> }) => void)
       | undefined;
     mockedPost.mockImplementation((url: unknown) => {
       const requestUrl = String(url);
-      if (requestUrl.includes('/list-models') && requestUrl.includes('tenant_id=tenant-first')) {
+      if (requestUrl.includes('/list-models') && testState.currentContext?.tenantId === 'tenant-first') {
         return new Promise((resolve) => {
           resolveFirstTenant = resolve;
         });
       }
-      if (requestUrl.includes('/list-models') && requestUrl.includes('tenant_id=tenant-second')) {
+      if (requestUrl.includes('/list-models') && testState.currentContext?.tenantId === 'tenant-second') {
         return Promise.resolve({
           success: true,
           models: [{ id: 'tenant-second-model', label: 'tenant-second-model' }],
@@ -345,21 +321,21 @@ describe('ModelSetupWizard — auto-fetching the model list', () => {
       return Promise.reject(new Error(`unexpected call: ${requestUrl}`));
     });
     const user = userEvent.setup();
-    const rendered = renderWizard({ tenantId: 'tenant-first' });
+    testState.currentContext = makeTenantContext('tenant-first', 1);
+    const rendered = renderWizard();
 
     await selectChannelAndAdvance(user, 'OpenAI');
     const apiKeyInput = screen.getByPlaceholderText('sk-...');
     await user.type(apiKeyInput, 'sk-shared-key');
     await user.tab();
-    await waitFor(() =>
-      expect(mockedPost.mock.calls.some(([url]) => String(url).includes('tenant_id=tenant-first'))).toBe(true),
-    );
+    await waitFor(() => expect(mockedPost.mock.calls.some(([url]) => String(url).includes('/list-models'))).toBe(true));
 
+    testState.currentContext = makeTenantContext('tenant-second', 2);
     rendered.rerender(
       createElement(
         I18nProvider,
         null,
-        createElement(ModelSetupWizard, { ...rendered.props, tenantId: 'tenant-second' }),
+        createElement(ModelSetupWizard, rendered.props),
       ),
     );
     await act(async () => {
@@ -370,14 +346,10 @@ describe('ModelSetupWizard — auto-fetching the model list', () => {
       await Promise.resolve();
     });
 
-    await user.click(apiKeyInput);
-    await user.tab();
-    expect(await screen.findByText(/已自动获取到 1 个模型/)).toBeTruthy();
-    expect(mockedPost.mock.calls.some(([url]) => String(url).includes('tenant_id=tenant-second'))).toBe(true);
-
-    await user.click(screen.getByPlaceholderText('选择或输入模型'));
-    expect(await screen.findByText('tenant-second-model')).toBeTruthy();
+    await waitFor(() => expect(rendered.props.onOpenChange).toHaveBeenCalledWith(false));
+    expect(screen.queryByPlaceholderText('sk-...')).toBeNull();
     expect(screen.queryByText('tenant-first-model')).toBeNull();
+    expect(screen.queryByText('tenant-second-model')).toBeNull();
   });
 
   it('fetches vendor models on API Key blur and offers them in the combobox', async () => {
@@ -401,8 +373,8 @@ describe('ModelSetupWizard — auto-fetching the model list', () => {
     expect(await screen.findByText(/已自动获取到 1 个模型/)).toBeTruthy();
     const [url, body] = mockedPost.mock.calls[0] as [string, Record<string, unknown>];
     expect(url).toContain('/list-models');
-    expect(url).toContain('tenant_id=tenant-isolated');
-    expect(body.tenant_id).toBe('tenant-isolated');
+    expect(url).not.toContain('tenant_id=');
+    expect(body).not.toHaveProperty('tenant_id');
     expect(body.api_protocol).toBe('openai_chat_completions');
     expect(body.base_url).toBe('https://api.openai.com/v1');
     expect(body.api_key).toBe('sk-real-key');
@@ -509,12 +481,12 @@ describe('ModelSetupWizard — custom channel branch (US2)', () => {
     expect(screen.getByText('模型')).toBeTruthy();
   });
 
-  it('keeps 测试 disabled until Base URL, API Key and model are filled', async () => {
+  it('keeps 保存 disabled until Base URL, API Key and model are filled', async () => {
     const user = userEvent.setup();
     renderWizard();
     await selectChannelAndAdvance(user, '自定义渠道');
 
-    expect(testButton().disabled).toBe(true);
+    expect(saveButton().disabled).toBe(true);
   });
 
   it('drops the old protocol\'s fetched model list when the API protocol changes, instead of leaving it selectable under the new one', async () => {
@@ -601,7 +573,7 @@ describe('ModelSetupWizard — custom channel branch (US2)', () => {
     await user.clear(extraBodyField);
     await user.type(extraBodyField, '123');
 
-    await user.click(testButton());
+    await user.click(saveButton());
 
     expect(await screen.findByText('额外参数必须是合法的 JSON 对象')).toBeTruthy();
     expect(onCreated).not.toHaveBeenCalled();
@@ -618,7 +590,7 @@ describe('ModelSetupWizard — custom channel branch (US2)', () => {
     await user.click(screen.getByText('高级参数（Temperature / Max Tokens / extra_body，可选）'));
     await user.clear(screen.getByDisplayValue('0.2'));
 
-    await user.click(testButton());
+    await user.click(saveButton());
 
     expect(await screen.findByText('Temperature 与 Max Tokens 必须是数字')).toBeTruthy();
     expect(onCreated).not.toHaveBeenCalled();
@@ -635,33 +607,45 @@ describe('ModelSetupWizard — ChatGPT subscription branch (US3)', () => {
     expect(screen.queryByPlaceholderText('sk-...')).toBeNull();
   });
 
-  it('keeps 测试 disabled until the subscription account is connected', async () => {
+  it('keeps 保存 disabled until the subscription account is connected', async () => {
     const user = userEvent.setup();
     renderWizard({ subscriptionAccount: { status: 'requires_login', plan_type: null, message: '未登录' } });
     await selectChannelAndAdvance(user, 'ChatGPT 订阅（Codex）');
 
-    expect(testButton().disabled).toBe(true);
+    expect(saveButton().disabled).toBe(true);
   });
 
-  it('keeps 测试 disabled when connected but no model has been chosen — testing with no model would silently verify against whatever default the backend picks', async () => {
+  it('keeps 保存 disabled when connected but no model has been chosen', async () => {
     const user = userEvent.setup();
     renderWizard({ subscriptionAccount: { status: 'connected', plan_type: 'Plus', message: '已连接' } });
     await selectChannelAndAdvance(user, 'ChatGPT 订阅（Codex）');
 
-    expect(testButton().disabled).toBe(true);
+    expect(saveButton().disabled).toBe(true);
   });
 
-  it('enables 测试 once the subscription account is connected and a model is chosen', async () => {
+  it('enables 保存 once the subscription account is connected and a model is chosen', async () => {
     const user = userEvent.setup();
     renderWizard({ subscriptionAccount: { status: 'connected', plan_type: 'Plus', message: '已连接' } });
     await selectChannelAndAdvance(user, 'ChatGPT 订阅（Codex）');
     await user.type(screen.getByPlaceholderText('选择或输入模型'), 'gpt-5.6-terra');
 
-    expect(testButton().disabled).toBe(false);
+    expect(saveButton().disabled).toBe(false);
   });
 });
 
 describe('ModelSetupWizard — switching channels clears stale credentials (FR-013)', () => {
+  it('disables the optional Codex account check immediately after leaving the subscription channel', async () => {
+    const onSubscriptionSelected = vi.fn();
+    const user = userEvent.setup();
+    renderWizard({ onSubscriptionSelected });
+
+    await user.click(await screen.findByRole('option', { name: 'ChatGPT 订阅（Codex）' }));
+    expect(onSubscriptionSelected).toHaveBeenLastCalledWith(true);
+
+    await user.click(screen.getByRole('option', { name: 'OpenAI' }));
+    expect(onSubscriptionSelected).toHaveBeenLastCalledWith(false);
+  });
+
   it('does not leak the vendor API Key into the custom channel form', async () => {
     const user = userEvent.setup();
     renderWizard();
@@ -694,13 +678,31 @@ describe('ModelSetupWizard — switching channels clears stale credentials (FR-0
     await selectChannelAndAdvance(user, 'OpenAI');
     await user.type(screen.getByPlaceholderText('sk-...'), 'sk-test-123');
     await user.type(screen.getByPlaceholderText('选择或输入模型'), 'gpt-4o');
-    await user.click(testButton());
+    await user.click(saveButton());
     expect(await screen.findByText('模型保存或连接测试失败，请检查配置后重试。')).toBeTruthy();
 
     await user.click(screen.getByRole('button', { name: '上一步' }));
     await selectChannelAndAdvance(user, 'Anthropic');
 
     expect(screen.queryByText('模型保存或连接测试失败，请检查配置后重试。')).toBeNull();
+  });
+});
+
+describe('ModelSetupWizard — tenant generation isolation', () => {
+  it('closes and clears the active form when the tenant generation changes', async () => {
+    const user = userEvent.setup();
+    const rendered = renderWizard();
+
+    await selectChannelAndAdvance(user, 'OpenAI');
+    await user.type(screen.getByPlaceholderText('sk-...'), 'sk-tenant-one-secret');
+    await user.type(screen.getByPlaceholderText('选择或输入模型'), 'tenant-one-model');
+
+    testState.currentContext = makeTenantContext('tenant-two', 2);
+    rendered.rerender(createElement(I18nProvider, null, createElement(ModelSetupWizard, rendered.props)));
+
+    await waitFor(() => expect(rendered.props.onOpenChange).toHaveBeenCalledWith(false));
+    expect(screen.queryByDisplayValue('sk-tenant-one-secret')).toBeNull();
+    expect(screen.queryByDisplayValue('tenant-one-model')).toBeNull();
   });
 });
 
@@ -729,7 +731,6 @@ describe('ModelSetupWizard — closing mid-flow discards unsaved input', () => {
 
     rerender(createElement(I18nProvider, null, createElement(ModelSetupWizard, {
       open: true,
-      tenantId: 'tenant-isolated',
       onOpenChange,
       onCreated: vi.fn(),
       availableProtocols: ['openai_chat_completions'],

@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
-import { api } from '@/api/client';
 import { notify } from '@/components/ui/app-toast';
+import { createTenantClient } from '@/api/tenant-client';
+import { useTenantSession } from '@/contexts/TenantSessionContext';
 import { useAppIntl } from '@/i18n';
 import { apiErrorMessage } from '@/lib/apiErrorMessages';
 import type { CodexSubscriptionAccountRead } from '@/types';
@@ -9,7 +10,6 @@ import type { CodexSubscriptionAccountRead } from '@/types';
 type SubscriptionAction = 'login' | 'login/cancel' | 'logout';
 
 type UseCodexSubscriptionAccountOptions = {
-  tenantId: string;
   enabled?: boolean;
 };
 
@@ -24,43 +24,52 @@ type UseCodexSubscriptionAccountResult = {
 
 /** 管理指定租户的本机 Codex 订阅账号状态，并在登录待处理时持续轮询。 */
 export function useCodexSubscriptionAccount({
-  tenantId,
   enabled = true,
-}: UseCodexSubscriptionAccountOptions): UseCodexSubscriptionAccountResult {
+}: UseCodexSubscriptionAccountOptions = {}): UseCodexSubscriptionAccountResult {
   const { t } = useAppIntl();
+  const tenantContext = useTenantSession();
+  const tenantApi = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
   const [account, setAccount] = useState<CodexSubscriptionAccountRead | null>(null);
   const [loading, setLoading] = useState(false);
-  const activeTenantRef = useRef<string | null>(null);
   const requestGenerationRef = useRef(0);
   const accountActionInFlightRef = useRef(false);
-  activeTenantRef.current = enabled ? tenantId : null;
+
+  /** 验证请求仍属于当前租户代次，避免切换租户后发布旧的订阅状态。 */
+  function isCurrentRequest(requestGeneration: number, generation: number): boolean {
+    return Boolean(
+      enabled
+      && tenantContext
+      && !tenantContext.signal.aborted
+      && tenantContext.generation === generation
+      && tenantContext.isCurrentGeneration(generation)
+      && requestGenerationRef.current === requestGeneration,
+    );
+  }
 
   /** 读取当前租户的订阅账号状态。 */
   const reload = useCallback(async () => {
-    if (!enabled || accountActionInFlightRef.current) return;
-    const requestTenantId = tenantId;
+    if (!enabled || !tenantContext || accountActionInFlightRef.current) return;
+    const contextGeneration = tenantContext.generation;
     const requestGeneration = ++requestGenerationRef.current;
     try {
-      const nextAccount = await api.get<CodexSubscriptionAccountRead>(
-        `/api/enterprise/model-configs/codex-subscription/account?tenant_id=${encodeURIComponent(requestTenantId)}`,
+      const nextAccount = await tenantApi.get<CodexSubscriptionAccountRead>(
+        '/api/enterprise/model-configs/codex-subscription/account',
       );
-      if (
-        activeTenantRef.current !== requestTenantId ||
-        requestGenerationRef.current !== requestGeneration
-      ) {
+      if (!isCurrentRequest(requestGeneration, contextGeneration)) {
         return;
       }
       setAccount(nextAccount);
     } catch (error) {
-      if (
-        activeTenantRef.current !== requestTenantId ||
-        requestGenerationRef.current !== requestGeneration
-      ) {
+      if (!isCurrentRequest(requestGeneration, contextGeneration)) {
         return;
       }
+      // A failed refresh makes the pending snapshot unusable. Clearing it
+      // also tears down the pending-only interval, so one outage cannot
+      // produce an unbounded stream of requests and global toasts.
+      setAccount(null);
       notify.error(apiErrorMessage(error, t('modelsPage.toast.subscriptionStatusLoadFailed')));
     }
-  }, [enabled, t, tenantId]);
+  }, [enabled, t, tenantApi, tenantContext]);
   const reloadRef = useRef(reload);
   reloadRef.current = reload;
 
@@ -69,11 +78,11 @@ export function useCodexSubscriptionAccount({
     accountActionInFlightRef.current = false;
     setAccount(null);
     setLoading(false);
-    if (!enabled) {
+    if (!enabled || !tenantContext) {
       return;
     }
     void reloadRef.current();
-  }, [enabled, tenantId]);
+  }, [enabled, tenantContext, tenantContext?.generation]);
 
   useEffect(() => {
     if (!enabled || loading || account?.status !== 'pending') return;
@@ -86,19 +95,16 @@ export function useCodexSubscriptionAccount({
   /** 执行订阅账号动作并用服务端返回状态更新界面。 */
   const updateAccount = useCallback(
     async (action: SubscriptionAction, fallbackMessage: string) => {
-      if (!enabled) return;
-      const requestTenantId = tenantId;
+      if (!enabled || !tenantContext) return;
+      const contextGeneration = tenantContext.generation;
       accountActionInFlightRef.current = true;
       const requestGeneration = ++requestGenerationRef.current;
       setLoading(true);
       try {
-        const nextAccount = await api.post<CodexSubscriptionAccountRead>(
-          `/api/enterprise/model-configs/codex-subscription/${action}?tenant_id=${encodeURIComponent(requestTenantId)}`,
+        const nextAccount = await tenantApi.post<CodexSubscriptionAccountRead>(
+          `/api/enterprise/model-configs/codex-subscription/${action}`,
         );
-        if (
-          activeTenantRef.current !== requestTenantId ||
-          requestGenerationRef.current !== requestGeneration
-        ) {
+        if (!isCurrentRequest(requestGeneration, contextGeneration)) {
           return;
         }
         setAccount(nextAccount);
@@ -116,10 +122,7 @@ export function useCodexSubscriptionAccount({
             notify.success(t('modelsPage.subscription.unavailable'));
         }
       } catch (error) {
-        if (
-          activeTenantRef.current !== requestTenantId ||
-          requestGenerationRef.current !== requestGeneration
-        ) {
+        if (!isCurrentRequest(requestGeneration, contextGeneration)) {
           return;
         }
         notify.error(apiErrorMessage(error, fallbackMessage));
@@ -127,15 +130,12 @@ export function useCodexSubscriptionAccount({
         if (requestGenerationRef.current === requestGeneration) {
           accountActionInFlightRef.current = false;
         }
-        if (
-          activeTenantRef.current === requestTenantId &&
-          requestGenerationRef.current === requestGeneration
-        ) {
+        if (isCurrentRequest(requestGeneration, contextGeneration)) {
           setLoading(false);
         }
       }
     },
-    [enabled, t, tenantId],
+    [enabled, t, tenantApi, tenantContext],
   );
 
   /** 启动本机 Codex 登录流程。 */

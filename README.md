@@ -94,6 +94,7 @@ plus /workspace/gallery before reporting success.
     - [2. Configure a Model](#2-configure-a-model)
     - [3. Launch the Web Demo](#3-launch-the-web-demo)
     - [4. Verify the Installation](#4-verify-the-installation)
+    - [System Tenant Administration](#system-tenant-administration)
     - [Useful Commands](#useful-commands)
       - [Unified Python Entry](#unified-python-entry)
   - [MCP OAuth 2.1 + PKCE](#mcp-oauth-21--pkce)
@@ -178,7 +179,7 @@ remote or headless deployments.
 
 Both wrappers call the same cross-platform Python lifecycle entry, `scripts/dev.py`. The startup process builds the StaffDeck frontend and serves the UI, API, and Swagger documentation from one FastAPI process on port `5173`.
 
-Initial administrator credentials: username `admin`, password `admin`. Please change the password after first login.
+Initial demo-tenant credentials: tenant slug `demo`, username `admin`, password `admin`. Please change the password after first login.
 
 ### 4. Verify the Installation
 
@@ -201,6 +202,61 @@ Expected output:
 ```
 
 Open [http://127.0.0.1:5173/workspace/gallery](http://127.0.0.1:5173/workspace/gallery), select a digital employee, and send the first message. The answer and its execution record should stream into the same conversation turn.
+
+### System Tenant Administration
+
+Tenant administrators remain scoped to one tenant. Installation-wide tenant management uses a
+separate system administrator, signing secret, token audience, API client, browser session, and
+`/system/*` console. A system administrator can create tenants, rename their display names, reset
+the initial tenant administrator password, suspend/reactivate tenants, and inspect control audits;
+it cannot impersonate tenant users, read tenant business data through the control API, or hard-delete
+tenants.
+
+Generate a dedicated secret that is different from `APP_SECRET`, store it only in your local
+`backend/.env`, then run the normal application startup so the schema migration completes:
+
+```dotenv
+SYSTEM_ADMIN_SECRET="replace-with-a-different-long-random-secret"
+```
+
+Bootstrap the development system administrator locally. The command creates the fixed initial
+credential `sysadmin` / `sysadmin` and marks it for mandatory password replacement. Until that
+replacement succeeds, the system session cannot access tenant-control operations. Do not use this
+development bootstrap credential as a production provisioning mechanism:
+
+```bash
+cd backend
+.venv/bin/python -m app.system_admin.cli bootstrap
+cd ..
+```
+
+Open [http://127.0.0.1:5173/system/login](http://127.0.0.1:5173/system/login). This route is
+intentionally absent from ordinary tenant navigation. On first login, replace the initial password
+with an 8–20 character password that satisfies the configured system policy. The system console can
+subsequently rotate its own password and configure the installation default or per-tenant password
+policy. If local CLI recovery is required, run:
+
+```bash
+cd backend
+.venv/bin/python -m app.system_admin.cli reset-password --username sysadmin
+cd ..
+```
+
+Rotation invalidates existing system tokens. Missing or whitespace-tainted `SYSTEM_ADMIN_SECRET`
+disables system HTTP authentication; it never falls back to `APP_SECRET`.
+
+Tenant suspension is an execution-control boundary, not a delete. New tenant admission is denied,
+in-flight durable workers are fenced by lifecycle version/worker generation, and pre-suspension work
+is not replayed after reactivation. Do not treat suspension as production-ready until the lifecycle
+matrix, isolated-browser journey, migration checks, and security inspection in
+`specs/001-system-tenant-management/quickstart.md` are complete. Mocked provider tests do not verify
+real third-party behavior.
+
+Codex A2A is installation-owned (`system_runtime_key=codex_a2a`), not a tenant and not the Codex
+desktop application itself. Enabling it requires both `CODEX_A2A_ENABLED=true` and a dedicated,
+non-empty `CODEX_A2A_TOKEN`. New development databases use the explicit owner schema; a development
+database containing the old `a2a_codex` pseudo-tenant/schema must be rebuilt only after its exact path
+is confirmed. StaffDeck does not add a runtime compatibility branch or automatically delete that data.
 
 ### Useful Commands
 

@@ -32,8 +32,10 @@ def test_wechat_kf_accounts_migration_is_additive_idempotent_and_backfills(
         )
         conn.execute(
             text(
-                "INSERT INTO tenants (id, name, created_at, updated_at) "
-                "VALUES ('tenant_a', 'Tenant A', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+                "INSERT INTO tenants "
+                "(id, slug, name, status, lifecycle_version, created_at, updated_at) "
+                "VALUES ('tenant_a', 'tenant-a', 'Tenant A', 'active', 1, "
+                "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
             )
         )
         conn.execute(
@@ -145,8 +147,10 @@ def test_wechat_kf_backfill_runs_after_metadata_created_target_tables(
     with engine.begin() as conn:
         conn.execute(
             text(
-                "INSERT INTO tenants (id, name, created_at, updated_at) "
-                "VALUES ('tenant_b', 'Tenant B', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+                "INSERT INTO tenants "
+                "(id, slug, name, status, lifecycle_version, created_at, updated_at) "
+                "VALUES ('tenant_b', 'tenant-b', 'Tenant B', 'active', 1, "
+                "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
             )
         )
         conn.execute(

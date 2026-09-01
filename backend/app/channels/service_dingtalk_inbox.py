@@ -88,6 +88,35 @@ def stage_dingtalk_inbound(
                 or str((binding.config_json or {}).get("client_id") or "").strip() != client_id
             ):
                 return StageResult(StageDisposition.SECURITY_DROP, error_code="binding_fence_mismatch")
+            if binding.provider_tenant_key not in (None, "", tenant_key):
+                return StageResult(
+                    StageDisposition.SECURITY_DROP,
+                    error_code="provider_tenant_mismatch",
+                )
+            if binding.identity_scope_key not in (None, "", expected_scope):
+                return StageResult(
+                    StageDisposition.SECURITY_DROP,
+                    error_code="identity_scope_mismatch",
+                )
+
+            from app.channels.service_intake import (
+                admit_channel_lifecycle,
+                channel_lifecycle_error_code,
+                finalize_channel_staging_fence,
+            )
+            from app.security.tenant import TenantLifecycleDenied
+
+            try:
+                lifecycle = admit_channel_lifecycle(
+                    db,
+                    tenant_id=binding.tenant_id,
+                    correlation_id=inbound.event_id,
+                )
+            except TenantLifecycleDenied as exc:
+                return StageResult(
+                    StageDisposition.SECURITY_DROP,
+                    error_code=channel_lifecycle_error_code(exc),
+                )
             if binding.provider_tenant_key is None:
                 db.exec(
                     update(ChannelBinding)
@@ -122,6 +151,18 @@ def stage_dingtalk_inbound(
             if binding.identity_scope_key != expected_scope:
                 db.rollback()
                 return StageResult(StageDisposition.SECURITY_DROP, error_code="identity_scope_mismatch")
+
+            fence_error = finalize_channel_staging_fence(
+                db,
+                binding,
+                expected_channel="dingtalk",
+                expected_revision=expected_revision,
+                lifecycle_version=lifecycle.lifecycle_version,
+                correlation_id=inbound.event_id,
+            )
+            if fence_error:
+                db.rollback()
+                return StageResult(StageDisposition.SECURITY_DROP, error_code=fence_error)
             target = {
                 # 兼容现有 intake/outbox 的通用目标校验；provider-specific 字段同时保留。
                 "to_user_id": inbound.conv_key if inbound.is_group else inbound.from_user_id,
@@ -136,6 +177,7 @@ def stage_dingtalk_inbound(
                 id=new_id("chevt"), tenant_id=binding.tenant_id, binding_id=binding.id,
                 channel="dingtalk", event_id=inbound.event_id, payload_json=envelope,
                 config_revision=expected_revision, target_json=target, status="received",
+                tenant_lifecycle_version=lifecycle.lifecycle_version,
                 language_context_json=channel_ingress_language_context(binding).model_dump(
                     mode="json"
                 ),

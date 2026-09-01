@@ -8,6 +8,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { AppIntlProvider } from '@/i18n/provider';
 import type { AppLocale } from '@/i18n/locales';
+import { TenantSessionProvider } from '@/contexts/TenantSessionContext';
+import type { EnterpriseAuthSession } from '@/auth';
 import type { AgentProfileRead } from '@/types';
 
 import OpenPlatformPage from './OpenPlatformPage';
@@ -24,6 +26,21 @@ vi.mock('@/components/AppHeader', () => ({
     </header>
   ),
 }));
+
+const tenantSession: EnterpriseAuthSession = {
+  token: 'tenant-demo-token',
+  scope: 'tenant',
+  tenant: { id: 'tenant_demo', slug: 'demo', display_name: 'Demo tenant' },
+  user: {
+    id: 'user-1',
+    tenant_id: 'tenant_demo',
+    username: 'admin',
+    display_name: 'Demo admin',
+    role: 'admin',
+    must_change_password: false,
+    avatar_url: null,
+  },
+};
 
 const openPlatformAgent: AgentProfileRead = {
   id: 'agent-open-1',
@@ -88,6 +105,7 @@ function jsonResponse(body: unknown): Response {
     ok: true,
     status: 200,
     statusText: 'OK',
+    json: async () => body,
     text: async () => JSON.stringify(body),
   } as Response;
 }
@@ -96,6 +114,7 @@ function jsonResponse(body: unknown): Response {
 function stubOpenPlatformFetch(): void {
   vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input);
+    if (url.includes('/api/auth/me')) return jsonResponse(tenantSession.user);
     if (url.includes('/api/enterprise/agents')) return jsonResponse([openPlatformAgent]);
     return jsonResponse([]);
   }));
@@ -105,6 +124,7 @@ function stubOpenPlatformFetch(): void {
 function stubOpenPlatformToolFetch(): void {
   vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input);
+    if (url.includes('/api/auth/me')) return jsonResponse(tenantSession.user);
     if (url.includes('/api/enterprise/agents')) return jsonResponse([openPlatformAgent]);
     if (url.includes('/api/enterprise/tools')) {
       return jsonResponse([{
@@ -126,6 +146,7 @@ function stubOpenPlatformToolFetch(): void {
 function stubPersonaFetch(): void {
   vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input);
+    if (url.includes('/api/auth/me')) return jsonResponse(tenantSession.user);
     if (url.includes('/api/enterprise/agents')) return jsonResponse([]);
     if (url.includes('/api/enterprise/persona')) {
       return jsonResponse({ system_prompt: 'Raw persona prompt', updated_at: '2026-08-01T00:00:00Z' });
@@ -138,9 +159,11 @@ function stubPersonaFetch(): void {
 function renderSemanticOpenPlatform(locale: AppLocale): void {
   render(
     <AppIntlProvider initialLocale={locale}>
-      <MemoryRouter initialEntries={['/enterprise/platform']}>
-        <OpenPlatformPage isAdmin currentUser={{ id: 'user-1', tenant_id: 'tenant_demo', username: 'admin', role: 'admin' }} />
-      </MemoryRouter>
+      <TenantSessionProvider session={tenantSession}>
+        <MemoryRouter initialEntries={['/enterprise/platform']}>
+          <OpenPlatformPage isAdmin currentUser={tenantSession.user} />
+        </MemoryRouter>
+      </TenantSessionProvider>
     </AppIntlProvider>,
   );
 }
@@ -149,9 +172,11 @@ function renderSemanticOpenPlatform(locale: AppLocale): void {
 function renderSemanticPersona(locale: AppLocale): void {
   render(
     <AppIntlProvider initialLocale={locale}>
-      <MemoryRouter>
-        <PersonaPage />
-      </MemoryRouter>
+      <TenantSessionProvider session={tenantSession}>
+        <MemoryRouter>
+          <PersonaPage />
+        </MemoryRouter>
+      </TenantSessionProvider>
     </AppIntlProvider>,
   );
 }

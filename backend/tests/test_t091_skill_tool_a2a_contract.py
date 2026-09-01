@@ -125,8 +125,11 @@ def test_a2a_recovery_passes_the_durable_language_snapshot_to_tool_executor(
                 ),
                 A2ATaskRun(
                     id="a2arun-language-recovery",
+                    owner_scope="tenant",
                     direction="client",
                     tenant_id="tenant-a2a-recovery",
+                    system_runtime_key=None,
+                    tenant_lifecycle_version=1,
                     tool_id="tool-a2a-recovery",
                     invocation_id="invocation-a2a-recovery",
                     endpoint_url="https://agent.example.test/a2a",

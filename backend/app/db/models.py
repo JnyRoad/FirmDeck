@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import re
+from contextvars import ContextVar
 from datetime import UTC, datetime
 from typing import Any, Optional
 from uuid import uuid4
 
-from sqlalchemy import JSON, Column, Index, Integer, UniqueConstraint
+from pydantic import model_validator
+from sqlalchemy import JSON, CheckConstraint, Column, Index, Integer, UniqueConstraint, event
 from sqlmodel import Field, SQLModel
 
 
@@ -16,13 +19,91 @@ def new_id(prefix: str) -> str:
     return f"{prefix}_{uuid4().hex[:16]}"
 
 
+def _require_a2a_owner_shape(
+    *,
+    owner_scope: str | None,
+    tenant_id: str | None,
+    system_runtime_key: str | None,
+    tenant_lifecycle_version: int | None,
+    direction: str | None,
+) -> None:
+    """Reject incomplete or mixed A2A ownership before a model can reach persistence."""
+    tenant_owned = (
+        owner_scope == "tenant"
+        and tenant_id is not None
+        and system_runtime_key is None
+        and isinstance(tenant_lifecycle_version, int)
+        and not isinstance(tenant_lifecycle_version, bool)
+        and tenant_lifecycle_version > 0
+    )
+    system_owned = (
+        owner_scope == "system"
+        and tenant_id is None
+        and isinstance(system_runtime_key, str)
+        and bool(system_runtime_key.strip())
+        and len(system_runtime_key) <= 128
+        and tenant_lifecycle_version is None
+    )
+    if not (tenant_owned or system_owned):
+        raise ValueError("A2A task run must use one complete tenant or system owner shape")
+    if direction not in {"client", "server"}:
+        raise ValueError("A2A task run direction must be client or server")
+
+
+_a2a_model_validation_active: ContextVar[bool] = ContextVar(
+    "a2a_model_validation_active",
+    default=False,
+)
+
+
 class Tenant(SQLModel, table=True):
     __tablename__ = "tenants"
+    __table_args__ = (
+        CheckConstraint(
+            "length(slug) BETWEEN 3 AND 63 "
+            "AND slug GLOB '[a-z0-9]*' "
+            "AND slug GLOB '*[a-z0-9]' "
+            "AND slug NOT GLOB '*[^a-z0-9-]*'",
+            name="ck_tenants_slug_shape",
+        ),
+        CheckConstraint("status IN ('active', 'suspended')", name="ck_tenants_status"),
+        CheckConstraint("lifecycle_version > 0", name="ck_tenants_lifecycle_version_positive"),
+    )
 
     id: str = Field(primary_key=True)
+    slug: str = Field(index=True, unique=True, min_length=3, max_length=63)
     name: str
+    status: str = Field(default="active", index=True)
+    lifecycle_version: int = Field(default=1, gt=0)
+    initial_admin_user_id: str | None = Field(default=None, index=True)
+    suspended_at: datetime | None = None
+    suspension_reason: str | None = Field(default=None, max_length=500)
+    reactivated_at: datetime | None = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
+
+    @staticmethod
+    def _legacy_slug_from_id(tenant_id: str) -> str:
+        """Normalize one durable tenant ID into a valid compatibility slug without random suffixes."""
+        if tenant_id == "tenant_demo":
+            return "demo"
+        slug = re.sub(r"[^a-z0-9]+", "-", tenant_id.lower()).strip("-")
+        if len(slug) < 3:
+            slug = f"tenant-{slug or 'unknown'}"
+        return slug[:63].rstrip("-")
+
+
+@event.listens_for(Tenant, "init")
+def _apply_tenant_slug_constructor_compatibility(
+    _target: Tenant,
+    _args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> None:
+    """Fill only omitted legacy slugs and reject an explicit null before SQLModel initializes fields."""
+    if "slug" in kwargs and kwargs["slug"] is None:
+        raise ValueError("Tenant slug cannot be null")
+    if "slug" not in kwargs and isinstance(kwargs.get("id"), str):
+        kwargs["slug"] = Tenant._legacy_slug_from_id(kwargs["id"])
 
 
 class User(SQLModel, table=True):
@@ -30,6 +111,7 @@ class User(SQLModel, table=True):
     __table_args__ = (
         UniqueConstraint("tenant_id", "username", name="uq_user_tenant_username"),
         Index("ix_users_tenant_id_display_name", "tenant_id", "display_name"),
+        CheckConstraint("auth_version > 0", name="ck_users_auth_version_positive"),
     )
 
     id: str = Field(default_factory=lambda: new_id("user"), primary_key=True)
@@ -44,8 +126,131 @@ class User(SQLModel, table=True):
     # Agent 新生成自然语言的语言偏好；与产品界面语言独立保存。
     agent_reply_locale: Optional[str] = Field(default=None)
     password_hash: str
+    auth_version: int = Field(default=1, gt=0)
+    must_change_password: bool = False
+    password_changed_at: datetime | None = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
+
+
+class SystemAdmin(SQLModel, table=True):
+    """Installation-scoped administrator identity, isolated from every tenant principal."""
+
+    __tablename__ = "system_admins"
+    __table_args__ = (
+        CheckConstraint("status IN ('active', 'disabled')", name="ck_system_admins_status"),
+        CheckConstraint("auth_version > 0", name="ck_system_admins_auth_version_positive"),
+    )
+
+    id: str = Field(default_factory=lambda: new_id("sysadmin"), primary_key=True)
+    username: str = Field(index=True, unique=True, min_length=1, max_length=128)
+    display_name: str | None = Field(default=None, max_length=255)
+    password_hash: str
+    status: str = Field(default="active", index=True)
+    auth_version: int = Field(default=1, gt=0)
+    must_change_password: bool = False
+    password_changed_at: datetime | None = None
+    last_login_at: datetime | None = None
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class InstallationPasswordPolicy(SQLModel, table=True):
+    """Persist one installation-wide password policy for system or default tenant credentials."""
+
+    __tablename__ = "installation_password_policies"
+    __table_args__ = (
+        CheckConstraint(
+            "scope IN ('system', 'tenant_default')",
+            name="ck_installation_password_policies_scope",
+        ),
+        CheckConstraint(
+            "min_length BETWEEN 8 AND 20",
+            name="ck_installation_password_policies_min_length",
+        ),
+        CheckConstraint(
+            "max_length BETWEEN 8 AND 20",
+            name="ck_installation_password_policies_max_length",
+        ),
+        CheckConstraint(
+            "min_length <= max_length",
+            name="ck_installation_password_policies_length_order",
+        ),
+    )
+
+    scope: str = Field(primary_key=True, max_length=32)
+    min_length: int = Field(default=8, ge=8, le=20)
+    max_length: int = Field(default=20, ge=8, le=20)
+    complexity_enabled: bool = False
+    require_uppercase: bool = True
+    require_lowercase: bool = True
+    require_digit: bool = True
+    require_special: bool = True
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class TenantPasswordPolicy(SQLModel, table=True):
+    """Persist one tenant custom policy, or an explicit inheritance choice, without password data."""
+
+    __tablename__ = "tenant_password_policies"
+    __table_args__ = (
+        CheckConstraint(
+            "mode IN ('inherit', 'custom')",
+            name="ck_tenant_password_policies_mode",
+        ),
+        CheckConstraint(
+            "min_length IS NULL OR min_length BETWEEN 8 AND 20",
+            name="ck_tenant_password_policies_min_length",
+        ),
+        CheckConstraint(
+            "max_length IS NULL OR max_length BETWEEN 8 AND 20",
+            name="ck_tenant_password_policies_max_length",
+        ),
+        CheckConstraint(
+            "min_length IS NULL OR max_length IS NULL OR min_length <= max_length",
+            name="ck_tenant_password_policies_length_order",
+        ),
+    )
+
+    tenant_id: str = Field(primary_key=True)
+    mode: str = Field(default="inherit", max_length=16)
+    min_length: int | None = Field(default=None, ge=8, le=20)
+    max_length: int | None = Field(default=None, ge=8, le=20)
+    complexity_enabled: bool | None = None
+    require_uppercase: bool | None = None
+    require_lowercase: bool | None = None
+    require_digit: bool | None = None
+    require_special: bool | None = None
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class SystemControlAudit(SQLModel, table=True):
+    """Append-only control-plane audit evidence without credentials or raw request diagnostics."""
+
+    __tablename__ = "system_control_audits"
+    __table_args__ = (
+        CheckConstraint(
+            "result IN ('succeeded', 'rejected', 'failed')",
+            name="ck_system_control_audits_result",
+        ),
+    )
+
+    id: str = Field(default_factory=lambda: new_id("sysaudit"), primary_key=True)
+    actor_system_admin_id: str | None = Field(default=None, index=True)
+    actor_label: str | None = Field(default=None, max_length=255)
+    action: str = Field(index=True, max_length=64)
+    target_type: str = Field(max_length=64)
+    target_id: str | None = Field(default=None, index=True)
+    result: str = Field(index=True, max_length=16)
+    reason_code: str = Field(max_length=128)
+    operator_reason: str | None = Field(default=None, max_length=500)
+    status_before: str | None = Field(default=None, max_length=16)
+    status_after: str | None = Field(default=None, max_length=16)
+    lifecycle_version: int | None = Field(default=None, gt=0)
+    request_id: str | None = Field(default=None, index=True)
+    trace_id: str | None = Field(default=None, index=True)
+    safe_params_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    created_at: datetime = Field(default_factory=utc_now, index=True)
 
 
 class UserAvatar(SQLModel, table=True):
@@ -147,6 +352,7 @@ class APIJob(SQLModel, table=True):
 
     id: str = Field(default_factory=lambda: new_id("apijob"), primary_key=True)
     tenant_id: str = Field(index=True)
+    tenant_lifecycle_version: int = Field(default=1, index=True, gt=0)
     credential_id: str = Field(index=True)
     agent_id: Optional[str] = Field(default=None, index=True)
     kind: str = Field(index=True)
@@ -156,11 +362,13 @@ class APIJob(SQLModel, table=True):
     request_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     result_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     error_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    terminal_reason: str | None = Field(default=None, index=True, max_length=120)
+    outcome_unknown: bool = False
     cancel_requested: bool = False
     retryable: bool = False
-    execution_owner: Optional[str] = Field(default=None, index=True)
+    execution_owner: str | None = Field(default=None, index=True)
     execution_generation: int = 0
-    lease_expires_at: Optional[datetime] = Field(default=None, index=True)
+    lease_expires_at: datetime | None = Field(default=None, index=True)
     session_id: Optional[str] = Field(default=None, index=True)
     # Durable public run snapshot; never re-resolve from mutable preferences on retry.
     language_context_json: Optional[dict[str, Any]] = Field(
@@ -193,10 +401,37 @@ class A2ATaskRun(SQLModel, table=True):
     """Durable state for outbound A2A calls and locally served A2A tasks."""
 
     __tablename__ = "a2a_task_runs"
+    __table_args__ = (
+        CheckConstraint(
+            "owner_scope IS NOT NULL AND owner_scope IN ('tenant', 'system')",
+            name="ck_a2a_task_runs_owner_scope",
+        ),
+        CheckConstraint(
+            "direction IS NOT NULL AND direction IN ('client', 'server')",
+            name="ck_a2a_task_runs_direction",
+        ),
+        CheckConstraint(
+            "(owner_scope = 'tenant' "
+            "AND tenant_id IS NOT NULL "
+            "AND system_runtime_key IS NULL "
+            "AND tenant_lifecycle_version IS NOT NULL "
+            "AND tenant_lifecycle_version > 0) "
+            "OR (owner_scope = 'system' "
+            "AND tenant_id IS NULL "
+            "AND system_runtime_key IS NOT NULL "
+            "AND length(trim(system_runtime_key)) > 0 "
+            "AND length(system_runtime_key) <= 128 "
+            "AND tenant_lifecycle_version IS NULL)",
+            name="ck_a2a_task_runs_owner_shape",
+        ),
+    )
 
     id: str = Field(default_factory=lambda: new_id("a2arun"), primary_key=True)
+    owner_scope: str | None = Field(default=None, index=True, min_length=1, max_length=16)
     direction: str = Field(default="client", index=True)
-    tenant_id: str = Field(index=True)
+    tenant_id: str | None = Field(default=None, index=True)
+    system_runtime_key: str | None = Field(default=None, index=True, max_length=128)
+    tenant_lifecycle_version: int | None = Field(default=None, index=True, gt=0)
     tool_id: Optional[str] = Field(default=None, index=True)
     agent_id: Optional[str] = Field(default=None, index=True)
     session_id: Optional[str] = Field(default=None, index=True)
@@ -222,10 +457,54 @@ class A2ATaskRun(SQLModel, table=True):
     last_event_id: Optional[str] = Field(default=None, index=True)
     cancel_requested: bool = False
     recovery_attempts: int = 0
+    # Durable worker claim shared by tenant-client recovery and system Codex execution.
+    # Generation prevents a worker whose lease expired from publishing over its successor.
+    worker_owner: str | None = Field(default=None, index=True, max_length=128)
+    worker_generation: int = Field(default=0, ge=0)
+    worker_lease_until: datetime | None = Field(default=None, index=True)
     created_at: datetime = Field(default_factory=utc_now)
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
     updated_at: datetime = Field(default_factory=utc_now)
+
+    @classmethod
+    def model_validate(cls, obj: Any, **kwargs: Any) -> A2ATaskRun:
+        """Let Pydantic create its internal blank model before the shared guard validates parsed fields."""
+        token = _a2a_model_validation_active.set(True)
+        try:
+            return super().model_validate(obj, **kwargs)
+        finally:
+            _a2a_model_validation_active.reset(token)
+
+    @model_validator(mode="after")
+    def validate_owner_shape(self) -> A2ATaskRun:
+        """Apply the same owner contract when callers explicitly use Pydantic model validation."""
+        _require_a2a_owner_shape(
+            owner_scope=self.owner_scope,
+            tenant_id=self.tenant_id,
+            system_runtime_key=self.system_runtime_key,
+            tenant_lifecycle_version=self.tenant_lifecycle_version,
+            direction=self.direction,
+        )
+        return self
+
+
+@event.listens_for(A2ATaskRun, "init")
+def _validate_a2a_task_run_constructor(
+    _target: A2ATaskRun,
+    _args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> None:
+    """Run the shared owner guard for direct table-model construction without disrupting model_validate."""
+    if _a2a_model_validation_active.get() and not kwargs:
+        return
+    _require_a2a_owner_shape(
+        owner_scope=kwargs.get("owner_scope"),
+        tenant_id=kwargs.get("tenant_id"),
+        system_runtime_key=kwargs.get("system_runtime_key"),
+        tenant_lifecycle_version=kwargs.get("tenant_lifecycle_version"),
+        direction=kwargs.get("direction", "client"),
+    )
 
 
 class A2ATaskEvent(SQLModel, table=True):
@@ -235,7 +514,6 @@ class A2ATaskEvent(SQLModel, table=True):
     )
 
     id: str = Field(default_factory=lambda: new_id("a2aevt"), primary_key=True)
-    tenant_id: str = Field(index=True)
     run_id: str = Field(index=True)
     sequence: int = Field(index=True)
     external_event_id: Optional[str] = Field(default=None, index=True)
@@ -267,6 +545,7 @@ class WebhookDelivery(SQLModel, table=True):
 
     id: str = Field(default_factory=lambda: new_id("whdelivery"), primary_key=True)
     tenant_id: str = Field(index=True)
+    tenant_lifecycle_version: int = Field(default=1, index=True, gt=0)
     endpoint_id: str = Field(index=True)
     event_id: str = Field(index=True)
     event_type: str = Field(index=True)
@@ -278,6 +557,8 @@ class WebhookDelivery(SQLModel, table=True):
     next_attempt_at: Optional[datetime] = Field(default=None, index=True)
     last_status_code: Optional[int] = None
     last_error: Optional[str] = None
+    terminal_reason: str | None = Field(default=None, index=True, max_length=120)
+    outcome_unknown: bool = False
     created_at: datetime = Field(default_factory=utc_now)
     delivered_at: Optional[datetime] = None
     updated_at: datetime = Field(default_factory=utc_now)
@@ -608,11 +889,15 @@ class KnowledgeIngestJob(SQLModel, table=True):
 
     id: str = Field(default_factory=lambda: new_id("kjob"), primary_key=True)
     tenant_id: str = Field(index=True)
+    tenant_lifecycle_version: int = Field(default=1, index=True, gt=0)
     knowledge_base_id: str = Field(index=True)
     knowledge_base_version_id: Optional[str] = Field(default=None, index=True)
     document_id: Optional[str] = Field(default=None, index=True)
     filename: str
     status: str = Field(default="queued", index=True)
+    execution_owner: Optional[str] = Field(default=None, index=True)
+    execution_generation: int = Field(default=0, index=True, ge=0)
+    lease_expires_at: Optional[datetime] = Field(default=None, index=True)
     stage: str = "queued"
     progress: float = 0.0
     error: Optional[str] = None
@@ -1150,6 +1435,7 @@ class ChannelInboundEvent(SQLModel, table=True):
 
     id: str = Field(default_factory=lambda: new_id("chevt"), primary_key=True)
     tenant_id: str = Field(index=True)
+    tenant_lifecycle_version: int = Field(default=1, index=True, gt=0)
     binding_id: str = Field(index=True)
     channel: str = Field(index=True)
     event_id: str
@@ -1188,6 +1474,7 @@ class ChannelDelivery(SQLModel, table=True):
 
     id: str = Field(default_factory=lambda: new_id("chdlv"), primary_key=True)
     tenant_id: str = Field(index=True)
+    tenant_lifecycle_version: int = Field(default=1, index=True, gt=0)
     binding_id: str = Field(index=True)
     session_id: str = Field(index=True)
     message_id: Optional[str] = Field(default=None, index=True)
@@ -1297,6 +1584,7 @@ class ScheduledTaskRun(SQLModel, table=True):
 
     id: str = Field(default_factory=lambda: new_id("schedrun"), primary_key=True)
     tenant_id: str = Field(index=True)
+    tenant_lifecycle_version: int = Field(default=1, index=True, gt=0)
     scheduled_task_id: str = Field(index=True)
     agent_id: str = Field(index=True)
     user_id: str = Field(index=True)
@@ -1356,6 +1644,7 @@ class HarnessTaskFrameRecord(SQLModel, table=True):
 
     id: str = Field(default_factory=lambda: new_id("htask"), primary_key=True)
     tenant_id: str = Field(index=True)
+    tenant_lifecycle_version: int = Field(default=1, index=True, gt=0)
     session_id: str = Field(index=True)
     source_turn_id: str = Field(index=True)
     task_id: str = Field(index=True)
@@ -1394,6 +1683,7 @@ class HarnessRunRecord(SQLModel, table=True):
 
     id: str = Field(default_factory=lambda: new_id("hrun"), primary_key=True)
     tenant_id: str = Field(index=True)
+    tenant_lifecycle_version: int = Field(default=1, index=True, gt=0)
     session_id: str = Field(index=True)
     task_frame_record_id: str = Field(index=True)
     agent_loop_id: Optional[str] = Field(default=None, index=True)
@@ -1437,6 +1727,7 @@ class HarnessTurnRecord(SQLModel, table=True):
 
     id: str = Field(default_factory=lambda: new_id("hturn"), primary_key=True)
     tenant_id: str = Field(index=True)
+    tenant_lifecycle_version: int = Field(default=1, index=True, gt=0)
     session_id: str = Field(index=True)
     client_turn_id: str = Field(index=True)
     request_digest: str = Field(index=True)
@@ -1494,6 +1785,7 @@ class HarnessInvocationRecord(SQLModel, table=True):
 
     id: str = Field(default_factory=lambda: new_id("hinvoke"), primary_key=True)
     tenant_id: str = Field(index=True)
+    tenant_lifecycle_version: int = Field(default=1, index=True, gt=0)
     session_id: str = Field(index=True)
     task_id: str = Field(index=True)
     run_id: str = Field(index=True)
@@ -1753,6 +2045,7 @@ class TeamRun(SQLModel, table=True):
     id: str = Field(default_factory=lambda: new_id("team_run"), primary_key=True)
     team_id: str = Field(index=True)
     tenant_id: str = Field(index=True)
+    tenant_lifecycle_version: int = Field(default=1, index=True, gt=0)
     tl_session_id: str = Field(index=True)
     source_turn_id: str = Field(index=True)
     created_by_user_id: Optional[str] = Field(default=None, index=True)
@@ -1782,6 +2075,7 @@ class TeamTask(SQLModel, table=True):
     id: str = Field(default_factory=lambda: new_id("team_task"), primary_key=True)
     team_id: str = Field(index=True)
     tenant_id: str = Field(index=True)
+    tenant_lifecycle_version: int = Field(default=1, index=True, gt=0)
     team_run_id: Optional[str] = Field(default=None, index=True)
     source_turn_id: Optional[str] = Field(default=None, index=True)
     parent_task_id: Optional[str] = Field(default=None, index=True)
@@ -1832,6 +2126,11 @@ class TeamWakeEvent(SQLModel, table=True):
     id: str = Field(default_factory=lambda: new_id("team_wake"), primary_key=True)
     team_id: str = Field(index=True)
     tenant_id: str = Field(index=True)
+    tenant_lifecycle_version: int = Field(default=1, index=True, gt=0)
+    # 每次认领都绑定唯一 owner 与单调 generation；租约过期接管后，旧 worker 的迟到结果不得落库。
+    worker_owner: str | None = Field(default=None, index=True, max_length=128)
+    worker_generation: int = Field(default=0, ge=0)
+    worker_lease_until: datetime | None = Field(default=None, index=True)
     target_agent_id: str = Field(index=True)
     # trigger_type: task_assigned / task_report / task_rework / tl_message 等
     trigger_type: str = Field(index=True)

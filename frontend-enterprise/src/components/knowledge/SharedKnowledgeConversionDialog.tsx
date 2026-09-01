@@ -2,9 +2,10 @@
  * 专用知识库转换向导：读取员工分支版本与可选团队，提交原子转换，并清楚展示来源保护边界。
  */
 
-import { useContext, useEffect, useMemo, useState } from 'react';
+import { useContext, useEffect, useMemo, useRef, useState } from 'react';
 
-import { api, TENANT_ID } from '@/api/client';
+import { createTenantClient } from '@/api/tenant-client';
+import { useTenantSession } from '@/contexts/TenantSessionContext';
 import {
   Checkbox,
   Dialog,
@@ -49,6 +50,10 @@ export function SharedKnowledgeConversionDialog({
 }: SharedKnowledgeConversionDialogProps) {
   /** 管理一次员工专用分支到新共享谱系的预览、配置和提交。 */
   const { t } = useSharedKnowledgeConversionIntl();
+  const tenantContext = useTenantSession();
+  const tenantClient = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
+  const tenantId = tenantContext?.tenantId || '';
+  const requestControllerRef = useRef<AbortController | null>(null);
   const [versions, setVersions] = useState<KnowledgeBaseVersionRead[]>([]);
   const [teams, setTeams] = useState<TeamRead[]>([]);
   const [sourceVersionId, setSourceVersionId] = useState('');
@@ -82,7 +87,17 @@ export function SharedKnowledgeConversionDialog({
   );
 
   useEffect(() => {
-    if (!open || !knowledgeBase) return;
+    requestControllerRef.current?.abort();
+    const controller = new AbortController();
+    requestControllerRef.current = controller;
+    return () => {
+      controller.abort();
+      if (requestControllerRef.current === controller) requestControllerRef.current = null;
+    };
+  }, [open, knowledgeBase?.id, agentId, tenantContext]);
+
+  useEffect(() => {
+    if (!open || !knowledgeBase || !tenantContext) return;
     setVersions([]);
     setTeams([]);
     setSourceVersionId('');
@@ -94,24 +109,32 @@ export function SharedKnowledgeConversionDialog({
     setErrorMessage('');
     setConversionResult(null);
     void loadConversionContext();
-  }, [open, knowledgeBase?.id, agentId]);
+  }, [open, knowledgeBase?.id, agentId, tenantClient, tenantContext, tenantId]);
 
   async function loadConversionContext() {
     /** 读取可转换版本和同租户活动团队；只更新向导本地状态，不改动知识数据。 */
-    if (!knowledgeBase || !agentId) return;
+    if (!knowledgeBase || !agentId || !tenantContext) return;
+    const context = tenantContext;
+    const generation = context.generation;
+    const controller = requestControllerRef.current;
+    if (!controller) return;
     setContextLoading(true);
     setErrorMessage('');
     try {
       // 版本和团队彼此独立，并行加载后再共同决定默认选项。
       const [versionRows, teamRows] = await Promise.all([
-        api.get<KnowledgeBaseVersionRead[]>(
-          `/api/enterprise/knowledge-bases/${knowledgeBase.id}/versions?tenant_id=${TENANT_ID}&agent_id=${encodeURIComponent(agentId)}`,
+        tenantClient.get<KnowledgeBaseVersionRead[]>(
+          `/api/enterprise/knowledge-bases/${knowledgeBase.id}/versions?tenant_id=${tenantId}&agent_id=${encodeURIComponent(agentId)}`,
+          { signal: controller.signal },
         ),
-        api.get<TeamRead[]>(`/api/enterprise/teams?tenant_id=${TENANT_ID}`),
+        tenantClient.get<TeamRead[]>(`/api/enterprise/teams?tenant_id=${tenantId}`, {
+          signal: controller.signal,
+        }),
       ]);
       const defaultVersion = versionRows.find((version) => version.is_head)
         || versionRows.find((version) => version.version === knowledgeBase.branch_head_version)
         || versionRows[0];
+      if (controller.signal.aborted || !context.isCurrentGeneration(generation)) return;
       setVersions(versionRows);
       setTeams(teamRows.filter((team) => team.status === 'active'));
       setSourceVersionId(defaultVersion?.id || '');
@@ -119,11 +142,12 @@ export function SharedKnowledgeConversionDialog({
         setErrorMessage(t('sharedKnowledgeConversion.error.noVersion'));
       }
     } catch (error) {
+      if (controller.signal.aborted || !context.isCurrentGeneration(generation)) return;
       const message = apiErrorMessage(error, 'sharedKnowledgeConversion.error.contextLoad', { t });
       setErrorMessage(t('sharedKnowledgeConversion.error.contextLoadBoundary', { message }));
       notify.error(message);
     } finally {
-      setContextLoading(false);
+      if (!controller.signal.aborted && context.isCurrentGeneration(generation)) setContextLoading(false);
     }
   }
 
@@ -139,17 +163,21 @@ export function SharedKnowledgeConversionDialog({
 
   async function submitConversion() {
     /** 提交原子转换；仅 API 明确成功后才通知页面替换来源实例。 */
-    if (!knowledgeBase || !canSubmit) return;
+    if (!knowledgeBase || !canSubmit || !tenantContext) return;
+    const context = tenantContext;
+    const generation = context.generation;
+    const controller = requestControllerRef.current;
+    if (!controller) return;
     setSubmitting(true);
     setErrorMessage('');
 
     let result: KnowledgeBaseConversionRead;
     try {
       // 服务端先复制与校验，成功响应代表新共享正式版可见且来源实例已归档。
-      result = await api.post<KnowledgeBaseConversionRead>(
+      result = await tenantClient.post<KnowledgeBaseConversionRead>(
         `/api/enterprise/knowledge-bases/${knowledgeBase.id}/convert-to-shared`,
         {
-          tenant_id: TENANT_ID,
+          tenant_id: tenantId,
           agent_id: agentId,
           source_version_id: sourceVersionId,
           name: sharedName.trim(),
@@ -158,8 +186,10 @@ export function SharedKnowledgeConversionDialog({
           team_bindings: selectedTeamIds,
           default_for_team_id: defaultTeamId || null,
         },
+        { signal: controller.signal },
       );
     } catch (error) {
+      if (controller.signal.aborted || !context.isCurrentGeneration(generation)) return;
       const message = apiErrorMessage(error, 'sharedKnowledgeConversion.error.failed', { t });
       setErrorMessage(t('sharedKnowledgeConversion.error.failedBoundary', { message }));
       notify.error(message);
@@ -167,15 +197,17 @@ export function SharedKnowledgeConversionDialog({
       return;
     }
 
+    if (controller.signal.aborted || !context.isCurrentGeneration(generation)) return;
     // 页面回调只负责定位新共享库；即使刷新失败，也不能把已完成的转换误报为失败。
     setConversionResult(result);
     notify.success(t('sharedKnowledgeConversion.toast.created', { name: result.new_knowledge_base.name }));
     try {
       await onConverted(result);
     } catch {
+      if (controller.signal.aborted || !context.isCurrentGeneration(generation)) return;
       notify.warning(t('sharedKnowledgeConversion.toast.refreshFailed'));
     } finally {
-      setSubmitting(false);
+      if (!controller.signal.aborted && context.isCurrentGeneration(generation)) setSubmitting(false);
     }
   }
 

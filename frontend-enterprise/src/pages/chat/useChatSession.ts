@@ -14,18 +14,19 @@ import { useNavigate, useParams } from 'react-router-dom';
 import {
   ApiError,
   SHOW_DEBUG,
-  TENANT_ID,
-  api,
   isAuthError,
   streamChatTurn,
   uploadChatAttachments,
   type StreamEvent,
 } from '@/api/client';
-import { clearEnterpriseAuthSession, getEnterpriseAuthSession } from '@/auth';
+import { createTenantClient } from '@/api/tenant-client';
+import { clearEnterpriseAuthSession } from '@/auth';
+import { useTenantSession } from '@/contexts/TenantSessionContext';
 import {
   emitAgentScopeChange,
   isTeamScope,
   persistSharedAgentScope,
+  readEmployeeScope,
   teamIdFromScope,
   toTeamScope,
 } from '@/lib/agent-scope-storage';
@@ -72,7 +73,6 @@ import {
   CHAT_STREAM_HEARTBEAT_GRACE_MS,
   HIDDEN_GENERAL_SKILL_TRACE_PHASES,
   RUNNING_EVENT_RECOVERY_WINDOW_MS,
-  SELECTED_AGENT_STORAGE_KEY,
   STREAM_TERMINAL_EVENTS,
   attachTurnIdsToServerMessages,
   buildTurnAliasMap,
@@ -444,32 +444,40 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
   const { sessionId: routeSessionId, draftAgentId } = useParams<{ sessionId?: string; draftAgentId?: string }>();
   const sessionId = options.sessionId || routeSessionId;
   const navigate = useNavigate();
-  const [auth] = useState(() => getEnterpriseAuthSession());
-  const tenantId = auth?.user.tenant_id || TENANT_ID;
-  const userId = auth?.user.id || '';
+  const tenantContext = useTenantSession();
+  const tenantClient = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
+  const auth = tenantContext?.session || null;
+  const tenantId = tenantContext?.tenantId || '';
+  const userId = tenantContext?.userId || '';
   const [agentReplyLocalePreference, setAgentReplyLocalePreference] = useState<AppLocale>(() => (
-    readAgentReplyLocalePreference(window.localStorage, userId)
+    readAgentReplyLocalePreference(window.localStorage, `${tenantId}:${userId}`)
   ));
-  const queueStorageKey = chatQueueStorageKey(tenantId, userId);
+  const queueStorageKey = tenantId && userId ? chatQueueStorageKey(tenantId, userId) : '';
   const [restoredQueuedTurns] = useState(() => (
-    readQueuedChatTurns(window.sessionStorage, queueStorageKey)
+    queueStorageKey ? readQueuedChatTurns(window.sessionStorage, queueStorageKey) : []
   ));
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [sessionsLoading, setSessionsLoading] = useState(true);
-  const [sessionReadTimes, setSessionReadTimes] = useState<Record<string, string>>(() => loadSessionReadTimes(userId));
+  const [sessionReadTimes, setSessionReadTimes] = useState<Record<string, string>>(() => (
+    tenantId && userId ? loadSessionReadTimes(tenantId, userId) : {}
+  ));
   const [agents, setAgents] = useState<AgentProfileRead[]>([]);
   const [agentsLoaded, setAgentsLoaded] = useState(false);
   const [teams, setTeams] = useState<TeamRead[]>([]);
   const [teamEmptyStats, setTeamEmptyStats] = useState<{ tasks: number; blackboard: number }>({ tasks: 0, blackboard: 0 });
-  const [selectedAgentId, setSelectedAgentId] = useState(() => window.localStorage.getItem(SELECTED_AGENT_STORAGE_KEY) || '');
+  const [selectedAgentId, setSelectedAgentId] = useState(() => (
+    tenantId && userId ? readEmployeeScope(tenantId, userId) : ''
+  ));
   const [sessionAgentFilter, setSessionAgentFilter] = useState(() => (
-    window.localStorage.getItem(sessionFilterStorageKey(userId))
-    || window.localStorage.getItem(SELECTED_AGENT_STORAGE_KEY)
-    || 'all'
+    tenantId && userId
+      ? window.localStorage.getItem(sessionFilterStorageKey(tenantId, userId))
+        || readEmployeeScope(tenantId, userId)
+        || 'all'
+      : 'all'
   ));
   const [modelConfigs, setModelConfigs] = useState<ModelConfigRead[]>([]);
   const [selectedModelConfigId, setSelectedModelConfigId] = useState(
-    () => window.localStorage.getItem(modelStorageKey(tenantId)) || '',
+    () => tenantId && userId ? window.localStorage.getItem(modelStorageKey(tenantId, userId)) || '' : '',
   );
   const [modelConfigsLoading, setModelConfigsLoading] = useState(Boolean(auth));
   const [modelConfigsLoadError, setModelConfigsLoadError] = useState('');
@@ -497,13 +505,15 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
   const persistChatSessionAgentFilter = useCallback((value: string) => {
     const next = value || 'all';
     setSessionAgentFilter(next);
-    window.localStorage.setItem(sessionFilterStorageKey(userId), next);
-  }, [userId]);
+    if (tenantId && userId) {
+      window.localStorage.setItem(sessionFilterStorageKey(tenantId, userId), next);
+    }
+  }, [tenantId, userId]);
   /** 更新当前用户的新会话回复语言偏好；既有 session 的权威快照不会被此操作改写。 */
   const setAgentReplyLocale = useCallback((nextLocale: AppLocale) => {
     setAgentReplyLocalePreference(nextLocale);
-    writeAgentReplyLocalePreference(window.localStorage, userId, nextLocale);
-  }, [userId]);
+    if (userId) writeAgentReplyLocalePreference(window.localStorage, `${tenantId}:${userId}`, nextLocale);
+  }, [tenantId, userId]);
   const [activeCitation, setActiveCitation] = useState<KnowledgeCitation | null>(null);
   const [handoffs, setHandoffs] = useState<HumanHandoffRead[]>([]);
   const [handoffsLoading, setHandoffsLoading] = useState(false);
@@ -559,6 +569,8 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
   const autoOpenedSessionIdsRef = useRef(new Set<string>());
   const loadErrorNoticeRef = useRef<Record<string, number>>({});
   const uploadControllersRef = useRef(new Map<string, AbortController>());
+  const workspaceControllerRef = useRef<AbortController | null>(null);
+  const workspaceGenerationRef = useRef(0);
 
   const notifyStore = useCallback(() => setStoreTick((value) => value + 1), []);
   const notifyStream = useCallback(() => setStreamTick((value) => value + 1), []);
@@ -569,16 +581,129 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     writeQueuedChatTurns(window.sessionStorage, queueStorageKey, queuedTurnsRef.current)
   ), [queueStorageKey]);
 
+  /**
+   * Own one abort fence for the mounted workspace. The provider's signal
+   * handles tenant replacement; this local controller also handles a chat
+   * subtree being removed while the surrounding tenant shell remains mounted.
+   */
+  useEffect(() => {
+    const previousController = workspaceControllerRef.current;
+    previousController?.abort();
+    const controller = new AbortController();
+    const generation = tenantContext?.generation ?? 0;
+    workspaceControllerRef.current = controller;
+    workspaceGenerationRef.current = generation;
+    const onTenantAbort = () => controller.abort();
+    tenantContext?.signal.addEventListener('abort', onTenantAbort, { once: true });
+
+    // A new verified tenant generation starts with no in-memory state from the
+    // previous tenant, even when the hook instance itself is retained by an
+    // embedding page.
+    setSessions([]);
+    setSessionsLoading(Boolean(tenantContext));
+    setAgents([]);
+    setAgentsLoaded(false);
+    setTeams([]);
+    setTeamEmptyStats({ tasks: 0, blackboard: 0 });
+    setHandoffs([]);
+    setHandoffsLoading(Boolean(tenantContext));
+    setScheduledDrafts({});
+    setCreatedScheduledTasks({});
+    setDismissedDraftMessageIds([]);
+    setHandoffReplies({});
+    setSessionReadTimes(
+      tenantId && userId ? loadSessionReadTimes(tenantId, userId) : {},
+    );
+    setAgentReplyLocalePreference(
+      readAgentReplyLocalePreference(window.localStorage, `${tenantId}:${userId}`),
+    );
+    setSelectedAgentId(tenantId && userId ? readEmployeeScope(tenantId, userId) : '');
+    setSessionAgentFilter(
+      tenantId && userId
+        ? window.localStorage.getItem(sessionFilterStorageKey(tenantId, userId))
+          || readEmployeeScope(tenantId, userId)
+          || 'all'
+        : 'all',
+    );
+    setSelectedModelConfigId(
+      tenantId && userId ? window.localStorage.getItem(modelStorageKey(tenantId, userId)) || '' : '',
+    );
+    setModelConfigs([]);
+    setModelConfigsLoadError('');
+    setModelConfigsLoading(Boolean(tenantContext));
+    setSlashCommands([]);
+    setComposerAttachments([]);
+    setInput('');
+    setComposerIntent(null);
+    setLastTurn(null);
+    setRenameSession(null);
+    setPendingDelete(null);
+    setActiveCitation(null);
+    setRunningTurn(null);
+    setUiConfig((current) => ({ ...current, tenant_id: tenantId }));
+    storeRef.current.clear();
+    streamRef.current.clear();
+    turnTraceRef.current.clear();
+    knownSessionIdsRef.current.clear();
+    optimisticSessionIdsRef.current.clear();
+    locallyCancelledSessionIdsRef.current.clear();
+    scheduledEventIdsRef.current.clear();
+    scheduledEventPollsRef.current.clear();
+    autoOpenedSessionIdsRef.current.clear();
+    pendingPromotedSessionIdRef.current = null;
+    queuedTurnsRef.current = tenantId && userId
+      ? readQueuedChatTurns(window.sessionStorage, chatQueueStorageKey(tenantId, userId))
+      : [];
+    queuedTurnProcessingRef.current = false;
+    queuedTurnPreviewsRestoredRef.current = false;
+    sessionsInitializedRef.current = false;
+
+    return () => {
+      tenantContext?.signal.removeEventListener('abort', onTenantAbort);
+      controller.abort();
+      if (workspaceControllerRef.current === controller) workspaceControllerRef.current = null;
+      uploadControllersRef.current.forEach((item) => item.abort());
+      uploadControllersRef.current.clear();
+      streamRef.current.forEach((item) => {
+        item.abortController?.abort();
+        if (item.timer) window.clearTimeout(item.timer);
+        item.abortController = null;
+        item.timer = null;
+      });
+      terminalTurnSyncRef.current.forEach((item) => {
+        if (item.timer) window.clearTimeout(item.timer);
+      });
+      terminalTurnSyncRef.current.clear();
+      scheduledEventPollsRef.current.clear();
+      storeRef.current.clear();
+      streamRef.current.clear();
+      turnTraceRef.current.clear();
+      queuedTurnsRef.current = [];
+      queuedTurnProcessingRef.current = false;
+      pendingPromotedSessionIdRef.current = null;
+    };
+  }, [tenantContext?.generation, tenantContext?.signal, tenantId, userId]);
+
   const redirectToLogin = useCallback(() => {
     if (anonymous) return;
     clearEnterpriseAuthSession();
     window.location.href = '/';
   }, [anonymous]);
 
-  useEffect(() => () => {
-    uploadControllersRef.current.forEach((controller) => controller.abort());
-    uploadControllersRef.current.clear();
-  }, []);
+  const workspaceSignal = useCallback(
+    () => workspaceControllerRef.current?.signal || tenantContext?.signal,
+    [tenantContext],
+  );
+  const isWorkspaceCurrent = useCallback(() => {
+    const controller = workspaceControllerRef.current;
+    const generation = tenantContext?.generation ?? 0;
+    return Boolean(
+      controller
+      && !controller.signal.aborted
+      && workspaceGenerationRef.current === generation
+      && (!tenantContext || tenantContext.isCurrentGeneration(generation)),
+    );
+  }, [tenantContext]);
 
   const updateChatStickiness = useCallback(() => {
     const element = chatMessagesRef.current;
@@ -601,6 +726,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
 
   /** 将请求异常收敛为稳定的界面错误消息；原始异常只进入诊断日志，不直出用户界面。 */
   const notifyRequestError = useCallback((scope: string, error: unknown, fallbackId: MessageId) => {
+    if (!isWorkspaceCurrent()) return false;
     if (isAuthError(error)) {
       redirectToLogin();
       return true;
@@ -638,7 +764,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       duration: 3000,
     });
     return false;
-  }, [redirectToLogin, t]);
+  }, [isWorkspaceCurrent, redirectToLogin, t]);
 
   const scrollChatToBottom = useCallback((options?: { preserveShortContentTop?: boolean; force?: boolean }) => {
     const element = chatMessagesRef.current;
@@ -679,10 +805,10 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
         return current;
       }
       const next = { ...current, [id]: value };
-      persistSessionReadTimes(userId, next);
+      persistSessionReadTimes(tenantId, userId, next);
       return next;
     });
-  }, [userId]);
+  }, [tenantId, userId]);
 
   const currentSession = sessionId ? sessions.find((item) => item.id === sessionId) || null : null;
   const sessionAgentReplyLocale = canonicalizeAppLocale(currentSession?.agent_reply_locale);
@@ -704,7 +830,11 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
   const activeDraftAgentId = invalidDraftAgentId || draftAgentLoading
     ? ''
     : explicitDraftAgentId || (!sessionId && !promotedSessionId ? (defaultAgent?.id || '') : '');
-  const activeConversationId = sessionId || promotedSessionId || (activeDraftAgentId ? draftConversationKey(activeDraftAgentId) : '');
+  const activeConversationId = sessionId || promotedSessionId || (
+    activeDraftAgentId && tenantId && userId
+      ? draftConversationKey(tenantId, userId, activeDraftAgentId)
+      : ''
+  );
   const isDraftConversation = Boolean(activeDraftAgentId && !sessionId && !promotedSessionId);
   const draftAgent = activeDraftAgentId
     ? availableAgents.find((agent) => agent.id === activeDraftAgentId) || null
@@ -774,9 +904,9 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       return;
     }
     let cancelled = false;
-    api
+    tenantClient
       .get<ChatSlashCommand[]>(
-        `/api/chat/slash-commands?tenant_id=${encodeURIComponent(tenantId)}&agent_id=${encodeURIComponent(displayedAgent.id)}`,
+        `/api/chat/slash-commands?agent_id=${encodeURIComponent(displayedAgent.id)}`,
       )
       .then((rows) => {
         if (!cancelled) setSlashCommands(rows);
@@ -787,16 +917,16 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     return () => {
       cancelled = true;
     };
-  }, [auth, displayedAgent?.id, tenantId]);
+  }, [auth, displayedAgent?.id, tenantClient, tenantId]);
 
   const changeModelConfig = useCallback((value: string) => {
     setSelectedModelConfigId(value);
     if (value) {
-      window.localStorage.setItem(modelStorageKey(tenantId), value);
+      window.localStorage.setItem(modelStorageKey(tenantId, userId), value);
     } else {
-      window.localStorage.removeItem(modelStorageKey(tenantId));
+      window.localStorage.removeItem(modelStorageKey(tenantId, userId));
     }
-  }, [tenantId]);
+  }, [tenantId, userId]);
 
   const completeModelSetup = useCallback((model: ModelConfigRead) => {
     const next = [...modelConfigs.filter((item) => item.id !== model.id), model];
@@ -839,7 +969,8 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
   const loadAgents = useCallback(async (preferredAgentId?: string) => {
     setAgentsLoaded(false);
     try {
-      const rows = await api.get<AgentProfileRead[]>(`/api/chat/agents?tenant_id=${tenantId}`);
+      const rows = await tenantClient.get<AgentProfileRead[]>('/api/chat/agents');
+      if (!isWorkspaceCurrent()) return;
       setAgents(rows);
       setSelectedAgentId((current) => {
         // A team scope is not part of the employee roster; keep it untouched.
@@ -851,11 +982,12 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
         return next;
       });
     } catch {
+      if (!isWorkspaceCurrent()) return;
       setAgents([]);
     } finally {
-      setAgentsLoaded(true);
+      if (isWorkspaceCurrent()) setAgentsLoaded(true);
     }
-  }, [auth?.user, tenantId]);
+  }, [auth?.user, isWorkspaceCurrent, tenantClient, tenantId]);
 
   useEffect(() => {
     void loadAgents();
@@ -864,18 +996,18 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
   // 团队花名册：用于侧栏团队会话行标明 TL 身份
   useEffect(() => {
     let cancelled = false;
-    api
-      .get<TeamRead[]>(`/api/enterprise/teams?tenant_id=${tenantId}`)
+    tenantClient
+      .get<TeamRead[]>('/api/enterprise/teams')
       .then((rows) => {
-        if (!cancelled) setTeams(rows);
+        if (!cancelled && isWorkspaceCurrent()) setTeams(rows);
       })
       .catch(() => {
-        if (!cancelled) setTeams([]);
+        if (!cancelled && isWorkspaceCurrent()) setTeams([]);
       });
     return () => {
       cancelled = true;
     };
-  }, [tenantId]);
+  }, [isWorkspaceCurrent, tenantClient, tenantId]);
 
   // 团队名片统计：任务数 + 黑板条目数，随当前会话 team_id 加载；失败静默为 0
   const displayedTeamId = currentSession?.team_id || '';
@@ -887,7 +1019,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     let cancelled = false;
     const fetchCount = async (path: string) => {
       try {
-        const rows = await api.get<unknown[]>(`${path}?tenant_id=${tenantId}`);
+        const rows = await tenantClient.get<unknown[]>(path);
         return Array.isArray(rows) ? rows.length : 0;
       } catch {
         return 0;
@@ -897,12 +1029,12 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       fetchCount(`/api/enterprise/teams/${displayedTeamId}/tasks`),
       fetchCount(`/api/enterprise/teams/${displayedTeamId}/blackboard`),
     ]).then(([taskCount, blackboardCount]) => {
-      if (!cancelled) setTeamEmptyStats({ tasks: taskCount, blackboard: blackboardCount });
+      if (!cancelled && isWorkspaceCurrent()) setTeamEmptyStats({ tasks: taskCount, blackboard: blackboardCount });
     });
     return () => {
       cancelled = true;
     };
-  }, [displayedTeamId, tenantId]);
+  }, [displayedTeamId, isWorkspaceCurrent, tenantClient, tenantId]);
 
   useEffect(() => {
     const onAgentRefresh = () => {
@@ -926,29 +1058,29 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     setSelectedAgentId(activeDraftAgentId);
     if (draftAgentId) {
       persistChatSessionAgentFilter(activeDraftAgentId);
-      persistSharedAgentScope(activeDraftAgentId, userId);
+      persistSharedAgentScope(activeDraftAgentId, tenantId, userId);
       emitAgentScopeChange(activeDraftAgentId);
     }
-  }, [activeDraftAgentId, draftAgentId, persistChatSessionAgentFilter, userId]);
+  }, [activeDraftAgentId, draftAgentId, persistChatSessionAgentFilter, tenantId, userId]);
 
   useEffect(() => {
     const onScopeChange = (event: Event) => {
       const nextAgentId = (
         (event as CustomEvent<{ agentId?: string }>).detail?.agentId
-        || window.localStorage.getItem(SELECTED_AGENT_STORAGE_KEY)
+        || readEmployeeScope(tenantId, userId)
         || ''
       );
       if (!nextAgentId) return;
       setSelectedAgentId(nextAgentId);
       setSessionAgentFilter((current) => {
         if (current === 'all') return current;
-        window.localStorage.setItem(sessionFilterStorageKey(userId), nextAgentId);
+        window.localStorage.setItem(sessionFilterStorageKey(tenantId, userId), nextAgentId);
         return nextAgentId;
       });
     };
     window.addEventListener('ultrarag-enterprise-agent-scope-change', onScopeChange);
     return () => window.removeEventListener('ultrarag-enterprise-agent-scope-change', onScopeChange);
-  }, [userId]);
+  }, [tenantId, userId]);
 
   // 会话作用域以服务端会话归属为准：团队群聊跟随 team:{team_id}，员工私聊回到 agent_id。
   // 这样从团队切换到员工时不会把上一团队的共享作用域遗留在私聊界面。
@@ -960,24 +1092,26 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     if (!scope) return;
     if (selectedAgentId === scope) return;
     setSelectedAgentId(scope);
-    persistSharedAgentScope(scope, userId);
+    persistSharedAgentScope(scope, tenantId, userId);
     emitAgentScopeChange(scope);
   }, [
     currentSession?.agent_id,
     currentSession?.team_id,
     embedded,
     selectedAgentId,
+    tenantId,
     userId,
   ]);
 
+  // 只有稳定机器类型明确为 team_tl 才留在聊天；缺失类型的旧响应保守跳回团队详情。
   useEffect(() => {
     if (
       embedded
       || !currentSession?.team_id
-      || /TL 对话/.test(currentSession.title || '')
+      || currentSession.session_kind === 'team_tl'
     ) return;
     navigate(`/enterprise/teams/${currentSession.team_id}`, { replace: true });
-  }, [currentSession?.team_id, currentSession?.title, embedded, navigate]);
+  }, [currentSession?.session_kind, currentSession?.team_id, embedded, navigate]);
 
   useEffect(() => {
     if (!auth) {
@@ -986,23 +1120,25 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     }
     setModelConfigsLoading(true);
     setModelConfigsLoadError('');
-    api
-      .get<ModelConfigRead[]>(`/api/enterprise/model-configs?tenant_id=${tenantId}`)
+    tenantClient
+      .get<ModelConfigRead[]>('/api/enterprise/model-configs')
       .then((rows) => {
+        if (!isWorkspaceCurrent()) return;
         setModelConfigs(rows);
         setSelectedModelConfigId((current) => {
           const enabledRows = rows.filter((item) => item.enabled);
-          const stored = window.localStorage.getItem(modelStorageKey(tenantId)) || '';
+          const stored = window.localStorage.getItem(modelStorageKey(tenantId, userId)) || '';
           if (current && enabledRows.some((item) => item.id === current)) return current;
           if (stored && enabledRows.some((item) => item.id === stored)) return stored;
           const next = enabledRows.find((item) => item.is_default)?.id || enabledRows[0]?.id || '';
           if (next) {
-            window.localStorage.setItem(modelStorageKey(tenantId), next);
+            window.localStorage.setItem(modelStorageKey(tenantId, userId), next);
           }
           return next;
         });
       })
       .catch((error) => {
+        if (!isWorkspaceCurrent()) return;
         if (isAuthError(error)) {
           redirectToLogin();
           return;
@@ -1010,8 +1146,10 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
         console.error('[chat] model configuration load failed', error);
         setModelConfigsLoadError('failed');
       })
-      .finally(() => setModelConfigsLoading(false));
-  }, [auth, redirectToLogin, tenantId]);
+      .finally(() => {
+        if (isWorkspaceCurrent()) setModelConfigsLoading(false);
+      });
+  }, [auth, isWorkspaceCurrent, redirectToLogin, tenantClient, tenantId, userId]);
 
   useEffect(() => {
     const onModelConfigsUpdated = (event: Event) => {
@@ -1025,16 +1163,16 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
         if (current && enabledRows.some((item) => item.id === current)) return current;
         const next = enabledRows.find((item) => item.is_default)?.id || enabledRows[0]?.id || '';
         if (next) {
-          window.localStorage.setItem(modelStorageKey(tenantId), next);
+          window.localStorage.setItem(modelStorageKey(tenantId, userId), next);
         } else {
-          window.localStorage.removeItem(modelStorageKey(tenantId));
+          window.localStorage.removeItem(modelStorageKey(tenantId, userId));
         }
         return next;
       });
     };
     window.addEventListener(MODEL_CONFIGS_UPDATED_EVENT, onModelConfigsUpdated);
     return () => window.removeEventListener(MODEL_CONFIGS_UPDATED_EVENT, onModelConfigsUpdated);
-  }, [tenantId]);
+  }, [tenantId, userId]);
 
   useEffect(() => {
     if (!auth || modelConfigsLoading || modelConfigsLoadError || selectedModelConfig) return;
@@ -1365,21 +1503,22 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
   ));
 
   const loadSessions = useCallback(() => {
-    const listed = api.get<ChatSession[]>(`/api/chat/sessions?tenant_id=${tenantId}`);
+    const listed = tenantClient.get<ChatSession[]>('/api/chat/sessions');
     const selected = sessionId
-      ? api
-        .get<ChatSession>(`/api/chat/sessions/${sessionId}?tenant_id=${tenantId}`)
+      ? tenantClient
+        .get<ChatSession>(`/api/chat/sessions/${sessionId}`)
         .catch(() => null)
       : Promise.resolve(null);
     Promise.all([listed, selected])
       .then(([listedRows, selectedRow]) => {
+        if (!isWorkspaceCurrent()) return;
         const rows = selectedRow && !listedRows.some((row) => row.id === selectedRow.id)
           ? [...listedRows, selectedRow]
           : listedRows;
         const previousIds = new Set(knownSessionIdsRef.current);
         const initialized = sessionsInitializedRef.current;
         if (!initialized) {
-          const initialReads = loadSessionReadTimes(userId);
+          const initialReads = loadSessionReadTimes(tenantId, userId);
           const nextReads = { ...initialReads };
           if (Object.keys(initialReads).length === 0) {
             rows.forEach((row) => {
@@ -1387,7 +1526,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
             });
           }
           setSessionReadTimes(nextReads);
-          persistSessionReadTimes(userId, nextReads);
+          persistSessionReadTimes(tenantId, userId, nextReads);
           sessionsInitializedRef.current = true;
         }
         rows.forEach((row) => {
@@ -1413,12 +1552,12 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
         }
       })
       .catch((error) => {
-        notifyRequestError('sessions', error, 'chat.error.sessionsLoad');
+        if (isWorkspaceCurrent()) notifyRequestError('sessions', error, 'chat.error.sessionsLoad');
       })
       .finally(() => {
-        setSessionsLoading(false);
+        if (isWorkspaceCurrent()) setSessionsLoading(false);
       });
-  }, [embedded, getSlot, input, navigate, notifyRequestError, sessionId, tenantId, userId]);
+  }, [embedded, getSlot, input, isWorkspaceCurrent, navigate, notifyRequestError, sessionId, tenantClient, tenantId, userId]);
 
   const handleMissingSession = useCallback((id: string) => {
     forgetMissingSession(id);
@@ -1430,9 +1569,10 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
   }, [embedded, forgetMissingSession, loadSessions, navigate, sessionId]);
 
   const loadMessages = useCallback((id: string) => {
-    return api
-      .get<ChatMessage[]>(`/api/chat/sessions/${id}/messages?tenant_id=${tenantId}`)
+    return tenantClient
+      .get<ChatMessage[]>(`/api/chat/sessions/${id}/messages`)
       .then((rows) => {
+        if (!isWorkspaceCurrent()) return [];
         const slot = getSlot(id);
         slot.serverMessages = attachTurnIdsToServerMessages(rows, slot.realtimeMessages);
         const stream = getStreamSlot(id);
@@ -1447,6 +1587,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
         return rows;
       })
       .catch((error) => {
+        if (!isWorkspaceCurrent()) return [];
         if (isMissingChatSessionError(error)) {
           handleMissingSession(id);
           return [];
@@ -1454,12 +1595,13 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
         notifyRequestError('messages', error, 'chat.error.messagesLoad');
         return [];
       });
-  }, [clearStreamSlot, getSlot, getStreamSlot, handleMissingSession, notifyRequestError, notifyStore, pruneRealtime, tenantId]);
+  }, [clearStreamSlot, getSlot, getStreamSlot, handleMissingSession, isWorkspaceCurrent, notifyRequestError, notifyStore, pruneRealtime, tenantClient, tenantId]);
 
   const loadTraces = useCallback((id: string) => {
-    return api
-      .get<TurnTraceRead[]>(`/api/chat/sessions/${id}/trace?tenant_id=${tenantId}`)
+    return tenantClient
+      .get<TurnTraceRead[]>(`/api/chat/sessions/${id}/trace`)
       .then((rows) => {
+        if (!isWorkspaceCurrent()) return;
         const slot = getSlot(id);
         const stream = getStreamSlot(id);
         const locallyCancelled = locallyCancelledSessionIdsRef.current.has(id);
@@ -1576,13 +1718,14 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
         notifyTrace();
       })
       .catch((error) => {
+        if (!isWorkspaceCurrent()) return;
         if (isMissingChatSessionError(error)) {
           handleMissingSession(id);
           return;
         }
         notifyRequestError('trace', error, 'chat.error.traceLoad');
       });
-  }, [getSlot, getStreamSlot, handleMissingSession, locale, notifyRequestError, notifyStore, notifyStream, notifyTrace, t, tenantId]);
+  }, [getSlot, getStreamSlot, handleMissingSession, isWorkspaceCurrent, locale, notifyRequestError, notifyStore, notifyStream, notifyTrace, t, tenantClient, tenantId]);
 
   const stopTerminalTurnSync = useCallback((sessionIdToStop: string, turnIdToStop: string) => {
     const key = `${sessionIdToStop}:${turnIdToStop}`;
@@ -1594,7 +1737,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
   }, []);
 
   const syncTurnUntilAssistant = useCallback((targetSessionId: string, targetTurnId: string) => {
-    if (!targetSessionId || !targetTurnId || isDraftConversationKey(targetSessionId)) return;
+    if (!isWorkspaceCurrent() || !targetSessionId || !targetTurnId || isDraftConversationKey(targetSessionId)) return;
     const key = `${targetSessionId}:${targetTurnId}`;
     const existing = terminalTurnSyncRef.current.get(key);
     const startedAt = existing?.startedAt || Date.now();
@@ -1607,6 +1750,10 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
         loadTraces(targetSessionId),
         loadSessions(),
       ]).finally(() => {
+        if (!isWorkspaceCurrent()) {
+          stopTerminalTurnSync(targetSessionId, targetTurnId);
+          return;
+        }
         const slot = getSlot(targetSessionId);
         if (hasAssistantMessageForTurn(slot, targetTurnId)) {
           stopTerminalTurnSync(targetSessionId, targetTurnId);
@@ -1630,6 +1777,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     getSlot,
     getStreamSlot,
     clearStreamSlot,
+    isWorkspaceCurrent,
     loadMessages,
     loadSessions,
     loadTraces,
@@ -1639,19 +1787,25 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
   const loadHandoffs = useCallback(() => {
     if (!auth) return Promise.resolve();
     setHandoffsLoading(true);
-    return api
-      .get<HumanHandoffRead[]>(`/api/chat/handoffs?tenant_id=${tenantId}&status=pending`)
-      .then(setHandoffs)
-      .catch((error) => {
-        notifyRequestError('handoffs', error, 'chat.error.handoffsLoad');
+    return tenantClient
+      .get<HumanHandoffRead[]>('/api/chat/handoffs?status=pending')
+      .then((rows) => {
+        if (isWorkspaceCurrent()) setHandoffs(rows);
       })
-      .finally(() => setHandoffsLoading(false));
-  }, [auth, notifyRequestError, tenantId]);
+      .catch((error) => {
+        if (isWorkspaceCurrent()) notifyRequestError('handoffs', error, 'chat.error.handoffsLoad');
+      })
+      .finally(() => {
+        if (isWorkspaceCurrent()) setHandoffsLoading(false);
+      });
+  }, [auth, isWorkspaceCurrent, notifyRequestError, tenantClient, tenantId]);
 
   /** 提交人工接续回复；服务错误仅记录技术根因并显示稳定的本地化错误。 */
   const replyToHandoff = useCallback(async (handoff: HumanHandoffRead, reply: string): Promise<boolean> => {
+    if (!isWorkspaceCurrent()) return false;
     try {
-      await api.post<HumanHandoffRead>(`/api/chat/handoffs/${handoff.id}/reply`, { tenant_id: tenantId, reply });
+      await tenantClient.post<HumanHandoffRead>(`/api/chat/handoffs/${handoff.id}/reply`, { reply });
+      if (!isWorkspaceCurrent()) return false;
       notify.success(t('chat.notice.handoffReplied'));
       setHandoffs((rows) => rows.filter((item) => item.id !== handoff.id));
       setHandoffReplies((prev) => {
@@ -1665,6 +1819,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       void loadTraces(handoff.session_id);
       return true;
     } catch (error) {
+      if (!isWorkspaceCurrent()) return false;
       if (isAuthError(error)) {
         redirectToLogin();
         return false;
@@ -1673,7 +1828,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       notify.error(t('chat.error.replyFailed'));
       return false;
     }
-  }, [getSlot, loadMessages, loadSessions, loadTraces, redirectToLogin, t, tenantId]);
+  }, [getSlot, isWorkspaceCurrent, loadMessages, loadSessions, loadTraces, redirectToLogin, t, tenantClient, tenantId]);
 
   /** 校验并提交人工接续文本；空输入使用稳定的语义校验消息。 */
   const submitHandoffReply = useCallback((handoff: HumanHandoffRead) => {
@@ -1913,12 +2068,16 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
   }, [flushStreaming, getSlot, getStreamSlot, notifyStore]);
 
   useEffect(() => {
-    if (!auth) {
+    if (!auth || !tenantContext) {
+      // A tenant provider has a deliberate null verification window. Do not
+      // clear the persisted session or navigate away while /api/auth/me is
+      // still establishing the verified context.
+      if (!tenantContext) return;
       if (!anonymous) redirectToLogin();
       return;
     }
     loadSessions();
-  }, [anonymous, auth, loadSessions, redirectToLogin]);
+  }, [anonymous, auth, loadSessions, redirectToLogin, tenantContext]);
 
   useEffect(() => {
     if (!auth) return;
@@ -1937,11 +2096,13 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
 
   useEffect(() => {
     if (!auth) return;
-    api
-      .get<UIConfigRead>(`/api/chat/ui-config?tenant_id=${tenantId}`)
-      .then(setUiConfig)
+    tenantClient
+      .get<UIConfigRead>('/api/chat/ui-config')
+      .then((config) => {
+        if (isWorkspaceCurrent()) setUiConfig(config);
+      })
       .catch(() => undefined);
-  }, [auth, tenantId]);
+  }, [auth, isWorkspaceCurrent, tenantClient, tenantId]);
 
   useEffect(() => {
     if (sessionId) {
@@ -1950,11 +2111,11 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
   }, [sessionId]);
 
   useEffect(() => {
-    if (!sessionId) return;
+    if (!sessionId || !auth || !tenantContext) return;
     void loadMessages(sessionId).finally(() => {
       void loadTraces(sessionId);
     });
-  }, [loadMessages, loadTraces, sessionId]);
+  }, [auth, loadMessages, loadTraces, sessionId, tenantContext]);
 
   useEffect(() => {
     if (!sessionId || runningTurn?.sessionId !== sessionId) return;
@@ -2025,26 +2186,27 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
 
   /** 保存会话标题；标题本身是用户输入，校验与失败提示使用本地化产品文案。 */
   const saveRename = useCallback(async () => {
-    if (!renameSession) return;
+    if (!renameSession || !isWorkspaceCurrent()) return;
     const title = renameTitle.trim();
     if (!title) {
       notify.warning(t('chat.error.renameRequired'));
       return;
     }
     try {
-      const updated = await api.put<ChatSession>(`/api/chat/sessions/${renameSession.id}`, {
-        tenant_id: tenantId,
+      const updated = await tenantClient.put<ChatSession>(`/api/chat/sessions/${renameSession.id}`, {
         title,
       });
+      if (!isWorkspaceCurrent()) return;
       setSessions((items) => items.map((item) => (item.id === updated.id ? updated : item)));
       setRenameSession(null);
       setRenameTitle('');
       notify.success(t('chat.notice.renamed'));
     } catch (error) {
+      if (!isWorkspaceCurrent()) return;
       console.error('[chat] rename session failed', error);
       notify.error(t('chat.error.renameFailed'));
     }
-  }, [renameSession, renameTitle, t, tenantId]);
+  }, [isWorkspaceCurrent, renameSession, renameTitle, t, tenantClient, tenantId]);
 
   const requestDelete = useCallback((session: ChatSession) => {
     setPendingDelete(session);
@@ -2053,20 +2215,22 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
   /** 删除会话并清理本地流状态；技术异常保留在日志，用户只看到稳定错误。 */
   const confirmDeleteSession = useCallback(async () => {
     const target = pendingDelete;
-    if (!target) return;
+    if (!target || !isWorkspaceCurrent()) return;
     setPendingDelete(null);
     const stream = getStreamSlot(target.id);
     stream.abortController?.abort();
     streamRef.current.delete(target.id);
     storeRef.current.delete(target.id);
     try {
-      await api.delete(`/api/chat/sessions/${target.id}?tenant_id=${tenantId}`);
+      await tenantClient.delete(`/api/chat/sessions/${target.id}`);
+      if (!isWorkspaceCurrent()) return;
       forgetMissingSession(target.id);
       if (target.id === sessionId) {
         navigate(CHAT_BASE_PATH);
       }
       notify.success(t('chat.notice.deleted'));
     } catch (error) {
+      if (!isWorkspaceCurrent()) return;
       if (isAuthError(error)) {
         redirectToLogin();
         return;
@@ -2074,7 +2238,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       console.error('[chat] delete session failed', error);
       notify.error(t('chat.error.deleteFailed'));
     }
-  }, [forgetMissingSession, getStreamSlot, navigate, pendingDelete, redirectToLogin, t, sessionId, tenantId]);
+  }, [forgetMissingSession, getStreamSlot, isWorkspaceCurrent, navigate, pendingDelete, redirectToLogin, t, tenantClient, sessionId, tenantId]);
 
   const abortStream = useCallback(() => {
     if (!activeConversationId) return;
@@ -2093,8 +2257,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       void loadSessions();
     };
     const cancelRequest = cancelledTurnId && !isDraftConversationKey(activeConversationId)
-      ? api.postKeepalive(`/api/chat/sessions/${activeConversationId}/cancel`, {
-          tenant_id: tenantId,
+      ? tenantClient.post(`/api/chat/sessions/${activeConversationId}/cancel`, {
           turn_id: cancelledTurnId,
         }).catch(() => undefined)
       : Promise.resolve();
@@ -2140,6 +2303,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     notifyStore,
     notifyStream,
     runningTurn,
+    tenantClient,
     tenantId,
     t,
     upsertTraceLine,
@@ -2147,17 +2311,19 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
 
   /** 保存消息反馈并在请求失败时恢复本地状态，错误文本不直接暴露服务端异常。 */
   const rateMessage = useCallback(async (item: ChatMessage, rating: 'up' | 'down') => {
-    if (!sessionId) return;
+    if (!sessionId || !isWorkspaceCurrent()) return;
     const previous = item.feedback_rating || null;
     const next = previous === rating ? null : rating;
     updateMessageFeedback(sessionId, item.id, next);
     try {
       if (next) {
-        await api.post(`/api/chat/messages/${item.id}/feedback`, { tenant_id: tenantId, rating: next });
+        await tenantClient.post(`/api/chat/messages/${item.id}/feedback`, { rating: next });
       } else {
-        await api.delete(`/api/chat/messages/${item.id}/feedback?tenant_id=${tenantId}`);
+        await tenantClient.delete(`/api/chat/messages/${item.id}/feedback`);
       }
+      if (!isWorkspaceCurrent()) return;
     } catch (error) {
+      if (!isWorkspaceCurrent()) return;
       updateMessageFeedback(sessionId, item.id, previous);
       if (isAuthError(error)) {
         redirectToLogin();
@@ -2166,14 +2332,13 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       console.error('[chat] message feedback failed', error);
       notify.error(t('chat.error.feedbackFailed'));
     }
-  }, [redirectToLogin, sessionId, t, tenantId, updateMessageFeedback]);
+  }, [isWorkspaceCurrent, redirectToLogin, sessionId, t, tenantClient, tenantId, updateMessageFeedback]);
 
   /** 将用户确认的定时任务写入服务端；任务标题作为业务值插入本地化通知。 */
   const confirmScheduledTask = useCallback(async (draft: ScheduledTaskDraftRead, draftKey?: string) => {
-    if (!sessionId) return;
+    if (!sessionId || !isWorkspaceCurrent()) return;
     try {
-      const saved = await api.post<ScheduledTaskRead>('/api/chat/scheduled-tasks', {
-        tenant_id: tenantId,
+      const saved = await tenantClient.post<ScheduledTaskRead>('/api/chat/scheduled-tasks', {
         agent_id: draft.agent_id,
         title: draft.title,
         prompt: draft.prompt,
@@ -2192,6 +2357,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
           reason: draft.reason,
         },
       });
+      if (!isWorkspaceCurrent()) return;
       const createdKey = draftKey || `session:${sessionId}`;
       setCreatedScheduledTasks((prev) => ({ ...prev, [createdKey]: saved }));
       setScheduledDrafts((prev) => {
@@ -2201,6 +2367,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       });
       notify.success(t('chat.notice.scheduledEnabled', { title: saved.title }));
     } catch (error) {
+      if (!isWorkspaceCurrent()) return;
       if (isAuthError(error)) {
         redirectToLogin();
         return;
@@ -2208,7 +2375,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       console.error('[chat] scheduled task creation failed', error);
       notify.error(t('chat.error.scheduleCreateFailed'));
     }
-  }, [redirectToLogin, sessionId, t, tenantId]);
+  }, [isWorkspaceCurrent, redirectToLogin, sessionId, t, tenantClient, tenantId]);
 
   const dismissScheduledTaskDraft = useCallback((messageId?: string) => {
     if (!sessionId) return;
@@ -2886,8 +3053,8 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     if (locallyCancelledSessionIdsRef.current.has(id)) return Promise.resolve();
     const inFlight = scheduledEventPollsRef.current.get(id);
     if (inFlight) return inFlight;
-    const request = api
-      .get<ChatSessionEventRead[]>(`/api/chat/sessions/${id}/events?tenant_id=${tenantId}`)
+    const request = tenantClient
+      .get<ChatSessionEventRead[]>(`/api/chat/sessions/${id}/events`)
       .then((events) => {
         const traceEvents = events.filter((event) => Boolean(eventTraceTurnId(event)));
         if (!traceEvents.length) return;
@@ -3045,6 +3212,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     notifyStream,
     redirectToLogin,
     syncTurnUntilAssistant,
+    tenantClient,
     tenantId,
     updateStreaming,
     t,
@@ -3057,6 +3225,10 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     validFiles.forEach((file) => {
       const uploadKey = `upload_${Date.now()}_${Math.random().toString(16).slice(2)}`;
       const controller = new AbortController();
+      const scopeSignal = workspaceSignal();
+      const onScopeAbort = () => controller.abort();
+      if (scopeSignal?.aborted) controller.abort();
+      else scopeSignal?.addEventListener('abort', onScopeAbort, { once: true });
       uploadControllersRef.current.set(uploadKey, controller);
       setComposerAttachments((current) => [
         ...current,
@@ -3072,6 +3244,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       ]);
       uploadChatAttachments<ChatAttachmentRead[]>(tenantId, [file], controller.signal)
         .then((items) => {
+          if (!isWorkspaceCurrent() || controller.signal.aborted) return;
           const parsed = items[0];
           if (!parsed) throw new Error('chat.error.uploadParseFailed');
           setComposerAttachments((current) =>
@@ -3079,7 +3252,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
           );
         })
         .catch((error) => {
-          if (controller.signal.aborted) return;
+          if (controller.signal.aborted || !isWorkspaceCurrent()) return;
           setComposerAttachments((current) =>
             current.map((item) => (
               item.uploadKey === uploadKey
@@ -3089,10 +3262,11 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
           );
         })
         .finally(() => {
+          scopeSignal?.removeEventListener('abort', onScopeAbort);
           uploadControllersRef.current.delete(uploadKey);
         });
     });
-  }, [t, tenantId]);
+  }, [isWorkspaceCurrent, t, tenantId, workspaceSignal]);
 
   const removeComposerAttachment = useCallback((uploadKey: string) => {
     uploadControllersRef.current.get(uploadKey)?.abort();
@@ -3170,6 +3344,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     prepared: PreparedChatTurn,
     options: { queued?: boolean } = {},
   ) => {
+    if (!isWorkspaceCurrent()) return;
     const resolvedInteractionMode = prepared.interactionMode;
     const currentConversationId = prepared.conversationId;
     const sessionAgentId = prepared.agentId;
@@ -3214,6 +3389,10 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     notifyStream();
 
     const controller = new AbortController();
+    const scopeSignal = workspaceSignal();
+    const onScopeAbort = () => controller.abort();
+    if (scopeSignal?.aborted) controller.abort();
+    else scopeSignal?.addEventListener('abort', onScopeAbort, { once: true });
     stream.abortController = controller;
     let receivedTerminalEvent = false;
     let streamWatchdog: number | null = null;
@@ -3236,6 +3415,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
 
     /** 在无法确认服务端会话时插入安全的本地化错误消息，根因保留在技术日志。 */
     const appendInterruptedResponse = (reason: string) => {
+      if (!isWorkspaceCurrent() || controller.signal.aborted) return;
       const activeTurnId = getStreamSlot(liveConversationId).turnId || turnId;
       clearStreamSlot(liveConversationId, true);
       appendRealtime(liveConversationId, {
@@ -3250,6 +3430,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       clearRunningTurn(liveConversationId);
       notifyStream();
       window.setTimeout(() => {
+        if (!isWorkspaceCurrent() || controller.signal.aborted) return;
         loadMessages(liveConversationId);
         loadTraces(liveConversationId);
         loadSessions();
@@ -3355,7 +3536,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     };
 
     function beginRelayRecovery() {
-      if (receivedTerminalEvent) return;
+      if (!isWorkspaceCurrent() || receivedTerminalEvent || controller.signal.aborted) return;
       clearStreamWatchdog();
       if (startedAsDraftConversation && createdSessionId) {
         promoteDraftConversation(createdSessionId);
@@ -3418,9 +3599,10 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       }
       armStreamWatchdog();
       await streamChatTurn(requestBody, (item) => {
-        if (!controller.signal.aborted) {
+        if (!controller.signal.aborted && isWorkspaceCurrent()) {
           armStreamWatchdog();
         }
+        if (controller.signal.aborted || !isWorkspaceCurrent()) return;
         if (item.event === 'session_created') {
           createdSessionId = String(item.data.newSessionId || item.data.sessionId || '');
           if (startedAsDraftConversation && createdSessionId) {
@@ -3466,7 +3648,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
         handleStreamEvent(item, eventSessionId, turnId);
       }, controller.signal);
       clearStreamWatchdog();
-      if (!receivedTerminalEvent && !controller.signal.aborted) {
+      if (!receivedTerminalEvent && !controller.signal.aborted && isWorkspaceCurrent()) {
         beginRelayRecovery();
       }
     } catch (error) {
@@ -3493,6 +3675,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       beginRelayRecovery();
     } finally {
       clearStreamWatchdog();
+      scopeSignal?.removeEventListener('abort', onScopeAbort);
       if (stream.abortController === controller) {
         stream.abortController = null;
         stream.loading = false;
@@ -3513,6 +3696,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     loadMessages,
     loadSessions,
     loadTraces,
+    isWorkspaceCurrent,
     navigate,
     notifyQueue,
     notifyStore,
@@ -3525,6 +3709,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     updateStreaming,
     upsertOptimisticSession,
     upsertTraceLine,
+    workspaceSignal,
     t,
     userId,
   ]);
@@ -3719,10 +3904,10 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     if (!agentId) return;
     setSelectedAgentId(agentId);
     persistChatSessionAgentFilter(agentId);
-    persistSharedAgentScope(agentId, userId);
+    persistSharedAgentScope(agentId, tenantId, userId);
     emitAgentScopeChange(agentId);
     navigate(`${CHAT_BASE_PATH}/draft/${encodeURIComponent(agentId)}`);
-  }, [navigate, persistChatSessionAgentFilter, userId]);
+  }, [navigate, persistChatSessionAgentFilter, tenantId, userId]);
 
   const openGallery = useCallback(() => {
     navigate('/workspace/gallery');

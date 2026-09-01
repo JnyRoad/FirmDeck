@@ -312,8 +312,11 @@ import {
   type SkillFlowConnectionPreview,
   type SkillFlowPosition,
 } from './skillFlowModel';
-import { api, ApiError, streamGet, streamPost, TENANT_ID } from '../api/client';
+import { API_BASE, ApiError } from '../api/client';
+import { createTenantClient } from '../api/tenant-client';
+import { useTenantSession, type TenantSessionContextValue } from '../contexts/TenantSessionContext';
 import { copyTextToClipboard } from '@/lib/clipboard';
+import { tenantUserStorageKey } from '@/lib/tenant-storage';
 import type {
   GeneralSkillRead,
   KnowledgeBaseRead,
@@ -687,6 +690,174 @@ type DistillPageProps = {
   onLogout?: () => void;
 };
 
+type TenantStreamEvent = {
+  event: string;
+  data: Record<string, unknown>;
+};
+
+type TenantStreamRequestBody = Record<string, unknown>;
+
+/**
+ * Check both the captured tenant generation and the request-local abort
+ * signal before publishing an asynchronous result.  A tenant context can be
+ * replaced while a request is still settling, so checking only the latest
+ * context object would allow an old rejection/finally callback to affect the
+ * new tenant's UI.
+ */
+export function isCurrentTenantRequest(
+  context: Pick<TenantSessionContextValue, 'signal' | 'isCurrentGeneration'> | null | undefined,
+  generation: number | undefined,
+  requestSignal?: AbortSignal,
+): boolean {
+  return Boolean(
+    context
+      && generation !== undefined
+      && !context.signal.aborted
+      && !requestSignal?.aborted
+      && context.isCurrentGeneration(generation),
+  );
+}
+
+/** Build a stream URL from the verified tenant and reject caller-supplied mismatches. */
+function tenantStreamUrl(path: string, tenantId: string): string {
+  const hasAbsoluteBase = /^(?:https?:|blob:)/i.test(path);
+  const url = new URL(hasAbsoluteBase ? path : `${API_BASE}${path}`, window.location.origin);
+  const requestedTenantIds = url.searchParams.getAll('tenant_id');
+  if (requestedTenantIds.some((value) => value !== tenantId)) {
+    throw new Error('租户请求上下文不匹配');
+  }
+  url.searchParams.set('tenant_id', tenantId);
+  return !API_BASE && !hasAbsoluteBase
+    ? `${url.pathname}${url.search}${url.hash}`
+    : url.toString();
+}
+
+/** Link a request abort signal to the verified tenant generation signal. */
+function combineTenantStreamSignals(
+  tenantSignal: AbortSignal,
+  requestSignal?: AbortSignal,
+): { signal: AbortSignal; cleanup: () => void } {
+  if (!requestSignal || requestSignal === tenantSignal) {
+    return { signal: tenantSignal, cleanup: () => undefined };
+  }
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  if (tenantSignal.aborted || requestSignal.aborted) controller.abort();
+  else {
+    tenantSignal.addEventListener('abort', abort, { once: true });
+    requestSignal.addEventListener('abort', abort, { once: true });
+  }
+  return {
+    signal: controller.signal,
+    cleanup: () => {
+      tenantSignal.removeEventListener('abort', abort);
+      requestSignal.removeEventListener('abort', abort);
+    },
+  };
+}
+
+/** Parse one SSE block while keeping malformed payloads diagnosable to callers. */
+function parseTenantSseBlock(block: string): TenantStreamEvent | null {
+  const lines = block.split('\n').map((line) => line.trimEnd());
+  const eventLine = lines.find((line) => line.startsWith('event:'));
+  const dataLines = lines.filter((line) => line.startsWith('data:'));
+  if (!eventLine || dataLines.length === 0) return null;
+  const event = eventLine.replace(/^event:\s*/, '');
+  const rawData = dataLines.map((line) => line.replace(/^data:\s*/, '')).join('\n');
+  try {
+    return { event, data: JSON.parse(rawData) as Record<string, unknown> };
+  } catch {
+    return { event, data: { raw: rawData } };
+  }
+}
+
+/** Stream an enterprise endpoint with the verified bearer, tenant query and generation fence. */
+async function streamTenantRequest(
+  context: TenantSessionContextValue | null,
+  method: 'GET' | 'POST',
+  path: string,
+  body: TenantStreamRequestBody | undefined,
+  onEvent: (item: TenantStreamEvent) => void,
+  requestSignal?: AbortSignal,
+): Promise<void> {
+  if (!context) throw new Error('租户请求上下文不可用');
+  const generation = context.generation;
+  const combined = combineTenantStreamSignals(context.signal, requestSignal);
+  const isCurrent = () => isCurrentTenantRequest(context, generation, combined.signal);
+  try {
+    if (!isCurrent()) return;
+    let requestBody: string | undefined;
+    if (method === 'POST') {
+      if (!body || Array.isArray(body)) throw new Error('租户请求体格式无效');
+      if (body.tenant_id !== undefined && body.tenant_id !== context.tenantId) {
+        throw new Error('租户请求上下文不匹配');
+      }
+      requestBody = JSON.stringify({ ...body, tenant_id: context.tenantId });
+    }
+    const response = await fetch(tenantStreamUrl(path, context.tenantId), {
+      method,
+      headers: {
+        ...(method === 'POST' ? { 'Content-Type': 'application/json' } : {}),
+        Authorization: `Bearer ${context.session.token}`,
+      },
+      body: requestBody,
+      signal: combined.signal,
+    });
+    if (!isCurrent()) return;
+    if (!response.ok) {
+      const text = await response.text();
+      if (!isCurrent()) return;
+      throw new ApiError(response.status, text, response.statusText);
+    }
+    if (!response.body) throw new Error('当前浏览器不支持流式响应');
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder('utf-8');
+    let buffer = '';
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!isCurrent()) {
+        await reader.cancel().catch(() => undefined);
+        return;
+      }
+      buffer += decoder.decode(value, { stream: true });
+      const blocks = buffer.split('\n\n');
+      buffer = blocks.pop() || '';
+      blocks.forEach((block) => {
+        if (!isCurrent()) return;
+        const parsed = parseTenantSseBlock(block);
+        if (parsed) onEvent(parsed);
+      });
+    }
+    if (!isCurrent()) return;
+    buffer += decoder.decode();
+    const parsed = parseTenantSseBlock(buffer);
+    if (parsed && isCurrent()) onEvent(parsed);
+  } finally {
+    combined.cleanup();
+  }
+}
+
+function streamTenantGet(
+  context: TenantSessionContextValue | null,
+  path: string,
+  onEvent: (item: TenantStreamEvent) => void,
+  requestSignal?: AbortSignal,
+): Promise<void> {
+  return streamTenantRequest(context, 'GET', path, undefined, onEvent, requestSignal);
+}
+
+function streamTenantPost(
+  context: TenantSessionContextValue | null,
+  path: string,
+  body: TenantStreamRequestBody,
+  onEvent: (item: TenantStreamEvent) => void,
+  requestSignal?: AbortSignal,
+): Promise<void> {
+  return streamTenantRequest(context, 'POST', path, body, onEvent, requestSignal);
+}
+
 function lockSkillIdForDraft(draft: SkillCard, lockedSkillId: string): SkillCard {
   if (!lockedSkillId || draft.skill_id === lockedSkillId) return draft;
   return { ...cloneSkill(draft), skill_id: lockedSkillId };
@@ -707,19 +878,31 @@ function lockPendingChangeSkillId(change: PendingChange | null, lockedSkillId: s
 
 export default function DistillPage({ active = true, searchParamsOverride, currentUser, onLogout }: DistillPageProps = {}) {
   const { t } = useDistillIntl();
+  const tenantContext = useTenantSession();
+  const tenantClient = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
+  const tenantId = tenantContext?.tenantId || '';
+  const userId = tenantContext?.userId || '';
   const navigate = useNavigate();
   const [routerSearchParams] = useSearchParams();
   const searchParams = searchParamsOverride || routerSearchParams;
   const skillId = searchParams.get('skill_id');
   const mode = searchParams.get('mode') || '';
   const workspaceId = searchParams.get('workspace_id') || '';
-  const [selectedAgentId, setSelectedAgentId] = useState(readEmployeeScope);
+  const [selectedAgentId, setSelectedAgentId] = useState(
+    () => tenantId && userId ? readEmployeeScope(tenantId, userId) : '',
+  );
   const activeAgentId = searchParams.get('agent_id') || selectedAgentId;
   const agentQuery = activeAgentId ? `&agent_id=${encodeURIComponent(activeAgentId)}` : '';
   const agentSearchParam = activeAgentId ? `agent_id=${encodeURIComponent(activeAgentId)}` : '';
   const agentOnlyQuery = agentSearchParam ? `?${agentSearchParam}` : '';
   const cacheIdentity = skillId || (mode === 'create' ? `create:${workspaceId || 'pending'}` : mode || 'new');
-  const cacheKey = `skill-distill:${TENANT_ID}:${activeAgentId || 'default'}:${cacheIdentity}`;
+  const cacheKey = tenantId && userId
+    ? tenantUserStorageKey(
+      tenantId,
+      userId,
+      `skill-distill:${activeAgentId || 'default'}:${cacheIdentity}`,
+    )
+    : '';
   const [draft, setDraft] = useState<SkillCard | null>(null);
   const [loadedSkill, setLoadedSkill] = useState<SkillRead | null>(null);
   const [lastSavedDraft, setLastSavedDraft] = useState<SkillCard | null>(null);
@@ -762,7 +945,11 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
   const [tenantUsers, setTenantUsers] = useState<Array<{ id: string; username: string; display_name?: string; source?: string; channel_identities?: Array<{ channel: string; display_name?: string; external_user_id?: string; external_account_scope?: string }> }>>([]);
   const [modelConfigs, setModelConfigs] = useState<ModelConfigRead[]>([]);
   const [selectedRewriteModelId, setSelectedRewriteModelId] = useState(
-    () => window.localStorage.getItem(`${DISTILL_REWRITE_MODEL_STORAGE_KEY}:${TENANT_ID}`) || '',
+    () => tenantId && userId
+      ? window.localStorage.getItem(
+        tenantUserStorageKey(tenantId, userId, DISTILL_REWRITE_MODEL_STORAGE_KEY),
+      ) || ''
+      : '',
   );
   const [streamStatus, setStreamStatus] = useState('');
   const [activeJob, setActiveJob] = useState<ActiveDistillJob | null>(null);
@@ -771,6 +958,10 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
   const abortRef = useRef<AbortController | null>(null);
   const manualStopRef = useRef(false);
   const uploadControllersRef = useRef<Record<string, AbortController>>({});
+  const saveControllerRef = useRef<AbortController | null>(null);
+  const probeControllersRef = useRef<Record<string, AbortController>>({});
+  const commitToolsControllerRef = useRef<AbortController | null>(null);
+  const rerunControllerRef = useRef<AbortController | null>(null);
   const dragDepthRef = useRef(0);
   const animationTimersRef = useRef<number[]>([]);
   const capabilityCatalogRequestRef = useRef(0);
@@ -780,13 +971,25 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
   const [hydratedCacheKey, setHydratedCacheKey] = useState('');
 
   useEffect(() => {
+    setSelectedAgentId(tenantId && userId ? readEmployeeScope(tenantId, userId) : '');
+    setDraft(null);
+    setLoadedSkill(null);
+    setLastSavedDraft(null);
+    setMessages(defaultDistillMessages());
+    setAttachments([]);
+    setActiveJob(null);
+    setCacheReady(false);
+    setHydratedCacheKey('');
+  }, [tenantId, userId]);
+
+  useEffect(() => {
     const onScopeChange = (event: Event) => {
       const next = (event as CustomEvent<{ agentId?: string }>).detail?.agentId || '';
-      setSelectedAgentId(next && !isTeamScope(next) ? next : readEmployeeScope());
+      setSelectedAgentId(next && !isTeamScope(next) ? next : readEmployeeScope(tenantId, userId));
     };
     window.addEventListener('ultrarag-enterprise-agent-scope-change', onScopeChange);
     return () => window.removeEventListener('ultrarag-enterprise-agent-scope-change', onScopeChange);
-  }, []);
+  }, [tenantId, userId]);
 
   useEffect(() => {
     if (!active || skillId || mode !== 'create' || workspaceId) return;
@@ -796,9 +999,24 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
   }, [active, mode, navigate, searchParams, skillId, workspaceId]);
 
   useEffect(() => {
+    if (!tenantContext) return;
+    const context = tenantContext;
+    const generation = context.generation;
+    const controller = new AbortController();
+    let requestActive = true;
+    const isCurrent = () => (
+      requestActive
+      && !controller.signal.aborted
+      && context.isCurrentGeneration(generation)
+    );
     setCacheReady(false);
     setHydratedCacheKey('');
-    if (mode === 'create' && !workspaceId) return;
+    if (mode === 'create' && !workspaceId) {
+      return () => {
+        requestActive = false;
+        controller.abort();
+      };
+    }
     const cached = readDistillCache(cacheKey);
     if (cached) {
       if (skillId && isBlankDistillWorkspace(cached)) {
@@ -826,7 +1044,10 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
         setSaveDraftSnapshot(null);
         setHydratedCacheKey(cacheKey);
         setCacheReady(true);
-        return;
+        return () => {
+          requestActive = false;
+          controller.abort();
+        };
       }
     }
 
@@ -847,12 +1068,19 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
       setSaveDraftSnapshot(null);
       setHydratedCacheKey(cacheKey);
       setCacheReady(true);
-      return;
+      return () => {
+        requestActive = false;
+        controller.abort();
+      };
     }
 
-    api
-      .get<SkillRead>(`/api/enterprise/skills/${encodeURIComponent(skillId)}?tenant_id=${TENANT_ID}${agentQuery}`)
+    tenantClient
+      .get<SkillRead>(
+        `/api/enterprise/skills/${encodeURIComponent(skillId)}?tenant_id=${tenantId}${agentQuery}`,
+        { signal: controller.signal },
+      )
       .then((result) => {
+        if (!isCurrent()) return;
         const nextContent = lockSkillIdForDraft(result.content, result.skill_id || skillId || '');
         const nextResult = nextContent === result.content ? result : { ...result, content: nextContent };
         setDraft(nextContent);
@@ -878,11 +1106,16 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
         setCacheReady(true);
       })
       .catch((error) => {
+        if (!isCurrent()) return;
         notify.error(apiErrorMessage(error, 'distillPage.error.loadSkill', { t }));
         setHydratedCacheKey(cacheKey);
         setCacheReady(true);
       });
-  }, [agentQuery, cacheKey, mode, skillId, workspaceId]);
+    return () => {
+      requestActive = false;
+      controller.abort();
+    };
+  }, [agentQuery, cacheKey, mode, skillId, tenantContext, tenantClient, tenantId, workspaceId]);
 
   useEffect(() => {
     if (!cacheReady || hydratedCacheKey !== cacheKey) return;
@@ -929,30 +1162,37 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
     return () => {
       abortRef.current?.abort();
       Object.values(uploadControllersRef.current).forEach((controller) => controller.abort());
+      saveControllerRef.current?.abort();
+      Object.values(probeControllersRef.current).forEach((controller) => controller.abort());
+      commitToolsControllerRef.current?.abort();
+      rerunControllerRef.current?.abort();
       clearAnimationTimers();
     };
-  }, []);
+  }, [tenantContext]);
 
   useEffect(() => {
-    if (!cacheReady || hydratedCacheKey !== cacheKey || !activeJob) return;
+    if (!tenantContext || !cacheReady || hydratedCacheKey !== cacheKey || !activeJob) return;
     if (activeJob.status === 'succeeded' || activeJob.status === 'failed') return;
     if (abortRef.current) return;
+    const context = tenantContext;
+    const generation = context.generation;
     const controller = new AbortController();
     manualStopRef.current = false;
     abortRef.current = controller;
     setLoading(true);
-    void streamGet(
+    void streamTenantGet(
+      context,
       `/api/enterprise/skills/jobs/${encodeURIComponent(activeJob.jobId)}/stream?after_seq=${activeJob.lastSeq || 0}`,
       (item) => handleResumedJobEvent(activeJob, item),
       controller.signal,
     )
       .catch((error) => {
-        if (controller.signal.aborted) return;
+        if (!isCurrentTenantRequest(context, generation, controller.signal)) return;
         updateMessage(activeJob.assistantId, t('distillPage.chat.streamDisconnected'), { thinking: 'done' });
         notify.error(apiErrorMessage(error, 'distillPage.error.resumeGeneration', { t }));
       })
-      .finally(() => finishStream(controller));
-  }, [activeJob, cacheKey, cacheReady, hydratedCacheKey]);
+      .finally(() => finishStream(controller, context, generation));
+  }, [activeJob, cacheKey, cacheReady, hydratedCacheKey, tenantContext]);
 
   useEffect(() => {
     if (!active) {
@@ -966,25 +1206,27 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
   }, [active]);
 
   const refreshCapabilityCatalog = useCallback(async () => {
-    if (!active) return;
+    if (!active || !tenantContext) return;
+    const context = tenantContext;
+    const generation = context.generation;
     const requestId = capabilityCatalogRequestRef.current + 1;
     capabilityCatalogRequestRef.current = requestId;
     const [toolResult, skillResult, knowledgeResult, sopResult] = await Promise.allSettled([
-      api.get<ToolRead[]>(`/api/enterprise/tools?tenant_id=${TENANT_ID}${agentQuery}`),
-      api.get<GeneralSkillRead[]>(
-        `/api/enterprise/general-skills?tenant_id=${TENANT_ID}${agentQuery}`,
+      tenantClient.get<ToolRead[]>(`/api/enterprise/tools?tenant_id=${tenantId}${agentQuery}`),
+      tenantClient.get<GeneralSkillRead[]>(
+        `/api/enterprise/general-skills?tenant_id=${tenantId}${agentQuery}`,
       ),
-      api.get<KnowledgeBaseRead[]>(
-        `/api/enterprise/knowledge-bases?tenant_id=${TENANT_ID}${agentQuery}`,
+      tenantClient.get<KnowledgeBaseRead[]>(
+        `/api/enterprise/knowledge-bases?tenant_id=${tenantId}${agentQuery}`,
       ),
-      api.get<SkillRead[]>(`/api/enterprise/skills?tenant_id=${TENANT_ID}${agentQuery}`),
+      tenantClient.get<SkillRead[]>(`/api/enterprise/skills?tenant_id=${tenantId}${agentQuery}`),
     ]);
-    if (requestId !== capabilityCatalogRequestRef.current) return;
+    if (requestId !== capabilityCatalogRequestRef.current || !context.isCurrentGeneration(generation)) return;
     if (toolResult.status === 'fulfilled') setTools(toolResult.value);
     if (skillResult.status === 'fulfilled') setGeneralSkills(skillResult.value);
     if (knowledgeResult.status === 'fulfilled') setKnowledgeBases(knowledgeResult.value);
     if (sopResult.status === 'fulfilled') setSopSkills(sopResult.value);
-  }, [active, agentQuery]);
+  }, [active, agentQuery, tenantContext, tenantClient, tenantId]);
 
   useEffect(() => {
     void refreshCapabilityCatalog();
@@ -1001,31 +1243,47 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
   }, [active, refreshCapabilityCatalog]);
 
   useEffect(() => {
-    api
+    if (!tenantContext) return;
+    const context = tenantContext;
+    const generation = context.generation;
+    tenantClient
       .get<Array<{ id: string; username: string; display_name?: string; source?: string; channel_identities?: Array<{ channel: string; display_name?: string; external_user_id?: string }> }>>(
-        `/api/auth/users?tenant_id=${TENANT_ID}&include_channel=true`,
+        `/api/auth/users?tenant_id=${tenantId}&include_channel=true`,
       )
-      .then(setTenantUsers)
-      .catch(() => setTenantUsers([]));
-  }, []);
+      .then((rows) => {
+        if (context.isCurrentGeneration(generation)) setTenantUsers(rows);
+      })
+      .catch(() => {
+        if (context.isCurrentGeneration(generation)) setTenantUsers([]);
+      });
+  }, [tenantClient, tenantContext, tenantId]);
 
   useEffect(() => {
-    api
-      .get<ModelConfigRead[]>(`/api/enterprise/model-configs?tenant_id=${TENANT_ID}`)
+    if (!tenantContext) return;
+    const context = tenantContext;
+    const generation = context.generation;
+    tenantClient
+      .get<ModelConfigRead[]>(`/api/enterprise/model-configs?tenant_id=${tenantId}`)
       .then((rows) => {
+        if (!context.isCurrentGeneration(generation)) return;
         const enabled = rows.filter((item) => item.enabled);
         setModelConfigs(enabled);
         setSelectedRewriteModelId((current) => {
           if (current && enabled.some((item) => item.id === current)) return current;
           const fallback = enabled.find((item) => item.is_default)?.id || enabled[0]?.id || '';
           if (fallback) {
-            window.localStorage.setItem(`${DISTILL_REWRITE_MODEL_STORAGE_KEY}:${TENANT_ID}`, fallback);
+            window.localStorage.setItem(
+              tenantUserStorageKey(tenantId, userId, DISTILL_REWRITE_MODEL_STORAGE_KEY),
+              fallback,
+            );
           }
           return fallback;
         });
       })
-      .catch(() => setModelConfigs([]));
-  }, []);
+      .catch(() => {
+        if (context.isCurrentGeneration(generation)) setModelConfigs([]);
+      });
+  }, [tenantClient, tenantContext, tenantId, userId]);
 
   useEffect(() => {
     if (!chatMessagesRef.current) return;
@@ -1097,6 +1355,9 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
   }
 
   async function createDraftFromText(text: string) {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     const payload = parseInitialSkillPrompt(text);
     setLoading(true);
     setSourceAutoScroll(true);
@@ -1125,10 +1386,11 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
     const controller = new AbortController();
     abortRef.current = controller;
     try {
-      await streamPost(
+      await streamTenantPost(
+        context,
         '/api/enterprise/skills/distill/stream',
         {
-          tenant_id: TENANT_ID,
+          tenant_id: tenantId,
           agent_id: activeAgentId || undefined,
           ...payload,
           model_config_id: selectedRewriteModelId || undefined,
@@ -1196,6 +1458,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
         controller.signal,
       );
     } catch (error) {
+      if (context.signal.aborted || !context.isCurrentGeneration(generation)) return;
       if (controller.signal.aborted && !manualStopRef.current) return;
       appendThinkingDetail(assistantId, t('distillPage.thinking.generationFailed'));
       applyDistillFailure(assistantId, error, 'distill');
@@ -1205,7 +1468,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
         notify.error(apiErrorMessage(error, 'distillPage.error.generate', { t }));
       }
     } finally {
-      finishStream(controller);
+      finishStream(controller, context, generation);
     }
   }
 
@@ -1217,6 +1480,9 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
     conversationOverride?: ChatItem[],
   ) {
     if (!currentDraft) return;
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     setSourceAutoScroll(false);
     const editableDraft = canonicalizeSkillCapabilityRefs(lockSkillIdForDraft(currentDraft, lockedSkillId));
     const previousDraft = cloneSkill(editableDraft);
@@ -1247,10 +1513,11 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
     manualStopRef.current = false;
     abortRef.current = controller;
     try {
-      await streamPost(
+      await streamTenantPost(
+        context,
         `/api/enterprise/skills/${encodeURIComponent(editableDraft.skill_id)}/rewrite/stream`,
         {
-          tenant_id: TENANT_ID,
+          tenant_id: tenantId,
           agent_id: activeAgentId || undefined,
           current_skill: editableDraft,
           instruction: text,
@@ -1325,6 +1592,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
         controller.signal,
       );
     } catch (error) {
+      if (context.signal.aborted || !context.isCurrentGeneration(generation)) return;
       if (controller.signal.aborted && !manualStopRef.current) return;
       appendThinkingDetail(assistantId, t('distillPage.thinking.rewriteFailed'));
       applyDistillFailure(assistantId, error, 'rewrite');
@@ -1334,7 +1602,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
         notify.error(apiErrorMessage(error, 'distillPage.error.rewrite', { t }));
       }
     } finally {
-      finishStream(controller);
+      finishStream(controller, context, generation);
     }
   }
 
@@ -1360,6 +1628,16 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
       notify.info(t('distillPage.toast.noDraftChanges'));
       return;
     }
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
+    const controller = new AbortController();
+    saveControllerRef.current?.abort();
+    saveControllerRef.current = controller;
+    if (!isCurrentTenantRequest(context, generation, controller.signal)) {
+      if (saveControllerRef.current === controller) saveControllerRef.current = null;
+      return;
+    }
     let finalDraft: SkillCard = canonicalizeSkillCapabilityRefs(
       normalizeSubflowNodes(lockSkillIdForDraft(saveReviewDraft, lockedSkillId)),
     );
@@ -1367,24 +1645,34 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
     try {
       let savedSkill: SkillRead;
       if (loadedSkill) {
-        savedSkill = await api.put<SkillRead>(`/api/enterprise/skills/${loadedSkill.skill_id}${agentOnlyQuery}`, {
-          tenant_id: TENANT_ID,
+        savedSkill = await tenantClient.put<SkillRead>(`/api/enterprise/skills/${loadedSkill.skill_id}${agentOnlyQuery}`, {
+          tenant_id: tenantId,
           content: finalDraft,
           status: loadedSkill.status,
-        });
+        }, { signal: controller.signal });
       } else {
         try {
-          savedSkill = await api.post<SkillRead>(`/api/enterprise/skills${agentOnlyQuery}`, { tenant_id: TENANT_ID, content: finalDraft, status: 'published' });
+          savedSkill = await tenantClient.post<SkillRead>(
+            `/api/enterprise/skills${agentOnlyQuery}`,
+            { tenant_id: tenantId, content: finalDraft, status: 'published' },
+            { signal: controller.signal },
+          );
         } catch (error) {
+          if (!isCurrentTenantRequest(context, generation, controller.signal)) throw error;
           if (!(error instanceof ApiError) || error.status !== 409) throw error;
           finalDraft = {
             ...cloneSkill(finalDraft),
             skill_id: uniqueDraftSkillId(finalDraft.skill_id),
           };
           renamedSkillId = finalDraft.skill_id;
-          savedSkill = await api.post<SkillRead>(`/api/enterprise/skills${agentOnlyQuery}`, { tenant_id: TENANT_ID, content: finalDraft, status: 'published' });
+          savedSkill = await tenantClient.post<SkillRead>(
+            `/api/enterprise/skills${agentOnlyQuery}`,
+            { tenant_id: tenantId, content: finalDraft, status: 'published' },
+            { signal: controller.signal },
+          );
         }
       }
+      if (!isCurrentTenantRequest(context, generation, controller.signal)) return;
       const savedContent = lockSkillIdForDraft(savedSkill.content, savedSkill.skill_id || lockedSkillId);
       if (savedContent !== savedSkill.content) {
         savedSkill = { ...savedSkill, content: savedContent };
@@ -1410,7 +1698,10 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
         notify.success(renamedSkillId ? t('distillPage.toast.savedAsRenamed', { skillId: renamedSkillId }) : t('distillPage.toast.saved'));
       }
     } catch (error) {
+      if (!isCurrentTenantRequest(context, generation, controller.signal)) return;
       notify.error(apiErrorMessage(error, 'distillPage.error.save', { t }));
+    } finally {
+      if (saveControllerRef.current === controller) saveControllerRef.current = null;
     }
   }
 
@@ -1418,7 +1709,9 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
     const jobId = activeJob?.jobId;
     manualStopRef.current = true;
     if (jobId) {
-      void api.post(`/api/enterprise/skills/jobs/${encodeURIComponent(jobId)}/cancel`);
+      void tenantClient
+        .post(`/api/enterprise/skills/jobs/${encodeURIComponent(jobId)}/cancel`)
+        .catch(() => undefined);
     }
     abortRef.current?.abort();
     abortRef.current = null;
@@ -1541,7 +1834,9 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
   }
 
   async function stageFileUpload(file: File) {
-    if (loading) return;
+    if (loading || !tenantContext) return;
+    const context = tenantContext;
+    const generation = context.generation;
     const suffix = file.name.toLowerCase().split('.').pop() || '';
     if (!['md', 'txt', 'doc', 'docx'].includes(suffix)) {
       notify.error(t('distillPage.error.unsupportedUploadType'));
@@ -1553,8 +1848,8 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
     setAttachments((current) => [...current, { id, name: file.name, status: 'uploading' }]);
     try {
       const contentBase64 = await fileToBase64(file);
-      if (controller.signal.aborted) return;
-      const result = await api.postWithSignal<{ filename: string; text: string }>(
+      if (controller.signal.aborted || !context.isCurrentGeneration(generation)) return;
+      const result = await tenantClient.postWithSignal<{ filename: string; text: string }>(
         '/api/enterprise/skills/files/extract',
         {
           filename: file.name,
@@ -1562,13 +1857,14 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
         },
         controller.signal,
       );
+      if (controller.signal.aborted || !context.isCurrentGeneration(generation)) return;
       setAttachments((current) =>
         current.map((item) =>
           item.id === id ? { id, name: result.filename, status: 'ready', text: result.text } : item,
         ),
       );
     } catch (error) {
-      if (controller.signal.aborted) return;
+      if (controller.signal.aborted || !context.isCurrentGeneration(generation)) return;
       setAttachments((current) =>
         current.map((item) =>
           item.id === id
@@ -1692,13 +1988,27 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
       setToolSuggestionPatch(messageId, suggestion.name, { probeStatus: 'error', probe_result: result });
       return result;
     }
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return null;
+    const controller = new AbortController();
+    const requestKey = `${messageId}:${suggestion.name}`;
+    probeControllersRef.current[requestKey]?.abort();
+    probeControllersRef.current[requestKey] = controller;
+    if (!isCurrentTenantRequest(context, generation, controller.signal)) {
+      if (probeControllersRef.current[requestKey] === controller) delete probeControllersRef.current[requestKey];
+      return null;
+    }
     setToolSuggestionPatch(messageId, suggestion.name, { probeStatus: 'probing' });
     try {
       const payload = {
         ...toolPayloadFromSuggestion(suggestion, lockNullableSkillIdForDraft(pendingChange?.nextDraft || draft, lockedSkillId)?.skill_id),
         sample_arguments: args,
       };
-      const result = await api.post<ToolProbeResponse>('/api/enterprise/tools/probe', payload);
+      const result = await tenantClient.post<ToolProbeResponse>('/api/enterprise/tools/probe', payload, {
+        signal: controller.signal,
+      });
+      if (!isCurrentTenantRequest(context, generation, controller.signal)) return null;
       const nextOutputSchema = result.success && result.inferred_output_schema
         ? result.inferred_output_schema
         : suggestion.output_schema;
@@ -1715,6 +2025,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
       }
       return result;
     } catch (error) {
+      if (!isCurrentTenantRequest(context, generation, controller.signal)) return null;
       const result: ToolProbeResponse = {
         success: false,
         inferred_output_schema: {},
@@ -1726,6 +2037,8 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
       });
       if (!options.silent) notify.error(result.error?.message || t('distillPage.error.toolProbe'));
       return result;
+    } finally {
+      if (probeControllersRef.current[requestKey] === controller) delete probeControllersRef.current[requestKey];
     }
   }
 
@@ -1780,10 +2093,21 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
       notify.info(t('distillPage.toast.allToolSuggestionsRejected'));
       return;
     }
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
+    const controller = new AbortController();
+    commitToolsControllerRef.current?.abort();
+    commitToolsControllerRef.current = controller;
+    if (!isCurrentTenantRequest(context, generation, controller.signal)) {
+      if (commitToolsControllerRef.current === controller) commitToolsControllerRef.current = null;
+      return;
+    }
     try {
       const createdTools: ToolRead[] = [];
       const createdNewTools: ToolRead[] = [];
       for (const suggestion of acceptedSuggestions) {
+        if (!isCurrentTenantRequest(context, generation, controller.signal)) return;
         if (!suggestion.probe_result?.success) {
           throw new Error(t('distillPage.error.toolNotProbePassed', { name: suggestion.display_name || suggestion.name }));
         }
@@ -1791,16 +2115,26 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
         let createdTool: ToolRead;
         let createdNewTool = false;
         try {
-          createdTool = await api.post<ToolRead>(`/api/enterprise/tools${agentQuery ? `?${agentQuery.slice(1)}` : ''}`, payload);
+          createdTool = await tenantClient.post<ToolRead>(
+            `/api/enterprise/tools${agentQuery ? `?${agentQuery.slice(1)}` : ''}`,
+            payload,
+            { signal: controller.signal },
+          );
           createdNewTool = true;
         } catch (error) {
+          if (!isCurrentTenantRequest(context, generation, controller.signal)) throw error;
           if (!(error instanceof ApiError) || error.status !== 409) throw error;
-          createdTool = toolReadFromSuggestion(suggestion, activeDraft?.skill_id);
+          createdTool = {
+            ...toolReadFromSuggestion(suggestion, activeDraft?.skill_id),
+            tenant_id: tenantId,
+          };
         }
+        if (!isCurrentTenantRequest(context, generation, controller.signal)) return;
         createdTools.push(createdTool);
         if (createdNewTool) createdNewTools.push(createdTool);
         setToolSuggestionStatus(messageId, suggestion.name, 'created');
       }
+      if (!isCurrentTenantRequest(context, generation, controller.signal)) return;
       setTools((current) => createdTools.reduce((nextTools, tool) => upsertToolRead(nextTools, tool), current));
       createdNewTools.forEach((createdTool) => {
         appendOperationToMessage(messageId, {
@@ -1821,6 +2155,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
         lockedSkillId,
       );
       const changedPaths = diffTargetPaths(activeDraft, nextDraft, allTargetPaths(nextDraft));
+      if (!isCurrentTenantRequest(context, generation, controller.signal)) return;
       confirmPendingChange(false);
       clearAnimationTimers();
       setDraft(nextDraft);
@@ -1838,7 +2173,10 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
       }
       notify.success(t('distillPage.toast.toolSuggestionsCommitted', { count: acceptedSuggestions.length }));
     } catch (error) {
+      if (!isCurrentTenantRequest(context, generation, controller.signal)) return;
       notify.error(apiErrorMessage(error, 'distillPage.error.commitToolSuggestions', { t }));
+    } finally {
+      if (commitToolsControllerRef.current === controller) commitToolsControllerRef.current = null;
     }
   }
 
@@ -1929,7 +2267,11 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
     const nextParams = new URLSearchParams({ mode: 'create', workspace_id: nextWorkspaceId });
     if (activeAgentId) nextParams.set('agent_id', activeAgentId);
     const nextRoute = `/enterprise/skills/distill?${nextParams.toString()}`;
-    const nextCacheKey = `skill-distill:${TENANT_ID}:${activeAgentId || 'default'}:create:${nextWorkspaceId}`;
+    const nextCacheKey = tenantUserStorageKey(
+      tenantId,
+      userId,
+      `skill-distill:${activeAgentId || 'default'}:create:${nextWorkspaceId}`,
+    );
     removeDistillCache(cacheKey);
     removeDistillCache(nextCacheKey);
     setCacheReady(false);
@@ -2073,9 +2415,15 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
     );
   }
 
-  function finishStream(controller: AbortController) {
+  function finishStream(
+    controller: AbortController,
+    context: Pick<TenantSessionContextValue, 'signal' | 'isCurrentGeneration'> | null | undefined,
+    generation: number | undefined,
+  ) {
     if (abortRef.current === controller) abortRef.current = null;
-    setLoading(false);
+    if (isCurrentTenantRequest(context, generation, controller.signal)) {
+      setLoading(false);
+    }
   }
 
   function createHistorySnapshot(): DistillHistorySnapshot {
@@ -2208,8 +2556,15 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
     displayText: string,
     outgoingText: string,
   ) {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
+    const controller = new AbortController();
+    rerunControllerRef.current?.abort();
+    rerunControllerRef.current = controller;
     try {
-      await rollbackPersistedOperations(snapshot, operations);
+      await rollbackPersistedOperations(snapshot, operations, context, generation, controller.signal);
+      if (!isCurrentTenantRequest(context, generation, controller.signal)) return;
       const snapshotLockedSkillId = snapshot.loadedSkill?.skill_id || lockedSkillId;
       const confirmedDraft = lockNullableSkillIdForDraft(snapshot.pendingChange?.nextDraft || snapshot.draft, snapshotLockedSkillId);
       restoreHistorySnapshot({
@@ -2231,51 +2586,76 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
       const nextMessages = [...previousMessages, editedUser];
       setMessages(nextMessages);
       setEditingMessage(null);
+      if (!isCurrentTenantRequest(context, generation, controller.signal)) return;
       if (!confirmedDraft) {
         await createDraftFromText(outgoingText);
         return;
       }
       await rewriteSelectedTarget(outgoingText, confirmedDraft, undefined, undefined, nextMessages);
     } catch (error) {
+      if (!isCurrentTenantRequest(context, generation, controller.signal)) return;
       notify.error(apiErrorMessage(error, 'distillPage.error.rollback', { t }));
+    } finally {
+      if (rerunControllerRef.current === controller) rerunControllerRef.current = null;
     }
   }
 
   async function rollbackPersistedOperations(
     snapshot: DistillHistorySnapshot,
     operations: DistillHistoryOperation[],
+    context: TenantSessionContextValue | null | undefined = tenantContext,
+    generation: number | undefined = context?.generation,
+    requestSignal?: AbortSignal,
   ) {
+    if (!context || generation === undefined) return;
+    const isCurrent = () => isCurrentTenantRequest(context, generation, requestSignal);
     const toolOps = operations.filter((operation) => operation.kind === 'tool_add' && operation.toolId);
     for (const operation of toolOps) {
+      if (!isCurrent()) return;
       try {
-        await api.delete(`/api/enterprise/tools/${encodeURIComponent(String(operation.toolId))}?tenant_id=${TENANT_ID}${agentQuery}`);
-      } catch {
+        await tenantClient.delete(
+          `/api/enterprise/tools/${encodeURIComponent(String(operation.toolId))}?tenant_id=${tenantId}${agentQuery}`,
+          undefined,
+          { signal: requestSignal },
+        );
+      } catch (error) {
+        if (!isCurrent()) return;
         // Tool may already have been removed. Local state is restored from the snapshot below.
       }
     }
 
     const versionOps = operations.filter((operation) => operation.kind === 'version_save' && operation.skillId);
     for (const operation of versionOps) {
+      if (!isCurrent()) return;
       const skillId = String(operation.skillId);
       if (snapshot.loadedSkill) {
-        await api.put<SkillRead>(`/api/enterprise/skills/${encodeURIComponent(snapshot.loadedSkill.skill_id)}${agentOnlyQuery}`, {
-          tenant_id: TENANT_ID,
+        await tenantClient.put<SkillRead>(`/api/enterprise/skills/${encodeURIComponent(snapshot.loadedSkill.skill_id)}${agentOnlyQuery}`, {
+          tenant_id: tenantId,
           content: snapshot.loadedSkill.content,
           status: snapshot.loadedSkill.status,
-        });
+        }, { signal: requestSignal });
+        if (!isCurrent()) return;
         if (operation.version && operation.version !== snapshot.loadedSkill.version) {
           try {
-            await api.delete(
-              `/api/enterprise/skills/${encodeURIComponent(skillId)}/versions/${encodeURIComponent(operation.version)}?tenant_id=${TENANT_ID}${agentQuery}`,
+            await tenantClient.delete(
+              `/api/enterprise/skills/${encodeURIComponent(skillId)}/versions/${encodeURIComponent(operation.version)}?tenant_id=${tenantId}${agentQuery}`,
+              undefined,
+              { signal: requestSignal },
             );
-          } catch {
+          } catch (error) {
+            if (!isCurrent()) return;
             // A saved version may be shared with current state or already removed. The active draft has been restored.
           }
         }
       } else {
         try {
-          await api.delete(`/api/enterprise/skills/${encodeURIComponent(skillId)}?tenant_id=${TENANT_ID}${agentQuery}`);
-        } catch {
+          await tenantClient.delete(
+            `/api/enterprise/skills/${encodeURIComponent(skillId)}?tenant_id=${tenantId}${agentQuery}`,
+            undefined,
+            { signal: requestSignal },
+          );
+        } catch (error) {
+          if (!isCurrent()) return;
           // If the skill was not persisted, there is nothing else to roll back.
         }
       }
@@ -2705,7 +3085,10 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
                     value={selectedRewriteModelId}
                     onChange={(modelId) => {
                       setSelectedRewriteModelId(modelId);
-                      window.localStorage.setItem(`${DISTILL_REWRITE_MODEL_STORAGE_KEY}:${TENANT_ID}`, modelId);
+                      window.localStorage.setItem(
+                        tenantUserStorageKey(tenantId, userId, DISTILL_REWRITE_MODEL_STORAGE_KEY),
+                        modelId,
+                      );
                     }}
                     buttonClassName={cn(
                       REWRITE_MODEL_BUTTON_CLASS,
@@ -8523,7 +8906,6 @@ function toolPayloadFromSuggestion(suggestion: ToolSuggestionItem, skillId?: str
     ? suggestion.probe_result.inferred_output_schema
     : suggestion.output_schema || {};
   return {
-    tenant_id: TENANT_ID,
     name: suggestion.name,
     display_name: suggestion.display_name || suggestion.name,
     description: suggestion.description || suggestion.reason || '',
@@ -8542,14 +8924,16 @@ function toolPayloadFromSuggestion(suggestion: ToolSuggestionItem, skillId?: str
   };
 }
 
-function toolReadFromSuggestion(suggestion: ToolSuggestionItem, skillId?: string): ToolRead {
+function toolReadFromSuggestion(
+  suggestion: ToolSuggestionItem,
+  skillId?: string,
+): Omit<ToolRead, 'tenant_id'> {
   const { t } = currentDistillTranslator();
   const outputSchema = suggestion.probe_result?.success && suggestion.probe_result.inferred_output_schema
     ? suggestion.probe_result.inferred_output_schema
     : suggestion.output_schema || {};
   return {
     id: suggestion.name,
-    tenant_id: TENANT_ID,
     name: suggestion.name,
     display_name: suggestion.display_name || suggestion.name,
     description: suggestion.description || suggestion.reason || '',

@@ -58,6 +58,8 @@ class ToolExecutor:
         timeout_seconds_override: float | None = None,
         language_context: LanguageContext | dict[str, Any] | None = None,
         user_id: str | None = None,
+        a2a_worker_owner: str | None = None,
+        a2a_worker_generation: int | None = None,
     ) -> ToolResult:
         """Execute one configured tool while preserving success data and sanitizing failures."""
         language_context = language_context or tool_call.language_context
@@ -101,6 +103,8 @@ class ToolExecutor:
                 invocation_id=invocation_id,
                 timeout_seconds_override=timeout_seconds_override,
                 language_context=language_context,
+                worker_owner=a2a_worker_owner,
+                worker_generation=a2a_worker_generation,
             )
         if (tool.tool_type or "http") != "http":
             return self._error(
@@ -182,6 +186,8 @@ class ToolExecutor:
         invocation_id: str | None = None,
         timeout_seconds_override: float | None = None,
         language_context: LanguageContext | dict[str, Any] | None = None,
+        worker_owner: str | None = None,
+        worker_generation: int | None = None,
     ) -> ToolResult:
         """Invoke an A2A agent and wait for its durable Task lifecycle."""
 
@@ -204,6 +210,8 @@ class ToolExecutor:
                 session_id=session_id,
                 invocation_id=invocation_id,
                 language_context=language_context,
+                worker_owner=worker_owner,
+                worker_generation=worker_generation,
             ).execute(arguments)
             return ToolResult(tool_name=tool.name, success=True, data=data, error=None)
         except A2AClientError as exc:

@@ -47,6 +47,7 @@ from app.db.models import (
     Skill,
     SkillFeedback,
     Team,
+    Tenant,
     User,
     new_id,
     utc_now,
@@ -78,7 +79,14 @@ from app.scheduled_tasks.schema import ScheduledTaskDraftRead
 from app.scheduled_tasks.service import detect_scheduled_task_draft
 from app.security.auth import get_current_user
 from app.security.permissions import agent_owned_by_user, is_admin_user
-from app.security.tenant import ensure_tenant
+from app.security.tenant import (
+    TenantExecutionKind,
+    TenantLifecycleDecision,
+    TenantLifecycleDenied,
+    ensure_tenant,
+    require_active_tenant,
+    require_matching_admission_version,
+)
 from app.session.attachments import (
     parse_chat_attachment,
     validate_chat_turn_attachments,
@@ -99,19 +107,27 @@ from app.session.session_kinds import is_team_tl_session, team_tl_session_filter
 from app.session.session_schema import (
     ChatAttachmentRead,
     ChatSessionCreateRequest,
-    ChatSessionRead,
     ChatSessionUpdateRequest,
     ChatTurnRequest,
     ChatTurnResponse,
     MessageFeedbackRequest,
     MessageRead,
 )
+from app.session.session_schema import ChatSessionRead as ChatSessionReadSchema
 from app.skills.nesting import discoverable_sops
 from app.teams.service import get_team_leader
 from app.teams.wakeup import build_tl_chat_context, process_tl_reply
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 logger = logging.getLogger(__name__)
+
+
+class ChatSessionRead(ChatSessionReadSchema):
+    """Expose the persisted machine session kind to chat clients during the API migration."""
+
+    session_kind: str | None = None
+
+
 STREAM_REPLY_CHUNK_SIZE = 96
 STREAM_RELAY_POLL_SECONDS = 0.08
 STREAM_RELAY_HEARTBEAT_SECONDS = 5.0
@@ -146,6 +162,80 @@ _LEGACY_PUBLIC_ERROR_ALIASES = {
     "HARNESS_SESSION_BUSY": "INTERNAL_ERROR",
     "HARNESS_TURN_CONFLICT": "INTERNAL_ERROR",
 }
+
+
+def _chat_stream_lifecycle_active(tenant_id: str, correlation_id: str) -> bool:
+    """Recheck the authoritative tenant state before a chat stream emits work."""
+    try:
+        with Session(engine) as lifecycle_db:
+            require_active_tenant(
+                lifecycle_db,
+                tenant_id,
+                TenantExecutionKind.JOB_CLAIM,
+                correlation_id,
+            )
+    except Exception:  # noqa: BLE001 - lifecycle reads fail closed for any backend failure.
+        return False
+    return True
+
+
+def _require_handoff_resume_lifecycle(
+    db: Session,
+    handoff: HumanHandoffRequest,
+    persisted_lifecycle_version: object | None,
+) -> TenantLifecycleDecision:
+    """Admit one handoff resume only for the active tenant generation that answered it.
+
+    The handoff's optional durable version is retained as a compatibility boundary for rows
+    created before lifecycle fencing.  New channel replies always carry it; when present it
+    must match the current active tenant version, otherwise a fast suspend/reactivate cycle
+    is treated as stale and raises the stable suspension denial.  This function only reads
+    and expires the tenant row; callers decide how to terminalize the handoff on denial.
+    """
+    tenant = db.get(Tenant, handoff.tenant_id)
+    if tenant is not None and tenant not in db.new and tenant not in db.dirty:
+        # The worker keeps one Session across its durable marker and AgentLoop call.  Expire
+        # the cached tenant before every invocation so a concurrent lifecycle commit is seen.
+        db.expire(tenant)
+    decision = require_active_tenant(
+        db,
+        handoff.tenant_id,
+        TenantExecutionKind.CHANNEL_DELIVERY,
+        f"handoff-resume:{handoff.id}",
+    )
+    if persisted_lifecycle_version is None:
+        return decision
+    try:
+        require_matching_admission_version(decision, persisted_lifecycle_version)
+    except TenantLifecycleDenied as exc:
+        # A version mismatch is stale even if the tenant is active again after reactivation.
+        raise TenantLifecycleDenied(
+            "TENANT_SUSPENDED",
+            {
+                "tenant_id": decision.tenant_id,
+                "execution_kind": decision.execution_kind,
+                "correlation_id": decision.correlation_id,
+            },
+        ) from exc
+    return decision
+
+
+def _require_chat_stream_lifecycle(tenant_id: str, correlation_id: str) -> None:
+    """Reject a chat stream before mutating state or exposing its first response event."""
+    try:
+        with Session(engine) as lifecycle_db:
+            require_active_tenant(
+                lifecycle_db,
+                tenant_id,
+                TenantExecutionKind.JOB_CLAIM,
+                correlation_id,
+            )
+    except TenantLifecycleDenied as exc:
+        if exc.code == "TENANT_SUSPENDED":
+            raise _chat_error("TENANT_SUSPENDED", 403) from None
+        raise _chat_error("TENANT_LIFECYCLE_CHECK_FAILED", 503) from None
+    except Exception:  # noqa: BLE001 - project every lifecycle backend failure to one safe code.
+        raise _chat_error("TENANT_LIFECYCLE_CHECK_FAILED", 503) from None
 
 
 def _chat_error(
@@ -247,6 +337,7 @@ def session_read(
         is_scheduled=is_scheduled,
         team_id=row.team_id,
         team_name=team_name,
+        session_kind=row.session_kind,
         created_at=row.created_at.isoformat(),
         updated_at=row.updated_at.isoformat(),
     )
@@ -642,7 +733,22 @@ def _resume_human_handoff_worker(handoff_id: str) -> None:
             chat_session = db.get(ChatSession, handoff.session_id)
             if not chat_session or chat_session.tenant_id != handoff.tenant_id:
                 return
-            resume_payload = dict(handoff.resume_payload_json or {})
+            resume_payload = (
+                dict(handoff.resume_payload_json)
+                if isinstance(handoff.resume_payload_json, dict)
+                else {}
+            )
+            persisted_lifecycle_version = resume_payload.get("tenant_lifecycle_version")
+            lifecycle = _require_handoff_resume_lifecycle(
+                db,
+                handoff,
+                persisted_lifecycle_version,
+            )
+            if persisted_lifecycle_version is None:
+                # Web-created legacy handoffs did not have a durable generation at answer
+                # time. Pin the first admitted generation so fast reactivation cannot replay it.
+                resume_payload["tenant_lifecycle_version"] = lifecycle.lifecycle_version
+                handoff.resume_payload_json = resume_payload
             if "channel" in resume_payload:
                 chat_session.channel = str(resume_payload.get("channel") or "web").strip()
             if "channel_binding_id" in resume_payload:
@@ -726,6 +832,11 @@ def _resume_human_handoff_worker(handoff_id: str) -> None:
                 agent_reply_locale=language_context.agent_reply_locale,
                 language_context=language_context,
                 debug=False,
+            )
+            _require_handoff_resume_lifecycle(
+                db,
+                handoff,
+                resume_payload.get("tenant_lifecycle_version"),
             )
             AgentLoop(db).handle_turn(request)
             # resume turn 完成后不再写 resume_finished_at 标记:
@@ -1298,6 +1409,8 @@ def chat_stream(
 ) -> StreamingResponse:
     """Stream one authenticated chat turn while sanitizing persisted replay and failure events."""
     _ensure_request_tenant(request.tenant_id, current_user)
+    stream_correlation_id = f"chat-stream:{current_user.id}"
+    _require_chat_stream_lifecycle(request.tenant_id, stream_correlation_id)
     request = request.model_copy(
         update={
             "user_id": current_user.id,
@@ -1348,6 +1461,9 @@ def chat_stream(
     def run_stream_worker() -> None:
         span_sink_token = None
         try:
+            if not _chat_stream_lifecycle_active(request.tenant_id, stream_correlation_id):
+                worker_terminal["seen"] = True
+                return
             with Session(engine) as worker_db:
                 span_turn_id = {"value": ""}
 
@@ -1491,6 +1607,9 @@ def chat_stream(
                         )
                         return
                 for item in AgentLoop(worker_db).handle_turn_stream(request):
+                    if not _chat_stream_lifecycle_active(request.tenant_id, stream_correlation_id):
+                        worker_terminal["seen"] = True
+                        return
                     event_name = str(item["event"])
                     data = item["data"] if isinstance(item.get("data"), dict) else {}
                     item_session_id = str(data.get("sessionId") or request.session_id or source_session_id["value"] or "")
@@ -1659,12 +1778,16 @@ def chat_stream(
         terminal_sent = False
         internal_relay_turn_ids: set[str] = set()
         while True:
+            if not _chat_stream_lifecycle_active(request.tenant_id, stream_correlation_id):
+                return
             session_id = source_session_id["value"]
             emitted = False
             if session_id:
                 with Session(engine) as relay_db:
                     rows = _events_after_cursor(relay_db, request.tenant_id, session_id, initial_cursor)
                 for row in rows:
+                    if not _chat_stream_lifecycle_active(request.tenant_id, stream_correlation_id):
+                        return
                     payload = row.payload_json or {}
                     row_turn_ids = {
                         str(payload.get(key) or "").strip()
@@ -1706,6 +1829,8 @@ def chat_stream(
                 return
             now = time.monotonic()
             if now - last_heartbeat_at >= STREAM_RELAY_HEARTBEAT_SECONDS:
+                if not _chat_stream_lifecycle_active(request.tenant_id, stream_correlation_id):
+                    return
                 last_heartbeat_at = now
                 yield _sse(
                     "heartbeat",

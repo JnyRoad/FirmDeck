@@ -4,13 +4,45 @@ import type { ReactNode } from 'react';
 import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { AppIntlProvider } from '@/i18n/provider';
 import type { AppLocale } from '@/i18n/locales';
 import { I18nProvider } from '@/i18n';
 import type { EnterpriseAuthUser } from '@/auth';
 import type { AgentProfileRead, TeamRead } from '@/types';
+
+const tenantContextMock = vi.hoisted(() => {
+  const controller = new AbortController();
+  return {
+    context: {
+      session: {
+        token: 'tenant-demo-token',
+        scope: 'tenant' as const,
+        tenant: { id: 'tenant_demo', slug: 'tenant-demo', display_name: 'Tenant Demo' },
+        user: {
+          id: 'user-1',
+          tenant_id: 'tenant_demo',
+          username: 'demo',
+          display_name: 'Demo',
+          role: 'admin' as const,
+          must_change_password: false,
+          avatar_url: null,
+        },
+      },
+      tenantId: 'tenant_demo',
+      tenantSlug: 'tenant-demo',
+      userId: 'user-1',
+      generation: 1,
+      signal: controller.signal,
+      isCurrentGeneration: (generation: number): boolean => generation === 1,
+    },
+  };
+});
+
+vi.mock('../contexts/TenantSessionContext', () => ({
+  useTenantSession: () => tenantContextMock.context,
+}));
 
 /** 隔离仍使用 legacy locale 的全局页头，使语义矩阵不依赖 DOM observer。 */
 vi.mock('../components/AppHeader', () => ({
@@ -92,6 +124,16 @@ function jsonResponse(body: unknown): Response {
   } as Response;
 }
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 function stubGalleryFetch(teams: TeamRead[], agents: AgentProfileRead[] = []) {
   const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
@@ -140,12 +182,58 @@ function renderGallery(currentUser?: EnterpriseAuthUser) {
   );
 }
 
+beforeEach(() => {
+  tenantContextMock.context.generation = 1;
+  tenantContextMock.context.isCurrentGeneration = (generation: number) => generation === 1;
+});
+
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
 });
 
 describe('EmployeeGalleryPage teams tab', () => {
+  it('clears pending employee and team chat states when the tenant generation changes', async () => {
+    const user = userEvent.setup();
+    const pendingEmployeeChat = deferred<void>();
+    const pendingTeamChat = deferred<Response>();
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (init?.method === 'POST' && url.includes('/tl/session')) return pendingTeamChat.promise;
+      if (url.includes('/api/enterprise/teams')) return jsonResponse([team]);
+      if (url.includes('/api/enterprise/agents')) return jsonResponse([galleryAgent]);
+      return jsonResponse({});
+    }));
+
+    const renderPage = () => (
+      <AppIntlProvider initialLocale="zh-CN">
+        <MemoryRouter initialEntries={['/workspace/gallery']}>
+          <EmployeeGalleryPage onStartChat={() => pendingEmployeeChat.promise} />
+        </MemoryRouter>
+      </AppIntlProvider>
+    );
+    const view = render(renderPage());
+
+    const employeeChatButton = await screen.findByRole('button', { name: '发起对话' });
+    await user.click(employeeChatButton);
+    await waitFor(() => expect((employeeChatButton as HTMLButtonElement).disabled).toBe(true));
+
+    tenantContextMock.context.generation = 2;
+    tenantContextMock.context.isCurrentGeneration = (generation: number) => generation === 2;
+    view.rerender(renderPage());
+    await waitFor(() => expect((employeeChatButton as HTMLButtonElement).disabled).toBe(false));
+
+    await user.click(screen.getByRole('tab', { name: '团队对话' }));
+    const teamCard = await screen.findByRole('button', { name: '团队卡片' });
+    await user.click(teamCard);
+    await waitFor(() => expect(teamCard.getAttribute('aria-busy')).toBe('true'));
+
+    tenantContextMock.context.generation = 3;
+    tenantContextMock.context.isCurrentGeneration = (generation: number) => generation === 3;
+    view.rerender(renderPage());
+    await waitFor(() => expect(teamCard.getAttribute('aria-busy')).toBe('false'));
+  });
+
   it('renders team chat cards with member count, project leader and avatar stack', async () => {
     const user = userEvent.setup();
     stubGalleryFetch([team]);
