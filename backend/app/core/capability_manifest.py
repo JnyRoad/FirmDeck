@@ -20,6 +20,7 @@ from app.capabilities.local_general_skill import package_from_row
 from app.core.task_request_compiler import (
     CapabilityDescriptor,
     CapabilityManifest,
+    current_step_authorization_skill_ids,
     current_step_capability_refs,
 )
 from app.db.models import (
@@ -74,6 +75,11 @@ class CapabilityAuthorizationError(RuntimeError):
 
 class CapabilityManifestBuilder:
     def __init__(self, db: Session):
+        """Bind the active database session used to read manifest resources.
+
+        The caller owns the session lifecycle and tenant scope; construction does not query or
+        mutate storage, while later manifest reads propagate database failures to the caller.
+        """
         self.db = db
 
     def build(
@@ -91,6 +97,7 @@ class CapabilityManifestBuilder:
         if agent_id and get_agent(self.db, tenant_id, agent_id) is None:
             raise CapabilityAuthorizationError("当前员工不存在、已归档或不属于该租户。")
         refs = current_step_capability_refs(skill, step_id)
+        authorization_skill_ids = current_step_authorization_skill_ids(skill, step_id)
         available: list[CapabilityDescriptor] = []
         unavailable: list[CapabilityDescriptor] = []
 
@@ -217,8 +224,8 @@ class CapabilityManifestBuilder:
             explicitly_allowed = any(tool_by_ref.get(ref) is row for ref in refs["tool_ids"])
             if scope == "sop_specific" and not explicitly_allowed:
                 continue
-            if row.allowed_skills_json and (
-                skill is None or skill.skill_id not in row.allowed_skills_json
+            if row.allowed_skills_json and not authorization_skill_ids.intersection(
+                str(value).strip() for value in row.allowed_skills_json if str(value).strip()
             ):
                 if explicitly_allowed:
                     unavailable.append(
@@ -362,6 +369,11 @@ class CapabilityManifestBuilder:
         tool_by_ref: dict[str, Tool],
         knowledge_ids: set[str],
     ) -> list[CapabilityDescriptor]:
+        """Describe explicit SOP references that are absent from the visible resource sets.
+
+        Inputs are the current tenant's resolved references and visibility maps; this only reads
+        related rows for safe reasons and returns fail-closed descriptors, propagating DB errors.
+        """
         unavailable: list[CapabilityDescriptor] = []
         for ref in refs["general_skill_ids"]:
             if ref not in general_by_ref:

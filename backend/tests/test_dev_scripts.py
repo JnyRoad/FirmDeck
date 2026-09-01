@@ -166,11 +166,17 @@ def test_dev_cli_keeps_complete_frontend_dependencies(monkeypatch) -> None:
 
 
 def test_dev_cli_refreshes_incomplete_frontend_dependencies(monkeypatch) -> None:
+    """Verify an incomplete frontend install invokes npm ci after the health check.
+
+    The mocked subprocess only records local command arguments and does not start npm or mutate
+    dependencies outside the test process.
+    """
     dev = _load_script("dev")
     calls: list[list[str]] = []
     monkeypatch.setattr(dev, "_npm_executable", lambda: "npm")
 
     def run(command, **_kwargs):
+        """Record a mocked npm invocation and simulate an incomplete dependency listing."""
         calls.append(command)
         return subprocess.CompletedProcess(command, 1 if "ls" in command else 0)
 
@@ -180,6 +186,51 @@ def test_dev_cli_refreshes_incomplete_frontend_dependencies(monkeypatch) -> None
 
     assert len(calls) == 2
     assert calls[1][-3:] == ["ci", "--no-audit", "--no-fund"]
+
+
+def test_dev_cli_detects_missing_backend_dependency(tmp_path, monkeypatch) -> None:
+    """验证缺失的后端运行时依赖会使开发启动器请求刷新环境。"""
+    dev = _load_script("dev")
+    backend = tmp_path / "backend"
+    backend.mkdir()
+    (backend / "pyproject.toml").write_text(
+        '[project]\ndependencies = ["present>=1", "missing>=1"]\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(dev, "ROOT_DIR", tmp_path)
+    monkeypatch.setattr(
+        dev,
+        "_installed_distribution_version",
+        lambda name: "1.2" if name == "present" else None,
+    )
+
+    assert dev._backend_dependencies_complete() is False
+
+
+def test_dev_cli_refreshes_incomplete_backend_dependencies(monkeypatch) -> None:
+    """验证依赖检查失败时以当前解释器刷新可编辑后端安装。"""
+    dev = _load_script("dev")
+    calls: list[list[str]] = []
+    monkeypatch.setattr(dev, "_backend_dependencies_complete", lambda: False)
+
+    def run(command, **_kwargs):
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(dev.subprocess, "run", run)
+
+    dev._ensure_backend_dependencies()
+
+    assert calls == [
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "-e",
+            str(ROOT_DIR / "backend"),
+        ]
+    ]
 
 
 def test_supervisor_does_not_restart_during_startup_grace(monkeypatch) -> None:
