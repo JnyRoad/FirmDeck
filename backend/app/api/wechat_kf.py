@@ -127,8 +127,11 @@ class WeChatKfAvatarRequestLimitMiddleware:
 
 
 def _callback_signature(token: str, timestamp: str, nonce: str, ciphertext: str) -> str:
-    """计算微信客服回调签名；输入只在内存使用，无外部副作用。"""
+    """按企业微信回调协议计算签名；输入只在内存使用，无外部副作用。"""
     values = sorted((token, timestamp, nonce, ciphertext))
+    # 企业微信固定要求 sha1(sort(token, timestamp, nonce, msg_encrypt))：
+    # https://developer.work.weixin.qq.com/document/path/90968
+    # usedforsecurity=False 只声明外部旧协议兼容；协议升级前不能改成 SHA-256 或 HMAC。
     return hashlib.sha1("".join(values).encode("utf-8"), usedforsecurity=False).hexdigest()
 
 
