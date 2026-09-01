@@ -94,6 +94,7 @@ const SYSTEM_ADMIN = {
   username: 'root',
   display_name: 'E2E Root',
   status: 'active' as const,
+  must_change_password: false,
   last_login_at: '2026-08-31T00:00:00Z',
   created_at: '2026-08-30T00:00:00Z',
 };

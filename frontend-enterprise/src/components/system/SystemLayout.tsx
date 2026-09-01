@@ -1,4 +1,4 @@
-import type { ComponentType, CSSProperties, ReactNode, SVGProps } from 'react';
+import { useEffect, type ComponentType, type CSSProperties, type ReactNode, type SVGProps } from 'react';
 import { Link, useLocation } from 'react-router-dom';
 import { LogOut, ShieldCheck } from 'lucide-react';
 
@@ -80,9 +80,14 @@ function SystemNavButton({ item, active }: { item: SystemNavItem; active: boolea
 function SystemSidebar({ systemAdmin }: { systemAdmin: SystemAdminRead }) {
   const { t } = useAppIntl();
   const location = useLocation();
-  const { state, toggleSidebar } = useSidebar();
+  const { state, toggleSidebar, isMobile, setOpen } = useSidebar();
   const displayName = systemAdmin.display_name?.trim() || systemAdmin.username;
   const collapsed = state === 'collapsed';
+
+  /** Preserve the icon rail on small screens so the control-plane workspace keeps usable width. */
+  useEffect(() => {
+    if (isMobile) setOpen(false);
+  }, [isMobile, setOpen]);
 
   return (
     <Sidebar

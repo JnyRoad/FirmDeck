@@ -541,6 +541,73 @@ def test_turn_claim_is_durable_before_knowledge_version_freeze(monkeypatch) -> N
     assert records[0].error_json["code"] == "INTERNAL_ERROR"
 
 
+def test_harness_replay_rechecks_tenant_lifecycle_before_return(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lifecycle transition after replay claim must fence the cached response."""
+    engine = _test_engine()
+    with Session(engine) as db:
+        tenant = Tenant(
+            id="tenant-demo",
+            name="Demo",
+            status="active",
+            lifecycle_version=1,
+        )
+        session = _chat_session(user_id="user-1", agent_id="agent-1")
+        db.add_all([tenant, session])
+        db.commit()
+
+        replay = ChatTurnResponse(
+            reply="replayed",
+            session_id=session.id,
+            session_state=SessionPublic(
+                session_id=session.id,
+                tenant_id=tenant.id,
+                user_id=session.user_id,
+                agent_id=session.agent_id,
+            ),
+        )
+        turn_record = SimpleNamespace(tenant_lifecycle_version=1)
+        owner = SimpleNamespace(
+            db=db,
+            events=SimpleNamespace(record_legacy_event=lambda *_args, **_kwargs: None),
+            _get_or_create_session=lambda _request: session,
+        )
+        harness = HarnessV2Engine(owner)
+        harness.session_leases = SimpleNamespace(acquire=lambda _session: object())
+
+        def claim_after_lifecycle_change(*_args: object, **_kwargs: object):
+            """Simulate a version change after claim but before replay return."""
+            current_tenant = db.get(Tenant, tenant.id)
+            assert current_tenant is not None
+            current_tenant.status = "active"
+            current_tenant.lifecycle_version = 2
+            db.add(current_tenant)
+            db.commit()
+            return SimpleNamespace(record=turn_record, replay=replay)
+
+        harness.turn_store = SimpleNamespace(claim=claim_after_lifecycle_change)
+        monkeypatch.setattr(
+            harness_v2_engine_module,
+            "acquire_harness_session",
+            lambda _session_id: object(),
+        )
+
+        with pytest.raises(TenantLifecycleDenied) as denied:
+            harness.run(
+                ChatTurnRequest(
+                    tenant_id=tenant.id,
+                    session_id=session.id,
+                    user_id=session.user_id,
+                    agent_id=session.agent_id,
+                    client_turn_id="turn-replay-lifecycle-fence",
+                    message="重放结果",
+                )
+            )
+
+    assert denied.value.code == "TENANT_LIFECYCLE_CHECK_FAILED"
+
+
 def test_agent_loop_runtime_failure_keeps_raw_exception_private(monkeypatch) -> None:
     """Do not leak raw runtime exceptions into the user reply or persisted error event."""
     raw_error = "provider token=do-not-publish path=/private/runtime.sock"
@@ -831,6 +898,61 @@ def test_harness_stream_missing_tenant_fails_closed_without_creating_session(
                 "code": "TENANT_NOT_FOUND",
                 "message": "TENANT_NOT_FOUND",
                 "client_turn_id": "client-missing-tenant",
+                "execution_engine": "harness_v2",
+            },
+        }
+    ]
+    assert sessions == []
+
+
+def test_harness_stream_initial_wake_fence_emits_stable_error_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An initial lost wake claim must become a stable stream error without session writes."""
+    engine = _test_engine()
+    request = ChatTurnRequest(
+        tenant_id="tenant-demo",
+        user_id="user-1",
+        agent_id="agent-1",
+        client_turn_id="client-turn-initial-wake-fence",
+        message="hello",
+    )
+    expected_session_id = _with_recoverable_first_session(request).session_id
+
+    def reject_initial_wake() -> None:
+        """Simulate the enclosing wake losing its claim before stream setup."""
+        raise HarnessExecutionFenced("TEAM_WAKE_CLAIM_LOST")
+
+    with Session(engine) as db:
+        tenant_id = "tenant-demo"
+        db.add(Tenant(id=tenant_id, name="Demo"))
+        db.commit()
+        loop = AgentLoop(db)
+        monkeypatch.setattr(
+            loop,
+            "handle_turn",
+            lambda *_args, **_kwargs: pytest.fail("initially fenced stream reached handle_turn"),
+        )
+
+        events = list(
+            loop._handle_turn_stream_v2(
+                request,
+                wake_admission_check=reject_initial_wake,
+            )
+        )
+        sessions = db.exec(
+            select(ChatSession).where(ChatSession.tenant_id == tenant_id)
+        ).all()
+
+    assert events == [
+        {
+            "event": "error",
+            "data": {
+                "kind": "error",
+                "sessionId": expected_session_id,
+                "code": "TEAM_WAKE_CLAIM_LOST",
+                "message": "TEAM_WAKE_CLAIM_LOST",
+                "client_turn_id": request.client_turn_id,
                 "execution_engine": "harness_v2",
             },
         }
@@ -3046,6 +3168,52 @@ def test_external_idempotency_key_is_stable_per_task_not_entire_session(
 
     assert first_key == retry_key
     assert first_key != later_key
+
+
+def test_harness_unknown_outcome_replay_preserves_reconciliation_marker() -> None:
+    """A blocked retry must keep the marker clients use to reconcile an unknown outcome."""
+    engine = _test_engine()
+    with Session(engine) as db:
+        session = _chat_session()
+        db.add(session)
+        db.add(
+            HarnessInvocationRecord(
+                tenant_id=session.tenant_id,
+                session_id=session.id,
+                task_id="task-unknown-outcome",
+                run_id="run-unknown-outcome",
+                call_id="call-unknown-outcome",
+                tool_name="orders.create",
+                request_digest="sha256:unknown-outcome",
+                logical_action_key="sha256:logical-action",
+                status="outcome_unknown",
+                response_cache_json={
+                    "success": False,
+                    "error": {
+                        "code": "TOOL_CALL_OUTCOME_UNKNOWN",
+                        "outcome_unknown": True,
+                    },
+                },
+            )
+        )
+        db.commit()
+        invoker = HarnessCapabilityInvoker(
+            db,
+            tenant_id=session.tenant_id,
+            session=session,
+            task_frame_id="task-unknown-outcome",
+            model_config=_model_config(),
+            manifest=CapabilityManifest(available=[]),
+            active_skill=None,
+            active_step_id=None,
+            agent_id=None,
+        )
+
+        replay = invoker._replay_or_block("sha256:logical-action")
+
+    assert replay is not None
+    assert replay["error"]["code"] == "TOOL_CALL_OUTCOME_UNKNOWN"
+    assert replay["error"].get("outcome_unknown") is True
 
 
 def test_general_skill_harness_tool_reads_full_package_when_requested(

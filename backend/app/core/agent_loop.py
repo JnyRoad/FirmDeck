@@ -771,11 +771,27 @@ class AgentLoop:
         *,
         wake_admission_check: Callable[[], None] | None = None,
     ) -> Iterator[dict[str, object]]:
-        """Resolve the turn language before emitting any initial stream event."""
-        if callable(wake_admission_check):
-            wake_admission_check()
-        self._prepare_request_language_context(request)
+        """Resolve turn language before streaming and project an early wake fence safely."""
         session_request = _with_recoverable_first_session(request)
+        try:
+            if callable(wake_admission_check):
+                wake_admission_check()
+        except HarnessExecutionFenced:
+            # A wake can be fenced before a session exists, so project the same
+            # stable stream error without entering normal turn finalization.
+            yield {
+                "event": "error",
+                "data": {
+                    "kind": "error",
+                    "sessionId": session_request.session_id or "session_unbound",
+                    "code": "TEAM_WAKE_CLAIM_LOST",
+                    "message": "TEAM_WAKE_CLAIM_LOST",
+                    "client_turn_id": request.client_turn_id,
+                    "execution_engine": "harness_v2",
+                },
+            }
+            return
+        self._prepare_request_language_context(request)
         try:
             require_active_tenant(
                 self.db,

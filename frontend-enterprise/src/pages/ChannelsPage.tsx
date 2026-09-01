@@ -421,8 +421,20 @@ function groupByDay<T>(
   return groups;
 }
 
+/** 按租户会话代次隔离渠道页面状态，切换租户时先卸载旧绑定和详情再加载新数据。 */
+export default function ChannelsPage(props: {
+  currentUser?: EnterpriseAuthUser;
+  onLogout?: () => void;
+} = {}) {
+  const tenantContext = useTenantSession();
+  const tenantScopeKey = tenantContext
+    ? `${tenantContext.tenantId}:${tenantContext.userId}:${tenantContext.generation}`
+    : 'no-tenant';
+  return <ChannelsPageContent key={tenantScopeKey} {...props} />;
+}
+
 /** 渲染渠道治理主页面；产品 chrome 跟随 UI locale，业务内容与 provider 标识保持 raw。 */
-export default function ChannelsPage({
+function ChannelsPageContent({
   currentUser,
   onLogout,
 }: {

@@ -173,8 +173,8 @@ function stubBrowserApis(): void {
 }
 
 /** 在不挂载 legacy Provider 的前提下渲染技能广场页。 */
-function renderSemanticGeneralSkills(locale: AppLocale): void {
-  render(
+function renderSemanticGeneralSkills(locale: AppLocale) {
+  return render(
     <AppIntlProvider initialLocale={locale}>
       <MemoryRouter>
         <GeneralSkillsPage currentUser={{ id: 'user-1', tenant_id: 'tenant_demo', username: 'demo', role: 'admin' }} />
@@ -256,6 +256,35 @@ describe('GeneralSkillsPage semantic locale matrix', () => {
       expect(toastMocks.error).not.toHaveBeenCalledWith(rawError);
     },
   );
+
+  it('does not render the previous tenant skill list while the new generation is loading', async () => {
+    const nextSkills = deferred<Response>();
+    let skillRequestCount = 0;
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/api/enterprise/agents')) return jsonResponse([overallAgent]);
+      if (url.includes('/api/enterprise/general-skills')) {
+        skillRequestCount += 1;
+        return skillRequestCount === 1 ? jsonResponse([rawSkill]) : nextSkills.promise;
+      }
+      return jsonResponse([]);
+    }));
+
+    const view = renderSemanticGeneralSkills('zh-CN');
+    await screen.findAllByText(rawSkill.name);
+
+    tenantContextMock.context.generation = 2;
+    tenantContextMock.context.isCurrentGeneration = (generation: number) => generation === 2;
+    view.rerender(
+      <AppIntlProvider initialLocale="zh-CN">
+        <MemoryRouter>
+          <GeneralSkillsPage currentUser={{ id: 'user-1', tenant_id: 'tenant_demo', username: 'demo', role: 'admin' }} />
+        </MemoryRouter>
+      </AppIntlProvider>,
+    );
+
+    expect(screen.queryAllByText(rawSkill.name)).toHaveLength(0);
+  });
   });
 
   it('clears a pending delete when the tenant generation changes', async () => {
@@ -296,7 +325,7 @@ describe('GeneralSkillsPage semantic locale matrix', () => {
       </AppIntlProvider>,
     );
 
-    await waitFor(() => expect((confirmButton as HTMLButtonElement).disabled).toBe(false));
+    await waitFor(() => expect(screen.queryByRole('button', { name: '删除' })).toBeNull());
   });
 
   it('clears a pending employee skill import when the tenant generation changes', async () => {
@@ -354,7 +383,7 @@ describe('GeneralSkillsPage semantic locale matrix', () => {
       </AppIntlProvider>,
     );
 
-    await waitFor(() => expect((copyButton as HTMLButtonElement).disabled).toBe(false));
+    await waitFor(() => expect(screen.queryByRole('button', { name: '复制' })).toBeNull());
   });
 
   it('does not toast or clear saving state when an import rejection belongs to an old generation', async () => {
@@ -388,4 +417,37 @@ describe('GeneralSkillsPage semantic locale matrix', () => {
 
     await waitFor(() => expect((saveButton as HTMLButtonElement).disabled).toBe(true));
     expect(toastMocks.error).not.toHaveBeenCalled();
+  });
+
+  it('resets the skill editor draft when the tenant generation changes', async () => {
+    const user = userEvent.setup();
+    const view = render(
+      <AppIntlProvider initialLocale="zh-CN">
+        <MemoryRouter initialEntries={['/enterprise/general-skills/new']}>
+          <TooltipProvider>
+            <GeneralSkillNewPage currentUser={{ id: 'user-1', tenant_id: 'tenant_demo', username: 'demo', role: 'admin' }} />
+          </TooltipProvider>
+        </MemoryRouter>
+      </AppIntlProvider>,
+    );
+
+    const nameInput = await screen.findByPlaceholderText('例如 天气查询、代码审查');
+    const queryInput = screen.getByPlaceholderText('输入要测试的问题');
+    await user.type(nameInput, '旧租户草稿');
+    await user.type(queryInput, '旧租户测试问题');
+
+    tenantContextMock.context.generation = 2;
+    tenantContextMock.context.isCurrentGeneration = (generation: number) => generation === 2;
+    view.rerender(
+      <AppIntlProvider initialLocale="zh-CN">
+        <MemoryRouter initialEntries={['/enterprise/general-skills/new']}>
+          <TooltipProvider>
+            <GeneralSkillNewPage currentUser={{ id: 'user-1', tenant_id: 'tenant_demo', username: 'demo', role: 'admin' }} />
+          </TooltipProvider>
+        </MemoryRouter>
+      </AppIntlProvider>,
+    );
+
+    expect((screen.getByPlaceholderText('例如 天气查询、代码审查') as HTMLInputElement).value).toBe('');
+    expect((screen.getByPlaceholderText('输入要测试的问题') as HTMLInputElement).value).toBe('');
   });

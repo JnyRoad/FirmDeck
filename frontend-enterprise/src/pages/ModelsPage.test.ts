@@ -99,6 +99,15 @@ const semanticModelRow = {
   updated_at: '2026-08-29T12:34:00Z',
 } satisfies ModelConfigRead;
 
+const subscriptionModelRow = {
+  ...semanticModelRow,
+  id: 'subscription-model-id',
+  name: 'ChatGPT 订阅模型',
+  auth_mode: 'chatgpt_subscription' as const,
+  api_key_masked: '',
+  model: 'gpt-5',
+} satisfies ModelConfigRead;
+
 const semanticModelCopy = {
   'zh-CN': {
     actions: '模型操作',
@@ -486,6 +495,17 @@ describe('semantic model locale contract', () => {
     ))).toHaveLength(0);
   });
 
+  it('does not check the subscription account while only displaying a configured subscription model', async () => {
+    const fetchMock = renderSemanticModels('zh-CN', [subscriptionModelRow]);
+
+    await waitFor(() => expect(fetchMock.mock.calls.some(([input]) => (
+      String(input).includes('/api/enterprise/model-configs?')
+    ))).toBe(true));
+    expect(fetchMock.mock.calls.filter(([input]) => (
+      String(input).includes('/codex-subscription/account')
+    ))).toHaveLength(0);
+  });
+
   it('checks subscription status after the user selects the subscription channel', async () => {
     const fetchMock = renderSemanticModels('zh-CN', [semanticModelRow]);
     const user = userEvent.setup();
@@ -539,6 +559,42 @@ describe('semantic model locale contract', () => {
     });
 
     expect(notifyError).not.toHaveBeenCalled();
+  });
+
+  it('does not query Codex in the replacement tenant generation while an old subscription edit is reset', async () => {
+    const fetchMock = stubModelsPageFetch({
+      status: 'connected',
+      plan_type: null,
+      message: 'RAW_SUBSCRIPTION_STATUS',
+    }, [subscriptionModelRow]);
+    const user = userEvent.setup();
+    const page = render(createElement(AppIntlProvider, {
+      locale: 'zh-CN',
+      children: createElement(ModelsPage),
+    }));
+
+    const actionButtons = await screen.findAllByRole('button', { name: '模型操作' });
+    await user.click(actionButtons[0]);
+    await user.click(await screen.findByRole('menuitem', { name: '编辑' }));
+    await waitFor(() => expect(fetchMock.mock.calls.filter(([input]) => (
+      String(input).includes('/codex-subscription/account')
+    ))).toHaveLength(1));
+
+    const oldContext = modelTestState.currentContext as TestTenantContext;
+    oldContext.controller.abort();
+    modelTestState.currentContext = makeTenantContext(2);
+    page.rerender(createElement(AppIntlProvider, {
+      locale: 'zh-CN',
+      children: createElement(ModelsPage),
+    }));
+
+    await waitFor(() => expect(fetchMock.mock.calls.filter(([input]) => (
+      String(input).includes('/api/enterprise/model-configs?')
+    ))).toHaveLength(2));
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    expect(fetchMock.mock.calls.filter(([input]) => (
+      String(input).includes('/codex-subscription/account')
+    ))).toHaveLength(1);
   });
 
   it('closes the model wizard when the tenant generation changes', async () => {

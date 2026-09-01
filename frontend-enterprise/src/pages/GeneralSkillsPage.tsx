@@ -749,7 +749,16 @@ export function GeneralSkillEditPage(props: GeneralSkillPageProps = {}) {
   return <GeneralSkillEditorPage mode="edit" {...props} />;
 }
 
-export default function GeneralSkillsPage({ embedded = false, currentUser, onLogout }: { embedded?: boolean } & GeneralSkillPageProps) {
+/** 按租户会话代次隔离技能列表状态，切换租户时先卸载旧内容再加载新数据。 */
+export default function GeneralSkillsPage(props: { embedded?: boolean } & GeneralSkillPageProps) {
+  const tenantContext = useTenantSession();
+  const tenantScopeKey = tenantContext
+    ? tenantContext.tenantId
+    : 'no-tenant';
+  return <GeneralSkillsPageContent key={tenantScopeKey} {...props} />;
+}
+
+function GeneralSkillsPageContent({ embedded = false, currentUser, onLogout }: { embedded?: boolean } & GeneralSkillPageProps) {
   const { t } = useAppIntl();
   const tenantContext = useTenantSession();
   const tenantClient = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
@@ -788,6 +797,36 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
   const listImportAgentsControllerRef = useRef<AbortController | null>(null);
   const listImportSourceControllerRef = useRef<AbortController | null>(null);
   const listImportSubmitControllerRef = useRef<AbortController | null>(null);
+  const tenantScopeKey = tenantContext
+    ? `${tenantId}:${userId}:${tenantContext.generation}`
+    : 'no-tenant';
+  const [stateScopeKey, setStateScopeKey] = useState(tenantScopeKey);
+  const hasCurrentTenantState = stateScopeKey === tenantScopeKey;
+
+  useEffect(() => {
+    if (hasCurrentTenantState) return;
+    setRows([]);
+    setAgents([]);
+    setAgentScopeLoaded(false);
+    setSearchText('');
+    setStatusFilter('all');
+    setAgentId(tenantId && userId ? readEmployeeScope(tenantId, userId) : '');
+    setIsOverallAgent(true);
+    setDeleting(false);
+    setLoading(false);
+    setAgentImportLoading(false);
+    setAgentImportMode('plaza');
+    setAgentImportAgents([]);
+    setAgentImportSourceAgentId('');
+    setAgentImportSourceSkills([]);
+    setAgentImportSelectedSkillIds([]);
+    setAgentImportOpen(false);
+    setClawhubLoading(false);
+    setClawhubSource('');
+    setClawhubModalOpen(false);
+    setDeleteTarget(null);
+    setStateScopeKey(tenantScopeKey);
+  }, [hasCurrentTenantState, tenantId, tenantScopeKey, userId]);
 
   useEffect(() => {
     setDeleting(false);
@@ -813,12 +852,16 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
     setAgentScopeLoaded(false);
   }, [tenantId, userId]);
 
-  const pageTitle = isOverallAgent ? copy.pageTitle : copy.scopedPageTitle;
-  const listLabel = isOverallAgent ? copy.listOverall : copy.listScoped;
-  const currentAgent = useMemo(() => agents.find((item) => item.id === agentId), [agents, agentId]);
+  const scopedRows = hasCurrentTenantState ? rows : [];
+  const scopedAgents = hasCurrentTenantState ? agents : [];
+  const scopedAgentId = hasCurrentTenantState ? agentId : '';
+  const scopedIsOverallAgent = hasCurrentTenantState ? isOverallAgent : true;
+  const pageTitle = scopedIsOverallAgent ? copy.pageTitle : copy.scopedPageTitle;
+  const listLabel = scopedIsOverallAgent ? copy.listOverall : copy.listScoped;
+  const currentAgent = useMemo(() => scopedAgents.find((item) => item.id === scopedAgentId), [scopedAgents, scopedAgentId]);
   const canManageCurrentScope = currentAgent
     ? canManageEmployeeAgent(currentAgent, currentUser)
-    : isEnterpriseAdmin(currentUser) && isOverallAgent;
+    : isEnterpriseAdmin(currentUser) && scopedIsOverallAgent;
 
   const load = () => {
     const context = tenantContext;
@@ -848,12 +891,13 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
   };
 
   useEffect(() => {
+    if (!hasCurrentTenantState) return;
     void load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [agentId, tenantContext, tenantClient, tenantId]);
+  }, [agentId, hasCurrentTenantState, tenantContext, tenantClient, tenantId, tenantScopeKey]);
 
   useEffect(() => {
-    if (!tenantContext) return;
+    if (!tenantContext || !hasCurrentTenantState) return;
     const context = tenantContext;
     const generation = context.generation;
     listAgentScopeControllerRef.current?.abort();
@@ -876,13 +920,14 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
         if (listAgentScopeControllerRef.current === controller) listAgentScopeControllerRef.current = null;
       });
     return () => controller.abort();
-  }, [agentId, tenantContext, tenantClient, tenantId]);
+  }, [agentId, hasCurrentTenantState, tenantContext, tenantClient, tenantId, tenantScopeKey]);
 
   useEffect(() => {
+    if (!hasCurrentTenantState) return;
     if (searchParams.get('add') !== 'plaza') return;
     if (!agentScopeLoaded) return;
     const resourceId = searchParams.get('resourceId') || undefined;
-    if (isOverallAgent) {
+    if (scopedIsOverallAgent) {
       notify.warning(copy.plazaCopyRequiresEmployee);
     } else {
       void requestAgentImport('plaza', resourceId);
@@ -892,7 +937,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
     next.delete('resourceId');
     setSearchParams(next, { replace: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [agentScopeLoaded, isOverallAgent, searchParams, setSearchParams]);
+  }, [agentScopeLoaded, hasCurrentTenantState, scopedIsOverallAgent, searchParams, setSearchParams]);
 
   useEffect(() => {
     const onScopeChange = (event: Event) => {
@@ -905,7 +950,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
 
   const filteredRows = useMemo(() => {
     const keyword = searchText.trim().toLowerCase();
-    return rows.filter((row) => {
+    return scopedRows.filter((row) => {
       const matchesStatus = statusFilter === 'all' || row.status === statusFilter;
       const haystack = [
         row.name,
@@ -916,16 +961,16 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
       ].filter(Boolean).join(' ').toLowerCase();
       return matchesStatus && (!keyword || haystack.includes(keyword));
     });
-  }, [rows, searchText, statusFilter]);
+  }, [scopedRows, searchText, statusFilter]);
 
   const pagination = useClientPagination(filteredRows, GENERAL_SKILL_PAGE_SIZE, `${searchText}|${statusFilter}`);
 
   const stats = useMemo(() => ({
-    total: rows.length,
-    published: rows.filter((row) => row.status === 'published').length,
-    draft: rows.filter((row) => row.status === 'draft').length,
-    archived: rows.filter((row) => row.status === 'archived').length,
-  }), [rows]);
+    total: scopedRows.length,
+    published: scopedRows.filter((row) => row.status === 'published').length,
+    draft: scopedRows.filter((row) => row.status === 'draft').length,
+    archived: scopedRows.filter((row) => row.status === 'archived').length,
+  }), [scopedRows]);
 
   async function setSkillPublished(row: GeneralSkillRead, published: boolean) {
     const context = tenantContext;
@@ -979,8 +1024,8 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
 
   async function confirmDeleteSkill() {
     const row = deleteTarget;
-    if (!row) return;
-    const branchMode = !isOverallAgent;
+    if (!row || !row.id || !row.slug) return;
+    const branchMode = !scopedIsOverallAgent;
     const context = tenantContext;
     const generation = context?.generation;
     if (!context || generation === undefined) return;
@@ -1147,7 +1192,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
     try {
       const row = await tenantClient.postWithSignal<GeneralSkillRead>('/api/enterprise/general-skills/import-skillhub', {
         tenant_id: tenantId,
-        agent_id: !isOverallAgent && agentId ? agentId : undefined,
+        agent_id: !scopedIsOverallAgent && scopedAgentId ? scopedAgentId : undefined,
         source: clawhubSource.trim(),
         status: 'published',
       }, controller.signal);
@@ -1173,7 +1218,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
 
   function renderActions(row: GeneralSkillRead) {
     const published = row.status === 'published';
-    if (isOverallAgent && !canManageCurrentScope) {
+    if (scopedIsOverallAgent && !canManageCurrentScope) {
       return null;
     }
     return (
@@ -1190,7 +1235,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
             onSelect={() => navigate(`/enterprise/general-skills/${encodeURIComponent(row.slug)}/edit`)}
           >
             <IconEdit />
-            {isOverallAgent ? copy.actionEdit : copy.actionEditLocal}
+            {scopedIsOverallAgent ? copy.actionEdit : copy.actionEditLocal}
           </DropdownMenuItem>
           {published ? (
             <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => void setSkillPublished(row, false)}>
@@ -1203,7 +1248,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
               {copy.actionPublish}
             </DropdownMenuItem>
           )}
-          {!isOverallAgent && row.metadata?.scope === 'agent_private' && (
+          {!scopedIsOverallAgent && row.metadata?.scope === 'agent_private' && (
             <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => void publishSkillToGallery(row)}>
               <UploadOutlined />
               {copy.publishToMarketplaceAction}
@@ -1216,7 +1261,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
             onSelect={() => setDeleteTarget(row)}
           >
             <IconTrash />
-            {isOverallAgent ? copy.actionDelete : copy.actionRemove}
+            {scopedIsOverallAgent ? copy.actionDelete : copy.actionRemove}
           </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
@@ -1326,7 +1371,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
     );
   };
 
-  const listEmptyText = isOverallAgent
+  const listEmptyText = scopedIsOverallAgent
     ? canManageCurrentScope ? copy.emptyManage : copy.emptyReadonly
     : copy.emptyScoped;
 
@@ -1359,7 +1404,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
                     <IconAdd />
                     {copy.create}
                   </DropdownMenuItem>
-                  {!isOverallAgent && (
+                  {!scopedIsOverallAgent && (
                     <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => void requestAgentImport('plaza')}>
                       <Copy />
                       {copy.copyFromMarketplace}
@@ -1369,7 +1414,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
                     <GithubOutlined />
                     {copy.importFromOpenSource}
                   </DropdownMenuItem>
-                  {!isOverallAgent && (
+                  {!scopedIsOverallAgent && (
                     <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => void requestAgentImport('employee')}>
                       <Users />
                       {copy.copyFromEmployee}
@@ -1517,15 +1562,15 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
         loading={deleting}
         title={deleteTarget
           ? copy.deleteTitle
-            .replace('{action}', isOverallAgent ? copy.actionDelete : copy.actionRemove)
+            .replace('{action}', scopedIsOverallAgent ? copy.actionDelete : copy.actionRemove)
             .replace('{name}', deleteTarget.name)
           : ''}
         description={
-          isOverallAgent
+          scopedIsOverallAgent
             ? copy.deleteDescriptionOverall
             : copy.deleteDescriptionScoped
         }
-        confirmText={isOverallAgent ? copy.actionDelete : copy.actionRemove}
+        confirmText={scopedIsOverallAgent ? copy.actionDelete : copy.actionRemove}
         onConfirm={() => void confirmDeleteSkill()}
       />
     </div>
@@ -1987,7 +2032,16 @@ function Field({ label, children }: { label: string; children: ReactNode }) {
   );
 }
 
-function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'edit' } & GeneralSkillPageProps) {
+/** 按租户会话代次隔离技能编辑器状态，防止草稿、文件和运行结果跨租户复用。 */
+function GeneralSkillEditorPage(props: { mode: 'new' | 'edit' } & GeneralSkillPageProps) {
+  const tenantContext = useTenantSession();
+  const tenantScopeKey = tenantContext
+    ? `${tenantContext.tenantId}:${tenantContext.userId}:${tenantContext.generation}`
+    : 'no-tenant';
+  return <GeneralSkillEditorPageContent key={tenantScopeKey} {...props} />;
+}
+
+function GeneralSkillEditorPageContent({ mode, currentUser, onLogout }: { mode: 'new' | 'edit' } & GeneralSkillPageProps) {
   const { t } = useAppIntl();
   const tenantContext = useTenantSession();
   const tenantClient = useMemo(() => createTenantClient(tenantContext), [tenantContext]);

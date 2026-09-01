@@ -5,6 +5,7 @@ import {
   systemClient,
   type SystemClient,
   type SystemControlAudit,
+  type PasswordPolicy,
   type SystemRuntimeStatus,
   type SystemTenantDetail,
   type SystemTenantListInput,
@@ -20,6 +21,8 @@ import { useAppIntl } from '@/i18n/useAppIntl';
 type PageClient = Pick<SystemClient, 'listTenants' | 'provisionTenant'> & Partial<Pick<
   SystemClient,
   | 'getTenant'
+  | 'getPasswordPolicies'
+  | 'getTenantPasswordPolicy'
   | 'renameTenant'
   | 'resetInitialAdminPassword'
   | 'suspendTenant'
@@ -52,6 +55,15 @@ const EMPTY_CREATE_FORM: CreateForm = {
   temporaryPassword: '',
 };
 const TENANT_SLUG_PATTERN = /^[a-z0-9](?:[a-z0-9-]{1,61}[a-z0-9])$/;
+const DEFAULT_PASSWORD_POLICY: PasswordPolicy = {
+  min_length: 8,
+  max_length: 20,
+  complexity_enabled: false,
+  require_uppercase: false,
+  require_lowercase: false,
+  require_digit: false,
+  require_special: false,
+};
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === 'object' && !Array.isArray(value));
@@ -179,6 +191,14 @@ function isConflictError(error: unknown): boolean {
   return isRecord(error) && error.status === 409 && error.code === 'SYSTEM_CONTROL_CONFLICT';
 }
 
+/** Tests only the complexity requirements enabled by the active password policy. */
+function hasRequiredPasswordComplexity(password: string, policy: PasswordPolicy): boolean {
+  return (!policy.require_uppercase || /[A-Z]/.test(password))
+    && (!policy.require_lowercase || /[a-z]/.test(password))
+    && (!policy.require_digit || /\d/.test(password))
+    && (!policy.require_special || /[^A-Za-z0-9]/.test(password));
+}
+
 export default function SystemTenantsPage({ client = systemClient }: SystemTenantsPageProps) {
   const { t, locale } = useAppIntl();
   const [rows, setRows] = useState<SystemTenantSummary[]>([]);
@@ -204,12 +224,14 @@ export default function SystemTenantsPage({ client = systemClient }: SystemTenan
   const [runtime, setRuntime] = useState<SystemRuntimeStatus | null>(null);
   const [runtimeLoading, setRuntimeLoading] = useState(Boolean(client.getCodexA2ARuntimeStatus));
   const [runtimeError, setRuntimeError] = useState(false);
+  const [tenantDefaultPolicy, setTenantDefaultPolicy] = useState<PasswordPolicy>(DEFAULT_PASSWORD_POLICY);
   const [renameOpen, setRenameOpen] = useState(false);
   const [renameName, setRenameName] = useState('');
   const [renaming, setRenaming] = useState(false);
   const [renameError, setRenameError] = useState('');
   const [resetOpen, setResetOpen] = useState(false);
   const [resetPassword, setResetPassword] = useState('');
+  const [resetPolicy, setResetPolicy] = useState<PasswordPolicy>(DEFAULT_PASSWORD_POLICY);
   const [resetting, setResetting] = useState(false);
   const [resetError, setResetError] = useState('');
   const [suspendOpen, setSuspendOpen] = useState(false);
@@ -403,6 +425,7 @@ export default function SystemTenantsPage({ client = systemClient }: SystemTenan
     setRenameError('');
     setResetOpen(false);
     setResetPassword('');
+    setResetPolicy(DEFAULT_PASSWORD_POLICY);
     setResetError('');
     setSuspendOpen(false);
     setSuspendReason('');
@@ -412,19 +435,25 @@ export default function SystemTenantsPage({ client = systemClient }: SystemTenan
     setReactivating(false);
     setReactivateError('');
     const row = rows.find((candidate) => candidate.id === tenantId);
+    /** Keep tenant detail and audit available when policy lookup fails; use the bounded default policy. */
+    const tenantPolicyPromise = client.getTenantPasswordPolicy
+      ? client.getTenantPasswordPolicy(tenantId).catch(() => null)
+      : Promise.resolve(null);
     try {
-      const [detailResult, auditResult] = await Promise.all([
+      const [detailResult, auditResult, policyResult] = await Promise.all([
         client.getTenant
           ? client.getTenant(tenantId)
           : Promise.resolve({ ...projectTenant(row), suspension_reason: null }),
         client.listTenantAudit
           ? client.listTenantAudit(tenantId, { limit: 50 })
           : Promise.resolve({ items: [], next_cursor: null }),
+        tenantPolicyPromise,
       ]);
       if (!isCurrent()) return;
       setDetail(projectDetail(detailResult));
       setAudits(Array.isArray(auditResult.items) ? auditResult.items.map(projectAudit) : []);
       setAuditNextCursor(safeNullableText(auditResult.next_cursor, 512));
+      setResetPolicy(policyResult?.effective ?? DEFAULT_PASSWORD_POLICY);
       setAuditError(false);
     } catch {
       if (isCurrent()) setDetailError(true);
@@ -465,6 +494,19 @@ export default function SystemTenantsPage({ client = systemClient }: SystemTenan
 
   useEffect(() => { void loadTenants(); }, [loadTenants]);
   useEffect(() => { void loadRuntime(); }, [loadRuntime]);
+  /** Loads the installation tenant-default policy used when creating a tenant. */
+  useEffect(() => {
+    let cancelled = false;
+    if (!client.getPasswordPolicies) return () => { cancelled = true; };
+    void client.getPasswordPolicies()
+      .then((policies) => {
+        if (!cancelled) setTenantDefaultPolicy(policies.tenant_default);
+      })
+      .catch(() => {
+        if (!cancelled) setTenantDefaultPolicy(DEFAULT_PASSWORD_POLICY);
+      });
+    return () => { cancelled = true; };
+  }, [client]);
 
   function resetCreateForm() {
     setCreateForm({ ...EMPTY_CREATE_FORM });
@@ -485,7 +527,20 @@ export default function SystemTenantsPage({ client = systemClient }: SystemTenan
     if (!TENANT_SLUG_PATTERN.test(createForm.slug.trim())) errors.slug = t('system.tenants.validation.slug');
     if (!createForm.displayName.trim()) errors.displayName = t('system.tenants.validation.displayName');
     if (!createForm.adminUsername.trim()) errors.adminUsername = t('system.tenants.validation.adminUsername');
-    if (createForm.temporaryPassword.length < 12) errors.temporaryPassword = t('system.tenants.validation.password');
+    if (
+      createForm.temporaryPassword.length < tenantDefaultPolicy.min_length
+      || createForm.temporaryPassword.length > tenantDefaultPolicy.max_length
+    ) {
+      errors.temporaryPassword = t('system.tenants.validation.password', {
+        min: tenantDefaultPolicy.min_length,
+        max: tenantDefaultPolicy.max_length,
+      });
+    } else if (
+      tenantDefaultPolicy.complexity_enabled
+      && !hasRequiredPasswordComplexity(createForm.temporaryPassword, tenantDefaultPolicy)
+    ) {
+      errors.temporaryPassword = t('system.tenants.validation.passwordComplexity');
+    }
     setCreateErrors(errors);
     setCreateRequestError('');
     if (Object.keys(errors).length > 0 || creating) return;
@@ -558,8 +613,21 @@ export default function SystemTenantsPage({ client = systemClient }: SystemTenan
   async function submitReset(event?: FormEvent<HTMLFormElement>) {
     event?.preventDefault();
     if (!selectedId || !client.resetInitialAdminPassword || resetting) return;
-    if (resetPassword.length < 12) {
-      setResetError(t('system.tenants.validation.password'));
+    if (
+      resetPassword.length < resetPolicy.min_length
+      || resetPassword.length > resetPolicy.max_length
+    ) {
+      setResetError(t('system.tenants.validation.password', {
+        min: resetPolicy.min_length,
+        max: resetPolicy.max_length,
+      }));
+      return;
+    }
+    if (
+      resetPolicy.complexity_enabled
+      && !hasRequiredPasswordComplexity(resetPassword, resetPolicy)
+    ) {
+      setResetError(t('system.tenants.validation.passwordComplexity'));
       return;
     }
     const tenantId = selectedId;
@@ -712,12 +780,12 @@ export default function SystemTenantsPage({ client = systemClient }: SystemTenan
   return (
     <main aria-busy={listLoading} className="flex min-w-0 flex-1 flex-col gap-6">
       <header className="flex flex-wrap items-start justify-between gap-4">
-        <div>
+        <div className="min-w-0 max-w-full">
           <p className="mb-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-[#1a71ff]">{t('system.tenants.kicker')}</p>
-          <h1 className="text-[27px] font-semibold tracking-[-0.03em] text-[#18181a]">{t('system.tenants.title')}</h1>
+          <h1 className="[overflow-wrap:anywhere] text-[24px] font-semibold tracking-[-0.03em] text-[#18181a] sm:text-[27px]">{t('system.tenants.title')}</h1>
           <p className="mt-2 max-w-2xl text-[13px] leading-6 text-[#6f788a]">{t('system.tenants.description')}</p>
         </div>
-        <div className="flex gap-2">
+        <div className="flex max-w-full flex-wrap gap-2">
           <Button type="button" variant="outline" onClick={() => void loadTenants()}>{t('system.tenants.action.refresh')}</Button>
           <Button type="button" onClick={() => { resetCreateForm(); setCreateOpen(true); }}>{t('system.tenants.action.create')}</Button>
         </div>
@@ -954,7 +1022,7 @@ export default function SystemTenantsPage({ client = systemClient }: SystemTenan
             <DialogTitle>{t('system.tenants.dialog.title')}</DialogTitle>
             <DialogDescription className="mt-2">{t('system.tenants.dialog.description')}</DialogDescription>
           </div>
-          <form onSubmit={submitCreate} className="grid gap-4 px-6 py-5">
+          <form onSubmit={submitCreate} noValidate className="grid gap-4 px-6 py-5">
             {createRequestError && <div role="alert" className="rounded-lg bg-[#fff2f2] p-3 text-[12px] text-[#a03c3c]">{createRequestError}</div>}
             {Object.keys(createErrors).length > 0 && <div role="alert" className="sr-only">{Object.values(createErrors).filter(Boolean).join(' ')}</div>}
             <CreateField id="system-tenant-slug" label={t('system.tenants.field.slug')} value={createForm.slug} error={createErrors.slug} onChange={(value) => updateCreate('slug', value)} />
@@ -963,7 +1031,21 @@ export default function SystemTenantsPage({ client = systemClient }: SystemTenan
               <CreateField id="system-tenant-admin-username" label={t('system.tenants.field.adminUsername')} value={createForm.adminUsername} error={createErrors.adminUsername} onChange={(value) => updateCreate('adminUsername', value)} />
               <CreateField id="system-tenant-admin-name" label={t('system.tenants.field.adminDisplayName')} value={createForm.adminDisplayName} onChange={(value) => updateCreate('adminDisplayName', value)} />
             </div>
-            <CreateField id="system-tenant-password" type="password" label={t('system.tenants.field.temporaryPassword')} value={createForm.temporaryPassword} error={createErrors.temporaryPassword} onChange={(value) => updateCreate('temporaryPassword', value)} />
+            <CreateField
+              id="system-tenant-password"
+              type="password"
+              label={t('system.tenants.field.temporaryPassword')}
+              value={createForm.temporaryPassword}
+              error={createErrors.temporaryPassword}
+              placeholder={t('system.tenants.field.temporaryPasswordPlaceholder', {
+                min: tenantDefaultPolicy.min_length,
+                max: tenantDefaultPolicy.max_length,
+              })}
+              minLength={tenantDefaultPolicy.min_length}
+              maxLength={tenantDefaultPolicy.max_length}
+              onChange={(value) => updateCreate('temporaryPassword', value)}
+            />
+            <PasswordPolicyRequirements policy={tenantDefaultPolicy} />
             <div className="flex justify-end gap-2 pt-2">
               <Button type="button" variant="outline" disabled={creating} onClick={closeCreate}>{t('system.tenants.action.cancel')}</Button>
               <Button type="submit" disabled={creating}>{creating ? t('system.tenants.action.submitting') : t('system.tenants.action.create')}</Button>
@@ -993,13 +1075,29 @@ export default function SystemTenantsPage({ client = systemClient }: SystemTenan
       <Dialog open={resetOpen} onOpenChange={(open) => { if (open) setResetOpen(true); else closeReset(); }}>
         <DialogContent showCloseButton={!resetting} onEscapeKeyDown={closeReset} className="max-w-[480px]">
           <DialogTitle>{t('system.tenants.reset.title')}</DialogTitle>
-          <DialogDescription>{t('system.tenants.reset.description')}</DialogDescription>
-          <form onSubmit={submitReset} className="grid gap-4">
+          <DialogDescription>{t('system.tenants.reset.description', {
+            min: resetPolicy.min_length,
+            max: resetPolicy.max_length,
+          })}</DialogDescription>
+          <form onSubmit={submitReset} noValidate className="grid gap-4">
             {resetError && <div role="alert" className="rounded-lg bg-[#fff2f2] p-3 text-[12px] text-[#a03c3c]">{resetError}</div>}
             <label className="grid gap-1.5 text-[12px] font-medium text-[#464c5e]">
               <span>{t('system.tenants.reset.field')}</span>
-              <Input type="password" aria-label={t('system.tenants.reset.field')} value={resetPassword} onChange={(event) => { setResetPassword(event.target.value); setResetError(''); }} className={fieldClass} />
+              <Input
+                type="password"
+                aria-label={t('system.tenants.reset.field')}
+                placeholder={t('system.tenants.field.temporaryPasswordPlaceholder', {
+                  min: resetPolicy.min_length,
+                  max: resetPolicy.max_length,
+                })}
+                minLength={resetPolicy.min_length}
+                maxLength={resetPolicy.max_length}
+                value={resetPassword}
+                onChange={(event) => { setResetPassword(event.target.value); setResetError(''); }}
+                className={fieldClass}
+              />
             </label>
+            <PasswordPolicyRequirements policy={resetPolicy} />
             <div className="flex justify-end gap-2">
               <Button type="button" variant="outline" disabled={resetting} onClick={closeReset}>{t('system.tenants.action.cancel')}</Button>
               <Button type="submit" disabled={resetting}>{t('system.tenants.reset.confirm')}</Button>
@@ -1090,10 +1188,23 @@ type CreateFieldProps = {
   value: string;
   error?: string;
   type?: 'text' | 'password';
+  placeholder?: string;
+  minLength?: number;
+  maxLength?: number;
   onChange: (value: string) => void;
 };
 
-function CreateField({ id, label, value, error, type = 'text', onChange }: CreateFieldProps) {
+function CreateField({
+  id,
+  label,
+  value,
+  error,
+  type = 'text',
+  placeholder,
+  minLength,
+  maxLength,
+  onChange,
+}: CreateFieldProps) {
   const errorId = `${id}-error`;
   return (
     <label htmlFor={id} className="grid gap-1.5 text-[12px] font-medium text-[#464c5e]">
@@ -1102,6 +1213,9 @@ function CreateField({ id, label, value, error, type = 'text', onChange }: Creat
         id={id}
         type={type}
         aria-label={label}
+        placeholder={placeholder}
+        minLength={minLength}
+        maxLength={maxLength}
         aria-invalid={error ? true : undefined}
         aria-describedby={error ? errorId : undefined}
         value={value}
@@ -1110,5 +1224,19 @@ function CreateField({ id, label, value, error, type = 'text', onChange }: Creat
       />
       {error && <span id={errorId} className="text-[11px] text-[#b24545]">{error}</span>}
     </label>
+  );
+}
+
+/** Renders only the complexity rules enabled by the current tenant password policy. */
+function PasswordPolicyRequirements({ policy }: { policy: PasswordPolicy }) {
+  const { t } = useAppIntl();
+  if (!policy.complexity_enabled) return null;
+  return (
+    <ul className="grid gap-1 text-[12px] text-[#6f788a]">
+      {policy.require_uppercase && <li>{t('system.passwordPolicies.requireUppercase')}</li>}
+      {policy.require_lowercase && <li>{t('system.passwordPolicies.requireLowercase')}</li>}
+      {policy.require_digit && <li>{t('system.passwordPolicies.requireDigit')}</li>}
+      {policy.require_special && <li>{t('system.passwordPolicies.requireSpecial')}</li>}
+    </ul>
   );
 }

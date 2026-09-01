@@ -242,12 +242,13 @@ export default function ModelsPage({
   const [loading, setLoading] = useState(false);
   const [searchText, setSearchText] = useState('');
   const [editingModel, setEditingModel] = useState<ModelConfigRead | null>(null);
+  const [editingModelGeneration, setEditingModelGeneration] = useState<number | null>(null);
   const [wizardOpen, setWizardOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<ModelConfigRead | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [subscriptionLogoutConfirmOpen, setSubscriptionLogoutConfirmOpen] = useState(false);
-  const [subscriptionConfigTenantId, setSubscriptionConfigTenantId] = useState<string | null>(null);
   const [subscriptionExplicitTenantId, setSubscriptionExplicitTenantId] = useState<string | null>(null);
+  const [subscriptionExplicitGeneration, setSubscriptionExplicitGeneration] = useState<number | null>(null);
   const previousTenantGenerationRef = useRef<number | null>(tenantContext?.generation ?? null);
   const loadingRequestOwnerRef = useRef(0);
   const testingModelIdsRef = useRef(new Set<string>());
@@ -262,14 +263,32 @@ export default function ModelsPage({
     cancelLogin: cancelSubscriptionLogin,
     logout: logoutSubscription,
   } = useCodexSubscriptionAccount({
-    enabled: tenantContext?.tenantId === subscriptionConfigTenantId
-      || tenantContext?.tenantId === subscriptionExplicitTenantId
-      || editingModel?.auth_mode === 'chatgpt_subscription',
+    enabled: Boolean(
+      wizardOpen
+      && tenantContext?.tenantId === subscriptionExplicitTenantId
+      && tenantContext.generation === subscriptionExplicitGeneration,
+    ) || Boolean(
+      editingModel?.auth_mode === 'chatgpt_subscription'
+      && tenantContext?.generation === editingModelGeneration,
+    ),
   });
 
   /** 仅在订阅渠道被选中时查询当前租户账户，离开渠道后立即停用。 */
   function setSubscriptionChannelSelected(selected: boolean) {
     setSubscriptionExplicitTenantId(selected && tenantContext ? tenantContext.tenantId : null);
+    setSubscriptionExplicitGeneration(selected && tenantContext ? tenantContext.generation : null);
+  }
+
+  /** 打开模型编辑并绑定当前租户代次；无返回值、不发请求，仅更新本地编辑状态。 */
+  function openModelEditor(row: ModelConfigRead) {
+    setEditingModel(row);
+    setEditingModelGeneration(tenantContext?.generation ?? null);
+  }
+
+  /** 清理编辑目标及其租户代次资格；无返回值、不发请求，仅修改本地 React 状态。 */
+  function clearModelEditor() {
+    setEditingModel(null);
+    setEditingModelGeneration(null);
   }
 
   const load = (showLoading = true) => {
@@ -282,11 +301,6 @@ export default function ModelsPage({
       .get<ModelConfigRead[]>('/api/enterprise/model-configs')
       .then((items) => {
         if (!isCurrentTenantGeneration(context, generation)) return;
-        setSubscriptionConfigTenantId(
-          items.some((item) => item.auth_mode === 'chatgpt_subscription')
-            ? context.tenantId
-            : null,
-        );
         setRows(items);
         window.dispatchEvent(new CustomEvent(MODEL_CONFIGS_UPDATED_EVENT, { detail: { models: items } }));
       })
@@ -309,12 +323,12 @@ export default function ModelsPage({
     // Tenant generation is a hard UI isolation boundary: no modal target or
     // explicit subscription check may survive into the next tenant context.
     setWizardOpen(false);
-    setEditingModel(null);
+    clearModelEditor();
     setDeleteTarget(null);
     setDeleting(false);
     setSubscriptionLogoutConfirmOpen(false);
-    setSubscriptionConfigTenantId(null);
     setSubscriptionExplicitTenantId(null);
+    setSubscriptionExplicitGeneration(null);
     loadingRequestOwnerRef.current += 1;
     testingModelRequestOwnersRef.current.clear();
     testingModelIdsRef.current.clear();
@@ -340,7 +354,10 @@ export default function ModelsPage({
   }, [tenantApi, tenantContext]);
 
   useEffect(() => {
-    if (!wizardOpen) setSubscriptionExplicitTenantId(null);
+    if (!wizardOpen) {
+      setSubscriptionExplicitTenantId(null);
+      setSubscriptionExplicitGeneration(null);
+    }
   }, [wizardOpen]);
 
   useEffect(() => {
@@ -469,7 +486,7 @@ export default function ModelsPage({
           {isTesting ? <LoaderCircle className="size-3.5 animate-spin" /> : <IconMore className="size-3.5" />}
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end" className={MENU_CONTENT_CLASS}>
-          <DropdownMenuItem className={MENU_ITEM_CLASS} disabled={isTesting} onSelect={() => setEditingModel(row)}>
+          <DropdownMenuItem className={MENU_ITEM_CLASS} disabled={isTesting} onSelect={() => openModelEditor(row)}>
             <IconEdit />
             {t('modelsPage.actions.edit')}
           </DropdownMenuItem>
@@ -692,7 +709,7 @@ export default function ModelsPage({
         onStartSubscriptionLogin={startSubscriptionLogin}
         onCancelSubscriptionLogin={cancelSubscriptionLogin}
         onRequestSubscriptionLogout={requestSubscriptionLogout}
-        onOpenChange={(open) => !open && setEditingModel(null)}
+        onOpenChange={(open) => !open && clearModelEditor()}
         onSaved={() => void load()}
       />
 

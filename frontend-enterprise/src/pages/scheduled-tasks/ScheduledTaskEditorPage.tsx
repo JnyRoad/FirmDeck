@@ -72,7 +72,7 @@ function editorErrorDescriptor(error: unknown, fallbackId: MessageId): MessageDe
 }
 
 /** 加载并保存定时任务编辑表单，同时将产品界面文案交给当前 locale 的 runtime。 */
-function ScheduledTaskEditorPage({
+export default function ScheduledTaskEditorPage({
   mode,
   currentUser,
   onLogout,
@@ -85,6 +85,7 @@ function ScheduledTaskEditorPage({
     ? `${tenantId}:${userId}:${tenantContext.generation}`
     : '';
   const scopeKeyRef = useRef('');
+  const establishedScopeRef = useRef(false);
   const [scopeReady, setScopeReady] = useState(false);
   const [values, setValues] = useState<TaskFormValues>(INITIAL_VALUES);
   const [errors, setErrors] = useState<FormErrors>({});
@@ -112,6 +113,7 @@ function ScheduledTaskEditorPage({
     typeof taskMetadata.sop_version === 'string' && taskMetadata.sop_version
       ? taskMetadata.sop_version
       : undefined;
+  const tenantScopeTransition = establishedScopeRef.current && scopeKeyRef.current !== tenantScopeKey;
 
   // Keep route and employee identity current before passive effects run so late callbacks
   // cannot publish into a newly mounted task editor.
@@ -154,20 +156,37 @@ function ScheduledTaskEditorPage({
   useEffect(() => {
     if (!tenantContext || !tenantId || !userId) {
       scopeKeyRef.current = '';
+      establishedScopeRef.current = false;
       agentIdRef.current = '';
       scopeRevisionRef.current += 1;
       cancelActionControllers();
       setScopeReady(false);
       setAgentId('');
+      setValues(INITIAL_VALUES);
+      setErrors({});
+      setSops([]);
+      setTaskMetadata({});
+      setLoading(false);
+      setSaving(false);
       return;
     }
+    const scopeChanged = scopeKeyRef.current !== tenantScopeKey;
     scopeKeyRef.current = tenantScopeKey;
+    establishedScopeRef.current = true;
     const nextAgentId = readEmployeeScope(tenantId, userId);
     agentIdRef.current = nextAgentId;
     scopeRevisionRef.current += 1;
     cancelActionControllers();
     setAgentId(nextAgentId);
     setScopeReady(true);
+    if (scopeChanged) {
+      setValues(INITIAL_VALUES);
+      setErrors({});
+      setSops([]);
+      setTaskMetadata({});
+      setLoading(false);
+      setSaving(false);
+    }
   }, [tenantContext, tenantId, tenantScopeKey, userId]);
 
   useEffect(() => {
@@ -181,7 +200,7 @@ function ScheduledTaskEditorPage({
   }, [tenantContext, tenantId, tenantScopeKey, userId]);
 
   useEffect(() => {
-    if (!tenantContext || !tenantId || !userId || !scopeReady || scopeKeyRef.current !== tenantScopeKey) return;
+    if (tenantScopeTransition || !tenantContext || !tenantId || !userId || !scopeReady || scopeKeyRef.current !== tenantScopeKey) return;
     if (!isEdit) {
       setValues(INITIAL_VALUES);
       return;
@@ -223,10 +242,10 @@ function ScheduledTaskEditorPage({
         if (isCurrent()) setLoading(false);
       });
     return () => requestController.abort();
-  }, [isEdit, scopeReady, taskId, tenantClient, tenantContext, tenantId, tenantScopeKey, toast, userId]);
+  }, [isEdit, scopeReady, taskId, tenantClient, tenantContext, tenantId, tenantScopeKey, tenantScopeTransition, toast, userId]);
 
   useEffect(() => {
-    if (!tenantContext || !tenantId || !userId || !scopeReady || scopeKeyRef.current !== tenantScopeKey) return;
+    if (tenantScopeTransition || !tenantContext || !tenantId || !userId || !scopeReady || scopeKeyRef.current !== tenantScopeKey) return;
     if (!agentId) {
       setSops([]);
       return;
@@ -257,7 +276,7 @@ function ScheduledTaskEditorPage({
     return () => {
       requestController.abort();
     };
-  }, [agentId, scopeReady, tenantClient, tenantContext, tenantId, tenantScopeKey, userId]);
+  }, [agentId, scopeReady, tenantClient, tenantContext, tenantId, tenantScopeKey, tenantScopeTransition, userId]);
 
   /** 校验必填排程字段并返回表单是否可提交，副作用是更新字段错误状态。 */
   function validate(): boolean {
@@ -370,6 +389,10 @@ function ScheduledTaskEditorPage({
         : prev.weekdays.filter((item) => item !== day);
       return { ...prev, weekdays: next.sort((a, b) => a - b) };
     });
+  }
+
+  if (tenantScopeTransition) {
+    return <div className="min-h-full" aria-busy="true" />;
   }
 
   return (

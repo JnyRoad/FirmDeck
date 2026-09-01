@@ -322,6 +322,17 @@ class HarnessV2Engine:
         self._require_wake_admission()
         self.turn_record = turn_claim.record
         if turn_claim.replay is not None:
+            # Replay lookup may have opened a read transaction before a concurrent
+            # lifecycle transition; require a fresh authoritative admission snapshot.
+            self.db.rollback()
+            self._require_current_tenant_admission(
+                persisted_version=(
+                    self.turn_record.tenant_lifecycle_version
+                    if self.turn_record is not None
+                    else None
+                ),
+                correlation_id=session.id,
+            )
             return turn_claim.replay
         self.tenant_admission = self._optional_tenant_admission(
             tenant_id=request.tenant_id,

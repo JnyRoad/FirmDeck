@@ -1802,8 +1802,10 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
 
   /** 提交人工接续回复；服务错误仅记录技术根因并显示稳定的本地化错误。 */
   const replyToHandoff = useCallback(async (handoff: HumanHandoffRead, reply: string): Promise<boolean> => {
+    if (!isWorkspaceCurrent()) return false;
     try {
       await tenantClient.post<HumanHandoffRead>(`/api/chat/handoffs/${handoff.id}/reply`, { reply });
+      if (!isWorkspaceCurrent()) return false;
       notify.success(t('chat.notice.handoffReplied'));
       setHandoffs((rows) => rows.filter((item) => item.id !== handoff.id));
       setHandoffReplies((prev) => {
@@ -1817,6 +1819,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       void loadTraces(handoff.session_id);
       return true;
     } catch (error) {
+      if (!isWorkspaceCurrent()) return false;
       if (isAuthError(error)) {
         redirectToLogin();
         return false;
@@ -1825,7 +1828,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       notify.error(t('chat.error.replyFailed'));
       return false;
     }
-  }, [getSlot, loadMessages, loadSessions, loadTraces, redirectToLogin, t, tenantClient, tenantId]);
+  }, [getSlot, isWorkspaceCurrent, loadMessages, loadSessions, loadTraces, redirectToLogin, t, tenantClient, tenantId]);
 
   /** 校验并提交人工接续文本；空输入使用稳定的语义校验消息。 */
   const submitHandoffReply = useCallback((handoff: HumanHandoffRead) => {
@@ -2183,7 +2186,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
 
   /** 保存会话标题；标题本身是用户输入，校验与失败提示使用本地化产品文案。 */
   const saveRename = useCallback(async () => {
-    if (!renameSession) return;
+    if (!renameSession || !isWorkspaceCurrent()) return;
     const title = renameTitle.trim();
     if (!title) {
       notify.warning(t('chat.error.renameRequired'));
@@ -2193,15 +2196,17 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       const updated = await tenantClient.put<ChatSession>(`/api/chat/sessions/${renameSession.id}`, {
         title,
       });
+      if (!isWorkspaceCurrent()) return;
       setSessions((items) => items.map((item) => (item.id === updated.id ? updated : item)));
       setRenameSession(null);
       setRenameTitle('');
       notify.success(t('chat.notice.renamed'));
     } catch (error) {
+      if (!isWorkspaceCurrent()) return;
       console.error('[chat] rename session failed', error);
       notify.error(t('chat.error.renameFailed'));
     }
-  }, [renameSession, renameTitle, t, tenantClient, tenantId]);
+  }, [isWorkspaceCurrent, renameSession, renameTitle, t, tenantClient, tenantId]);
 
   const requestDelete = useCallback((session: ChatSession) => {
     setPendingDelete(session);
@@ -2210,7 +2215,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
   /** 删除会话并清理本地流状态；技术异常保留在日志，用户只看到稳定错误。 */
   const confirmDeleteSession = useCallback(async () => {
     const target = pendingDelete;
-    if (!target) return;
+    if (!target || !isWorkspaceCurrent()) return;
     setPendingDelete(null);
     const stream = getStreamSlot(target.id);
     stream.abortController?.abort();
@@ -2218,12 +2223,14 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     storeRef.current.delete(target.id);
     try {
       await tenantClient.delete(`/api/chat/sessions/${target.id}`);
+      if (!isWorkspaceCurrent()) return;
       forgetMissingSession(target.id);
       if (target.id === sessionId) {
         navigate(CHAT_BASE_PATH);
       }
       notify.success(t('chat.notice.deleted'));
     } catch (error) {
+      if (!isWorkspaceCurrent()) return;
       if (isAuthError(error)) {
         redirectToLogin();
         return;
@@ -2231,7 +2238,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       console.error('[chat] delete session failed', error);
       notify.error(t('chat.error.deleteFailed'));
     }
-  }, [forgetMissingSession, getStreamSlot, navigate, pendingDelete, redirectToLogin, t, tenantClient, sessionId, tenantId]);
+  }, [forgetMissingSession, getStreamSlot, isWorkspaceCurrent, navigate, pendingDelete, redirectToLogin, t, tenantClient, sessionId, tenantId]);
 
   const abortStream = useCallback(() => {
     if (!activeConversationId) return;
@@ -2304,7 +2311,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
 
   /** 保存消息反馈并在请求失败时恢复本地状态，错误文本不直接暴露服务端异常。 */
   const rateMessage = useCallback(async (item: ChatMessage, rating: 'up' | 'down') => {
-    if (!sessionId) return;
+    if (!sessionId || !isWorkspaceCurrent()) return;
     const previous = item.feedback_rating || null;
     const next = previous === rating ? null : rating;
     updateMessageFeedback(sessionId, item.id, next);
@@ -2314,7 +2321,9 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       } else {
         await tenantClient.delete(`/api/chat/messages/${item.id}/feedback`);
       }
+      if (!isWorkspaceCurrent()) return;
     } catch (error) {
+      if (!isWorkspaceCurrent()) return;
       updateMessageFeedback(sessionId, item.id, previous);
       if (isAuthError(error)) {
         redirectToLogin();
@@ -2323,11 +2332,11 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       console.error('[chat] message feedback failed', error);
       notify.error(t('chat.error.feedbackFailed'));
     }
-  }, [redirectToLogin, sessionId, t, tenantClient, tenantId, updateMessageFeedback]);
+  }, [isWorkspaceCurrent, redirectToLogin, sessionId, t, tenantClient, tenantId, updateMessageFeedback]);
 
   /** 将用户确认的定时任务写入服务端；任务标题作为业务值插入本地化通知。 */
   const confirmScheduledTask = useCallback(async (draft: ScheduledTaskDraftRead, draftKey?: string) => {
-    if (!sessionId) return;
+    if (!sessionId || !isWorkspaceCurrent()) return;
     try {
       const saved = await tenantClient.post<ScheduledTaskRead>('/api/chat/scheduled-tasks', {
         agent_id: draft.agent_id,
@@ -2348,6 +2357,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
           reason: draft.reason,
         },
       });
+      if (!isWorkspaceCurrent()) return;
       const createdKey = draftKey || `session:${sessionId}`;
       setCreatedScheduledTasks((prev) => ({ ...prev, [createdKey]: saved }));
       setScheduledDrafts((prev) => {
@@ -2357,6 +2367,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       });
       notify.success(t('chat.notice.scheduledEnabled', { title: saved.title }));
     } catch (error) {
+      if (!isWorkspaceCurrent()) return;
       if (isAuthError(error)) {
         redirectToLogin();
         return;
@@ -2364,7 +2375,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       console.error('[chat] scheduled task creation failed', error);
       notify.error(t('chat.error.scheduleCreateFailed'));
     }
-  }, [redirectToLogin, sessionId, t, tenantClient, tenantId]);
+  }, [isWorkspaceCurrent, redirectToLogin, sessionId, t, tenantClient, tenantId]);
 
   const dismissScheduledTaskDraft = useCallback((messageId?: string) => {
     if (!sessionId) return;

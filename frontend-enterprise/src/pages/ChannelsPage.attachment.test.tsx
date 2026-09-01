@@ -174,6 +174,9 @@ describe('ChannelsPage attachment lifecycle', () => {
       );
     });
     expect(screen.queryByRole('img', { name: 'evidence.png' })).toBeNull();
+    await user.click(await screen.findByText('附件渠道'));
+    await user.click(await screen.findByText('附件会话'));
+    expect(screen.queryByRole('img', { name: 'evidence.png' })).toBeNull();
     replacementAttachment.resolve(response(null));
     await waitFor(() => expect(screen.getByRole('img', { name: 'evidence.png' }).getAttribute('src')).toBe('blob:tenant-two'));
   });

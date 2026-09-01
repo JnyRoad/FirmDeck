@@ -15,12 +15,26 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { StreamEvent } from '@/api/client';
 import { I18nProvider } from '@/i18n';
-import type { AgentProfileRead, ChatSession, ModelConfigRead } from '@/types';
+import type {
+  AgentProfileRead,
+  ChatMessage,
+  ChatSession,
+  HumanHandoffRead,
+  ModelConfigRead,
+  ScheduledTaskDraftRead,
+} from '@/types';
 
 import { useChatSession } from './useChatSession';
 
 const streamChatTurnMock = vi.hoisted(() => vi.fn());
 const uploadChatAttachmentsMock = vi.hoisted(() => vi.fn());
+const toastSpies = vi.hoisted(() => ({
+  error: vi.fn(),
+  info: vi.fn(),
+  loading: vi.fn(),
+  success: vi.fn(),
+  warning: vi.fn(),
+}));
 
 vi.mock('@/api/client', async () => {
   const actual = await vi.importActual<typeof import('@/api/client')>('@/api/client');
@@ -30,6 +44,8 @@ vi.mock('@/api/client', async () => {
     uploadChatAttachments: uploadChatAttachmentsMock,
   };
 });
+
+vi.mock('@/components/ui/app-toast', () => ({ notify: toastSpies }));
 
 const AUTH_STORAGE_KEY = 'ultrarag_auth';
 const TENANT_CONTEXT_MODULE_PATH = '../../contexts/TenantSessionContext';
@@ -252,21 +268,31 @@ const modelConfig: ModelConfigRead = {
 
 type FetchCall = [RequestInfo | URL, RequestInit | undefined];
 
+type TenantRequestHandler = (
+  input: RequestInfo | URL,
+  init?: RequestInit,
+) => Response | Promise<Response> | undefined;
+
 function stubTenantFetch(options: {
   sessions?: Promise<Response>;
   events?: Promise<Response>;
   sessionList?: ChatSession[];
   selectedSessions?: Record<string, ChatSession>;
-  verifiedSession?: TenantAuthSessionFixture;
+  verifiedSession?: TenantAuthSessionFixture | ((init?: RequestInit) => TenantAuthSessionFixture);
+  requestHandler?: TenantRequestHandler;
 }) {
   const calls: FetchCall[] = [];
   const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
     calls.push([input, init]);
     const url = String(input);
     if (url.includes('/api/auth/me')) {
-      const verifiedSession = options.verifiedSession || readStoredTenantSession();
+      const verifiedSession = typeof options.verifiedSession === 'function'
+        ? options.verifiedSession(init)
+        : options.verifiedSession || readStoredTenantSession();
       return Promise.resolve(jsonResponse(verifiedSession.user));
     }
+    const customResponse = options.requestHandler?.(input, init);
+    if (customResponse !== undefined) return Promise.resolve(customResponse);
     if (url.includes('/api/chat/sessions?')) {
       return options.sessions || Promise.resolve(jsonResponse(options.sessionList || []));
     }
@@ -313,10 +339,90 @@ async function renderVerifiedTenantHook(
   return renderHook(() => useChatSession(options), { wrapper });
 }
 
+/** 渲染一个可替换已验证租户的 hook；切换保留 hook 实例以复现旧请求跨 generation 收敛。 */
+async function renderSwitchableTenantHook(
+  initialPath: string,
+  session: TenantAuthSessionFixture,
+  options: Parameters<typeof useChatSession>[0] = {},
+) {
+  const context = await loadTenantContext();
+  const Provider = context?.TenantSessionProvider || LocalVerifiedTenantProvider;
+  let currentSession = session;
+  const wrapper = ({ children }: { children: ReactNode }) => (
+    <Provider session={currentSession}>
+      <I18nProvider>
+        <MemoryRouter initialEntries={[initialPath]}>
+          <Routes>
+            <Route path="/workspace/chat/:sessionId" element={<>{children}</>} />
+            <Route path="/workspace/chat" element={<>{children}</>} />
+            <Route path="/workspace/gallery" element={<>{children}</>} />
+          </Routes>
+        </MemoryRouter>
+      </I18nProvider>
+    </Provider>
+  );
+  const hook = renderHook(() => useChatSession(options), { wrapper });
+
+  /** 切换到下一已验证租户并等待新 generation 对 hook 可见。 */
+  const switchTenant = async (nextSession: TenantAuthSessionFixture) => {
+    currentSession = nextSession;
+    await act(async () => {
+      hook.rerender();
+      await Promise.resolve();
+    });
+    await waitFor(() => {
+      expect(hook.result.current.auth?.tenant.id).toBe(nextSession.tenant.id);
+    });
+  };
+
+  return { hook, switchTenant };
+}
+
+/** 构造带稳定 ID 的人工接续 fixture，供跨租户同 ID 竞争测试复用。 */
+function tenantHandoff(tenantId: string, handoffId = 'handoff-shared'): HumanHandoffRead {
+  return {
+    id: handoffId,
+    tenant_id: tenantId,
+    session_id: 'session-shared',
+    agent_id: 'agent-1',
+    status: 'pending',
+    created_at: '2026-08-31T00:00:00Z',
+    updated_at: '2026-08-31T00:00:00Z',
+  };
+}
+
+/** 构造带指定反馈状态的消息 fixture，供反馈回滚隔离测试复用。 */
+function tenantMessage(feedbackRating: ChatMessage['feedback_rating']): ChatMessage {
+  return {
+    id: 'message-shared',
+    role: 'assistant',
+    content: 'Shared tenant message',
+    created_at: '2026-08-31T00:00:00Z',
+    feedback_rating: feedbackRating,
+  };
+}
+
+const scheduledTaskDraft: ScheduledTaskDraftRead = {
+  should_create: true,
+  tenant_id: 'tenant-a',
+  agent_id: 'agent-1',
+  title: 'Shared scheduled task',
+  prompt: 'Run the shared task',
+  schedule_type: 'daily',
+  schedule: { hour: 9 },
+  timezone: 'UTC',
+  confidence: 0.99,
+};
+
 beforeEach(() => {
   window.localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify(tenantAuthSession('tenant-a')));
   streamChatTurnMock.mockReset();
   uploadChatAttachmentsMock.mockReset();
+  toastSpies.error.mockReset();
+  toastSpies.info.mockReset();
+  toastSpies.loading.mockReset();
+  toastSpies.success.mockReset();
+  toastSpies.warning.mockReset();
 });
 
 afterEach(() => {
@@ -506,6 +612,7 @@ describe('useChatSession tenant replacement RED contracts', () => {
 
 describe('useChatSession tenant client callback dependencies', () => {
   const callbackBoundaries = [
+    ['replyToHandoff', '  /** 校验并提交人工接续文本'] as const,
     ['saveRename', '  const requestDelete'] as const,
     ['confirmDeleteSession', '  const abortStream'] as const,
     ['abortStream', '  /** 保存消息反馈'] as const,
@@ -523,5 +630,285 @@ describe('useChatSession tenant client callback dependencies', () => {
     const block = source.slice(start, end);
     const dependencyList = block.match(/\}, \[([\s\S]*)\]\);\s*$/)?.[1] || '';
     expect(dependencyList.split(',').map((dependency) => dependency.trim())).toContain('tenantClient');
+  });
+});
+
+/** 读取请求 URL 中由 tenant client 注入的租户身份。 */
+function requestTenantId(input: RequestInfo | URL): string {
+  return new URL(String(input), window.location.origin).searchParams.get('tenant_id') || '';
+}
+
+/** 读取请求路径以便测试只拦截目标 API 调用。 */
+function requestPath(input: RequestInfo | URL): string {
+  return new URL(String(input), window.location.origin).pathname;
+}
+
+/** 按请求 bearer 返回对应租户 fixture，模拟 provider 的服务端身份验证。 */
+function verifiedSessionForRequest(
+  sessionA: TenantAuthSessionFixture,
+  sessionB: TenantAuthSessionFixture,
+) {
+  return (init?: RequestInit) => {
+    const authorization = new Headers(init?.headers).get('Authorization');
+    return authorization === `Bearer ${sessionB.token}` ? sessionB : sessionA;
+  };
+}
+
+describe('useChatSession stale tenant callback side effects', () => {
+  it('does not toast or remove the current handoff when an old reply is superseded', async () => {
+    const replyRequest = deferred<Response>();
+    const sessionA = tenantAuthSession('tenant-a');
+    const sessionB = tenantAuthSession('tenant-b', 'user-tenant-b');
+    const handoffA = tenantHandoff('tenant-a');
+    const handoffB = tenantHandoff('tenant-b');
+    const { fetchMock } = stubTenantFetch({
+      verifiedSession: verifiedSessionForRequest(sessionA, sessionB),
+      requestHandler: (input, init) => {
+        const tenantId = requestTenantId(input);
+        const pathname = requestPath(input);
+        if (pathname === '/api/chat/handoffs' && tenantId === 'tenant-a') {
+          return jsonResponse([handoffA]);
+        }
+        if (pathname === '/api/chat/handoffs' && tenantId === 'tenant-b') {
+          return jsonResponse([handoffB]);
+        }
+        if (
+          pathname === `/api/chat/handoffs/${handoffA.id}/reply`
+          && tenantId === 'tenant-a'
+          && init?.method === 'POST'
+        ) {
+          return replyRequest.promise;
+        }
+        return undefined;
+      },
+    });
+    const { hook, switchTenant } = await renderSwitchableTenantHook('/workspace/chat', sessionA);
+
+    await waitFor(() => expect(hook.result.current.handoffs).toEqual([handoffA]));
+    act(() => hook.result.current.setHandoffReplies({ [handoffA.id]: 'tenant A reply' }));
+    act(() => hook.result.current.submitHandoffReply(handoffA));
+    await waitFor(() => expect(fetchMock.mock.calls.some(([input, init]) => (
+      requestPath(input) === `/api/chat/handoffs/${handoffA.id}/reply`
+      && init?.method === 'POST'
+    ))).toBe(true));
+
+    await switchTenant(sessionB);
+    await waitFor(() => expect(hook.result.current.handoffs).toEqual([handoffB]));
+    replyRequest.resolve(jsonResponse(handoffA));
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(hook.result.current.handoffs).toEqual([handoffB]);
+    expect(toastSpies.success).not.toHaveBeenCalled();
+    expect(toastSpies.error).not.toHaveBeenCalled();
+  });
+
+  it('does not toast or replace the current session when an old rename is superseded', async () => {
+    const renameRequest = deferred<Response>();
+    const sessionA = tenantAuthSession('tenant-a');
+    const sessionB = tenantAuthSession('tenant-b', 'user-tenant-b');
+    const sessionARecord = tenantSession('tenant-a', 'session-shared');
+    const sessionBRecord = tenantSession('tenant-b', 'session-shared', 'user-tenant-b');
+    const { fetchMock } = stubTenantFetch({
+      sessionList: [sessionARecord],
+      verifiedSession: verifiedSessionForRequest(sessionA, sessionB),
+      requestHandler: (input, init) => {
+        const tenantId = requestTenantId(input);
+        const pathname = requestPath(input);
+        if (pathname === '/api/chat/sessions' && tenantId === 'tenant-b') {
+          return jsonResponse([sessionBRecord]);
+        }
+        if (
+          pathname === `/api/chat/sessions/${sessionARecord.id}`
+          && tenantId === 'tenant-a'
+          && init?.method === 'PUT'
+        ) {
+          return renameRequest.promise;
+        }
+        return undefined;
+      },
+    });
+    const { hook, switchTenant } = await renderSwitchableTenantHook('/workspace/chat', sessionA);
+
+    await waitFor(() => expect(hook.result.current.sessions).toEqual([sessionARecord]));
+    act(() => {
+      hook.result.current.openRename(sessionARecord);
+      hook.result.current.setRenameTitle('tenant A renamed');
+    });
+    const pendingRename = hook.result.current.saveRename();
+    await waitFor(() => expect(fetchMock.mock.calls.some(([input, init]) => (
+      requestPath(input) === `/api/chat/sessions/${sessionARecord.id}`
+      && init?.method === 'PUT'
+    ))).toBe(true));
+
+    await switchTenant(sessionB);
+    await waitFor(() => expect(hook.result.current.sessions).toEqual([sessionBRecord]));
+    renameRequest.resolve(jsonResponse({ ...sessionARecord, title: 'stale A title' }));
+
+    await pendingRename;
+    expect(hook.result.current.sessions).toEqual([sessionBRecord]);
+    expect(toastSpies.success).not.toHaveBeenCalled();
+    expect(toastSpies.error).not.toHaveBeenCalled();
+  });
+
+  it('does not toast or remove the current session when an old delete is superseded', async () => {
+    const deleteRequest = deferred<Response>();
+    const sessionA = tenantAuthSession('tenant-a');
+    const sessionB = tenantAuthSession('tenant-b', 'user-tenant-b');
+    const sessionARecord = tenantSession('tenant-a', 'session-shared');
+    const sessionBRecord = tenantSession('tenant-b', 'session-shared', 'user-tenant-b');
+    const { fetchMock } = stubTenantFetch({
+      sessionList: [sessionARecord],
+      verifiedSession: verifiedSessionForRequest(sessionA, sessionB),
+      requestHandler: (input, init) => {
+        const tenantId = requestTenantId(input);
+        const pathname = requestPath(input);
+        if (pathname === '/api/chat/sessions' && tenantId === 'tenant-b') {
+          return jsonResponse([sessionBRecord]);
+        }
+        if (
+          pathname === `/api/chat/sessions/${sessionARecord.id}`
+          && tenantId === 'tenant-a'
+          && init?.method === 'DELETE'
+        ) {
+          return deleteRequest.promise;
+        }
+        return undefined;
+      },
+    });
+    const { hook, switchTenant } = await renderSwitchableTenantHook('/workspace/chat', sessionA);
+
+    await waitFor(() => expect(hook.result.current.sessions).toEqual([sessionARecord]));
+    act(() => hook.result.current.requestDelete(sessionARecord));
+    const pendingDelete = hook.result.current.confirmDeleteSession();
+    await waitFor(() => expect(fetchMock.mock.calls.some(([input, init]) => (
+      requestPath(input) === `/api/chat/sessions/${sessionARecord.id}`
+      && init?.method === 'DELETE'
+    ))).toBe(true));
+
+    await switchTenant(sessionB);
+    await waitFor(() => expect(hook.result.current.sessions).toEqual([sessionBRecord]));
+    deleteRequest.resolve(jsonResponse({}));
+
+    await pendingDelete;
+    expect(hook.result.current.sessions).toEqual([sessionBRecord]);
+    expect(toastSpies.success).not.toHaveBeenCalled();
+    expect(toastSpies.error).not.toHaveBeenCalled();
+  });
+
+  it('only restores feedback in the current workspace when an old rating is superseded', async () => {
+    const feedbackRequest = deferred<Response>();
+    const sessionA = tenantAuthSession('tenant-a');
+    const sessionB = tenantAuthSession('tenant-b', 'user-tenant-b');
+    const sessionARecord = tenantSession('tenant-a', 'session-shared');
+    const sessionBRecord = tenantSession('tenant-b', 'session-shared', 'user-tenant-b');
+    const messageA = tenantMessage('up');
+    const messageB = tenantMessage('down');
+    const { fetchMock } = stubTenantFetch({
+      sessionList: [],
+      verifiedSession: verifiedSessionForRequest(sessionA, sessionB),
+      requestHandler: (input, init) => {
+        const tenantId = requestTenantId(input);
+        const pathname = requestPath(input);
+        if (pathname === '/api/chat/sessions' && tenantId === 'tenant-b') {
+          return jsonResponse([]);
+        }
+        if (
+          pathname === `/api/chat/sessions/${sessionARecord.id}`
+          && (tenantId === 'tenant-a' || tenantId === 'tenant-b')
+          && init?.method === 'GET'
+        ) {
+          return Promise.reject(new Error('selected session is outside this test'));
+        }
+        if (
+          pathname === `/api/chat/sessions/${sessionARecord.id}/messages`
+          && tenantId === 'tenant-a'
+        ) {
+          return jsonResponse([messageA]);
+        }
+        if (
+          pathname === `/api/chat/sessions/${sessionBRecord.id}/messages`
+          && tenantId === 'tenant-b'
+        ) {
+          return jsonResponse([messageB]);
+        }
+        if (
+          pathname === `/api/chat/messages/${messageA.id}/feedback`
+          && tenantId === 'tenant-a'
+          && init?.method === 'POST'
+        ) {
+          return feedbackRequest.promise;
+        }
+        return undefined;
+      },
+    });
+    const { hook, switchTenant } = await renderSwitchableTenantHook('/workspace/chat/session-shared', sessionA);
+
+    await waitFor(() => expect(hook.result.current.displayedMessages).toEqual([messageA]));
+    const pendingFeedback = hook.result.current.rateMessage(messageA, 'down');
+    await waitFor(() => expect(fetchMock.mock.calls.some(([input, init]) => (
+      requestPath(input) === `/api/chat/messages/${messageA.id}/feedback`
+      && init?.method === 'POST'
+    ))).toBe(true));
+
+    await switchTenant(sessionB);
+    await waitFor(() => expect(hook.result.current.displayedMessages).toEqual([messageB]));
+    feedbackRequest.resolve(jsonResponse({}));
+
+    await pendingFeedback;
+    expect(hook.result.current.displayedMessages).toEqual([messageB]);
+    expect(hook.result.current.displayedMessages[0]?.feedback_rating).toBe('down');
+    expect(toastSpies.error).not.toHaveBeenCalled();
+  });
+
+  it('does not toast or create a task when an old scheduled-task confirmation is superseded', async () => {
+    const scheduledTaskRequest = deferred<Response>();
+    const sessionA = tenantAuthSession('tenant-a');
+    const sessionB = tenantAuthSession('tenant-b', 'user-tenant-b');
+    const sessionARecord = tenantSession('tenant-a', 'session-shared');
+    const { fetchMock } = stubTenantFetch({
+      sessionList: [],
+      verifiedSession: verifiedSessionForRequest(sessionA, sessionB),
+      requestHandler: (input, init) => {
+        const tenantId = requestTenantId(input);
+        const pathname = requestPath(input);
+        if (pathname === '/api/chat/sessions' && tenantId === 'tenant-b') {
+          return jsonResponse([]);
+        }
+        if (
+          pathname === `/api/chat/sessions/${sessionARecord.id}`
+          && (tenantId === 'tenant-a' || tenantId === 'tenant-b')
+          && init?.method === 'GET'
+        ) {
+          return Promise.reject(new Error('selected session is outside this test'));
+        }
+        if (
+          pathname === '/api/chat/scheduled-tasks'
+          && tenantId === 'tenant-a'
+          && init?.method === 'POST'
+        ) {
+          return scheduledTaskRequest.promise;
+        }
+        return undefined;
+      },
+    });
+    const { hook, switchTenant } = await renderSwitchableTenantHook('/workspace/chat/session-shared', sessionA);
+
+    await waitFor(() => expect(hook.result.current.auth?.tenant.id).toBe('tenant-a'));
+    const pendingTask = hook.result.current.confirmScheduledTask(scheduledTaskDraft);
+    await waitFor(() => expect(fetchMock.mock.calls.some(([input, init]) => (
+      requestPath(input) === '/api/chat/scheduled-tasks'
+      && init?.method === 'POST'
+    ))).toBe(true));
+
+    await switchTenant(sessionB);
+    scheduledTaskRequest.resolve(jsonResponse({ id: 'stale-task', title: scheduledTaskDraft.title }));
+
+    await pendingTask;
+    expect(hook.result.current.createdScheduledTasks).toEqual({});
+    expect(toastSpies.success).not.toHaveBeenCalled();
+    expect(toastSpies.error).not.toHaveBeenCalled();
   });
 });

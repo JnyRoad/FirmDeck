@@ -3,7 +3,7 @@
 import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { I18nProvider } from '@/i18n';
 import type { EnterpriseAuthUser } from '@/auth';
@@ -16,18 +16,21 @@ import type {
 
 import ChannelsPage from './ChannelsPage';
 
-vi.mock('../contexts/TenantSessionContext', () => {
-  const context = {
+const tenantContextMock = vi.hoisted(() => ({
+  context: {
     tenantId: 'tenant_demo',
     tenantSlug: 'tenant-demo',
     userId: 'user-1',
     generation: 1,
     signal: new AbortController().signal,
     session: { token: 'test-token' },
-    isCurrentGeneration: () => true,
-  };
-  return { useTenantSession: () => context };
-});
+    isCurrentGeneration: (_generation: number): boolean => true,
+  },
+}));
+
+vi.mock('../contexts/TenantSessionContext', () => ({
+  useTenantSession: () => tenantContextMock.context,
+}));
 
 const adminUser: EnterpriseAuthUser = {
   id: 'user-1',
@@ -180,6 +183,11 @@ function createPostBody(fetchMock: ReturnType<typeof makeFetchMock>): Record<str
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
+});
+
+beforeEach(() => {
+  tenantContextMock.context.generation = 1;
+  tenantContextMock.context.isCurrentGeneration = (_generation: number) => true;
 });
 
 describe('ChannelsPage', () => {
@@ -443,5 +451,48 @@ describe('ChannelsPage', () => {
 
     expect(screen.getByText(/加载中/)).toBeTruthy();
     requestB.resolve(jsonResponse({ items: [], total: 0, offset: 0, limit: 20 }));
+  });
+
+  it('does not keep the previous tenant binding detail visible during the next generation load', async () => {
+    const user = userEvent.setup();
+    const previousBinding: ChannelBindingRead = {
+      ...teamBinding,
+      id: 'binding-old-tenant',
+      name: '旧租户渠道',
+      team_id: null,
+      team_name: null,
+      my_role: 'owner',
+    };
+    const nextBindings = new Promise<Response>(() => {});
+    const baseFetch = makeFetchMock({ bindings: [previousBinding] });
+    let bindingRequestCount = 0;
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method || 'GET';
+      if (method === 'GET' && url.split('?')[0].endsWith('/api/enterprise/channels')) {
+        bindingRequestCount += 1;
+        return bindingRequestCount === 1
+          ? Promise.resolve(jsonResponse([previousBinding]))
+          : nextBindings;
+      }
+      return baseFetch(input, init);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const view = renderPage();
+    await user.click(await screen.findByText('旧租户渠道'));
+    expect(screen.getAllByText('旧租户渠道').length).toBeGreaterThan(0);
+
+    tenantContextMock.context.generation = 2;
+    tenantContextMock.context.isCurrentGeneration = (generation: number) => generation === 2;
+    view.rerender(
+      <I18nProvider>
+        <MemoryRouter>
+          <ChannelsPage currentUser={adminUser} />
+        </MemoryRouter>
+      </I18nProvider>,
+    );
+
+    expect(screen.queryAllByText('旧租户渠道')).toHaveLength(0);
   });
 });

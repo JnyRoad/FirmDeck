@@ -580,6 +580,7 @@ class HarnessCapabilityInvoker:
         self,
         logical_action_key: str,
     ) -> dict[str, Any] | None:
+        """Replay a completed action or block a duplicate whose remote outcome is unknown."""
         prior = self.db.exec(
             select(HarnessInvocationRecord).where(
                 HarnessInvocationRecord.logical_action_key
@@ -593,13 +594,15 @@ class HarnessCapabilityInvoker:
             and prior.response_cache_json.get("success") is True
         ):
             return _replayed_result(prior)
-        return _failure(
+        blocked = _failure(
             "TOOL_CALL_OUTCOME_UNKNOWN",
             (
                 "相同副作用调用已有未完成的持久化记录；为避免重复提交，"
                 "Harness 不会自动重试，请先核对外部系统状态。"
             ),
         )
+        blocked["error"]["outcome_unknown"] = True
+        return blocked
 
     def _raise_if_cancelled(self) -> None:
         if callable(self.is_cancelled) and self.is_cancelled():

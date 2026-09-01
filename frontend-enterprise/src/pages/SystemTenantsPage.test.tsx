@@ -5,11 +5,25 @@ import userEvent from '@testing-library/user-event';
 import type { ComponentType } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import type {
+  PasswordPolicy,
+  SystemPasswordPolicies,
+  TenantPasswordPolicy,
+} from '@/api/system-client';
 import { I18nProvider } from '../i18n';
 import type { AppLocale } from '../i18n/locales';
 
 const SYSTEM_TENANTS_MODULE_PATH = './SystemTenantsPage';
-const TEMPORARY_PASSWORD = 'Temporary-secret-2026';
+const TEMPORARY_PASSWORD = 'Temporary-secret-26';
+const DEFAULT_PASSWORD_POLICY: PasswordPolicy = {
+  min_length: 8,
+  max_length: 20,
+  complexity_enabled: false,
+  require_uppercase: false,
+  require_lowercase: false,
+  require_digit: false,
+  require_special: false,
+};
 
 type TenantSummary = {
   id: string;
@@ -99,6 +113,8 @@ type PageClient = {
     input?: { cursor?: string; limit?: number },
   ): Promise<{ items: TenantAudit[]; next_cursor: string | null }>;
   getCodexA2ARuntimeStatus?(): Promise<RuntimeStatus>;
+  getPasswordPolicies?(): Promise<SystemPasswordPolicies>;
+  getTenantPasswordPolicy?(tenantId: string): Promise<TenantPasswordPolicy>;
 };
 
 type PageProps = {
@@ -341,6 +357,7 @@ describe('SystemTenantsPage', () => {
     expect(within(dialog).getByLabelText('初始管理员账号')).toBeTruthy();
     expect(within(dialog).getByLabelText('初始管理员名称')).toBeTruthy();
     expect(within(dialog).getByLabelText('临时密码').getAttribute('type')).toBe('password');
+    expect(within(dialog).getByText('创建一个活动租户并设置首个租户管理员，同时预置 10 名租户员工。预置能力会绑定到这些员工并发布到员工广场；不会复制租户业务记录。')).toBeTruthy();
     expect(within(dialog).getByRole('button', { name: '取消' })).toBeTruthy();
     expect(within(dialog).getByRole('button', { name: '创建租户' })).toBeTruthy();
   });
@@ -362,12 +379,12 @@ describe('SystemTenantsPage', () => {
     expect(alert.textContent).toContain('租户标识必须为 3 至 63 位小写字母、数字或连字符');
     expect(alert.textContent).toContain('请输入租户名称');
     expect(alert.textContent).toContain('请输入初始管理员账号');
-    expect(alert.textContent).toContain('临时密码至少需要 12 位');
+    expect(alert.textContent).toContain('临时密码长度必须为 8–20 位');
     for (const [label, message] of [
       ['租户标识', '租户标识必须为 3 至 63 位小写字母、数字或连字符'],
       ['租户名称', '请输入租户名称'],
       ['初始管理员账号', '请输入初始管理员账号'],
-      ['临时密码', '临时密码至少需要 12 位'],
+      ['临时密码', '临时密码长度必须为 8–20 位'],
     ]) {
       const control = within(dialog).getByLabelText(label);
       expect(control.getAttribute('aria-invalid')).toBe('true');
@@ -376,6 +393,54 @@ describe('SystemTenantsPage', () => {
       expect(document.getElementById(describedBy || '')?.textContent).toContain(message);
     }
     expect(client.provisionTenant).not.toHaveBeenCalled();
+  });
+
+  it('uses the tenant-default password policy for creation validation and field constraints', async () => {
+    const user = userEvent.setup();
+    const tenantDefault: PasswordPolicy = {
+      ...DEFAULT_PASSWORD_POLICY,
+      min_length: 10,
+      max_length: 16,
+      complexity_enabled: true,
+      require_uppercase: true,
+      require_lowercase: true,
+      require_digit: true,
+      require_special: true,
+    };
+    const getPasswordPolicies = vi.fn(async (): Promise<SystemPasswordPolicies> => ({
+      system: DEFAULT_PASSWORD_POLICY,
+      tenant_default: tenantDefault,
+    }));
+    const provisionTenant = vi.fn(async () => tenant);
+    const client = createPageClient({ getPasswordPolicies, provisionTenant });
+    await renderPage(client);
+    const dialog = await openCreateDialog(user);
+    const password = within(dialog).getByLabelText('临时密码');
+
+    await waitFor(() => expect(getPasswordPolicies).toHaveBeenCalledTimes(1));
+    expect(password.getAttribute('minlength')).toBe('10');
+    expect(password.getAttribute('maxlength')).toBe('16');
+    expect(password.getAttribute('placeholder')).toBe('请输入 10–16 位，仅用于首次登录；复杂度规则按当前策略执行');
+    expect(within(dialog).getByText('要求大写字母')).toBeTruthy();
+    expect(within(dialog).getByText('要求小写字母')).toBeTruthy();
+    expect(within(dialog).getByText('要求数字')).toBeTruthy();
+    expect(within(dialog).getByText('要求特殊字符')).toBeTruthy();
+
+    await user.type(within(dialog).getByLabelText('租户标识'), 'alpha-lab');
+    await user.type(within(dialog).getByLabelText('租户名称'), 'Alpha Lab');
+    await user.type(within(dialog).getByLabelText('初始管理员账号'), 'admin');
+    await user.type(password, 'abcdefghij');
+    await user.click(within(dialog).getByRole('button', { name: '创建租户' }));
+
+    expect(within(dialog).getByRole('alert').textContent).toContain('临时密码未满足已启用的复杂度规则');
+    expect(provisionTenant).not.toHaveBeenCalled();
+
+    await user.clear(password);
+    await user.type(password, 'Abcdefgh1!');
+    await user.click(within(dialog).getByRole('button', { name: '创建租户' }));
+    await waitFor(() => expect(provisionTenant).toHaveBeenCalledWith(expect.objectContaining({
+      initial_admin: expect.objectContaining({ temporary_password: 'Abcdefgh1!' }),
+    })));
   });
 
   it('submits the exact payload, displays the created tenant, and clears the temporary password', async () => {
@@ -864,6 +929,93 @@ describe('SystemTenantsPage', () => {
       (_, index) => window.localStorage.getItem(window.localStorage.key(index) || ''),
     ).join('\n');
     expect(persistedValues).not.toContain(TEMPORARY_PASSWORD);
+  });
+
+  it('keeps tenant detail and audit available when the effective policy request fails', async () => {
+    const user = userEvent.setup();
+    const getTenant = vi.fn(async () => tenantDetail);
+    const listTenantAudit = vi.fn(async () => ({ items: [], next_cursor: null }));
+    const getTenantPasswordPolicy = vi.fn(async (): Promise<TenantPasswordPolicy> => {
+      throw new Error('password policy unavailable');
+    });
+    const resetInitialAdminPassword = vi.fn(async () => undefined);
+    const client = createPageClient({
+      getTenant,
+      listTenantAudit,
+      getTenantPasswordPolicy,
+      resetInitialAdminPassword,
+    });
+    await renderPage(client);
+    await user.click(await screen.findByRole('button', { name: '查看租户详情：Alpha Lab' }));
+
+    const detail = await screen.findByRole('region', { name: '租户详情' });
+    expect(within(detail).getByText('Alpha Lab')).toBeTruthy();
+    expect(listTenantAudit).toHaveBeenCalledWith('tenant-alpha', { limit: 50 });
+    await user.click(within(detail).getByRole('button', { name: '重置初始管理员临时密码' }));
+
+    const dialog = screen.getByRole('dialog', { name: '重置初始管理员临时密码' });
+    const password = within(dialog).getByLabelText('新的临时密码');
+    expect(password.getAttribute('minlength')).toBe('8');
+    expect(password.getAttribute('maxlength')).toBe('20');
+    expect(password.getAttribute('placeholder')).toBe('请输入 8–20 位，仅用于首次登录；复杂度规则按当前策略执行');
+    expect(within(dialog).getByText('重置后现有会话会失效。请输入 8–20 位临时密码；如已启用复杂度规则，也必须满足这些规则。初始管理员下次登录必须修改。')).toBeTruthy();
+    await user.type(password, 'short');
+    await user.click(within(dialog).getByRole('button', { name: '确认重置临时密码' }));
+    expect(within(dialog).getByRole('alert').textContent).toContain('临时密码长度必须为 8–20 位');
+    expect(resetInitialAdminPassword).not.toHaveBeenCalled();
+  });
+
+  it('uses the selected tenant effective password policy for reset validation and field constraints', async () => {
+    const user = userEvent.setup();
+    const effectivePolicy: PasswordPolicy = {
+      ...DEFAULT_PASSWORD_POLICY,
+      min_length: 10,
+      max_length: 16,
+      complexity_enabled: true,
+      require_uppercase: true,
+      require_digit: true,
+    };
+    const getTenantPasswordPolicy = vi.fn(async (): Promise<TenantPasswordPolicy> => ({
+      mode: 'custom',
+      custom: effectivePolicy,
+      effective: effectivePolicy,
+    }));
+    const resetInitialAdminPassword = vi.fn(async () => undefined);
+    const client = createPageClient({
+      getTenant: vi.fn(async () => tenantDetail),
+      listTenantAudit: vi.fn(async () => ({ items: [], next_cursor: null })),
+      getTenantPasswordPolicy,
+      resetInitialAdminPassword,
+    });
+    await renderPage(client);
+    await user.click(await screen.findByRole('button', { name: '查看租户详情：Alpha Lab' }));
+    await waitFor(() => expect(getTenantPasswordPolicy).toHaveBeenCalledWith('tenant-alpha'));
+    const detail = await screen.findByRole('region', { name: '租户详情' });
+    await user.click(within(detail).getByRole('button', { name: '重置初始管理员临时密码' }));
+
+    const dialog = screen.getByRole('dialog', { name: '重置初始管理员临时密码' });
+    const password = within(dialog).getByLabelText('新的临时密码');
+    expect(password.getAttribute('minlength')).toBe('10');
+    expect(password.getAttribute('maxlength')).toBe('16');
+    expect(password.getAttribute('placeholder')).toBe('请输入 10–16 位，仅用于首次登录；复杂度规则按当前策略执行');
+    expect(within(dialog).getByText('要求大写字母')).toBeTruthy();
+    expect(within(dialog).getByText('要求数字')).toBeTruthy();
+    expect(within(dialog).queryByText('要求小写字母')).toBeNull();
+    expect(within(dialog).queryByText('要求特殊字符')).toBeNull();
+    expect(within(dialog).getByText('重置后现有会话会失效。请输入 10–16 位临时密码；如已启用复杂度规则，也必须满足这些规则。初始管理员下次登录必须修改。')).toBeTruthy();
+
+    await user.type(password, 'abcdefghij');
+    await user.click(within(dialog).getByRole('button', { name: '确认重置临时密码' }));
+    expect(within(dialog).getByRole('alert').textContent).toContain('临时密码未满足已启用的复杂度规则');
+    expect(resetInitialAdminPassword).not.toHaveBeenCalled();
+
+    await user.clear(password);
+    await user.type(password, 'Abcdefgh1!');
+    await user.click(within(dialog).getByRole('button', { name: '确认重置临时密码' }));
+    await waitFor(() => expect(resetInitialAdminPassword).toHaveBeenCalledWith(
+      'tenant-alpha',
+      { temporary_password: 'Abcdefgh1!' },
+    ));
   });
 
   it('keeps a successful password reset when the follow-up audit refresh fails', async () => {
