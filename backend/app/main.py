@@ -107,25 +107,32 @@ def on_startup() -> None:
             enqueue_due_webhook_deliveries()
             start_public_api_maintenance()
     except Exception:
-        stop_wechat_kf_account_recovery()
-        release_runtime_instance_lock()
+        recovery_stopped = stop_wechat_kf_account_recovery(
+            on_stopped=release_runtime_instance_lock
+        )
+        if recovery_stopped:
+            release_runtime_instance_lock()
         raise
 
 
 @app.on_event("shutdown")
 def on_shutdown() -> None:
+    recovery_stopped = False
     try:
         stop_codex_a2a_tasks()
         stop_codex_subscription_service()
         stop_public_api_maintenance()
-        stop_wechat_kf_account_recovery()
+        recovery_stopped = stop_wechat_kf_account_recovery(
+            on_stopped=release_runtime_instance_lock
+        )
         stop_channel_services()
         stop_background_worker()
         stop_timeout_sweeper()
         stop_harness_recovery_sweeper()
         shutdown_async_jobs()
     finally:
-        release_runtime_instance_lock()
+        if recovery_stopped:
+            release_runtime_instance_lock()
 
 
 @app.get("/api/health", tags=["health"])

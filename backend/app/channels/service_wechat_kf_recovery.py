@@ -30,8 +30,12 @@ def start_wechat_kf_account_recovery(reconcile: Callable[..., object]) -> bool:
         return True
 
 
-def stop_wechat_kf_account_recovery(*, timeout_seconds: float = 25.0) -> bool:
-    """请求停止恢复并有界等待；返回线程是否已经退出。"""
+def stop_wechat_kf_account_recovery(
+    *,
+    timeout_seconds: float = 25.0,
+    on_stopped: Callable[[], object] | None = None,
+) -> bool:
+    """请求停止恢复并有界等待；超时时在线程退出后执行延迟清理。"""
     with _recovery_lock:
         thread = _recovery_thread
         stop_event = _recovery_stop_event
@@ -42,7 +46,28 @@ def stop_wechat_kf_account_recovery(*, timeout_seconds: float = 25.0) -> bool:
     if thread is threading.current_thread():
         return False
     thread.join(timeout=max(0.0, timeout_seconds))
-    return not thread.is_alive()
+    if not thread.is_alive():
+        return True
+    if on_stopped is not None:
+        threading.Thread(
+            target=_run_after_wechat_kf_recovery_stops,
+            args=(thread, on_stopped),
+            name="wechat-kf-account-recovery-cleanup",
+            daemon=True,
+        ).start()
+    return False
+
+
+def _run_after_wechat_kf_recovery_stops(
+    thread: threading.Thread,
+    callback: Callable[[], object],
+) -> None:
+    """Wait outside the shutdown hook, then release resources retained for recovery safety."""
+    thread.join()
+    try:
+        callback()
+    except Exception:  # noqa: BLE001 - deferred shutdown cleanup must not crash the process
+        logger.exception("微信客服账号恢复延迟清理失败")
 
 
 def _run_wechat_kf_account_recovery(
