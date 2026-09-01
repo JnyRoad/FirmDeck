@@ -10,6 +10,7 @@ import { AppIntlProvider } from '@/i18n/provider';
 import type { AppLocale } from '@/i18n/locales';
 import type { AgentProfileRead, GeneralSkillRead } from '@/types';
 import { TooltipProvider } from '@/components/ui/tooltip';
+import { tenantUserStorageKey } from '@/lib/tenant-storage';
 
 /** 隔离 legacy 页头，让矩阵只验证 AppIntlProvider 下的产品文案与 raw 边界。 */
 vi.mock('../components/AppHeader', () => ({
@@ -48,7 +49,7 @@ const tenantContextMock = vi.hoisted(() => {
       userId: 'user-1',
       generation: 1,
       signal: controller.signal,
-      isCurrentGeneration: (generation: number) => generation === 1,
+      isCurrentGeneration: (generation: number): boolean => generation === 1,
     },
   };
 });
@@ -185,6 +186,7 @@ function renderSemanticGeneralSkills(locale: AppLocale): void {
 beforeEach(() => {
   stubBrowserApis();
   stubGeneralSkillsFetch();
+  tenantContextMock.context.generation = 1;
   tenantContextMock.context.isCurrentGeneration = (generation: number) => generation === 1;
   toastMocks.error.mockReset();
   toastMocks.info.mockReset();
@@ -254,6 +256,105 @@ describe('GeneralSkillsPage semantic locale matrix', () => {
       expect(toastMocks.error).not.toHaveBeenCalledWith(rawError);
     },
   );
+  });
+
+  it('clears a pending delete when the tenant generation changes', async () => {
+    const user = userEvent.setup();
+    const pendingDelete = deferred<Response>();
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (init?.method === 'DELETE' && url.includes('/api/enterprise/general-skills/')) {
+        return pendingDelete.promise;
+      }
+      if (url.includes('/api/enterprise/agents')) return jsonResponse([overallAgent]);
+      if (url.includes('/api/enterprise/general-skills')) return jsonResponse([rawSkill]);
+      return jsonResponse([]);
+    }));
+
+    const view = render(
+      <AppIntlProvider initialLocale="zh-CN">
+        <MemoryRouter>
+          <GeneralSkillsPage currentUser={{ id: 'user-1', tenant_id: 'tenant_demo', username: 'demo', role: 'admin' }} />
+        </MemoryRouter>
+      </AppIntlProvider>,
+    );
+
+    await screen.findAllByText(rawSkill.name);
+    await user.click(screen.getAllByRole('button', { name: '技能操作' })[0]);
+    await user.click(screen.getByRole('menuitem', { name: '删除' }));
+    const confirmButton = screen.getByRole('button', { name: '删除' });
+    await user.click(confirmButton);
+    await waitFor(() => expect((confirmButton as HTMLButtonElement).disabled).toBe(true));
+
+    tenantContextMock.context.generation = 2;
+    tenantContextMock.context.isCurrentGeneration = (generation: number) => generation === 2;
+    view.rerender(
+      <AppIntlProvider initialLocale="zh-CN">
+        <MemoryRouter>
+          <GeneralSkillsPage currentUser={{ id: 'user-1', tenant_id: 'tenant_demo', username: 'demo', role: 'admin' }} />
+        </MemoryRouter>
+      </AppIntlProvider>,
+    );
+
+    await waitFor(() => expect((confirmButton as HTMLButtonElement).disabled).toBe(false));
+  });
+
+  it('clears a pending employee skill import when the tenant generation changes', async () => {
+    const user = userEvent.setup();
+    const targetAgent: AgentProfileRead = {
+      ...overallAgent,
+      id: 'agent-target',
+      name: 'Target agent',
+      is_overall: false,
+      metadata: { owner_user_id: 'user-1' },
+    };
+    const sourceSkill: GeneralSkillRead = {
+      ...rawSkill,
+      id: 'general-skill-source',
+      slug: 'source_skill',
+      name: 'Source skill',
+    };
+    const pendingImport = deferred<Response>();
+    window.localStorage.setItem(
+      tenantUserStorageKey('tenant_demo', 'user-1', 'selected-agent'),
+      targetAgent.id,
+    );
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (init?.method === 'POST' && url.includes('/resources/import')) return pendingImport.promise;
+      if (url.includes('/api/enterprise/agents')) return jsonResponse([overallAgent, targetAgent]);
+      if (url.includes(`agent_id=${overallAgent.id}`)) return jsonResponse([sourceSkill]);
+      if (url.includes('/api/enterprise/general-skills')) return jsonResponse([rawSkill]);
+      return jsonResponse([]);
+    }));
+
+    const view = render(
+      <AppIntlProvider initialLocale="zh-CN">
+        <MemoryRouter>
+          <GeneralSkillsPage currentUser={{ id: 'user-1', tenant_id: 'tenant_demo', username: 'demo', role: 'admin' }} />
+        </MemoryRouter>
+      </AppIntlProvider>,
+    );
+
+    await screen.findAllByText(rawSkill.name);
+    await user.click(screen.getByRole('button', { name: /新增/ }));
+    await user.click(screen.getByRole('menuitem', { name: '从广场复制' }));
+    await user.click(await screen.findByRole('checkbox', { name: /Source skill/ }));
+    const copyButton = screen.getByRole('button', { name: '复制' });
+    await user.click(copyButton);
+    await waitFor(() => expect((copyButton as HTMLButtonElement).disabled).toBe(true));
+
+    tenantContextMock.context.generation = 2;
+    tenantContextMock.context.isCurrentGeneration = (generation: number) => generation === 2;
+    view.rerender(
+      <AppIntlProvider initialLocale="zh-CN">
+        <MemoryRouter>
+          <GeneralSkillsPage currentUser={{ id: 'user-1', tenant_id: 'tenant_demo', username: 'demo', role: 'admin' }} />
+        </MemoryRouter>
+      </AppIntlProvider>,
+    );
+
+    await waitFor(() => expect((copyButton as HTMLButtonElement).disabled).toBe(false));
   });
 
   it('does not toast or clear saving state when an import rejection belongs to an old generation', async () => {

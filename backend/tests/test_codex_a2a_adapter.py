@@ -437,6 +437,14 @@ def test_codex_a2a_authorization_never_accepts_an_empty_expected_credential(
     assert getattr(error.value, "status_code", None) == 401
 
 
+def test_codex_a2a_authorization_rejects_non_ascii_bearer_with_stable_401() -> None:
+    """A malformed Unicode bearer credential must be rejected without a comparison TypeError."""
+    with pytest.raises(HTTPException) as error:
+        codex_adapter._authorize(_TEST_CODEX_A2A_TOKEN, "Bearer 密码")
+
+    assert getattr(error.value, "status_code", None) == 401
+
+
 def test_codex_a2a_uses_public_task_id_and_supports_continuation(monkeypatch, tmp_path) -> None:
     client, engine = _client(monkeypatch, tmp_path)
     message = {

@@ -349,6 +349,41 @@ describe('App system route boundary', () => {
 });
 
 describe('App tenant session lifecycle RED contracts', () => {
+  it('keeps a tenant session on transient verification failure and lets the user retry', async () => {
+    const user = userEvent.setup();
+    let verificationAttempts = 0;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/api/auth/me')) {
+        verificationAttempts += 1;
+        if (verificationAttempts === 1) {
+          return {
+            ok: false,
+            status: 503,
+            statusText: 'Service Unavailable',
+            json: async () => ({}),
+            text: async () => '',
+          } as Response;
+        }
+        return jsonResponse(authUser);
+      }
+      if (url.includes('/api/enterprise/model-configs')) return jsonResponse([modelConfig]);
+      if (url.includes('/api/enterprise/') || url.includes('/api/chat/')) return jsonResponse([]);
+      return jsonResponse({});
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    window.history.pushState({}, '', '/workspace/gallery');
+
+    render(<I18nProvider><App /></I18nProvider>);
+
+    expect((await screen.findByRole('alert')).textContent).toContain('暂时无法验证当前会话');
+    expect(window.localStorage.getItem(AUTH_STORAGE_KEY)).not.toBeNull();
+    await user.click(screen.getByRole('button', { name: '重新验证' }));
+
+    await waitFor(() => expect(verificationAttempts).toBe(2));
+    await waitFor(() => expect(screen.queryByRole('alert')).toBeNull());
+  });
+
   it('does not mount a tenant business subtree on a direct deep link before session verification', async () => {
     const verification = deferred<Response>();
     const fetchMock = vi.fn((input: RequestInfo | URL) => {
@@ -445,6 +480,17 @@ describe('App tenant session lifecycle RED contracts', () => {
         passwordChanged = true;
         return jsonResponse(replacementSession);
       }
+      if (url.includes('/api/auth/password-policy')) {
+        return jsonResponse({
+          min_length: 8,
+          max_length: 20,
+          complexity_enabled: false,
+          require_uppercase: false,
+          require_lowercase: false,
+          require_digit: false,
+          require_special: false,
+        });
+      }
       if (url.includes('/api/auth/me')) {
         return jsonResponse(passwordChanged ? replacementSession.user : forcedUser);
       }
@@ -459,8 +505,8 @@ describe('App tenant session lifecycle RED contracts', () => {
     render(<I18nProvider><App /></I18nProvider>);
 
     await user.type(await screen.findByLabelText('当前密码'), 'Current-password-2026');
-    await user.type(screen.getByLabelText('新密码'), 'Replacement-password-2026');
-    await user.type(screen.getByLabelText('确认新密码'), 'Replacement-password-2026');
+    await user.type(screen.getByLabelText('新密码'), 'Replacement-2026');
+    await user.type(screen.getByLabelText('确认新密码'), 'Replacement-2026');
     await user.click(screen.getByRole('button', { name: '更新密码' }));
 
     await waitFor(() => expect(window.location.pathname).toBe('/workspace/gallery'));

@@ -741,9 +741,10 @@ class A2AClient:
                 run=run,
             )
             self._record_result(run, result, event_type="cancelled")
-        except A2AClientError:
+        except A2AClientError as exc:
             # A lifecycle error is authoritative even on a best-effort timeout cancellation.
-            raise
+            if not best_effort or exc.code in _LIFECYCLE_ERROR_CODES:
+                raise
         except Exception:
             if not best_effort:
                 raise

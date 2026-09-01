@@ -526,6 +526,8 @@ def test_turn_claim_is_durable_before_knowledge_version_freeze(monkeypatch) -> N
     )
 
     with Session(engine) as db:
+        db.add(Tenant(id="tenant-demo", name="Demo"))
+        db.commit()
         response = AgentLoop(db).handle_turn(request)
         records = db.exec(
             select(HarnessTurnRecord).where(
@@ -757,6 +759,8 @@ def test_harness_stream_retry_bootstraps_the_same_first_session(
     seen_session_ids: list[str] = []
 
     with Session(engine) as db:
+        db.add(Tenant(id="tenant-demo", name="Demo"))
+        db.commit()
         loop = AgentLoop(db)
 
         def fake_handle_turn(scoped: ChatTurnRequest) -> ChatTurnResponse:
@@ -791,6 +795,63 @@ def test_harness_stream_retry_bootstraps_the_same_first_session(
     assert "text" not in planning["data"]
     assert not [event for event in retry_events if event["event"] == "session_created"]
     assert [session.id for session in sessions] == [expected_session_id]
+
+
+def test_harness_stream_missing_tenant_fails_closed_without_creating_session(
+    monkeypatch,
+) -> None:
+    """A stream for a missing tenant must emit a lifecycle error before any session write."""
+    engine = _test_engine()
+    request = ChatTurnRequest(
+        tenant_id="tenant-missing",
+        user_id="user-1",
+        agent_id="agent-1",
+        client_turn_id="client-missing-tenant",
+        message="hello",
+    )
+    expected_session_id = _with_recoverable_first_session(request).session_id
+
+    with Session(engine) as db:
+        loop = AgentLoop(db)
+        monkeypatch.setattr(
+            loop,
+            "handle_turn",
+            lambda *_args, **_kwargs: pytest.fail("missing tenant reached Harness execution"),
+        )
+
+        events = list(loop._handle_turn_stream_v2(request))
+        sessions = db.exec(select(ChatSession)).all()
+
+    assert events == [
+        {
+            "event": "error",
+            "data": {
+                "kind": "error",
+                "sessionId": expected_session_id,
+                "code": "TENANT_NOT_FOUND",
+                "message": "TENANT_NOT_FOUND",
+                "client_turn_id": "client-missing-tenant",
+                "execution_engine": "harness_v2",
+            },
+        }
+    ]
+    assert sessions == []
+
+
+def test_harness_optional_tenant_admission_rejects_missing_tenant() -> None:
+    """The optional admission helper must not turn a missing authoritative tenant into no-op state."""
+    engine = _test_engine()
+    with Session(engine) as db:
+        harness = HarnessV2Engine.__new__(HarnessV2Engine)
+        harness.db = db
+
+        with pytest.raises(TenantLifecycleDenied) as denied:
+            harness._optional_tenant_admission(
+                tenant_id="tenant-missing",
+                correlation_id="missing-tenant-admission",
+            )
+
+    assert denied.value.code == "TENANT_NOT_FOUND"
 
 
 def test_turn_planner_falls_back_to_an_isolated_conversation_frame() -> None:
@@ -4006,6 +4067,74 @@ def test_harness_agent_keeps_tool_exception_private_in_public_trace(
     assert raw_error not in json.dumps(result.capability_results, ensure_ascii=False)
 
 
+def test_harness_agent_keeps_post_tool_lifecycle_denial_as_execution_fence(
+    monkeypatch,
+) -> None:
+    """A lifecycle denial after a tool call must fence the Harness rather than look upstream."""
+    actions = iter(
+        [
+            {
+                "action": "tool",
+                "tool_name": "orders.lookup",
+                "arguments": {"order_id": "SO-42"},
+            }
+        ]
+    )
+
+    class FakeLLMClient:
+        """Return one deterministic tool action at the model boundary."""
+
+        def __init__(self, _model_config: ModelConfig) -> None:
+            """Avoid external model initialization in this execution-fence contract test."""
+
+        def generate_json(self, _system_prompt, _payload):
+            """Return the next seeded Harness action."""
+            return next(actions)
+
+    monkeypatch.setattr(harness_agent_module, "LLMClient", FakeLLMClient)
+    tool_invoked = False
+
+    def admission_check() -> None:
+        """Deny the post-tool admission check while allowing setup and the tool itself."""
+        if tool_invoked:
+            raise TenantLifecycleDenied(
+                "TENANT_LIFECYCLE_CHECK_FAILED",
+                {
+                    "tenant_id": "tenant-demo",
+                    "execution_kind": "job.claim",
+                    "correlation_id": "corr-harness",
+                },
+            )
+
+    def invoke_tool(_name: str, _arguments: dict[str, object]) -> dict[str, object]:
+        """Mark the external invocation before the following admission check runs."""
+        nonlocal tool_invoked
+        tool_invoked = True
+        return {"success": True}
+
+    with pytest.raises(HarnessExecutionFenced):
+        HarnessTaskAgent().run(
+            TaskRequirement(
+                task_frame_id="task-tool-lifecycle-fence",
+                kind="conversation",
+                goal="查询订单",
+                capability_manifest=CapabilityManifest(
+                    available=[
+                        CapabilityDescriptor(
+                            capability_id="tool-orders-lookup",
+                            name="orders.lookup",
+                            kind="tool",
+                        )
+                    ]
+                ),
+            ),
+            _model_config(),
+            invoke_tool,
+            max_actions=1,
+            admission_check=admission_check,
+        )
+
+
 def test_harness_agent_executes_consecutive_json_actions_in_order(
     monkeypatch,
 ) -> None:
@@ -6136,6 +6265,7 @@ def test_harness_started_tool_call_records_unknown_outcome_after_suspension(
         ).one()
         assert result["success"] is False
         assert invocation.status == "outcome_unknown"
+        assert result["error"]["code"] == "TOOL_CALL_OUTCOME_UNKNOWN"
         assert result["error"].get("outcome_unknown") is True
 
 

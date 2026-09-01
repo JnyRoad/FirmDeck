@@ -90,6 +90,13 @@ def _api_key_principal(token: str, db: Session) -> PublicPrincipal:
         # while storage/corrupt-state failures fail closed without revealing tenant internals.
         if exc.code == "TENANT_SUSPENDED":
             raise PublicAPIError(403, "TENANT_SUSPENDED", "The tenant is suspended.") from None
+        if exc.code == "TENANT_NOT_FOUND":
+            raise PublicAPIError(
+                403,
+                "TENANT_NOT_FOUND",
+                "The tenant is unavailable.",
+                params={"tenant_id": client.tenant_id},
+            ) from None
         raise PublicAPIError(
             503,
             "TENANT_LIFECYCLE_CHECK_FAILED",

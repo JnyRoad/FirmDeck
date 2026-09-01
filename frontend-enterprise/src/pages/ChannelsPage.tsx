@@ -319,6 +319,7 @@ function ChannelAttachmentView({
 
   useEffect(() => {
     if (attachment.kind !== 'image') return;
+    setUrl(null);
     let disposed = false;
     let objectUrl: string | null = null;
     const context = tenantContext;

@@ -228,6 +228,19 @@ def test_codex_a2a_adapter_status_never_returns_token(monkeypatch: pytest.Monkey
     assert "secret-token" not in repr(payload)
 
 
+def test_codex_a2a_adapter_status_defaults_null_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "app.api.tools.get_settings",
+        lambda: SimpleNamespace(
+            codex_a2a_enabled=True,
+            codex_a2a_timeout_seconds=None,
+            codex_a2a_token="secret-token",
+        ),
+    )
+
+    assert get_codex_a2a_adapter().timeout_seconds == 1800.0
+
+
 def test_tenant_codex_a2a_connection_helper_returns_only_sanitized_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

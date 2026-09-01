@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any, Self
@@ -333,6 +334,75 @@ def test_tenant_a2a_cancel_is_fenced_after_suspend(tmp_path, monkeypatch) -> Non
     assert result.error.code == "TENANT_WORK_TERMINALIZED"
     assert calls == []
     _terminal_state(run)
+
+
+def test_timeout_preserves_original_timeout_when_best_effort_cancel_returns_a2a_error(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """A provider CancelTask error cannot replace the original polling timeout."""
+    calls: list[str] = []
+
+    class CancelErrorClient:
+        """Return a normal JSON-RPC provider error for the timeout cleanup call."""
+
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return
+
+        def post(
+            self,
+            url: str,
+            *,
+            headers: dict[str, str] | None = None,
+            json: dict[str, Any] | None = None,
+        ) -> httpx.Response:
+            del headers
+            assert json is not None
+            calls.append(str(json["method"]))
+            return httpx.Response(
+                200,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": "cancel-timeout",
+                    "error": {"message": "provider cancel unavailable"},
+                },
+                request=httpx.Request("POST", url),
+            )
+
+    monkeypatch.setattr(a2a_client.httpx, "Client", lambda **_kwargs: CancelErrorClient())
+    engine = _engine(tmp_path)
+    SQLModel.metadata.create_all(engine)
+
+    with Session(engine) as db:
+        tool = _seed_tool(db)
+        run = A2ATaskRun(
+            id="a2a-run-timeout-cancel-error",
+            owner_scope="tenant",
+            direction="client",
+            tenant_id="tenant-a2a-lifecycle",
+            system_runtime_key=None,
+            tenant_lifecycle_version=1,
+            tool_id=tool.id,
+            endpoint_url=tool.url,
+            remote_task_id="remote-timeout",
+            status="working",
+        )
+        db.add(run)
+        db.commit()
+
+        client = a2a_client.A2AClient(db, tool, headers={}, timeout_seconds=1)
+        with pytest.raises(a2a_client.A2AClientError) as error:
+            client._wait_if_needed(
+                run,
+                {"id": "remote-timeout", "status": {"state": "working"}},
+                deadline=time.monotonic() - 1,
+            )
+
+    assert error.value.code == "A2A_TIMEOUT"
+    assert calls == ["CancelTask"]
 
 
 def test_tenant_a2a_late_provider_success_becomes_unknown_outcome(tmp_path, monkeypatch) -> None:

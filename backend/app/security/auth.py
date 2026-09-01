@@ -110,6 +110,8 @@ def _get_authenticated_user(
     except TenantLifecycleDenied as exc:
         # A bearer must not disclose whether its tenant row is missing/corrupt.  Suspension is
         # deliberately distinct so the UI can stop an existing tenant session immediately.
+        if exc.code == "TENANT_LIFECYCLE_CHECK_FAILED":
+            raise build_http_exception("TENANT_LIFECYCLE_CHECK_FAILED") from None
         if exc.code == "TENANT_SUSPENDED":
             raise build_http_exception("TENANT_SUSPENDED") from None
         raise build_http_exception("AUTH_INVALID_USER_TOKEN") from None

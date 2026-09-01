@@ -7,6 +7,8 @@ from unittest.mock import ANY
 
 import pytest
 from sqlalchemy import create_engine, event, inspect, text
+from sqlalchemy.exc import IntegrityError
+from sqlmodel import SQLModel
 
 from app.db import database
 
@@ -162,6 +164,65 @@ def test_legacy_tenants_users_and_durable_work_receive_complete_control_backfill
             text("SELECT id, tenant_lifecycle_version FROM api_jobs ORDER BY id")
         ).all() == [("job_acme", 1), ("job_demo", 1), ("job_no_admin", 1)]
     assert _marker_count(engine) == 1
+
+
+def test_fresh_sqlmodel_password_policy_schema_enforces_length_order(tmp_path) -> None:
+    """Fresh create_all must enforce the same bounded min/max policy as startup migration DDL."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'fresh-policy.db'}")
+    SQLModel.metadata.create_all(engine)
+
+    with pytest.raises(IntegrityError), engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO installation_password_policies "
+                "(scope, min_length, max_length, complexity_enabled, "
+                "require_uppercase, require_lowercase, require_digit, require_special, updated_at) "
+                "VALUES ('system', 12, 8, 0, 1, 1, 1, 1, CURRENT_TIMESTAMP)"
+            )
+        )
+
+
+def test_tenant_admin_backfill_preserves_existing_valid_pointer(monkeypatch, tmp_path) -> None:
+    """Startup repair must preserve an explicit same-tenant active administrator pointer."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'tenant-pointer-preserve.db'}")
+    _create_legacy_tenant_schema(engine)
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE tenants ADD COLUMN initial_admin_user_id VARCHAR"))
+        conn.execute(
+            text(
+                "UPDATE tenants SET initial_admin_user_id = 'user_newer' "
+                "WHERE id = 'tenant_demo'"
+            )
+        )
+    _use_isolated_database(monkeypatch, engine)
+
+    database._migrate_sqlite_skill_schema()
+
+    assert _tenant_rows(engine)["tenant_demo"][3] == "user_newer"
+
+
+@pytest.mark.parametrize("pointer", ["user_cross_tenant_admin", "user_inactive"])
+def test_tenant_admin_backfill_rejects_existing_non_active_same_tenant_pointer(
+    monkeypatch,
+    tmp_path,
+    pointer: str,
+) -> None:
+    """Startup repair must fail closed when an existing pointer is not an active same-tenant admin."""
+    engine = create_engine(f"sqlite:///{tmp_path / f'tenant-pointer-invalid-{pointer}.db'}")
+    _create_legacy_tenant_schema(engine)
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE tenants ADD COLUMN initial_admin_user_id VARCHAR"))
+        conn.execute(
+            text(
+                "UPDATE tenants SET initial_admin_user_id = :pointer "
+                "WHERE id = 'tenant_demo'"
+            ),
+            {"pointer": pointer},
+        )
+    _use_isolated_database(monkeypatch, engine)
+
+    with pytest.raises(RuntimeError, match="initial administrator"):
+        database._migrate_sqlite_skill_schema()
 
 
 def test_legacy_slug_map_is_normalized_unique_repeatable_and_identical_across_databases(monkeypatch, tmp_path) -> None:

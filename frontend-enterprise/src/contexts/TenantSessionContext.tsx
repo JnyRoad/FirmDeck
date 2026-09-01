@@ -1,4 +1,13 @@
-import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from 'react';
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from 'react';
 
 import {
   clearEnterpriseAuthSession,
@@ -30,7 +39,21 @@ export type TenantSessionProviderProps = {
   onInvalidSession?: () => void;
 };
 
+export type TenantSessionVerificationError = 'network' | 'server' | 'malformed-response';
+
+export type TenantSessionVerificationState = {
+  status: 'idle' | 'verifying' | 'ready' | 'invalid' | 'error';
+  error: TenantSessionVerificationError | null;
+  /** Retry the current bearer verification without changing tenant scope. */
+  retry(): void;
+};
+
 const TenantSessionContext = createContext<TenantSessionContextValue | null>(null);
+const TenantSessionVerificationContext = createContext<TenantSessionVerificationState>({
+  status: 'idle',
+  error: null,
+  retry: () => {},
+});
 
 /**
  * Verify a tenant bearer before making tenant identity available to children.
@@ -45,6 +68,10 @@ export function TenantSessionProvider({
   onInvalidSession,
 }: TenantSessionProviderProps) {
   const [value, setValue] = useState<TenantSessionContextValue | null>(null);
+  const [verificationState, setVerificationState] = useState<
+    Omit<TenantSessionVerificationState, 'retry'>
+  >({ status: 'idle', error: null });
+  const [retryRevision, setRetryRevision] = useState(0);
   const generationRef = useRef(0);
   const rootControllerRef = useRef<AbortController | null>(null);
   const invalidSessionHandlerRef = useRef(onInvalidSession);
@@ -52,6 +79,14 @@ export function TenantSessionProvider({
   // Keep callback changes from restarting verification or creating a new
   // generation. The callback is still current when a request becomes invalid.
   invalidSessionHandlerRef.current = onInvalidSession;
+
+  const retry = useCallback(() => {
+    setRetryRevision((revision) => revision + 1);
+  }, []);
+  const verificationContextValue = useMemo(
+    () => ({ ...verificationState, retry }),
+    [retry, verificationState],
+  );
 
   useEffect(() => {
     const previousController = rootControllerRef.current;
@@ -62,6 +97,7 @@ export function TenantSessionProvider({
     const controller = new AbortController();
     rootControllerRef.current = controller;
     setValue(null);
+    setVerificationState({ status: session ? 'verifying' : 'idle', error: null });
 
     const isCurrent = () => (
       generationRef.current === generation && !controller.signal.aborted
@@ -81,6 +117,7 @@ export function TenantSessionProvider({
 
     const invalidate = () => {
       if (!isCurrent()) return;
+      setVerificationState({ status: 'invalid', error: null });
       clearEnterpriseAuthSession();
       setValue(null);
       invalidSessionHandlerRef.current?.();
@@ -98,39 +135,52 @@ export function TenantSessionProvider({
     }
 
     let settled = false;
-    const verify = async () => {
+    const verify = async (): Promise<
+      | { kind: 'verified'; user: EnterpriseAuthUser }
+      | { kind: 'invalid' }
+      | { kind: 'transient'; error: TenantSessionVerificationError }
+    > => {
       const response = await fetch(`${API_BASE}/api/auth/me`, {
         headers: { Authorization: `Bearer ${parsedSession.token}` },
         signal: controller.signal,
       });
-      if (!response.ok) return null;
+      if (!response.ok) {
+        return response.status === 401 || response.status === 403
+          ? { kind: 'invalid' }
+          : { kind: 'transient', error: 'server' };
+      }
 
       let payload: unknown;
       try {
         payload = await response.json();
       } catch {
-        return null;
+        return { kind: 'transient', error: 'malformed-response' };
       }
 
       const verifiedUser = parseEnterpriseAuthUser(payload);
-      if (!verifiedUser) return null;
-      if (verifiedUser.tenant_id !== parsedSession.tenant.id) return null;
-      if (verifiedUser.id !== parsedSession.user.id) return null;
-      return verifiedUser;
+      if (!verifiedUser) return { kind: 'transient', error: 'malformed-response' };
+      if (verifiedUser.tenant_id !== parsedSession.tenant.id) return { kind: 'invalid' };
+      if (verifiedUser.id !== parsedSession.user.id) return { kind: 'invalid' };
+      return { kind: 'verified', user: verifiedUser };
     };
 
     void verify()
-      .then((verifiedUser) => {
+      .then((result) => {
         if (!isCurrent()) return;
         settled = true;
-        if (!verifiedUser) {
+        if (result.kind === 'invalid') {
           invalidate();
+          return;
+        }
+        if (result.kind === 'transient') {
+          setVerificationState({ status: 'error', error: result.error });
+          setValue(null);
           return;
         }
 
         const verifiedSession: EnterpriseAuthSession = {
           ...parsedSession,
-          user: verifiedUser,
+          user: result.user,
         };
         // The response is authoritative for mutable policy fields such as
         // must_change_password. A storage failure must not turn a valid
@@ -142,6 +192,7 @@ export function TenantSessionProvider({
           // will retry persistence and re-verify the bearer.
         }
 
+        setVerificationState({ status: 'ready', error: null });
         setValue({
           session: verifiedSession,
           tenantId: verifiedSession.tenant.id,
@@ -158,7 +209,8 @@ export function TenantSessionProvider({
       .catch(() => {
         if (!isCurrent()) return;
         settled = true;
-        invalidate();
+        setVerificationState({ status: 'error', error: 'network' });
+        setValue(null);
       });
 
     return () => {
@@ -171,17 +223,23 @@ export function TenantSessionProvider({
       setValue(null);
       void settled;
     };
-  }, [session]);
+  }, [retryRevision, session]);
 
   return (
-    <TenantSessionContext.Provider value={value}>
-      {children}
-    </TenantSessionContext.Provider>
+    <TenantSessionVerificationContext.Provider value={verificationContextValue}>
+      <TenantSessionContext.Provider value={value}>
+        {children}
+      </TenantSessionContext.Provider>
+    </TenantSessionVerificationContext.Provider>
   );
 }
 
 export function useTenantSession(): TenantSessionContextValue | null {
   return useContext(TenantSessionContext);
+}
+
+export function useTenantSessionVerification(): TenantSessionVerificationState {
+  return useContext(TenantSessionVerificationContext);
 }
 
 export type { EnterpriseAuthUser };

@@ -702,6 +702,14 @@ export const BACKEND_ERROR_CONTRACT = {
     "status": 401,
     "visibility": "public"
   },
+  "AUTH_PASSWORD_POLICY_VIOLATION": {
+    "code": "AUTH_PASSWORD_POLICY_VIOLATION",
+    "message_key": "errors.auth.passwordPolicyViolation",
+    "params": {},
+    "retryable": false,
+    "status": 400,
+    "visibility": "public"
+  },
   "AUTH_SELF_ROLE_CHANGE_FORBIDDEN": {
     "code": "AUTH_SELF_ROLE_CHANGE_FORBIDDEN",
     "message_key": "errors.auth.selfRoleChangeForbidden",

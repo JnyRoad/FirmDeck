@@ -8,10 +8,21 @@ import { setEnterpriseAuthSession, type EnterpriseAuthSession } from '../auth';
 import { useAppIntl } from '../i18n/useAppIntl';
 
 export type ChangePasswordClient = {
+  getPasswordPolicy(): Promise<PasswordPolicy>;
   changePassword(input: {
     current_password: string;
     new_password: string;
   }): Promise<EnterpriseAuthSession>;
+};
+
+export type PasswordPolicy = {
+  min_length: number;
+  max_length: number;
+  complexity_enabled: boolean;
+  require_uppercase: boolean;
+  require_lowercase: boolean;
+  require_digit: boolean;
+  require_special: boolean;
 };
 
 export type ChangePasswordPageProps = {
@@ -21,7 +32,15 @@ export type ChangePasswordPageProps = {
   onCancel?: () => void;
 };
 
-const NEW_PASSWORD_MIN_LENGTH = 12;
+const DEFAULT_PASSWORD_POLICY: PasswordPolicy = {
+  min_length: 8,
+  max_length: 20,
+  complexity_enabled: false,
+  require_uppercase: false,
+  require_lowercase: false,
+  require_digit: false,
+  require_special: false,
+};
 const INPUT_BASE_CLASS =
   'h-[44px] w-full rounded-[10px] border border-[#e3e7f1] bg-white px-[16px] text-[14px] text-[#18181a] outline-none transition-colors placeholder:text-[#858b9c] focus:border-[#18181a] focus:ring-2 focus:ring-[#18181a]/10 disabled:cursor-not-allowed disabled:opacity-60';
 
@@ -29,7 +48,7 @@ type PasswordField = 'current' | 'next' | 'confirm';
 
 /**
  * Forced password-change screen. It accepts opaque password bytes as entered;
- * only the local minimum-length and confirmation rules are applied before the
+ * the current tenant policy and confirmation rules are applied before the
  * authenticated client receives them.
  */
 export default function ChangePasswordPage({
@@ -52,6 +71,7 @@ export default function ChangePasswordPage({
   const [confirmationError, setConfirmationError] = useState('');
   const [formError, setFormError] = useState('');
   const [loading, setLoading] = useState(false);
+  const [policy, setPolicy] = useState<PasswordPolicy>(DEFAULT_PASSWORD_POLICY);
   const currentFieldRef = useRef<HTMLInputElement>(null);
   const newFieldRef = useRef<HTMLInputElement>(null);
   const confirmationFieldRef = useRef<HTMLInputElement>(null);
@@ -63,6 +83,20 @@ export default function ChangePasswordPage({
   useEffect(() => {
     currentFieldRef.current?.focus();
   }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    void client.getPasswordPolicy()
+      .then((nextPolicy) => {
+        if (!cancelled) setPolicy(nextPolicy);
+      })
+      .catch(() => {
+        if (!cancelled) setPolicy(DEFAULT_PASSWORD_POLICY);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [client]);
 
   function clearSecrets() {
     setCurrentPassword('');
@@ -89,9 +123,15 @@ export default function ChangePasswordPage({
     const nextCurrentError = currentPassword.length > 0
       ? ''
       : t('auth.changePassword.currentRequired');
-    const nextNewError = newPassword.length >= NEW_PASSWORD_MIN_LENGTH
-      ? ''
-      : t('auth.changePassword.minimumLength');
+    const nextNewError = newPassword.length >= policy.min_length
+      && newPassword.length <= policy.max_length
+      ? policy.complexity_enabled && !hasRequiredComplexity(newPassword, policy)
+        ? t('auth.changePassword.complexity')
+        : ''
+      : t('auth.changePassword.minimumLength', {
+        min: policy.min_length,
+        max: policy.max_length,
+      });
     const nextConfirmationError = confirmation === newPassword && confirmation.length > 0
       ? ''
       : t('auth.changePassword.mismatch');
@@ -176,7 +216,10 @@ export default function ChangePasswordPage({
               {t('auth.changePassword.title')}
             </h1>
             <p className="mt-2 text-[13px] leading-5 text-[#7d879a]">
-              {t('auth.changePassword.description')}
+              {t('auth.changePassword.description', {
+                min: policy.min_length,
+                max: policy.max_length,
+              })}
             </p>
           </div>
 
@@ -230,12 +273,16 @@ export default function ChangePasswordPage({
                 value={newPassword}
                 visible={visible.next}
                 label={t('auth.changePassword.newLabel')}
-                placeholder={t('auth.changePassword.newPlaceholder')}
+                placeholder={t('auth.changePassword.newPlaceholder', {
+                  min: policy.min_length,
+                  max: policy.max_length,
+                })}
                 error={newError}
                 errorId="change-password-new-error"
                 descriptionId="change-password-new-description"
                 autoComplete="new-password"
-                minLength={NEW_PASSWORD_MIN_LENGTH}
+                minLength={policy.min_length}
+                maxLength={policy.max_length}
                 disabled={loading}
                 onChange={(value) => {
                   setNewPassword(value);
@@ -247,8 +294,19 @@ export default function ChangePasswordPage({
                 hideLabel={t('auth.changePassword.hidePassword')}
               />
               <p id="change-password-new-description" className="text-[12px] leading-5 text-[#858b9c]">
-                {t('auth.changePassword.newDescription')}
+                {t('auth.changePassword.newDescription', {
+                  min: policy.min_length,
+                  max: policy.max_length,
+                })}
               </p>
+              {policy.complexity_enabled && (
+                <ul className="text-[12px] leading-5 text-[#858b9c]">
+                  {policy.require_uppercase && <li>{t('system.passwordPolicies.requireUppercase')}</li>}
+                  {policy.require_lowercase && <li>{t('system.passwordPolicies.requireLowercase')}</li>}
+                  {policy.require_digit && <li>{t('system.passwordPolicies.requireDigit')}</li>}
+                  {policy.require_special && <li>{t('system.passwordPolicies.requireSpecial')}</li>}
+                </ul>
+              )}
               {newError && (
                 <p id="change-password-new-error" className="text-[12px] text-[#c43b3b]">
                   {newError}
@@ -330,6 +388,7 @@ type PasswordInputProps = {
   descriptionId?: string;
   autoComplete: string;
   minLength?: number;
+  maxLength?: number;
   disabled: boolean;
   showLabel: string;
   hideLabel: string;
@@ -350,6 +409,7 @@ const PasswordInput = forwardRef<HTMLInputElement, PasswordInputProps>(function 
     descriptionId,
     autoComplete,
     minLength,
+    maxLength,
     disabled,
     showLabel,
     hideLabel,
@@ -373,6 +433,7 @@ const PasswordInput = forwardRef<HTMLInputElement, PasswordInputProps>(function 
         aria-invalid={error ? 'true' : undefined}
         aria-describedby={describedBy}
         minLength={minLength}
+        maxLength={maxLength}
         onChange={(event) => onChange(event.target.value)}
         disabled={disabled}
         className={`${INPUT_BASE_CLASS} ${error ? 'border-[#f54a45]' : ''} pr-11`}
@@ -394,3 +455,11 @@ const PasswordInput = forwardRef<HTMLInputElement, PasswordInputProps>(function 
     </div>
   );
 });
+
+/** Check only the complexity clauses enabled by the current tenant policy. */
+function hasRequiredComplexity(password: string, policy: PasswordPolicy): boolean {
+  return (!policy.require_uppercase || /[A-Z]/.test(password))
+    && (!policy.require_lowercase || /[a-z]/.test(password))
+    && (!policy.require_digit || /\d/.test(password))
+    && (!policy.require_special || /[^A-Za-z0-9]/.test(password));
+}

@@ -344,6 +344,7 @@ def build_default_error_registry() -> ErrorRegistry:
 
     auth_entries = (
         ("AUTH_LOGIN_FIELDS_REQUIRED", "loginFieldsRequired", 400, False, {}),
+        ("AUTH_PASSWORD_POLICY_VIOLATION", "passwordPolicyViolation", 400, False, {}),
         ("AUTH_INVALID_CREDENTIALS", "invalidCredentials", 401, False, {}),
         ("AUTH_AVATAR_NOT_FOUND", "avatarNotFound", 404, False, {}),
         ("AUTH_AVATAR_TOO_LARGE", "avatarTooLarge", 413, False, {}),

@@ -666,12 +666,15 @@ export default function OpenPlatformPage({
         notify.warning(copy.noAgent);
         return;
       }
+      const context = tenantContext;
+      if (!context) return;
+      const generation = context.generation;
       try {
         const used = await markPlatformAgentUsed(agent);
         if (!used) return;
         navigate('/enterprise/dashboard');
       } catch (error) {
-        if (!isCurrentTenantGeneration(tenantContext, tenantContext?.generation ?? -1)) return;
+        if (!isCurrentTenantGeneration(context, generation)) return;
         notify.error(platformErrorMessage(error, copy.useAgentFailed));
       }
       return;

@@ -27,18 +27,20 @@ async function renderPage(client: Client, onComplete = vi.fn(), forced = true) {
 afterEach(() => cleanup());
 
 describe('SystemPasswordChangePage', () => {
-  it('forces a replacement with 8–20 character client validation before the protected request', async () => {
+  it('loads the system policy for a forced replacement before validating the protected request', async () => {
     const user = userEvent.setup();
-    const client = { changePassword: vi.fn(async () => replacement), getPasswordPolicies: vi.fn(async () => ({ system: defaultPolicy, tenant_default: defaultPolicy })) };
+    const systemPolicy: PasswordPolicy = { ...defaultPolicy, min_length: 12, max_length: 16 };
+    const client = { changePassword: vi.fn(async () => replacement), getPasswordPolicies: vi.fn(async () => ({ system: systemPolicy, tenant_default: defaultPolicy })) };
     await renderPage(client);
     expect(screen.getByRole('heading', { name: '必须修改密码' })).toBeTruthy();
+    await waitFor(() => expect(client.getPasswordPolicies).toHaveBeenCalledTimes(1));
+    expect(screen.getByText('新密码长度必须为 12–16 个字符。')).toBeTruthy();
     await user.type(screen.getByLabelText('当前密码'), 'Current-2026');
     await user.type(screen.getByLabelText('新密码'), 'short');
     await user.type(screen.getByLabelText('确认新密码'), 'short');
     await user.click(screen.getByRole('button', { name: '更新密码' }));
-    expect((await screen.findByRole('alert')).textContent).toContain('新密码长度必须为 8–20 个字符');
+    expect((await screen.findByRole('alert')).textContent).toContain('新密码长度必须为 12–16 个字符');
     expect(client.changePassword).not.toHaveBeenCalled();
-    expect(client.getPasswordPolicies).not.toHaveBeenCalled();
   });
 
   it('sends only current/new opaque password values then gives the replacement session to the app', async () => {

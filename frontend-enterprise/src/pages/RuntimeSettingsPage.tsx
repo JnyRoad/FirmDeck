@@ -1,5 +1,5 @@
 import { SaveOutlined } from '../icons';
-import { useEffect, useMemo, useState, type ReactNode } from 'react';
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { Button as UIButton, Card, CardContent, CardHeader, CardTitle, Input, Switch, Textarea, notify } from '@/components/ui';
 import { api } from '../api/client';
 import { createTenantClient } from '../api/tenant-client';
@@ -173,7 +173,25 @@ export default function RuntimeSettingsPage({ currentUser }: { currentUser: Ente
   const [networkForm, setNetworkForm] = useState<NetworkSettingsForm>(DEFAULT_NETWORK_SETTINGS);
   const [networkLoading, setNetworkLoading] = useState(false);
   const [sandboxStatus, setSandboxStatus] = useState<Pick<RuntimeSettingsUIConfigRead, 'sandbox_status' | 'sandbox_status_code' | 'sandbox_status_params' | 'sandbox_remediation_code' | 'sandbox_remediation_params'>>({ sandbox_status: 'unavailable' });
+  const saveRequestOwnerRef = useRef(0);
+  const networkRequestOwnerRef = useRef(0);
+  const previousTenantGenerationRef = useRef<number | null>(tenantContext?.generation ?? null);
   const update = (patch: Partial<UiConfigForm>) => setForm((prev) => ({ ...prev, ...patch }));
+
+  useEffect(() => {
+    const nextGeneration = tenantContext?.generation ?? null;
+    const previousGeneration = previousTenantGenerationRef.current;
+    previousTenantGenerationRef.current = nextGeneration;
+    if (previousGeneration === null || previousGeneration === nextGeneration) return;
+
+    // Tenant replacement is a hard UI boundary. Invalidate request owners and
+    // release every page-level busy indicator even while old requests linger.
+    saveRequestOwnerRef.current += 1;
+    networkRequestOwnerRef.current += 1;
+    setLoading(false);
+    setNetworkLoading(false);
+    setRestarting(false);
+  }, [tenantContext?.generation]);
 
   useEffect(() => {
     const context = tenantContext;
@@ -251,6 +269,7 @@ export default function RuntimeSettingsPage({ currentUser }: { currentUser: Ente
     const context = tenantContext;
     if (!context) return;
     const generation = context.generation;
+    const requestOwner = ++saveRequestOwnerRef.current;
     setLoading(true);
     try {
       const row = await tenantApi.put<RuntimeSettingsUIConfigRead>('/api/enterprise/ui-config', {
@@ -296,7 +315,10 @@ export default function RuntimeSettingsPage({ currentUser }: { currentUser: Ente
       if (!isCurrentTenantGeneration(context, generation)) return;
       notify.error(runtimeSettingsErrorMessage(error, 'runtimeSettings.toast.saveFailed'));
     } finally {
-      if (isCurrentTenantGeneration(context, generation)) setLoading(false);
+      if (requestOwner === saveRequestOwnerRef.current) {
+        setLoading(false);
+        setRestarting(false);
+      }
     }
   }
 
@@ -309,6 +331,7 @@ export default function RuntimeSettingsPage({ currentUser }: { currentUser: Ente
     const context = tenantContext;
     if (!context) return;
     const generation = context.generation;
+    const requestOwner = ++networkRequestOwnerRef.current;
     setNetworkLoading(true);
     try {
       const row = await tenantApi.put<NetworkSettingsRead>('/api/enterprise/network-settings', {
@@ -328,7 +351,7 @@ export default function RuntimeSettingsPage({ currentUser }: { currentUser: Ente
       if (!isCurrentTenantGeneration(context, generation)) return;
       notify.error(runtimeSettingsErrorMessage(error, 'runtimeSettings.toast.networkSaveFailed'));
     } finally {
-      if (isCurrentTenantGeneration(context, generation)) setNetworkLoading(false);
+      if (requestOwner === networkRequestOwnerRef.current) setNetworkLoading(false);
     }
   }
 

@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import type { InputHTMLAttributes, TextareaHTMLAttributes } from 'react';
-import { cleanup, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -397,7 +397,7 @@ describe('sandbox diagnostic contract', () => {
     });
   }
 
-  it('does not toast or clear save loading when an old generation rejects', async () => {
+  it('does not toast but clears save loading when an old generation rejects', async () => {
     const user = userEvent.setup();
     const context = mocks.currentContext as TenantSessionContextValue;
     let rejectSave: ((reason?: unknown) => void) | undefined;
@@ -414,6 +414,35 @@ describe('sandbox diagnostic contract', () => {
     context.isCurrentGeneration = () => false;
     rejectSave?.(new DOMException('aborted', 'AbortError'));
     await waitFor(() => expect(notifyError).not.toHaveBeenCalled());
-    expect((screen.getByRole('button', { name: 'Save settings' }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole('button', { name: 'Save settings' }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it('clears network save loading when an old generation resolves', async () => {
+    const user = userEvent.setup();
+    const context = mocks.currentContext as TenantSessionContextValue;
+    let resolveNetwork: ((value: typeof networkSettings) => void) | undefined;
+    mocks.put.mockImplementation((path: string) => {
+      if (path.includes('/network-settings')) {
+        return new Promise<typeof networkSettings>((resolve) => {
+          resolveNetwork = resolve;
+        });
+      }
+      return Promise.resolve(runtimeSettings);
+    });
+
+    renderSemanticRuntimeSettings('en-US');
+    const saveNetworkButton = await screen.findByRole('button', { name: 'Save next-launch settings' });
+    await user.click(saveNetworkButton);
+    await waitFor(() => expect(mocks.put).toHaveBeenCalledWith(
+      '/api/enterprise/network-settings',
+      expect.any(Object),
+    ));
+
+    context.isCurrentGeneration = () => false;
+    await act(async () => {
+      resolveNetwork?.(networkSettings);
+      await Promise.resolve();
+    });
+    await waitFor(() => expect((saveNetworkButton as HTMLButtonElement).disabled).toBe(false));
   });
 });

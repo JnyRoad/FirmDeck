@@ -2201,7 +2201,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       console.error('[chat] rename session failed', error);
       notify.error(t('chat.error.renameFailed'));
     }
-  }, [renameSession, renameTitle, t, tenantId]);
+  }, [renameSession, renameTitle, t, tenantClient, tenantId]);
 
   const requestDelete = useCallback((session: ChatSession) => {
     setPendingDelete(session);
@@ -2231,7 +2231,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       console.error('[chat] delete session failed', error);
       notify.error(t('chat.error.deleteFailed'));
     }
-  }, [forgetMissingSession, getStreamSlot, navigate, pendingDelete, redirectToLogin, t, sessionId, tenantId]);
+  }, [forgetMissingSession, getStreamSlot, navigate, pendingDelete, redirectToLogin, t, tenantClient, sessionId, tenantId]);
 
   const abortStream = useCallback(() => {
     if (!activeConversationId) return;
@@ -2296,6 +2296,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     notifyStore,
     notifyStream,
     runningTurn,
+    tenantClient,
     tenantId,
     t,
     upsertTraceLine,
@@ -2322,7 +2323,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       console.error('[chat] message feedback failed', error);
       notify.error(t('chat.error.feedbackFailed'));
     }
-  }, [redirectToLogin, sessionId, t, tenantId, updateMessageFeedback]);
+  }, [redirectToLogin, sessionId, t, tenantClient, tenantId, updateMessageFeedback]);
 
   /** 将用户确认的定时任务写入服务端；任务标题作为业务值插入本地化通知。 */
   const confirmScheduledTask = useCallback(async (draft: ScheduledTaskDraftRead, draftKey?: string) => {
@@ -2363,7 +2364,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       console.error('[chat] scheduled task creation failed', error);
       notify.error(t('chat.error.scheduleCreateFailed'));
     }
-  }, [redirectToLogin, sessionId, t, tenantId]);
+  }, [redirectToLogin, sessionId, t, tenantClient, tenantId]);
 
   const dismissScheduledTaskDraft = useCallback((messageId?: string) => {
     if (!sessionId) return;

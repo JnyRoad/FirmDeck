@@ -2,7 +2,7 @@
 
 import { cleanup, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { AppIntlProvider } from '@/i18n';
 
@@ -34,73 +34,77 @@ const tenantContextMock = vi.hoisted(() => {
   };
 });
 
-const personaMocks = vi.hoisted(() => {
-  const overall = {
-    id: 'agent-overall',
-    tenant_id: 'tenant_demo',
-    name: 'Overall A',
-    description: 'A overall description',
-    persona_prompt: '',
-    is_overall: true,
-    status: 'active',
-    metadata: {},
-    resources: [],
-    created_at: '2026-08-29T00:00:00Z',
-    updated_at: '2026-08-29T00:00:00Z',
-  };
-  const employee = {
-    id: 'agent-b',
-    tenant_id: 'tenant_demo',
-    name: 'Employee B',
-    description: 'B employee description',
-    persona_prompt: 'B local persona',
-    is_overall: false,
-    status: 'active',
-    metadata: {},
-    resources: [],
-    created_at: '2026-08-29T00:00:00Z',
-    updated_at: '2026-08-29T00:00:00Z',
-  };
-  let personaCallCount = 0;
-  let resolveStalePersona: ((value: unknown) => void) | null = null;
-  let resolveAgentPut: ((value: unknown) => void) | null = null;
-  const stalePersona = new Promise<unknown>((resolve) => {
-    resolveStalePersona = resolve;
-  });
-  const agentPut = new Promise<unknown>((resolve) => {
-    resolveAgentPut = resolve;
-  });
-  const client = {
-    get: vi.fn(async (path: string) => {
-      if (path === '/api/enterprise/agents') return [overall, employee];
-      if (path === '/api/enterprise/persona') {
-        personaCallCount += 1;
-        if (personaCallCount === 1) {
-          return { system_prompt: 'Initial persona', updated_at: '2026-08-29T00:00:00Z' };
+const personaMocks = vi.hoisted(() => ({
+  create() {
+    const overall = {
+      id: 'agent-overall',
+      tenant_id: 'tenant_demo',
+      name: 'Overall A',
+      description: 'A overall description',
+      persona_prompt: '',
+      is_overall: true,
+      status: 'active',
+      metadata: {},
+      resources: [],
+      created_at: '2026-08-29T00:00:00Z',
+      updated_at: '2026-08-29T00:00:00Z',
+    };
+    const employee = {
+      id: 'agent-b',
+      tenant_id: 'tenant_demo',
+      name: 'Employee B',
+      description: 'B employee description',
+      persona_prompt: 'B local persona',
+      is_overall: false,
+      status: 'active',
+      metadata: {},
+      resources: [],
+      created_at: '2026-08-29T00:00:00Z',
+      updated_at: '2026-08-29T00:00:00Z',
+    };
+    let personaCallCount = 0;
+    let resolveStalePersona: ((value: unknown) => void) | null = null;
+    let resolveAgentPut: ((value: unknown) => void) | null = null;
+    const stalePersona = new Promise<unknown>((resolve) => {
+      resolveStalePersona = resolve;
+    });
+    const agentPut = new Promise<unknown>((resolve) => {
+      resolveAgentPut = resolve;
+    });
+    const client = {
+      get: vi.fn(async (path: string) => {
+        if (path === '/api/enterprise/agents') return [overall, employee];
+        if (path === '/api/enterprise/persona') {
+          personaCallCount += 1;
+          if (personaCallCount === 1) {
+            return { system_prompt: 'Initial persona', updated_at: '2026-08-29T00:00:00Z' };
+          }
+          return stalePersona;
         }
-        return stalePersona;
-      }
-      return {};
-    }),
-    put: vi.fn(async (path: string) => {
-      if (path.startsWith('/api/enterprise/agents/')) return agentPut;
-      return { system_prompt: 'Saved A', updated_at: '2026-08-31T00:00:00Z' };
-    }),
-  };
-  return {
-    client,
-    getPersonaCallCount: () => personaCallCount,
-    resolveStalePersona: (value: unknown) => resolveStalePersona?.(value),
-    resolveAgentPut: (value: unknown) => resolveAgentPut?.(value),
-  };
-});
+        return {};
+      }),
+      put: vi.fn(async (path: string) => {
+        if (path.startsWith('/api/enterprise/agents/')) return agentPut;
+        return { system_prompt: 'Saved A', updated_at: '2026-08-31T00:00:00Z' };
+      }),
+    };
+    return {
+      client,
+      getPersonaCallCount: () => personaCallCount,
+      resolveStalePersona: (value: unknown) => resolveStalePersona?.(value),
+      resolveAgentPut: (value: unknown) => resolveAgentPut?.(value),
+    };
+  },
+}));
+
+let activePersonaMocks = personaMocks.create();
 
 vi.mock('../contexts/TenantSessionContext', () => ({
   useTenantSession: () => tenantContextMock.context,
 }));
 
 vi.mock('../api/tenant-client', () => ({
-  createTenantClient: () => personaMocks.client,
+  createTenantClient: () => activePersonaMocks.client,
 }));
 
 import PersonaPage from './PersonaPage';
@@ -109,6 +113,10 @@ afterEach(() => {
   cleanup();
   window.localStorage.clear();
   vi.clearAllMocks();
+});
+
+beforeEach(() => {
+  activePersonaMocks = personaMocks.create();
 });
 
 describe('PersonaPage tenant scope fencing', () => {
@@ -120,8 +128,8 @@ describe('PersonaPage tenant scope fencing', () => {
       </AppIntlProvider>,
     );
 
-    await waitFor(() => expect(personaMocks.getPersonaCallCount()).toBeGreaterThanOrEqual(2));
-    personaMocks.resolveStalePersona({
+    await waitFor(() => expect(activePersonaMocks.getPersonaCallCount()).toBeGreaterThanOrEqual(2));
+    activePersonaMocks.resolveStalePersona({
       system_prompt: 'A persona',
       updated_at: '2026-08-30T00:00:00Z',
     });
@@ -133,7 +141,7 @@ describe('PersonaPage tenant scope fencing', () => {
     }));
     expect(await screen.findByDisplayValue('B local persona')).toBeTruthy();
 
-    personaMocks.resolveAgentPut({
+    activePersonaMocks.resolveAgentPut({
       id: 'agent-overall',
       tenant_id: 'tenant_demo',
       name: 'Overall A',
@@ -149,7 +157,7 @@ describe('PersonaPage tenant scope fencing', () => {
 
     await waitFor(() => expect(screen.getByDisplayValue('B local persona')).toBeTruthy());
     expect(screen.getByDisplayValue('Employee B')).toBeTruthy();
-    expect(personaMocks.client.put).toHaveBeenCalledTimes(1);
+    expect(activePersonaMocks.client.put).toHaveBeenCalledTimes(1);
   });
 
   it('does not let a previous overall-persona response overwrite the newly selected employee', async () => {
@@ -159,13 +167,13 @@ describe('PersonaPage tenant scope fencing', () => {
       </AppIntlProvider>,
     );
 
-    await waitFor(() => expect(personaMocks.getPersonaCallCount()).toBeGreaterThanOrEqual(2));
+    await waitFor(() => expect(activePersonaMocks.getPersonaCallCount()).toBeGreaterThanOrEqual(2));
     window.dispatchEvent(new CustomEvent('ultrarag-enterprise-agent-scope-change', {
       detail: { agentId: 'agent-b' },
     }));
 
     expect(await screen.findByDisplayValue('B local persona')).toBeTruthy();
-    personaMocks.resolveStalePersona({
+    activePersonaMocks.resolveStalePersona({
       system_prompt: 'A stale response',
       updated_at: '2026-08-31T00:00:00Z',
     });

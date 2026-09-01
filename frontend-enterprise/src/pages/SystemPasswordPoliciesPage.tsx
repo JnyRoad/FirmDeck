@@ -6,6 +6,7 @@ import { useAppIntl } from '@/i18n/useAppIntl';
 
 type PolicyClient = Pick<SystemClient, 'listTenants' | 'getPasswordPolicies' | 'updatePasswordPolicies' | 'getTenantPasswordPolicy' | 'updateTenantPasswordPolicy'>;
 type SystemPasswordPoliciesPageProps = { client?: PolicyClient };
+const MAX_TENANT_POLICY_PAGES = 100;
 
 /** Edits installation defaults and an explicit per-tenant override as separate scopes. */
 export default function SystemPasswordPoliciesPage({ client = systemClient }: SystemPasswordPoliciesPageProps) {
@@ -23,21 +24,30 @@ export default function SystemPasswordPoliciesPage({ client = systemClient }: Sy
     let cancelled = false;
     async function listAllTenants() {
       const items: Array<{ id: string; display_name: string }> = [];
+      const seenCursors = new Set<string>();
       let cursor: string | undefined;
-      do {
+      for (let pageNumber = 0; pageNumber < MAX_TENANT_POLICY_PAGES; pageNumber += 1) {
+        if (cancelled) return null;
         const page = await client.listTenants({ limit: 100, cursor });
+        if (cancelled) return null;
         items.push(...page.items.map(({ id, display_name }) => ({ id, display_name })));
-        cursor = page.next_cursor || undefined;
-      } while (cursor);
+        const nextCursor = page.next_cursor || undefined;
+        if (!nextCursor || seenCursors.has(nextCursor)) break;
+        seenCursors.add(nextCursor);
+        cursor = nextCursor;
+      }
       return items;
     }
     void Promise.all([client.getPasswordPolicies(), listAllTenants()])
       .then(([nextPolicies, nextTenants]) => {
-        if (cancelled) return;
+        if (cancelled || nextTenants === null) return;
         setPolicies(nextPolicies);
         setTenants(nextTenants);
       })
-      .catch(() => setError(t('system.passwordPolicies.loadError')));
+      .catch(() => {
+        if (cancelled) return;
+        setError(t('system.passwordPolicies.loadError'));
+      });
     return () => { cancelled = true; };
   }, [client, t]);
 

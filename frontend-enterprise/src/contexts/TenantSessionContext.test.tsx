@@ -38,6 +38,12 @@ type TenantSessionContextValue = {
   isCurrentGeneration(generation: number): boolean;
 };
 
+type TenantSessionVerificationState = {
+  status: 'idle' | 'verifying' | 'ready' | 'invalid' | 'error';
+  error: 'network' | 'server' | 'malformed-response' | null;
+  retry(): void;
+};
+
 type TenantSessionContextModule = {
   TenantSessionProvider: (props: {
     session: TenantAuthSessionFixture | null;
@@ -45,6 +51,7 @@ type TenantSessionContextModule = {
     onInvalidSession?: () => void;
   }) => JSX.Element;
   useTenantSession: () => TenantSessionContextValue | null;
+  useTenantSessionVerification: () => TenantSessionVerificationState;
 };
 
 const sessionA: TenantAuthSessionFixture = {
@@ -110,6 +117,7 @@ async function loadTenantContext(): Promise<TenantSessionContextModule> {
     const module = await import(/* @vite-ignore */ TENANT_CONTEXT_MODULE_PATH) as unknown as TenantSessionContextModule;
     expect(typeof module.TenantSessionProvider).toBe('function');
     expect(typeof module.useTenantSession).toBe('function');
+    expect(typeof module.useTenantSessionVerification).toBe('function');
     return module;
   } catch (error) {
     throw new Error(`T032 must implement ${TENANT_CONTEXT_MODULE_PATH}: ${String(error)}`);
@@ -119,12 +127,16 @@ async function loadTenantContext(): Promise<TenantSessionContextModule> {
 function ContextProbe({
   context,
   onValue,
+  onVerification,
 }: {
   context: TenantSessionContextModule;
   onValue: (value: TenantSessionContextValue | null) => void;
+  onVerification?: (value: TenantSessionVerificationState) => void;
 }) {
   const value = context.useTenantSession();
+  const verification = context.useTenantSessionVerification();
   onValue(value);
+  onVerification?.(verification);
   return <output data-testid="tenant-context">{value?.tenantId || 'not-ready'}</output>;
 }
 
@@ -299,5 +311,101 @@ describe('verified tenant session context', () => {
     });
     expect(observed.filter((candidate) => candidate?.tenantId === 'tenant-a')).toHaveLength(0);
     expect(observed[observed.length - 1]?.tenantId).toBe('tenant-b');
+  });
+
+  it('preserves the session after a transient network failure and retries explicitly', async () => {
+    const context = await loadTenantContext();
+    const fetchMock = vi.fn<typeof fetch>()
+      .mockRejectedValueOnce(new TypeError('network unavailable'))
+      .mockResolvedValueOnce(jsonResponse(sessionA.user));
+    const onInvalidSession = vi.fn();
+    let latestVerification: TenantSessionVerificationState | undefined;
+    window.localStorage.setItem(ENTERPRISE_AUTH_STORAGE_KEY, JSON.stringify(sessionA));
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(
+      <context.TenantSessionProvider session={sessionA} onInvalidSession={onInvalidSession}>
+        <ContextProbe
+          context={context}
+          onValue={() => {}}
+          onVerification={(value) => { latestVerification = value; }}
+        />
+      </context.TenantSessionProvider>,
+    );
+
+    await waitFor(() => expect(latestVerification).toMatchObject({
+      status: 'error',
+      error: 'network',
+    }));
+    expect(onInvalidSession).not.toHaveBeenCalled();
+    expect(window.localStorage.getItem(ENTERPRISE_AUTH_STORAGE_KEY)).not.toBeNull();
+    expect(screen.getByTestId('tenant-context').textContent).toBe('not-ready');
+
+    latestVerification?.retry();
+    await waitFor(() => expect(screen.getByTestId('tenant-context').textContent).toBe('tenant-a'));
+    expect(latestVerification).toMatchObject({ status: 'ready', error: null });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(onInvalidSession).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { name: 'a server failure', response: jsonResponse({ detail: 'busy' }, 503), error: 'server' },
+    {
+      name: 'a malformed response',
+      response: {
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        json: async () => { throw new SyntaxError('invalid json'); },
+        text: async () => 'not-json',
+      } as unknown as Response,
+      error: 'malformed-response',
+    },
+  ])('does not invalidate the session after $name', async ({ response, error }) => {
+    const context = await loadTenantContext();
+    const fetchMock = vi.fn<typeof fetch>(async () => response);
+    const onInvalidSession = vi.fn();
+    let latestVerification: TenantSessionVerificationState | undefined;
+    window.localStorage.setItem(ENTERPRISE_AUTH_STORAGE_KEY, JSON.stringify(sessionA));
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(
+      <context.TenantSessionProvider session={sessionA} onInvalidSession={onInvalidSession}>
+        <ContextProbe
+          context={context}
+          onValue={() => {}}
+          onVerification={(value) => { latestVerification = value; }}
+        />
+      </context.TenantSessionProvider>,
+    );
+
+    await waitFor(() => expect(latestVerification).toMatchObject({ status: 'error', error }));
+    expect(onInvalidSession).not.toHaveBeenCalled();
+    expect(window.localStorage.getItem(ENTERPRISE_AUTH_STORAGE_KEY)).not.toBeNull();
+    expect(screen.getByTestId('tenant-context').textContent).toBe('not-ready');
+  });
+
+  it.each([401, 403])('invalidates the session for an authentication response %s', async (status) => {
+    const context = await loadTenantContext();
+    const fetchMock = vi.fn<typeof fetch>(async () => jsonResponse({ detail: 'denied' }, status));
+    const onInvalidSession = vi.fn();
+    let latestVerification: TenantSessionVerificationState | undefined;
+    window.localStorage.setItem(ENTERPRISE_AUTH_STORAGE_KEY, JSON.stringify(sessionA));
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(
+      <context.TenantSessionProvider session={sessionA} onInvalidSession={onInvalidSession}>
+        <ContextProbe
+          context={context}
+          onValue={() => {}}
+          onVerification={(value) => { latestVerification = value; }}
+        />
+      </context.TenantSessionProvider>,
+    );
+
+    await waitFor(() => expect(onInvalidSession).toHaveBeenCalledTimes(1));
+    expect(latestVerification).toMatchObject({ status: 'invalid', error: null });
+    expect(window.localStorage.getItem(ENTERPRISE_AUTH_STORAGE_KEY)).toBeNull();
+    expect(screen.getByTestId('tenant-context').textContent).toBe('not-ready');
   });
 });

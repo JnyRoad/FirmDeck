@@ -1195,7 +1195,8 @@ def _migrate_tenant_control_columns(conn, tables: set[str]) -> None:
             "UPDATE tenants SET initial_admin_user_id = ("
             "SELECT u.id FROM users AS u "
             "WHERE u.tenant_id = tenants.id AND u.role = 'admin' "
-            f"{active_predicate} ORDER BY {admin_order} LIMIT 1)"
+            f"{active_predicate} ORDER BY {admin_order} LIMIT 1) "
+            "WHERE initial_admin_user_id IS NULL"
         )
     )
 
@@ -1660,22 +1661,20 @@ def _verify_system_tenant_control(conn, tables: set[str]) -> None:
         if "users" in tables:
             user_columns = _sqlite_table_columns(conn, "users")
             active_predicate = "AND u.active = 1" if "active" in user_columns else ""
-            admin_order = (
-                "u.created_at ASC, u.id ASC"
-                if "created_at" in user_columns
-                else "u.id ASC"
-            )
             invalid_admins = conn.execute(
                 text(
-                    "SELECT COUNT(*) FROM tenants WHERE initial_admin_user_id IS NOT ("
-                    "SELECT u.id FROM users AS u "
-                    "WHERE u.tenant_id = tenants.id AND u.role = 'admin' "
-                    f"{active_predicate} ORDER BY {admin_order} LIMIT 1)"
+                    "SELECT COUNT(*) FROM tenants "
+                    "WHERE initial_admin_user_id IS NOT NULL "
+                    "AND NOT EXISTS ("
+                    "SELECT 1 FROM users AS u "
+                    "WHERE u.id = tenants.initial_admin_user_id "
+                    "AND u.tenant_id = tenants.id AND u.role = 'admin' "
+                    f"{active_predicate})"
                 )
             ).scalar_one()
             if int(invalid_admins):
                 raise RuntimeError(
-                    "Tenant initial administrator is not the oldest eligible administrator"
+                    "Tenant initial administrator is not an active same-tenant administrator"
                 )
         else:
             invalid_admins = conn.execute(

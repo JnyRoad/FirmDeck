@@ -159,6 +159,24 @@ class InstallationPasswordPolicy(SQLModel, table=True):
     """Persist one installation-wide password policy for system or default tenant credentials."""
 
     __tablename__ = "installation_password_policies"
+    __table_args__ = (
+        CheckConstraint(
+            "scope IN ('system', 'tenant_default')",
+            name="ck_installation_password_policies_scope",
+        ),
+        CheckConstraint(
+            "min_length BETWEEN 8 AND 20",
+            name="ck_installation_password_policies_min_length",
+        ),
+        CheckConstraint(
+            "max_length BETWEEN 8 AND 20",
+            name="ck_installation_password_policies_max_length",
+        ),
+        CheckConstraint(
+            "min_length <= max_length",
+            name="ck_installation_password_policies_length_order",
+        ),
+    )
 
     scope: str = Field(primary_key=True, max_length=32)
     min_length: int = Field(default=8, ge=8, le=20)
@@ -175,6 +193,24 @@ class TenantPasswordPolicy(SQLModel, table=True):
     """Persist one tenant custom policy, or an explicit inheritance choice, without password data."""
 
     __tablename__ = "tenant_password_policies"
+    __table_args__ = (
+        CheckConstraint(
+            "mode IN ('inherit', 'custom')",
+            name="ck_tenant_password_policies_mode",
+        ),
+        CheckConstraint(
+            "min_length IS NULL OR min_length BETWEEN 8 AND 20",
+            name="ck_tenant_password_policies_min_length",
+        ),
+        CheckConstraint(
+            "max_length IS NULL OR max_length BETWEEN 8 AND 20",
+            name="ck_tenant_password_policies_max_length",
+        ),
+        CheckConstraint(
+            "min_length IS NULL OR max_length IS NULL OR min_length <= max_length",
+            name="ck_tenant_password_policies_length_order",
+        ),
+    )
 
     tenant_id: str = Field(primary_key=True)
     mode: str = Field(default="inherit", max_length=16)

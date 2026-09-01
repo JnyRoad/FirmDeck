@@ -52,13 +52,51 @@ describe('DistillPage stale tenant request fences', () => {
     expect(saveBlock).toContain('const controller = new AbortController();');
     expect(saveBlock).toContain('signal: controller.signal');
     expect(saveBlock).toMatch(/catch \(error\) \{[\s\S]*isCurrentTenantRequest\(context, generation, controller\.signal\)[\s\S]*notify\.error/);
-    expect(saveBlock).toMatch(/finally \{[\s\S]*isCurrentTenantRequest\(context, generation, controller\.signal\)/);
+    expect(saveBlock).toMatch(/finally \{[\s\S]*saveControllerRef\.current === controller[\s\S]*saveControllerRef\.current = null;/);
 
     expect(probeBlock).toContain('const generation = context?.generation;');
     expect(probeBlock).toContain('const controller = new AbortController();');
     expect(probeBlock).toContain('signal: controller.signal');
     expect(probeBlock).toMatch(/if \(!isCurrentTenantRequest\(context, generation, controller\.signal\)\) return null;/);
     expect(probeBlock).toMatch(/catch \(error\) \{[\s\S]*isCurrentTenantRequest\(context, generation, controller\.signal\)[\s\S]*setToolSuggestionPatch/);
-    expect(probeBlock).toMatch(/finally \{[\s\S]*isCurrentTenantRequest\(context, generation, controller\.signal\)/);
+    expect(probeBlock).toMatch(/finally \{[\s\S]*probeControllersRef\.current\[requestKey\] === controller[\s\S]*delete probeControllersRef\.current\[requestKey\];/);
+  });
+
+  it('keeps request cleanup finally blocks from returning or masking the original result', () => {
+    const source = fs.readFileSync(path.resolve(__dirname, 'DistillPage.tsx'), 'utf8');
+    const functions = [
+      {
+        name: 'saveDraft',
+        end: '  function stopStream()',
+        cleanup: 'saveControllerRef.current === controller',
+      },
+      {
+        name: 'probeToolSuggestion',
+        end: '  function applyProbeArgumentsFromDetail()',
+        cleanup: 'probeControllersRef.current[requestKey] === controller',
+      },
+      {
+        name: 'commitToolSuggestionSelections',
+        end: '  function rejectToolSuggestion(',
+        cleanup: 'commitToolsControllerRef.current === controller',
+      },
+      {
+        name: 'rerunEditedMessage',
+        end: '  async function rollbackPersistedOperations(',
+        cleanup: 'rerunControllerRef.current === controller',
+      },
+    ];
+
+    functions.forEach(({ name, end, cleanup }) => {
+      const start = source.indexOf(`  async function ${name}(`);
+      const blockEnd = source.indexOf(end, start);
+      const block = source.slice(start, blockEnd);
+      const finallyStart = block.lastIndexOf('finally {');
+      const finallyBlock = block.slice(finallyStart);
+
+      expect(finallyStart).toBeGreaterThanOrEqual(0);
+      expect(finallyBlock).toContain(cleanup);
+      expect(finallyBlock).not.toMatch(/\breturn\b/);
+    });
   });
 });

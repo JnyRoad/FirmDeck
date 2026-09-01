@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from 'react';
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { LoaderCircle, LogIn, LogOut } from 'lucide-react';
 
 import { ApiError } from '@/api/client';
@@ -108,6 +108,21 @@ export default function ModelEditDialog({
   const [form, setForm] = useState<ModelForm>(BLANK_FORM);
   const [saving, setSaving] = useState(false);
   const [saveStage, setSaveStage] = useState<'saving' | 'testing' | null>(null);
+  const saveRequestOwnerRef = useRef(0);
+  const previousTenantGenerationRef = useRef<number | null>(tenantContext?.generation ?? null);
+
+  useEffect(() => {
+    const nextGeneration = tenantContext?.generation ?? null;
+    const previousGeneration = previousTenantGenerationRef.current;
+    previousTenantGenerationRef.current = nextGeneration;
+    if (previousGeneration === null || previousGeneration === nextGeneration) return;
+
+    // A tenant replacement invalidates the in-flight request owner as well as
+    // the result fence, so a hidden persistent dialog cannot remain blocked.
+    saveRequestOwnerRef.current += 1;
+    setSaving(false);
+    setSaveStage(null);
+  }, [tenantContext?.generation]);
 
   useEffect(() => {
     if (!open || !selected) {
@@ -197,6 +212,7 @@ export default function ModelEditDialog({
     const context = tenantContext;
     if (!context) return;
     const generation = context.generation;
+    const requestOwner = ++saveRequestOwnerRef.current;
     setSaving(true);
     setSaveStage(form.enabled ? 'testing' : 'saving');
     try {
@@ -220,7 +236,7 @@ export default function ModelEditDialog({
           : modelActionError(error, t('modelSetup.toast.saveFailed')),
       );
     } finally {
-      if (isCurrentTenantGeneration(context, generation)) {
+      if (requestOwner === saveRequestOwnerRef.current) {
         setSaving(false);
         setSaveStage(null);
       }

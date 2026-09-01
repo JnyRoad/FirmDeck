@@ -50,8 +50,10 @@ vi.mock('@/components/LanguageSwitcher', () => {
   return { default: SemanticTestLanguageSwitcher };
 });
 
+type TestTenantContext = TenantSessionContextValue & { controller: AbortController };
+
 const modelTestState = vi.hoisted(() => ({
-  currentContext: null as TenantSessionContextValue | null,
+  currentContext: null as TestTenantContext | null,
 }));
 
 vi.mock('@/contexts/TenantSessionContext', () => {
@@ -114,7 +116,7 @@ const semanticModelCopy = {
   },
 } as const;
 
-function makeTenantContext(generation = 1): TenantSessionContextValue {
+function makeTenantContext(generation = 1): TestTenantContext {
   const controller = new AbortController();
   return {
     tenantId: 'tenant_demo',
@@ -137,6 +139,7 @@ function makeTenantContext(generation = 1): TenantSessionContextValue {
       },
     },
     isCurrentGeneration: (candidate) => candidate === generation && !controller.signal.aborted,
+    controller,
   };
 }
 
@@ -374,7 +377,7 @@ describe('semantic model locale contract', () => {
     });
   }
 
-  it('does not toast or clear list loading when an old generation rejects', async () => {
+  it('does not toast but clears list loading when an old generation rejects', async () => {
     const context = modelTestState.currentContext as TenantSessionContextValue;
     let resolveConfigs: ((response: Response) => void) | undefined;
     const fetchMock = vi.fn((input: RequestInfo | URL) => {
@@ -410,7 +413,66 @@ describe('semantic model locale contract', () => {
     context.isCurrentGeneration = () => false;
     resolveConfigs?.(jsonResponse([]));
     await waitFor(() => expect(notifyError).not.toHaveBeenCalled());
-    expect((screen.getByRole('button', { name: '刷新' }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole('button', { name: '刷新' }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it('releases model testing busy state after tenant replacement fences the old request', async () => {
+    const user = userEvent.setup();
+    let resolveTest: ((response: Response) => void) | undefined;
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/api/enterprise/model-configs/raw-model-id/opaque_01/test')) {
+        return new Promise<Response>((resolve) => {
+          resolveTest = resolve;
+        });
+      }
+      if (url.includes('/codex-subscription/account')) {
+        return Promise.resolve(jsonResponse({
+          status: 'requires_login',
+          plan_type: null,
+          message: 'requires login',
+        }));
+      }
+      if (url.includes('/model-configs/protocols')) {
+        return Promise.resolve(jsonResponse({ protocols: ['openai_chat_completions'] }));
+      }
+      if (url.includes('/model-configs')) return Promise.resolve(jsonResponse([semanticModelRow]));
+      return Promise.resolve(jsonResponse({}));
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const page = render(createElement(AppIntlProvider, {
+      locale: 'zh-CN',
+      children: createElement(ModelsPage),
+    }));
+    const oldContext = modelTestState.currentContext as TestTenantContext;
+
+    const actionButtons = await screen.findAllByRole('button', { name: '模型操作' });
+    await user.click(actionButtons[0]);
+    await user.click(await screen.findByRole('menuitem', { name: '测试' }));
+    await waitFor(() => {
+      expect(fetchMock.mock.calls.some(([input]) => (
+        String(input).includes('/api/enterprise/model-configs/raw-model-id/opaque_01/test')
+      ))).toBe(true);
+      expect(screen.getAllByRole('button', { name: 'Raw Provider 模型 正在测试' }).length).toBeGreaterThan(0);
+    });
+
+    oldContext.controller.abort();
+    modelTestState.currentContext = makeTenantContext(2);
+    page.rerender(createElement(AppIntlProvider, {
+      locale: 'zh-CN',
+      children: createElement(ModelsPage),
+    }));
+    resolveTest?.(jsonResponse({
+      success: false,
+      message: 'late stale result',
+      activated: false,
+    }));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    await waitFor(() => {
+      expect(screen.getAllByRole('button', { name: '模型操作' }).length).toBeGreaterThan(0);
+    });
   });
 
   it('does not check the subscription account while loading API-key-only models', async () => {

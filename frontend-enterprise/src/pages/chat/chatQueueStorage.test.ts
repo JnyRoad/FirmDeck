@@ -159,17 +159,8 @@ describe('tenant/user chat queue namespace', () => {
   });
 
   it('fails closed instead of falling back to a default tenant for malformed identity', () => {
-    let missingTenantKey: unknown;
-    let missingUserKey: unknown;
-    try {
-      missingTenantKey = chatQueueStorageKey('', 'user-a');
-      missingUserKey = chatQueueStorageKey('tenant-a', '');
-    } catch {
-      // Throwing is an acceptable fail-closed result for an unusable identity.
-    }
-
-    expect(typeof missingTenantKey).not.toBe('string');
-    expect(typeof missingUserKey).not.toBe('string');
+    expect(() => chatQueueStorageKey('', 'user-a')).toThrow(TypeError);
+    expect(() => chatQueueStorageKey('tenant-a', '')).toThrow(TypeError);
   });
 
   it('round-trips raw turn text without locale rewriting in a tenant namespace', () => {

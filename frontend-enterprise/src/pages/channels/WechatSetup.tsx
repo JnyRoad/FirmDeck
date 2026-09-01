@@ -100,6 +100,7 @@ export default function WechatSetup({
     setVerifyCode('');
     setQr(null);
     setQrStatus('');
+    setQrLoading(false);
   }
 
   /** 请求新的微信二维码并启动受控轮询；provider 返回值仅用于二维码 raw 数据。 */

@@ -4,7 +4,7 @@ import type { ReactNode } from 'react';
 import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { AppIntlProvider } from '@/i18n/provider';
 import type { AppLocale } from '@/i18n/locales';
@@ -35,7 +35,7 @@ const tenantContextMock = vi.hoisted(() => {
       userId: 'user-1',
       generation: 1,
       signal: controller.signal,
-      isCurrentGeneration: (generation: number) => generation === 1,
+      isCurrentGeneration: (generation: number): boolean => generation === 1,
     },
   };
 });
@@ -124,6 +124,16 @@ function jsonResponse(body: unknown): Response {
   } as Response;
 }
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 function stubGalleryFetch(teams: TeamRead[], agents: AgentProfileRead[] = []) {
   const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
@@ -172,12 +182,58 @@ function renderGallery(currentUser?: EnterpriseAuthUser) {
   );
 }
 
+beforeEach(() => {
+  tenantContextMock.context.generation = 1;
+  tenantContextMock.context.isCurrentGeneration = (generation: number) => generation === 1;
+});
+
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
 });
 
 describe('EmployeeGalleryPage teams tab', () => {
+  it('clears pending employee and team chat states when the tenant generation changes', async () => {
+    const user = userEvent.setup();
+    const pendingEmployeeChat = deferred<void>();
+    const pendingTeamChat = deferred<Response>();
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (init?.method === 'POST' && url.includes('/tl/session')) return pendingTeamChat.promise;
+      if (url.includes('/api/enterprise/teams')) return jsonResponse([team]);
+      if (url.includes('/api/enterprise/agents')) return jsonResponse([galleryAgent]);
+      return jsonResponse({});
+    }));
+
+    const renderPage = () => (
+      <AppIntlProvider initialLocale="zh-CN">
+        <MemoryRouter initialEntries={['/workspace/gallery']}>
+          <EmployeeGalleryPage onStartChat={() => pendingEmployeeChat.promise} />
+        </MemoryRouter>
+      </AppIntlProvider>
+    );
+    const view = render(renderPage());
+
+    const employeeChatButton = await screen.findByRole('button', { name: '发起对话' });
+    await user.click(employeeChatButton);
+    await waitFor(() => expect((employeeChatButton as HTMLButtonElement).disabled).toBe(true));
+
+    tenantContextMock.context.generation = 2;
+    tenantContextMock.context.isCurrentGeneration = (generation: number) => generation === 2;
+    view.rerender(renderPage());
+    await waitFor(() => expect((employeeChatButton as HTMLButtonElement).disabled).toBe(false));
+
+    await user.click(screen.getByRole('tab', { name: '团队对话' }));
+    const teamCard = await screen.findByRole('button', { name: '团队卡片' });
+    await user.click(teamCard);
+    await waitFor(() => expect(teamCard.getAttribute('aria-busy')).toBe('true'));
+
+    tenantContextMock.context.generation = 3;
+    tenantContextMock.context.isCurrentGeneration = (generation: number) => generation === 3;
+    view.rerender(renderPage());
+    await waitFor(() => expect(teamCard.getAttribute('aria-busy')).toBe('false'));
+  });
+
   it('renders team chat cards with member count, project leader and avatar stack', async () => {
     const user = userEvent.setup();
     stubGalleryFetch([team]);

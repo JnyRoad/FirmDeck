@@ -249,7 +249,10 @@ export default function ModelsPage({
   const [subscriptionConfigTenantId, setSubscriptionConfigTenantId] = useState<string | null>(null);
   const [subscriptionExplicitTenantId, setSubscriptionExplicitTenantId] = useState<string | null>(null);
   const previousTenantGenerationRef = useRef<number | null>(tenantContext?.generation ?? null);
+  const loadingRequestOwnerRef = useRef(0);
   const testingModelIdsRef = useRef(new Set<string>());
+  const testingModelRequestOwnersRef = useRef(new Map<string, number>());
+  const testingRequestOwnerRef = useRef(0);
   const [testingModelIds, setTestingModelIds] = useState<Set<string>>(new Set());
   const [availableProtocols, setAvailableProtocols] = useState<ApiKeyProtocol[]>(['openai_chat_completions']);
   const {
@@ -273,6 +276,7 @@ export default function ModelsPage({
     const context = tenantContext;
     if (!context) return Promise.resolve();
     const generation = context.generation;
+    const requestOwner = showLoading ? ++loadingRequestOwnerRef.current : null;
     if (showLoading) setLoading(true);
     return tenantApi
       .get<ModelConfigRead[]>('/api/enterprise/model-configs')
@@ -291,9 +295,32 @@ export default function ModelsPage({
         notify.error(modelActionError(error, t('modelsPage.toast.loadFailed')));
       })
       .finally(() => {
-        if (showLoading && isCurrentTenantGeneration(context, generation)) setLoading(false);
+        if (showLoading && requestOwner === loadingRequestOwnerRef.current) setLoading(false);
       });
   };
+
+  useEffect(() => {
+    const nextGeneration = tenantContext?.generation ?? null;
+    const previousGeneration = previousTenantGenerationRef.current;
+    previousTenantGenerationRef.current = nextGeneration;
+    if (previousGeneration === null || previousGeneration === nextGeneration) {
+      return;
+    }
+    // Tenant generation is a hard UI isolation boundary: no modal target or
+    // explicit subscription check may survive into the next tenant context.
+    setWizardOpen(false);
+    setEditingModel(null);
+    setDeleteTarget(null);
+    setDeleting(false);
+    setSubscriptionLogoutConfirmOpen(false);
+    setSubscriptionConfigTenantId(null);
+    setSubscriptionExplicitTenantId(null);
+    loadingRequestOwnerRef.current += 1;
+    testingModelRequestOwnersRef.current.clear();
+    testingModelIdsRef.current.clear();
+    setLoading(false);
+    setTestingModelIds(new Set());
+  }, [tenantContext?.generation]);
 
   useEffect(() => {
     const context = tenantContext;
@@ -311,24 +338,6 @@ export default function ModelsPage({
         // tenant generation must never become an unhandled rejection/toast.
       });
   }, [tenantApi, tenantContext]);
-
-  useEffect(() => {
-    const nextGeneration = tenantContext?.generation ?? null;
-    const previousGeneration = previousTenantGenerationRef.current;
-    previousTenantGenerationRef.current = nextGeneration;
-    if (previousGeneration === null || nextGeneration === null || previousGeneration === nextGeneration) {
-      return;
-    }
-    // Tenant generation is a hard UI isolation boundary: no modal target or
-    // explicit subscription check may survive into the next tenant context.
-    setWizardOpen(false);
-    setEditingModel(null);
-    setDeleteTarget(null);
-    setDeleting(false);
-    setSubscriptionLogoutConfirmOpen(false);
-    setSubscriptionConfigTenantId(null);
-    setSubscriptionExplicitTenantId(null);
-  }, [tenantContext?.generation]);
 
   useEffect(() => {
     if (!wizardOpen) setSubscriptionExplicitTenantId(null);
@@ -408,6 +417,8 @@ export default function ModelsPage({
     const context = tenantContext;
     if (!context) return false;
     const generation = context.generation;
+    const requestOwner = ++testingRequestOwnerRef.current;
+    testingModelRequestOwnersRef.current.set(row.id, requestOwner);
     testingModelIdsRef.current.add(row.id);
     setTestingModelIds(new Set(testingModelIdsRef.current));
     const controller = new AbortController();
@@ -438,10 +449,11 @@ export default function ModelsPage({
       return false;
     } finally {
       window.clearTimeout(timeoutId);
-      if (isCurrentTenantGeneration(context, generation)) {
+      if (testingModelRequestOwnersRef.current.get(row.id) === requestOwner) {
+        testingModelRequestOwnersRef.current.delete(row.id);
         testingModelIdsRef.current.delete(row.id);
         setTestingModelIds(new Set(testingModelIdsRef.current));
-        void load(false);
+        if (isCurrentTenantGeneration(context, generation)) void load(false);
       }
     }
   }

@@ -1361,5 +1361,7 @@ def _authorize(expected: str, authorization: str | None) -> None:
     """Require the exact Bearer credential and reject an unusable expected secret."""
     if not _codex_a2a_token_is_usable(expected):
         raise _a2a_http_error(status_code=401, detail="Invalid A2A adapter credential")
-    if not secrets.compare_digest(authorization or "", f"Bearer {expected}"):
+    provided = (authorization or "").encode("utf-8")
+    required = f"Bearer {expected}".encode()
+    if not secrets.compare_digest(provided, required):
         raise _a2a_http_error(status_code=401, detail="Invalid A2A adapter credential")

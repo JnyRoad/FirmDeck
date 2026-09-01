@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { ENTERPRISE_AUTH_STORAGE_KEY } from './auth';
 
@@ -58,6 +58,7 @@ async function loadSystemAuth(): Promise<SystemAuthModule> {
 
 afterEach(() => {
   window.localStorage.clear();
+  vi.restoreAllMocks();
 });
 
 describe('system auth storage isolation', () => {
@@ -126,5 +127,14 @@ describe('system auth storage isolation', () => {
     expect(restored).toEqual(session);
     expect(restored).not.toHaveProperty('tenant_id');
     expect(restored?.system_admin).not.toHaveProperty('tenant_id');
+  });
+
+  it('does not let a storage write failure crash the system login flow', async () => {
+    const auth = await loadSystemAuth();
+    vi.spyOn(window.localStorage, 'setItem').mockImplementation(() => {
+      throw new Error('storage quota exceeded');
+    });
+
+    expect(() => auth.setSystemAuthSession(session)).not.toThrow();
   });
 });

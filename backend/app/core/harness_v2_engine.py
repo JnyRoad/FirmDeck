@@ -70,7 +70,6 @@ from app.db.models import (
     Message,
     Skill,
     Team,
-    Tenant,
     utc_now,
 )
 from app.i18n.language_context import LanguageContext
@@ -1010,9 +1009,7 @@ class HarnessV2Engine:
         correlation_id: str,
         persisted_version: object | None = None,
     ) -> TenantLifecycleDecision | None:
-        """Admit a Harness boundary when its authoritative Tenant row exists."""
-        if self.db.get(Tenant, tenant_id) is None:
-            return None
+        """Admit a Harness boundary through the authoritative Tenant lifecycle."""
         decision = require_active_tenant(
             self.db,
             tenant_id,

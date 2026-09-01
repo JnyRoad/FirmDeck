@@ -435,12 +435,13 @@ class HarnessCapabilityInvoker:
         if lifecycle_changed:
             # Once dispatch began, a lifecycle change makes the provider outcome
             # unknowable; never expose or replay it as ordinary success.
-            error = result.get("error")
-            if not isinstance(error, dict):
-                error = {}
-                result["error"] = error
-            error["outcome_unknown"] = True
-            result["success"] = False
+            result = _failure(
+                "TOOL_CALL_OUTCOME_UNKNOWN",
+                "工具调用已跨越租户生命周期边界，远端结果未知。",
+                request_id=call_id,
+                trace_id=self.run_id,
+            )
+            result["error"]["outcome_unknown"] = True
         # 将业务结果与调用记录一次提交；失败类型决定 Harness 是否释放重试声明。
         if lifecycle_changed:
             invocation.status = "outcome_unknown"

@@ -38,8 +38,13 @@ def _file_engine(path: Path) -> object:
     """Create a file-backed database so independent Sessions can exercise a commit race."""
     engine = create_engine(
         f"sqlite:///{path}",
-        connect_args={"check_same_thread": False, "timeout": 5},
+        connect_args={"check_same_thread": False, "timeout": 30},
     )
+    with engine.connect() as connection:
+        # WAL lets the independent race participants keep reading while one writer commits.
+        connection.exec_driver_sql("PRAGMA journal_mode=WAL")
+        connection.exec_driver_sql("PRAGMA busy_timeout=30000")
+        connection.commit()
     SQLModel.metadata.create_all(engine)
     return engine
 
@@ -489,7 +494,7 @@ def test_suspended_occurrence_unique_key_race_is_idempotent(tmp_path: Path, monk
 
     def synchronized_create_run(*args, **kwargs):
         """Ensure both Sessions pass the read-before-insert window before either commit."""
-        barrier.wait(timeout=5)
+        barrier.wait(timeout=10)
         return original_create_run(*args, **kwargs)
 
     monkeypatch.setattr(scheduled_service, "_create_run", synchronized_create_run)
@@ -526,7 +531,7 @@ def test_suspended_occurrence_unique_key_race_is_idempotent(tmp_path: Path, monk
     for thread in threads:
         thread.start()
     for thread in threads:
-        thread.join(timeout=10)
+        thread.join(timeout=35)
 
     assert not any(thread.is_alive() for thread in threads)
     assert errors == []

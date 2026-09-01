@@ -37,12 +37,8 @@ export default function SystemPasswordChangePage({
   const [policy, setPolicy] = useState<PasswordPolicy>(DEFAULT_PASSWORD_POLICY);
   void _session;
 
-  /** Loads the normal system-admin policy while restricted first-login sessions retain the fixed baseline. */
+  /** Loads the read-only effective policy for both normal and restricted first-login sessions. */
   useEffect(() => {
-    if (forced) {
-      setPolicy(DEFAULT_PASSWORD_POLICY);
-      return;
-    }
     let cancelled = false;
     void client.getPasswordPolicies()
       .then((policies) => {
@@ -52,7 +48,7 @@ export default function SystemPasswordChangePage({
         if (!cancelled) setPolicy(DEFAULT_PASSWORD_POLICY);
       });
     return () => { cancelled = true; };
-  }, [client, forced]);
+  }, [client]);
 
   /** Clears password values immediately after any completed attempt. */
   function clearSecrets() {
@@ -116,7 +112,7 @@ export default function SystemPasswordChangePage({
             min: policy.min_length,
             max: policy.max_length,
           })}</p>
-          {!forced && policy.complexity_enabled && <ul className="text-[12px] text-[#6f788a]">{policy.require_uppercase && <li>{t('system.passwordPolicies.requireUppercase')}</li>}{policy.require_lowercase && <li>{t('system.passwordPolicies.requireLowercase')}</li>}{policy.require_digit && <li>{t('system.passwordPolicies.requireDigit')}</li>}{policy.require_special && <li>{t('system.passwordPolicies.requireSpecial')}</li>}</ul>}
+          {policy.complexity_enabled && <ul className="text-[12px] text-[#6f788a]">{policy.require_uppercase && <li>{t('system.passwordPolicies.requireUppercase')}</li>}{policy.require_lowercase && <li>{t('system.passwordPolicies.requireLowercase')}</li>}{policy.require_digit && <li>{t('system.passwordPolicies.requireDigit')}</li>}{policy.require_special && <li>{t('system.passwordPolicies.requireSpecial')}</li>}</ul>}
           {error && <p role="alert" className="text-[13px] text-[#a73535]">{error}</p>}
           <Button type="submit" disabled={loading}>{loading ? t('system.passwordChange.submitting') : t('system.passwordChange.submit')}</Button>
         </form>

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import base64
-from time import sleep
+from time import monotonic, sleep
 from typing import Any
 
 from fastapi import APIRouter, Depends, File, Form, Request, Response, UploadFile
@@ -50,6 +50,8 @@ from app.tools.tool_schema import (
 )
 
 router = APIRouter(tags=["resources"])
+
+KNOWLEDGE_INGEST_POLL_TIMEOUT_SECONDS = 300.0
 
 
 def _dump(value: Any) -> Any:
@@ -395,10 +397,13 @@ def execute_knowledge_ingest(db: Session, job: APIJob) -> dict[str, Any]:
         db.rollback()
         mark_side_effect_started(db)
         inner = internal_knowledge.upload_document(upload, str(job.agent_id), db, actor)
+        poll_deadline = monotonic() + KNOWLEDGE_INGEST_POLL_TIMEOUT_SECONDS
         while True:
             # The nested worker can run for an unbounded provider-backed interval.
             # Close every prior read transaction, admit the next observation, and
             # close that decision before polling or sleeping again.
+            if monotonic() >= poll_deadline:
+                raise TimeoutError("Knowledge ingest polling timed out")
             db.rollback()
             _require_job_lifecycle(db, job)
             db.rollback()

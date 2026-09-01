@@ -95,11 +95,20 @@ export function setSystemAuthSession(session: SystemAuthSession): void {
   if (!isSystemAuthSession(session)) {
     throw new TypeError('Invalid system authentication session');
   }
-  window.localStorage.setItem(SYSTEM_AUTH_STORAGE_KEY, JSON.stringify(session));
+  try {
+    window.localStorage.setItem(SYSTEM_AUTH_STORAGE_KEY, JSON.stringify(session));
+  } catch {
+    // Persistence is best-effort: the authenticated in-memory flow must not
+    // report a valid login as failed when browser storage is unavailable.
+  }
 }
 
 /** Clear only the installation-scoped system session. */
 export function clearSystemAuthSession(): void {
   if (typeof window === 'undefined') return;
-  window.localStorage.removeItem(SYSTEM_AUTH_STORAGE_KEY);
+  try {
+    window.localStorage.removeItem(SYSTEM_AUTH_STORAGE_KEY);
+  } catch {
+    // A storage failure must not prevent the caller from completing logout.
+  }
 }

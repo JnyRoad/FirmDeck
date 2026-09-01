@@ -15,7 +15,11 @@ import {
   isGalleryEmployee,
   type EnterpriseAuthSession,
 } from "./auth";
-import { TenantSessionProvider, useTenantSession } from "./contexts/TenantSessionContext";
+import {
+  TenantSessionProvider,
+  useTenantSession,
+  useTenantSessionVerification,
+} from "./contexts/TenantSessionContext";
 import AppSidebar from "./components/AppSidebar";
 import OnboardingGuide, { ONBOARDING_SEEN_KEY } from "./components/OnboardingGuide";
 import QuickStartGuide, {
@@ -41,7 +45,7 @@ import AgentsPage from "./pages/AgentsPage";
 import ChannelsPage from "./pages/ChannelsPage";
 import ChatPage from "./pages/chat/ChatPage";
 import ChatGalleryPage from "./pages/chat/ChatGalleryPage";
-import ChangePasswordPage from "./pages/ChangePasswordPage";
+import ChangePasswordPage, { type PasswordPolicy } from "./pages/ChangePasswordPage";
 import DashboardPage from "./pages/dashboard/DashboardPage";
 import EmptyEmployeeState from "./components/EmptyEmployeeState";
 import DistillPage from "./pages/DistillPage";
@@ -1075,6 +1079,7 @@ function TenantChangePasswordRoute({
     <ChangePasswordPage
       session={session}
       client={{
+        getPasswordPolicy: () => tenantApi.get<PasswordPolicy>("/api/auth/password-policy"),
         changePassword: (input) => tenantApi.post<EnterpriseAuthSession>(
           "/api/auth/change-password",
           input,
@@ -1095,8 +1100,24 @@ function VerifiedTenantApp({
   onSessionChange: (session: EnterpriseAuthSession) => void;
   guidesCompleted: boolean;
 }) {
+  const { t } = useAppIntl();
   const tenantContext = useTenantSession();
-  if (!tenantContext) return null;
+  const verification = useTenantSessionVerification();
+  if (!tenantContext) {
+    if (verification.status !== 'error') return null;
+    return (
+      <main className="flex min-h-screen items-center justify-center bg-[#f7f9fc] px-5">
+        <section className="w-full max-w-md rounded-[18px] border border-[#e3e8f1] bg-white p-8 text-center shadow-[0_18px_55px_rgba(35,61,102,0.08)]">
+          <p role="alert" className="text-[14px] text-[#464c5e]">
+            {t('auth.sessionVerification.failure')}
+          </p>
+          <UIButton className="mt-5" onClick={verification.retry}>
+            {t('auth.sessionVerification.retry')}
+          </UIButton>
+        </section>
+      </main>
+    );
+  }
   const auth = tenantContext.session;
 
   return (

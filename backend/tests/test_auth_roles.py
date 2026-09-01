@@ -20,9 +20,11 @@ from app.api.auth import (
     update_user,
 )
 from app.db import get_session
-from app.db.models import InstallationPasswordPolicy, Tenant, User
+from app.db.models import InstallationPasswordPolicy, Tenant, TenantPasswordPolicy, User
 from app.db.seed import seed_demo_data
 from app.security.auth import hash_password
+from app.security.password_policy import PasswordPolicy, save_tenant_policy
+from app.security.tenant import TenantLifecycleDenied
 
 _TEST_APP_SECRET = "t026-tenant-signing-secret"
 _ALPHA_PASSWORD = "Alpha-password-2026"
@@ -51,6 +53,46 @@ def test_unknown_login_does_not_create_account() -> None:
             raise AssertionError("unknown account must not be created during login")
 
         assert db.exec(select(User)).all() == []
+
+
+def test_tenant_lifecycle_check_failure_keeps_service_unavailable_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A storage/lifecycle check failure must remain 503 instead of becoming a 401 token denial."""
+    user = User(
+        id="lifecycle-user",
+        tenant_id="tenant-demo",
+        username="admin",
+        role="admin",
+        password_hash=hash_password("secret"),
+    )
+
+    class UserStore:
+        """Provide the one user lookup needed by token authentication."""
+
+        def get(self, model_type, user_id: str):
+            """Return the seeded user for the model and ID requested by auth."""
+            assert model_type is User
+            return user if user_id == user.id else None
+
+    def fail_lifecycle(*_args, **_kwargs):
+        """Raise the registered service-unavailable lifecycle denial."""
+        raise TenantLifecycleDenied(
+            "TENANT_LIFECYCLE_CHECK_FAILED",
+            {
+                "tenant_id": user.tenant_id,
+                "execution_kind": "job.claim",
+                "correlation_id": "tenant-bearer:lifecycle-user",
+            },
+        )
+
+    monkeypatch.setattr(tenant_auth, "require_active_tenant", fail_lifecycle)
+
+    with pytest.raises(HTTPException) as denied:
+        tenant_auth.authenticate_tenant_token(tenant_auth.create_access_token(user), UserStore())
+
+    assert denied.value.status_code == 503
+    assert denied.value.detail["code"] == "TENANT_LIFECYCLE_CHECK_FAILED"
 
 
 def test_database_role_controls_account_management() -> None:
@@ -276,6 +318,8 @@ def test_enabled_tenant_complexity_applies_to_self_change_and_admin_update() -> 
         assert member is not None
         assert (member.password_hash, member.auth_version, member.password_changed_at) == before_self_change
 
+    assert rejected_self_change.json()["detail"]["code"] == "AUTH_PASSWORD_POLICY_VIOLATION"
+
     accepted_self_change = client.post(
         "/api/auth/change-password",
         json={"current_password": "Member-old-2026", "new_password": "MemberA1!2"},
@@ -307,6 +351,65 @@ def test_enabled_tenant_complexity_applies_to_self_change_and_admin_update() -> 
             db,
         )
         assert member.auth_version == before_admin_update[1] + 1
+
+
+def test_temporary_tenant_session_can_read_its_effective_password_policy() -> None:
+    """Expose only the caller tenant's resolved policy so forced-change UI can validate correctly."""
+    engine = _test_engine()
+    _seed_two_tenants(engine)
+    with Session(engine) as db:
+        user = db.get(User, "user_alpha")
+        assert user is not None
+        user.must_change_password = True
+        db.add(user)
+        db.add(
+            TenantPasswordPolicy(
+                tenant_id="tenant_alpha",
+                mode="custom",
+                min_length=10,
+                max_length=16,
+                complexity_enabled=True,
+                require_uppercase=True,
+                require_lowercase=False,
+                require_digit=True,
+                require_special=False,
+            )
+        )
+        db.commit()
+
+    client = _api_client(engine)
+    login_response = client.post(
+        "/api/auth/login",
+        json={"tenant_slug": "alpha", "username": "admin", "password": _ALPHA_PASSWORD},
+    )
+    assert login_response.status_code == 200, login_response.text
+
+    response = client.get(
+        "/api/auth/password-policy",
+        headers={"Authorization": f"Bearer {login_response.json()['token']}"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "min_length": 10,
+        "max_length": 16,
+        "complexity_enabled": True,
+        "require_uppercase": True,
+        "require_lowercase": False,
+        "require_digit": True,
+        "require_special": False,
+    }
+
+
+def test_tenant_policy_rejects_inherit_with_hidden_custom_values() -> None:
+    """Inheritance must not persist a custom rule set that the resolver silently ignores."""
+    with _test_session() as db, pytest.raises(ValueError, match="invalid tenant password policy"):
+        save_tenant_policy(
+            db,
+            "tenant_alpha",
+            "inherit",
+            PasswordPolicy(min_length=12, max_length=16),
+        )
 
 
 def test_duplicate_display_name_cannot_be_used_to_login() -> None:

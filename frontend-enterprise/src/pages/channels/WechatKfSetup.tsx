@@ -113,6 +113,7 @@ export default function WechatKfSetup({
   const [contactUrls, setContactUrls] = useState<Record<string, string>>({});
   const [contactQrImages, setContactQrImages] = useState<Record<string, string>>({});
   const [contactOperationOpenKfid, setContactOperationOpenKfid] = useState<string | null>(null);
+  const bindingGenerationRef = useRef(0);
   const accountRequestGeneration = useRef(0);
 
   /** 清空账号编辑器和本地 File 引用；不删除服务端账号。 */
@@ -127,6 +128,7 @@ export default function WechatKfSetup({
 
   /** binding 切换时清除所有一次性 Secret、callback 与文件状态，并重新读取公开投影。 */
   useEffect(() => {
+    const generation = ++bindingGenerationRef.current;
     setCorpId(bindingCorpId(binding));
     setSecret('');
     setCallbackConfig(null);
@@ -139,7 +141,16 @@ export default function WechatKfSetup({
     setErrorId(null);
     setOperation(null);
     accountRequestGeneration.current += 1;
+    return () => {
+      if (bindingGenerationRef.current === generation) bindingGenerationRef.current += 1;
+    };
   }, [binding.id]);
+
+  /** Captures the binding generation so an older request cannot publish state into a new binding. */
+  function currentBindingRequest(): () => boolean {
+    const generation = bindingGenerationRef.current;
+    return () => bindingGenerationRef.current === generation;
+  }
 
   /** callback 已就绪且用户可管理时读取 provider 清单；未授权状态不发请求。 */
   useEffect(() => {
@@ -203,6 +214,7 @@ export default function WechatKfSetup({
 
   /** 准备当前 corp 的一次性 callback 配置；开始和失败都会清除旧 corp 的值。 */
   async function prepareCallback(): Promise<void> {
+    const isCurrent = currentBindingRequest();
     const normalizedCorpId = corpId.trim();
     setCallbackConfig(null);
     setPreparedCorpId(null);
@@ -217,18 +229,21 @@ export default function WechatKfSetup({
         tenant_id: binding.tenant_id,
         corp_id: normalizedCorpId,
       });
+      if (!isCurrent()) return;
       setCallbackConfig(prepared);
       setPreparedCorpId(normalizedCorpId);
       toast.success(createMessageDescriptor('channels.wechatKf.callback.prepared'));
     } catch (error) {
+      if (!isCurrent()) return;
       showError(error, 'channels.wechatKf.error.callbackPrepare');
     } finally {
-      setOperation(null);
+      if (isCurrent()) setOperation(null);
     }
   }
 
   /** 快照并立即清空 Secret，再校验并保存与当前 corp 匹配的 callback 凭据。 */
   async function saveCredentials(): Promise<void> {
+    const isCurrent = currentBindingRequest();
     const submittedSecret = secret;
     setSecret('');
     const normalizedCorpId = corpId.trim();
@@ -253,28 +268,31 @@ export default function WechatKfSetup({
         secret: submittedSecret,
         ...callbackCredentials,
       });
+      if (!isCurrent()) return;
       applyBinding(updated);
       toast.success(createMessageDescriptor('channels.wechatKf.credentials.saved'));
     } catch (error) {
+      if (!isCurrent()) return;
       showError(error, 'channels.wechatKf.error.credentialsSave');
     } finally {
-      setOperation(null);
+      if (isCurrent()) setOperation(null);
     }
   }
 
   /** 获取并全量替换 provider 账号；generation 防止旧 binding 响应覆盖新状态。 */
   async function refreshAccounts(errorFallbackId: MessageId): Promise<AccountRefreshResult> {
+    const isCurrentBinding = currentBindingRequest();
     const generation = accountRequestGeneration.current + 1;
     accountRequestGeneration.current = generation;
     try {
       const result = await wechatKfApi.listAccounts(binding.id, binding.tenant_id);
-      if (accountRequestGeneration.current !== generation) {
+      if (!isCurrentBinding() || accountRequestGeneration.current !== generation) {
         return { accepted: false, succeeded: false };
       }
       setAccounts(Array.isArray(result.accounts) ? result.accounts : []);
       return { accepted: true, succeeded: true };
     } catch (error) {
-      if (accountRequestGeneration.current !== generation) {
+      if (!isCurrentBinding() || accountRequestGeneration.current !== generation) {
         return { accepted: false, succeeded: false };
       }
       showError(error, errorFallbackId);
@@ -293,6 +311,7 @@ export default function WechatKfSetup({
   /** 选择一个未绑定 provider 账号并以 provider 刷新结果同步完整账号集合。 */
   async function selectAccount(account: WeChatKfProviderAccountRead): Promise<void> {
     if (!account.manage_privilege || account.bound) return;
+    const isCurrent = currentBindingRequest();
     setOperation('select');
     setErrorId(null);
     try {
@@ -300,13 +319,16 @@ export default function WechatKfSetup({
         tenant_id: binding.tenant_id,
         open_kfid: account.open_kfid,
       });
+      if (!isCurrent()) return;
       applyBinding(updated);
       const refreshed = await refreshAccounts('channels.wechatKf.error.mutationRefresh');
+      if (!isCurrent()) return;
       if (refreshed.succeeded) toast.success(createMessageDescriptor('channels.wechatKf.account.selectedToast'));
     } catch (error) {
+      if (!isCurrent()) return;
       showError(error, 'channels.wechatKf.error.accountSelect');
     } finally {
-      setOperation(null);
+      if (isCurrent()) setOperation(null);
     }
   }
 
@@ -346,18 +368,21 @@ export default function WechatKfSetup({
       setErrorId(createMessageDescriptor('channels.wechatKf.avatar.required').id);
       return;
     }
+    const isCurrent = currentBindingRequest();
     setOperation('avatar');
     setErrorId(null);
     try {
       const result = await wechatKfApi.uploadAvatar(binding.id, avatarFile, binding.tenant_id);
+      if (!isCurrent()) return;
       setAvatarMediaId(result.media_id);
       setAvatarFile(null);
       setAvatarInputRevision((revision) => revision + 1);
       setAvatarStatusId(createMessageDescriptor('channels.wechatKf.avatar.uploaded').id);
     } catch (error) {
+      if (!isCurrent()) return;
       showError(error, 'channels.wechatKf.error.avatarUpload');
     } finally {
-      setOperation(null);
+      if (isCurrent()) setOperation(null);
     }
   }
 
@@ -372,6 +397,7 @@ export default function WechatKfSetup({
       setErrorId(createMessageDescriptor('channels.wechatKf.avatar.required').id);
       return;
     }
+    const isCurrent = currentBindingRequest();
     setOperation('create');
     setErrorId(null);
     try {
@@ -380,14 +406,17 @@ export default function WechatKfSetup({
         name,
         media_id: avatarMediaId,
       });
+      if (!isCurrent()) return;
       applyBinding(updated);
       const refreshed = await refreshAccounts('channels.wechatKf.error.mutationRefresh');
+      if (!isCurrent()) return;
       resetAccountEditor();
       if (refreshed.succeeded) toast.success(createMessageDescriptor('channels.wechatKf.account.createdToast'));
     } catch (error) {
+      if (!isCurrent()) return;
       showError(error, 'channels.wechatKf.error.accountCreate');
     } finally {
-      setOperation(null);
+      if (isCurrent()) setOperation(null);
     }
   }
 
@@ -408,6 +437,7 @@ export default function WechatKfSetup({
       setErrorId(createMessageDescriptor('channels.wechatKf.account.nameRequired').id);
       return;
     }
+    const isCurrent = currentBindingRequest();
     setOperation('update');
     setErrorId(null);
     try {
@@ -417,14 +447,17 @@ export default function WechatKfSetup({
         name,
         ...(avatarMediaId ? { media_id: avatarMediaId } : {}),
       });
+      if (!isCurrent()) return;
       applyBinding(updated);
       const refreshed = await refreshAccounts('channels.wechatKf.error.mutationRefresh');
+      if (!isCurrent()) return;
       resetAccountEditor();
       if (refreshed.succeeded) toast.success(createMessageDescriptor('channels.wechatKf.account.updatedToast'));
     } catch (error) {
+      if (!isCurrent()) return;
       showError(error, 'channels.wechatKf.error.accountUpdate');
     } finally {
-      setOperation(null);
+      if (isCurrent()) setOperation(null);
     }
   }
 
@@ -442,18 +475,22 @@ export default function WechatKfSetup({
   async function confirmDelete(): Promise<void> {
     if (!deleteTarget) return;
     const target = deleteTarget;
+    const isCurrent = currentBindingRequest();
     setOperation('delete');
     setErrorId(null);
     try {
       const updated = await wechatKfApi.deleteAccount(binding.id, target.open_kfid, binding.tenant_id);
+      if (!isCurrent()) return;
       applyBinding(updated);
       setDeleteTarget(null);
       const refreshed = await refreshAccounts('channels.wechatKf.error.mutationRefresh');
+      if (!isCurrent()) return;
       if (refreshed.succeeded) toast.success(createMessageDescriptor('channels.wechatKf.account.deletedToast'));
     } catch (error) {
+      if (!isCurrent()) return;
       showError(error, 'channels.wechatKf.error.accountDelete');
     } finally {
-      setOperation(null);
+      if (isCurrent()) setOperation(null);
     }
   }
 
@@ -473,6 +510,7 @@ export default function WechatKfSetup({
 
   /** 为已绑定账号生成经严格 URL allowlist 校验的咨询链接与 QR。 */
   async function createContactWay(account: WeChatKfProviderAccountRead): Promise<void> {
+    const isCurrent = currentBindingRequest();
     setOperation('contact');
     setContactOperationOpenKfid(account.open_kfid);
     setErrorId(null);
@@ -484,19 +522,24 @@ export default function WechatKfSetup({
         account.open_kfid,
         binding.tenant_id,
       );
+      if (!isCurrent()) return;
       if (!isSafeWechatKfContactUrl(result.url)) {
         setErrorId(createMessageDescriptor('channels.wechatKf.contact.invalidUrl').id);
         toast.error(createMessageDescriptor('channels.wechatKf.contact.invalidUrl'));
         return;
       }
       const qrImageUrl = await QRCode.toDataURL(result.url, { width: 220, margin: 1 });
+      if (!isCurrent()) return;
       setContactUrls((current) => ({ ...current, [account.open_kfid]: result.url }));
       setContactQrImages((current) => ({ ...current, [account.open_kfid]: qrImageUrl }));
     } catch (error) {
+      if (!isCurrent()) return;
       showError(error, 'channels.wechatKf.error.contactWay');
     } finally {
-      setContactOperationOpenKfid(null);
-      setOperation(null);
+      if (isCurrent()) {
+        setContactOperationOpenKfid(null);
+        setOperation(null);
+      }
     }
   }
 

@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import type { ReactNode } from 'react';
-import { cleanup, render, screen } from '@testing-library/react';
+import { cleanup, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -39,6 +39,20 @@ const tenantContextMock = vi.hoisted(() => {
       isCurrentGeneration: (generation: number) => generation === 1,
     },
   };
+});
+
+const notifyMock = vi.hoisted(() => ({
+  dismiss: vi.fn(),
+  error: vi.fn(),
+  info: vi.fn(),
+  loading: vi.fn(),
+  success: vi.fn(),
+  warning: vi.fn(),
+}));
+
+vi.mock('@/components/ui/app-toast', async () => {
+  const actual = await vi.importActual<typeof import('@/components/ui/app-toast')>('@/components/ui/app-toast');
+  return { ...actual, notify: notifyMock };
 });
 
 vi.mock('../contexts/TenantSessionContext', () => ({
@@ -177,8 +191,29 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  vi.clearAllMocks();
   vi.unstubAllGlobals();
   window.localStorage.clear();
+});
+
+describe('AgentsPage localized API error fallback', () => {
+  it('uses the page fallback when apiErrorMessage returns localized generic text', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      throw new Error('network unavailable');
+    }));
+
+    render(
+      <AppIntlProvider initialLocale="en-US">
+        <MemoryRouter>
+          <AgentsPage
+            currentUser={{ id: 'user-1', tenant_id: 'tenant_demo', username: 'demo', role: 'admin' }}
+          />
+        </MemoryRouter>
+      </AppIntlProvider>,
+    );
+
+    await waitFor(() => expect(notifyMock.error).toHaveBeenCalledWith('Failed to load employees'));
+  });
 });
 
 describe('AgentsPage team scope compatibility', () => {

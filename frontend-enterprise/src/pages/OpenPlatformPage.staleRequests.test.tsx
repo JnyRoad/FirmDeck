@@ -1,6 +1,9 @@
 // @vitest-environment jsdom
 
+import type { ReactNode } from 'react';
+
 import { act, cleanup, render, screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -48,11 +51,11 @@ vi.mock('@/components/AppHeader', () => ({
 }));
 
 vi.mock('@/components/openPlatform', () => ({
-  PlatformCategoryPanel: ({ loading }: { loading: boolean }) => (
-    <div data-testid="platform-panel" data-loading={String(loading)} />
+  PlatformCategoryPanel: ({ loading, children }: { loading: boolean; children?: ReactNode }) => (
+    <div data-testid="platform-panel" data-loading={String(loading)}>{children}</div>
   ),
-  PlatformEmployeeCard: () => null,
-  PlatformEmployeeDrawer: () => null,
+  PlatformEmployeeCard: ({ onOpen }: { onOpen?: () => void }) => <button type="button" onClick={onOpen}>open agent</button>,
+  PlatformEmployeeDrawer: ({ onUse }: { onUse?: () => void }) => <button type="button" onClick={onUse}>use agent</button>,
   PlatformKindDetailView: () => null,
   PlatformResourceCard: () => null,
   PlatformResourceDrawer: () => null,
@@ -147,5 +150,34 @@ describe('OpenPlatformPage stale requests', () => {
     // Keep the deferred contract explicit so this test cannot accidentally
     // leave an in-flight request if the implementation changes its fence.
     request.resolve([agent]);
+  });
+
+  it('uses the request-start generation when an agent use request rejects', async () => {
+    const context = makeContext();
+    context.isCurrentGeneration = (generation) => generation === context.generation;
+    openPlatformTestState.context = context;
+    openPlatformTestState.get.mockImplementation((path: string) => (
+      path === '/api/enterprise/agents' ? Promise.resolve([agent]) : Promise.resolve([])
+    ));
+    const request = deferred<AgentProfileRead>();
+    openPlatformTestState.post.mockReturnValue(request.promise);
+    const user = userEvent.setup();
+
+    render(
+      <I18nProvider>
+        <MemoryRouter>
+          <OpenPlatformPage isAdmin currentUser={context.session.user} />
+        </MemoryRouter>
+      </I18nProvider>,
+    );
+
+    await user.click(await screen.findByRole('button', { name: 'open agent' }));
+    await user.click(screen.getByRole('button', { name: 'use agent' }));
+    context.generation = 2;
+    await act(async () => {
+      request.reject(new DOMException('tenant changed', 'AbortError'));
+    });
+
+    expect(openPlatformTestState.notifyError).not.toHaveBeenCalled();
   });
 });

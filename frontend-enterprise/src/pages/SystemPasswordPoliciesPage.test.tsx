@@ -20,7 +20,7 @@ type Props = { client?: Client };
 async function renderPage(client: Client) {
   const module = await import(/* @vite-ignore */ MODULE_PATH) as { default?: ComponentType<Props> };
   const Page = module.default!;
-  render(<I18nProvider><Page client={client} /></I18nProvider>);
+  return render(<I18nProvider><Page client={client} /></I18nProvider>);
 }
 afterEach(() => cleanup());
 
@@ -60,6 +60,70 @@ describe('SystemPasswordPoliciesPage', () => {
 
     expect(await screen.findByRole('option', { name: 'Tenant 101' })).toBeTruthy();
     expect(client.listTenants).toHaveBeenCalledTimes(2);
+  });
+
+  it('stops tenant pagination after unmount cancels the in-flight page', async () => {
+    let resolveFirstPage!: (value: { items: Array<{ id: string; display_name: string }>; next_cursor: string | null }) => void;
+    const firstPage = new Promise<{ items: Array<{ id: string; display_name: string }>; next_cursor: string | null }>((resolve) => {
+      resolveFirstPage = resolve;
+    });
+    const client: Client = {
+      listTenants: vi.fn((input) => input?.cursor ? Promise.resolve({ items: [], next_cursor: null }) : firstPage),
+      getPasswordPolicies: vi.fn(async () => ({ system: policy, tenant_default: policy })),
+      updatePasswordPolicies: vi.fn(),
+      getTenantPasswordPolicy: vi.fn(),
+      updateTenantPasswordPolicy: vi.fn(),
+    };
+
+    const view = await renderPage(client);
+    await waitFor(() => expect(client.listTenants).toHaveBeenCalledTimes(1));
+    view.unmount();
+    resolveFirstPage({ items: [{ id: 'tenant-100', display_name: 'Tenant 100' }], next_cursor: 'page-2' });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(client.listTenants).toHaveBeenCalledTimes(1);
+  });
+
+  it('stops tenant pagination when the API repeats a cursor', async () => {
+    const listTenants = vi.fn(async ({ cursor }: { cursor?: string } = {}) => {
+      if (!cursor) return { items: [{ id: 'tenant-100', display_name: 'Tenant 100' }], next_cursor: 'page-2' };
+      if (listTenants.mock.calls.length === 2) return { items: [{ id: 'tenant-101', display_name: 'Tenant 101' }], next_cursor: 'page-2' };
+      return { items: [], next_cursor: null };
+    });
+    const client: Client = {
+      listTenants,
+      getPasswordPolicies: vi.fn(async () => ({ system: policy, tenant_default: policy })),
+      updatePasswordPolicies: vi.fn(),
+      getTenantPasswordPolicy: vi.fn(),
+      updateTenantPasswordPolicy: vi.fn(),
+    };
+
+    await renderPage(client);
+
+    expect(await screen.findByRole('option', { name: 'Tenant 101' })).toBeTruthy();
+    expect(client.listTenants).toHaveBeenCalledTimes(2);
+  });
+
+  it('caps tenant pagination at a bounded page budget', async () => {
+    const listTenants = vi.fn(async ({ cursor }: { cursor?: string } = {}) => {
+      const pageNumber = cursor ? Number(cursor.replace('page-', '')) : 1;
+      return {
+        items: [{ id: `tenant-${pageNumber}`, display_name: `Tenant ${pageNumber}` }],
+        next_cursor: pageNumber < 105 ? `page-${pageNumber + 1}` : null,
+      };
+    });
+    const client: Client = {
+      listTenants,
+      getPasswordPolicies: vi.fn(async () => ({ system: policy, tenant_default: policy })),
+      updatePasswordPolicies: vi.fn(),
+      getTenantPasswordPolicy: vi.fn(),
+      updateTenantPasswordPolicy: vi.fn(),
+    };
+
+    await renderPage(client);
+
+    expect(await screen.findByRole('option', { name: 'Tenant 100' })).toBeTruthy();
+    expect(listTenants.mock.calls.length).toBeLessThanOrEqual(100);
   });
 
   it('discards a late tenant policy response before it can be saved to another tenant', async () => {

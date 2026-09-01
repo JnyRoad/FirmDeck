@@ -789,17 +789,21 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
   const listImportSourceControllerRef = useRef<AbortController | null>(null);
   const listImportSubmitControllerRef = useRef<AbortController | null>(null);
 
-  useEffect(() => () => {
-    [
-      listLoadControllerRef,
-      listAgentScopeControllerRef,
-      listPublishControllerRef,
-      listDeleteControllerRef,
-      clawhubAbortRef,
-      listImportAgentsControllerRef,
-      listImportSourceControllerRef,
-      listImportSubmitControllerRef,
-    ].forEach((ref) => ref.current?.abort());
+  useEffect(() => {
+    setDeleting(false);
+    setAgentImportLoading(false);
+    return () => {
+      [
+        listLoadControllerRef,
+        listAgentScopeControllerRef,
+        listPublishControllerRef,
+        listDeleteControllerRef,
+        clawhubAbortRef,
+        listImportAgentsControllerRef,
+        listImportSourceControllerRef,
+        listImportSubmitControllerRef,
+      ].forEach((ref) => ref.current?.abort());
+    };
   }, [tenantContext?.tenantId, tenantContext?.generation]);
 
   useEffect(() => {

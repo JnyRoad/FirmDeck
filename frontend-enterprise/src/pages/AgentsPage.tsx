@@ -74,9 +74,10 @@ export default function AgentsPage({
       setAgents(rows);
     } catch (error) {
       if (!context.isCurrentGeneration(generation)) return;
-      notify.error(apiErrorMessage(error, 'common.error.generic') === 'common.error.generic'
+      const message = apiErrorMessage(error, 'common.error.generic', { t });
+      notify.error(message === t('common.error.generic')
         ? t('agentsPage.toast.loadFailed')
-        : apiErrorMessage(error, 'common.error.generic'));
+        : message);
     } finally {
       if (context.isCurrentGeneration(generation)) setLoading(false);
     }
@@ -172,9 +173,10 @@ export default function AgentsPage({
       navigate('/enterprise/dashboard');
     } catch (error) {
       if (!context.isCurrentGeneration(generation)) return;
-      notify.error(apiErrorMessage(error, 'common.error.generic') === 'common.error.generic'
+      const message = apiErrorMessage(error, 'common.error.generic', { t });
+      notify.error(message === t('common.error.generic')
         ? t('agentsPage.toast.loadFailed')
-        : apiErrorMessage(error, 'common.error.generic'));
+        : message);
     } finally {
       if (context.isCurrentGeneration(generation)) setSelectingAgentId(null);
     }
@@ -199,9 +201,10 @@ export default function AgentsPage({
       window.dispatchEvent(new Event('ultrarag-enterprise-agent-scope-refresh'));
     } catch (error) {
       if (!context.isCurrentGeneration(generation)) return;
-      notify.error(apiErrorMessage(error, 'common.error.generic') === 'common.error.generic'
+      const message = apiErrorMessage(error, 'common.error.generic', { t });
+      notify.error(message === t('common.error.generic')
         ? t('agentsPage.toast.updateStatusFailed')
-        : apiErrorMessage(error, 'common.error.generic'));
+        : message);
     }
   }
 
@@ -229,9 +232,10 @@ export default function AgentsPage({
       window.dispatchEvent(new Event('ultrarag-enterprise-agent-scope-refresh'));
     } catch (error) {
       if (!context.isCurrentGeneration(generation)) return;
-      notify.error(apiErrorMessage(error, 'common.error.generic') === 'common.error.generic'
+      const message = apiErrorMessage(error, 'common.error.generic', { t });
+      notify.error(message === t('common.error.generic')
         ? t('agentsPage.toast.updateMarketplaceFailed')
-        : apiErrorMessage(error, 'common.error.generic'));
+        : message);
     }
   }
 
@@ -262,9 +266,10 @@ export default function AgentsPage({
       window.dispatchEvent(new Event('ultrarag-enterprise-agent-scope-refresh'));
     } catch (error) {
       if (!context.isCurrentGeneration(generation)) return;
-      notify.error(apiErrorMessage(error, 'common.error.generic') === 'common.error.generic'
+      const message = apiErrorMessage(error, 'common.error.generic', { t });
+      notify.error(message === t('common.error.generic')
         ? t('agentsPage.toast.deleteFailed')
-        : apiErrorMessage(error, 'common.error.generic'));
+        : message);
     } finally {
       if (context.isCurrentGeneration(generation)) setDeleting(false);
     }

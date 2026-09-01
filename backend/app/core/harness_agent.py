@@ -26,6 +26,7 @@ from app.i18n.raw_source import RawSourceKind, RawSourceMarker
 from app.llm import LLMClient, LLMError
 from app.llm.prompts.language import language_prompt_contract, localized_compat_text
 from app.observability.spans import llm_operation
+from app.security.tenant import TenantLifecycleDenied
 from app.session.slot_policy import strip_router_generated_message_slots
 
 PROMPT_PATH = paths.resource_dir() / "app" / "llm" / "prompts" / "harness_agent_prompt.md"
@@ -548,6 +549,8 @@ class HarnessTaskAgent:
                         _raise_if_cancelled(is_cancelled)
                     except (HarnessExecutionCancelled, HarnessExecutionFenced):
                         raise
+                    except TenantLifecycleDenied as exc:
+                        raise HarnessExecutionFenced(exc.code) from exc
                     except Exception:
                         logger.exception(
                             "harness tool invocation failed",

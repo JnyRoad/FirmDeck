@@ -125,12 +125,13 @@ function ScheduledTaskEditorPage({
     actionControllersRef.current.clear();
   }
 
-  /** Advance the employee scope revision synchronously and clear stale save state. */
+  /** Advance the employee scope revision synchronously and clear stale request busy state. */
   function updateAgentScope(nextAgentId: string) {
     agentIdRef.current = nextAgentId;
     scopeRevisionRef.current += 1;
     cancelActionControllers();
     setAgentId(nextAgentId);
+    setLoading(false);
     setSaving(false);
   }
 

@@ -1,5 +1,7 @@
 // @vitest-environment jsdom
 
+import fs from 'node:fs';
+import path from 'node:path';
 import { act, cleanup, renderHook, waitFor } from '@testing-library/react';
 import {
   createContext,
@@ -499,5 +501,27 @@ describe('useChatSession tenant replacement RED contracts', () => {
     const signal = firstListCall?.[1]?.signal as AbortSignal | undefined;
     expect(signal).toBeDefined();
     expect(signal?.aborted).toBe(true);
+  });
+});
+
+describe('useChatSession tenant client callback dependencies', () => {
+  const callbackBoundaries = [
+    ['saveRename', '  const requestDelete'] as const,
+    ['confirmDeleteSession', '  const abortStream'] as const,
+    ['abortStream', '  /** 保存消息反馈'] as const,
+    ['rateMessage', '  /** 将用户确认的定时任务'] as const,
+    ['confirmScheduledTask', '  const dismissScheduledTaskDraft'] as const,
+  ];
+
+  it.each(callbackBoundaries)('includes tenantClient in %s dependencies', (callbackName, endMarker) => {
+    const source = fs.readFileSync(path.resolve(__dirname, 'useChatSession.ts'), 'utf8');
+    const start = source.indexOf(`  const ${callbackName} = useCallback`);
+    const end = source.indexOf(endMarker, start);
+    expect(start).toBeGreaterThanOrEqual(0);
+    expect(end).toBeGreaterThan(start);
+
+    const block = source.slice(start, end);
+    const dependencyList = block.match(/\}, \[([\s\S]*)\]\);\s*$/)?.[1] || '';
+    expect(dependencyList.split(',').map((dependency) => dependency.trim())).toContain('tenantClient');
   });
 });

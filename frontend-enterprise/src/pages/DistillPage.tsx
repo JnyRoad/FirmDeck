@@ -1701,10 +1701,6 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
       if (!isCurrentTenantRequest(context, generation, controller.signal)) return;
       notify.error(apiErrorMessage(error, 'distillPage.error.save', { t }));
     } finally {
-      if (!isCurrentTenantRequest(context, generation, controller.signal)) {
-        if (saveControllerRef.current === controller) saveControllerRef.current = null;
-        return;
-      }
       if (saveControllerRef.current === controller) saveControllerRef.current = null;
     }
   }
@@ -2042,10 +2038,6 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
       if (!options.silent) notify.error(result.error?.message || t('distillPage.error.toolProbe'));
       return result;
     } finally {
-      if (!isCurrentTenantRequest(context, generation, controller.signal)) {
-        if (probeControllersRef.current[requestKey] === controller) delete probeControllersRef.current[requestKey];
-        return null;
-      }
       if (probeControllersRef.current[requestKey] === controller) delete probeControllersRef.current[requestKey];
     }
   }
@@ -2184,10 +2176,6 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
       if (!isCurrentTenantRequest(context, generation, controller.signal)) return;
       notify.error(apiErrorMessage(error, 'distillPage.error.commitToolSuggestions', { t }));
     } finally {
-      if (!isCurrentTenantRequest(context, generation, controller.signal)) {
-        if (commitToolsControllerRef.current === controller) commitToolsControllerRef.current = null;
-        return;
-      }
       if (commitToolsControllerRef.current === controller) commitToolsControllerRef.current = null;
     }
   }
@@ -2608,10 +2596,6 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
       if (!isCurrentTenantRequest(context, generation, controller.signal)) return;
       notify.error(apiErrorMessage(error, 'distillPage.error.rollback', { t }));
     } finally {
-      if (!isCurrentTenantRequest(context, generation, controller.signal)) {
-        if (rerunControllerRef.current === controller) rerunControllerRef.current = null;
-        return;
-      }
       if (rerunControllerRef.current === controller) rerunControllerRef.current = null;
     }
   }

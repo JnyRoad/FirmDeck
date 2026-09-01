@@ -515,6 +515,7 @@ def probe_tool(
 def get_codex_a2a_adapter() -> CodexA2AAdapterRead:
     settings = get_settings()
     token = getattr(settings, "codex_a2a_token", "")
+    configured_timeout = getattr(settings, "codex_a2a_timeout_seconds", None)
     return CodexA2AAdapterRead(
         available=(
             bool(getattr(settings, "codex_a2a_enabled", False))
@@ -524,7 +525,7 @@ def get_codex_a2a_adapter() -> CodexA2AAdapterRead:
         ),
         endpoint_url="/api/a2a/codex",
         agent_card_url="/.well-known/agent-card.json",
-        timeout_seconds=float(getattr(settings, "codex_a2a_timeout_seconds", 1800.0)),
+        timeout_seconds=float(1800.0 if configured_timeout is None else configured_timeout),
     )
 
 

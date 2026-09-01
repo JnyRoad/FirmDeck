@@ -5,6 +5,7 @@ import pytest
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
+from app.channels import service_outbox as outbox_service
 from app.channels.adapters import base as adapter_registry
 from app.channels.adapters.base import register_channel_adapter
 from app.channels.crypto import encrypt_channel_secret
@@ -152,6 +153,11 @@ def _file_engine(tmp_path, name: str = "channel-lifecycle.db"):
         f"sqlite:///{tmp_path / name}",
         connect_args={"check_same_thread": False, "timeout": 30},
     )
+    with engine.connect() as connection:
+        # WAL keeps concurrent claim readers independent while SQLite serializes writers.
+        connection.exec_driver_sql("PRAGMA journal_mode=WAL")
+        connection.exec_driver_sql("PRAGMA busy_timeout=30000")
+        connection.commit()
     SQLModel.metadata.create_all(engine)
     return engine
 
@@ -588,6 +594,57 @@ def test_channel_staging_failure_propagates() -> None:
     message = _assistant_message("session_chan", "msg_x")
     with pytest.raises(RuntimeError, match="db 炸了"):
         stage_channel_delivery(BrokenDb(), chat_session, message)
+
+
+def test_duck_typed_channel_staging_uses_baseline_lifecycle_version(monkeypatch) -> None:
+    """Keep legacy db doubles usable when they intentionally expose exec but not get."""
+
+    class EmptyResult:
+        def first(self):
+            return None
+
+    class DuckDb:
+        def exec(self, _statement):
+            return EmptyResult()
+
+        def add(self, _row):
+            pass
+
+        def flush(self):
+            pass
+
+    binding = ChannelBinding(
+        id="binding_duck",
+        tenant_id="tenant_demo",
+        agent_id="agent_1",
+        channel="fake",
+        status="active",
+        external_account_key="fake:account",
+    )
+    chat_session = ChatSession(
+        id="session_duck",
+        tenant_id="tenant_demo",
+        agent_id="agent_1",
+        channel="fake",
+        external_conv_id="duck-conversation",
+        channel_account_key="fake:account",
+    )
+    message = _assistant_message(chat_session.id, "msg_duck")
+    captured: dict[str, int] = {}
+    monkeypatch.setattr(outbox_service, "_find_active_binding_for_agent", lambda *_args: binding)
+    monkeypatch.setattr(outbox_service, "_immutable_delivery_target", lambda *_args: {})
+    monkeypatch.setattr(outbox_service, "_reply_idempotency_key", lambda *_args: "duck-key")
+    monkeypatch.setattr(
+        outbox_service,
+        "_stage_failed_delivery",
+        lambda *_args, tenant_lifecycle_version, **_kwargs: captured.update(
+            version=tenant_lifecycle_version
+        ),
+    )
+
+    stage_channel_delivery(DuckDb(), chat_session, message)
+
+    assert captured == {"version": 1}
 
 
 def test_legacy_session_claim_conflict_fails_channel_transaction() -> None:
@@ -1399,11 +1456,7 @@ def test_dingtalk_binding_delete_cleanup_recalls_without_query(monkeypatch) -> N
 def test_two_workers_atomically_claim_one_delivery(tmp_path) -> None:
     import app.channels.service_outbox as outbox
 
-    engine = create_engine(
-        f"sqlite:///{tmp_path / 'outbox.db'}",
-        connect_args={"check_same_thread": False},
-    )
-    SQLModel.metadata.create_all(engine)
+    engine = _file_engine(tmp_path, "outbox.db")
     adapter = FakeAdapter()
     register_channel_adapter("fake", adapter)
     with Session(engine) as db:
@@ -1428,27 +1481,32 @@ def test_two_workers_atomically_claim_one_delivery(tmp_path) -> None:
 
     barrier = threading.Barrier(2)
     claimed: list[bool] = []
+    thread_errors: list[BaseException] = []
 
     def worker() -> None:
-        with Session(engine) as db:
-            barrier.wait(timeout=5.0)
-            delivery = outbox._claim_delivery(
-                db,
-                delivery_id,
-                now=utc_now(),
-                reaction_lane=False,
-            )
-            claimed.append(delivery is not None)
-            if delivery:
-                outbox._deliver_one(db, delivery)
+        try:
+            barrier.wait(timeout=10.0)
+            with Session(engine) as db:
+                delivery = outbox._claim_delivery(
+                    db,
+                    delivery_id,
+                    now=utc_now(),
+                    reaction_lane=False,
+                )
+                claimed.append(delivery is not None)
+                if delivery:
+                    outbox._deliver_one(db, delivery)
+        except BaseException as exc:  # noqa: BLE001 - surface worker failures in the test thread
+            thread_errors.append(exc)
 
     threads = [threading.Thread(target=worker) for _ in range(2)]
     for thread in threads:
         thread.start()
     for thread in threads:
-        thread.join(timeout=5.0)
+        thread.join(timeout=35.0)
 
     assert all(not thread.is_alive() for thread in threads)
+    assert thread_errors == []
     assert sorted(claimed) == [False, True]
     assert len(adapter.sent) == 1
     with Session(engine) as db:
@@ -1474,11 +1532,7 @@ def test_concurrent_daemons_claim_disjoint_deliveries(tmp_path) -> None:
 
     import app.channels.service_outbox as outbox
 
-    engine = create_engine(
-        f"sqlite:///{tmp_path / 'outbox_claim.db'}",
-        connect_args={"check_same_thread": False, "timeout": 30},
-    )
-    SQLModel.metadata.create_all(engine)
+    engine = _file_engine(tmp_path, "outbox_claim.db")
     with Session(engine) as db:
         binding = _seed_binding(db)
         all_ids = set()
@@ -1487,25 +1541,33 @@ def test_concurrent_daemons_claim_disjoint_deliveries(tmp_path) -> None:
             all_ids.add(delivery.id)
 
     claimed: list[set] = []
+    thread_errors: list[BaseException] = []
     barrier = threading.Barrier(3)
 
     def claim() -> None:
-        barrier.wait()
-        mine: set[str] = set()
-        with Session(engine) as db:
-            for delivery_id in sorted(all_ids):
-                if outbox._claim_delivery(db, delivery_id, now=utc_now(), reaction_lane=False):
-                    mine.add(delivery_id)
-        claimed.append(mine)
+        try:
+            barrier.wait(timeout=10.0)
+            mine: set[str] = set()
+            with Session(engine) as db:
+                for delivery_id in sorted(all_ids):
+                    if outbox._claim_delivery(db, delivery_id, now=utc_now(), reaction_lane=False):
+                        mine.add(delivery_id)
+            claimed.append(mine)
+        except BaseException as exc:  # noqa: BLE001 - surface worker failures in the test thread
+            thread_errors.append(exc)
 
     threads = [threading.Thread(target=claim) for _ in range(2)]
     for thread in threads:
         thread.start()
-    barrier.wait()
+    try:
+        barrier.wait(timeout=10.0)
+    except BaseException as exc:  # noqa: BLE001 - make a broken barrier an assertion failure
+        thread_errors.append(exc)
     for thread in threads:
-        thread.join(timeout=30)
+        thread.join(timeout=35.0)
 
     assert len(claimed) == 2
+    assert thread_errors == []
     # 两个并发守护拿到互不重叠的行集,且合起来覆盖全部到期投递
     assert claimed[0].isdisjoint(claimed[1])
     assert claimed[0] | claimed[1] == all_ids

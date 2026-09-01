@@ -26,6 +26,7 @@ from app.db.models import (
     WebhookEndpoint,
     utc_now,
 )
+from app.public_api import auth as public_auth
 from app.public_api import jobs as public_jobs
 from app.public_api import resources as public_resources
 from app.public_api import runs as public_runs
@@ -131,6 +132,50 @@ def _seed_webhook_context(engine, *, status: str = "active", version: int = 1) -
             )
         )
         db.commit()
+
+
+def test_api_key_missing_tenant_is_a_stable_client_denial(_engine, monkeypatch) -> None:
+    """A deleted credential tenant is invalid client state, not a retryable control-plane outage."""
+    token = "sd_live_missing_tenant_credential"
+    digest = "missing-tenant-digest"
+    with Session(_engine) as db:
+        db.add(
+            User(
+                id=ACTOR_ID,
+                tenant_id=TENANT_ID,
+                username="lifecycle-admin",
+                role="admin",
+                password_hash="test-only-hash",
+            )
+        )
+        db.add(
+            APIClient(
+                id=CLIENT_ID,
+                tenant_id=TENANT_ID,
+                name="lifecycle-client",
+                scopes_json=["*"],
+                created_by_user_id=ACTOR_ID,
+            )
+        )
+        db.add(
+            APICredential(
+                id=CREDENTIAL_ID,
+                tenant_id=TENANT_ID,
+                client_id=CLIENT_ID,
+                name="lifecycle-key",
+                key_prefix=token[:20],
+                key_digest=digest,
+                scopes_json=["*"],
+            )
+        )
+        db.commit()
+        monkeypatch.setattr(public_auth, "_credential_digest", lambda _token: digest)
+
+        with pytest.raises(PublicAPIError) as denied:
+            public_auth._api_key_principal(token, db)
+
+    assert denied.value.status_code == 403
+    assert denied.value.code == "TENANT_NOT_FOUND"
 
 
 def _set_tenant_state(db: Session, *, status: str, version: int) -> None:
@@ -1182,6 +1227,49 @@ def test_knowledge_ingest_gate_closes_read_transaction_before_nested_worker(monk
 
     assert observed_transactions == [False]
     assert db.info.get(public_jobs._SIDE_EFFECT_STARTED_INFO_KEY) is True
+
+
+def test_knowledge_ingest_polling_stops_at_total_deadline(monkeypatch) -> None:
+    """A nested ingest that stays pending must terminate instead of occupying a worker forever."""
+    db = _GateTransactionDB()
+    job = APIJob(
+        id="apijob-knowledge-ingest-timeout",
+        tenant_id=TENANT_ID,
+        credential_id=CREDENTIAL_ID,
+        agent_id="agent-boundary",
+        kind="knowledge.ingest",
+        request_json={
+            "knowledge_base_id": "kb-boundary",
+            "entries": [{"external_id": "entry-1", "content": "Document"}],
+        },
+    )
+    inner = SimpleNamespace(id="inner-pending")
+    reads = 0
+    clock = iter((10.0, 10.0, 10.3))
+
+    def get(_model, _inner_id):
+        nonlocal reads
+        reads += 1
+        return SimpleNamespace(
+            id="inner-pending",
+            status="pending" if reads < 3 else "failed",
+            stage="extracting",
+            error=None,
+            document_id=None,
+        )
+
+    db.get = get  # type: ignore[method-assign]
+    db.expire_all = lambda: None  # type: ignore[method-assign]
+    monkeypatch.setattr(public_resources, "_job_actor", lambda *_args, **_kwargs: (object(), object()))
+    monkeypatch.setattr(public_resources, "update_job", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(public_resources, "_require_job_lifecycle", _open_gate)
+    monkeypatch.setattr(public_resources, "sleep", lambda _delay: None)
+    monkeypatch.setattr(public_resources, "monotonic", lambda: next(clock), raising=False)
+    monkeypatch.setattr(public_resources, "KNOWLEDGE_INGEST_POLL_TIMEOUT_SECONDS", 0.2, raising=False)
+    monkeypatch.setattr(public_resources.internal_knowledge, "upload_document", lambda *_args, **_kwargs: inner)
+
+    with pytest.raises(TimeoutError, match="(?i)knowledge ingest polling timed out"):
+        public_resources.execute_knowledge_ingest(db, job)
 
 
 @pytest.mark.parametrize("operation", ["generate", "rewrite"])

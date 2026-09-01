@@ -124,10 +124,12 @@ def _client(monkeypatch, tmp_path=None):
         # both Sessions share StaticPool's single SQLite connection.
         engine = create_engine(
             f"sqlite:///{tmp_path / 'public-api-run.db'}",
-            connect_args={"check_same_thread": False, "timeout": 5},
+            connect_args={"check_same_thread": False, "timeout": 30},
         )
         with engine.connect() as connection:
+            # Stream polling and lifecycle mutation use independent Sessions.
             connection.exec_driver_sql("PRAGMA journal_mode=WAL")
+            connection.exec_driver_sql("PRAGMA busy_timeout=30000")
             connection.commit()
     SQLModel.metadata.create_all(engine)
     with Session(engine) as db:
@@ -536,8 +538,8 @@ def test_suspended_tenant_api_key_is_rejected_without_updating_last_used(monkeyp
         assert credential.last_used_at == before_last_used
 
 
-def test_streaming_run_endpoint_emits_reply_deltas(monkeypatch) -> None:
-    client, engine, admin_token = _client(monkeypatch)
+def test_streaming_run_endpoint_emits_reply_deltas(monkeypatch, tmp_path) -> None:
+    client, engine, admin_token = _client(monkeypatch, tmp_path)
     tenant_key = _tenant_key(client, admin_token, ["agents:read", "runs:create", "runs:read"])
 
     class FakeStreamingLoop:
@@ -603,9 +605,9 @@ def test_streaming_run_endpoint_emits_reply_deltas(monkeypatch) -> None:
     assert "event: run.output.completed" in response.text
 
 
-def test_public_run_stream_stops_after_tenant_suspension(monkeypatch) -> None:
+def test_public_run_stream_stops_after_tenant_suspension(monkeypatch, tmp_path) -> None:
     """Close a running public stream at the next lifecycle checkpoint after suspension."""
-    client, engine, admin_token = _client(monkeypatch)
+    client, engine, admin_token = _client(monkeypatch, tmp_path)
     tenant_key = _tenant_key(client, admin_token, ["runs:create", "runs:read"])
     created = client.post(
         "/agents/agent_api/runs",

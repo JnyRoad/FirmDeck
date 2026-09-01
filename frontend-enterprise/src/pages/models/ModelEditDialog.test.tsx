@@ -1,32 +1,30 @@
 // @vitest-environment jsdom
 
 import { createElement } from 'react';
-import { cleanup, render, screen } from '@testing-library/react';
+import { act, cleanup, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { I18nProvider } from '@/i18n';
+import type { TenantSessionContextValue } from '@/contexts/TenantSessionContext';
 import type { ModelConfigRead } from '@/types';
 import ModelEditDialog, { type ModelEditDialogProps } from './ModelEditDialog';
 
 const mockedPut = vi.fn();
 
+type TestTenantContext = TenantSessionContextValue & { controller: AbortController };
+
+const modelEditTestState = vi.hoisted(() => ({
+  currentContext: null as TestTenantContext | null,
+}));
+
 vi.mock('@/api/tenant-client', () => ({
   createTenantClient: vi.fn(() => ({ put: mockedPut })),
 }));
 
-vi.mock('@/contexts/TenantSessionContext', () => {
-  const context = {
-    tenantId: 'tenant_demo',
-    tenantSlug: 'tenant-demo',
-    userId: 'user_demo',
-    generation: 1,
-    signal: new AbortController().signal,
-    session: { token: 'test-token' },
-    isCurrentGeneration: () => true,
-  };
-  return { useTenantSession: () => context };
-});
+vi.mock('@/contexts/TenantSessionContext', () => ({
+  useTenantSession: () => modelEditTestState.currentContext,
+}));
 
 vi.mock('@/components/ui/app-toast', () => ({
   notify: { success: vi.fn(), error: vi.fn(), warning: vi.fn(), info: vi.fn(), loading: vi.fn(), dismiss: vi.fn() },
@@ -39,6 +37,33 @@ function stubSelectPointerCapture() {
   if (!Element.prototype.scrollIntoView) {
     Element.prototype.scrollIntoView = () => {};
   }
+}
+
+function makeTenantContext(generation = 1): TestTenantContext {
+  const controller = new AbortController();
+  return {
+    tenantId: 'tenant_demo',
+    tenantSlug: 'tenant-demo',
+    userId: 'user_demo',
+    generation,
+    signal: controller.signal,
+    session: {
+      token: 'test-token',
+      scope: 'tenant',
+      tenant: { id: 'tenant_demo', slug: 'tenant-demo', display_name: 'Tenant Demo' },
+      user: {
+        id: 'user_demo',
+        tenant_id: 'tenant_demo',
+        username: 'admin',
+        display_name: 'Admin',
+        role: 'admin',
+        must_change_password: false,
+        avatar_url: null,
+      },
+    },
+    isCurrentGeneration: (candidate) => candidate === generation && !controller.signal.aborted,
+    controller,
+  };
 }
 
 const SELECTED_MODEL: ModelConfigRead = {
@@ -84,8 +109,10 @@ function renderDialog(overrides: Partial<ModelEditDialogProps> = {}) {
 
 beforeEach(async () => {
   stubSelectPointerCapture();
+  modelEditTestState.currentContext = makeTenantContext();
   mockedPut.mockReset();
   const { notify } = await import('@/components/ui/app-toast');
+  vi.mocked(notify.success).mockReset();
   vi.mocked(notify.error).mockReset();
 });
 
@@ -144,5 +171,39 @@ describe('ModelEditDialog — secret lifecycle', () => {
     await user.click(screen.getByRole('button', { name: '取消' }));
 
     expect(apiKeyInput.value).toBe('');
+  });
+});
+
+describe('ModelEditDialog — stale generation busy state', () => {
+  it('releases saving state when an old generation request settles after tenant replacement', async () => {
+    const user = userEvent.setup();
+    let resolveSave: ((value: ModelConfigRead) => void) | undefined;
+    mockedPut.mockImplementation(() => new Promise<ModelConfigRead>((resolve) => {
+      resolveSave = resolve;
+    }));
+    const onSaved = vi.fn();
+    const view = renderDialog({ onSaved });
+    const oldContext = modelEditTestState.currentContext as TestTenantContext;
+
+    const saveButton = screen.getByRole('button', { name: '保存' });
+    await user.click(saveButton);
+    await waitFor(() => {
+      expect(mockedPut).toHaveBeenCalledTimes(1);
+      expect((saveButton as HTMLButtonElement).disabled).toBe(true);
+    });
+
+    oldContext.controller.abort();
+    modelEditTestState.currentContext = makeTenantContext(2);
+    view.rerender(createElement(I18nProvider, null, createElement(ModelEditDialog, view.props)));
+
+    await waitFor(() => {
+      expect((saveButton as HTMLButtonElement).disabled).toBe(false);
+    });
+
+    await act(async () => {
+      resolveSave?.(SELECTED_MODEL);
+      await Promise.resolve();
+    });
+    expect(onSaved).not.toHaveBeenCalled();
   });
 });

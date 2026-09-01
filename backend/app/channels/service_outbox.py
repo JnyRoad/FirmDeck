@@ -272,6 +272,7 @@ def stage_channel_delivery(
             legacy_ui_locale=None,
             legacy_agent_reply_locale=None,
         )
+        admitted_lifecycle_version = lifecycle.lifecycle_version if lifecycle is not None else 1
         # 已锚定会话绝不跨 binding 回退，避免携带旧 target/context_token 串 Bot。
         binding = None
         binding_id = getattr(chat_session, "channel_binding_id", None)
@@ -286,7 +287,7 @@ def stage_channel_delivery(
                     target=dict(chat_session.channel_target_json or {}),
                     error="binding_missing_or_inactive",
                     language_context=language_context,
-                    tenant_lifecycle_version=lifecycle.lifecycle_version,
+                    tenant_lifecycle_version=admitted_lifecycle_version,
                 )
                 return
             if (
@@ -348,7 +349,7 @@ def stage_channel_delivery(
                 error="delivery_target_missing",
                 language_context=language_context,
                 idempotency_key=idempotency_key,
-                tenant_lifecycle_version=lifecycle.lifecycle_version,
+                tenant_lifecycle_version=admitted_lifecycle_version,
             )
             return
         try:
@@ -356,7 +357,7 @@ def stage_channel_delivery(
                 db,
                 tenant_id=chat_session.tenant_id,
                 correlation_id=f"channel-stage:{chat_session.id}:{message.id}",
-                persisted_lifecycle_version=lifecycle.lifecycle_version,
+                persisted_lifecycle_version=admitted_lifecycle_version,
             )
         except TenantLifecycleDenied as exc:
             _stage_failed_delivery(

@@ -69,8 +69,29 @@ def test_temporary_system_token_cannot_list_tenants_before_password_change(
         "/api/system/tenants",
         headers={"Authorization": f"Bearer {temporary_token}"},
     )
+    policy_response = client.get(
+        "/api/system/password-policies",
+        headers={"Authorization": f"Bearer {temporary_token}"},
+    )
+    policy_update_response = client.put(
+        "/api/system/password-policies",
+        headers={"Authorization": f"Bearer {temporary_token}"},
+        json={
+            "system": {
+                "min_length": 12,
+                "max_length": 20,
+                "complexity_enabled": False,
+                "require_uppercase": False,
+                "require_lowercase": False,
+                "require_digit": False,
+                "require_special": False,
+            }
+        },
+    )
 
     assert response.status_code == 403
+    assert policy_response.status_code == 200
+    assert policy_update_response.status_code == 403
 
 
 def test_system_password_policies_expose_strict_installation_and_tenant_defaults(

@@ -134,7 +134,11 @@ def save_tenant_policy(
     db: Session, tenant_id: str, mode: str, custom: PasswordPolicy | None
 ) -> PasswordPolicy:
     """Persist tenant inheritance or a complete custom override and return the effective rules."""
-    if mode not in {"inherit", "custom"} or (mode == "custom" and custom is None):
+    if (
+        mode not in {"inherit", "custom"}
+        or (mode == "custom" and custom is None)
+        or (mode == "inherit" and custom is not None)
+    ):
         raise ValueError("invalid tenant password policy")
     record = db.get(TenantPasswordPolicy, tenant_id) or TenantPasswordPolicy(tenant_id=tenant_id)
     record.mode = mode

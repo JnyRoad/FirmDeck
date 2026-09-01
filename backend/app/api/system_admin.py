@@ -419,10 +419,13 @@ def _authenticate_system_admin(
             "SYSTEM_AUTH_INVALID_CREDENTIALS"
         )
         raise build_http_exception(entry.code) from None
-    if admin.must_change_password and request.url.path not in {
+    temporary_password_allowed = request.url.path in {
         "/api/system/auth/me",
         "/api/system/auth/change-password",
-    }:
+    } or (
+        request.method == "GET" and request.url.path == "/api/system/password-policies"
+    )
+    if admin.must_change_password and not temporary_password_allowed:
         raise build_http_exception("TEMPORARY_PASSWORD_CHANGE_REQUIRED")
     request.state.system_control_actor_id = admin.id
     return admin

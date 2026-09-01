@@ -54,7 +54,6 @@ from app.db.models import (
     ModelConfig,
     PersonaConfig,
     Skill,
-    Tenant,
     UIConfig,
     User,
     new_id,
@@ -777,35 +776,34 @@ class AgentLoop:
             wake_admission_check()
         self._prepare_request_language_context(request)
         session_request = _with_recoverable_first_session(request)
-        if self.db.get(Tenant, request.tenant_id) is not None:
-            try:
-                require_active_tenant(
-                    self.db,
-                    request.tenant_id,
-                    TenantExecutionKind.JOB_CLAIM,
-                    (
-                        str(request.client_turn_id or "").strip()
-                        or session_request.session_id
-                        or "harness-stream"
-                    ),
-                )
-            except TenantLifecycleDenied as exc:
-                # Keep denied streams side-effect free: no session_created event,
-                # user message, receipt, or worker session is persisted.
-                error_code = public_error_code(exc.code)
-                session_id = session_request.session_id or "session_unbound"
-                yield {
-                    "event": "error",
-                    "data": {
-                        "kind": "error",
-                        "sessionId": session_id,
-                        "code": error_code,
-                        "message": error_code,
-                        "client_turn_id": request.client_turn_id,
-                        "execution_engine": "harness_v2",
-                    },
-                }
-                return
+        try:
+            require_active_tenant(
+                self.db,
+                request.tenant_id,
+                TenantExecutionKind.JOB_CLAIM,
+                (
+                    str(request.client_turn_id or "").strip()
+                    or session_request.session_id
+                    or "harness-stream"
+                ),
+            )
+        except TenantLifecycleDenied as exc:
+            # Keep denied streams side-effect free: no session_created event,
+            # user message, receipt, or worker session is persisted.
+            error_code = public_error_code(exc.code)
+            session_id = session_request.session_id or "session_unbound"
+            yield {
+                "event": "error",
+                "data": {
+                    "kind": "error",
+                    "sessionId": session_id,
+                    "code": error_code,
+                    "message": error_code,
+                    "client_turn_id": request.client_turn_id,
+                    "execution_engine": "harness_v2",
+                },
+            }
+            return
         existing_session = (
             self.db.get(ChatSession, session_request.session_id)
             if session_request.session_id

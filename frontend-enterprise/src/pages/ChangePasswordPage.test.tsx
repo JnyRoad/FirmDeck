@@ -31,10 +31,21 @@ type TenantSession = {
 };
 
 type ChangePasswordClient = {
+  getPasswordPolicy?(): Promise<PasswordPolicy>;
   changePassword(input: {
     current_password: string;
     new_password: string;
   }): Promise<TenantSession>;
+};
+
+type PasswordPolicy = {
+  min_length: number;
+  max_length: number;
+  complexity_enabled: boolean;
+  require_uppercase: boolean;
+  require_lowercase: boolean;
+  require_digit: boolean;
+  require_special: boolean;
 };
 
 type ChangePasswordProps = {
@@ -72,34 +83,44 @@ const replacementSession: TenantSession = {
   },
 };
 
+const defaultPolicy: PasswordPolicy = {
+  min_length: 8,
+  max_length: 20,
+  complexity_enabled: false,
+  require_uppercase: false,
+  require_lowercase: false,
+  require_digit: false,
+  require_special: false,
+};
+
 const copy = {
   'zh-CN': {
     title: '修改密码',
-    description: '为保护你的账号，请设置至少 12 位的新密码。',
+    description: '为保护你的账号，请设置 8–20 位的新密码。',
     current: '当前密码',
     next: '新密码',
     confirm: '确认新密码',
-    nextDescription: '新密码至少需要 12 位。',
+    nextDescription: '新密码长度必须为 8–20 位。',
     submit: '更新密码',
     cancel: '取消',
     show: '显示密码',
     hide: '隐藏密码',
-    minimum: '新密码至少需要 12 位',
+    minimum: '新密码长度必须为 8–20 位。',
     mismatch: '两次输入的新密码不一致',
     genericFailure: '密码更新失败，请稍后重试。',
   },
   'en-US': {
     title: 'Change password',
-    description: 'For account security, set a new password with at least 12 characters.',
+    description: 'For account security, set a new password containing 8–20 characters.',
     current: 'Current password',
     next: 'New password',
     confirm: 'Confirm new password',
-    nextDescription: 'Your new password must be at least 12 characters.',
+    nextDescription: 'Your new password must contain 8–20 characters.',
     submit: 'Update password',
     cancel: 'Cancel',
     show: 'Show password',
     hide: 'Hide password',
-    minimum: 'Your new password must be at least 12 characters.',
+    minimum: 'Your new password must contain 8–20 characters.',
     mismatch: 'The new passwords do not match.',
     genericFailure: 'Password update failed. Please try again later.',
   },
@@ -130,11 +151,15 @@ async function renderChangePassword(
   onCancel = vi.fn(),
 ) {
   const ChangePasswordPage = await loadChangePasswordPage();
+  const completeClient = {
+    getPasswordPolicy: async () => defaultPolicy,
+    ...client,
+  };
   render(
     <AppIntlProvider initialLocale={locale}>
       <ChangePasswordPage
         session={temporarySession}
-        client={client}
+        client={completeClient}
         onComplete={onComplete}
         onCancel={onCancel}
       />
@@ -146,7 +171,7 @@ async function renderChangePassword(
 async function fillValidChange(
   user: ReturnType<typeof userEvent.setup>,
   current = 'Current opaque password',
-  next = 'New opaque password 2026',
+  next = 'New password 2026',
 ) {
   await user.type(screen.getByLabelText('当前密码'), current);
   await user.type(screen.getByLabelText('新密码'), next);
@@ -160,6 +185,39 @@ afterEach(() => {
 });
 
 describe('ChangePasswordPage forced-change RED contracts', () => {
+  it('loads and enforces the current tenant password policy', async () => {
+    const user = userEvent.setup();
+    const policy: PasswordPolicy = {
+      min_length: 10,
+      max_length: 16,
+      complexity_enabled: true,
+      require_uppercase: true,
+      require_lowercase: false,
+      require_digit: true,
+      require_special: false,
+    };
+    const client = {
+      getPasswordPolicy: vi.fn(async () => policy),
+      changePassword: changePasswordMock(),
+    };
+    await renderChangePassword(client);
+
+    await waitFor(() => expect(client.getPasswordPolicy).toHaveBeenCalledTimes(1));
+    const nextField = screen.getByLabelText('新密码');
+    expect(nextField.getAttribute('minlength')).toBe('10');
+    expect(nextField.getAttribute('maxlength')).toBe('16');
+    expect(screen.getByText('要求大写字母')).toBeTruthy();
+    expect(screen.getByText('要求数字')).toBeTruthy();
+
+    await user.type(screen.getByLabelText('当前密码'), 'Current-2026');
+    await user.type(nextField, 'lowercase10');
+    await user.type(screen.getByLabelText('确认新密码'), 'lowercase10');
+    await user.click(screen.getByRole('button', { name: copy['zh-CN'].submit }));
+
+    expect((await screen.findByRole('alert')).textContent).toContain('未满足已启用的复杂度规则');
+    expect(client.changePassword).not.toHaveBeenCalled();
+  });
+
   it('renders current, new, and confirmation password fields with an accessible policy description', async () => {
     const client = { changePassword: changePasswordMock() };
     await renderChangePassword(client);
@@ -172,7 +230,8 @@ describe('ChangePasswordPage forced-change RED contracts', () => {
     const description = screen.getByText(copy['zh-CN'].nextDescription);
     const nextField = screen.getByLabelText(copy['zh-CN'].next);
     expect(nextField.getAttribute('aria-describedby')).toContain(description.id);
-    expect(nextField.getAttribute('minlength')).toBe('12');
+    expect(nextField.getAttribute('minlength')).toBe('8');
+    expect(nextField.getAttribute('maxlength')).toBe('20');
     expect((screen.getByLabelText(copy['zh-CN'].current) as HTMLInputElement).type).toBe('password');
     expect((screen.getByLabelText(copy['zh-CN'].next) as HTMLInputElement).type).toBe('password');
     expect((screen.getByLabelText(copy['zh-CN'].confirm) as HTMLInputElement).type).toBe('password');
@@ -222,8 +281,8 @@ describe('ChangePasswordPage forced-change RED contracts', () => {
     await renderChangePassword(client);
 
     await user.type(screen.getByLabelText('当前密码'), 'current-password');
-    await user.type(screen.getByLabelText('新密码'), 'New opaque password 2026');
-    await user.type(screen.getByLabelText('确认新密码'), 'Different opaque password');
+    await user.type(screen.getByLabelText('新密码'), 'New password 2026');
+    await user.type(screen.getByLabelText('确认新密码'), 'Different password');
     await user.click(screen.getByRole('button', { name: copy['zh-CN'].submit }));
 
     const alert = await screen.findByRole('alert');
@@ -237,7 +296,7 @@ describe('ChangePasswordPage forced-change RED contracts', () => {
   it('sends exact opaque current/new password bytes and accepts the replacement session', async () => {
     const user = userEvent.setup();
     const current = '  current opaque bytes  ';
-    const next = '  new opaque bytes 2026  ';
+    const next = '  new bytes 2026  ';
     const client = { changePassword: changePasswordMock() };
     const { onComplete } = await renderChangePassword(client);
 
@@ -263,7 +322,7 @@ describe('ChangePasswordPage forced-change RED contracts', () => {
   it('advances the in-memory session when replacement persistence fails after backend success', async () => {
     const user = userEvent.setup();
     const current = 'Current persistence failure secret';
-    const next = 'New persistence failure secret 2026';
+    const next = 'New persist 2026';
     const client = { changePassword: changePasswordMock() };
     const onComplete = vi.fn();
     await renderChangePassword(client, 'zh-CN', onComplete);
@@ -314,7 +373,7 @@ describe('ChangePasswordPage forced-change RED contracts', () => {
   it('clears every secret after a successful replacement and never renders it in visible text', async () => {
     const user = userEvent.setup();
     const current = 'Current success secret';
-    const next = 'New success secret 2026';
+    const next = 'New success 2026';
     const client = { changePassword: changePasswordMock() };
     await renderChangePassword(client);
 
@@ -332,7 +391,7 @@ describe('ChangePasswordPage forced-change RED contracts', () => {
   it('projects any upstream failure into a stable generic error and clears all secrets', async () => {
     const user = userEvent.setup();
     const current = 'Current failure secret';
-    const next = 'New failure secret 2026';
+    const next = 'New failure 2026';
     const rawCause = 'raw database password hash and stack trace';
     const client = {
       changePassword: changePasswordMock(async () => {
@@ -369,7 +428,7 @@ describe('ChangePasswordPage forced-change RED contracts', () => {
     const onCancelAgain = vi.fn();
     await renderChangePassword(client, 'zh-CN', vi.fn(), onCancelAgain);
     await user.type(screen.getByLabelText('当前密码'), 'cancel current secret');
-    await user.type(screen.getByLabelText('新密码'), 'cancel new secret 2026');
+    await user.type(screen.getByLabelText('新密码'), 'Cancel new 2026');
     await user.keyboard('{Escape}');
 
     expect(onCancelAgain).toHaveBeenCalledTimes(1);
@@ -378,7 +437,7 @@ describe('ChangePasswordPage forced-change RED contracts', () => {
     expect((screen.getByLabelText('新密码') as HTMLInputElement).value).toBe('');
     expect((screen.getByLabelText('确认新密码') as HTMLInputElement).value).toBe('');
     expect(document.body.textContent).not.toContain('cancel current secret');
-    expect(document.body.textContent).not.toContain('cancel new secret 2026');
+    expect(document.body.textContent).not.toContain('Cancel new 2026');
   });
 
   it.each(['zh-CN', 'en-US'] as const)(

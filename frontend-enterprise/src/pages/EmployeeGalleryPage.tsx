@@ -106,6 +106,12 @@ export default function EmployeeGalleryPage({
     void loadTeams();
   }, [tenantApi]);
 
+  useEffect(() => {
+    setDeleting(false);
+    setStartingAgentId(null);
+    setStartingTeamId(null);
+  }, [tenantContext?.generation]);
+
   // Clear tenant-A records and editor state while the replacement tenant is
   // still being verified by TenantSessionProvider.
   useEffect(() => {

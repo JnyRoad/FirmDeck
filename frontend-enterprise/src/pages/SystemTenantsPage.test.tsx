@@ -797,6 +797,40 @@ describe('SystemTenantsPage', () => {
     expect(document.body.textContent).toContain('Alpha Renamed');
   });
 
+  it('keeps a successful rename when the follow-up audit refresh fails', async () => {
+    const user = userEvent.setup();
+    let auditCalls = 0;
+    const renameTenant = vi.fn(async (_tenantId: string, input: { display_name: string }) => ({
+      ...tenantDetail,
+      display_name: input.display_name,
+    }));
+    const listTenantAudit = vi.fn(async () => {
+      auditCalls += 1;
+      if (auditCalls > 1) throw new Error('audit refresh failed');
+      return { items: [], next_cursor: null };
+    });
+    const client = createPageClient({
+      getTenant: vi.fn(async () => tenantDetail),
+      listTenantAudit,
+      renameTenant,
+    });
+    await renderPage(client);
+    await user.click(await screen.findByRole('button', { name: '查看租户详情：Alpha Lab' }));
+    const detail = await screen.findByRole('region', { name: '租户详情' });
+    await user.click(within(detail).getByRole('button', { name: '重命名租户' }));
+    const dialog = screen.getByRole('dialog', { name: '重命名租户' });
+    const displayName = within(dialog).getByRole('textbox', { name: '新的租户名称' });
+    await user.clear(displayName);
+    await user.type(displayName, 'Alpha Renamed');
+    await user.click(within(dialog).getByRole('button', { name: '确认重命名' }));
+
+    await waitFor(() => expect(renameTenant).toHaveBeenCalledTimes(1));
+    expect(screen.queryByRole('dialog', { name: '重命名租户' })).toBeNull();
+    expect(screen.getAllByText('Alpha Renamed').length).toBeGreaterThan(0);
+    expect(screen.queryByText('重命名租户失败')).toBeNull();
+    expect(await screen.findByText('审计记录刷新失败，请重试。')).toBeTruthy();
+  });
+
   it('requires explicit confirmation before resetting a temporary password and never echoes it', async () => {
     const user = userEvent.setup();
     const resetInitialAdminPassword = vi.fn(async () => undefined);
@@ -812,8 +846,9 @@ describe('SystemTenantsPage', () => {
 
     const dialog = screen.getByRole('dialog', { name: '重置初始管理员临时密码' });
     expect(within(dialog).getByText(/现有会话/)).toBeTruthy();
-    const password = within(dialog).getByRole('textbox', { name: '新的临时密码' });
+    const password = within(dialog).getByLabelText('新的临时密码');
     expect(password.getAttribute('type')).toBe('password');
+    expect(within(dialog).queryByRole('textbox', { name: '新的临时密码' })).toBeNull();
     await user.type(password, TEMPORARY_PASSWORD);
     expect(resetInitialAdminPassword).not.toHaveBeenCalled();
 
@@ -829,6 +864,34 @@ describe('SystemTenantsPage', () => {
       (_, index) => window.localStorage.getItem(window.localStorage.key(index) || ''),
     ).join('\n');
     expect(persistedValues).not.toContain(TEMPORARY_PASSWORD);
+  });
+
+  it('keeps a successful password reset when the follow-up audit refresh fails', async () => {
+    const user = userEvent.setup();
+    let auditCalls = 0;
+    const resetInitialAdminPassword = vi.fn(async () => undefined);
+    const listTenantAudit = vi.fn(async () => {
+      auditCalls += 1;
+      if (auditCalls > 1) throw new Error('audit refresh failed');
+      return { items: [], next_cursor: null };
+    });
+    const client = createPageClient({
+      getTenant: vi.fn(async () => tenantDetail),
+      listTenantAudit,
+      resetInitialAdminPassword,
+    });
+    await renderPage(client);
+    await user.click(await screen.findByRole('button', { name: '查看租户详情：Alpha Lab' }));
+    const detail = await screen.findByRole('region', { name: '租户详情' });
+    await user.click(within(detail).getByRole('button', { name: '重置初始管理员临时密码' }));
+    const dialog = screen.getByRole('dialog', { name: '重置初始管理员临时密码' });
+    await user.type(within(dialog).getByLabelText('新的临时密码'), TEMPORARY_PASSWORD);
+    await user.click(within(dialog).getByRole('button', { name: '确认重置临时密码' }));
+
+    await waitFor(() => expect(resetInitialAdminPassword).toHaveBeenCalledTimes(1));
+    expect(screen.queryByRole('dialog', { name: '重置初始管理员临时密码' })).toBeNull();
+    expect(screen.queryByText('重置临时密码失败')).toBeNull();
+    expect(await screen.findByText('审计记录刷新失败，请重试。')).toBeTruthy();
   });
 
   it('shows a stable reset failure without rendering raw response content or credentials', async () => {
@@ -847,7 +910,7 @@ describe('SystemTenantsPage', () => {
     const detail = await screen.findByRole('region', { name: '租户详情' });
     await user.click(within(detail).getByRole('button', { name: '重置初始管理员临时密码' }));
     const dialog = screen.getByRole('dialog', { name: '重置初始管理员临时密码' });
-    await user.type(within(dialog).getByRole('textbox', { name: '新的临时密码' }), TEMPORARY_PASSWORD);
+    await user.type(within(dialog).getByLabelText('新的临时密码'), TEMPORARY_PASSWORD);
     await user.click(within(dialog).getByRole('button', { name: '确认重置临时密码' }));
 
     const alert = await within(dialog).findByRole('alert');
@@ -1386,7 +1449,8 @@ describe('SystemTenantsPage', () => {
     await user.keyboard('{Enter}');
     const resetDialog = screen.getByRole('dialog', { name: '重置初始管理员临时密码' });
     expect(resetDialog.getAttribute('aria-describedby')).toBeTruthy();
-    expect(within(resetDialog).getByRole('textbox', { name: '新的临时密码' }).getAttribute('type'))
+    expect(within(resetDialog).getByLabelText('新的临时密码').getAttribute('type'))
       .toBe('password');
+    expect(within(resetDialog).queryByRole('textbox', { name: '新的临时密码' })).toBeNull();
   });
 });

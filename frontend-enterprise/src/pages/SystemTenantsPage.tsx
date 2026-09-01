@@ -546,20 +546,7 @@ export default function SystemTenantsPage({ client = systemClient }: SystemTenan
       setRows((current) => current.map((row) => row.id === updated.id ? projectTenant(updated) : row));
       setRenameOpen(false);
       setRenameName('');
-      if (client.listTenantAudit) {
-        const auditFence = beginRequest(auditControllerRef, auditRevisionRef);
-        setAuditLoadingMore(false);
-        try {
-          const result = await client.listTenantAudit(tenantId, { limit: 50 });
-          if (!isCurrent() || !currentDetailRequest(auditFence, tenantId, detailRevision)) return;
-          setAudits(result.items.map(projectAudit));
-          setAuditNextCursor(safeNullableText(result.next_cursor, 512));
-        } finally {
-          if (auditControllerRef.current === auditFence.controller) {
-            auditControllerRef.current = null;
-          }
-        }
-      }
+      await refreshAuditAfterLifecycleMutation(tenantId, detailRevision, isCurrent);
     } catch {
       if (isCurrent()) setRenameError(t('system.tenants.rename.error'));
     } finally {
@@ -587,20 +574,7 @@ export default function SystemTenantsPage({ client = systemClient }: SystemTenan
       if (!isCurrent()) return;
       setResetPassword('');
       setResetOpen(false);
-      if (client.listTenantAudit) {
-        const auditFence = beginRequest(auditControllerRef, auditRevisionRef);
-        setAuditLoadingMore(false);
-        try {
-          const result = await client.listTenantAudit(tenantId, { limit: 50 });
-          if (!isCurrent() || !currentDetailRequest(auditFence, tenantId, detailRevision)) return;
-          setAudits(result.items.map(projectAudit));
-          setAuditNextCursor(safeNullableText(result.next_cursor, 512));
-        } finally {
-          if (auditControllerRef.current === auditFence.controller) {
-            auditControllerRef.current = null;
-          }
-        }
-      }
+      await refreshAuditAfterLifecycleMutation(tenantId, detailRevision, isCurrent);
     } catch {
       if (isCurrent()) {
         setResetPassword('');
@@ -1024,7 +998,7 @@ export default function SystemTenantsPage({ client = systemClient }: SystemTenan
             {resetError && <div role="alert" className="rounded-lg bg-[#fff2f2] p-3 text-[12px] text-[#a03c3c]">{resetError}</div>}
             <label className="grid gap-1.5 text-[12px] font-medium text-[#464c5e]">
               <span>{t('system.tenants.reset.field')}</span>
-              <Input role="textbox" type="password" aria-label={t('system.tenants.reset.field')} value={resetPassword} onChange={(event) => { setResetPassword(event.target.value); setResetError(''); }} className={fieldClass} />
+              <Input type="password" aria-label={t('system.tenants.reset.field')} value={resetPassword} onChange={(event) => { setResetPassword(event.target.value); setResetError(''); }} className={fieldClass} />
             </label>
             <div className="flex justify-end gap-2">
               <Button type="button" variant="outline" disabled={resetting} onClick={closeReset}>{t('system.tenants.action.cancel')}</Button>

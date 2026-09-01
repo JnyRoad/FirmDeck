@@ -155,6 +155,18 @@ class ChangePasswordRequest(BaseModel):
     new_password: str
 
 
+class PasswordPolicyRead(BaseModel):
+    """Expose the effective password rules for the authenticated tenant only."""
+
+    min_length: int
+    max_length: int
+    complexity_enabled: bool
+    require_uppercase: bool
+    require_lowercase: bool
+    require_digit: bool
+    require_special: bool
+
+
 class AccountAPICredentialCreateRequest(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     expires_at: datetime | None = None
@@ -223,6 +235,24 @@ def me(
     return _tenant_user_read(user, _avatar_pointer_for(db, user.id))
 
 
+@router.get("/password-policy", response_model=PasswordPolicyRead)
+def get_password_policy(
+    current_user: User = Depends(get_current_user_allowing_temporary),  # noqa: B008
+    db: Session = Depends(get_session),  # noqa: B008
+) -> PasswordPolicyRead:
+    """Return the caller tenant's resolved rules without exposing another tenant's policy record."""
+    policy = effective_tenant_policy(db, current_user.tenant_id)
+    return PasswordPolicyRead(
+        min_length=policy.min_length,
+        max_length=policy.max_length,
+        complexity_enabled=policy.complexity_enabled,
+        require_uppercase=policy.require_uppercase,
+        require_lowercase=policy.require_lowercase,
+        require_digit=policy.require_digit,
+        require_special=policy.require_special,
+    )
+
+
 @router.post("/change-password", response_model=LoginResponse)
 def change_password(
     request: ChangePasswordRequest,
@@ -233,7 +263,7 @@ def change_password(
     if not request.current_password or not request.new_password:
         raise build_http_exception("AUTH_LOGIN_FIELDS_REQUIRED")
     if not validate_password(request.new_password, effective_tenant_policy(db, current_user.tenant_id)):
-        raise build_http_exception("AUTH_LOGIN_FIELDS_REQUIRED")
+        raise build_http_exception("AUTH_PASSWORD_POLICY_VIOLATION")
     if not verify_password(request.current_password, current_user.password_hash):
         raise build_http_exception("AUTH_INVALID_CREDENTIALS", status_code=400)
 
@@ -361,12 +391,10 @@ def create_user(
     if request.tenant_id != current_user.tenant_id:
         raise build_http_exception("TENANT_MISMATCH")
     username = request.username.strip()
-    if (
-        not username
-        or not request.password
-        or not validate_password(request.password, effective_tenant_policy(db, request.tenant_id))
-    ):
+    if not username or not request.password:
         raise build_http_exception("AUTH_LOGIN_FIELDS_REQUIRED")
+    if not validate_password(request.password, effective_tenant_policy(db, request.tenant_id)):
+        raise build_http_exception("AUTH_PASSWORD_POLICY_VIOLATION")
     existing = db.exec(
         select(User).where(User.tenant_id == request.tenant_id, User.username == username)
     ).first()
@@ -612,7 +640,7 @@ def update_user(
             request.password,
             effective_tenant_policy(db, request.tenant_id),
         ):
-            raise build_http_exception("AUTH_LOGIN_FIELDS_REQUIRED")
+            raise build_http_exception("AUTH_PASSWORD_POLICY_VIOLATION")
         password_hash = hash_password(request.password)
     if request.display_name is not None:
         display_name = request.display_name.strip()[:80]

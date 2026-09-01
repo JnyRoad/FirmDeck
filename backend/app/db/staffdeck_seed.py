@@ -1107,6 +1107,21 @@ def _knowledge_version_with_seed_content(session: Session, kb_id: str, agent_id:
             return version.version
     if fallback_version:
         return fallback_version
+    seeded_versions = session.exec(
+        select(KnowledgeBaseVersion)
+        .where(
+            KnowledgeBaseVersion.tenant_id == _seed_tenant_id(),
+            KnowledgeBaseVersion.knowledge_base_id == kb_id,
+        )
+        .order_by(KnowledgeBaseVersion.created_at, KnowledgeBaseVersion.id)
+    ).all()
+    for version in seeded_versions:
+        if (version.metadata_json or {}).get("owner_agent_id") == agent_id:
+            return version.version
+        if f"branch.{agent_id}." in version.version:
+            return version.version
+    if seeded_versions:
+        return seeded_versions[0].version
     kb = session.get(KnowledgeBase, kb_id)
     if kb:
         return str((kb.metadata_json or {}).get("current_version") or "1.0.0")

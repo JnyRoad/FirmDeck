@@ -212,7 +212,7 @@ def test_invalid_password_change_rejects_without_mutating_credentials(
     assert response.status_code == 400, response.text
     assert response.json()["detail"]["code"] in {
         "AUTH_INVALID_CREDENTIALS",
-        "AUTH_LOGIN_FIELDS_REQUIRED",
+        "AUTH_PASSWORD_POLICY_VIOLATION",
     }
     assert response.json()["detail"]["params"] == {}
     assert "token" not in response.text

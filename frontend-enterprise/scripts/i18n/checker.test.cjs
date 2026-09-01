@@ -579,6 +579,8 @@ function verifyPositiveTypeScriptFixture() {
  * beyond Vitest's in-memory suite state and fails only when the test runner rejects the suite.
  */
 function registerFixtureHarnessTests() {
+  const typeScriptCheckerFixtureTimeoutMs = 15_000;
+
   it('loads aligned bilingual catalog fixtures', verifyPositiveCatalogFixtures);
   it('parses the localized TypeScript fixture as TSX', verifyPositiveTypeScriptFixture);
   it('accepts the valid catalog contract', verifyPositiveCatalogChecker);
@@ -589,7 +591,11 @@ function registerFixtureHarnessTests() {
   it('formats diagnostics for humans and JSON artifacts', verifyDiagnosticFormats);
   it('accepts the valid TypeScript sink fixture', verifyPositiveTypeScriptChecker);
   it('detects every governed TypeScript sink and fixed locale', verifyTypeScriptSinkDiagnostics);
-  it('ratchets legacy findings with exact expiring fingerprints', verifyExactAllowlistRatchet);
+  it(
+    'ratchets legacy findings with exact expiring fingerprints',
+    verifyExactAllowlistRatchet,
+    typeScriptCheckerFixtureTimeoutMs,
+  );
 }
 
 /** Register the final migration absence tests without weakening their intentionally strict scans. */
