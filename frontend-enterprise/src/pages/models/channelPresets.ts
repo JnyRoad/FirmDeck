@@ -171,7 +171,7 @@ export function buildModelConfigPayload(
       max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
       api_protocol: channel.apiProtocol ?? undefined,
       base_url: channel.baseUrl ?? undefined,
-      api_key: values.apiKey || undefined,
+      ...(values.apiKey ? { api_key: values.apiKey } : {}),
     };
   }
 
@@ -201,7 +201,7 @@ export function buildModelConfigPayload(
       max_output_tokens: maxOutputTokens,
       api_protocol: values.apiProtocol,
       base_url: values.baseUrl.trim() || undefined,
-      api_key: values.apiKey || undefined,
+      ...(values.apiKey ? { api_key: values.apiKey } : {}),
       extra_body: extraBody,
     };
   }

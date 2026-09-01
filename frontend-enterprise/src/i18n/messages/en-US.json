@@ -2916,6 +2916,7 @@
   "modelsPage.toast.subscriptionLogoutFailed": "Unable to sign out of the ChatGPT subscription.",
   "modelsPage.toast.subscriptionStatusLoadFailed": "Unable to load the ChatGPT subscription status.",
   "modelsPage.toast.testFailed": "Model connectivity test failed.",
+  "modelsPage.toast.testSucceeded": "Model connectivity test succeeded.",
   "onboarding.action.close": "Close guide",
   "onboarding.action.next": "Next",
   "onboarding.action.previous": "Previous",

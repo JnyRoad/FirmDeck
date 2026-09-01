@@ -1693,9 +1693,9 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
       if (clearAfterSave) {
         setClearAfterSave(false);
         clearDistillWorkspace();
-        notify.success(t('distillPage.toast.savedAndCleared'));
+        notify.successText(t('distillPage.toast.savedAndCleared'));
       } else {
-        notify.success(renamedSkillId ? t('distillPage.toast.savedAsRenamed', { skillId: renamedSkillId }) : t('distillPage.toast.saved'));
+        notify.successText(renamedSkillId ? t('distillPage.toast.savedAsRenamed', { skillId: renamedSkillId }) : t('distillPage.toast.saved'));
       }
     } catch (error) {
       if (!isCurrentTenantRequest(context, generation, controller.signal)) return;
@@ -2019,7 +2019,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
         output_schema: nextOutputSchema || {},
       });
       if (result.success) {
-        if (!options.silent) notify.success(t('distillPage.toast.toolProbeSucceeded'));
+        if (!options.silent) notify.successText(t('distillPage.toast.toolProbeSucceeded'));
       } else {
         if (!options.silent) notify.error(result.error?.message || t('distillPage.error.toolProbe'));
       }
@@ -2051,7 +2051,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
     }
     setToolSuggestionPatch(toolDetailMessageId, toolDetail.name, { sample_arguments: parsed });
     setToolDetail({ ...toolDetail, sample_arguments: parsed });
-    notify.success(t('distillPage.toast.probeArgsUpdated'));
+    notify.successText(t('distillPage.toast.probeArgsUpdated'));
   }
 
   function probeToolDetail() {
@@ -2078,7 +2078,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
     setToolSuggestionStatus(messageId, suggestion.name, 'accepted');
     const shouldCommit = toolSuggestionSelectionsComplete(nextSuggestions);
     if (!shouldCommit) {
-      notify.success(t('distillPage.toast.toolSuggestionAcceptedPending'));
+      notify.successText(t('distillPage.toast.toolSuggestionAcceptedPending'));
       return;
     }
     await commitToolSuggestionSelections(messageId, nextSuggestions);
@@ -2171,7 +2171,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
           skillId: nextDraft.skill_id,
         });
       }
-      notify.success(t('distillPage.toast.toolSuggestionsCommitted', { count: acceptedSuggestions.length }));
+      notify.successText(t('distillPage.toast.toolSuggestionsCommitted', { count: acceptedSuggestions.length }));
     } catch (error) {
       if (!isCurrentTenantRequest(context, generation, controller.signal)) return;
       notify.error(apiErrorMessage(error, 'distillPage.error.commitToolSuggestions', { t }));
@@ -2365,7 +2365,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
       .join('\n');
     try {
       await copyTextToClipboard(text);
-      notify.success(t('distillPage.toast.failureCopied'));
+      notify.successText(t('distillPage.toast.failureCopied'));
     } catch {
       notify.error(t('distillPage.error.copyFailure'));
     }
@@ -2490,7 +2490,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
     setTextDiffs([]);
     updateMessage(pendingChange.assistantId, undefined, { actionState: 'confirmed' });
     setPendingChange(null);
-    if (showToast) notify.success(t('distillPage.toast.confirmedRewrite'));
+    if (showToast) notify.successText(t('distillPage.toast.confirmedRewrite'));
   }
 
   function rejectPendingChange() {
@@ -2514,7 +2514,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
     const text = visibleChatContent(item);
     try {
       await navigator.clipboard.writeText(text);
-      notify.success(t('common.toast.copied'));
+      notify.successText(t('common.toast.copied'));
     } catch {
       notify.error(t('common.toast.copyFailed'));
     }
@@ -4589,7 +4589,7 @@ function SkillFlow({
     }];
     if (sourceIndex >= 0) setSelectedNodeIndex(sourceIndex);
     onEdit(next, stepTargetPath(Math.max(sourceIndex, 0)));
-    notify.success(t('distillPage.toast.connectedEdge', { name: targetName }));
+    notify.successText(t('distillPage.toast.connectedEdge', { name: targetName }));
   };
   const deleteFlowEdgeAt = (edgeIndex: number) => {
     const edge = normalizeSkillEdges(skill)[edgeIndex];
@@ -4601,7 +4601,7 @@ function SkillFlow({
     ));
     onEdit(withoutSkillEdgeAt(skill, edgeIndex), stepTargetPath(Math.max(sourceIndex, 0)));
     setSelectedEdgeId('');
-    notify.success(t('distillPage.toast.deletedEdge', {
+    notify.successText(t('distillPage.toast.deletedEdge', {
       source: nodeNameMap[sourceNodeId] || sourceNodeId,
       target: nodeNameMap[targetNodeId] || targetNodeId,
     }));

@@ -27,7 +27,15 @@ vi.mock('@/contexts/TenantSessionContext', () => ({
 }));
 
 vi.mock('@/components/ui/app-toast', () => ({
-  notify: { success: vi.fn(), error: vi.fn(), warning: vi.fn(), info: vi.fn(), loading: vi.fn(), dismiss: vi.fn() },
+  notify: {
+    success: vi.fn(),
+    successText: vi.fn(),
+    error: vi.fn(),
+    warning: vi.fn(),
+    info: vi.fn(),
+    loading: vi.fn(),
+    dismiss: vi.fn(),
+  },
 }));
 
 function stubSelectPointerCapture() {
@@ -113,6 +121,7 @@ beforeEach(async () => {
   mockedPut.mockReset();
   const { notify } = await import('@/components/ui/app-toast');
   vi.mocked(notify.success).mockReset();
+  vi.mocked(notify.successText).mockReset();
   vi.mocked(notify.error).mockReset();
 });
 

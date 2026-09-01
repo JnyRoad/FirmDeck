@@ -179,7 +179,7 @@ export default function EmployeeApiKeyDialog({
       setCopied(false);
       await load();
       if (!context.isCurrentGeneration(generation)) return;
-      notify.success(t('employeeApiKey.toast.createSuccess'));
+      notify.successText(t('employeeApiKey.toast.createSuccess'));
     } catch (error) {
       if (!context.isCurrentGeneration(generation)) return;
       notify.error(error instanceof Error ? error.message : t('employeeApiKey.toast.createFailed'));
@@ -204,7 +204,7 @@ export default function EmployeeApiKeyDialog({
       setCopied(false);
       await load();
       if (!context.isCurrentGeneration(generation)) return;
-      notify.success(t('employeeApiKey.toast.rotateSuccess'));
+      notify.successText(t('employeeApiKey.toast.rotateSuccess'));
     } catch (error) {
       if (!context.isCurrentGeneration(generation)) return;
       notify.error(error instanceof Error ? error.message : t('employeeApiKey.toast.rotateFailed'));
@@ -227,7 +227,7 @@ export default function EmployeeApiKeyDialog({
       if (!context.isCurrentGeneration(generation)) return;
       await copyTextToClipboard(revealedKey.api_key);
       if (!context.isCurrentGeneration(generation)) return;
-      notify.success(t('employeeApiKey.toast.copyFullSuccess'));
+      notify.successText(t('employeeApiKey.toast.copyFullSuccess'));
     } catch (error) {
       if (!context.isCurrentGeneration(generation)) return;
       notify.error(error instanceof Error ? error.message : t('employeeApiKey.toast.copyFullFailed'));
@@ -251,7 +251,7 @@ export default function EmployeeApiKeyDialog({
       if (revealed?.id === row.id) setRevealed(null);
       await load();
       if (!context.isCurrentGeneration(generation)) return;
-      notify.success(t('employeeApiKey.toast.revokeSuccess'));
+      notify.successText(t('employeeApiKey.toast.revokeSuccess'));
     } catch (error) {
       if (!context.isCurrentGeneration(generation)) return;
       notify.error(error instanceof Error ? error.message : t('employeeApiKey.toast.revokeFailed'));
@@ -277,7 +277,7 @@ export default function EmployeeApiKeyDialog({
       if (revealed?.id === row.id) setRevealed(null);
       await load();
       if (!context.isCurrentGeneration(generation)) return;
-      notify.success(t('employeeApiKey.toast.deleteSuccess'));
+      notify.successText(t('employeeApiKey.toast.deleteSuccess'));
     } catch (error) {
       if (!context.isCurrentGeneration(generation)) return;
       notify.error(error instanceof Error ? error.message : t('employeeApiKey.toast.deleteFailed'));
@@ -299,7 +299,7 @@ export default function EmployeeApiKeyDialog({
       await copyTextToClipboard(key);
       if (!context.isCurrentGeneration(generation)) return;
       setCopied(true);
-      notify.success(t('employeeApiKey.toast.copySuccess'));
+      notify.successText(t('employeeApiKey.toast.copySuccess'));
     } catch {
       if (!context.isCurrentGeneration(generation)) return;
       revealedKeyRef.current?.focus();

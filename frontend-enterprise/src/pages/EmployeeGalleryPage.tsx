@@ -226,7 +226,7 @@ export default function EmployeeGalleryPage({
         metadata: row.metadata || {},
       });
       if (!context.isCurrentGeneration(generation)) return;
-      notify.success(
+      notify.successText(
         status === 'active'
           ? t('employeeGalleryPage.toast.published')
           : t('employeeGalleryPage.toast.archived'),
@@ -258,7 +258,7 @@ export default function EmployeeGalleryPage({
         metadata,
       });
       if (!context.isCurrentGeneration(generation)) return;
-      notify.success(
+      notify.successText(
         published
           ? t('employeeGalleryPage.toast.marketplacePublished')
           : t('employeeGalleryPage.toast.marketplaceUnpublished'),
@@ -292,7 +292,7 @@ export default function EmployeeGalleryPage({
           window.dispatchEvent(new CustomEvent('ultrarag-enterprise-agent-scope-change', { detail: { agentId: '' } }));
         }
       }
-      notify.success(t('employeeGalleryPage.toast.deleted'));
+      notify.successText(t('employeeGalleryPage.toast.deleted'));
       setDeleteTarget(null);
       await load();
       window.dispatchEvent(new Event('ultrarag-enterprise-agent-scope-refresh'));

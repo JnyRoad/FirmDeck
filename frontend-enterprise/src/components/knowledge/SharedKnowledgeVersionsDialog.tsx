@@ -381,7 +381,7 @@ export function SharedKnowledgeVersionsDialog({
     try {
       await action();
       if (controller.signal.aborted || !context.isCurrentGeneration(generation)) return;
-      notify.success(successMessage);
+      notify.successText(successMessage);
       setReason('');
       await loadVersions();
       await onChanged?.();

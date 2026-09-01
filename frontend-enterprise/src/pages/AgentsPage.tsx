@@ -196,7 +196,7 @@ export default function AgentsPage({
         metadata: row.metadata || {},
       });
       if (!context.isCurrentGeneration(generation)) return;
-      notify.success(status === 'active' ? t('agentsPage.toast.published') : t('agentsPage.toast.archived'));
+      notify.successText(status === 'active' ? t('agentsPage.toast.published') : t('agentsPage.toast.archived'));
       await load();
       window.dispatchEvent(new Event('ultrarag-enterprise-agent-scope-refresh'));
     } catch (error) {
@@ -223,7 +223,7 @@ export default function AgentsPage({
         metadata,
       });
       if (!context.isCurrentGeneration(generation)) return;
-      notify.success(
+      notify.successText(
         published
           ? t('agentsPage.toast.marketplacePublished')
           : t('agentsPage.toast.marketplaceUnpublished'),
@@ -260,7 +260,7 @@ export default function AgentsPage({
           window.dispatchEvent(new CustomEvent('ultrarag-enterprise-agent-scope-change', { detail: { agentId: '' } }));
         }
       }
-      notify.success(t('agentsPage.toast.deleted'));
+      notify.successText(t('agentsPage.toast.deleted'));
       setDeleteTarget(null);
       await load();
       window.dispatchEvent(new Event('ultrarag-enterprise-agent-scope-refresh'));

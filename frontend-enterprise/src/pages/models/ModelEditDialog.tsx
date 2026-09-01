@@ -220,9 +220,9 @@ export default function ModelEditDialog({
       await tenantApi.put<ModelConfigRead>(`/api/enterprise/model-configs/${selected.id}${verifyQuery}`, payload);
       if (!isCurrentTenantGeneration(context, generation)) return;
       if (form.enabled) {
-        notify.success(form.is_default ? t('modelSetup.toast.enabledDefault') : t('modelSetup.toast.enabled'));
+        notify.successText(form.is_default ? t('modelSetup.toast.enabledDefault') : t('modelSetup.toast.enabled'));
       } else {
-        notify.success(t('modelSetup.toast.saved'));
+        notify.successText(t('modelSetup.toast.saved'));
       }
       setForm(BLANK_FORM);
       onOpenChange(false);

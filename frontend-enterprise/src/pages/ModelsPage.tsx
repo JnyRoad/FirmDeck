@@ -35,7 +35,6 @@ import { OPEN_MODEL_CREATE_EVENT } from '@/components/QuickStartGuide';
 import { createAppTranslator, useAppIntl } from '@/i18n';
 import { LOCALE_STORAGE_KEY, normalizeAppLocale } from '@/i18n/locales';
 import ModelSetupWizard from './models/ModelSetupWizard';
-import ModelEditDialog from './models/ModelEditDialog';
 import { ModelPayloadValidationError, type ApiKeyProtocol } from './models/channelPresets';
 import { useCodexSubscriptionAccount } from './models/useCodexSubscriptionAccount';
 
@@ -403,7 +402,7 @@ export default function ModelsPage({
     try {
       await tenantApi.delete(`/api/enterprise/model-configs/${row.id}`);
       if (!isCurrentTenantGeneration(context, generation)) return;
-      notify.success(t('modelsPage.toast.deleted'));
+      notify.successText(t('modelsPage.toast.deleted'));
       setDeleteTarget(null);
       await load();
     } catch (error) {
@@ -421,7 +420,7 @@ export default function ModelsPage({
     try {
       await tenantApi.post(`/api/enterprise/model-configs/${row.id}/set-default`);
       if (!isCurrentTenantGeneration(context, generation)) return;
-      notify.success(t('modelsPage.toast.setDefault'));
+      notify.successText(t('modelsPage.toast.setDefault'));
       await load();
     } catch (error) {
       if (!isCurrentTenantGeneration(context, generation)) return;
@@ -448,7 +447,9 @@ export default function ModelsPage({
       );
       if (!isCurrentTenantGeneration(context, generation)) return false;
       if (result.success) {
-        if (!result.activated) notify.success(result.output || result.message);
+        // The verification output is provider-originated diagnostic data. Do not
+        // surface it through the success toast; use catalog-owned copy instead.
+        if (!result.activated) notify.successText(t('modelsPage.toast.testSucceeded'));
         return true;
       } else if (result.message === 'MODEL_VERIFICATION_STALE') {
         notify.warning(t('modelsPage.toast.stale'));
@@ -685,11 +686,24 @@ export default function ModelsPage({
       </div>
 
       <ModelSetupWizard
-        open={wizardOpen}
-        onOpenChange={setWizardOpen}
+        open={wizardOpen || editingModel !== null}
+        editingModel={editingModel}
+        onOpenChange={(open) => {
+          if (open) return;
+          setWizardOpen(false);
+          clearModelEditor();
+        }}
         onCreated={(model) => {
           void load();
-          notify.success(t('modelsPage.toast.createdTested', { name: model.name }));
+          if (editingModel) {
+            notify.successText(
+              model.enabled
+                ? (model.is_default ? t('modelSetup.toast.enabledDefault') : t('modelSetup.toast.enabled'))
+                : t('modelSetup.toast.saved'),
+            );
+            return;
+          }
+          notify.successText(t('modelsPage.toast.createdTested', { name: model.name }));
         }}
         availableProtocols={availableProtocols}
         subscriptionAccount={subscriptionAccount}
@@ -698,19 +712,6 @@ export default function ModelsPage({
         onStartSubscriptionLogin={startSubscriptionLogin}
         onCancelSubscriptionLogin={cancelSubscriptionLogin}
         onRequestSubscriptionLogout={requestSubscriptionLogout}
-      />
-
-      <ModelEditDialog
-        open={editingModel !== null}
-        selected={editingModel}
-        availableProtocols={availableProtocols}
-        subscriptionAccount={subscriptionAccount}
-        subscriptionLoading={subscriptionLoading}
-        onStartSubscriptionLogin={startSubscriptionLogin}
-        onCancelSubscriptionLogin={cancelSubscriptionLogin}
-        onRequestSubscriptionLogout={requestSubscriptionLogout}
-        onOpenChange={(open) => !open && clearModelEditor()}
-        onSaved={() => void load()}
       />
 
       <ConfirmDialog

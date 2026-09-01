@@ -445,7 +445,7 @@ export type ModelConfigRead = {
   provider: string;
   auth_mode: ModelAuthMode;
   api_protocol: 'openai_chat_completions' | 'openai_responses' | 'anthropic_messages' | 'gemini_generate_content' | 'codex_app_server';
-  base_url?: string;
+  base_url?: string | null;
   api_key_masked: string;
   model: string;
   temperature: number;

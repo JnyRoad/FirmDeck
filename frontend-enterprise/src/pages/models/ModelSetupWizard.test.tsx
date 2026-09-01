@@ -12,12 +12,14 @@ import ModelSetupWizard, { type ModelSetupWizardProps } from './ModelSetupWizard
 
 const testState = vi.hoisted(() => ({
   mockedPost: vi.fn(),
+  mockedPut: vi.fn(),
   currentContext: null as TenantSessionContextValue | null,
 }));
 
 vi.mock('@/api/tenant-client', () => ({
   createTenantClient: vi.fn(() => ({
     post: testState.mockedPost,
+    put: testState.mockedPut,
   })),
 }));
 
@@ -26,6 +28,7 @@ vi.mock('@/contexts/TenantSessionContext', () => ({
 }));
 
 const mockedPost = testState.mockedPost;
+const mockedPut = testState.mockedPut;
 
 function makeTenantContext(tenantId: string, generation = 1): TenantSessionContextValue {
   const controller = new AbortController();
@@ -124,6 +127,7 @@ beforeEach(() => {
   stubSelectPointerCapture();
   testState.currentContext = makeTenantContext('tenant-isolated');
   mockedPost.mockReset();
+  mockedPut.mockReset();
   stubApiPost(); // safe default: list-models routes to "unsupported", anything else rejects loudly
 });
 
@@ -158,6 +162,76 @@ describe('ModelSetupWizard — step 1 channel selection', () => {
     renderWizard();
     await user.type(screen.getByPlaceholderText('搜索厂商或渠道，例如 OpenAI'), 'no-such-vendor');
     expect(screen.getByText('未找到匹配的渠道')).toBeTruthy();
+  });
+});
+
+describe('ModelSetupWizard — edit mode', () => {
+  const EDITING_MODEL = {
+    id: 'model-edit-1',
+    tenant_id: 'tenant-isolated',
+    name: 'OpenAI · gpt-4o',
+    provider: 'openai_compatible',
+    auth_mode: 'api_key',
+    api_protocol: 'openai_chat_completions',
+    base_url: 'https://api.openai.com/v1',
+    api_key_masked: 'sk-****1234',
+    model: 'gpt-4o',
+    temperature: 0.2,
+    max_output_tokens: 8192,
+    extra_body: {},
+    protocol_options: {},
+    legacy_unmapped_options: {},
+    trust_status: 'verified',
+    verification_attempt_status: 'succeeded',
+    config_revision: 1,
+    security_revision: 1,
+    is_default: false,
+    enabled: true,
+    created_at: '2026-08-31T00:00:00Z',
+    updated_at: '2026-08-31T00:00:00Z',
+  } as ModelConfigRead;
+
+  it('opens an existing model in the guided form and preserves its secret when the field is blank', async () => {
+    mockedPut.mockResolvedValue(EDITING_MODEL);
+    const onCreated = vi.fn();
+    const user = userEvent.setup();
+    renderWizard({ editingModel: EDITING_MODEL, onCreated });
+
+    expect(await screen.findByPlaceholderText('不修改请留空')).toBeTruthy();
+    expect(screen.getByDisplayValue('gpt-4o')).toBeTruthy();
+    expect(screen.getByText('选择渠道')).toBeTruthy();
+    expect(screen.getByText('填写凭证并保存')).toBeTruthy();
+    expect(saveButton().disabled).toBe(false);
+
+    await user.click(saveButton());
+
+    await waitFor(() => expect(mockedPut).toHaveBeenCalledTimes(1));
+    expect(mockedPut).toHaveBeenCalledWith(
+      '/api/enterprise/model-configs/model-edit-1?verify_before_save=true',
+      expect.objectContaining({
+        name: 'OpenAI · gpt-4o',
+        model: 'gpt-4o',
+        enabled: true,
+      }),
+    );
+    expect(mockedPut.mock.calls[0]?.[1]).not.toHaveProperty('api_key');
+    expect(onCreated).toHaveBeenCalledWith(EDITING_MODEL, { tested: true });
+  });
+
+  it('keeps a legacy OpenAI default endpoint implicit while preserving its existing secret', async () => {
+    const legacyModel = { ...EDITING_MODEL, base_url: null };
+    mockedPut.mockResolvedValue(legacyModel);
+    const user = userEvent.setup();
+    renderWizard({ editingModel: legacyModel });
+
+    expect(await screen.findByPlaceholderText('不修改请留空')).toBeTruthy();
+    expect(saveButton().disabled).toBe(false);
+
+    await user.click(saveButton());
+
+    await waitFor(() => expect(mockedPut).toHaveBeenCalledTimes(1));
+    expect(mockedPut.mock.calls[0]?.[1]).not.toHaveProperty('api_key');
+    expect(mockedPut.mock.calls[0]?.[1]).not.toHaveProperty('base_url');
   });
 });
 
@@ -628,6 +702,42 @@ describe('ModelSetupWizard — ChatGPT subscription branch (US3)', () => {
     renderWizard({ subscriptionAccount: { status: 'connected', plan_type: 'Plus', message: '已连接' } });
     await selectChannelAndAdvance(user, 'ChatGPT 订阅（Codex）');
     await user.type(screen.getByPlaceholderText('选择或输入模型'), 'gpt-5.6-terra');
+
+    expect(saveButton().disabled).toBe(false);
+  });
+
+  it('allows an existing subscription model to be disabled while disconnected', async () => {
+    const editingSubscription: ModelConfigRead = {
+      id: 'subscription-edit-1',
+      tenant_id: 'tenant-isolated',
+      name: 'ChatGPT subscription · gpt-5.6-terra',
+      provider: 'openai_compatible',
+      auth_mode: 'chatgpt_subscription',
+      api_protocol: 'codex_app_server',
+      base_url: null,
+      api_key_masked: '',
+      model: 'gpt-5.6-terra',
+      temperature: 0.2,
+      max_output_tokens: 8192,
+      extra_body: {},
+      protocol_options: {},
+      legacy_unmapped_options: {},
+      trust_status: 'unverified',
+      verification_attempt_status: 'idle',
+      config_revision: 1,
+      security_revision: 1,
+      is_default: true,
+      enabled: true,
+      updated_at: '2026-09-01T00:00:00Z',
+    };
+    const user = userEvent.setup();
+    renderWizard({
+      editingModel: editingSubscription,
+      subscriptionAccount: { status: 'requires_login', plan_type: null, message: '未登录' },
+    });
+
+    expect(saveButton().disabled).toBe(true);
+    await user.click(screen.getAllByRole('switch')[1]!);
 
     expect(saveButton().disabled).toBe(false);
   });

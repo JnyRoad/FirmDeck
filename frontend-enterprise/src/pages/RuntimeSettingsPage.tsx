@@ -304,13 +304,13 @@ export default function RuntimeSettingsPage({ currentUser }: { currentUser: Ente
       });
       if (row.restart_scheduled) {
         setRestarting(true);
-        notify.success(t('runtimeSettings.toast.restartScheduled'));
+        notify.successText(t('runtimeSettings.toast.restartScheduled'));
         await waitForApplicationRestart();
         if (!isCurrentTenantGeneration(context, generation)) return;
         window.location.reload();
         return;
       }
-      notify.success(t('runtimeSettings.toast.saved'));
+      notify.successText(t('runtimeSettings.toast.saved'));
     } catch (error) {
       if (!isCurrentTenantGeneration(context, generation)) return;
       notify.error(runtimeSettingsErrorMessage(error, 'runtimeSettings.toast.saveFailed'));
@@ -342,7 +342,7 @@ export default function RuntimeSettingsPage({ currentUser }: { currentUser: Ente
       if (!isCurrentTenantGeneration(context, generation)) return;
       setNetworkSettings(row);
       setNetworkForm({ mode: row.mode, port: String(row.port), public_url: row.public_url || '' });
-      notify.success(
+      notify.successText(
         row.restart_required
           ? t('runtimeSettings.toast.networkSavedRestartRequired')
           : t('runtimeSettings.toast.networkSaved'),
@@ -620,7 +620,7 @@ function NetworkEndpointDetails({ settings }: { settings: NetworkSettingsRead })
   async function copyApiValue(value: string, label: string): Promise<void> {
     try {
       await copyTextToClipboard(value);
-      notify.success(t('runtimeSettings.toast.copiedValue', { label }));
+      notify.successText(t('runtimeSettings.toast.copiedValue', { label }));
     } catch (error) {
       notify.error(runtimeSettingsErrorMessage(error, 'runtimeSettings.toast.copyFailed'));
     }

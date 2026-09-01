@@ -503,7 +503,7 @@ function Shell({
       await loadAgents();
       changeAgentScope(created.id);
       setAgentCreateOpen(false);
-      notify.success(t("shell.agentCreate.success"));
+      notify.successText(t("shell.agentCreate.success"));
     } catch (error) {
       notify.error(error instanceof Error ? error.message : t("shell.agentCreate.failure"));
     }
