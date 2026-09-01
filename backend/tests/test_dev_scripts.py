@@ -66,7 +66,11 @@ def test_url_ready_does_not_require_reading_response_body(monkeypatch) -> None:
             """Simulate a reset if readiness code consumes the response body."""
             raise ConnectionResetError("body connection closed")
 
-    monkeypatch.setattr(dev.urllib.request, "urlopen", lambda *_args, **_kwargs: Response())
+    def open_response(*_args: object, **_kwargs: object) -> Response:
+        """Return the controlled response without performing network I/O."""
+        return Response()
+
+    monkeypatch.setattr(dev.urllib.request, "urlopen", open_response)
     assert dev._url_ready("http://127.0.0.1:5173/api/health") is True
 
 
@@ -78,13 +82,22 @@ def test_url_ready_ignores_response_close_failure(monkeypatch) -> None:
         """Model a successful response that resets while being closed."""
 
         status = 200
+        closed = False
 
         def close(self) -> None:
             """Simulate a connection reset while releasing the response."""
+            self.closed = True
             raise ConnectionResetError("connection closed")
 
-    monkeypatch.setattr(dev.urllib.request, "urlopen", lambda *_args, **_kwargs: Response())
+    response = Response()
+
+    def open_response(*_args: object, **_kwargs: object) -> Response:
+        """Return the tracked response without performing network I/O."""
+        return response
+
+    monkeypatch.setattr(dev.urllib.request, "urlopen", open_response)
     assert dev._url_ready("http://127.0.0.1:5173/api/health") is True
+    assert response.closed is True
 
 
 def test_supervisor_healthy_ignores_response_close_failure(monkeypatch) -> None:
@@ -95,15 +108,23 @@ def test_supervisor_healthy_ignores_response_close_failure(monkeypatch) -> None:
         """Model a healthy supervisor response that resets while being closed."""
 
         status = 200
+        closed = False
 
         def close(self) -> None:
             """Simulate a connection reset while releasing the response."""
+            self.closed = True
             raise ConnectionResetError("connection closed")
+
+    response = Response()
+
+    def open_response(*_args: object, **_kwargs: object) -> Response:
+        """Return the tracked response without performing network I/O."""
+        return response
 
     monkeypatch.setattr(
         supervisor.urllib.request,
         "urlopen",
-        lambda *_args, **_kwargs: Response(),
+        open_response,
     )
     service = supervisor.Service(
         name="app",
@@ -113,6 +134,7 @@ def test_supervisor_healthy_ignores_response_close_failure(monkeypatch) -> None:
     )
 
     assert service.healthy() is True
+    assert response.closed is True
 
 
 def test_dev_cli_honors_packaged_app_port_range(monkeypatch) -> None:
