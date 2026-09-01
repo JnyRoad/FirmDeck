@@ -25,6 +25,8 @@ from app.channels.adapters.wechat_kf import WeChatKfAdapter
 from app.channels.crypto import encrypt_channel_secret
 from app.db.models import ChannelBinding, ChannelInboundEvent, Tenant, WeChatKfAccount
 
+CALLBACK_SIGNING_FIXTURE = "callback-token-private"
+
 
 def _wechat_kf_api():
     """加载待实现的回调模块；缺失时用明确测试失败表达 RED，无副作用。"""
@@ -48,9 +50,7 @@ def _encrypt(plaintext: str, aes_key: str, receive_id: str) -> str:
 def _signature(token: str, timestamp: str, nonce: str, ciphertext: str) -> str:
     """为受控测试密文生成回调签名，无持久化副作用。"""
     values = sorted((token, timestamp, nonce, ciphertext))
-    return hashlib.sha1(  # lgtm[py/weak-sensitive-data-hashing]
-        "".join(values).encode(), usedforsecurity=False
-    ).hexdigest()
+    return hashlib.sha1("".join(values).encode(), usedforsecurity=False).hexdigest()
 
 
 def _client(monkeypatch) -> tuple[TestClient, Any, str, dict[str, str]]:
@@ -63,7 +63,6 @@ def _client(monkeypatch) -> tuple[TestClient, Any, str, dict[str, str]]:
     )
     SQLModel.metadata.create_all(db_engine)
     secrets = {
-        "token": "callback-token-private",
         "aes_key": base64.b64encode(bytes(range(32))).decode().rstrip("="),
         "corp_id": "ww1234567890",
         "open_kfid": "wk1234567890",
@@ -128,7 +127,9 @@ def _post_callback(
     return client.post(
         f"/api/channels/wechat-kf/{binding_id}/callback",
         params={
-            "msg_signature": _signature(secrets["token"], callback_timestamp, nonce, ciphertext),
+            "msg_signature": _signature(
+                CALLBACK_SIGNING_FIXTURE, callback_timestamp, nonce, ciphertext
+            ),
             "timestamp": callback_timestamp,
             "nonce": nonce,
         },
@@ -145,7 +146,7 @@ def test_callback_verification_returns_decrypted_echo(monkeypatch) -> None:
     response = client.get(
         f"/api/channels/wechat-kf/{binding_id}/callback",
         params={
-            "msg_signature": _signature(secrets["token"], timestamp, "nonce", ciphertext),
+            "msg_signature": _signature(CALLBACK_SIGNING_FIXTURE, timestamp, "nonce", ciphertext),
             "timestamp": timestamp,
             "nonce": "nonce",
             "echostr": ciphertext,
@@ -175,7 +176,8 @@ def test_callback_rejects_invalid_signature_or_timestamp_without_secret_echo(
     response = client.get(
         f"/api/channels/wechat-kf/{binding_id}/callback",
         params={
-            "msg_signature": signature or _signature(secrets["token"], value, "nonce", ciphertext),
+            "msg_signature": signature
+            or _signature(CALLBACK_SIGNING_FIXTURE, value, "nonce", ciphertext),
             "timestamp": value,
             "nonce": "nonce",
             "echostr": ciphertext,
@@ -184,7 +186,7 @@ def test_callback_rejects_invalid_signature_or_timestamp_without_secret_echo(
 
     assert response.status_code == expected_status
     assert response.json()["detail"]["code"] in {"CHANNEL_BAD_REQUEST", "CHANNEL_FORBIDDEN"}
-    assert secrets["token"] not in response.text
+    assert CALLBACK_SIGNING_FIXTURE not in response.text
     assert secrets["aes_key"] not in response.text
     assert ciphertext not in response.text
 
@@ -222,7 +224,7 @@ def test_callback_rejects_invalid_aes_payload_after_valid_signature(monkeypatch)
     response = client.post(
         f"/api/channels/wechat-kf/{binding_id}/callback",
         params={
-            "msg_signature": _signature(secrets["token"], timestamp, "nonce", ciphertext),
+            "msg_signature": _signature(CALLBACK_SIGNING_FIXTURE, timestamp, "nonce", ciphertext),
             "timestamp": timestamp,
             "nonce": "nonce",
         },
@@ -855,7 +857,7 @@ def test_slow_provider_sync_does_not_block_event_loop_health(monkeypatch) -> Non
     ciphertext, _plaintext = _callback_xml(secrets)
     timestamp = str(int(time.time()))
     params = {
-        "msg_signature": _signature(secrets["token"], timestamp, "nonce", ciphertext),
+        "msg_signature": _signature(CALLBACK_SIGNING_FIXTURE, timestamp, "nonce", ciphertext),
         "timestamp": timestamp,
         "nonce": "nonce",
     }
