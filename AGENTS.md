@@ -5,8 +5,8 @@
 
 | 任务范围 | 读取 |
 |---|---|
-| 读取、修改、测试或调试后端代码 | `docs/agents/domain.md` + `docs/agents/backend.md` |
-| 读取、修改、测试或调试前端代码 | `docs/agents/domain.md` + `docs/agents/frontend.md` |
+| 读取、修改、测试或调试后端代码 | `docs/agents/domain.md` + `docs/agents/backend.md` + `docs/agents/tenancy.md` |
+| 读取、修改、测试或调试前端代码 | `docs/agents/domain.md` + `docs/agents/frontend.md` + `docs/agents/tenancy.md` |
 | 修改 UI 文案、本地化或语言区域行为 | `docs/agents/i18n.md`（修改前端代码时还需读取 `docs/agents/frontend.md`） |
 | 运行本地应用 | `docs/agents/local-runtime.md` |
 | 修改配置、凭据或安全敏感行为 | `docs/agents/security.md` |

@@ -12,6 +12,14 @@ FastAPI/Python 后端、Harness/Agent 运行链路、持久化会话与任务、
 
 ## 术语
 
+- **租户（tenant）**：企业客户的隔离边界。业务数据、会话、任务、知识与渠道默认按
+  `tenant_id` 归属并隔离；租户生命周期为 `active/suspended`，携带单调递增
+  `lifecycle_version`（见 `docs/adr/ADR-004-system-tenant-control-plane.md`）。
+- **tenant principal**：服务端认证解析出的唯一权威租户上下文。前端、任务参数或调用方
+  声称的 `tenant_id` 都不得替代它推断当前租户。
+- **系统面 / 租户面**：`SystemAdmin` 控制面负责租户生命周期管理，与租户数据面双向隔离；
+  系统 token 与租户 token 双向拒绝。无租户归属的安装级资源显式声明 `owner_scope=system`，
+  不允许「无主」数据或伪租户。
 - **产品消息（product message）**：由 StaffDeck 开发者拥有、需要随界面语言变化的标签、
   状态、动作、校验、帮助、通知、错误、事件投影、无障碍文本、页面标题、下载前缀等。
 - **语义消息 ID（MessageId）**：稳定、可读、由英文代码标识符组成的 BCP 47 无关键，例如
@@ -99,8 +107,10 @@ source-key、自然语言错误字段和 legacy event projection 只能在已登
 - 国际化规则：`docs/agents/i18n.md`
 - 前端规则：`docs/agents/frontend.md`
 - 后端规则：`docs/agents/backend.md`
+- 多租户规则：`docs/agents/tenancy.md`
 - 发布门禁：`docs/agents/release.md`
 - 架构决策：`docs/adr/ADR-001-i18n-runtime-and-catalog.md`、
   `docs/adr/ADR-002-error-event-localization.md`、
-  `docs/adr/ADR-003-agent-language-context.md`
+  `docs/adr/ADR-003-agent-language-context.md`、
+  `docs/adr/ADR-004-system-tenant-control-plane.md`
 - 迁移清单、契约和验收资产：`specs/001-i18n-governance/` 与 `docs/i18n/`
