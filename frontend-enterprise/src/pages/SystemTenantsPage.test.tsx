@@ -443,6 +443,30 @@ describe('SystemTenantsPage', () => {
     })));
   });
 
+  it('blocks tenant creation until the tenant-default password policy finishes loading', async () => {
+    const user = userEvent.setup();
+    const policyRequest = deferred<SystemPasswordPolicies>();
+    const provisionTenant = vi.fn(async () => tenant);
+    const client = createPageClient({
+      getPasswordPolicies: vi.fn(() => policyRequest.promise),
+      provisionTenant,
+    });
+    await renderPage(client);
+    const dialog = await openCreateDialog(user);
+    const submit = within(dialog).getByRole('button', { name: '创建租户' });
+
+    expect(submit.hasAttribute('disabled')).toBe(true);
+    fireEvent.submit(submit.closest('form')!);
+    expect(provisionTenant).not.toHaveBeenCalled();
+
+    policyRequest.resolve({
+      system: DEFAULT_PASSWORD_POLICY,
+      tenant_default: { ...DEFAULT_PASSWORD_POLICY, min_length: 10 },
+    });
+    await waitFor(() => expect(submit.hasAttribute('disabled')).toBe(false));
+    expect(within(dialog).getByLabelText('临时密码').getAttribute('minlength')).toBe('10');
+  });
+
   it('submits the exact payload, displays the created tenant, and clears the temporary password', async () => {
     const user = userEvent.setup();
     const client = {
@@ -929,6 +953,24 @@ describe('SystemTenantsPage', () => {
       (_, index) => window.localStorage.getItem(window.localStorage.key(index) || ''),
     ).join('\n');
     expect(persistedValues).not.toContain(TEMPORARY_PASSWORD);
+  });
+
+  it('renders the English reset guidance with dynamic password lengths grammatically', async () => {
+    const user = userEvent.setup();
+    const client = createPageClient({
+      getTenant: vi.fn(async () => tenantDetail),
+      listTenantAudit: vi.fn(async () => ({ items: [], next_cursor: null })),
+      resetInitialAdminPassword: vi.fn(async () => undefined),
+    });
+    await renderPage(client, 'en-US');
+    await user.click(await screen.findByRole('button', { name: 'View tenant details: Alpha Lab' }));
+    const detail = await screen.findByRole('region', { name: 'Tenant details' });
+    await user.click(within(detail).getByRole('button', { name: 'Reset initial administrator temporary password' }));
+
+    const dialog = screen.getByRole('dialog', { name: 'Reset initial administrator temporary password' });
+    expect(within(dialog).getByText(
+      'Existing sessions will be invalidated. Enter a temporary password with 8–20 characters; any enabled complexity rules also apply. The initial administrator must change it at the next login.',
+    )).toBeTruthy();
   });
 
   it('keeps tenant detail and audit available when the effective policy request fails', async () => {

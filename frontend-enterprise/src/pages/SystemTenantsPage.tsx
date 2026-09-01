@@ -225,6 +225,9 @@ export default function SystemTenantsPage({ client = systemClient }: SystemTenan
   const [runtimeLoading, setRuntimeLoading] = useState(Boolean(client.getCodexA2ARuntimeStatus));
   const [runtimeError, setRuntimeError] = useState(false);
   const [tenantDefaultPolicy, setTenantDefaultPolicy] = useState<PasswordPolicy>(DEFAULT_PASSWORD_POLICY);
+  const [tenantDefaultPolicyLoading, setTenantDefaultPolicyLoading] = useState(
+    Boolean(client.getPasswordPolicies),
+  );
   const [renameOpen, setRenameOpen] = useState(false);
   const [renameName, setRenameName] = useState('');
   const [renaming, setRenaming] = useState(false);
@@ -497,13 +500,21 @@ export default function SystemTenantsPage({ client = systemClient }: SystemTenan
   /** Loads the installation tenant-default policy used when creating a tenant. */
   useEffect(() => {
     let cancelled = false;
-    if (!client.getPasswordPolicies) return () => { cancelled = true; };
+    if (!client.getPasswordPolicies) {
+      setTenantDefaultPolicy(DEFAULT_PASSWORD_POLICY);
+      setTenantDefaultPolicyLoading(false);
+      return () => { cancelled = true; };
+    }
+    setTenantDefaultPolicyLoading(true);
     void client.getPasswordPolicies()
       .then((policies) => {
         if (!cancelled) setTenantDefaultPolicy(policies.tenant_default);
       })
       .catch(() => {
         if (!cancelled) setTenantDefaultPolicy(DEFAULT_PASSWORD_POLICY);
+      })
+      .finally(() => {
+        if (!cancelled) setTenantDefaultPolicyLoading(false);
       });
     return () => { cancelled = true; };
   }, [client]);
@@ -523,6 +534,7 @@ export default function SystemTenantsPage({ client = systemClient }: SystemTenan
 
   async function submitCreate(event?: FormEvent<HTMLFormElement>) {
     event?.preventDefault();
+    if (tenantDefaultPolicyLoading) return;
     const errors: CreateErrors = {};
     if (!TENANT_SLUG_PATTERN.test(createForm.slug.trim())) errors.slug = t('system.tenants.validation.slug');
     if (!createForm.displayName.trim()) errors.displayName = t('system.tenants.validation.displayName');
@@ -1048,7 +1060,13 @@ export default function SystemTenantsPage({ client = systemClient }: SystemTenan
             <PasswordPolicyRequirements policy={tenantDefaultPolicy} />
             <div className="flex justify-end gap-2 pt-2">
               <Button type="button" variant="outline" disabled={creating} onClick={closeCreate}>{t('system.tenants.action.cancel')}</Button>
-              <Button type="submit" disabled={creating}>{creating ? t('system.tenants.action.submitting') : t('system.tenants.action.create')}</Button>
+              <Button
+                type="submit"
+                disabled={creating || tenantDefaultPolicyLoading}
+                aria-busy={tenantDefaultPolicyLoading || creating}
+              >
+                {creating ? t('system.tenants.action.submitting') : t('system.tenants.action.create')}
+              </Button>
             </div>
           </form>
         </DialogContent>

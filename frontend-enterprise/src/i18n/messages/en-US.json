@@ -4598,7 +4598,7 @@
   "system.tenants.rename.error": "Tenant rename failed. Please try again.",
   "system.tenants.reset.action": "Reset initial administrator temporary password",
   "system.tenants.reset.title": "Reset initial administrator temporary password",
-  "system.tenants.reset.description": "Existing sessions will be invalidated. Enter a {min}–{max}-character temporary password; any enabled complexity rules also apply. The initial administrator must change it at the next login.",
+  "system.tenants.reset.description": "Existing sessions will be invalidated. Enter a temporary password with {min}–{max} characters; any enabled complexity rules also apply. The initial administrator must change it at the next login.",
   "system.tenants.reset.field": "New temporary password",
   "system.tenants.reset.confirm": "Confirm temporary password reset",
   "system.tenants.reset.error": "Temporary password reset failed. Please try again.",
