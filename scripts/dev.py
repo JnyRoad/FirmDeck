@@ -251,12 +251,20 @@ def _ensure_sandbox_runtime() -> None:
 
 
 def _url_ready(url: str) -> bool:
+    response = None
     try:
-        with urllib.request.urlopen(url, timeout=2) as response:
-            response.read()
-            return response.status < 500
+        response = urllib.request.urlopen(url, timeout=2)
+        return response.status < 500
     except (OSError, urllib.error.URLError):
         return False
+    finally:
+        if response is not None:
+            try:
+                close = getattr(response, "close", None)
+                if close:
+                    close()
+            except OSError:
+                pass
 
 
 def _wait_for_url(label: str, url: str, log_file: Path) -> None:
