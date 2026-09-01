@@ -675,6 +675,43 @@ describe('WechatKfSetup', () => {
     expect(document.body.textContent).not.toContain('provider secret body must never render');
   });
 
+  it('shows contact generation progress only on the account being processed', async () => {
+    const user = userEvent.setup();
+    const first = providerAccount({ open_kfid: 'wk-contact-first' });
+    const second = providerAccount({ open_kfid: 'wk-contact-second' });
+    let releaseContact: ((response: Response) => void) | undefined;
+    const contactResponse = new Promise<Response>((resolve) => {
+      releaseContact = resolve;
+    });
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/accounts?')) return jsonResponse({ accounts: [first, second] });
+      if (url.includes('/contact-way?')) return contactResponse;
+      return jsonResponse({});
+    }));
+    renderSetup('en-US', {
+      ...ownerBinding,
+      status: 'active',
+      callback_ready: true,
+      wechat_kf_accounts: [first, second].map((account) => ({
+        open_kfid: account.open_kfid,
+        name: account.name,
+        status: 'active',
+        sync_cursor: '',
+      })),
+    });
+    await screen.findByText(first.open_kfid);
+
+    const firstButton = screen.getByRole('button', { name: `Generate contact link for ${first.open_kfid}` });
+    const secondButton = screen.getByRole('button', { name: `Generate contact link for ${second.open_kfid}` });
+    await user.click(firstButton);
+
+    expect(firstButton.textContent).toBe('Generating contact link…');
+    expect(secondButton.textContent).toBe('Generate contact link');
+    releaseContact?.(jsonResponse({ url: 'https://work.weixin.qq.com/kf/contact-first' }));
+    await screen.findByText('https://work.weixin.qq.com/kf/contact-first');
+  });
+
   it.each([
     'javascript:alert(1)',
     'http://work.weixin.qq.com/kf/demo',

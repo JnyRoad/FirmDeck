@@ -1,6 +1,6 @@
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
-import threading
 
 import pytest
 from sqlalchemy.pool import StaticPool
@@ -1646,13 +1646,39 @@ def test_agent_delete_and_mount_update_reverse_order_has_no_deadlock(
     assert not update_thread.is_alive()
     assert not delete_thread.is_alive()
     assert update_responses[0].status_code == 200
-    assert delete_responses[0].status_code == 409
-    assert delete_responses[0].json()["detail"]["code"] == "CHANNEL_CONFLICT"
+    assert delete_responses[0].status_code == 200
     with Session(engine) as db:
-        assert db.get(AgentProfile, "agent_cw") is not None
+        assert db.get(AgentProfile, "agent_cw") is None
         binding = db.get(ChannelBinding, binding_id)
         assert binding.agent_id == "agent_xz"
         mounts = db.exec(
             select(ChannelBindingAgent).where(ChannelBindingAgent.binding_id == binding_id)
         ).all()
         assert [(mount.agent_id, mount.is_default) for mount in mounts] == [("agent_xz", True)]
+
+
+def test_agent_delete_rejects_when_affected_binding_set_grows(monkeypatch) -> None:
+    """锁外快照后出现未锁 binding 时，删除必须稳定冲突且不删除员工。"""
+    import app.api.agents as agents_api
+
+    engine = _test_engine()
+    users = _seed_api_users(engine)
+    calls = 0
+    real_affected_ids = agents_api._affected_channel_binding_ids
+
+    def grow_after_snapshot(db, agent_id):
+        nonlocal calls
+        calls += 1
+        result = real_affected_ids(db, agent_id)
+        return result if calls == 1 else ("binding-appeared-in-other-worker",)
+
+    monkeypatch.setattr(agents_api, "_affected_channel_binding_ids", grow_after_snapshot)
+    response = _make_agent_channel_client(engine).delete(
+        "/api/enterprise/agents/agent_cw?tenant_id=tenant_demo",
+        headers=_auth(users["owner"]),
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "CHANNEL_CONFLICT"
+    with Session(engine) as db:
+        assert db.get(AgentProfile, "agent_cw") is not None

@@ -387,6 +387,10 @@ class WeComStreamReply:
         skill_names: dict[str, str] | None = None,
         step_names: dict[str, dict[str, str]] | None = None,
         tool_names: dict[str, str] | None = None,
+        progress_names_loader: Callable[
+            [], tuple[dict[str, str], dict[str, dict[str, str]], dict[str, str]]
+        ]
+        | None = None,
         language_context: LanguageContext | dict[str, Any] | None = None,
     ) -> None:
         """Bind one immutable locale snapshot and start a bounded background sender."""
@@ -427,6 +431,8 @@ class WeComStreamReply:
         self._skill_names = dict(skill_names or {})
         self._step_names = dict(step_names or {})
         self._tool_names = dict(tool_names or {})
+        self._progress_names_loader = progress_names_loader
+        self._progress_names_lock = threading.Lock()
         self._worker = threading.Thread(
             target=self._run,
             name=f"staffdeck-wecom-reply-{self._stream_id[-24:]}",
@@ -501,6 +507,27 @@ class WeComStreamReply:
             self._dirty = True
             self._condition.notify_all()
 
+    def _ensure_progress_names(self) -> None:
+        """Load tenant-owned display names at most once, only when an event needs them."""
+        if self._progress_names_loader is None:
+            return
+        with self._progress_names_lock:
+            loader = self._progress_names_loader
+            if loader is None:
+                return
+            self._progress_names_loader = None
+            try:
+                skill_names, step_names, tool_names = loader()
+            except Exception:  # noqa: BLE001 - optional progress labels must not fail a turn
+                logger.exception(
+                    "企微进度名称加载失败 binding=%s",
+                    self._binding.id,
+                )
+                return
+            self._skill_names = dict(skill_names)
+            self._step_names = dict(step_names)
+            self._tool_names = dict(tool_names)
+
     def _event_progress(
         self,
         event_type: str,
@@ -537,6 +564,8 @@ class WeComStreamReply:
         if event_name in {"skill_started", "skill_resumed"}:
             skill_id = _wecom_event_label(payload, "to_skill_id", "from_skill_id", "skill_id")
             name = _wecom_event_label(payload, "skill_name", "skillName", "name")
+            if not name and skill_id:
+                self._ensure_progress_names()
             name = name or self._skill_names.get(skill_id, "")
             key = "skill"
             notice_code = (
@@ -549,12 +578,16 @@ class WeComStreamReply:
             skill_id = _wecom_event_label(payload, "to_skill_id", "from_skill_id", "skill_id")
             step_id = _wecom_event_label(payload, "to_step_id", "step_id")
             step = _wecom_event_label(payload, "to_step_name", "step_name")
+            if not step and step_id:
+                self._ensure_progress_names()
             step = step or self._step_names.get(skill_id, {}).get(step_id, "") or step_id
             return "step", ChannelNotice("wecom.progress.step", {"step_name": step})
         if event_name == "task_frame_started":
             skill_id = _wecom_event_label(payload, "skill_id")
             step_id = _wecom_event_label(payload, "step_id")
             name = _wecom_event_label(payload, "skill_name", "name", "title")
+            if skill_id or step_id:
+                self._ensure_progress_names()
             name = self._step_names.get(skill_id, {}).get(step_id, "") or name
             name = name or self._skill_names.get(skill_id, "")
             if name:
@@ -577,6 +610,8 @@ class WeComStreamReply:
                 "name",
                 "toolId",
             )
+            if name:
+                self._ensure_progress_names()
             name = self._tool_names.get(name, name)
             code = "wecom.progress.tool_started" if name else "wecom.progress.tool_started_default"
             params = {"tool_name": name} if name else {}
@@ -595,6 +630,8 @@ class WeComStreamReply:
                 "tool_name",
                 "name",
             )
+            if name:
+                self._ensure_progress_names()
             name = self._tool_names.get(name, name)
             failed = payload.get("isError") is True or payload.get("success") is False
             if failed:
@@ -1482,14 +1519,11 @@ class WeComAdapter:
         stream = get_wecom_stream_manager().get_stream(binding.id)
         if not stream or not isinstance(frame, dict):
             return None
-        skill_names, step_names, tool_names = _load_wecom_progress_names(binding)
         return WeComStreamReply(
             binding,
             frame,
             stream,
-            skill_names=skill_names,
-            step_names=step_names,
-            tool_names=tool_names,
+            progress_names_loader=lambda: _load_wecom_progress_names(binding),
             language_context=language_context,
         )
 

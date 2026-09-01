@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import json
 import traceback
+from datetime import timedelta
 from typing import Any, ClassVar
 
 import httpx
@@ -11,6 +12,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
+import app.channels.service_intake as intake_module
 from app.channels.adapters.base import ChannelInbound, ChannelInboundAttachment
 from app.channels.crypto import encrypt_channel_secret
 from app.channels.service_durable_inbox import StageDisposition
@@ -608,6 +610,50 @@ def test_wechat_kf_media_download_uses_safe_provider_metadata(monkeypatch) -> No
     )
 
 
+def test_wechat_kf_media_size_violation_has_dedicated_exception(monkeypatch) -> None:
+    """大小超限不依赖本地化错误文案识别，且仍保持既有 ValueError 契约。"""
+    module = _wechat_kf_adapter_module()
+    adapter = module.WeChatKfAdapter()
+    binding = ChannelBinding(tenant_id="tenant_a", agent_id="agent_a", channel="wechat_kf")
+    monkeypatch.setattr(adapter._tokens, "get", lambda _binding: "token")
+
+    class OversizedResponse:
+        headers = {"content-type": "application/octet-stream", "content-length": "9"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            pass
+
+        def raise_for_status(self) -> None:
+            pass
+
+        def iter_bytes(self, _size: int):
+            return iter(())
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            pass
+
+        def stream(self, *_args, **_kwargs):
+            return OversizedResponse()
+
+    monkeypatch.setattr(module.httpx, "Client", lambda **_kwargs: FakeClient())
+    attachment = ChannelInboundAttachment(
+        media_id="media-too-large",
+        kind="file",
+        download_params={"provider_max_bytes": 20},
+    )
+
+    with pytest.raises(ValueError) as caught:
+        adapter.download_media(binding, attachment, max_bytes=8)
+    assert type(caught.value).__name__ == "_WeChatKfMediaTooLargeError"
+
+
 def test_wechat_kf_media_upload_and_account_operations_use_provider_contract(monkeypatch) -> None:
     """Avatar, account CRUD, and contact-way operations emit the documented provider payloads."""
     module = _wechat_kf_adapter_module()
@@ -905,6 +951,39 @@ def test_wechat_kf_stage_persists_language_snapshot_and_deduplicates() -> None:
             "ui_locale_source": "channel_default",
             "agent_reply_locale_source": "channel_default",
         }
+
+
+def test_wechat_kf_staged_event_is_claimable_and_uses_durable_stale_recovery(
+    monkeypatch,
+) -> None:
+    """微信客服必须与其他 durable lane 使用同一 claim 和 stale-recovery 路径。"""
+    module = _wechat_kf_inbox_module()
+    engine = _test_engine()
+    binding = _seed_binding_and_account(engine)
+    staged = module.stage_wechat_kf_inbound(
+        db_engine=engine,
+        binding_id=binding.id,
+        expected_revision=7,
+        account_scope="ww-tenant-a:wk-support",
+        inbound=_inbound(text="durable"),
+    )
+
+    assert intake_module.claim_staged_inbound(staged.event_pk, db_engine=engine) is True
+    with Session(engine) as db:
+        event = db.get(ChannelInboundEvent, staged.event_pk)
+        event.processor_run_id = "dead-worker"
+        event.processor_lease_expires_at = db_models.utc_now() - timedelta(seconds=1)
+        db.add(event)
+        db.commit()
+
+    recovered: list[str] = []
+    monkeypatch.setattr(
+        intake_module,
+        "_recover_stale_durable_event",
+        lambda event_pk, *, db_engine: recovered.append(event_pk) or True,
+    )
+    assert intake_module.sweep_stale_inbound_events(db_engine=engine) == 1
+    assert recovered == [staged.event_pk]
 
 
 @pytest.mark.parametrize(

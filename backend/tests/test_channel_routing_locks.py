@@ -29,13 +29,13 @@ class _ObservedRLock:
         self._attempts_guard = threading.Lock()
         self._second_acquire_attempted = second_acquire_attempted
 
-    def acquire(self) -> bool:
+    def acquire(self, *args, **kwargs) -> bool:
         """记录 acquire 次数后阻塞取得真实锁；第二个调用者到达时设置事件。"""
         with self._attempts_guard:
             self._attempts += 1
             if self._attempts == 2:
                 self._second_acquire_attempted.set()
-        return self._lock.acquire()
+        return self._lock.acquire(*args, **kwargs)
 
     def release(self) -> None:
         """释放当前线程持有的真实锁；未持有时由底层 RLock 抛错。"""

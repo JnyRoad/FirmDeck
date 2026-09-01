@@ -112,6 +112,7 @@ export default function WechatKfSetup({
   const [deleteTarget, setDeleteTarget] = useState<WeChatKfProviderAccountRead | null>(null);
   const [contactUrls, setContactUrls] = useState<Record<string, string>>({});
   const [contactQrImages, setContactQrImages] = useState<Record<string, string>>({});
+  const [contactOperationOpenKfid, setContactOperationOpenKfid] = useState<string | null>(null);
   const accountRequestGeneration = useRef(0);
 
   /** 清空账号编辑器和本地 File 引用；不删除服务端账号。 */
@@ -473,6 +474,7 @@ export default function WechatKfSetup({
   /** 为已绑定账号生成经严格 URL allowlist 校验的咨询链接与 QR。 */
   async function createContactWay(account: WeChatKfProviderAccountRead): Promise<void> {
     setOperation('contact');
+    setContactOperationOpenKfid(account.open_kfid);
     setErrorId(null);
     clearContactWay(account.open_kfid);
     try {
@@ -489,6 +491,7 @@ export default function WechatKfSetup({
     } catch (error) {
       showError(error, 'channels.wechatKf.error.contactWay');
     } finally {
+      setContactOperationOpenKfid(null);
       setOperation(null);
     }
   }
@@ -598,7 +601,7 @@ export default function WechatKfSetup({
                   aria-label={t('channels.wechatKf.contact.generateAria', { openKfid: account.open_kfid })}
                   onClick={createContactWay.bind(null, account)}
                 >
-                  {operation === 'contact'
+                  {operation === 'contact' && contactOperationOpenKfid === account.open_kfid
                     ? t('channels.wechatKf.contact.generating')
                     : t('channels.wechatKf.contact.generate')}
                 </Button>

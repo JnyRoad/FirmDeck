@@ -1500,6 +1500,71 @@ def test_wecom_p2p_inbound_full_chain() -> None:
         assert event.status == "done"
 
 
+def test_wecom_progress_sink_failure_does_not_abort_agent_turn(monkeypatch) -> None:
+    """可选进度 UI 抛错时，数字员工主流程仍完成并提交 durable event。"""
+    engine = _test_engine()
+    binding_id = _seed_wecom_binding(engine)
+    binding = _load_binding(engine, binding_id)
+
+    class FailingProgressSink:
+        def on_event(self, _event_type, _payload) -> None:
+            raise RuntimeError("progress sink failed")
+
+        def abort(self) -> None:
+            pass
+
+    class EventAgentLoop:
+        def __init__(self, db, *, event_sink=None, stream_sink=None):
+            self.db = db
+            self.event_sink = event_sink
+            self.stream_delivery_succeeded = False
+
+        def handle_turn(self, request):
+            self.event_sink("tool_call_started", {"name": "lookup"})
+            self.db.commit()
+
+    monkeypatch.setattr(agent_loop_module, "AgentLoop", EventAgentLoop)
+    monkeypatch.setattr(
+        WeComAdapter,
+        "create_stream_reply",
+        lambda *_args, **_kwargs: FailingProgressSink(),
+    )
+
+    assert process_inbound(
+        binding,
+        normalize_wecom_frame(_text_frame(msgid="msg_progress_failure")),
+        db_engine=engine,
+    ) is True
+    with Session(engine) as db:
+        assert db.exec(select(ChannelInboundEvent)).one().status == "done"
+
+
+def test_wecom_progress_names_load_lazily_once_per_reply() -> None:
+    """无命名需求的事件不查租户表，首次 ID 解析时只加载一次名称映射。"""
+    reply = WeComStreamReply.__new__(WeComStreamReply)
+    reply._skill_names = {}
+    reply._step_names = {}
+    reply._tool_names = {}
+    reply._progress_names_lock = threading.Lock()
+    loads = 0
+
+    def load_names():
+        nonlocal loads
+        loads += 1
+        return {"skill-1": "订单流程"}, {}, {"lookup": "订单查询"}
+
+    reply._progress_names_loader = load_names
+    intent = reply._event_progress("router_decision_created", {"intent": "查询订单"})
+    assert intent is not None
+    assert loads == 0
+
+    skill = reply._event_progress("skill_started", {"skill_id": "skill-1"})
+    tool = reply._event_progress("tool_call_started", {"name": "lookup"})
+    assert skill is not None and skill[1].params == {"skill_name": "订单流程"}
+    assert tool is not None and tool[1].params == {"tool_name": "订单查询"}
+    assert loads == 1
+
+
 def test_wecom_group_inbound_uses_sender_name_prefix() -> None:
     engine = _test_engine()
     binding_id = _seed_wecom_binding(engine)

@@ -68,6 +68,8 @@ logger = logging.getLogger(__name__)
 # handoff_reply 命令成功时返回此哨兵,跳过通用 _stage_notice(已自行创建 handoff_ack)
 _HANDOFF_REPLY_HANDLED: object = object()
 _DEDUP_LOOKBACK = 50
+_HANDOFF_LOOKUP_LIMIT = 100
+_DURABLE_INBOX_CHANNELS = frozenset({"feishu", "wecom", "dingtalk", "wechat_kf"})
 _processor_run_pid: int | None = None
 _processor_run_id: str | None = None
 _processor_run_guard = threading.Lock()
@@ -203,7 +205,7 @@ def claim_staged_inbound(event_id: str, *, db_engine=None) -> bool:
             update(ChannelInboundEvent)
             .where(
                 ChannelInboundEvent.id == event_id,
-                ChannelInboundEvent.channel.in_({"feishu", "wecom", "dingtalk"}),
+                ChannelInboundEvent.channel.in_(_DURABLE_INBOX_CHANNELS),
                 ChannelInboundEvent.status == "received",
             )
             .values(
@@ -1146,12 +1148,21 @@ def _run_handoff_reply_command(
         # matching so the duplicate is consumed idempotently instead of falling
         # through to a misleading "no pending request" response.
         ack_suffix = f":{inbound.event_id}"
+        like_event_id = (
+            inbound.event_id.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        )
         existing_acks = db.exec(
-            select(ChannelDelivery).where(
+            select(ChannelDelivery)
+            .where(
                 ChannelDelivery.tenant_id == binding.tenant_id,
                 ChannelDelivery.binding_id == binding.id,
                 ChannelDelivery.kind == "handoff_ack",
+                ChannelDelivery.idempotency_key.like(
+                    f"handoff-ack:{binding.id}:%:{like_event_id}",
+                    escape="\\",
+                ),
             )
+            .limit(_HANDOFF_LOOKUP_LIMIT)
         ).all()
         if any(
             str(row.idempotency_key or "").startswith(f"handoff-ack:{binding.id}:")
@@ -1247,6 +1258,7 @@ def _run_handoff_reply_command(
                 ChannelDelivery.status == "delivered",
             )
             .order_by(ChannelDelivery.created_at.desc())
+            .limit(_HANDOFF_LOOKUP_LIMIT)
         ).all()
         for notice in notices:
             target = notice.target_json or {}
@@ -1796,7 +1808,14 @@ def process_inbound(
 
                         def event_sink(event_type: str, payload: dict[str, object]) -> None:
                             """Fan execution events out to WeCom progress and Feishu tracing."""
-                            stream_sink.on_event(event_type, payload)
+                            try:
+                                stream_sink.on_event(event_type, payload)
+                            except Exception:  # noqa: BLE001 - optional progress UI is isolated
+                                logger.exception(
+                                    "企微进度事件投递失败 binding=%s event=%s",
+                                    binding.id,
+                                    inbound.event_id,
+                                )
                             if original_event_sink:
                                 original_event_sink(event_type, payload)
 
@@ -1928,7 +1947,7 @@ def process_staged_inbound(event_pk: str, *, db_engine=None) -> bool:
                 update(ChannelInboundEvent)
                 .where(
                     ChannelInboundEvent.id == event_pk,
-                    ChannelInboundEvent.channel.in_({"feishu", "wecom", "dingtalk", "wechat_kf"}),
+                    ChannelInboundEvent.channel.in_(_DURABLE_INBOX_CHANNELS),
                     ChannelInboundEvent.status == "processing",
                     ChannelInboundEvent.processor_run_id == current_processor_run_id(),
                 )
@@ -2028,9 +2047,7 @@ def run_staged_inbound_daemon(
                 event_ids = db.exec(
                     select(ChannelInboundEvent.id)
                     .where(
-                        ChannelInboundEvent.channel.in_(
-                            {"feishu", "wecom", "dingtalk", "wechat_kf"}
-                        ),
+                        ChannelInboundEvent.channel.in_(_DURABLE_INBOX_CHANNELS),
                         ChannelInboundEvent.status == "received",
                     )
                     .order_by(ChannelInboundEvent.created_at)
@@ -2243,11 +2260,11 @@ def sweep_stale_inbound_events(*, db_engine=None) -> int:
             binding = db.get(ChannelBinding, binding_id)
             if not binding:
                 continue
-            if channel not in {"feishu", "wecom", "dingtalk"} and binding.status != "active":
+            if channel not in _DURABLE_INBOX_CHANNELS and binding.status != "active":
                 continue
             db.expunge(binding)
         try:
-            if channel in {"feishu", "wecom", "dingtalk"}:
+            if channel in _DURABLE_INBOX_CHANNELS:
                 if _recover_stale_durable_event(event_pk, db_engine=use_engine):
                     taken += 1
                 continue

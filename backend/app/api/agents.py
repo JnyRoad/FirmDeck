@@ -583,9 +583,11 @@ def delete_agent(
                 select(ChannelBindingAgent).where(ChannelBindingAgent.agent_id == row.id)
             ).all()
             locked_binding_ids = _affected_channel_binding_ids(db, row.id)
-            if locked_binding_ids != affected_binding_ids:
+            if set(locked_binding_ids) - set(affected_binding_ids):
                 db.rollback()
                 raise build_http_exception("CHANNEL_CONFLICT", status_code=409)
+            # The set may safely shrink while waiting: every still-affected binding is locked.
+            affected_binding_ids = locked_binding_ids
             affected_bindings = {
                 binding_id: binding
                 for binding_id in affected_binding_ids
@@ -613,6 +615,7 @@ def delete_agent(
                 db.delete(binding)
             for mount in channel_mounts:
                 db.delete(mount)
+            db.flush()
 
             # 每个变化 binding 只推进一次 revision；默认被删时提升剩余首个挂载。
             for binding_id in affected_binding_ids:

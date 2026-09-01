@@ -55,6 +55,10 @@ class WeChatKfTransientError(RuntimeError):
     retryable = True
 
 
+class _WeChatKfMediaTooLargeError(ValueError):
+    """Signal a provider media size violation independently of localized wording."""
+
+
 class WeChatKfMessageDisposition(StrEnum):
     """Classify provider messages without conflating unsupported and malformed payloads."""
 
@@ -445,18 +449,22 @@ class WeChatKfAdapter:
                     )
                 content_length = int(response.headers.get("content-length") or 0)
                 if content_length > limit:
-                    raise ValueError(f"微信客服附件超过大小上限: size>{limit}")
+                    raise _WeChatKfMediaTooLargeError(
+                        f"微信客服附件超过大小上限: size>{limit}"
+                    )
                 chunks: list[bytes] = []
                 total = 0
                 for chunk in response.iter_bytes(64 * 1024):
                     total += len(chunk)
                     if total > limit:
-                        raise ValueError(f"微信客服附件超过大小上限: size>{limit}")
+                        raise _WeChatKfMediaTooLargeError(
+                            f"微信客服附件超过大小上限: size>{limit}"
+                        )
                     chunks.append(chunk)
                 downloaded = b"".join(chunks)
+        except _WeChatKfMediaTooLargeError:
+            raise
         except (httpx.HTTPError, ValueError) as exc:
-            if isinstance(exc, ValueError) and "超过大小上限" in str(exc):
-                raise
             raise WeChatKfTransientError("下载微信客服附件失败") from exc
         if "application/json" in content_type.lower():
             try:
