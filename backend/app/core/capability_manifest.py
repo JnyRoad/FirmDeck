@@ -75,6 +75,11 @@ class CapabilityAuthorizationError(RuntimeError):
 
 class CapabilityManifestBuilder:
     def __init__(self, db: Session):
+        """Bind the active database session used to read manifest resources.
+
+        The caller owns the session lifecycle and tenant scope; construction does not query or
+        mutate storage, while later manifest reads propagate database failures to the caller.
+        """
         self.db = db
 
     def build(
@@ -364,6 +369,11 @@ class CapabilityManifestBuilder:
         tool_by_ref: dict[str, Tool],
         knowledge_ids: set[str],
     ) -> list[CapabilityDescriptor]:
+        """Describe explicit SOP references that are absent from the visible resource sets.
+
+        Inputs are the current tenant's resolved references and visibility maps; this only reads
+        related rows for safe reasons and returns fail-closed descriptors, propagating DB errors.
+        """
         unavailable: list[CapabilityDescriptor] = []
         for ref in refs["general_skill_ids"]:
             if ref not in general_by_ref:

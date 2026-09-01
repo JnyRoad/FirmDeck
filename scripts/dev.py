@@ -378,6 +378,11 @@ def _service_ports(supervisor) -> list[tuple[str, int]]:
 
 
 def _start_detached(supervisor) -> int:
+    """Launch the development supervisor in its own process group and return its PID.
+
+    The helper creates local log files and starts a subprocess using the supplied supervisor
+    configuration; filesystem and process-launch failures propagate to the startup caller.
+    """
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     stdout = (LOG_DIR / "supervisor.log").open("ab", buffering=0)
     stderr = (LOG_DIR / "supervisor.err.log").open("ab", buffering=0)
@@ -399,6 +404,12 @@ def _start_detached(supervisor) -> int:
 
 
 def command_up(detach_flag: bool) -> int:
+    """Prepare dependencies and start StaffDeck development services.
+
+    The flag selects detached supervision while environment settings control ports and restart
+    behavior. This command may install local dependencies, stop services, build assets, and start
+    processes; setup, subprocess, or readiness failures propagate rather than reporting success.
+    """
     detach = detach_flag or _env_flag("DETACH")
     os.environ.setdefault("AUTO_RESTART", "1" if detach else "0")
     _ensure_backend_dependencies()
@@ -449,6 +460,11 @@ def command_up(detach_flag: bool) -> int:
 
 
 def command_status() -> int:
+    """Print current supervisor, port, and health status without changing running services.
+
+    This reads PID files, process state, and health endpoints; unavailable services are reported
+    in the output while unexpected filesystem or networking failures propagate to the CLI caller.
+    """
     _restore_runtime_port()
     supervisor = _load_supervisor()
     names = ("supervisor", "app") if supervisor.SINGLE_PORT else ("supervisor", "backend", "enterprise")

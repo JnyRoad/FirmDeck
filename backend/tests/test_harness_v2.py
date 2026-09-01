@@ -1974,6 +1974,11 @@ def test_staged_image_is_both_a_sandbox_file_and_vision_payload(
 
 
 def test_capability_manifest_only_exposes_current_step_sop_specific_resources() -> None:
+    """Verify each SOP step sees only its explicit resources and shared capabilities.
+
+    The test writes isolated in-memory fixtures and checks the generated manifest after the
+    session closes; database setup failures surface directly through the test.
+    """
     engine = _test_engine()
     with Session(engine) as db:
         db.add(Tenant(id="tenant-demo", name="Demo"))
@@ -2173,6 +2178,11 @@ def test_nested_sop_tool_grant_survives_parent_expansion() -> None:
 
 
 def test_general_tools_remain_discoverable_across_sop_steps() -> None:
+    """Verify general tools remain available while the active SOP step changes.
+
+    The fixture uses an isolated in-memory database and asserts manifests only; no external tool
+    endpoint is invoked.
+    """
     engine = _test_engine()
     with Session(engine) as db:
         db.add(Tenant(id="tenant-demo", name="Demo"))

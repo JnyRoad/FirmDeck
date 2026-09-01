@@ -166,11 +166,17 @@ def test_dev_cli_keeps_complete_frontend_dependencies(monkeypatch) -> None:
 
 
 def test_dev_cli_refreshes_incomplete_frontend_dependencies(monkeypatch) -> None:
+    """Verify an incomplete frontend install invokes npm ci after the health check.
+
+    The mocked subprocess only records local command arguments and does not start npm or mutate
+    dependencies outside the test process.
+    """
     dev = _load_script("dev")
     calls: list[list[str]] = []
     monkeypatch.setattr(dev, "_npm_executable", lambda: "npm")
 
     def run(command, **_kwargs):
+        """Record a mocked npm invocation and simulate an incomplete dependency listing."""
         calls.append(command)
         return subprocess.CompletedProcess(command, 1 if "ls" in command else 0)
 

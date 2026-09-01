@@ -196,6 +196,11 @@ class TaskRequestCompiler:
 
 
 def current_step_capability_refs(skill: Skill | None, step_id: str | None) -> dict[str, list[str]]:
+    """Return normalized capability references for one active SOP node.
+
+    Missing or malformed SOP content yields empty lists, while legacy ``allowed_actions`` and
+    knowledge scope fields are folded into the stable result without mutating the persisted skill.
+    """
     node = _current_node(skill, step_id)
     refs = (node or {}).get("capability_refs")
     result = {
