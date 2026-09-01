@@ -8,6 +8,7 @@ import type { MessageValues } from '@/i18n/imperative';
 import type { AppLocale } from '@/i18n/locales';
 import type { MessageId } from '@/i18n/types';
 import { useAppIntl } from '@/i18n/useAppIntl';
+import { tenantUserStorageKey } from '@/lib/tenant-storage';
 import { getClientTimeZone, parseBackendDateTime } from '@/lib/timezone';
 import type {
   ChatAttachmentRead,
@@ -38,14 +39,8 @@ import type {
   TraceTool,
   TurnTrace,
 } from './chatTypes';
-export {
-  SELECTED_AGENT_STORAGE_KEY,
-  SESSION_FILTER_STORAGE_PREFIX,
-  sessionFilterStorageKey,
-} from '@/lib/agent-scope-storage';
+export { sessionFilterStorageKey } from '@/lib/agent-scope-storage';
 
-export const MODEL_CONFIG_STORAGE_PREFIX = 'skill_agent_selected_model_config';
-export const SESSION_READ_STORAGE_PREFIX = 'skill_agent_session_read_at';
 export const SIDEBAR_COLLAPSED_STORAGE_KEY = 'skill_agent_sidebar_collapsed';
 export const RUNNING_EVENT_RECOVERY_WINDOW_MS = 600 * 1000;
 export const CHAT_STREAM_IDLE_TIMEOUT_MS = 600 * 1000;
@@ -70,13 +65,19 @@ const DRAFT_WEEKDAY_MESSAGE_IDS = [
   'chat.draft.weekday.sunday',
 ] as const satisfies readonly MessageId[];
 
-export function sessionReadStorageKey(userId: string): string {
-  return `${SESSION_READ_STORAGE_PREFIX}:${userId || 'anonymous'}`;
+/** Generate a read-marker key only from verified tenant and user identity. */
+export function sessionReadStorageKey(tenantId: string, userId: string): string {
+  return tenantUserStorageKey(tenantId, userId, 'session-read');
 }
 
-export function loadSessionReadTimes(userId: string): Record<string, string> {
+/**
+ * 读取租户/用户的会话已读标记；显式身份缺失、旧键或损坏 JSON 都只返回空集合。
+ * 函数只读浏览器存储，不会把旧无租户键迁入新命名空间。
+ */
+export function loadSessionReadTimes(tenantId: string, userId: string): Record<string, string> {
   try {
-    const raw = window.localStorage.getItem(sessionReadStorageKey(userId));
+    const key = sessionReadStorageKey(tenantId, userId);
+    const raw = window.localStorage.getItem(key);
     if (!raw) return {};
     const parsed = JSON.parse(raw) as Record<string, string>;
     return parsed && typeof parsed === 'object' ? parsed : {};
@@ -85,8 +86,17 @@ export function loadSessionReadTimes(userId: string): Record<string, string> {
   }
 }
 
-export function persistSessionReadTimes(userId: string, values: Record<string, string>): void {
-  window.localStorage.setItem(sessionReadStorageKey(userId), JSON.stringify(values));
+/**
+ * 写入租户/用户的会话已读标记；显式身份非法时在生成键阶段失败，不写入旧无租户位置。
+ * 浏览器存储异常会继续抛出，调用方不得把失败当成成功。
+ */
+export function persistSessionReadTimes(
+  tenantId: string,
+  userId: string,
+  values: Record<string, string>,
+): void {
+  const key = sessionReadStorageKey(tenantId, userId);
+  window.localStorage.setItem(key, JSON.stringify(values));
 }
 
 export function isScheduledSession(session: ChatSession): boolean {
@@ -107,8 +117,12 @@ export function sessionHasUnreadReply(
   return Number.isFinite(updatedAt) && (!Number.isFinite(readAt) || updatedAt > readAt + 1000);
 }
 
-export function draftConversationKey(agentId: string): string {
-  return `draft:${agentId}`;
+export function draftConversationKey(
+  tenantId: string,
+  userId: string,
+  agentId: string,
+): string {
+  return `draft:${tenantUserStorageKey(tenantId, userId, agentId)}`;
 }
 
 export function isDraftConversationKey(id: string): boolean {
@@ -119,8 +133,9 @@ export function isMissingChatSessionError(error: unknown): boolean {
   return error instanceof ApiError && error.status === 404;
 }
 
-export function modelStorageKey(tenantId: string): string {
-  return `${MODEL_CONFIG_STORAGE_PREFIX}:${tenantId}`;
+/** Generate a model preference key only from verified tenant and user identity. */
+export function modelStorageKey(tenantId: string, userId: string): string {
+  return tenantUserStorageKey(tenantId, userId, 'model-config');
 }
 
 /** 返回模型业务名称；无名称时使用当前界面的稳定默认标签。 */

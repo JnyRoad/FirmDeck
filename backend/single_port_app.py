@@ -494,6 +494,13 @@ def enterprise_app(path: str = "") -> FileResponse:
     return spa_index_response(ENTERPRISE_DIST / "index.html")
 
 
+@app.get("/system", include_in_schema=False)
+@app.get("/system/{path:path}", include_in_schema=False)
+def system_app(path: str = "") -> FileResponse:
+    """Serve the installation control-plane SPA for direct and deep-link navigation."""
+    return spa_index_response(ENTERPRISE_DIST / "index.html")
+
+
 @app.get("/login", include_in_schema=False)
 @app.get("/chat", include_in_schema=False)
 @app.get("/chat/{path:path}", include_in_schema=False)

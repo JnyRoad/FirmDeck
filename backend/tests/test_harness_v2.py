@@ -44,7 +44,7 @@ from app.core.harness_session_cleanup import (
     harness_task_workspace_path,
 )
 from app.core.harness_session_lock import HarnessSessionBusy
-from app.core.harness_turn_store import HarnessTurnConflict
+from app.core.harness_turn_store import HarnessTurnConflict, HarnessTurnStore
 from app.core.harness_v2_engine import (
     HarnessV2Engine,
     _combine_results,
@@ -118,6 +118,7 @@ from app.scheduled_tasks.service import (
     _skip_misfired_run,
     due_scheduled_tasks,
 )
+from app.security.tenant import TenantLifecycleDenied
 from app.session.attachment_store import stage_chat_attachment
 from app.session.session_schema import (
     ChatAttachmentRead,
@@ -1312,6 +1313,62 @@ def test_turn_planner_retries_schema_invalid_json(monkeypatch) -> None:
     assert len(plan.task_frames) == 1
     assert plan.task_frames[0].kind == "conversation"
     assert plan.task_frames[0].slot_hints == {}
+
+
+def test_turn_planner_admission_fences_every_provider_schema_attempt(monkeypatch) -> None:
+    """The wake admission callback surrounds the initial and schema-repair calls."""
+    callbacks: list[str] = []
+    provider_calls: list[int] = []
+    outputs = iter(
+        [
+            {
+                "decision": "answer_only",
+                "task_frames": [{"kind": "not-a-kind"}],
+            },
+            {
+                "decision": "answer_only",
+                "user_intent": "打招呼",
+                "task_frames": [
+                    {
+                        "kind": "conversation",
+                        "decision": "answer_only",
+                        "requirements": ["友好回复用户问候"],
+                        "slot_hints": {},
+                        "depends_on_task_ids": [],
+                    }
+                ],
+                "task_updates": [],
+            },
+        ]
+    )
+
+    class FakeLLMClient:
+        def __init__(self, _model_config: ModelConfig):
+            pass
+
+        def generate_json(
+            self, _system_prompt: str, _payload: dict[str, object]
+        ) -> dict[str, object]:
+            provider_calls.append(len(provider_calls) + 1)
+            return next(outputs)
+
+    def admission_check() -> None:
+        callbacks.append("admission")
+
+    monkeypatch.setattr(turn_planner_module, "LLMClient", FakeLLMClient)
+
+    plan = TurnPlanner().plan(
+        "你好",
+        _chat_session(),
+        available_skills=[],
+        model_config=_model_config(),
+        admission_check=admission_check,
+    )
+
+    assert len(provider_calls) == 2
+    assert len(callbacks) == 4
+    assert len(callbacks) == len(provider_calls) * 2
+    assert plan.task_frames[0].kind == "conversation"
 
 
 def test_turn_planner_exposes_sops_but_not_runtime_capabilities(monkeypatch) -> None:
@@ -5717,6 +5774,63 @@ def test_frame_and_run_completion_are_fenced_by_current_lease() -> None:
         assert run.lease_owner == "new-run-owner"
 
 
+def test_mark_lifecycle_denied_does_not_overwrite_successor_frame_or_run() -> None:
+    """A stale lifecycle callback must not terminalize a newly claimed attempt."""
+    engine = _test_engine()
+    with Session(engine) as db:
+        session = _chat_session()
+        row = HarnessTaskFrameRecord(
+            tenant_id=session.tenant_id,
+            session_id=session.id,
+            source_turn_id="turn-stale-denial",
+            task_id="task-stale-denial",
+            kind="conversation",
+            status="queued",
+        )
+        db.add_all([session, row])
+        db.commit()
+        store = TaskFrameStore(db)
+        store.mark_running(row)
+        run = store.start_run(
+            row,
+            requirement={"goal": "stale denial"},
+            capability_snapshot={"available": []},
+        )
+        db.commit()
+        db.refresh(row)
+        db.refresh(run)
+        stale_owner = row.lease_owner
+        stale_attempt = row.attempt_no
+        assert stale_owner
+
+        row.lease_owner = "successor-frame-owner"
+        row.attempt_no = stale_attempt + 1
+        run.lease_owner = "successor-run-owner"
+        run.attempt_no = stale_attempt + 1
+        db.add_all([row, run])
+        db.commit()
+
+        harness = object.__new__(HarnessV2Engine)
+        harness.db = db
+        harness.store = store
+        harness.session = session
+        harness.turn_record = None
+        harness.active_run_id = run.id
+        harness.active_frame_id = row.id
+        harness.active_frame_lease_owner = stale_owner
+        harness.active_frame_attempt_no = stale_attempt
+        harness.mark_lifecycle_denied("TENANT_SUSPENDED")
+
+        db.refresh(row)
+        db.refresh(run)
+        assert row.status == "running"
+        assert row.lease_owner == "successor-frame-owner"
+        assert row.attempt_no == stale_attempt + 1
+        assert run.status == "running"
+        assert run.lease_owner == "successor-run-owner"
+        assert run.attempt_no == stale_attempt + 1
+
+
 def _test_engine():
     engine = create_engine(
         "sqlite://",
@@ -5799,6 +5913,460 @@ def test_activate_frame_records_skill_call_events_for_stats() -> None:
         assert by_task["task-start_new_task"].payload_json["from_skill_id"] is None
         # 每次激活都恢复了任务帧
         assert len(stub_runtime.restored) == 3
+
+
+def test_harness_turn_frame_run_and_invocation_share_the_admission_version(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """Every durable Harness child record must bind the same tenant version as turn admission."""
+    monkeypatch.setenv("ULTRARAG_DATA_DIR", str(tmp_path / "data"))
+    engine = _test_engine()
+    with Session(engine) as db:
+        db.add(
+            Tenant(
+                id="tenant-demo",
+                name="Demo",
+                status="active",
+                lifecycle_version=7,
+            )
+        )
+        session = _chat_session()
+        db.add(session)
+        db.commit()
+
+        request = ChatTurnRequest(
+            tenant_id="tenant-demo",
+            session_id=session.id,
+            client_turn_id="turn-admission-version",
+            message="查询版本",
+        )
+        turn = HarnessTurnStore(db).claim(session, request).record
+        assert turn is not None
+
+        store = TaskFrameStore(db)
+        row = store.persist_plan(
+            session,
+            "source-turn-admission-version",
+            TurnPlan(
+                decision="answer_only",
+                user_intent="查询版本",
+                task_frames=[
+                    PlannedTaskFrame(
+                        task_id="task-admission-version",
+                        kind="conversation",
+                        decision="answer_only",
+                        requirements=["返回租户版本"],
+                    )
+                ],
+            ),
+        )[0]
+        store.mark_running(row)
+        store.ensure_agent_loop(row)
+        run = store.start_run(
+            row,
+            requirement={"goal": "查询版本"},
+            capability_snapshot={"available": []},
+        )
+        db.commit()
+
+        manifest = CapabilityManifest(
+            available=[
+                CapabilityDescriptor(
+                    capability_id="builtin.capability_search",
+                    name="capability_search",
+                    kind="internal",
+                )
+            ]
+        )
+        invoker = HarnessCapabilityInvoker(
+            db,
+            tenant_id=session.tenant_id,
+            session=session,
+            task_frame_id=row.task_id,
+            model_config=_model_config(),
+            manifest=manifest,
+            active_skill=None,
+            active_step_id=None,
+            agent_id=None,
+            run_id=run.id,
+            initially_activated_names={"capability_search"},
+        )
+        monkeypatch.setattr(
+            invoker,
+            "_currently_authorized_descriptor",
+            lambda _descriptor: manifest.available[0],
+        )
+        result = invoker.invoke("capability_search", {"query": "版本"})
+        assert result["success"] is True
+
+        invocation = db.exec(
+            select(HarnessInvocationRecord).where(
+                HarnessInvocationRecord.run_id == run.id,
+            )
+        ).one()
+
+        assert turn.tenant_lifecycle_version == 7
+        assert row.tenant_lifecycle_version == 7
+        assert run.tenant_lifecycle_version == 7
+        assert invocation.tenant_lifecycle_version == 7
+
+
+def test_harness_tool_call_is_denied_after_suspension_before_external_side_effect(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """A suspension observed at the tool boundary must prevent the provider call."""
+    monkeypatch.setenv("ULTRARAG_DATA_DIR", str(tmp_path / "data"))
+    engine = _test_engine()
+    side_effects: list[dict[str, object]] = []
+    with Session(engine) as db:
+        tenant = Tenant(
+            id="tenant-demo",
+            name="Demo",
+            status="active",
+            lifecycle_version=3,
+        )
+        session = _chat_session()
+        db.add_all([tenant, session])
+        db.commit()
+        descriptor = CapabilityDescriptor(
+            capability_id="tool-provider-write",
+            name="provider_write",
+            kind="tool",
+        )
+        invoker = HarnessCapabilityInvoker(
+            db,
+            tenant_id=tenant.id,
+            session=session,
+            task_frame_id="task-provider-write",
+            model_config=_model_config(),
+            manifest=CapabilityManifest(available=[descriptor]),
+            active_skill=None,
+            active_step_id=None,
+            agent_id=None,
+            run_id="run-provider-write",
+            initially_activated_names={descriptor.name},
+        )
+        monkeypatch.setattr(
+            invoker,
+            "_currently_authorized_descriptor",
+            lambda _descriptor: descriptor,
+        )
+        monkeypatch.setattr(
+            invoker,
+            "_invoke_external_tool",
+            lambda *_args, **_kwargs: side_effects.append({"called": True})
+            or {"success": True, "data": {"written": True}},
+        )
+        tenant.status = "suspended"
+        tenant.lifecycle_version = 4
+        db.add(tenant)
+        db.commit()
+
+        result = invoker.invoke("provider_write", {"value": "should-not-send"})
+
+        assert result["error"]["code"] == "TENANT_SUSPENDED"
+        assert side_effects == []
+        invocation = db.exec(
+            select(HarnessInvocationRecord).where(
+                HarnessInvocationRecord.run_id == "run-provider-write",
+            )
+        ).one()
+        assert invocation.status == "failed"
+
+
+def test_harness_started_tool_call_records_unknown_outcome_after_suspension(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """A provider call that started before suspension must not become ordinary success or retry."""
+    monkeypatch.setenv("ULTRARAG_DATA_DIR", str(tmp_path / "data"))
+    engine = _test_engine()
+    with Session(engine) as db:
+        tenant = Tenant(
+            id="tenant-demo",
+            name="Demo",
+            status="active",
+            lifecycle_version=3,
+        )
+        session = _chat_session()
+        db.add_all([tenant, session])
+        db.commit()
+        descriptor = CapabilityDescriptor(
+            capability_id="tool-provider-timeout",
+            name="provider_timeout",
+            kind="tool",
+        )
+        invoker = HarnessCapabilityInvoker(
+            db,
+            tenant_id=tenant.id,
+            session=session,
+            task_frame_id="task-provider-timeout",
+            model_config=_model_config(),
+            manifest=CapabilityManifest(available=[descriptor]),
+            active_skill=None,
+            active_step_id=None,
+            agent_id=None,
+            run_id="run-provider-timeout",
+            initially_activated_names={descriptor.name},
+        )
+        monkeypatch.setattr(
+            invoker,
+            "_currently_authorized_descriptor",
+            lambda _descriptor: descriptor,
+        )
+
+        def provider_call_started(*_args, **_kwargs):
+            """Simulate a provider accepting a write before the local timeout is observed."""
+            tenant.status = "suspended"
+            tenant.lifecycle_version = 4
+            db.add(tenant)
+            db.commit()
+            raise TimeoutError("provider response not observed")
+
+        monkeypatch.setattr(invoker, "_invoke_external_tool", provider_call_started)
+
+        result = invoker.invoke("provider_timeout", {"value": "may-have-sent"})
+
+        invocation = db.exec(
+            select(HarnessInvocationRecord).where(
+                HarnessInvocationRecord.run_id == "run-provider-timeout",
+            )
+        ).one()
+        assert result["success"] is False
+        assert invocation.status == "outcome_unknown"
+        assert result["error"].get("outcome_unknown") is True
+
+
+def test_harness_fences_lifecycle_immediately_before_model_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lifecycle transition between setup and model generation must block the model call."""
+    engine = _test_engine()
+    model_calls: list[str] = []
+    with Session(engine) as db:
+        tenant = Tenant(
+            id="tenant-demo",
+            name="Demo",
+            status="active",
+            lifecycle_version=1,
+        )
+        session = _chat_session()
+        row = HarnessTaskFrameRecord(
+            tenant_id=tenant.id,
+            session_id=session.id,
+            source_turn_id="turn-model-fence",
+            task_id="task-model-fence",
+            kind="conversation",
+            decision="answer_only",
+            status="queued",
+            tenant_lifecycle_version=1,
+        )
+        db.add_all([tenant, session, row])
+        db.commit()
+
+        requirement = TaskRequirement(
+            task_frame_id=row.task_id,
+            kind="conversation",
+            goal="model fence",
+        )
+        loop = SimpleNamespace(
+            id="loop-model-fence",
+            kind="conversation",
+            checkpoint_json={},
+        )
+        run = SimpleNamespace(id="run-model-fence")
+        store = SimpleNamespace(
+            mark_running=lambda _row: None,
+            ensure_agent_loop=lambda _row: loop,
+            save_requirement=lambda *_args, **_kwargs: None,
+            start_run=lambda *_args, **_kwargs: run,
+            save_agent_loop_checkpoint=lambda *_args, **_kwargs: None,
+        )
+        harness = HarnessV2Engine.__new__(HarnessV2Engine)
+        harness.db = db
+        harness.owner = SimpleNamespace()
+        harness.events = SimpleNamespace(record_legacy_event=lambda *_args, **_kwargs: None)
+        harness.store = store
+        harness.manifests = SimpleNamespace(build=lambda *_args, **_kwargs: CapabilityManifest())
+        harness.compiler = SimpleNamespace(compile=lambda *_args, **_kwargs: requirement)
+        harness.task_agent = SimpleNamespace(
+            run=lambda *_args, **_kwargs: model_calls.append("called")
+            or TaskExecutionResult(
+                task_frame_id=row.task_id,
+                status="completed",
+                reply_fragment="generated",
+            )
+        )
+        harness.session = session
+        harness.user_message_id = "turn-model-fence"
+        harness.turn_knowledge_versions = None
+        harness.slash_command = None
+        harness.tenant_admission = harness._optional_tenant_admission(
+            tenant_id=tenant.id,
+            correlation_id=row.task_id,
+        )
+        harness.lifecycle_denial = None
+        harness.active_frame_id = None
+        harness.active_frame_lease_owner = None
+        harness.active_frame_attempt_no = None
+
+        class SuspendingInvoker:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                current_tenant = db.get(Tenant, tenant.id)
+                assert current_tenant is not None
+                current_tenant.status = "suspended"
+                current_tenant.lifecycle_version = 2
+                db.add(current_tenant)
+                db.commit()
+
+            def invoke(self, *_args: object, **_kwargs: object) -> dict[str, object]:
+                return {"success": True}
+
+            def discover_artifacts(self) -> list[dict[str, object]]:
+                return []
+
+        monkeypatch.setattr(harness_v2_engine_module, "HarnessCapabilityInvoker", SuspendingInvoker)
+
+        with pytest.raises((TenantLifecycleDenied, HarnessExecutionFenced)):
+            harness._run_frame(
+                ChatTurnRequest(
+                    tenant_id=tenant.id,
+                    session_id=session.id,
+                    user_id="user-1",
+                    agent_id="agent-1",
+                    client_turn_id="turn-model-fence",
+                    message="触发模型调用",
+                ),
+                session,
+                row,
+                PlannedTaskFrame(
+                    task_id=row.task_id,
+                    kind="conversation",
+                    decision="answer_only",
+                    requirements=["model fence"],
+                ),
+                None,
+                _model_config(),
+                [],
+                [],
+                1,
+            )
+
+        assert model_calls == []
+
+
+def test_harness_fences_lifecycle_immediately_before_final_response_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lifecycle transition during response setup must block the final generator call."""
+    engine = _test_engine()
+    generator_calls: list[str] = []
+    response_setup_calls: list[str] = []
+    with Session(engine) as db:
+        tenant = Tenant(
+            id="tenant-demo",
+            name="Demo",
+            status="active",
+            lifecycle_version=1,
+        )
+        session = _chat_session(agent_id="agent-1", user_id="user-1")
+        db.add_all([tenant, session])
+        db.commit()
+
+        turn_record = SimpleNamespace(tenant_lifecycle_version=1)
+        harness = HarnessV2Engine.__new__(HarnessV2Engine)
+        harness.db = db
+        harness.events = SimpleNamespace(record_legacy_event=lambda *_args, **_kwargs: None)
+        harness.owner = SimpleNamespace(
+            db=db,
+            _get_or_create_session=lambda _request: session,
+            _mark_session_running=lambda _session: None,
+            _append_message=lambda *_args, **_kwargs: SimpleNamespace(id="user-message"),
+            _user_message_metadata=lambda _request: {},
+            _get_request_model=lambda *_args, **_kwargs: _model_config(),
+            _list_published_skills=lambda *_args, **_kwargs: [],
+            _drop_unavailable_skill_state=lambda *_args, **_kwargs: None,
+            memory=SimpleNamespace(context_memories=lambda *_args, **_kwargs: []),
+            _conversation_context=lambda *_args, **_kwargs: {},
+            _get_agent_loop_max_actions=lambda *_args, **_kwargs: 1,
+            _get_persona_prompt=lambda *_args, **_kwargs: "",
+            _finalize_turn=lambda _session, _tenant_id, reply, *_args, **_kwargs: reply,
+            _enqueue_memory_capture=lambda *_args, **_kwargs: None,
+            response_generator=SimpleNamespace(
+                generate=lambda *_args, **_kwargs: generator_calls.append("called")
+                or "generated reply"
+            ),
+        )
+        harness.store = SimpleNamespace(
+            planner_state=lambda _session: {},
+            persist_plan=lambda *_args, **_kwargs: [],
+            ready_dependency_frames=lambda *_args, **_kwargs: [],
+            project_session=lambda _session: None,
+        )
+        harness.session_leases = SimpleNamespace(
+            acquire=lambda _session: None,
+            renew=lambda _lease: None,
+            release=lambda _lease: None,
+        )
+        harness.turn_store = SimpleNamespace(
+            claim=lambda *_args, **_kwargs: SimpleNamespace(
+                record=turn_record,
+                replay=None,
+            ),
+            bind_user_message=lambda *_args, **_kwargs: None,
+            renew=lambda _record: None,
+            begin_completion=lambda _record: None,
+            complete=lambda *_args, **_kwargs: None,
+        )
+        harness.planner = SimpleNamespace(
+            plan=lambda *_args, **_kwargs: TurnPlan(
+                decision="answer_only",
+                user_intent="final response fence",
+                task_frames=[],
+            )
+        )
+        harness._restore_visible_active_frame = lambda *_args, **_kwargs: None
+        harness._freeze_turn_knowledge_versions = lambda *_args, **_kwargs: None
+        harness._raise_if_cancelled = lambda *_args, **_kwargs: None
+        harness._renew_session_lease = lambda: None
+        harness._session_lock = None
+        harness._session_lock_id = None
+        monkeypatch.setattr(
+            harness_v2_engine_module,
+            "acquire_harness_session",
+            lambda _session_id: object(),
+        )
+
+        def suspend_during_response_setup(*_args: object, **_kwargs: object):
+            response_setup_calls.append("called")
+            current_tenant = db.get(Tenant, tenant.id)
+            assert current_tenant is not None
+            current_tenant.status = "suspended"
+            current_tenant.lifecycle_version = 2
+            db.add(current_tenant)
+            db.commit()
+
+        harness.owner._get_active_skill = suspend_during_response_setup
+
+        with pytest.raises((TenantLifecycleDenied, HarnessExecutionFenced)) as exc_info:
+            harness.run(
+                ChatTurnRequest(
+                    tenant_id=tenant.id,
+                    session_id=session.id,
+                    user_id="user-1",
+                    agent_id="agent-1",
+                    client_turn_id="turn-final-response-fence",
+                    message="生成最终回复",
+                )
+            )
+
+        assert response_setup_calls == ["called"], (
+            type(exc_info.value).__name__,
+            str(exc_info.value),
+        )
+        assert generator_calls == []
 
 
 def _chat_session(**updates: object) -> ChatSession:

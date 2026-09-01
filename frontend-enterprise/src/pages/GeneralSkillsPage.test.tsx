@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { AppIntlProvider } from '@/i18n/provider';
 import type { AppLocale } from '@/i18n/locales';
 import type { AgentProfileRead, GeneralSkillRead } from '@/types';
+import { TooltipProvider } from '@/components/ui/tooltip';
 
 /** 隔离 legacy 页头，让矩阵只验证 AppIntlProvider 下的产品文案与 raw 边界。 */
 vi.mock('../components/AppHeader', () => ({
@@ -24,11 +25,43 @@ const toastMocks = vi.hoisted(() => ({
   warning: vi.fn(),
 }));
 
+const tenantContextMock = vi.hoisted(() => {
+  const controller = new AbortController();
+  return {
+    context: {
+      session: {
+        token: 'tenant-demo-token',
+        scope: 'tenant' as const,
+        tenant: { id: 'tenant_demo', slug: 'tenant-demo', display_name: 'Tenant Demo' },
+        user: {
+          id: 'user-1',
+          tenant_id: 'tenant_demo',
+          username: 'demo',
+          display_name: 'Demo',
+          role: 'admin' as const,
+          must_change_password: false,
+          avatar_url: null,
+        },
+      },
+      tenantId: 'tenant_demo',
+      tenantSlug: 'tenant-demo',
+      userId: 'user-1',
+      generation: 1,
+      signal: controller.signal,
+      isCurrentGeneration: (generation: number) => generation === 1,
+    },
+  };
+});
+
+vi.mock('../contexts/TenantSessionContext', () => ({
+  useTenantSession: () => tenantContextMock.context,
+}));
+
 vi.mock('@/components/ui/app-toast', () => ({
   notify: toastMocks,
 }));
 
-import GeneralSkillsPage from './GeneralSkillsPage';
+import GeneralSkillsPage, { GeneralSkillNewPage } from './GeneralSkillsPage';
 
 const overallAgent: AgentProfileRead = {
   id: 'agent-overall',
@@ -92,6 +125,16 @@ function jsonResponse(body: unknown): Response {
   } as Response;
 }
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 /** 为技能广场页提供固定的员工与技能数据。 */
 function stubGeneralSkillsFetch(): void {
   vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
@@ -142,6 +185,7 @@ function renderSemanticGeneralSkills(locale: AppLocale): void {
 beforeEach(() => {
   stubBrowserApis();
   stubGeneralSkillsFetch();
+  tenantContextMock.context.isCurrentGeneration = (generation: number) => generation === 1;
   toastMocks.error.mockReset();
   toastMocks.info.mockReset();
   toastMocks.success.mockReset();
@@ -210,4 +254,37 @@ describe('GeneralSkillsPage semantic locale matrix', () => {
       expect(toastMocks.error).not.toHaveBeenCalledWith(rawError);
     },
   );
-});
+  });
+
+  it('does not toast or clear saving state when an import rejection belongs to an old generation', async () => {
+    const user = userEvent.setup();
+    const pendingImport = deferred<Response>();
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (init?.method === 'POST' && url.includes('/api/enterprise/general-skills/import')) {
+        return pendingImport.promise;
+      }
+      if (url.includes('/api/enterprise/agents')) return jsonResponse([overallAgent]);
+      return jsonResponse([]);
+    }));
+
+    render(
+      <AppIntlProvider initialLocale="zh-CN">
+        <MemoryRouter initialEntries={['/enterprise/general-skills/new']}>
+          <TooltipProvider>
+            <GeneralSkillNewPage currentUser={{ id: 'user-1', tenant_id: 'tenant_demo', username: 'demo', role: 'admin' }} />
+          </TooltipProvider>
+        </MemoryRouter>
+      </AppIntlProvider>,
+    );
+
+    const saveButton = await screen.findByRole('button', { name: '保存' });
+    await user.click(saveButton);
+    await waitFor(() => expect((saveButton as HTMLButtonElement).disabled).toBe(true));
+
+    tenantContextMock.context.isCurrentGeneration = (_generation: number): _generation is 1 => false;
+    pendingImport.reject(new Error('stale import rejection'));
+
+    await waitFor(() => expect((saveButton as HTMLButtonElement).disabled).toBe(true));
+    expect(toastMocks.error).not.toHaveBeenCalled();
+  });

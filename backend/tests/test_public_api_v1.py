@@ -111,12 +111,24 @@ def _legacy_language_snapshot() -> dict[str, object]:
     }
 
 
-def _client(monkeypatch):
-    engine = create_engine(
-        "sqlite://",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
-    )
+def _client(monkeypatch, tmp_path=None):
+    if tmp_path is None:
+        engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+    else:
+        # execute_run deliberately uses independent Sessions for polling and the
+        # worker; a file-backed store prevents this concurrency test from making
+        # both Sessions share StaticPool's single SQLite connection.
+        engine = create_engine(
+            f"sqlite:///{tmp_path / 'public-api-run.db'}",
+            connect_args={"check_same_thread": False, "timeout": 5},
+        )
+        with engine.connect() as connection:
+            connection.exec_driver_sql("PRAGMA journal_mode=WAL")
+            connection.commit()
     SQLModel.metadata.create_all(engine)
     with Session(engine) as db:
         db.add(Tenant(id="tenant_api", name="API Tenant"))
@@ -177,6 +189,49 @@ def _tenant_key(client: TestClient, admin_token: str, scopes: list[str]) -> str:
     )
     assert credential.status_code == 201, credential.text
     return credential.json()["api_key"]
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_status", "expected_code"),
+    [
+        ("temporary", 403, "TEMPORARY_PASSWORD_CHANGE_REQUIRED"),
+        ("stale_version", 401, "INVALID_USER_TOKEN"),
+        ("suspended", 403, "TENANT_SUSPENDED"),
+    ],
+    ids=["temporary-password", "stale-auth-version", "suspended-tenant"],
+)
+def test_bootstrap_api_client_requires_current_active_tenant_admin(
+    monkeypatch,
+    mutation: str,
+    expected_status: int,
+    expected_code: str,
+) -> None:
+    client, engine, admin_token = _client(monkeypatch)
+    with Session(engine) as db:
+        admin = db.get(User, "user_api_admin")
+        tenant = db.get(Tenant, "tenant_api")
+        assert admin is not None and tenant is not None
+        if mutation == "temporary":
+            admin.must_change_password = True
+            db.add(admin)
+        elif mutation == "stale_version":
+            admin.auth_version += 1
+            db.add(admin)
+        else:
+            tenant.status = "suspended"
+            db.add(tenant)
+        db.commit()
+
+    response = client.post(
+        "/api-clients",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={"name": f"blocked-{mutation}", "scopes": ["*"]},
+    )
+
+    assert response.status_code == expected_status, response.text
+    assert response.json()["code"] == expected_code
+    with Session(engine) as db:
+        assert db.exec(select(APIClient)).all() == []
 
 
 def test_problem_details_and_openapi_contract(monkeypatch) -> None:
@@ -416,6 +471,71 @@ def test_api_key_scope_agent_boundary_and_idempotent_run(monkeypatch) -> None:
     ).status_code == 403
 
 
+def test_idempotent_run_replay_rechecks_current_tenant_lifecycle(monkeypatch, tmp_path) -> None:
+    """A replay discovered after auth must still be denied when suspension wins the race."""
+    client, _engine, admin_token = _client(monkeypatch, tmp_path)
+    tenant_key = _tenant_key(client, admin_token, ["agents:read", "runs:create", "runs:read"])
+    headers = {"Authorization": f"Bearer {tenant_key}", "Idempotency-Key": "run-replay-suspend"}
+    first = client.post(
+        "/agents/agent_api/runs",
+        headers=headers,
+        json={"input": "replay me", "session_mode": "stateless"},
+    )
+    assert first.status_code == 202, first.text
+
+    def replay_then_suspend(db, principal, request, payload):
+        """Commit the control-plane transition after replay lookup but before route return."""
+        del principal, request, payload
+        tenant = db.get(Tenant, "tenant_api")
+        assert tenant is not None
+        tenant.status = "suspended"
+        tenant.lifecycle_version = 2
+        db.add(tenant)
+        db.commit()
+        return 202, first.json()
+
+    monkeypatch.setattr(public_runs, "replay_idempotent_response", replay_then_suspend)
+    replay = client.post(
+        "/agents/agent_api/runs",
+        headers=headers,
+        json={"input": "replay me", "session_mode": "stateless"},
+    )
+
+    assert replay.status_code == 403, replay.text
+    assert replay.json()["code"] == "TENANT_SUSPENDED"
+
+
+def test_suspended_tenant_api_key_is_rejected_without_updating_last_used(monkeypatch) -> None:
+    """Reject a public credential after suspension without recording a successful use."""
+    client, engine, admin_token = _client(monkeypatch)
+    tenant_key = _tenant_key(client, admin_token, ["agents:read"])
+
+    with Session(engine) as db:
+        credential = db.exec(select(APICredential)).one()
+        credential_id = credential.id
+        before_last_used = credential.last_used_at
+        tenant = db.get(Tenant, "tenant_api")
+        assert tenant is not None
+        tenant.status = "suspended"
+        tenant.lifecycle_version = 2
+        tenant.suspension_reason = "billing review"
+        db.add(tenant)
+        db.commit()
+
+    response = client.get(
+        "/agents",
+        headers={"Authorization": f"Bearer {tenant_key}"},
+    )
+    assert response.status_code == 403, response.text
+    assert response.json()["code"] == "TENANT_SUSPENDED"
+    assert "billing review" not in response.text
+
+    with Session(engine) as db:
+        credential = db.get(APICredential, credential_id)
+        assert credential is not None
+        assert credential.last_used_at == before_last_used
+
+
 def test_streaming_run_endpoint_emits_reply_deltas(monkeypatch) -> None:
     client, engine, admin_token = _client(monkeypatch)
     tenant_key = _tenant_key(client, admin_token, ["agents:read", "runs:create", "runs:read"])
@@ -481,6 +601,58 @@ def test_streaming_run_endpoint_emits_reply_deltas(monkeypatch) -> None:
     assert "event: run.output.delta" in response.text
     assert '"content": "流式答复"' in response.text
     assert "event: run.output.completed" in response.text
+
+
+def test_public_run_stream_stops_after_tenant_suspension(monkeypatch) -> None:
+    """Close a running public stream at the next lifecycle checkpoint after suspension."""
+    client, engine, admin_token = _client(monkeypatch)
+    tenant_key = _tenant_key(client, admin_token, ["runs:create", "runs:read"])
+    created = client.post(
+        "/agents/agent_api/runs",
+        headers={
+            "Authorization": f"Bearer {tenant_key}",
+            "Idempotency-Key": "lifecycle-stream-stop",
+        },
+        json={"input": "stream must stop", "session_mode": "stateless"},
+    )
+    assert created.status_code == 202, created.text
+    run_id = created.json()["id"]
+    with Session(engine) as db:
+        job = db.get(APIJob, run_id)
+        assert job is not None
+        job.status = "running"
+        db.add(job)
+        db.commit()
+
+    monkeypatch.setattr(public_jobs, "engine", engine)
+    sleep_calls = 0
+
+    def suspend_after_first_poll(_delay: float) -> None:
+        """Suspend the tenant after the first idle poll and fail if the stream keeps polling."""
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls > 1:
+            raise AssertionError("stream continued polling after tenant suspension")
+        with Session(engine) as db:
+            tenant = db.get(Tenant, "tenant_api")
+            assert tenant is not None
+            tenant.status = "suspended"
+            tenant.lifecycle_version = 2
+            tenant.suspension_reason = "operator hold"
+            db.add(tenant)
+            db.commit()
+
+    monkeypatch.setattr(public_jobs, "sleep", suspend_after_first_poll)
+    with client.stream(
+        "GET",
+        f"/runs/{run_id}/events",
+        headers={"Authorization": f"Bearer {tenant_key}"},
+    ) as response:
+        assert response.status_code == 200
+        lines = list(response.iter_lines())
+
+    assert sleep_calls == 1
+    assert any(line.startswith("event: job.queued") for line in lines)
 
 
 def test_public_run_trace_maps_harness_actions_and_failures() -> None:
@@ -1132,8 +1304,8 @@ def test_public_employee_resource_update_rejects_shared_knowledge_base(monkeypat
         assert row.name == "Shared before patch"
 
 
-def test_run_handler_relays_live_public_trace_and_returns_citations(monkeypatch) -> None:
-    _client_value, engine, _token = _client(monkeypatch)
+def test_run_handler_relays_live_public_trace_and_returns_citations(monkeypatch, tmp_path) -> None:
+    _client_value, engine, _token = _client(monkeypatch, tmp_path)
     with Session(engine) as db:
         client = APIClient(
             id="client_run",

@@ -1,10 +1,11 @@
-import { type CSSProperties } from 'react';
+import { type CSSProperties, useMemo } from 'react';
 
-import { api, TENANT_ID } from '@/api/client';
+import { createTenantClient } from '@/api/tenant-client';
 import AppSidebar from '@/components/AppSidebar';
 import { notify } from '@/components/ui/app-toast';
 import { SidebarProvider } from '@/components/ui/sidebar';
-import { getEnterpriseAuthSession, isEnterpriseAdmin } from '@/auth';
+import { isEnterpriseAdmin } from '@/auth';
+import { useTenantSession } from '@/contexts/TenantSessionContext';
 import { useAppIntl } from '@/i18n/useAppIntl';
 import type { AgentProfileRead } from '@/types';
 
@@ -17,13 +18,16 @@ import ChatDialogs from './components/ChatDialogs';
 export default function ChatGalleryPage() {
   const chat = useChatSession();
   const { t } = useAppIntl();
-  const auth = getEnterpriseAuthSession();
+  const tenantContext = useTenantSession();
+  const tenantClient = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
+  const auth = chat.auth;
   const isAdmin = isEnterpriseAdmin(auth?.user);
 
   /** 启动员工草稿会话；服务端异常只记录诊断信息并显示稳定的本地化错误。 */
   async function startGalleryChat(agent: AgentProfileRead) {
+    if (!tenantContext) return;
     try {
-      await api.post<AgentProfileRead>(`/api/chat/agents/${agent.id}/use?tenant_id=${TENANT_ID}`, {});
+      await tenantClient.post<AgentProfileRead>(`/api/chat/agents/${agent.id}/use`, {});
       await chat.refreshAgents(agent.id);
       chat.setSessionAgentFilter(agent.id);
       chat.openDraftForAgent(agent.id);

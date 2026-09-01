@@ -61,7 +61,6 @@ export default function ChatDialogs({ chat }: { chat: UseChatSession }) {
     pendingDelete,
     setPendingDelete,
     confirmDeleteSession,
-    tenantId,
     canConfigureModels,
     modelSetupOpen,
     setModelSetupOpen,
@@ -72,7 +71,6 @@ export default function ChatDialogs({ chat }: { chat: UseChatSession }) {
     <>
       <ChatModelSetupGate
         open={modelSetupOpen}
-        tenantId={tenantId}
         canConfigure={canConfigureModels}
         onOpenChange={setModelSetupOpen}
         onConfigured={completeModelSetup}

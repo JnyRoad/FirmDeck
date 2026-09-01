@@ -1,12 +1,13 @@
 import { ApiOutlined, CheckOutlined, ExperimentOutlined, ToolOutlined } from '../icons';
 import type { ReactNode } from 'react';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { Activity, Copy, FlaskConical, RotateCcw, TerminalSquare, Users, XCircle } from 'lucide-react';
 import { pinyin } from 'pinyin-pro';
 
-import { api, TENANT_ID } from '../api/client';
+import { createTenantClient, type TenantClient } from '../api/tenant-client';
 import { isEnterpriseAdmin, type EnterpriseAuthUser } from '../auth';
+import { useTenantSession, type TenantSessionContextValue } from '../contexts/TenantSessionContext';
 import AppHeader from '@/components/AppHeader';
 import CapabilityScopeLoading from '@/components/CapabilityScopeLoading';
 import {
@@ -413,6 +414,20 @@ const LEGACY_UNBUCKETED_BUCKET_MARKER = '未分桶';
 
 type ToolsTranslate = (id: MessageId, values?: MessageValues) => string;
 
+/** 只允许请求所属租户代次仍有效时的回调更新页面或发出提示。 */
+function isCurrentTenantRequest(
+  context: TenantSessionContextValue | null,
+  generation: number,
+  controller: AbortController,
+): boolean {
+  return Boolean(
+    context
+    && !controller.signal.aborted
+    && !context.signal.aborted
+    && context.isCurrentGeneration(generation),
+  );
+}
+
 /** 将稳定后端错误投影为工具页 descriptor；未知异常只展示本地化 fallback，不透传 raw message。 */
 function toolErrorDescriptor(error: unknown, fallbackId: MessageId): MessageDescriptor {
   const descriptor = backendErrorMessageDescriptor(error);
@@ -488,8 +503,14 @@ const TRANSPORT_OPTIONS: { value: MCPTransport; labelId: MessageId; hintId: Mess
 export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {}) {
   const { locale, t } = useAppIntl();
   const toast = createToastNotifier({ t });
+  const tenantContext = useTenantSession();
+  const tenantClient = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
+  const tenantId = tenantContext?.tenantId || '';
+  const userId = tenantContext?.userId || '';
   const [rows, setRows] = useState<ToolRead[]>([]);
-  const [agentId, setAgentId] = useState(readEmployeeScope);
+  const [agentId, setAgentId] = useState(
+    () => tenantId && userId ? readEmployeeScope(tenantId, userId) : '',
+  );
   const [isOverallAgent, setIsOverallAgent] = useState(true);
   const [agentScopeLoaded, setAgentScopeLoaded] = useState(false);
   const [bucketFilter, setBucketFilter] = useState('__all__');
@@ -510,6 +531,33 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
   const [deletingServer, setDeletingServer] = useState(false);
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
+  const loadControllerRef = useRef<AbortController | null>(null);
+  const agentScopeControllerRef = useRef<AbortController | null>(null);
+  const deleteControllerRef = useRef<AbortController | null>(null);
+  const serverDeleteControllerRef = useRef<AbortController | null>(null);
+  const importAgentsControllerRef = useRef<AbortController | null>(null);
+  const importSourceControllerRef = useRef<AbortController | null>(null);
+  const importSubmitControllerRef = useRef<AbortController | null>(null);
+
+  useEffect(() => () => {
+    [
+      loadControllerRef,
+      agentScopeControllerRef,
+      deleteControllerRef,
+      serverDeleteControllerRef,
+      importAgentsControllerRef,
+      importSourceControllerRef,
+      importSubmitControllerRef,
+    ].forEach((ref) => ref.current?.abort());
+  }, [tenantContext?.tenantId, tenantContext?.generation]);
+
+  useEffect(() => {
+    setAgentId(tenantId && userId ? readEmployeeScope(tenantId, userId) : '');
+    setRows([]);
+    setAgents([]);
+    setServers([]);
+    setAgentScopeLoaded(false);
+  }, [tenantId, userId]);
 
   const pageTitle = t(isOverallAgent ? TOOLS_MESSAGE_IDS.titleMarketplace : TOOLS_MESSAGE_IDS.titleScoped);
   const listLabel = t(isOverallAgent ? TOOLS_MESSAGE_IDS.listTools : TOOLS_MESSAGE_IDS.listEmployeeTools);
@@ -521,38 +569,63 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
 
   const agentQuery = agentId ? `&agent_id=${encodeURIComponent(agentId)}` : '';
   const load = () => {
+    if (!tenantContext) return Promise.resolve();
     if (!agentScopeLoaded) {
       setRows([]);
       return Promise.resolve();
     }
+    const context = tenantContext;
+    const generation = context.generation;
+    loadControllerRef.current?.abort();
+    const controller = new AbortController();
+    loadControllerRef.current = controller;
     setLoading(true);
     return Promise.all([
-      api.get<ToolRead[]>(`/api/enterprise/tools?tenant_id=${TENANT_ID}${agentQuery}`),
-      api
-        .get<MCPServerRead[]>(`/api/enterprise/mcp-servers?tenant_id=${TENANT_ID}`)
-        .catch(() => [] as MCPServerRead[]),
+      tenantClient.get<ToolRead[]>(`/api/enterprise/tools?tenant_id=${tenantId}${agentQuery}`, {
+        signal: controller.signal,
+      }),
+      tenantClient
+        .get<MCPServerRead[]>(`/api/enterprise/mcp-servers?tenant_id=${tenantId}`, { signal: controller.signal })
+        .catch((error) => {
+          if (!isCurrentTenantRequest(context, generation, controller)) throw error;
+          return [] as MCPServerRead[];
+        }),
     ])
       .then(([toolRows, serverRows]) => {
+        if (!isCurrentTenantRequest(context, generation, controller)) return;
         setRows(toolRows);
         setServers(serverRows);
       })
       .catch((error) => {
+        if (!isCurrentTenantRequest(context, generation, controller)) return;
         console.error('[tools-page] load tools failed', error);
         toast.error(toolErrorDescriptor(error, TOOLS_MESSAGE_IDS.toastLoadToolsFailed));
       })
-      .finally(() => setLoading(false));
+      .finally(() => {
+        if (loadControllerRef.current === controller) loadControllerRef.current = null;
+        if (isCurrentTenantRequest(context, generation, controller)) setLoading(false);
+      });
   };
 
   useEffect(() => {
-    if (!agentScopeLoaded) return;
+    if (!tenantContext || !agentScopeLoaded) return;
     void load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [agentQuery, agentScopeLoaded]);
+  }, [agentQuery, agentScopeLoaded, tenantContext, tenantClient, tenantId]);
 
   useEffect(() => {
+    if (!tenantContext) return;
+    const context = tenantContext;
+    const generation = context.generation;
+    agentScopeControllerRef.current?.abort();
+    const controller = new AbortController();
+    agentScopeControllerRef.current = controller;
     const loadAgentScope = async () => {
       try {
-        const agents = await api.get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${TENANT_ID}`);
+        const agents = await tenantClient.get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${tenantId}`, {
+          signal: controller.signal,
+        });
+        if (!isCurrentTenantRequest(context, generation, controller)) return;
         setAgents(agents);
         const exactSelectedAgent = agents.find((agent) => agent.id === agentId) || null;
         const selectedAgent = exactSelectedAgent || agents.find((agent) => agent.is_overall) || null;
@@ -562,21 +635,25 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
         setIsOverallAgent(Boolean(selectedAgent?.is_overall));
         setAgentScopeLoaded(true);
       } catch {
+        if (!isCurrentTenantRequest(context, generation, controller)) return;
         setIsOverallAgent(true);
         setAgentScopeLoaded(true);
+      } finally {
+        if (agentScopeControllerRef.current === controller) agentScopeControllerRef.current = null;
       }
     };
     void loadAgentScope();
-  }, [agentId]);
+    return () => controller.abort();
+  }, [agentId, tenantContext, tenantClient, tenantId]);
 
   useEffect(() => {
     const onScopeChange = (event: Event) => {
       const next = (event as CustomEvent<{ agentId?: string }>).detail?.agentId || '';
-      setAgentId(next && !isTeamScope(next) ? next : readEmployeeScope());
+      setAgentId(next && !isTeamScope(next) ? next : readEmployeeScope(tenantId, userId));
     };
     window.addEventListener('ultrarag-enterprise-agent-scope-change', onScopeChange);
     return () => window.removeEventListener('ultrarag-enterprise-agent-scope-change', onScopeChange);
-  }, []);
+  }, [tenantId, userId]);
 
   useEffect(() => {
     if (searchParams.get('add') !== 'plaza') return;
@@ -665,10 +742,21 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
   async function confirmDelete() {
     const row = deleteTarget;
     if (!row) return;
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
+    deleteControllerRef.current?.abort();
+    const controller = new AbortController();
+    deleteControllerRef.current = controller;
     setDeleting(true);
     try {
       const agentSuffix = agentId ? `&agent_id=${encodeURIComponent(agentId)}` : '';
-      await api.delete(`/api/enterprise/tools/${row.id}?tenant_id=${TENANT_ID}${agentSuffix}`);
+      await tenantClient.delete(
+        `/api/enterprise/tools/${row.id}?tenant_id=${tenantId}${agentSuffix}`,
+        undefined,
+        { signal: controller.signal },
+      );
+      if (!isCurrentTenantRequest(context, generation, controller)) return;
       toast.success(createMessageDescriptor(
         isOverallAgent ? TOOLS_MESSAGE_IDS.toastDeleteTool : TOOLS_MESSAGE_IDS.toastRemoveTool,
       ));
@@ -679,13 +767,15 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
       setDeleteTarget(null);
       await load();
     } catch (error) {
+      if (!isCurrentTenantRequest(context, generation, controller)) return;
       console.error('[tools-page] delete tool failed', error);
       toast.error(toolErrorDescriptor(
         error,
         isOverallAgent ? TOOLS_MESSAGE_IDS.toastDeleteFailed : TOOLS_MESSAGE_IDS.toastRemoveFailed,
       ));
     } finally {
-      setDeleting(false);
+      if (deleteControllerRef.current === controller) deleteControllerRef.current = null;
+      if (isCurrentTenantRequest(context, generation, controller)) setDeleting(false);
     }
   }
 
@@ -710,11 +800,20 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
   async function confirmDeleteServer() {
     const row = serverDeleteTarget;
     if (!row || deletingServer) return;
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
+    serverDeleteControllerRef.current?.abort();
+    const controller = new AbortController();
+    serverDeleteControllerRef.current = controller;
     setDeletingServer(true);
     try {
-      await api.delete(
-        `/api/enterprise/mcp-servers/${row.id}?tenant_id=${TENANT_ID}${agentQuery}&remove_tools=true`,
+      await tenantClient.delete(
+        `/api/enterprise/mcp-servers/${row.id}?tenant_id=${tenantId}${agentQuery}&remove_tools=true`,
+        undefined,
+        { signal: controller.signal },
       );
+      if (!isCurrentTenantRequest(context, generation, controller)) return;
       toast.success(createMessageDescriptor(
         isOverallAgent ? TOOLS_MESSAGE_IDS.toastDeleteTool : TOOLS_MESSAGE_IDS.toastRemoveTool,
       ));
@@ -725,21 +824,32 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
       setServerDeleteTarget(null);
       void load();
     } catch (error) {
+      if (!isCurrentTenantRequest(context, generation, controller)) return;
       console.error('[tools-page] delete MCP server failed', error);
       toast.error(toolErrorDescriptor(
         error,
         isOverallAgent ? TOOLS_MESSAGE_IDS.toastDeleteFailed : TOOLS_MESSAGE_IDS.toastRemoveFailed,
       ));
     } finally {
-      setDeletingServer(false);
+      if (serverDeleteControllerRef.current === controller) serverDeleteControllerRef.current = null;
+      if (isCurrentTenantRequest(context, generation, controller)) setDeletingServer(false);
     }
   }
 
   async function openImportTools(mode: 'plaza' | 'employee' = 'plaza', selectedResourceId?: string) {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
+    importAgentsControllerRef.current?.abort();
+    const controller = new AbortController();
+    importAgentsControllerRef.current = controller;
     try {
       const agentRows = agents.length
         ? agents
-        : await api.get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${TENANT_ID}`);
+        : await tenantClient.get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${tenantId}`, {
+          signal: controller.signal,
+        });
+      if (!isCurrentTenantRequest(context, generation, controller)) return;
       setAgents(agentRows);
       setImportMode(mode);
       const targetCandidates = importTargetCandidates(agentRows);
@@ -748,6 +858,7 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
         || targetCandidates[0]?.id
         || '';
       if (!nextTargetAgentId) {
+        if (!isCurrentTenantRequest(context, generation, controller)) return;
         toast.warning(createMessageDescriptor(TOOLS_MESSAGE_IDS.toastNoTargetAgent));
         return;
       }
@@ -760,6 +871,7 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
       setImportOpen(true);
       if (firstSource) {
         const sourceRows = await loadImportSourceTools(firstSource);
+        if (!isCurrentTenantRequest(context, generation, controller)) return;
         if (selectedResourceId && sourceRows.some((item) => item.id === selectedResourceId)) {
           setImportSelectedToolIds([selectedResourceId]);
         }
@@ -767,26 +879,43 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
         setImportSourceTools([]);
       }
     } catch (error) {
+      if (!isCurrentTenantRequest(context, generation, controller)) return;
       console.error('[tools-page] load agents failed', error);
       toast.error(toolErrorDescriptor(error, TOOLS_MESSAGE_IDS.toastLoadAgentsFailed));
+    } finally {
+      if (importAgentsControllerRef.current === controller) importAgentsControllerRef.current = null;
     }
   }
 
   async function loadImportSourceTools(sourceAgentId: string): Promise<ToolRead[]> {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return [];
+    importSourceControllerRef.current?.abort();
+    const controller = new AbortController();
+    importSourceControllerRef.current = controller;
     setImportSourceTools([]);
     setImportSelectedToolIds([]);
-    if (!sourceAgentId) return [];
+    if (!sourceAgentId) {
+      importSourceControllerRef.current = null;
+      return [];
+    }
     try {
-      const sourceRows = await api.get<ToolRead[]>(
-        `/api/enterprise/tools?tenant_id=${TENANT_ID}&agent_id=${encodeURIComponent(sourceAgentId)}`,
+      const sourceRows = await tenantClient.get<ToolRead[]>(
+        `/api/enterprise/tools?tenant_id=${tenantId}&agent_id=${encodeURIComponent(sourceAgentId)}`,
+        { signal: controller.signal },
       );
+      if (!isCurrentTenantRequest(context, generation, controller)) return [];
       const enabledRows = sourceRows.filter((item) => item.enabled);
       setImportSourceTools(enabledRows);
       return enabledRows;
     } catch (error) {
+      if (!isCurrentTenantRequest(context, generation, controller)) return [];
       console.error('[tools-page] load source tools failed', error);
       toast.error(toolErrorDescriptor(error, TOOLS_MESSAGE_IDS.toastLoadSourceToolsFailed));
       return [];
+    } finally {
+      if (importSourceControllerRef.current === controller) importSourceControllerRef.current = null;
     }
   }
 
@@ -808,17 +937,25 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
       toast.warning(createMessageDescriptor(TOOLS_MESSAGE_IDS.toastItemsRequired));
       return;
     }
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
+    importSubmitControllerRef.current?.abort();
+    const controller = new AbortController();
+    importSubmitControllerRef.current = controller;
     setImportLoading(true);
     try {
-      const result = await api.post<{ imported: Array<Record<string, unknown>>; missing: Array<Record<string, unknown>> }>(
+      const result = await tenantClient.post<{ imported: Array<Record<string, unknown>>; missing: Array<Record<string, unknown>> }>(
         `/api/enterprise/agents/${targetAgentId}/resources/import`,
         {
-          tenant_id: TENANT_ID,
+          tenant_id: tenantId,
           source_agent_id: importSourceAgentId,
           resource_type: 'tool',
           resource_ids: importSelectedToolIds,
         },
+        { signal: controller.signal },
       );
+      if (!isCurrentTenantRequest(context, generation, controller)) return;
       const importedCount = result.imported?.length || 0;
       const missingCount = result.missing?.length || 0;
       toast.success(createMessageDescriptor(TOOLS_MESSAGE_IDS.toastImportComplete, {
@@ -837,10 +974,12 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
         await load();
       }
     } catch (error) {
+      if (!isCurrentTenantRequest(context, generation, controller)) return;
       console.error('[tools-page] import tools failed', error);
       toast.error(toolErrorDescriptor(error, TOOLS_MESSAGE_IDS.toastImportFailed));
     } finally {
-      setImportLoading(false);
+      if (importSubmitControllerRef.current === controller) importSubmitControllerRef.current = null;
+      if (isCurrentTenantRequest(context, generation, controller)) setImportLoading(false);
     }
   }
 
@@ -1523,6 +1662,10 @@ function ToolTypeSwitcher({ active, onProtocolChange }: { active: 'http' | 'a2a'
 function ToolEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'edit' } & ToolPageProps) {
   const { t } = useAppIntl();
   const toast = createToastNotifier({ t });
+  const tenantContext = useTenantSession();
+  const tenantClient = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
+  const tenantId = tenantContext?.tenantId || '';
+  const userId = tenantContext?.userId || '';
   const [values, setValues] = useState<ToolFormValues>({ ...TOOL_FORM_INITIAL_VALUES });
   const [tool, setTool] = useState<ToolRead | null>(null);
   const [loading, setLoading] = useState(false);
@@ -1532,13 +1675,33 @@ function ToolEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'edit' 
   const { toolId } = useParams();
   const isEdit = mode === 'edit';
   const requestedToolType = searchParams.get('type') === 'a2a' ? 'a2a' : 'http';
+  const bucketControllerRef = useRef<AbortController | null>(null);
+  const loadControllerRef = useRef<AbortController | null>(null);
+  const saveControllerRef = useRef<AbortController | null>(null);
+
+  useEffect(() => () => {
+    [bucketControllerRef, loadControllerRef, saveControllerRef].forEach((ref) => ref.current?.abort());
+  }, [tenantContext?.tenantId, tenantContext?.generation]);
 
   const setField = <K extends keyof ToolFormValues>(name: K, value: ToolFormValues[K]) =>
     setValues((prev) => ({ ...prev, [name]: value }));
 
   useEffect(() => {
-    void loadBucketValues().then(setBucketValues);
-  }, []);
+    if (!tenantContext) return;
+    const context = tenantContext;
+    const generation = context.generation;
+    bucketControllerRef.current?.abort();
+    const controller = new AbortController();
+    bucketControllerRef.current = controller;
+    void loadBucketValues(tenantClient, tenantId, userId, { signal: controller.signal })
+      .then((values) => {
+        if (isCurrentTenantRequest(context, generation, controller)) setBucketValues(values);
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        if (bucketControllerRef.current === controller) bucketControllerRef.current = null;
+      });
+  }, [tenantClient, tenantContext, tenantId, userId]);
 
   useEffect(() => {
     if (!isEdit) {
@@ -1546,21 +1709,33 @@ function ToolEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'edit' 
       setTool(null);
       return;
     }
-    if (!toolId) return;
+    if (!tenantContext || !toolId) return;
+    const context = tenantContext;
+    const generation = context.generation;
+    loadControllerRef.current?.abort();
+    const controller = new AbortController();
+    loadControllerRef.current = controller;
     setLoading(true);
-    const agentQuery = currentAgentQuery();
-    api
-      .get<ToolRead>(`/api/enterprise/tools/${toolId}?tenant_id=${TENANT_ID}${agentQuery}`)
+    const agentQuery = currentAgentQuery(tenantId, userId);
+    tenantClient
+      .get<ToolRead>(`/api/enterprise/tools/${toolId}?tenant_id=${tenantId}${agentQuery}`, {
+        signal: controller.signal,
+      })
       .then((row) => {
+        if (!isCurrentTenantRequest(context, generation, controller)) return;
         setTool(row);
         setValues(toolToFormValues(row));
       })
       .catch((error) => {
+        if (!isCurrentTenantRequest(context, generation, controller)) return;
         console.error('[tools-page] load tool failed', error);
         toast.error(toolErrorDescriptor(error, TOOLS_MESSAGE_IDS.toastLoadToolsFailed));
       })
-      .finally(() => setLoading(false));
-  }, [isEdit, requestedToolType, toolId]);
+      .finally(() => {
+        if (loadControllerRef.current === controller) loadControllerRef.current = null;
+        if (isCurrentTenantRequest(context, generation, controller)) setLoading(false);
+      });
+  }, [isEdit, requestedToolType, tenantClient, tenantContext, tenantId, toolId, userId]);
 
   async function save() {
     if (!String(values.name || '').trim()) {
@@ -1576,16 +1751,23 @@ function ToolEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'edit' 
       toast.error(createMessageDescriptor(TOOLS_MESSAGE_IDS.toastJsonConfigInvalid));
       return;
     }
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
+    saveControllerRef.current?.abort();
+    const controller = new AbortController();
+    saveControllerRef.current = controller;
     setLoading(true);
     try {
-      const agentQuery = currentAgentQuery();
+      const agentQuery = currentAgentQuery(tenantId, userId);
       const saved = isEdit && toolId
-        ? await api.put<ToolRead>(`/api/enterprise/tools/${toolId}${agentQuery ? `?${agentQuery.slice(1)}` : ''}`, payload)
-        : await api.post<ToolRead>(`/api/enterprise/tools${agentQuery ? `?${agentQuery.slice(1)}` : ''}`, payload);
+        ? await tenantClient.put<ToolRead>(`/api/enterprise/tools/${toolId}${agentQuery ? `?${agentQuery.slice(1)}` : ''}`, payload, { signal: controller.signal })
+        : await tenantClient.post<ToolRead>(`/api/enterprise/tools${agentQuery ? `?${agentQuery.slice(1)}` : ''}`, payload, { signal: controller.signal });
+      if (!isCurrentTenantRequest(context, generation, controller)) return;
       toast.success(createMessageDescriptor(TOOLS_MESSAGE_IDS.toastSaved));
       announceEnterpriseCapabilityCatalogChange({
         resourceType: 'tool',
-        agentId: readEmployeeScope() || undefined,
+        agentId: readEmployeeScope(tenantId, userId) || undefined,
       });
       setTool(saved);
       setValues(toolToFormValues(saved));
@@ -1593,10 +1775,12 @@ function ToolEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'edit' 
         navigate(`/enterprise/tools/${saved.id}/edit`, { replace: true });
       }
     } catch (error) {
+      if (!isCurrentTenantRequest(context, generation, controller)) return;
       console.error('[tools-page] save tool failed', error);
       toast.error(toolErrorDescriptor(error, TOOLS_MESSAGE_IDS.toastSaveFailed));
     } finally {
-      setLoading(false);
+      if (saveControllerRef.current === controller) saveControllerRef.current = null;
+      if (isCurrentTenantRequest(context, generation, controller)) setLoading(false);
     }
   }
 
@@ -1718,24 +1902,45 @@ function Field({
 export function ToolTestPage({ currentUser, onLogout }: ToolPageProps = {}) {
   const { locale, t } = useAppIntl();
   const toast = createToastNotifier({ t });
+  const tenantContext = useTenantSession();
+  const tenantClient = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
+  const tenantId = tenantContext?.tenantId || '';
+  const userId = tenantContext?.userId || '';
   const [tool, setTool] = useState<ToolRead | null>(null);
   const [loading, setLoading] = useState(false);
   const navigate = useNavigate();
   const { toolId } = useParams();
+  const loadControllerRef = useRef<AbortController | null>(null);
+
+  useEffect(() => () => loadControllerRef.current?.abort(), [tenantContext?.tenantId, tenantContext?.generation]);
 
   useEffect(() => {
-    if (!toolId) return;
+    if (!tenantContext || !toolId) return;
+    const context = tenantContext;
+    const generation = context.generation;
+    loadControllerRef.current?.abort();
+    const controller = new AbortController();
+    loadControllerRef.current = controller;
     setLoading(true);
-    const agentQuery = currentAgentQuery();
-    api
-      .get<ToolRead>(`/api/enterprise/tools/${toolId}?tenant_id=${TENANT_ID}${agentQuery}`)
-      .then(setTool)
+    const agentQuery = currentAgentQuery(tenantId, userId);
+    tenantClient
+      .get<ToolRead>(`/api/enterprise/tools/${toolId}?tenant_id=${tenantId}${agentQuery}`, {
+        signal: controller.signal,
+      })
+      .then((row) => {
+        if (isCurrentTenantRequest(context, generation, controller)) setTool(row);
+      })
       .catch((error) => {
+        if (!isCurrentTenantRequest(context, generation, controller)) return;
         console.error('[tools-page] load tool test target failed', error);
         toast.error(toolErrorDescriptor(error, TOOLS_MESSAGE_IDS.toastLoadToolsFailed));
       })
-      .finally(() => setLoading(false));
-  }, [toolId]);
+      .finally(() => {
+        if (loadControllerRef.current === controller) loadControllerRef.current = null;
+        if (isCurrentTenantRequest(context, generation, controller)) setLoading(false);
+      });
+    return () => controller.abort();
+  }, [tenantClient, tenantContext, tenantId, toolId, userId]);
 
   return (
     <div className="min-h-full box-border px-[48px] pt-[32px] pb-[43px] max-[900px]:px-[16px]" aria-busy={loading}>
@@ -1844,43 +2049,81 @@ const A2A_TERMINAL_STATES = new Set(['completed', 'failed', 'canceled', 'cancell
 function A2ARunsPanel({ tool }: { tool: ToolRead }) {
   const { locale, t } = useAppIntl();
   const toast = createToastNotifier({ t });
+  const tenantContext = useTenantSession();
+  const tenantClient = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
+  const tenantId = tenantContext?.tenantId || '';
+  const userId = tenantContext?.userId || '';
   const [runs, setRuns] = useState<A2ATaskRunRead[]>([]);
   const [adapter, setAdapter] = useState<CodexA2AAdapterRead | null>(null);
   const [loading, setLoading] = useState(true);
   const [expanded, setExpanded] = useState<string | null>(null);
-  const agentQuery = currentAgentQuery();
+  const agentQuery = currentAgentQuery(tenantId, userId);
+  const loadControllerRef = useRef<AbortController | null>(null);
+  const cancelControllerRef = useRef<AbortController | null>(null);
 
   const load = async () => {
+    if (!tenantContext) return;
+    loadControllerRef.current?.abort();
+    const controller = new AbortController();
+    loadControllerRef.current = controller;
+    const generation = tenantContext.generation;
     setLoading(true);
     try {
       const [nextRuns, nextAdapter] = await Promise.all([
-        api.get<A2ATaskRunRead[]>(`/api/enterprise/tools/${tool.id}/a2a-runs?tenant_id=${TENANT_ID}${agentQuery}&limit=20`),
-        api.get<CodexA2AAdapterRead>(`/api/enterprise/tools/a2a/codex-adapter?tenant_id=${TENANT_ID}${agentQuery}`),
+        tenantClient.get<A2ATaskRunRead[]>(
+          `/api/enterprise/tools/${tool.id}/a2a-runs?tenant_id=${tenantId}${agentQuery}&limit=20`,
+          { signal: controller.signal },
+        ),
+        tenantClient.get<CodexA2AAdapterRead>(
+          `/api/enterprise/tools/a2a/codex-adapter?tenant_id=${tenantId}${agentQuery}`,
+          { signal: controller.signal },
+        ),
       ]);
+      if (!isCurrentTenantRequest(tenantContext, generation, controller)) return;
       setRuns(nextRuns);
       setAdapter(nextAdapter);
     } catch (error) {
+      if (!isCurrentTenantRequest(tenantContext, generation, controller)) return;
       console.error('[tools-page] load A2A runs failed', error);
       toast.error(toolErrorDescriptor(error, TOOLS_MESSAGE_IDS.toastLoadA2ARunsFailed));
     } finally {
-      setLoading(false);
+      if (isCurrentTenantRequest(tenantContext, generation, controller)) setLoading(false);
     }
   };
 
   useEffect(() => {
+    if (!tenantContext) return undefined;
     void load();
+    return () => {
+      loadControllerRef.current?.abort();
+      cancelControllerRef.current?.abort();
+    };
     // Tool identity is the stable boundary for this panel.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tool.id]);
+  }, [tenantContext, tenantClient, tenantId, tool.id, userId]);
 
   async function cancel(run: A2ATaskRunRead) {
+    if (!tenantContext) return;
+    const context = tenantContext;
+    const generation = context.generation;
+    cancelControllerRef.current?.abort();
+    const controller = new AbortController();
+    cancelControllerRef.current = controller;
     try {
-      await api.post(`/api/enterprise/tools/${tool.id}/a2a-runs/${run.id}:cancel?tenant_id=${TENANT_ID}${agentQuery}`, {});
+      await tenantClient.post(
+        `/api/enterprise/tools/${tool.id}/a2a-runs/${run.id}:cancel?tenant_id=${tenantId}${agentQuery}`,
+        {},
+        { signal: controller.signal },
+      );
+      if (!isCurrentTenantRequest(context, generation, controller)) return;
       toast.success(createMessageDescriptor(TOOLS_MESSAGE_IDS.toastCancelSubmitted));
       await load();
     } catch (error) {
+      if (!isCurrentTenantRequest(context, generation, controller)) return;
       console.error('[tools-page] cancel A2A run failed', error);
       toast.error(toolErrorDescriptor(error, TOOLS_MESSAGE_IDS.toastCancelFailed));
+    } finally {
+      if (cancelControllerRef.current === controller) cancelControllerRef.current = null;
     }
   }
 
@@ -1908,23 +2151,12 @@ function A2ARunsPanel({ tool }: { tool: ToolRead }) {
               {isCodexConnection ? t(TOOLS_MESSAGE_IDS.a2aCodexAdapter) : t(TOOLS_MESSAGE_IDS.a2aStandardAgent)}
             </strong>
             {isCodexConnection && (
-              <StatusBadge tone={adapter?.enabled ? 'green' : 'red'}>
-                {t(adapter?.enabled ? TOOLS_MESSAGE_IDS.statusConnected : TOOLS_MESSAGE_IDS.statusNotEnabled)}
+              <StatusBadge tone={adapter?.available ? 'green' : 'red'}>
+                {t(adapter?.available ? TOOLS_MESSAGE_IDS.statusConnected : TOOLS_MESSAGE_IDS.statusNotEnabled)}
               </StatusBadge>
             )}
           </div>
           <p className="mt-[7px] font-mono text-[11px] leading-[17px] break-all text-[#687083]"><RawIdentifier value={tool.url} /></p>
-          {isCodexConnection && adapter && (
-            <p className="mt-[4px] text-[11px] text-[#687083]">
-              {t(TOOLS_MESSAGE_IDS.a2aAdapterSummary, {
-                command: adapter.command,
-                timeoutSeconds: adapter.timeout_seconds,
-                credentialStatus: t(adapter.token_configured
-                  ? TOOLS_MESSAGE_IDS.statusCredentialConfigured
-                  : TOOLS_MESSAGE_IDS.statusCredentialMissing),
-              })}
-            </p>
-          )}
         </div>
         <div className="flex items-center gap-[8px] text-[11px] text-[#687083]"><span className="size-[7px] rounded-full bg-emerald-400" />{t(TOOLS_MESSAGE_IDS.a2aPersistenceHint)}</div>
       </div>
@@ -2047,6 +2279,10 @@ type DiscoveredRow = MCPDiscoverResponse['tools'][number] & { selected: boolean 
 function McpServerEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'edit' } & ToolPageProps) {
   const { t } = useAppIntl();
   const toast = createToastNotifier({ t });
+  const tenantContext = useTenantSession();
+  const tenantClient = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
+  const tenantId = tenantContext?.tenantId || '';
+  const userId = tenantContext?.userId || '';
   const [values, setValues] = useState<McpFormValues>({ ...MCP_FORM_INITIAL_VALUES });
   const [server, setServer] = useState<MCPServerRead | null>(null);
   const [loading, setLoading] = useState(false);
@@ -2059,6 +2295,15 @@ function McpServerEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'e
   const navigate = useNavigate();
   const { serverId } = useParams();
   const isEdit = mode === 'edit';
+  const loadControllerRef = useRef<AbortController | null>(null);
+  const saveControllerRef = useRef<AbortController | null>(null);
+  const discoverControllerRef = useRef<AbortController | null>(null);
+  const syncControllerRef = useRef<AbortController | null>(null);
+
+  useEffect(() => () => {
+    [loadControllerRef, saveControllerRef, discoverControllerRef, syncControllerRef]
+      .forEach((ref) => ref.current?.abort());
+  }, [tenantContext?.tenantId, tenantContext?.generation]);
 
   const setField = <K extends keyof McpFormValues>(name: K, value: McpFormValues[K]) =>
     setValues((prev) => ({ ...prev, [name]: value }));
@@ -2071,11 +2316,19 @@ function McpServerEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'e
       setDiscovered([]);
       return;
     }
-    if (!serverId) return;
+    if (!tenantContext || !serverId) return;
+    const context = tenantContext;
+    const generation = context.generation;
+    loadControllerRef.current?.abort();
+    const controller = new AbortController();
+    loadControllerRef.current = controller;
     setLoading(true);
-    api
-      .get<MCPServerRead>(`/api/enterprise/mcp-servers/${serverId}?tenant_id=${TENANT_ID}`)
+    tenantClient
+      .get<MCPServerRead>(`/api/enterprise/mcp-servers/${serverId}?tenant_id=${tenantId}`, {
+        signal: controller.signal,
+      })
       .then((row) => {
+        if (!isCurrentTenantRequest(context, generation, controller)) return;
         setServer(row);
         setValues(serverToFormValues(row));
         if (row.auth_mode === 'oauth_personal') {
@@ -2085,11 +2338,15 @@ function McpServerEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'e
         }
       })
       .catch((error) => {
+        if (!isCurrentTenantRequest(context, generation, controller)) return;
         console.error('[tools-page] load MCP server failed', error);
         toast.error(toolErrorDescriptor(error, TOOLS_MESSAGE_IDS.toastLoadServerFailed));
       })
-      .finally(() => setLoading(false));
-  }, [isEdit, serverId, t]);
+      .finally(() => {
+        if (loadControllerRef.current === controller) loadControllerRef.current = null;
+        if (isCurrentTenantRequest(context, generation, controller)) setLoading(false);
+      });
+  }, [isEdit, serverId, t, tenantClient, tenantContext, tenantId]);
 
   const transportOption = TRANSPORT_OPTIONS.find((item) => item.value === values.transport);
   const isRemote = values.transport === 'streamable_http' || values.transport === 'sse';
@@ -2109,8 +2366,8 @@ function McpServerEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'e
   async function loadOAuthStatus(targetServerId: string): Promise<void> {
     /** Refresh only the signed-in user's credential-free authorization projection. */
     try {
-      const status = await api.get<MCPOAuthStatusRead>(
-        `/api/enterprise/mcp-servers/${targetServerId}/oauth/status?tenant_id=${TENANT_ID}`,
+      const status = await tenantClient.get<MCPOAuthStatusRead>(
+        `/api/enterprise/mcp-servers/${targetServerId}/oauth/status?tenant_id=${tenantId}`,
       );
       setOauthStatus(status);
     } catch (error) {
@@ -2124,9 +2381,9 @@ function McpServerEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'e
     if (!server) return;
     setOauthBusy(true);
     try {
-      const started = await api.post<MCPOAuthStartResult>(
+      const started = await tenantClient.post<MCPOAuthStartResult>(
         `/api/enterprise/mcp-servers/${server.id}/oauth/start`,
-        { tenant_id: TENANT_ID },
+        { tenant_id: tenantId },
       );
       setOauthStatus({
         server_id: server.id,
@@ -2150,8 +2407,8 @@ function McpServerEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'e
     if (!server) return;
     setOauthBusy(true);
     try {
-      await api.delete(
-        `/api/enterprise/mcp-servers/${server.id}/oauth?tenant_id=${TENANT_ID}`,
+      await tenantClient.delete(
+        `/api/enterprise/mcp-servers/${server.id}/oauth?tenant_id=${tenantId}`,
       );
       await loadOAuthStatus(server.id);
       toast.success(createMessageDescriptor(TOOLS_MESSAGE_IDS.toastOAuthDisconnected));
@@ -2202,7 +2459,6 @@ function McpServerEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'e
     return {
       connection,
       payload: {
-        tenant_id: TENANT_ID,
         name: String(values.name || '').trim(),
         display_name: values.display_name,
         description: values.description,
@@ -2226,15 +2482,22 @@ function McpServerEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'e
     }
     const built = buildPayload();
     if (!built) return;
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
+    saveControllerRef.current?.abort();
+    const controller = new AbortController();
+    saveControllerRef.current = controller;
     setSaving(true);
     try {
       const saved = isEdit && serverId
-        ? await api.put<MCPServerRead>(`/api/enterprise/mcp-servers/${serverId}`, built.payload)
-        : await api.post<MCPServerRead>('/api/enterprise/mcp-servers', built.payload);
+        ? await tenantClient.put<MCPServerRead>(`/api/enterprise/mcp-servers/${serverId}`, built.payload, { signal: controller.signal })
+        : await tenantClient.post<MCPServerRead>('/api/enterprise/mcp-servers', built.payload, { signal: controller.signal });
+      if (!isCurrentTenantRequest(context, generation, controller)) return;
       toast.success(createMessageDescriptor(TOOLS_MESSAGE_IDS.toastSaved));
       announceEnterpriseCapabilityCatalogChange({
         resourceType: 'tool',
-        agentId: readEmployeeScope() || undefined,
+        agentId: readEmployeeScope(tenantId, userId) || undefined,
       });
       setServer(saved);
       setValues(serverToFormValues(saved));
@@ -2247,30 +2510,39 @@ function McpServerEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'e
         navigate(`/enterprise/tools/mcp/${saved.id}/edit`, { replace: true });
       }
     } catch (error) {
+      if (!isCurrentTenantRequest(context, generation, controller)) return;
       console.error('[tools-page] save MCP server failed', error);
       toast.error(toolErrorDescriptor(error, TOOLS_MESSAGE_IDS.toastSaveFailed));
     } finally {
-      setSaving(false);
+      if (saveControllerRef.current === controller) saveControllerRef.current = null;
+      if (isCurrentTenantRequest(context, generation, controller)) setSaving(false);
     }
   }
 
   async function discover() {
     const built = buildPayload();
     if (!built) return;
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
+    discoverControllerRef.current?.abort();
+    const controller = new AbortController();
+    discoverControllerRef.current = controller;
     setDiscovering(true);
     try {
-      const agentQuery = currentAgentQuery();
+      const agentQuery = currentAgentQuery(tenantId, userId);
       const response = server
-        ? await api.post<MCPDiscoverResponse>(`/api/enterprise/mcp-servers/${server.id}/discover${agentQuery ? `?${agentQuery.slice(1)}` : ''}`, {
-            tenant_id: TENANT_ID,
+        ? await tenantClient.post<MCPDiscoverResponse>(`/api/enterprise/mcp-servers/${server.id}/discover${agentQuery ? `?${agentQuery.slice(1)}` : ''}`, {
+            tenant_id: tenantId,
             connection: built.connection,
             apps_mode: values.apps_mode,
-          })
-        : await api.post<MCPDiscoverResponse>('/api/enterprise/mcp-servers/discover', {
-            tenant_id: TENANT_ID,
+          }, { signal: controller.signal })
+        : await tenantClient.post<MCPDiscoverResponse>('/api/enterprise/mcp-servers/discover', {
+            tenant_id: tenantId,
             connection: built.connection,
             apps_mode: values.apps_mode,
-          });
+          }, { signal: controller.signal });
+      if (!isCurrentTenantRequest(context, generation, controller)) return;
       if (!response.success) {
         toast.error(toolErrorDescriptor(response.error, TOOLS_MESSAGE_IDS.toastDiscoverFailed));
         return;
@@ -2280,10 +2552,12 @@ function McpServerEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'e
         count: response.tools.length,
       }));
     } catch (error) {
+      if (!isCurrentTenantRequest(context, generation, controller)) return;
       console.error('[tools-page] discover MCP tools failed', error);
       toast.error(toolErrorDescriptor(error, TOOLS_MESSAGE_IDS.toastDiscoverFailed));
     } finally {
-      setDiscovering(false);
+      if (discoverControllerRef.current === controller) discoverControllerRef.current = null;
+      if (isCurrentTenantRequest(context, generation, controller)) setDiscovering(false);
     }
   }
 
@@ -2297,16 +2571,24 @@ function McpServerEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'e
       toast.warning(createMessageDescriptor(TOOLS_MESSAGE_IDS.toastSelectToolToSync));
       return;
     }
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
+    syncControllerRef.current?.abort();
+    const controller = new AbortController();
+    syncControllerRef.current = controller;
     setSyncing(true);
     try {
-      const agentQuery = currentAgentQuery();
-      const response = await api.post<MCPSyncResponse>(
+      const agentQuery = currentAgentQuery(tenantId, userId);
+      const response = await tenantClient.post<MCPSyncResponse>(
         `/api/enterprise/mcp-servers/${server.id}/sync${agentQuery ? `?${agentQuery.slice(1)}` : ''}`,
         {
-          tenant_id: TENANT_ID,
+          tenant_id: tenantId,
           tool_names: discovered.length ? selectedNames : null,
         },
+        { signal: controller.signal },
       );
+      if (!isCurrentTenantRequest(context, generation, controller)) return;
       if (!response.success) {
         toast.error(toolErrorDescriptor(response.error, TOOLS_MESSAGE_IDS.toastSyncFailed));
         return;
@@ -2317,22 +2599,26 @@ function McpServerEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'e
       }));
       announceEnterpriseCapabilityCatalogChange({
         resourceType: 'tool',
-        agentId: readEmployeeScope() || undefined,
+        agentId: readEmployeeScope(tenantId, userId) || undefined,
       });
       try {
-        const refreshed = await api.get<MCPServerRead>(
-          `/api/enterprise/mcp-servers/${server.id}?tenant_id=${TENANT_ID}`,
+        const refreshed = await tenantClient.get<MCPServerRead>(
+          `/api/enterprise/mcp-servers/${server.id}?tenant_id=${tenantId}`,
+          { signal: controller.signal },
         );
-        setServer(refreshed);
+        if (isCurrentTenantRequest(context, generation, controller)) setServer(refreshed);
       } catch {
         // ignore refresh failure
       }
+      if (!isCurrentTenantRequest(context, generation, controller)) return;
       await discover();
     } catch (error) {
+      if (!isCurrentTenantRequest(context, generation, controller)) return;
       console.error('[tools-page] sync MCP tools failed', error);
       toast.error(toolErrorDescriptor(error, TOOLS_MESSAGE_IDS.toastSyncFailed));
     } finally {
-      setSyncing(false);
+      if (syncControllerRef.current === controller) syncControllerRef.current = null;
+      if (isCurrentTenantRequest(context, generation, controller)) setSyncing(false);
     }
   }
 
@@ -2958,17 +3244,39 @@ function A2AConnectionFields({
   setField: <K extends keyof ToolFormValues>(name: K, value: ToolFormValues[K]) => void;
 }) {
   const { t } = useAppIntl();
+  const tenantContext = useTenantSession();
+  const tenantClient = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
+  const tenantId = tenantContext?.tenantId || '';
+  const userId = tenantContext?.userId || '';
   const [adapter, setAdapter] = useState<CodexA2AAdapterRead | null>(null);
+  const adapterControllerRef = useRef<AbortController | null>(null);
   const config = safeJsonObject(values.mcp_config);
   const updateConfig = (patch: Record<string, unknown>) => {
     setField('mcp_config', JSON.stringify({ ...config, ...patch }, null, 2));
   };
 
   useEffect(() => {
-    api.get<CodexA2AAdapterRead>(`/api/enterprise/tools/a2a/codex-adapter?tenant_id=${TENANT_ID}${currentAgentQuery()}`)
-      .then(setAdapter)
-      .catch(() => setAdapter(null));
-  }, []);
+    if (!tenantContext) return;
+    const context = tenantContext;
+    const generation = context.generation;
+    adapterControllerRef.current?.abort();
+    const controller = new AbortController();
+    tenantClient.get<CodexA2AAdapterRead>(
+      `/api/enterprise/tools/a2a/codex-adapter?tenant_id=${tenantId}${currentAgentQuery(tenantId, userId)}`,
+      { signal: controller.signal },
+    )
+      .then((nextAdapter) => {
+        if (isCurrentTenantRequest(context, generation, controller)) setAdapter(nextAdapter);
+      })
+      .catch(() => {
+        if (isCurrentTenantRequest(context, generation, controller)) setAdapter(null);
+      })
+      .finally(() => {
+        if (adapterControllerRef.current === controller) adapterControllerRef.current = null;
+      });
+    adapterControllerRef.current = controller;
+    return () => controller.abort();
+  }, [tenantClient, tenantContext, tenantId, userId]);
 
   const useCodex = () => {
     if (!adapter) return;
@@ -2993,9 +3301,9 @@ function A2AConnectionFields({
           <p className="mt-[4px] text-[11px] leading-[17px] text-[#687083]">{t(TOOLS_MESSAGE_IDS.a2aConnectionDescription)}</p>
         </div>
         {adapter && (
-          <UIButton type="button" variant="outline" size="sm" onClick={useCodex} disabled={!adapter.enabled}>
+          <UIButton type="button" variant="outline" size="sm" onClick={useCodex} disabled={!adapter.available}>
             <TerminalSquare className="size-[14px]" />
-            {t(adapter.enabled ? TOOLS_MESSAGE_IDS.a2aCodexConnect : TOOLS_MESSAGE_IDS.a2aCodexDisabled)}
+            {t(adapter.available ? TOOLS_MESSAGE_IDS.a2aCodexConnect : TOOLS_MESSAGE_IDS.a2aCodexDisabled)}
           </UIButton>
         )}
       </div>
@@ -3040,13 +3348,22 @@ function SwitchRowCompact({ label, hint, checked, onChange }: { label: string; h
 function ToolProbeCard({ values }: { values: ToolFormValues }) {
   const { t } = useAppIntl();
   const toast = createToastNotifier({ t });
+  const tenantContext = useTenantSession();
+  const tenantClient = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
+  const tenantId = tenantContext?.tenantId || '';
   const [sampleJson, setSampleJson] = useState('{}');
   const [result, setResult] = useState('');
   const [loading, setLoading] = useState(false);
+  const probeControllerRef = useRef<AbortController | null>(null);
   const method = values.method || 'POST';
   const isGetMethod = method === 'GET';
 
+  useEffect(() => () => probeControllerRef.current?.abort(), [tenantContext?.tenantId, tenantContext?.generation]);
+
   async function probe() {
+    if (!tenantContext) return;
+    const context = tenantContext;
+    const generation = context.generation;
     if (!String(values.name || '').trim()) {
       toast.error(createMessageDescriptor(TOOLS_MESSAGE_IDS.toastToolNameRequired));
       return;
@@ -3076,10 +3393,13 @@ function ToolProbeCard({ values }: { values: ToolFormValues }) {
       toast.error(createMessageDescriptor(TOOLS_MESSAGE_IDS.toastQueryArgumentRule));
       return;
     }
+    probeControllerRef.current?.abort();
+    const controller = new AbortController();
+    probeControllerRef.current = controller;
     setLoading(true);
     try {
-      const response = await api.post('/api/enterprise/tools/probe', {
-        tenant_id: TENANT_ID,
+      const response = await tenantClient.post('/api/enterprise/tools/probe', {
+        tenant_id: tenantId,
         name: payload.name,
         display_name: payload.display_name,
         description: payload.description,
@@ -3093,13 +3413,17 @@ function ToolProbeCard({ values }: { values: ToolFormValues }) {
         input_schema: payload.input_schema,
         output_schema: payload.output_schema,
         sample_arguments: sampleArguments,
-      });
-      setResult(JSON.stringify(response, null, 2));
+      }, { signal: controller.signal });
+      if (isCurrentTenantRequest(context, generation, controller)) {
+        setResult(JSON.stringify(response, null, 2));
+      }
     } catch (error) {
+      if (!isCurrentTenantRequest(context, generation, controller)) return;
       console.error('[tools-page] probe tool failed', error);
       toast.error(toolErrorDescriptor(error, TOOLS_MESSAGE_IDS.toastProbeFailed));
     } finally {
-      setLoading(false);
+      if (probeControllerRef.current === controller) probeControllerRef.current = null;
+      if (isCurrentTenantRequest(context, generation, controller)) setLoading(false);
     }
   }
 
@@ -3141,9 +3465,16 @@ function ToolProbeCard({ values }: { values: ToolFormValues }) {
 function SavedToolTestCard({ tool, standalone = false }: { tool: ToolRead; standalone?: boolean }) {
   const { t } = useAppIntl();
   const toast = createToastNotifier({ t });
+  const tenantContext = useTenantSession();
+  const tenantClient = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
+  const tenantId = tenantContext?.tenantId || '';
+  const userId = tenantContext?.userId || '';
   const [testJson, setTestJson] = useState(() => JSON.stringify(exampleFromSchema(tool.input_schema), null, 2));
   const [testResult, setTestResult] = useState('');
   const [loading, setLoading] = useState(false);
+  const testControllerRef = useRef<AbortController | null>(null);
+
+  useEffect(() => () => testControllerRef.current?.abort(), [tenantContext?.tenantId, tenantContext?.generation]);
 
   useEffect(() => {
     setTestJson(JSON.stringify(exampleFromSchema(tool.input_schema), null, 2));
@@ -3151,6 +3482,7 @@ function SavedToolTestCard({ tool, standalone = false }: { tool: ToolRead; stand
   }, [tool.id, tool.input_schema]);
 
   async function test() {
+    if (!tenantContext) return;
     let argumentsJson: Record<string, unknown>;
     try {
       argumentsJson = parseJson(testJson, {});
@@ -3158,19 +3490,28 @@ function SavedToolTestCard({ tool, standalone = false }: { tool: ToolRead; stand
       toast.error(createMessageDescriptor(TOOLS_MESSAGE_IDS.toastInvalidProbeArguments));
       return;
     }
+    const context = tenantContext;
+    const generation = context.generation;
+    testControllerRef.current?.abort();
+    const controller = new AbortController();
+    testControllerRef.current = controller;
     setLoading(true);
     try {
-      const agentQuery = currentAgentQuery();
-      const response = await api.post(`/api/enterprise/tools/${tool.id}/test${agentQuery ? `?${agentQuery.slice(1)}` : ''}`, {
-        tenant_id: TENANT_ID,
+      const agentQuery = currentAgentQuery(tenantId, userId);
+      const response = await tenantClient.post(`/api/enterprise/tools/${tool.id}/test${agentQuery ? `?${agentQuery.slice(1)}` : ''}`, {
+        tenant_id: tenantId,
         arguments: argumentsJson,
-      });
-      setTestResult(JSON.stringify(response, null, 2));
+      }, { signal: controller.signal });
+      if (isCurrentTenantRequest(context, generation, controller)) {
+        setTestResult(JSON.stringify(response, null, 2));
+      }
     } catch (error) {
+      if (!isCurrentTenantRequest(context, generation, controller)) return;
       console.error('[tools-page] call saved tool failed', error);
       toast.error(toolErrorDescriptor(error, TOOLS_MESSAGE_IDS.toastCallFailed));
     } finally {
-      setLoading(false);
+      if (testControllerRef.current === controller) testControllerRef.current = null;
+      if (isCurrentTenantRequest(context, generation, controller)) setLoading(false);
     }
   }
 
@@ -3228,16 +3569,24 @@ function SavedToolTestCard({ tool, standalone = false }: { tool: ToolRead; stand
 }
 
 /** 加载工具分桶原始值；空分桶的显示标签由当前 locale 生成，业务值保持空字符串。 */
-async function loadBucketValues() {
-  const rows = await api.get<ToolRead[]>(`/api/enterprise/tools?tenant_id=${TENANT_ID}${currentAgentQuery()}`);
+async function loadBucketValues(
+  client: TenantClient,
+  tenantId: string,
+  userId: string,
+  options?: RequestInit,
+) {
+  const rows = await client.get<ToolRead[]>(
+    `/api/enterprise/tools?tenant_id=${tenantId}${currentAgentQuery(tenantId, userId)}`,
+    options,
+  );
   return Array.from(new Set(rows.map((row) => {
     const value = row.bucket || '';
     return value === LEGACY_UNBUCKETED_BUCKET_MARKER ? '' : value;
   })));
 }
 
-function currentAgentQuery() {
-  const agentId = readEmployeeScope();
+function currentAgentQuery(tenantId: string, userId: string): string {
+  const agentId = tenantId && userId ? readEmployeeScope(tenantId, userId) : '';
   return agentId ? `&agent_id=${encodeURIComponent(agentId)}` : '';
 }
 
@@ -3263,7 +3612,6 @@ function toolToFormValues(row: ToolRead): ToolFormValues {
 function buildToolPayload(values: ToolFormValues) {
   try {
     return {
-      tenant_id: TENANT_ID,
       name: String(values.name || '').trim(),
       display_name: values.display_name,
       description: values.description,

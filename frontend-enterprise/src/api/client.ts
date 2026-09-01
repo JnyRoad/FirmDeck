@@ -20,9 +20,8 @@ const resolveApiBase = () => {
   return '';
 };
 
-const API_BASE = resolveApiBase();
+export const API_BASE = resolveApiBase();
 
-export const TENANT_ID = import.meta.env.VITE_TENANT_ID || 'tenant_demo';
 export const SHOW_DEBUG = import.meta.env.VITE_SHOW_DEBUG === 'true';
 
 export class ApiError extends Error {
@@ -107,9 +106,41 @@ async function keepalivePost<T>(path: string, body?: unknown): Promise<T> {
   return (text ? JSON.parse(text) : {}) as T;
 }
 
+type TransportSession = {
+  token: string;
+  tenantId?: string;
+};
+
+/** Read the bearer and tenant identity from a strictly validated tenant session. */
+function transportSession(): TransportSession | null {
+  const strictSession = getEnterpriseAuthSession();
+  if (strictSession) {
+    return { token: strictSession.token, tenantId: strictSession.tenant.id };
+  }
+  return null;
+}
+
 function authHeader(): Record<string, string> {
-  const session = getEnterpriseAuthSession();
+  const session = transportSession();
   return session?.token ? { Authorization: `Bearer ${session.token}` } : {};
+}
+
+class TenantTransportError extends Error {
+  constructor(message = '租户请求上下文不可用') {
+    super(message);
+    this.name = 'TenantTransportError';
+  }
+}
+
+function assertTransportTenant(tenantId: string): TransportSession {
+  if (typeof tenantId !== 'string' || !tenantId.trim()) {
+    throw new TenantTransportError();
+  }
+  const session = transportSession();
+  if (!session?.token || !session.tenantId || session.tenantId !== tenantId) {
+    throw new TenantTransportError();
+  }
+  return session;
 }
 
 export const api = {
@@ -284,12 +315,13 @@ export async function uploadChatAttachments<T>(
   files: File[],
   signal?: AbortSignal,
 ): Promise<T> {
+  const session = assertTransportTenant(tenantId);
   const form = new FormData();
   files.forEach((file) => form.append('files', file));
   const response = await fetch(`${API_BASE}/api/chat/attachments?tenant_id=${encodeURIComponent(tenantId)}`, {
     method: 'POST',
     credentials: 'include',
-    headers: { ...authHeader() },
+    headers: { Authorization: `Bearer ${session.token}` },
     body: form,
     signal,
   });
@@ -319,11 +351,26 @@ export async function streamPost(
   onEvent: (item: StreamEvent) => void,
   signal?: AbortSignal,
 ): Promise<void> {
+  const session = transportSession();
+  const requestedTenantId = body.tenant_id;
+  if (requestedTenantId !== undefined && typeof requestedTenantId !== 'string') {
+    throw new TenantTransportError();
+  }
+  if (session?.tenantId && requestedTenantId !== undefined && requestedTenantId !== session.tenantId) {
+    throw new TenantTransportError();
+  }
+  if (!session?.token) throw new TenantTransportError();
+  const requestBody = {
+    ...body,
+    ...(session.tenantId && requestedTenantId === undefined
+      ? { tenant_id: session.tenantId }
+      : {}),
+  };
   const response = await fetch(`${API_BASE}${path}`, {
     method: 'POST',
     credentials: 'include',
-    headers: { 'Content-Type': 'application/json', ...authHeader() },
-    body: JSON.stringify(body),
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${session.token}` },
+    body: JSON.stringify(requestBody),
     signal,
   });
   if (!response.ok) {

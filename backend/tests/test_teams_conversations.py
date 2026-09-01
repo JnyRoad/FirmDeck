@@ -35,6 +35,7 @@ from app.db.models import (
     Message,
     TeamTask,
     TeamWakeEvent,
+    Tenant,
 )
 from app.session.session_schema import ChatTurnRequest, ChatTurnResponse, SessionPublic
 from app.teams import wakeup
@@ -722,9 +723,12 @@ def test_wakeup_turn_rejects_a_session_owned_by_another_team(
 # ---------- 团队会话写入权限与共享 TL 隔离 ----------
 
 
-def test_chat_turn_and_stream_reject_non_tl_team_sessions() -> None:
+def test_chat_turn_and_stream_reject_non_tl_team_sessions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """任务执行/竞标/验收会话仅可查看:人工 /turn、/stream 一律 403,TL 对话不受影响。"""
     with _test_session() as db:
+        monkeypatch.setattr(chat_api, "engine", db.get_bind())
         team = _seed_team(db)
         base = datetime(2026, 1, 1, 12, 0, 0)
         sessions = [
@@ -768,6 +772,38 @@ def test_chat_turn_and_stream_reject_non_tl_team_sessions() -> None:
                     db,
                 )
             assert exc_info.value.status_code == 403
+
+
+def test_chat_stream_initial_lifecycle_gate_uses_fresh_tenant_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cached active Tenant must not admit a stream after another session suspends it."""
+    with _test_session() as stale_db:
+        monkeypatch.setattr(chat_api, "engine", stale_db.get_bind())
+        stale_db.add(Tenant(id="tenant_demo", name="Demo"))
+        stale_db.commit()
+        stale_tenant = stale_db.get(Tenant, "tenant_demo")
+        assert stale_tenant is not None
+        assert stale_tenant.status == "active"
+
+        with Session(stale_db.get_bind()) as control_db:
+            tenant = control_db.get(Tenant, "tenant_demo")
+            assert tenant is not None
+            tenant.status = "suspended"
+            tenant.lifecycle_version += 1
+            control_db.add(tenant)
+            control_db.commit()
+
+        # The request-scoped identity map is intentionally stale here. The admission helper
+        # must create its own Session and observe the authoritative suspended state.
+        assert stale_db.get(Tenant, "tenant_demo") is stale_tenant
+        assert stale_tenant.status == "active"
+        with pytest.raises(HTTPException) as exc_info:
+            chat_api._require_chat_stream_lifecycle(
+                "tenant_demo",
+                "chat-stream:user_member",
+            )
+        assert exc_info.value.status_code == 403
 
 
 def test_tl_chat_rejects_session_from_other_team_with_shared_tl() -> None:

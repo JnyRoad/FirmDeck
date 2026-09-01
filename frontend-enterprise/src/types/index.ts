@@ -598,13 +598,10 @@ export type A2ATaskRunRead = {
 };
 
 export type CodexA2AAdapterRead = {
-  enabled: boolean;
+  available: boolean;
   endpoint_url: string;
   agent_card_url: string;
-  command: string;
-  workspace_root: string;
   timeout_seconds: number;
-  token_configured: boolean;
 };
 
 export type MCPTransport = 'stdio' | 'streamable_http' | 'sse' | 'builtin';
@@ -765,6 +762,8 @@ export type ChatSession = {
   /** 团队会话归属（后端逐步放开，可能缺省）。 */
   team_id?: string | null;
   team_name?: string | null;
+  /** 稳定的机器会话类型；旧 API 响应可能缺省。 */
+  session_kind?: string | null;
   /** 已绑定会话的 Agent 回复语言；一旦存在即优先于后续用户偏好。 */
   agent_reply_locale?: AppLocale | null;
   agent_reply_locale_source?: LanguageContextSource | null;

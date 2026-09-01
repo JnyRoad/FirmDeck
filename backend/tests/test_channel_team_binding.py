@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from typing import ClassVar
 
 import pytest
 from fastapi import FastAPI
@@ -57,7 +58,7 @@ def _p2p_message(event_id: str = "evt_1", text: str = "你好") -> dict:
 
 
 def _seed_team(db: Session, *, with_leader: bool = True) -> Team:
-    db.add(Tenant(id="tenant_demo", name="Demo"))
+    db.add(Tenant(id="tenant_demo", name="Demo", status="active", lifecycle_version=1))
     db.add(AgentProfile(id="agent_tl", tenant_id="tenant_demo", name="TL 小队长"))
     db.add(AgentProfile(id="agent_worker", tenant_id="tenant_demo", name="工人甲"))
     db.add(AgentProfile(id="agent_worker2", tenant_id="tenant_demo", name="工人乙"))
@@ -103,7 +104,7 @@ def _load_binding(engine, binding_id: str) -> ChannelBinding:
 class RecordingAgentLoop:
     """替代真实 AgentLoop：记录请求、模拟消息落库并返回固定回复。"""
 
-    calls: list = []
+    calls: ClassVar[list] = []
     reply_text = "自动回复"
 
     def __init__(self, db, *, event_sink=None):
@@ -300,8 +301,8 @@ def _auth(user: User) -> dict[str, str]:
 
 def _seed_api_users(engine) -> dict[str, User]:
     with Session(engine) as db:
-        db.add(Tenant(id="tenant_demo", name="Demo"))
-        db.add(Tenant(id="tenant_other", name="Other"))
+        db.add(Tenant(id="tenant_demo", name="Demo", status="active", lifecycle_version=1))
+        db.add(Tenant(id="tenant_other", name="Other", status="active", lifecycle_version=1))
         admin = User(
             id="user_admin", tenant_id="tenant_demo", username="admin",
             role="admin", password_hash="x",

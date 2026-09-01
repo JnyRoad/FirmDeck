@@ -7,7 +7,7 @@ import time
 from datetime import timedelta
 
 from sqlalchemy import or_, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import object_session
 from sqlmodel import Session, select
 
@@ -51,6 +51,7 @@ from app.db.models import (
     MemoryRecord,
     Message,
     Team,
+    Tenant,
     User,
     WeChatKfAccount,
     new_id,
@@ -61,6 +62,13 @@ from app.i18n.language_context import (
     resolve_compatible_language_context,
 )
 from app.observability.spans import bind_span_sink
+from app.security.tenant import (
+    TenantExecutionKind,
+    TenantLifecycleDecision,
+    TenantLifecycleDenied,
+    require_active_tenant,
+    require_matching_admission_version,
+)
 from app.session.session_schema import ChatTurnRequest
 
 logger = logging.getLogger(__name__)
@@ -84,6 +92,116 @@ _INBOUND_LEASE_SECONDS = 15 * 60
 
 def _inbound_lease_deadline():
     return utc_now() + timedelta(seconds=_INBOUND_LEASE_SECONDS)
+
+
+def admit_channel_lifecycle(
+    db: Session,
+    *,
+    tenant_id: str,
+    correlation_id: str,
+    persisted_lifecycle_version: object | None = None,
+) -> TenantLifecycleDecision:
+    """Admit one channel ingress/execution boundary and optionally verify its durable version.
+
+    ``tenant_id`` and ``correlation_id`` identify the tenant-owned work without carrying
+    payload data.  A persisted version must equal the current active version; a mismatch is
+    converted to the stable suspension terminal reason so a fast reactivation cannot replay
+    work admitted under an earlier lifecycle.
+    """
+    # A long-lived intake transaction may already have a Tenant object in its identity map;
+    # expire only that object so a concurrent suspend/reactivate commit is observed by the gate.
+    try:
+        tenant = db.get(Tenant, tenant_id)
+        if tenant is not None and tenant not in db.new and tenant not in db.dirty:
+            db.expire(tenant)
+    except SQLAlchemyError as exc:
+        # Let the central gate convert the same storage failure into its safe denial contract;
+        # log only the exception type so provider/database details never become lifecycle evidence.
+        logger.debug(
+            "租户生命周期预刷新失败 tenant=%s error_type=%s",
+            tenant_id,
+            type(exc).__name__,
+        )
+    decision = require_active_tenant(
+        db,
+        tenant_id,
+        TenantExecutionKind.CHANNEL_DELIVERY,
+        correlation_id,
+    )
+    if persisted_lifecycle_version is None:
+        return decision
+    try:
+        return require_matching_admission_version(decision, persisted_lifecycle_version)
+    except TenantLifecycleDenied as exc:
+        # A version mismatch is durable evidence that the work crossed a lifecycle transition.
+        # Use the same non-retryable terminal reason as an observed suspension, including after
+        # a suspend/reactivate cycle has already returned the tenant to active.
+        raise TenantLifecycleDenied(
+            "TENANT_SUSPENDED",
+            {
+                "tenant_id": decision.tenant_id,
+                "execution_kind": decision.execution_kind,
+                "correlation_id": decision.correlation_id,
+            },
+        ) from exc
+
+
+def channel_lifecycle_error_code(exc: BaseException) -> str:
+    """Project a channel lifecycle denial to its stable non-secret terminal reason."""
+    code = getattr(exc, "code", None)
+    if code in {"TENANT_SUSPENDED", "TENANT_NOT_FOUND", "TENANT_LIFECYCLE_CHECK_FAILED"}:
+        return str(code)
+    return "TENANT_LIFECYCLE_CHECK_FAILED"
+
+
+def finalize_channel_staging_fence(
+    db: Session,
+    binding: ChannelBinding,
+    *,
+    expected_channel: str,
+    expected_revision: int,
+    lifecycle_version: int,
+    correlation_id: str,
+) -> str | None:
+    """Recheck the mutable binding and tenant immediately before durable staging.
+
+    Provider callbacks perform an initial identity/account check and lifecycle admission
+    before doing any provider-specific initialization.  The callback must still fence the
+    final INSERT against a binding rotation/disable or a tenant suspend/reactivate that
+    happened during that work.  Return only stable, non-secret error codes so callers can
+    acknowledge a security drop without serializing the provider frame.
+    """
+    # Flush provider-specific scope initialization first, then refresh the same ORM row so
+    # a callback-local revision mutation and a concurrent committed update are both visible.
+    db.flush()
+    db.refresh(binding)
+    if (
+        binding.channel != expected_channel
+        or binding.status != "active"
+        or binding.config_revision != expected_revision
+    ):
+        return "binding_fence_mismatch"
+    try:
+        admit_channel_lifecycle(
+            db,
+            tenant_id=binding.tenant_id,
+            correlation_id=correlation_id,
+            persisted_lifecycle_version=lifecycle_version,
+        )
+    except TenantLifecycleDenied as exc:
+        return channel_lifecycle_error_code(exc)
+    # The admission callback itself is an integration boundary.  Refresh one final time so
+    # a provider/test hook that mutates the binding while admitting cannot be followed by an
+    # event INSERT from the old revision.
+    db.flush()
+    db.refresh(binding)
+    if (
+        binding.channel != expected_channel
+        or binding.status != "active"
+        or binding.config_revision != expected_revision
+    ):
+        return "binding_fence_mismatch"
+    return None
 
 
 def current_processor_run_id() -> str:
@@ -171,6 +289,19 @@ def _reset_bind_failures(
 
 def _claim_stale_event(db: Session, event_id: str) -> bool:
     """原子认领旧进程事件；当前进程持有的事件永不被墙钟接管。"""
+    event = db.get(ChannelInboundEvent, event_id)
+    if not event or event.status != "processing":
+        return False
+    try:
+        admit_channel_lifecycle(
+            db,
+            tenant_id=event.tenant_id,
+            correlation_id=event.id,
+            persisted_lifecycle_version=event.tenant_lifecycle_version,
+        )
+    except TenantLifecycleDenied as exc:
+        _mark_inbound_security_drop(db, event.id, channel_lifecycle_error_code(exc))
+        return False
     run_id = current_processor_run_id()
     result = db.exec(
         update(ChannelInboundEvent)
@@ -201,6 +332,23 @@ def claim_staged_inbound(event_id: str, *, db_engine=None) -> bool:
     """Atomically claim one durable received event for this processor generation."""
     use_engine = db_engine or engine
     with Session(use_engine) as db:
+        event = db.get(ChannelInboundEvent, event_id)
+        if (
+            not event
+            or event.status != "received"
+            or event.channel not in _DURABLE_INBOX_CHANNELS
+        ):
+            return False
+        try:
+            admit_channel_lifecycle(
+                db,
+                tenant_id=event.tenant_id,
+                correlation_id=event.id,
+                persisted_lifecycle_version=event.tenant_lifecycle_version,
+            )
+        except TenantLifecycleDenied as exc:
+            _mark_inbound_security_drop(db, event.id, channel_lifecycle_error_code(exc))
+            return False
         result = db.exec(
             update(ChannelInboundEvent)
             .where(
@@ -226,8 +374,24 @@ def _finish_owned_inbound(
     status: str,
     error: str | None = None,
     processed: bool = False,
+    allow_unclaimed: bool = False,
 ) -> bool:
-    """Finish/release an inbound event only while this process still owns its lease."""
+    """Finish/release an inbound event only while its owner and lifecycle generation match.
+
+    A worker may finish a denial after a tenant transition, but ordinary success/failure or
+    retryable release must never publish a result from the old generation.  When such a stale
+    completion is detected while this process still owns the row, terminalize it as a safe
+    security drop so recovery cannot replay it after a fast reactivation.
+
+    ``allow_unclaimed`` is reserved for the handoff reply staging helper, which is also used
+    as a small direct adapter seam in tests before the generic intake claimant has run.  It
+    still accepts only an ownerless row and retains the same lifecycle-generation predicate;
+    a row owned by another processor run is never writable through this escape hatch.
+    """
+    event = db.get(ChannelInboundEvent, event_id)
+    if not event or event.status != "processing":
+        return False
+    run_id = current_processor_run_id()
     values = {
         "status": status,
         "error": error,
@@ -235,16 +399,113 @@ def _finish_owned_inbound(
         "processor_lease_expires_at": None,
         "updated_at": utc_now(),
     }
+    if status == "security_drop":
+        # Once an event is terminally denied, its provider envelope and reply token are no
+        # longer needed for recovery.  Replace both JSON blobs with bounded audit identity.
+        values["payload_json"] = {
+            "channel": event.channel,
+            "event_id": event.event_id,
+        }
+        values["target_json"] = {"channel": event.channel}
     if processed:
         values["processed_at"] = utc_now()
+    finish = update(ChannelInboundEvent).where(
+        ChannelInboundEvent.id == event_id,
+        ChannelInboundEvent.status == "processing",
+    )
+    if allow_unclaimed:
+        finish = finish.where(
+            or_(
+                ChannelInboundEvent.processor_run_id == run_id,
+                ChannelInboundEvent.processor_run_id.is_(None),
+            )
+        )
+    else:
+        finish = finish.where(ChannelInboundEvent.processor_run_id == run_id)
+    if status != "security_drop":
+        # Keep this predicate in the UPDATE itself: a suspend committed after the caller's
+        # last read still wins over a stale success/retry write.
+        active_same_generation = select(Tenant.id).where(
+            Tenant.id == event.tenant_id,
+            Tenant.status == "active",
+            Tenant.lifecycle_version == event.tenant_lifecycle_version,
+        )
+        finish = finish.where(active_same_generation.exists())
+    result = db.exec(finish.values(**values).execution_options(synchronize_session=False))
+    db.commit()
+    if result.rowcount == 1:
+        return True
+
+    # If the owner is still present but lifecycle changed, convert the stale row to a
+    # terminal denial.  A concurrent owner/status change naturally makes this UPDATE a no-op.
+    if status == "security_drop":
+        return False
+    try:
+        admit_channel_lifecycle(
+            db,
+            tenant_id=event.tenant_id,
+            correlation_id=event.id,
+            persisted_lifecycle_version=event.tenant_lifecycle_version,
+        )
+    except TenantLifecycleDenied as exc:
+        db.exec(
+            update(ChannelInboundEvent)
+            .where(
+                ChannelInboundEvent.id == event_id,
+                ChannelInboundEvent.status == "processing",
+                (
+                    or_(
+                        ChannelInboundEvent.processor_run_id == run_id,
+                        ChannelInboundEvent.processor_run_id.is_(None),
+                    )
+                    if allow_unclaimed
+                    else ChannelInboundEvent.processor_run_id == run_id
+                ),
+            )
+            .values(
+                status="security_drop",
+                error=channel_lifecycle_error_code(exc),
+                payload_json={
+                    "channel": event.channel,
+                    "event_id": event.event_id,
+                },
+                target_json={"channel": event.channel},
+                processor_run_id=None,
+                processor_lease_expires_at=None,
+                processed_at=utc_now(),
+                updated_at=utc_now(),
+            )
+            .execution_options(synchronize_session=False)
+        )
+        db.commit()
+    return False
+
+
+def _mark_inbound_security_drop(db: Session, event_id: str, error: str) -> bool:
+    """Terminalize received or processing ingress without releasing it back to recovery."""
+    event = db.get(ChannelInboundEvent, event_id)
+    if not event or event.status not in {"received", "processing"}:
+        return False
+    now = utc_now()
     result = db.exec(
         update(ChannelInboundEvent)
         .where(
             ChannelInboundEvent.id == event_id,
-            ChannelInboundEvent.status == "processing",
-            ChannelInboundEvent.processor_run_id == current_processor_run_id(),
+            ChannelInboundEvent.status.in_({"received", "processing"}),
         )
-        .values(**values)
+        .values(
+            status="security_drop",
+            error=error,
+            payload_json={
+                "channel": event.channel,
+                "event_id": event.event_id,
+            },
+            target_json={"channel": event.channel},
+            processor_run_id=None,
+            processor_lease_expires_at=None,
+            processed_at=now,
+            updated_at=now,
+        )
         .execution_options(synchronize_session=False)
     )
     db.commit()
@@ -455,6 +716,14 @@ def _stage_error_notice(
     target = dict(chat_session.channel_target_json or {})
     if not _valid_notice_target(binding.channel, target):
         return
+    try:
+        lifecycle = admit_channel_lifecycle(
+            db,
+            tenant_id=binding.tenant_id,
+            correlation_id=f"error-notice:{binding.id}:{chat_session.id}",
+        )
+    except TenantLifecycleDenied:
+        return
     context = resolve_compatible_language_context(
         snapshot=language_context,
         legacy_ui_locale=None,
@@ -463,6 +732,7 @@ def _stage_error_notice(
     db.add(
         ChannelDelivery(
             tenant_id=binding.tenant_id,
+            tenant_lifecycle_version=lifecycle.lifecycle_version,
             binding_id=binding.id,
             session_id=chat_session.id,
             message_id=None,
@@ -492,6 +762,14 @@ def _stage_interrupted_notice(
     ).first()
     if existing:
         return
+    try:
+        lifecycle = admit_channel_lifecycle(
+            db,
+            tenant_id=binding.tenant_id,
+            correlation_id=idempotency_key,
+        )
+    except TenantLifecycleDenied:
+        return
     context = resolve_compatible_language_context(
         snapshot=language_context,
         legacy_ui_locale=None,
@@ -500,6 +778,7 @@ def _stage_interrupted_notice(
     db.add(
         ChannelDelivery(
             tenant_id=binding.tenant_id,
+            tenant_lifecycle_version=lifecycle.lifecycle_version,
             binding_id=binding.id,
             session_id=session_id,
             message_id=None,
@@ -528,6 +807,14 @@ def _stage_notice(
     """系统提示投递(指令回复/员工下线提示);session_id 用 conv: 前缀占位。"""
     if not _valid_notice_target(binding.channel, target):
         return
+    try:
+        lifecycle = admit_channel_lifecycle(
+            db,
+            tenant_id=binding.tenant_id,
+            correlation_id=idempotency_key or f"notice:{binding.id}:{external_conv_id}",
+        )
+    except TenantLifecycleDenied:
+        return
     delivery_target = dict(target)
     if final_for_event:
         delivery_target["reaction_final"] = True
@@ -542,6 +829,7 @@ def _stage_notice(
     db.add(
         ChannelDelivery(
             tenant_id=binding.tenant_id,
+            tenant_lifecycle_version=lifecycle.lifecycle_version,
             binding_id=binding.id,
             session_id=f"conv:{external_conv_id}",
             message_id=None,
@@ -638,6 +926,16 @@ def _stage_received_reaction(
     token = channel_reaction_token(binding.channel)
     if not token or not _reaction_staging_enabled(binding.channel):
         return
+    try:
+        admit_channel_lifecycle(
+            db,
+            tenant_id=event.tenant_id,
+            correlation_id=event.id,
+            persisted_lifecycle_version=event.tenant_lifecycle_version,
+        )
+    except TenantLifecycleDenied as exc:
+        _mark_inbound_security_drop(db, event.id, channel_lifecycle_error_code(exc))
+        return
     idempotency_key = f"{binding.channel}-reaction-add:{binding.id}:{event.event_id}"
     existing = db.exec(
         select(ChannelDelivery).where(ChannelDelivery.idempotency_key == idempotency_key)
@@ -647,6 +945,7 @@ def _stage_received_reaction(
     db.add(
         ChannelDelivery(
             tenant_id=binding.tenant_id,
+            tenant_lifecycle_version=event.tenant_lifecycle_version,
             binding_id=binding.id,
             session_id=f"event:{event.id}",
             message_id=None,
@@ -939,6 +1238,24 @@ def _stage_feishu_assignee_reply(
     language_context: LanguageContext | dict | None = None,
 ) -> None:
     """给处理人回一条 handoff 流程消息并结束入站事件(经 outbox 投递)。"""
+    try:
+        admit_channel_lifecycle(
+            db,
+            tenant_id=event.tenant_id,
+            correlation_id=event.id,
+            persisted_lifecycle_version=event.tenant_lifecycle_version,
+        )
+    except TenantLifecycleDenied as exc:
+        _finish_owned_inbound(
+            db,
+            event.id,
+            status="security_drop",
+            error=channel_lifecycle_error_code(exc),
+            processed=True,
+            allow_unclaimed=True,
+        )
+        return
+    lifecycle_version = event.tenant_lifecycle_version
     context = resolve_compatible_language_context(
         snapshot=language_context if language_context is not None else event.language_context_json,
         legacy_ui_locale=None,
@@ -954,6 +1271,7 @@ def _stage_feishu_assignee_reply(
         db.add(
             ChannelDelivery(
                 tenant_id=binding.tenant_id,
+                tenant_lifecycle_version=lifecycle_version,
                 binding_id=binding.id,
                 session_id=session_id,
                 message_id=None,
@@ -969,11 +1287,26 @@ def _stage_feishu_assignee_reply(
                 language_context_json=context.model_dump(mode="json"),
             )
         )
-    event.status = "done"
-    event.processed_at = utc_now()
-    event.updated_at = utc_now()
-    db.add(event)
-    db.commit()
+    _finish_owned_inbound(
+        db,
+        event.id,
+        status="done",
+        processed=True,
+        allow_unclaimed=True,
+    )
+
+
+def _pin_handoff_resume_lifecycle_version(
+    db: Session,
+    handoff: HumanHandoffRequest,
+    lifecycle_version: int,
+) -> None:
+    """Persist the exact tenant generation that admitted a channel handoff reply."""
+    payload = dict(handoff.resume_payload_json or {})
+    payload["tenant_lifecycle_version"] = lifecycle_version
+    handoff.resume_payload_json = payload
+    handoff.updated_at = utc_now()
+    db.add(handoff)
 
 
 def _try_handle_feishu_handoff_reply(
@@ -1028,6 +1361,24 @@ def _try_handle_feishu_handoff_reply(
     if event.language_context_json is None:
         event.language_context_json = handoff_context.model_dump(mode="json")
         db.add(event)
+    try:
+        admit_channel_lifecycle(
+            db,
+            tenant_id=event.tenant_id,
+            correlation_id=event.id,
+            persisted_lifecycle_version=event.tenant_lifecycle_version,
+        )
+    except TenantLifecycleDenied as exc:
+        # Handoff acknowledgement resumes the suspended turn through a separate API helper;
+        # fence it immediately before that durable mutation and keep the inbound event terminal.
+        _finish_owned_inbound(
+            db,
+            event.id,
+            status="security_drop",
+            error=channel_lifecycle_error_code(exc),
+            processed=True,
+        )
+        return True
     reply_text = (inbound.text or "").strip()
     if handoff.status != "pending":
         # 引用的是已处理/已失效的通知或确认消息:消费并提示,不进入数字员工会话。
@@ -1071,6 +1422,11 @@ def _try_handle_feishu_handoff_reply(
     answered_by = identity.staffdeck_user_id if identity else handoff.assignee_user_id
     from app.api.chat import _apply_handoff_reply
 
+    _pin_handoff_resume_lifecycle_version(
+        db,
+        handoff,
+        event.tenant_lifecycle_version,
+    )
     _apply_handoff_reply(
         db,
         handoff,
@@ -1103,6 +1459,7 @@ def _run_handoff_reply_command(
     command: ChannelCommand,
     *,
     language_context: LanguageContext | dict | None = None,
+    tenant_lifecycle_version: int | None = None,
 ) -> str:
     """处理人通过渠道发送 /回复反馈,并恢复对应人工转接请求。
 
@@ -1305,10 +1662,20 @@ def _run_handoff_reply_command(
     ack_key = f"handoff-ack:{binding.id}:{handoff.id}:{inbound.event_id}"
     if db.exec(select(ChannelDelivery).where(ChannelDelivery.idempotency_key == ack_key)).first():
         return _HANDOFF_REPLY_HANDLED
+    try:
+        lifecycle = admit_channel_lifecycle(
+            db,
+            tenant_id=binding.tenant_id,
+            correlation_id=f"handoff-command:{binding.id}:{handoff.id}",
+            persisted_lifecycle_version=tenant_lifecycle_version,
+        )
+    except TenantLifecycleDenied:
+        return render_channel_notice(ChannelNotice("system.error"), context)
 
     from app.api.chat import _apply_handoff_reply
 
     answered_by = assignee_user_id or handoff.assignee_user_id
+    _pin_handoff_resume_lifecycle_version(db, handoff, lifecycle.lifecycle_version)
     _apply_handoff_reply(
         db,
         handoff,
@@ -1328,6 +1695,7 @@ def _run_handoff_reply_command(
     db.add(
         ChannelDelivery(
             tenant_id=binding.tenant_id,
+            tenant_lifecycle_version=lifecycle.lifecycle_version,
             binding_id=binding.id,
             session_id=f"handoff:{handoff.id}",
             message_id=None,
@@ -1404,6 +1772,22 @@ def process_inbound(
             # Durable inbox targets are immutable channel-owned snapshots.
             # Rebuilding/merging them here would leak WeCom-only compatibility
             # keys into Feishu and other channel contracts.
+            try:
+                admit_channel_lifecycle(
+                    db,
+                    tenant_id=event.tenant_id,
+                    correlation_id=event.id,
+                    persisted_lifecycle_version=event.tenant_lifecycle_version,
+                )
+            except TenantLifecycleDenied as exc:
+                _finish_owned_inbound(
+                    db,
+                    event.id,
+                    status="security_drop",
+                    error=channel_lifecycle_error_code(exc),
+                    processed=True,
+                )
+                return False
             target = dict(event.target_json or {})
             language_context = resolve_compatible_language_context(
                 snapshot=event.language_context_json,
@@ -1414,9 +1798,56 @@ def process_inbound(
                 event.language_context_json = language_context.model_dump(mode="json")
                 db.add(event)
         else:
+            try:
+                lifecycle = admit_channel_lifecycle(
+                    db,
+                    tenant_id=binding.tenant_id,
+                    correlation_id=f"channel-inbound:{binding.id}:{inbound.event_id}",
+                )
+            except TenantLifecycleDenied as exc:
+                # Direct/poll-based ingress has no executable row yet.  Keep one terminal
+                # audit record for callers that bypass provider staging (notably handoff
+                # replies), while still avoiding identity/session/AgentLoop side effects.
+                tenant = db.get(Tenant, binding.tenant_id)
+                lifecycle_version = (
+                    tenant.lifecycle_version
+                    if tenant is not None and type(tenant.lifecycle_version) is int
+                    and tenant.lifecycle_version > 0
+                    else 1
+                )
+                dropped = ChannelInboundEvent(
+                    tenant_id=binding.tenant_id,
+                    tenant_lifecycle_version=lifecycle_version,
+                    binding_id=binding.id,
+                    channel=binding.channel,
+                    event_id=inbound.event_id,
+                    # A denied direct ingress still gets one audit row, but the provider
+                    # frame is intentionally not retained: raw bodies may contain secrets,
+                    # private text, and reply/context tokens.  Keep only bounded routing
+                    # identity needed to correlate the denial.
+                    payload_json={
+                        "channel": binding.channel,
+                        "event_id": inbound.event_id,
+                    },
+                    config_revision=binding.config_revision,
+                    target_json={"channel": binding.channel},
+                    status="security_drop",
+                    error=channel_lifecycle_error_code(exc),
+                    processed_at=utc_now(),
+                    language_context_json=channel_ingress_language_context(binding).model_dump(
+                        mode="json"
+                    ),
+                )
+                db.add(dropped)
+                try:
+                    db.commit()
+                except IntegrityError:
+                    db.rollback()
+                return False
             language_context = channel_ingress_language_context(binding)
             event = ChannelInboundEvent(
                 tenant_id=binding.tenant_id,
+                tenant_lifecycle_version=lifecycle.lifecycle_version,
                 binding_id=binding.id,
                 channel=binding.channel,
                 event_id=inbound.event_id,
@@ -1467,26 +1898,28 @@ def process_inbound(
                                 binding.id,
                                 inbound.event_id,
                             )
-                            stale.status = "failed"
-                            stale.error = "process_exit_incomplete_turn"
-                            stale.updated_at = utc_now()
-                            db.add(stale)
-                            _stage_interrupted_notice(
+                            if _finish_owned_inbound(
                                 db,
-                                binding,
-                                turn_message.session_id,
-                                target,
-                                inbound.event_id,
-                                stale.language_context_json,
-                            )
-                            db.commit()
+                                stale.id,
+                                status="failed",
+                                error="process_exit_incomplete_turn",
+                            ):
+                                _stage_interrupted_notice(
+                                    db,
+                                    binding,
+                                    turn_message.session_id,
+                                    target,
+                                    inbound.event_id,
+                                    stale.language_context_json,
+                                )
+                                db.commit()
                         else:
-                            stale.status = "done"
-                            stale.error = None
-                            stale.processed_at = utc_now()
-                            stale.updated_at = utc_now()
-                            db.add(stale)
-                            db.commit()
+                            _finish_owned_inbound(
+                                db,
+                                stale.id,
+                                status="done",
+                                processed=True,
+                            )
                     except Exception:
                         db.rollback()
                         _release_stale_event_claim_by_key(
@@ -1497,6 +1930,25 @@ def process_inbound(
                         raise
                 return False
 
+        # Claim 后、任何命令/绑定/手动恢复副作用前再做一次门禁；这覆盖了处理器
+        # 认领完成后才发生的 suspend，也避免 handoff 命令绕过统一生命周期检查。
+        try:
+            admit_channel_lifecycle(
+                db,
+                tenant_id=event.tenant_id,
+                correlation_id=event.id,
+                persisted_lifecycle_version=event.tenant_lifecycle_version,
+            )
+        except TenantLifecycleDenied as exc:
+            _finish_owned_inbound(
+                db,
+                event.id,
+                status="security_drop",
+                error=channel_lifecycle_error_code(exc),
+                processed=True,
+            )
+            return False
+
         # 指令拦截:早于身份解析与会话创建,指令消息不进 AgentLoop
         if command:
             if command.kind in {"bind", "unbind"}:
@@ -1505,7 +1957,12 @@ def process_inbound(
                 )
             elif command.kind == "handoff_reply":
                 reply = _run_handoff_reply_command(
-                    db, binding, inbound, command, language_context=language_context
+                    db,
+                    binding,
+                    inbound,
+                    command,
+                    language_context=language_context,
+                    tenant_lifecycle_version=event.tenant_lifecycle_version,
                 )
             elif binding.team_id:
                 # 团队绑定:消息直路由团队 TL,员工列表/切换等指令无意义
@@ -1529,11 +1986,12 @@ def process_inbound(
                     final_for_event=True,
                     language_context=language_context,
                 )
-            event.status = "done"
-            event.processed_at = utc_now()
-            event.updated_at = utc_now()
-            db.add(event)
-            db.commit()
+            _finish_owned_inbound(
+                db,
+                event.id,
+                status="done",
+                processed=True,
+            )
             return False
 
         # 阶段 4:飞书 handoff 回复分支。处理人用飞书"回复"功能引用通知消息即可
@@ -1547,6 +2005,25 @@ def process_inbound(
         ):
             if _try_handle_feishu_handoff_reply(db, binding, inbound, event, target):
                 return False
+
+        # The previous claim gate protects command/handoff handling; recheck immediately
+        # before identity/session work as that path creates the first tenant-owned turn row.
+        try:
+            admit_channel_lifecycle(
+                db,
+                tenant_id=event.tenant_id,
+                correlation_id=event.id,
+                persisted_lifecycle_version=event.tenant_lifecycle_version,
+            )
+        except TenantLifecycleDenied as exc:
+            _finish_owned_inbound(
+                db,
+                event.id,
+                status="security_drop",
+                error=channel_lifecycle_error_code(exc),
+                processed=True,
+            )
+            return False
 
         external_id, display_name = external_identity_for_message(
             binding.channel,
@@ -1572,11 +2049,12 @@ def process_inbound(
             inbound.external_conv_id,
             inbound.event_id,
         ):
-            event.status = "done"
-            event.processed_at = utc_now()
-            event.updated_at = utc_now()
-            db.add(event)
-            db.commit()
+            _finish_owned_inbound(
+                db,
+                event.id,
+                status="done",
+                processed=True,
+            )
             return False
         team: Team | None = None
         team_leader_agent_id: str | None = None
@@ -1606,12 +2084,29 @@ def process_inbound(
                     final_for_event=True,
                     language_context=language_context,
                 )
-                event.status = "done"
-                event.processed_at = utc_now()
-                event.updated_at = utc_now()
-                db.add(event)
-                db.commit()
+                _finish_owned_inbound(
+                    db,
+                    event.id,
+                    status="done",
+                    processed=True,
+                )
                 return False
+        try:
+            admit_channel_lifecycle(
+                db,
+                tenant_id=event.tenant_id,
+                correlation_id=event.id,
+                persisted_lifecycle_version=event.tenant_lifecycle_version,
+            )
+        except TenantLifecycleDenied as exc:
+            _finish_owned_inbound(
+                db,
+                event.id,
+                status="security_drop",
+                error=channel_lifecycle_error_code(exc),
+                processed=True,
+            )
+            return False
         if team is not None:
             current_agent_id = team_leader_agent_id
             pointer_reset = False
@@ -1637,6 +2132,22 @@ def process_inbound(
             )
             if route_decision and route_decision.switched:
                 current_agent_id = route_decision.agent_id
+            try:
+                admit_channel_lifecycle(
+                    db,
+                    tenant_id=event.tenant_id,
+                    correlation_id=event.id,
+                    persisted_lifecycle_version=event.tenant_lifecycle_version,
+                )
+            except TenantLifecycleDenied as exc:
+                _finish_owned_inbound(
+                    db,
+                    event.id,
+                    status="security_drop",
+                    error=channel_lifecycle_error_code(exc),
+                    processed=True,
+                )
+                return False
             chat_session = find_or_create_channel_session(
                 db, binding, user, current_agent_id, inbound.external_conv_id, inbound.text
             )
@@ -1646,12 +2157,13 @@ def process_inbound(
             chat_session.agent_reply_locale is not None
             and chat_session.agent_reply_locale != language_context.agent_reply_locale.value
         ):
-            event.status = "failed"
-            event.error = "AGENT_REPLY_LOCALE_CONFLICT"
-            event.processed_at = utc_now()
-            event.updated_at = utc_now()
-            db.add(event)
-            db.commit()
+            _finish_owned_inbound(
+                db,
+                event.id,
+                status="failed",
+                error="AGENT_REPLY_LOCALE_CONFLICT",
+                processed=True,
+            )
             return False
         if chat_session.agent_reply_locale is None:
             chat_session.agent_reply_locale = language_context.agent_reply_locale.value
@@ -1690,11 +2202,12 @@ def process_inbound(
             db, chat_session.id, inbound.event_id, binding.tenant_id
         ):
             # 崩溃恢复去重：同一 event 的用户消息已落库
-            event.status = "done"
-            event.processed_at = utc_now()
-            event.updated_at = utc_now()
-            db.add(event)
-            db.commit()
+            _finish_owned_inbound(
+                db,
+                event.id,
+                status="done",
+                processed=True,
+            )
             return False
         db.commit()
         session_id = chat_session.id
@@ -1707,6 +2220,22 @@ def process_inbound(
             event = db.get(ChannelInboundEvent, event_id)
             chat_session = db.get(ChatSession, session_id)
             if not event or not chat_session:
+                return False
+            try:
+                admit_channel_lifecycle(
+                    db,
+                    tenant_id=event.tenant_id,
+                    correlation_id=event.id,
+                    persisted_lifecycle_version=event.tenant_lifecycle_version,
+                )
+            except TenantLifecycleDenied as exc:
+                _finish_owned_inbound(
+                    db,
+                    event.id,
+                    status="security_drop",
+                    error=channel_lifecycle_error_code(exc),
+                    processed=True,
+                )
                 return False
             from app.core.agent_loop import AgentLoop
 
@@ -1845,6 +2374,23 @@ def process_inbound(
                 chat_session = db.get(ChatSession, session_id)
                 if not event or not chat_session:
                     return False
+                try:
+                    admit_channel_lifecycle(
+                        db,
+                        tenant_id=event.tenant_id,
+                        correlation_id=event.id,
+                        persisted_lifecycle_version=event.tenant_lifecycle_version,
+                    )
+                except TenantLifecycleDenied as lifecycle_exc:
+                    if _finish_owned_inbound(
+                        db,
+                        event_id,
+                        status="security_drop",
+                        error=channel_lifecycle_error_code(lifecycle_exc),
+                        processed=True,
+                    ):
+                        db.commit()
+                    return False
                 if _finish_owned_inbound(
                     db,
                     event_id,
@@ -1858,9 +2404,42 @@ def process_inbound(
                 if trace_streamer:
                     trace_streamer.finish()
             finally:
-                _send_wechat_typing(
-                    binding, inbound.from_user_id, inbound.context_token, 2, db_engine=use_engine
+                # Typing cleanup is an external provider side effect too.  A turn that
+                # crossed a tenant suspend must not send a late "stop" frame from its old
+                # lifecycle generation (the provider may interpret it as live work).
+                try:
+                    admit_channel_lifecycle(
+                        db,
+                        tenant_id=event.tenant_id,
+                        correlation_id=event.id,
+                        persisted_lifecycle_version=event.tenant_lifecycle_version,
+                    )
+                except TenantLifecycleDenied:
+                    pass
+                else:
+                    _send_wechat_typing(
+                        binding,
+                        inbound.from_user_id,
+                        inbound.context_token,
+                        2,
+                        db_engine=use_engine,
+                    )
+            try:
+                admit_channel_lifecycle(
+                    db,
+                    tenant_id=event.tenant_id,
+                    correlation_id=event.id,
+                    persisted_lifecycle_version=event.tenant_lifecycle_version,
                 )
+            except TenantLifecycleDenied as lifecycle_exc:
+                _finish_owned_inbound(
+                    db,
+                    event_id,
+                    status="security_drop",
+                    error=channel_lifecycle_error_code(lifecycle_exc),
+                    processed=True,
+                )
+                return False
             runtime_error_code = getattr(response, "runtime_error_code", None)
             response_reply = str(getattr(response, "reply", "") or "")
             if isinstance(response, dict):
@@ -1972,20 +2551,44 @@ def _process_claimed_staged_inbound(event_pk: str, *, db_engine=None) -> bool:
         binding = db.get(ChannelBinding, event.binding_id) if event else None
         if not event or not binding:
             if event:
-                event.status = "failed"
-                event.error = "binding_not_found"
-                event.updated_at = utc_now()
-                db.add(event)
-                db.commit()
+                _finish_owned_inbound(
+                    db,
+                    event.id,
+                    status="failed",
+                    error="binding_not_found",
+                )
+            return False
+        try:
+            admit_channel_lifecycle(
+                db,
+                tenant_id=event.tenant_id,
+                correlation_id=event.id,
+                persisted_lifecycle_version=event.tenant_lifecycle_version,
+            )
+        except TenantLifecycleDenied as exc:
+            # Recovery must not spend even decode/validation work on a suspended tenant;
+            # terminalize the claimed row so the received queue cannot replay it.
+            _mark_inbound_security_drop(db, event.id, channel_lifecycle_error_code(exc))
             return False
         try:
             inbound = _decode_and_validate_staged_event(event, binding)
         except ValueError as exc:
-            event.status = "failed"
-            event.error = str(exc)[:500]
-            event.updated_at = utc_now()
-            db.add(event)
-            db.commit()
+            _finish_owned_inbound(
+                db,
+                event.id,
+                status="failed",
+                error=str(exc)[:500],
+            )
+            return False
+        try:
+            admit_channel_lifecycle(
+                db,
+                tenant_id=event.tenant_id,
+                correlation_id=event.id,
+                persisted_lifecycle_version=event.tenant_lifecycle_version,
+            )
+        except TenantLifecycleDenied as exc:
+            _mark_inbound_security_drop(db, event.id, channel_lifecycle_error_code(exc))
             return False
         _stage_received_reaction(db, binding, event)
         db.commit()
@@ -2006,26 +2609,34 @@ def _process_claimed_staged_inbound(event_pk: str, *, db_engine=None) -> bool:
                     db, binding, inbound.external_conv_id, inbound.event_id
                 )
                 if not turn_message:
-                    event.status = "received"
-                    event.processor_run_id = None
-                elif _turn_reply_exists(db, binding, turn_message):
-                    event.status = "done"
-                    event.error = None
-                    event.processed_at = utc_now()
-                else:
-                    event.status = "failed"
-                    event.error = "process_exit_incomplete_turn"
-                    _stage_interrupted_notice(
+                    _finish_owned_inbound(
                         db,
-                        binding,
-                        turn_message.session_id,
-                        dict(event.target_json or {}),
-                        inbound.event_id,
-                        event.language_context_json,
+                        event.id,
+                        status="received",
                     )
-                event.updated_at = utc_now()
-                db.add(event)
-                db.commit()
+                elif _turn_reply_exists(db, binding, turn_message):
+                    _finish_owned_inbound(
+                        db,
+                        event.id,
+                        status="done",
+                        processed=True,
+                    )
+                else:
+                    if _finish_owned_inbound(
+                        db,
+                        event.id,
+                        status="failed",
+                        error="process_exit_incomplete_turn",
+                    ):
+                        _stage_interrupted_notice(
+                            db,
+                            binding,
+                            turn_message.session_id,
+                            dict(event.target_json or {}),
+                            inbound.event_id,
+                            event.language_context_json,
+                        )
+                        db.commit()
         raise
 
 
@@ -2201,6 +2812,22 @@ def _recover_stale_durable_event(event_pk: str, *, db_engine=None) -> bool:
                 event_pk,
                 status="failed",
                 error=str(exc)[:500],
+            )
+            return False
+        try:
+            admit_channel_lifecycle(
+                db,
+                tenant_id=event.tenant_id,
+                correlation_id=event.id,
+                persisted_lifecycle_version=event.tenant_lifecycle_version,
+            )
+        except TenantLifecycleDenied as exc:
+            _finish_owned_inbound(
+                db,
+                event_pk,
+                status="security_drop",
+                error=channel_lifecycle_error_code(exc),
+                processed=True,
             )
             return False
         turn_message = _find_turn_user_message_in_conv(

@@ -3,7 +3,6 @@ import { createAppTranslator, type AppTranslator, type MessageId } from '@/i18n'
 import { getClientTimeZone, parseBackendDateTime } from '@/lib/timezone';
 import type { ScheduledTaskRead, ScheduledTaskRunRead } from '../../types';
 
-export const ENTERPRISE_AGENT_STORAGE_KEY = 'ultrarag_enterprise_agent_scope';
 export const TASK_PAGE_SIZE = 10;
 
 export type ScheduledTasksIntl = Pick<AppTranslator, 'locale' | 't'>;

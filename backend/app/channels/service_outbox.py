@@ -5,6 +5,7 @@ import threading
 from datetime import datetime, timedelta
 
 from sqlalchemy import func, or_, update
+from sqlalchemy.exc import SQLAlchemyError
 from sqlmodel import Session, select
 
 from app.channels.adapters.base import channel_reaction_token
@@ -22,11 +23,19 @@ from app.db.models import (
     ChatSession,
     HumanHandoffRequest,
     Message,
+    Tenant,
     User,
     new_id,
     utc_now,
 )
 from app.i18n.language_context import LanguageContext, resolve_compatible_language_context
+from app.security.tenant import (
+    TenantExecutionKind,
+    TenantLifecycleDecision,
+    TenantLifecycleDenied,
+    require_active_tenant,
+    require_matching_admission_version,
+)
 from app.session.origin import PILOTDECK_GROUP_CHAT_CHANNEL
 
 logger = logging.getLogger(__name__)
@@ -49,6 +58,62 @@ _NON_DELIVERY_CHANNELS = {
 _INTERNAL_SLOT_KEYS = frozenset({"handoff_confirmed", "message_content", "_tool_results"})
 
 
+def _admit_channel_delivery(
+    db: Session,
+    *,
+    tenant_id: str,
+    correlation_id: str,
+    persisted_lifecycle_version: object | None = None,
+) -> TenantLifecycleDecision:
+    """Admit one channel outbox boundary and reject work from an older lifecycle generation."""
+    _refresh_tenant_before_gate(db, tenant_id)
+    decision = require_active_tenant(
+        db,
+        tenant_id,
+        TenantExecutionKind.CHANNEL_DELIVERY,
+        correlation_id,
+    )
+    if persisted_lifecycle_version is None:
+        return decision
+    try:
+        return require_matching_admission_version(decision, persisted_lifecycle_version)
+    except TenantLifecycleDenied as exc:
+        # A fast suspend/reactivate changes the version while returning to active.  Keep the
+        # old delivery terminal for the same stable reason as a directly observed suspension.
+        raise TenantLifecycleDenied(
+            "TENANT_SUSPENDED",
+            {
+                "tenant_id": decision.tenant_id,
+                "execution_kind": decision.execution_kind,
+                "correlation_id": decision.correlation_id,
+            },
+        ) from exc
+
+
+def _channel_lifecycle_error_code(exc: BaseException) -> str:
+    """Project a lifecycle denial to a stable outbox error without serializing raw details."""
+    code = getattr(exc, "code", None)
+    if code in {"TENANT_SUSPENDED", "TENANT_NOT_FOUND", "TENANT_LIFECYCLE_CHECK_FAILED"}:
+        return str(code)
+    return "TENANT_LIFECYCLE_CHECK_FAILED"
+
+
+def _refresh_tenant_before_gate(db: Session, tenant_id: str) -> None:
+    """Refresh only a cached tenant row so a worker observes concurrent lifecycle commits."""
+    try:
+        tenant = db.get(Tenant, tenant_id)
+        if tenant is not None and tenant not in db.new and tenant not in db.dirty:
+            db.expire(tenant)
+    except SQLAlchemyError as exc:
+        # The central gate below owns storage-failure projection and will fail closed; keep
+        # diagnostics type-only so raw database details never enter lifecycle evidence.
+        logger.debug(
+            "租户生命周期预刷新失败 tenant=%s error_type=%s",
+            tenant_id,
+            type(exc).__name__,
+        )
+
+
 def _stage_failed_delivery(
     db: Session,
     chat_session: ChatSession,
@@ -59,6 +124,7 @@ def _stage_failed_delivery(
     error: str,
     language_context: LanguageContext,
     idempotency_key: str | None = None,
+    tenant_lifecycle_version: int | None = None,
 ) -> None:
     stable_key = idempotency_key or message.id
     existing = db.exec(
@@ -69,6 +135,7 @@ def _stage_failed_delivery(
     db.add(
         ChannelDelivery(
             tenant_id=chat_session.tenant_id,
+            tenant_lifecycle_version=tenant_lifecycle_version or 1,
             binding_id=binding_id,
             session_id=chat_session.id,
             message_id=message.id,
@@ -170,6 +237,36 @@ def stage_channel_delivery(
         channel = str(getattr(chat_session, "channel", None) or "").strip()
         if not channel or channel in _NON_DELIVERY_CHANNELS:
             return
+        lifecycle: TenantLifecycleDecision | None = None
+        # Keep the historical generic-db failure behavior for the tiny duck-typed test
+        # doubles used by callers: their first ``exec`` should still surface its original
+        # exception rather than being converted into a lifecycle denial.
+        if callable(getattr(db, "get", None)):
+            try:
+                lifecycle = _admit_channel_delivery(
+                    db,
+                    tenant_id=chat_session.tenant_id,
+                    correlation_id=f"channel-stage:{chat_session.id}:{message.id}",
+                )
+            except TenantLifecycleDenied as exc:
+                binding_id = str(getattr(chat_session, "channel_binding_id", None) or "").strip()
+                if binding_id:
+                    context = resolve_compatible_language_context(
+                        snapshot=(message.metadata_json or {}).get("language_context"),
+                        legacy_ui_locale=None,
+                        legacy_agent_reply_locale=None,
+                    )
+                    _stage_failed_delivery(
+                        db,
+                        chat_session,
+                        message,
+                        binding_id=binding_id,
+                        target=dict(chat_session.channel_target_json or {}),
+                        error=_channel_lifecycle_error_code(exc),
+                        language_context=context,
+                        tenant_lifecycle_version=1,
+                    )
+                return
         language_context = resolve_compatible_language_context(
             snapshot=(message.metadata_json or {}).get("language_context"),
             legacy_ui_locale=None,
@@ -189,6 +286,7 @@ def stage_channel_delivery(
                     target=dict(chat_session.channel_target_json or {}),
                     error="binding_missing_or_inactive",
                     language_context=language_context,
+                    tenant_lifecycle_version=lifecycle.lifecycle_version,
                 )
                 return
             if (
@@ -250,10 +348,32 @@ def stage_channel_delivery(
                 error="delivery_target_missing",
                 language_context=language_context,
                 idempotency_key=idempotency_key,
+                tenant_lifecycle_version=lifecycle.lifecycle_version,
+            )
+            return
+        try:
+            lifecycle = _admit_channel_delivery(
+                db,
+                tenant_id=chat_session.tenant_id,
+                correlation_id=f"channel-stage:{chat_session.id}:{message.id}",
+                persisted_lifecycle_version=lifecycle.lifecycle_version,
+            )
+        except TenantLifecycleDenied as exc:
+            _stage_failed_delivery(
+                db,
+                chat_session,
+                message,
+                binding_id=binding.id,
+                target=target,
+                error=_channel_lifecycle_error_code(exc),
+                language_context=language_context,
+                idempotency_key=idempotency_key,
+                tenant_lifecycle_version=1,
             )
             return None
         delivery = ChannelDelivery(
             tenant_id=chat_session.tenant_id,
+            tenant_lifecycle_version=lifecycle.lifecycle_version,
             binding_id=binding.id,
             session_id=chat_session.id,
             message_id=message.id,
@@ -305,6 +425,38 @@ def _claim_delivery(
     now,
     reaction_lane: bool,
 ) -> ChannelDelivery | None:
+    delivery = db.get(ChannelDelivery, delivery_id)
+    if delivery is None or delivery.status != "pending":
+        return None
+    # Admission is checked before changing pending work into a sendable generation.  A
+    # suspended tenant therefore leaves no pending row for a later daemon/re-activation to
+    # replay.  The atomic UPDATE below remains the owner fence for concurrent claimers.
+    try:
+        _admit_channel_delivery(
+            db,
+            tenant_id=delivery.tenant_id,
+            correlation_id=delivery.id,
+            persisted_lifecycle_version=delivery.tenant_lifecycle_version,
+        )
+    except TenantLifecycleDenied as exc:
+        result = db.exec(
+            update(ChannelDelivery)
+            .where(
+                ChannelDelivery.id == delivery.id,
+                ChannelDelivery.status == "pending",
+            )
+            .values(
+                status="failed",
+                last_error=_channel_lifecycle_error_code(exc),
+                next_attempt_at=None,
+                sending_since=None,
+                delivery_owner=None,
+                updated_at=utc_now(),
+            )
+            .execution_options(synchronize_session=False)
+        )
+        db.commit()
+        return None
     owner = new_id("delivery-owner")
     claim = (
         update(ChannelDelivery)
@@ -345,16 +497,32 @@ def _finish_delivery_claim(
     next_attempt_at=None,
     delivered_at=None,
 ) -> bool:
-    """Commit a delivery outcome only for the worker generation that owns it."""
-    result = db.exec(
-        update(ChannelDelivery)
-        .where(
-            ChannelDelivery.id == delivery.id,
-            ChannelDelivery.status == "sending",
-            ChannelDelivery.delivery_owner == delivery.delivery_owner,
-            ChannelDelivery.delivery_generation == delivery.delivery_generation,
+    """Commit a delivery outcome only for the owner and lifecycle generation that owns it.
+
+    A worker may still be returning from a provider call after a tenant suspend.  Success
+    and retryable requeue writes therefore require the exact active lifecycle version in the
+    conditional UPDATE.  If that predicate loses a lifecycle race while this worker still
+    owns the claim, terminalize the claim as an unknown remote outcome rather than leaving
+    retryable work for a later reactivation.
+    """
+    finish = update(ChannelDelivery).where(
+        ChannelDelivery.id == delivery.id,
+        ChannelDelivery.status == "sending",
+        ChannelDelivery.delivery_owner == delivery.delivery_owner,
+        ChannelDelivery.delivery_generation == delivery.delivery_generation,
+    )
+    if status in {"delivered", "pending"}:
+        # Make success and retryable requeue writes lifecycle-aware.  If suspension commits
+        # after the pre/post-call read but before this UPDATE, the tenant version/status
+        # predicate wins and a stale worker cannot publish or requeue the old result.
+        active_same_generation = select(Tenant.id).where(
+            Tenant.id == delivery.tenant_id,
+            Tenant.status == "active",
+            Tenant.lifecycle_version == delivery.tenant_lifecycle_version,
         )
-        .values(
+        finish = finish.where(active_same_generation.exists())
+    result = db.exec(
+        finish.values(
             status=status,
             last_error=last_error,
             next_attempt_at=next_attempt_at,
@@ -366,7 +534,60 @@ def _finish_delivery_claim(
         .execution_options(synchronize_session=False)
     )
     db.commit()
-    return result.rowcount == 1
+    if result.rowcount == 1:
+        return True
+    if status not in {"delivered", "pending"}:
+        return False
+
+    # Distinguish a lifecycle fence loss from an ordinary owner race.  The same owner and
+    # generation predicate below makes this fallback harmless when another worker already
+    # completed or recovered the row.
+    try:
+        _admit_channel_delivery(
+            db,
+            tenant_id=delivery.tenant_id,
+            correlation_id=delivery.id,
+            persisted_lifecycle_version=delivery.tenant_lifecycle_version,
+        )
+    except TenantLifecycleDenied:
+        db.exec(
+            update(ChannelDelivery)
+            .where(
+                ChannelDelivery.id == delivery.id,
+                ChannelDelivery.status == "sending",
+                ChannelDelivery.delivery_owner == delivery.delivery_owner,
+                ChannelDelivery.delivery_generation == delivery.delivery_generation,
+            )
+            .values(
+                status="failed",
+                last_error="remote_state_unknown",
+                next_attempt_at=None,
+                delivered_at=None,
+                sending_since=None,
+                delivery_owner=None,
+                updated_at=utc_now(),
+            )
+            .execution_options(synchronize_session=False)
+        )
+        db.commit()
+    return False
+
+
+def _delivery_lifecycle_error(
+    db: Session,
+    delivery: ChannelDelivery,
+) -> str | None:
+    """Return a stable denial code when a claimed delivery crossed a tenant transition."""
+    try:
+        _admit_channel_delivery(
+            db,
+            tenant_id=delivery.tenant_id,
+            correlation_id=delivery.id,
+            persisted_lifecycle_version=delivery.tenant_lifecycle_version,
+        )
+    except TenantLifecycleDenied as exc:
+        return _channel_lifecycle_error_code(exc)
+    return None
 
 
 def _reaction_event_for_delivery(
@@ -424,6 +645,7 @@ def _stage_reaction_removal(
     db.add(
         ChannelDelivery(
             tenant_id=delivery.tenant_id,
+            tenant_lifecycle_version=event.tenant_lifecycle_version,
             binding_id=delivery.binding_id,
             session_id=f"event:{event.id}",
             message_id=None,
@@ -495,6 +717,16 @@ def _deliver_one_locked(db: Session, delivery: ChannelDelivery) -> None:
             delivery,
             status="failed",
             last_error="渠道绑定不存在或已停用",
+        )
+        return
+    lifecycle_error = _delivery_lifecycle_error(db, delivery)
+    if lifecycle_error:
+        _finish_delivery_claim(
+            db,
+            delivery,
+            status="failed",
+            last_error=lifecycle_error,
+            next_attempt_at=None,
         )
         return
     reaction_event = None
@@ -589,6 +821,19 @@ def _deliver_one_locked(db: Session, delivery: ChannelDelivery) -> None:
                 idempotency_key=delivery.idempotency_key,
             )
     except Exception as exc:
+        # Once the adapter was entered, the provider outcome is not safely knowable.  A
+        # concurrent suspension therefore must never turn this attempt into an automatic
+        # replay, even when the adapter surfaced a retryable exception.
+        lifecycle_error = _delivery_lifecycle_error(db, delivery)
+        if lifecycle_error:
+            _finish_delivery_claim(
+                db,
+                delivery,
+                status="failed",
+                last_error="remote_state_unknown",
+                next_attempt_at=None,
+            )
+            return
         last_error = str(exc)[:500]
         retryable = bool(getattr(exc, "retryable", True))
         if not retryable or delivery.attempts >= settings.channel_delivery_max_attempts:
@@ -607,6 +852,19 @@ def _deliver_one_locked(db: Session, delivery: ChannelDelivery) -> None:
         )
         logger.warning(
             "渠道投递失败(第 %s 次) delivery=%s: %s", delivery.attempts, delivery.id, exc
+        )
+        return
+    # The send/reaction call may have overlapped a suspend.  Re-read the authoritative
+    # lifecycle and use an unknown terminal outcome rather than marking a possibly stale
+    # provider result as delivered.
+    lifecycle_error = _delivery_lifecycle_error(db, delivery)
+    if lifecycle_error:
+        _finish_delivery_claim(
+            db,
+            delivery,
+            status="failed",
+            last_error="remote_state_unknown",
+            next_attempt_at=None,
         )
         return
     # handoff_notice/handoff_ack 投递成功后,把飞书返回的 message_id 回写到 delivery;
@@ -726,6 +984,7 @@ def _reset_stuck_deliveries(db: Session, *, reaction_lane: bool = False) -> None
             row.status = "failed"
             row.last_error = "remote_state_unknown"
             row.next_attempt_at = None
+            row.sending_since = None
             row.delivery_owner = None
             row.delivery_generation += 1
             row.updated_at = now
@@ -845,6 +1104,11 @@ def notify_binding_creator(db: Session, binding: ChannelBinding, text: str) -> N
     try:
         if not binding.created_by_user_id:
             return
+        lifecycle = _admit_channel_delivery(
+            db,
+            tenant_id=binding.tenant_id,
+            correlation_id=f"binding-alert:{binding.id}",
+        )
         scope = external_account_scope(db, binding)
         identity = db.exec(
             select(ChannelIdentity).where(
@@ -883,6 +1147,7 @@ def notify_binding_creator(db: Session, binding: ChannelBinding, text: str) -> N
         db.add(
             ChannelDelivery(
                 tenant_id=binding.tenant_id,
+                tenant_lifecycle_version=lifecycle.lifecycle_version,
                 binding_id=binding.id,
                 session_id=session_id,
                 message_id=None,
@@ -1139,6 +1404,11 @@ def notify_handoff_assignee(
                 binding.channel,
             )
             return
+        lifecycle = _admit_channel_delivery(
+            db,
+            tenant_id=binding.tenant_id,
+            correlation_id=f"handoff-notice:{binding.id}:{handoff.id}",
+        )
         language_context = resolve_compatible_language_context(
             snapshot=handoff.language_context_json,
             legacy_ui_locale=None,
@@ -1226,6 +1496,7 @@ def notify_handoff_assignee(
         db.add(
             ChannelDelivery(
                 tenant_id=binding.tenant_id,
+                tenant_lifecycle_version=lifecycle.lifecycle_version,
                 binding_id=binding.id,
                 session_id=f"handoff:{handoff.id}",
                 message_id=None,

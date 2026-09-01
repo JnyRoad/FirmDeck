@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { api } from '@/api/client';
+import type { TenantClient } from '@/api/tenant-client';
 import {
   CHANNEL_PRESETS,
   buildModelConfigPayload,
@@ -8,12 +8,8 @@ import {
   type ChannelPreset,
 } from './channelPresets';
 
-vi.mock('@/api/client', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('@/api/client')>();
-  return { ...actual, api: { ...actual.api, post: vi.fn() } };
-});
-
-const mockedPost = vi.mocked(api.post);
+const mockedPost = vi.fn();
+const tenantClient = { post: mockedPost } as unknown as TenantClient;
 
 afterEach(() => {
   mockedPost.mockReset();
@@ -127,19 +123,18 @@ describe('buildModelConfigPayload', () => {
 });
 
 describe('fetchProviderModels', () => {
-  it('uses the caller tenant for both the list-models query and request body', async () => {
+  it('uses the verified tenant client without accepting a caller-selected tenant', async () => {
     mockedPost.mockResolvedValueOnce({ success: true, models: [] });
 
-    await fetchProviderModels({
-      tenantId: 'tenant-isolated',
+    await fetchProviderModels(tenantClient, {
       apiProtocol: 'openai_chat_completions',
       baseUrl: 'https://api.openai.com/v1',
       apiKey: 'sk-test',
     });
 
     const [url, body] = mockedPost.mock.calls[0] as [string, Record<string, unknown>];
-    expect(url).toContain('tenant_id=tenant-isolated');
-    expect(body.tenant_id).toBe('tenant-isolated');
+    expect(url).toBe('/api/enterprise/model-configs/list-models');
+    expect(body).not.toHaveProperty('tenant_id');
   });
 
   it('posts protocol/base_url/api_key and returns the normalized result on success', async () => {
@@ -148,8 +143,7 @@ describe('fetchProviderModels', () => {
       models: [{ id: 'gpt-4o', label: 'gpt-4o' }],
     });
 
-    const result = await fetchProviderModels({
-      tenantId: 'tenant_demo',
+    const result = await fetchProviderModels(tenantClient, {
       apiProtocol: 'openai_chat_completions',
       baseUrl: 'https://api.openai.com/v1',
       apiKey: 'sk-test',
@@ -170,7 +164,7 @@ describe('fetchProviderModels', () => {
       models: [{ id: 'gpt-5.6-terra', label: 'GPT-5.6-Terra' }],
     });
 
-    const result = await fetchProviderModels({ tenantId: 'tenant_demo', apiProtocol: 'codex_app_server' });
+    const result = await fetchProviderModels(tenantClient, { apiProtocol: 'codex_app_server' });
 
     const [, body] = mockedPost.mock.calls[0] as [string, Record<string, unknown>];
     expect(body.api_protocol).toBe('codex_app_server');
@@ -182,8 +176,7 @@ describe('fetchProviderModels', () => {
   it('degrades to an empty, unsuccessful result instead of throwing when the request fails', async () => {
     mockedPost.mockRejectedValueOnce(new Error('network down'));
 
-    const result = await fetchProviderModels({
-      tenantId: 'tenant_demo',
+    const result = await fetchProviderModels(tenantClient, {
       apiProtocol: 'openai_chat_completions',
       baseUrl: 'https://api.openai.com/v1',
       apiKey: 'sk-test',

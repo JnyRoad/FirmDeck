@@ -1,9 +1,12 @@
 // @vitest-environment jsdom
 
+import fs from 'node:fs';
+import path from 'node:path';
+
 import type { ComponentProps, ReactElement, ReactNode } from 'react';
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
+import { MemoryRouter, Route, Routes, useLocation, useNavigate } from 'react-router-dom';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { AppIntlProvider, createAppTranslator, I18nProvider, type AppLocale } from '@/i18n';
@@ -16,6 +19,38 @@ import type {
   TeamTaskBidRead,
   TeamTaskRead,
 } from '@/types';
+
+const tenantContextMock = vi.hoisted(() => {
+  const controller = new AbortController();
+  return {
+    context: {
+      session: {
+        token: 'tenant-demo-token',
+        scope: 'tenant' as const,
+        tenant: { id: 'tenant_demo', slug: 'tenant-demo', display_name: 'Tenant Demo' },
+        user: {
+          id: 'user-1',
+          tenant_id: 'tenant_demo',
+          username: 'demo',
+          display_name: 'Demo',
+          role: 'admin' as const,
+          must_change_password: false,
+          avatar_url: null,
+        },
+      },
+      tenantId: 'tenant_demo',
+      tenantSlug: 'tenant-demo',
+      userId: 'user-1',
+      generation: 1,
+      signal: controller.signal,
+      isCurrentGeneration: (generation: number) => generation === 1,
+    },
+  };
+});
+
+vi.mock('../contexts/TenantSessionContext', () => ({
+  useTenantSession: () => tenantContextMock.context,
+}));
 
 import TeamDetailPage, { teamEventLabel } from './TeamDetailPage';
 
@@ -388,6 +423,12 @@ function LocationEcho() {
   return <div data-testid="location">{`${location.pathname}${location.search}`}</div>;
 }
 
+/** 为路由回归测试提供一个可点击的导航入口，模拟同一页面内的深链切换。 */
+function RouteChangeButton({ label, to }: { label: string; to: string }) {
+  const navigate = useNavigate();
+  return <button type="button" onClick={() => navigate(to)}>{label}</button>;
+}
+
 function renderDetail(initialEntry = '/enterprise/teams/team-1') {
   return render(
     <I18nProvider>
@@ -400,6 +441,128 @@ function renderDetail(initialEntry = '/enterprise/teams/team-1') {
       </MemoryRouter>
     </I18nProvider>,
   );
+}
+
+/** 挂载带路由切换控件的团队详情，覆盖参数和查询串在同一组件实例内变化。 */
+function renderDetailWithRouteChange(
+  initialEntry: string,
+  target: string,
+  label: string,
+) {
+  return render(
+    <I18nProvider>
+      <MemoryRouter initialEntries={[initialEntry]}>
+        <RouteChangeButton label={label} to={target} />
+        <Routes>
+          <Route path="/enterprise/teams/:teamId" element={<TeamDetailPage />} />
+        </Routes>
+      </MemoryRouter>
+    </I18nProvider>,
+  );
+}
+
+type RouteMutationFetchOptions = {
+  pendingPath: string;
+  pendingMethod?: string;
+  entriesByTeam?: Record<string, TeamBlackboardEntryRead[]>;
+  knowledgeRowsByTeam?: Record<string, TeamKnowledgeBindingRead[]>;
+  taskListByTeam?: Record<string, TeamTaskRead[]>;
+  taskDetails?: Record<string, TeamTaskRead>;
+};
+
+/** Create a deferred fetch response so a route can change while an action is in flight. */
+function deferredResponse() {
+  let resolve!: (response: Response) => void;
+  const promise = new Promise<Response>((nextResolve) => {
+    resolve = nextResolve;
+  });
+  return { promise, resolve };
+}
+
+/** Stub every TeamDetail read while leaving one selected route mutation pending. */
+function stubRouteMutationFetch(options: RouteMutationFetchOptions) {
+  const pending = deferredResponse();
+  const pendingMethod = (options.pendingMethod || 'POST').toUpperCase();
+  const teamById: Record<string, TeamRead> = {
+    'team-a': { ...team, id: 'team-a', name: '团队 A' },
+    'team-b': { ...team, id: 'team-b', name: '团队 B' },
+  };
+  const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = new URL(String(input), window.location.origin);
+    const requestPath = url.pathname;
+    const method = String(init?.method || 'GET').toUpperCase();
+    const teamMatch = requestPath.match(/\/teams\/([^/]+)/);
+    const routeTeamId = teamMatch?.[1] || 'team-a';
+
+    if (requestPath === options.pendingPath && method === pendingMethod) {
+      return pending.promise;
+    }
+    if (method === 'GET' && requestPath.match(/\/teams\/[^/]+$/)) {
+      return jsonResponse(teamById[routeTeamId] || teamById['team-a']);
+    }
+    if (method === 'GET' && requestPath.match(/\/teams\/[^/]+\/tasks\/[^/]+$/)) {
+      const taskId = requestPath.split('/').pop() || '';
+      return jsonResponse(options.taskDetails?.[taskId] || makeTask({ id: taskId }));
+    }
+    if (method === 'GET' && requestPath.endsWith('/tasks')) {
+      return jsonResponse(options.taskListByTeam?.[routeTeamId] || tasks);
+    }
+    if (method === 'GET' && requestPath.match(/\/teams\/[^/]+\/blackboard$/)) {
+      return jsonResponse(options.entriesByTeam?.[routeTeamId] || []);
+    }
+    if (method === 'GET' && requestPath.match(/\/teams\/[^/]+\/events$/)) {
+      return jsonResponse([]);
+    }
+    if (method === 'GET' && requestPath.match(/\/teams\/[^/]+\/knowledge-bases$/)) {
+      return jsonResponse(options.knowledgeRowsByTeam?.[routeTeamId] || []);
+    }
+    if (method === 'GET' && requestPath === '/api/enterprise/knowledge-bases') {
+      return jsonResponse([]);
+    }
+    if (method === 'GET' && requestPath === '/api/enterprise/agents') {
+      return jsonResponse(agents);
+    }
+    if (method === 'GET' && requestPath.endsWith('/export')) {
+      return jsonResponse(teamLog);
+    }
+    if (method === 'POST' && requestPath.endsWith('/tl/session')) {
+      return jsonResponse({ session_id: 'session-1' });
+    }
+    if (method === 'PUT' && requestPath.includes('/knowledge-bases/')) {
+      const rows = options.knowledgeRowsByTeam?.[routeTeamId] || knowledgeBindings;
+      return jsonResponse(rows[0] || knowledgeBindings[0]);
+    }
+    if (method === 'POST' && requestPath.includes('/award-override')) {
+      return jsonResponse(makeTask({ status: 'pending', assignee_agent_id: 'agent-1' }));
+    }
+    if (method === 'POST' && requestPath.includes('/override')) {
+      return jsonResponse(makeTask({ status: 'done' }));
+    }
+    if (method === 'POST' && requestPath.endsWith('/tasks')) {
+      return jsonResponse(makeTask({ id: 'task-created', title: '创建后的任务' }));
+    }
+    if (method === 'POST' && requestPath.includes('/blackboard')) {
+      return jsonResponse(makeEntry({ id: 'entry-created', content: '创建后的黑板条目' }));
+    }
+    if (method === 'POST' || method === 'PUT' || method === 'DELETE') {
+      return jsonResponse({});
+    }
+    return jsonResponse({});
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  return { fetchMock, pending };
+}
+
+function countRequest(
+  fetchMock: ReturnType<typeof vi.fn>,
+  requestPath: string,
+  method = 'GET',
+): number {
+  return fetchMock.mock.calls.filter(([input, init]) => {
+    const url = new URL(String(input), window.location.origin);
+    return url.pathname === requestPath
+      && String(init?.method || 'GET').toUpperCase() === method.toUpperCase();
+  }).length;
 }
 
 /** Render team detail with the semantic provider as the only locale source. */
@@ -434,6 +597,44 @@ beforeAll(() => {
 });
 
 describe('TeamDetailPage', () => {
+  it('requires one route action fence across every mutating TeamDetail pathway', () => {
+    const source = fs.readFileSync(path.resolve(__dirname, 'TeamDetailPage.tsx'), 'utf8');
+    const actionNames = [
+      'addMember',
+      'removeMember',
+      'promoteLeader',
+      'createTask',
+      'startTeamChat',
+      'openTeamLog',
+      'addBoardEntry',
+      'togglePinEntry',
+      'saveEditEntry',
+      'archiveBoardEntry',
+      'promoteBoardEntry',
+      'saveKnowledgeGrants',
+      'setDefaultKnowledgeBase',
+      'removeKnowledgeBase',
+      'bindExistingKnowledgeBase',
+      'createAndBindSharedKnowledgeBase',
+      'saveTeamConfig',
+      'awardOverride',
+      'overrideTask',
+    ];
+
+    actionNames.forEach((actionName) => {
+      const start = source.indexOf(`async function ${actionName}`);
+      const next = source.indexOf('\n  async function', start + 1);
+      const block = source.slice(start, next === -1 ? source.length : next);
+      expect(block, `${actionName} must capture route identity`).toMatch(/beginTeamActionFence\(\)/);
+      expect(block, `${actionName} must pass its abort signal`).toMatch(/signal: fence\.signal/);
+      expect(block, `${actionName} must fence every post-request side effect`).toMatch(/fence\.isCurrent\(\)/);
+    });
+
+    expect(source).toMatch(/actionControllersRef/);
+    expect(source).toMatch(/cancelRouteActionControllers/);
+    expect(source).toMatch(/routeAbortControllerRef/);
+  });
+
   it('projects canonical team event params and never renders legacy payload prose', () => {
     const english = createAppTranslator('en-US');
     const chinese = createAppTranslator('zh-CN');
@@ -507,7 +708,7 @@ describe('TeamDetailPage', () => {
 
     await waitFor(() => {
       const call = fetchMock.mock.calls.find(([input, init]) => (
-        String(input).endsWith('/knowledge-bases/kb-shared-1')
+        String(input).includes('/knowledge-bases/kb-shared-1')
         && init?.method === 'PUT'
       ));
       expect(JSON.parse(String(call?.[1]?.body))).toEqual({
@@ -949,6 +1150,254 @@ describe('TeamDetailPage', () => {
     const dialog = await screen.findByRole('dialog');
     expect(await within(dialog).findByText('周报已完成')).toBeTruthy();
     expect(within(dialog).getByText('submitted')).toBeTruthy();
+  });
+
+  it('does not let a previous team response replace the newly routed team', async () => {
+    const user = userEvent.setup();
+    const teamA = { ...team, id: 'team-a', name: '团队 A' };
+    const teamB = { ...team, id: 'team-b', name: '团队 B' };
+    let resolveTeamA!: (response: Response) => void;
+    const pendingTeamA = new Promise<Response>((resolve) => {
+      resolveTeamA = resolve;
+    });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith('/api/enterprise/teams/team-a?tenant_id=tenant_demo')) return pendingTeamA;
+      if (url.endsWith('/api/enterprise/teams/team-b?tenant_id=tenant_demo')) return jsonResponse(teamB);
+      if (url.includes('/api/enterprise/teams/') && url.includes('/tasks/')) return jsonResponse([]);
+      if (url.includes('/api/enterprise/teams/') && url.includes('/tasks?')) return jsonResponse([]);
+      if (url.includes('/api/enterprise/teams/') && url.includes('/blackboard')) return jsonResponse([]);
+      if (url.includes('/api/enterprise/teams/') && url.includes('/events')) return jsonResponse([]);
+      if (url.includes('/api/enterprise/teams/') && url.includes('/knowledge-bases')) return jsonResponse([]);
+      if (url.endsWith('/api/enterprise/knowledge-bases?tenant_id=tenant_demo')) return jsonResponse([]);
+      if (url.endsWith('/api/enterprise/agents?tenant_id=tenant_demo')) return jsonResponse([]);
+      return jsonResponse({});
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    renderDetailWithRouteChange('/enterprise/teams/team-a', '/enterprise/teams/team-b', '切换 B');
+    await waitFor(() => expect(fetchMock.mock.calls.some(([input]) => (
+      String(input).includes('/api/enterprise/teams/team-a')
+      && !String(input).includes('/tasks')
+      && !String(input).includes('/blackboard')
+      && !String(input).includes('/events')
+      && !String(input).includes('/knowledge-bases')
+    ))).toBe(true));
+    fireEvent.click(screen.getByText('切换 B'));
+    expect(await screen.findByText('团队 B')).toBeTruthy();
+
+    await act(async () => {
+      resolveTeamA(jsonResponse(teamA));
+      await Promise.resolve();
+    });
+    expect(screen.queryByText('团队 A')).toBeNull();
+  });
+
+  it('clears the active task when the task query parameter is removed', async () => {
+    stubDetailFetch();
+    renderDetailWithRouteChange(
+      '/enterprise/teams/team-1?task=task-1',
+      '/enterprise/teams/team-1',
+      '移除任务查询',
+    );
+
+    expect(await screen.findByRole('dialog')).toBeTruthy();
+    fireEvent.click(screen.getByText('移除任务查询'));
+
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+  });
+
+  it('does not reload team A after an add-member action completes on team B', async () => {
+    const user = userEvent.setup();
+    const { fetchMock, pending } = stubRouteMutationFetch({
+      pendingPath: '/api/enterprise/teams/team-a/members',
+    });
+    renderDetailWithRouteChange('/enterprise/teams/team-a', '/enterprise/teams/team-b', '切换 B');
+
+    await screen.findByText('团队 A', { exact: true });
+    const members = screen.getByRole('region', { name: '成员管理' });
+    await user.click(within(members).getByRole('combobox', { name: '选择员工' }));
+    await user.click(await screen.findByRole('option', { name: '小丙' }));
+    await user.click(within(members).getByRole('button', { name: '添加成员' }));
+    await waitFor(() => expect(countRequest(
+      fetchMock,
+      '/api/enterprise/teams/team-a/members',
+      'POST',
+    )).toBe(1));
+    const teamReadsBeforeRouteChange = countRequest(fetchMock, '/api/enterprise/teams/team-a');
+
+    fireEvent.click(screen.getByText('切换 B'));
+    await screen.findByText('团队 B', { exact: true });
+
+    await act(async () => {
+      pending.resolve(jsonResponse({}));
+      await pending.promise;
+    });
+    await waitFor(() => expect(countRequest(
+      fetchMock,
+      '/api/enterprise/teams/team-a',
+    )).toBe(teamReadsBeforeRouteChange));
+    expect(countRequest(fetchMock, '/api/enterprise/teams/team-b/members', 'POST')).toBe(0);
+  });
+
+  it('does not reload team A tasks after a create-task action completes on team B', async () => {
+    const user = userEvent.setup();
+    const { fetchMock, pending } = stubRouteMutationFetch({
+      pendingPath: '/api/enterprise/teams/team-a/tasks',
+      taskListByTeam: {
+        'team-a': [makeTask({ id: 'a-task', title: 'A task list' })],
+        'team-b': [makeTask({ id: 'b-task', title: 'B task list' })],
+      },
+    });
+    renderDetailWithRouteChange('/enterprise/teams/team-a', '/enterprise/teams/team-b', '切换 B');
+
+    const board = screen.getByRole('region', { name: '任务看板' });
+    await screen.findByText('团队 A', { exact: true });
+    await user.click(within(board).getByRole('button', { name: '新建任务' }));
+    const dialog = await screen.findByRole('dialog');
+    await user.type(within(dialog).getByLabelText('任务标题'), 'A pending task');
+    await user.click(within(dialog).getByRole('button', { name: '创建' }));
+    await waitFor(() => expect(countRequest(
+      fetchMock,
+      '/api/enterprise/teams/team-a/tasks',
+      'POST',
+    )).toBe(1));
+    const taskReadsBeforeRouteChange = countRequest(
+      fetchMock,
+      '/api/enterprise/teams/team-a/tasks',
+    );
+
+    fireEvent.click(screen.getByText('切换 B'));
+    await screen.findByText('团队 B', { exact: true });
+    await screen.findByText('B task list', { exact: true });
+
+    await act(async () => {
+      pending.resolve(jsonResponse(makeTask({ id: 'a-created', title: 'A pending task' })));
+      await pending.promise;
+    });
+    await waitFor(() => expect(countRequest(
+      fetchMock,
+      '/api/enterprise/teams/team-a/tasks',
+    )).toBe(taskReadsBeforeRouteChange));
+    expect(screen.queryByText('A task list', { exact: true })).toBeNull();
+    expect(countRequest(fetchMock, '/api/enterprise/teams/team-b/tasks', 'POST')).toBe(0);
+  });
+
+  it('does not publish a stale blackboard mutation after routing from team A to team B', async () => {
+    const user = userEvent.setup();
+    const { fetchMock, pending } = stubRouteMutationFetch({
+      pendingPath: '/api/enterprise/teams/team-a/blackboard',
+      entriesByTeam: {
+        'team-a': [makeEntry({ id: 'a-entry', content: 'A board refresh' })],
+        'team-b': [makeEntry({ id: 'b-entry', content: 'B board refresh' })],
+      },
+    });
+    renderDetailWithRouteChange('/enterprise/teams/team-a', '/enterprise/teams/team-b', '切换 B');
+
+    const board = screen.getByRole('region', { name: '团队黑板' });
+    await within(board).findByText('A board refresh', { exact: true });
+    await user.type(within(board).getByLabelText('输入黑板内容'), 'A pending board');
+    await user.click(within(board).getByRole('button', { name: '添加' }));
+    await waitFor(() => expect(countRequest(
+      fetchMock,
+      '/api/enterprise/teams/team-a/blackboard',
+      'POST',
+    )).toBe(1));
+    const boardReadsBeforeRouteChange = countRequest(
+      fetchMock,
+      '/api/enterprise/teams/team-a/blackboard',
+    );
+
+    fireEvent.click(screen.getByText('切换 B'));
+    await screen.findByText('团队 B', { exact: true });
+    await within(screen.getByRole('region', { name: '团队黑板' })).findByText('B board refresh', { exact: true });
+
+    await act(async () => {
+      pending.resolve(jsonResponse(makeEntry({ id: 'a-created', content: 'A pending board' })));
+      await pending.promise;
+    });
+    await waitFor(() => expect(countRequest(
+      fetchMock,
+      '/api/enterprise/teams/team-a/blackboard',
+    )).toBe(boardReadsBeforeRouteChange));
+    expect(screen.queryByText('A board refresh', { exact: true })).toBeNull();
+    expect(countRequest(fetchMock, '/api/enterprise/teams/team-b/blackboard', 'POST')).toBe(0);
+  });
+
+  it('does not publish a stale knowledge permission save after routing from team A to team B', async () => {
+    const user = userEvent.setup();
+    // Keep the binding id stable to prove the stale response cannot mutate the
+    // same rendered row after the team route changes.
+    const knowledgeA = { ...knowledgeBindings[0], id: 'teamkb-shared', knowledge_base_name: 'A binding' };
+    const knowledgeB = { ...knowledgeBindings[0], id: 'teamkb-shared', knowledge_base_name: 'B binding' };
+    const { fetchMock, pending } = stubRouteMutationFetch({
+      pendingPath: '/api/enterprise/teams/team-a/knowledge-bases/kb-shared-1/grants',
+      pendingMethod: 'PUT',
+      knowledgeRowsByTeam: {
+        'team-a': [knowledgeA],
+        'team-b': [knowledgeB],
+      },
+    });
+    renderDetailWithRouteChange('/enterprise/teams/team-a', '/enterprise/teams/team-b', '切换 B');
+
+    const knowledge = await screen.findByRole('region', { name: '团队知识库' });
+    await within(knowledge).findByText('A binding', { exact: true });
+    await user.click(within(knowledge).getByRole('button', { name: '保存 A binding 权限' }));
+    await waitFor(() => expect(countRequest(
+      fetchMock,
+      '/api/enterprise/teams/team-a/knowledge-bases/kb-shared-1/grants',
+      'PUT',
+    )).toBe(1));
+
+    fireEvent.click(screen.getByText('切换 B'));
+    const teamBKnowledge = await screen.findByRole('region', { name: '团队知识库' });
+    await within(teamBKnowledge).findByText('B binding', { exact: true });
+
+    await act(async () => {
+      pending.resolve(jsonResponse({ ...knowledgeA, knowledge_base_name: 'A stale binding' }));
+      await pending.promise;
+    });
+    await waitFor(() => expect(within(
+      screen.getByRole('region', { name: '团队知识库' }),
+    ).queryByText('A stale binding', { exact: true })).toBeNull());
+    expect(within(screen.getByRole('region', { name: '团队知识库' })).getByText('B binding', { exact: true })).toBeTruthy();
+  });
+
+  it('does not reload team A after a task override completes on team B', async () => {
+    const user = userEvent.setup();
+    const { fetchMock, pending } = stubRouteMutationFetch({
+      pendingPath: '/api/enterprise/teams/team-a/tasks/task-1/override',
+      taskListByTeam: {
+        'team-a': [
+          makeTask({ id: 'task-1', title: '写周报', status: 'review' }),
+          makeTask({ id: 'a-stale', title: 'A stale task', status: 'pending' }),
+        ],
+        'team-b': [makeTask({ id: 'b-task', title: 'B task', status: 'pending' })],
+      },
+    });
+    renderDetailWithRouteChange('/enterprise/teams/team-a', '/enterprise/teams/team-b', '切换 B');
+
+    const board = screen.getByRole('region', { name: '任务看板' });
+    await within(board).findByText('写周报', { exact: true });
+    await user.click(within(board).getByText('写周报', { exact: true }));
+    const dialog = await screen.findByRole('dialog');
+    await user.click(within(dialog).getByRole('button', { name: '通过' }));
+    await waitFor(() => expect(countRequest(
+      fetchMock,
+      '/api/enterprise/teams/team-a/tasks/task-1/override',
+      'POST',
+    )).toBe(1));
+
+    fireEvent.click(screen.getByText('切换 B'));
+    const teamBBoard = await screen.findByRole('region', { name: '任务看板' });
+    await within(teamBBoard).findByText('B task', { exact: true });
+
+    await act(async () => {
+      pending.resolve(jsonResponse(makeTask({ id: 'task-1', title: '写周报', status: 'done' })));
+      await pending.promise;
+    });
+    await waitFor(() => expect(screen.queryByText('A stale task', { exact: true })).toBeNull());
+    expect(within(screen.getByRole('region', { name: '任务看板' })).getByText('B task', { exact: true })).toBeTruthy();
   });
 
   it('saves team settings via PUT with the merged config', async () => {

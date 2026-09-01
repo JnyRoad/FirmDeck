@@ -1,7 +1,7 @@
 /** Trace 列表页：产品 chrome 由语义 i18n 投影，trace 标识和诊断 payload 保持 raw。 */
 
 import { ReloadOutlined } from '../icons';
-import { useEffect, useState, type ReactNode } from 'react';
+import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import {
   Button as UIButton,
   Card,
@@ -22,7 +22,8 @@ import { useAppIntl } from '@/i18n/useAppIntl';
 import type { MessageId } from '@/i18n/types';
 import { backendErrorMessageDescriptor } from '@/lib/apiErrorMessages';
 import { useClientPagination } from '../hooks/useClientPagination';
-import { api, TENANT_ID } from '../api/client';
+import { createTenantClient } from '../api/tenant-client';
+import { useTenantSession } from '../contexts/TenantSessionContext';
 import type { TraceSummary } from '../types';
 
 const TRACES_PAGE_SIZE = 10;
@@ -73,19 +74,33 @@ function serializeTraceDetail(value: Record<string, unknown> | null): string {
   }
 }
 
+function isCurrentTenantGeneration(
+  context: ReturnType<typeof useTenantSession>,
+  generation: number,
+): boolean {
+  return Boolean(context && !context.signal.aborted && context.isCurrentGeneration(generation));
+}
+
 /** 渲染 trace 列表与详情抽屉；请求失败只显示稳定的本地化产品错误。 */
 export default function TracesPage() {
   const { t } = useAppIntl();
   const toast = createToastNotifier({ t });
+  const tenantContext = useTenantSession();
+  const tenantApi = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
   const [rows, setRows] = useState<TraceSummary[]>([]);
   const [detail, setDetail] = useState<Record<string, unknown> | null>(null);
 
   /** 加载 trace 摘要；异常根因只记录到诊断日志，不进入 toast。 */
   async function load() {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined || !isCurrentTenantGeneration(context, generation)) return;
     try {
-      const result = await api.get<TraceSummary[]>(`/api/enterprise/traces?tenant_id=${TENANT_ID}`);
+      const result = await tenantApi.get<TraceSummary[]>('/api/enterprise/traces');
+      if (!isCurrentTenantGeneration(context, generation)) return;
       setRows(result);
     } catch (error) {
+      if (!isCurrentTenantGeneration(context, generation)) return;
       console.error('[traces-page] list load failed', error);
       toast.error(traceErrorDescriptor(error));
     }
@@ -93,16 +108,21 @@ export default function TracesPage() {
 
   useEffect(() => {
     void load();
-  }, []);
+  }, [tenantApi, tenantContext]);
 
   const pagination = useClientPagination(rows, TRACES_PAGE_SIZE);
 
   /** 打开单条 trace 详情；原始 payload 交给 raw 展示边界。 */
   async function openDetail(row: TraceSummary) {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined || !isCurrentTenantGeneration(context, generation)) return;
     try {
-      const result = await api.get<Record<string, unknown>>(`/api/enterprise/traces/${row.session_id}?tenant_id=${TENANT_ID}`);
+      const result = await tenantApi.get<Record<string, unknown>>(`/api/enterprise/traces/${row.session_id}`);
+      if (!isCurrentTenantGeneration(context, generation)) return;
       setDetail(result);
     } catch (error) {
+      if (!isCurrentTenantGeneration(context, generation)) return;
       console.error('[traces-page] detail load failed', error);
       toast.error(traceErrorDescriptor(error));
     }

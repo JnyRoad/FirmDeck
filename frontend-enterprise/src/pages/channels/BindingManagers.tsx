@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 
 import { createToastNotifier } from '@/components/ui/app-toast';
 import { Button as UIButton } from '@/components/ui/button';
@@ -9,7 +9,8 @@ import type { MessageId } from '@/i18n/types';
 import { backendErrorMessageDescriptor } from '@/lib/apiErrorMessages';
 import { RawContent, RawIdentifier } from '@/i18n/RawContent';
 
-import { api, TENANT_ID } from '../../api/client';
+import { createTenantClient } from '../../api/tenant-client';
+import { useTenantSession } from '../../contexts/TenantSessionContext';
 import type { ChannelBindingManagerRead } from '../../types';
 
 type TenantUser = {
@@ -25,6 +26,16 @@ type Props = {
   creatorUserId?: string | null;
 };
 
+type BindingManagersTenantContext = NonNullable<ReturnType<typeof useTenantSession>>;
+
+/** Prevent a stale tenant generation from publishing manager state or toasts. */
+function isCurrentTenantGeneration(
+  context: BindingManagersTenantContext | null,
+  generation: number,
+): context is BindingManagersTenantContext {
+  return Boolean(context && !context.signal.aborted && context.isCurrentGeneration(generation));
+}
+
 /** 将稳定后端错误投影为当前页面可安全展示的 descriptor，拒绝 raw detail 透传。 */
 function errorDescriptor(error: unknown, fallbackId: MessageId): MessageDescriptor {
   const descriptor = backendErrorMessageDescriptor(error);
@@ -37,6 +48,8 @@ function errorDescriptor(error: unknown, fallbackId: MessageId): MessageDescript
 export default function BindingManagers({ bindingId, users, creatorUserId }: Props) {
   const { t } = useAppIntl();
   const toast = createToastNotifier({ t });
+  const tenantContext = useTenantSession();
+  const tenantApi = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
   const [managers, setManagers] = useState<ChannelBindingManagerRead[]>([]);
   const [loading, setLoading] = useState(true);
   const [adding, setAdding] = useState(false);
@@ -45,20 +58,25 @@ export default function BindingManagers({ bindingId, users, creatorUserId }: Pro
   useEffect(() => {
     void load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [bindingId]);
+  }, [bindingId, tenantContext?.generation]);
 
   /** 加载协作者列表；错误只通过稳定错误契约或安全 fallback 进入产品 Toast。 */
   async function load() {
+    const context = tenantContext;
+    if (!context) return;
+    const generation = context.generation;
     setLoading(true);
     try {
-      const data = await api.get<ChannelBindingManagerRead[]>(
-        `/api/enterprise/channels/${bindingId}/managers?tenant_id=${TENANT_ID}`,
+      const data = await tenantApi.get<ChannelBindingManagerRead[]>(
+        `/api/enterprise/channels/${bindingId}/managers`,
       );
+      if (!isCurrentTenantGeneration(context, generation)) return;
       setManagers(data);
     } catch (error) {
+      if (!isCurrentTenantGeneration(context, generation)) return;
       toast.error(errorDescriptor(error, 'channels.collaborators.loadFailed'));
     } finally {
-      setLoading(false);
+      if (isCurrentTenantGeneration(context, generation)) setLoading(false);
     }
   }
 
@@ -70,30 +88,42 @@ export default function BindingManagers({ bindingId, users, creatorUserId }: Pro
   /** 添加当前租户内部协作者并刷新列表，用户输入仅作为 API 标识传递。 */
   async function add() {
     if (!candidate) return;
+    const context = tenantContext;
+    if (!context) return;
+    const generation = context.generation;
     setAdding(true);
     try {
-      await api.post(`/api/enterprise/channels/${bindingId}/managers?tenant_id=${TENANT_ID}`, {
+      await tenantApi.post(`/api/enterprise/channels/${bindingId}/managers`, {
         user_id: candidate,
       });
+      if (!isCurrentTenantGeneration(context, generation)) return;
       setCandidate('');
       await load();
+      if (!isCurrentTenantGeneration(context, generation)) return;
       toast.success(createMessageDescriptor('channels.collaborators.added'));
     } catch (error) {
+      if (!isCurrentTenantGeneration(context, generation)) return;
       toast.error(errorDescriptor(error, 'channels.collaborators.addFailed'));
     } finally {
-      setAdding(false);
+      if (isCurrentTenantGeneration(context, generation)) setAdding(false);
     }
   }
 
   /** 移除指定协作者；userId 是 raw 标识，不参与产品文案翻译。 */
   async function remove(userId: string) {
+    const context = tenantContext;
+    if (!context) return;
+    const generation = context.generation;
     try {
-      await api.delete(
-        `/api/enterprise/channels/${bindingId}/managers/${userId}?tenant_id=${TENANT_ID}`,
+      await tenantApi.delete(
+        `/api/enterprise/channels/${bindingId}/managers/${userId}`,
       );
+      if (!isCurrentTenantGeneration(context, generation)) return;
       await load();
+      if (!isCurrentTenantGeneration(context, generation)) return;
       toast.success(createMessageDescriptor('channels.collaborators.removed'));
     } catch (error) {
+      if (!isCurrentTenantGeneration(context, generation)) return;
       toast.error(errorDescriptor(error, 'channels.collaborators.removeFailed'));
     }
   }

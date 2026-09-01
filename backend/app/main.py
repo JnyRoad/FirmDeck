@@ -26,6 +26,7 @@ from app.api import (
     scheduled_tasks,
     sessions,
     skills,
+    system_admin,
     teams,
     tools,
     traces,
@@ -145,6 +146,7 @@ app.include_router(chat.router)
 app.include_router(agents.chat_router)
 app.include_router(ui_config.chat_router)
 app.include_router(auth.router)
+app.include_router(system_admin.router)
 app.include_router(agents.scope_router)
 app.include_router(agents.enterprise_router)
 app.include_router(general_skills.router)

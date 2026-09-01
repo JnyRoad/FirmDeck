@@ -5,11 +5,13 @@ import logging
 import mimetypes
 import os
 import queue
+import secrets
 import subprocess
 import threading
 import time
 import uuid
 from collections.abc import Iterator
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlsplit, urlunsplit
@@ -17,6 +19,7 @@ from urllib.parse import quote, urlsplit, urlunsplit
 from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import ValidationError
+from sqlalchemy import or_, update
 from sqlmodel import Session, select
 
 from app.config import get_settings
@@ -38,6 +41,7 @@ _process_lock = threading.Lock()
 _submission_lock = threading.Lock()
 _shutting_down = threading.Event()
 _TERMINAL = {"completed", "failed", "canceled", "rejected", "input-required"}
+_WORKER_LEASE_SECONDS = 15 * 60
 
 _A2A_HTTP_CODES = {
     400: "A2A_BAD_REQUEST",
@@ -336,15 +340,20 @@ def codex_a2a_artifact(
 
 
 def recover_codex_a2a_tasks() -> None:
+    """Relaunch durable Codex work only when the installation runtime is usable."""
     settings = get_settings()
-    if not settings.codex_a2a_enabled:
+    if not _codex_a2a_is_available(settings):
         return
     _shutting_down.clear()
     with Session(engine) as db:
         tasks = list(
             db.exec(
                 select(A2ATaskRun).where(
+                    A2ATaskRun.owner_scope == "system",
                     A2ATaskRun.direction == "server",
+                    A2ATaskRun.tenant_id.is_(None),
+                    A2ATaskRun.system_runtime_key == "codex_a2a",
+                    A2ATaskRun.tenant_lifecycle_version.is_(None),
                     A2ATaskRun.status.in_(["submitted", "working"]),
                 )
             ).all()
@@ -396,7 +405,11 @@ def _submit_message_locked(
         with Session(engine) as db:
             existing = db.exec(
                 select(A2ATaskRun).where(
+                    A2ATaskRun.owner_scope == "system",
                     A2ATaskRun.direction == "server",
+                    A2ATaskRun.tenant_id.is_(None),
+                    A2ATaskRun.system_runtime_key == "codex_a2a",
+                    A2ATaskRun.tenant_lifecycle_version.is_(None),
                     A2ATaskRun.remote_task_id == existing_id,
                 )
             ).first()
@@ -450,8 +463,11 @@ def _submit_message_locked(
         )
     context_id = str(message.get("contextId") or uuid.uuid4().hex)
     task = A2ATaskRun(
+        owner_scope="system",
         direction="server",
-        tenant_id="a2a_codex",
+        tenant_id=None,
+        system_runtime_key="codex_a2a",
+        tenant_lifecycle_version=None,
         endpoint_url=str(request.base_url).rstrip("/") + "/api/a2a/codex",
         protocol_binding="JSONRPC",
         protocol_version="1.0",
@@ -497,13 +513,97 @@ def _launch(task_id: str, *, recovery: bool = False) -> None:
     thread.start()
 
 
+def _claim_codex_task(
+    db: Session,
+    task_id: str,
+    *,
+    recovery: bool,
+) -> tuple[A2ATaskRun, str, int] | None:
+    """CAS one installation-owned task to a durable Codex worker generation."""
+    now = utc_now()
+    worker_owner = f"codex-a2a-{uuid.uuid4().hex}"
+    allowed_statuses = ["submitted", "working"] if recovery else ["submitted"]
+    result = db.exec(
+        update(A2ATaskRun)
+        .where(
+            A2ATaskRun.id == task_id,
+            A2ATaskRun.owner_scope == "system",
+            A2ATaskRun.direction == "server",
+            A2ATaskRun.tenant_id.is_(None),
+            A2ATaskRun.system_runtime_key == "codex_a2a",
+            A2ATaskRun.tenant_lifecycle_version.is_(None),
+            A2ATaskRun.status.in_(allowed_statuses),
+            A2ATaskRun.cancel_requested == False,
+            or_(
+                A2ATaskRun.worker_owner.is_(None),
+                A2ATaskRun.worker_lease_until.is_(None),
+                A2ATaskRun.worker_lease_until < now,
+            ),
+        )
+        .values(
+            status="working",
+            worker_owner=worker_owner,
+            worker_generation=A2ATaskRun.worker_generation + 1,
+            worker_lease_until=now + timedelta(seconds=_WORKER_LEASE_SECONDS),
+            recovery_attempts=(
+                A2ATaskRun.recovery_attempts + 1
+                if recovery
+                else A2ATaskRun.recovery_attempts
+            ),
+            updated_at=now,
+        )
+    )
+    db.commit()
+    if getattr(result, "rowcount", 0) != 1:
+        return None
+    db.expire_all()
+    task = db.get(A2ATaskRun, task_id)
+    if task is None or task.worker_owner != worker_owner:
+        return None
+    return task, worker_owner, task.worker_generation
+
+
+def _codex_worker_update(
+    db: Session,
+    task_id: str,
+    worker_owner: str,
+    worker_generation: int,
+    *,
+    values: dict[str, Any],
+) -> bool:
+    """Write worker output only while this generation still owns a non-cancelled task."""
+    result = db.exec(
+        update(A2ATaskRun)
+        .where(
+            A2ATaskRun.id == task_id,
+            A2ATaskRun.owner_scope == "system",
+            A2ATaskRun.direction == "server",
+            A2ATaskRun.tenant_id.is_(None),
+            A2ATaskRun.system_runtime_key == "codex_a2a",
+            A2ATaskRun.tenant_lifecycle_version.is_(None),
+            A2ATaskRun.status == "working",
+            A2ATaskRun.cancel_requested == False,
+            A2ATaskRun.worker_owner == worker_owner,
+            A2ATaskRun.worker_generation == worker_generation,
+        )
+        .values(**values)
+    )
+    db.commit()
+    return getattr(result, "rowcount", 0) == 1
+
+
 def _run_codex_task(task_id: str, *, recovery: bool = False) -> None:
     """Run or recover one local Codex task using its persisted locale snapshot."""
     settings = get_settings()
+    # A worker can outlive the configuration that admitted it; never launch Codex while the
+    # installation runtime is disabled or its credential has become unusable.
+    if not _codex_a2a_is_available(settings):
+        return
     with Session(engine) as db:
-        task = db.get(A2ATaskRun, task_id)
-        if task is None or task.cancel_requested:
+        claimed = _claim_codex_task(db, task_id, recovery=recovery)
+        if claimed is None:
             return
+        task, worker_owner, worker_generation = claimed
         prompt = str(task.request_json.get("prompt") or "")
         language_context = _task_language_context(task)
         language_snapshot = language_context.model_dump(mode="json")
@@ -512,11 +612,6 @@ def _run_codex_task(task_id: str, *, recovery: bool = False) -> None:
         workspace = Path(str(task.request_json.get("workspace") or "")).resolve()
         workspace.mkdir(parents=True, exist_ok=True)
         before = _workspace_snapshot(workspace)
-        task.status = "working"
-        task.recovery_attempts += 1 if recovery else 0
-        task.updated_at = utc_now()
-        db.add(task)
-        db.commit()
         _append_event(db, task, "working", _status_update(task, "working"))
         codex_session_id = task.codex_session_id
         should_resume = bool(task.request_json.get("resume") or recovery) and codex_session_id
@@ -591,7 +686,11 @@ def _run_codex_task(task_id: str, *, recovery: bool = False) -> None:
                 if current_task is None:
                     process.terminate()
                     return
-                if current_task.cancel_requested:
+                if (
+                    current_task.cancel_requested
+                    or current_task.worker_owner != worker_owner
+                    or current_task.worker_generation != worker_generation
+                ):
                     process.terminate()
                     raise RuntimeError("Codex CLI A2A task was cancelled.")
             try:
@@ -612,7 +711,11 @@ def _run_codex_task(task_id: str, *, recovery: bool = False) -> None:
                 if task is None:
                     process.terminate()
                     return
-                if task.cancel_requested:
+                if (
+                    task.cancel_requested
+                    or task.worker_owner != worker_owner
+                    or task.worker_generation != worker_generation
+                ):
                     process.terminate()
                     raise RuntimeError("Codex CLI A2A task was cancelled.")
                 session_id = _codex_session_id(event)
@@ -659,36 +762,75 @@ def _run_codex_task(task_id: str, *, recovery: bool = False) -> None:
             if task is None:
                 return
             if remote_failure is not None:
-                task.status = "failed"
-                task.error_json = remote_failure
-                task.result_json = {}
-                task.finished_at = utc_now()
-                task.updated_at = utc_now()
-                db.add(task)
-                db.commit()
+                now = utc_now()
+                if not _codex_worker_update(
+                    db,
+                    task_id,
+                    worker_owner,
+                    worker_generation,
+                    values={
+                        "status": "failed",
+                        "error_json": remote_failure,
+                        "result_json": {},
+                        "finished_at": now,
+                        "updated_at": now,
+                        "worker_owner": None,
+                        "worker_lease_until": None,
+                    },
+                ):
+                    return
+                db.expire_all()
+                task = db.get(A2ATaskRun, task_id)
+                if task is None:
+                    return
                 _append_event(db, task, "failed", _task_payload(task))
                 return
-            task.status = "completed"
-            task.artifacts_json = artifacts
-            task.result_json = {"text": final_text, "artifacts": artifacts}
-            task.finished_at = utc_now()
-            task.updated_at = utc_now()
-            db.add(task)
-            db.commit()
+            now = utc_now()
+            if not _codex_worker_update(
+                db,
+                task_id,
+                worker_owner,
+                worker_generation,
+                values={
+                    "status": "completed",
+                    "artifacts_json": artifacts,
+                    "result_json": {"text": final_text, "artifacts": artifacts},
+                    "finished_at": now,
+                    "updated_at": now,
+                    "worker_owner": None,
+                    "worker_lease_until": None,
+                },
+            ):
+                return
+            db.expire_all()
+            task = db.get(A2ATaskRun, task_id)
+            if task is None:
+                return
             _append_event(db, task, "completed", _task_payload(task))
     except Exception as exc:
         if _shutting_down.is_set():
             with Session(engine) as db:
                 task = db.get(A2ATaskRun, task_id)
-                if task is not None and task.status not in _TERMINAL:
-                    task.status = "working"
-                    task.error_json = _project_a2a_error(
-                        "A2A_INTERNAL_ERROR",
-                        raw_context="Service stopped; the durable task will resume on startup.",
-                    )
-                    task.updated_at = utc_now()
-                    db.add(task)
-                    db.commit()
+                if task is not None and _codex_worker_update(
+                    db,
+                    task_id,
+                    worker_owner,
+                    worker_generation,
+                    values={
+                        "status": "working",
+                        "error_json": _project_a2a_error(
+                            "A2A_INTERNAL_ERROR",
+                            raw_context="Service stopped; the durable task will resume on startup.",
+                        ),
+                        "updated_at": utc_now(),
+                        "worker_owner": None,
+                        "worker_lease_until": None,
+                    },
+                ):
+                    db.expire_all()
+                    task = db.get(A2ATaskRun, task_id)
+                    if task is None:
+                        return
                     _append_event(
                         db,
                         task,
@@ -701,7 +843,6 @@ def _run_codex_task(task_id: str, *, recovery: bool = False) -> None:
             if task is None:
                 return
             cancelled = task.cancel_requested or "cancel" in str(exc).lower()
-            task.status = "canceled" if cancelled else "failed"
             error_code = (
                 "A2A_CANCELLED"
                 if cancelled
@@ -709,14 +850,30 @@ def _run_codex_task(task_id: str, *, recovery: bool = False) -> None:
                 if isinstance(exc, TimeoutError)
                 else "A2A_TASK_FAILED"
             )
-            task.error_json = _project_a2a_error(error_code, raw_context=exc)
+            target_status = "canceled" if cancelled else "failed"
+            error_json = _project_a2a_error(error_code, raw_context=exc)
             if not cancelled:
                 logger.exception("Codex A2A task failed", extra={"task_id": task_id})
-            task.finished_at = utc_now()
-            task.updated_at = utc_now()
-            db.add(task)
-            db.commit()
-            _append_event(db, task, task.status, _task_payload(task))
+            now = utc_now()
+            if not _codex_worker_update(
+                db,
+                task_id,
+                worker_owner,
+                worker_generation,
+                values={
+                    "status": target_status,
+                    "error_json": error_json,
+                    "finished_at": now,
+                    "updated_at": now,
+                    "worker_owner": None,
+                    "worker_lease_until": None,
+                },
+            ):
+                return
+            db.expire_all()
+            task = db.get(A2ATaskRun, task_id)
+            if task is not None:
+                _append_event(db, task, task.status, _task_payload(task))
     finally:
         with _process_lock:
             _processes.pop(task_id, None)
@@ -778,15 +935,38 @@ def _latest_event_sequence(task_id: str, *, db: Session | None = None) -> int:
 def _cancel(task_id: str) -> None:
     with Session(engine) as db:
         task = db.get(A2ATaskRun, task_id)
-        if task is None:
+        if task is None or not _is_codex_system_task(task):
             raise _a2a_http_error(status_code=404, detail="Task not found")
-        task.cancel_requested = True
-        task.status = "canceled"
-        task.finished_at = utc_now()
-        task.updated_at = utc_now()
-        db.add(task)
+        if task.status in _TERMINAL:
+            return
+        now = utc_now()
+        result = db.exec(
+            update(A2ATaskRun)
+            .where(
+                A2ATaskRun.id == task_id,
+                A2ATaskRun.owner_scope == "system",
+                A2ATaskRun.direction == "server",
+                A2ATaskRun.tenant_id.is_(None),
+                A2ATaskRun.system_runtime_key == "codex_a2a",
+                A2ATaskRun.tenant_lifecycle_version.is_(None),
+                A2ATaskRun.status.in_(["submitted", "working"]),
+            )
+            .values(
+                cancel_requested=True,
+                status="canceled",
+                finished_at=now,
+                updated_at=now,
+                worker_owner=None,
+                worker_lease_until=None,
+            )
+        )
         db.commit()
-        _append_event(db, task, "canceled", _task_payload(task))
+        if getattr(result, "rowcount", 0) != 1:
+            return
+        db.expire_all()
+        task = db.get(A2ATaskRun, task_id)
+        if task is not None:
+            _append_event(db, task, "canceled", _task_payload(task))
     with _process_lock:
         process = _processes.get(task_id)
     if process and process.poll() is None:
@@ -797,7 +977,11 @@ def _require_task(task_public_id: str) -> A2ATaskRun:
     with Session(engine) as db:
         task = db.exec(
             select(A2ATaskRun).where(
+                A2ATaskRun.owner_scope == "system",
                 A2ATaskRun.direction == "server",
+                A2ATaskRun.tenant_id.is_(None),
+                A2ATaskRun.system_runtime_key == "codex_a2a",
+                A2ATaskRun.tenant_lifecycle_version.is_(None),
                 A2ATaskRun.remote_task_id == task_public_id,
             )
         ).first()
@@ -813,16 +997,33 @@ def _task_for_message_id(message_id: str) -> A2ATaskRun | None:
             select(A2ATaskEvent).where(A2ATaskEvent.external_event_id == message_id)
         ).first()
         task = db.get(A2ATaskRun, event.run_id) if event is not None else None
+        if task is not None and not _is_codex_system_task(task):
+            task = None
         if task is None:
             task = db.exec(
                 select(A2ATaskRun).where(
+                    A2ATaskRun.owner_scope == "system",
                     A2ATaskRun.direction == "server",
+                    A2ATaskRun.tenant_id.is_(None),
+                    A2ATaskRun.system_runtime_key == "codex_a2a",
+                    A2ATaskRun.tenant_lifecycle_version.is_(None),
                     A2ATaskRun.invocation_id == message_id,
                 )
             ).first()
         if task is not None:
             db.expunge(task)
         return task
+
+
+def _is_codex_system_task(task: A2ATaskRun) -> bool:
+    """Recognize only the installation-owned Codex server owner shape."""
+    return (
+        task.owner_scope == "system"
+        and task.direction == "server"
+        and task.tenant_id is None
+        and task.system_runtime_key == "codex_a2a"
+        and task.tenant_lifecycle_version is None
+    )
 
 
 def _append_event(
@@ -848,7 +1049,6 @@ def _append_event(
     ).first()
     db.add(
         A2ATaskEvent(
-            tenant_id=task.tenant_id,
             run_id=task.id,
             sequence=(previous.sequence + 1) if previous else 1,
             external_event_id=external_event_id,
@@ -1085,7 +1285,13 @@ def _list_tasks(params: dict[str, Any], *, request: Request) -> dict[str, Any]:
     requested_context = str(params.get("contextId") or "").strip()
     limit = min(max(int(params.get("pageSize") or 50), 1), 100)
     with Session(engine) as db:
-        statement = select(A2ATaskRun).where(A2ATaskRun.direction == "server")
+        statement = select(A2ATaskRun).where(
+            A2ATaskRun.owner_scope == "system",
+            A2ATaskRun.direction == "server",
+            A2ATaskRun.tenant_id.is_(None),
+            A2ATaskRun.system_runtime_key == "codex_a2a",
+            A2ATaskRun.tenant_lifecycle_version.is_(None),
+        )
         if requested_context:
             statement = statement.where(A2ATaskRun.context_id == requested_context)
         tasks = list(db.exec(statement.order_by(A2ATaskRun.created_at.desc()).limit(limit)).all())
@@ -1127,9 +1333,22 @@ def _error_envelope(
     }
 
 
-def _enabled_settings():
+def _codex_a2a_token_is_usable(token: object) -> bool:
+    """Accept only a non-empty token with no leading or trailing whitespace."""
+    return isinstance(token, str) and bool(token) and token == token.strip()
+
+
+def _codex_a2a_is_available(settings: Any) -> bool:
+    """Return whether the adapter is both explicitly enabled and credentialed."""
+    return bool(getattr(settings, "codex_a2a_enabled", False)) and _codex_a2a_token_is_usable(
+        getattr(settings, "codex_a2a_token", "")
+    )
+
+
+def _enabled_settings() -> Any:
+    """Return usable adapter settings or the stable disabled projection."""
     settings = get_settings()
-    if not settings.codex_a2a_enabled:
+    if not _codex_a2a_is_available(settings):
         raise _a2a_http_error(
             status_code=404,
             detail="Codex A2A adapter is disabled",
@@ -1139,5 +1358,8 @@ def _enabled_settings():
 
 
 def _authorize(expected: str, authorization: str | None) -> None:
-    if expected and authorization != f"Bearer {expected}":
+    """Require the exact Bearer credential and reject an unusable expected secret."""
+    if not _codex_a2a_token_is_usable(expected):
+        raise _a2a_http_error(status_code=401, detail="Invalid A2A adapter credential")
+    if not secrets.compare_digest(authorization or "", f"Bearer {expected}"):
         raise _a2a_http_error(status_code=401, detail="Invalid A2A adapter credential")

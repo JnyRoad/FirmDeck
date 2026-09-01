@@ -10,13 +10,16 @@ import logging
 import threading
 from datetime import datetime, timedelta
 
+from sqlalchemy import exists, update
 from sqlmodel import Session, select
 
 from app.db import engine
-from app.db.models import Team, TeamTask, TeamWakeEvent, utc_now
+from app.db.models import Team, TeamRun, TeamTask, TeamWakeEvent, Tenant, utc_now
 from app.teams.service import apply_task_transition
 from app.teams.wakeup import (
     _drain_member_queue,
+    _team_lifecycle_failure_code,
+    _terminalize_wake_lifecycle,
     dispatch_pending_wake_events,
     maybe_enqueue_team_synthesis,
     recover_orphaned_wake_events,
@@ -29,6 +32,51 @@ SWEEP_INTERVAL_SECONDS = 60.0
 DEFAULT_TASK_TIMEOUT_MINUTES = 30.0
 # 参与超时判定的任务状态:终态(done/escalated)与待启动(pending/rework)不扫
 TIMEOUT_SCAN_STATUSES = ("bidding", "in_progress", "review")
+
+
+def _cas_pending_wake_timeout(
+    db: Session,
+    *,
+    task: TeamTask,
+    wake: TeamWakeEvent,
+    now: datetime,
+) -> bool:
+    """Mark one pending wake failed only while its task/tenant admission still holds.
+
+    This is intentionally a single conditional UPDATE. A stale sweeper snapshot
+    must never overwrite a successor's claimed wake, nor a wake from a different
+    tenant lifecycle generation.
+    """
+    result = db.exec(
+        update(TeamWakeEvent)
+        .where(
+            TeamWakeEvent.id == wake.id,
+            TeamWakeEvent.team_id == task.team_id,
+            TeamWakeEvent.tenant_id == task.tenant_id,
+            TeamWakeEvent.tenant_lifecycle_version
+            == task.tenant_lifecycle_version,
+            TeamWakeEvent.status == "pending",
+            exists(
+                select(TeamTask.id).where(
+                    TeamTask.id == task.id,
+                    TeamTask.team_id == task.team_id,
+                    TeamTask.tenant_id == task.tenant_id,
+                    TeamTask.tenant_lifecycle_version
+                    == task.tenant_lifecycle_version,
+                    TeamTask.status == "escalated",
+                )
+            ),
+            exists(
+                select(Tenant.id).where(
+                    Tenant.id == task.tenant_id,
+                    Tenant.status == "active",
+                    Tenant.lifecycle_version == task.tenant_lifecycle_version,
+                )
+            ),
+        )
+        .values(status="failed", error="timeout", updated_at=now)
+    )
+    return getattr(result, "rowcount", 0) == 1
 
 
 def task_timeout_minutes(team: Team) -> float:
@@ -56,6 +104,57 @@ def sweep_timed_out_tasks(db: Session, *, now: datetime | None = None) -> list[T
         team = db.get(Team, task.team_id)
         if team is None:
             continue
+        lifecycle_code = _team_lifecycle_failure_code(
+            db,
+            tenant_id=task.tenant_id,
+            persisted_version=task.tenant_lifecycle_version,
+            correlation_id=task.id,
+        )
+        if lifecycle_code is not None:
+            previous = task.status
+            wakes = [
+                wake
+                for wake in db.exec(
+                    select(TeamWakeEvent).where(
+                        TeamWakeEvent.team_id == team.id,
+                        TeamWakeEvent.status.in_(["pending", "claimed"]),
+                    )
+                ).all()
+                if str(
+                    (wake.payload_json if isinstance(wake.payload_json, dict) else {})
+                    .get("task_id")
+                    or ""
+                )
+                == task.id
+            ]
+            if wakes:
+                for wake in wakes:
+                    _terminalize_wake_lifecycle(db, wake, lifecycle_code)
+            else:
+                apply_task_transition(
+                    db,
+                    task,
+                    "escalated",
+                    actor_type="system",
+                    actor_id=None,
+                    event_type="task_escalated",
+                    payload={
+                        "reason": "tenant_lifecycle",
+                        "error": lifecycle_code,
+                    },
+                )
+                if task.team_run_id:
+                    run = db.get(TeamRun, task.team_run_id)
+                    if run is not None and run.status not in {"completed", "failed"}:
+                        run.status = "failed"
+                        run.error = lifecycle_code
+                        run.updated_at = utc_now()
+                        db.add(run)
+            db.commit()
+            escalated.append(task)
+            if previous == "in_progress" and task.assignee_agent_id:
+                _drain_member_queue(db, team, task.assignee_agent_id)
+            continue
         timeout_minutes = task_timeout_minutes(team)
         if now - task.updated_at < timedelta(minutes=timeout_minutes):
             continue
@@ -77,10 +176,12 @@ def sweep_timed_out_tasks(db: Session, *, now: datetime | None = None) -> list[T
             payload = wake.payload_json if isinstance(wake.payload_json, dict) else {}
             if str(payload.get("task_id") or "") != task.id:
                 continue
-            wake.status = "failed"
-            wake.error = "timeout"
-            wake.updated_at = utc_now()
-            db.add(wake)
+            _cas_pending_wake_timeout(
+                db,
+                task=task,
+                wake=wake,
+                now=now,
+            )
         db.commit()
         escalated.append(task)
         if task.team_run_id:

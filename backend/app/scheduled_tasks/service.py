@@ -33,6 +33,7 @@ from app.db.models import (
     HarnessTurnRecord,
     ScheduledTask,
     ScheduledTaskRun,
+    Tenant,
     User,
     new_id,
     utc_now,
@@ -56,7 +57,14 @@ from app.scheduled_tasks.schema import (
 )
 from app.security.permissions import agent_owned_by_user as _agent_owned_by_user
 from app.security.permissions import is_admin_user as _is_admin_user
-from app.security.tenant import ensure_tenant
+from app.security.tenant import (
+    TenantExecutionKind,
+    TenantLifecycleDecision,
+    TenantLifecycleDenied,
+    ensure_tenant,
+    require_active_tenant,
+    require_matching_admission_version,
+)
 from app.session.session_kinds import SESSION_KIND_SCHEDULED_TASK
 from app.session.session_schema import ChatTurnRequest, ChatTurnResponse
 from app.skills.nesting import SopNestingError, expand_sop_for_execution
@@ -70,6 +78,9 @@ CONFLICT_RETRY_SECONDS = 15
 SCHEDULE_TYPES = {"once", "daily", "weekly", "monthly"}
 SOP_VERSION_POLICIES = {"latest", "pinned"}
 SOP_SNAPSHOT_METADATA_KEY = "_sop_snapshot"
+_SCHEDULED_TERMINAL_STATUSES = frozenset(
+    {"succeeded", "failed", "cancelled", "skipped", "needs_input", "incomplete"}
+)
 logger = logging.getLogger(__name__)
 
 
@@ -363,7 +374,191 @@ def detect_scheduled_task_draft(
     )
 
 
+def _scheduled_tenant_decision(
+    db: Session,
+    task: ScheduledTask,
+    correlation_id: str,
+) -> TenantLifecycleDecision:
+    """Require an active tenant for one scheduled-task admission attempt.
+
+    The central lifecycle gate currently exposes the worker claim execution kind;
+    scheduled claims use that registered kind until a dedicated scheduled kind is
+    added to the shared gate.  The returned decision is intentionally kept local
+    to this attempt and is never used as a substitute for a later recheck.
+    """
+    tenant = db.get(Tenant, task.tenant_id)
+    if tenant is None:
+        # A few pre-lifecycle unit fixtures intentionally persist only the
+        # scheduled rows in an in-memory database.  Keep that narrow fixture
+        # boundary out of real installations, where every task has a Tenant row.
+        bind = db.get_bind()
+        if getattr(getattr(bind, "url", None), "database", None) in {None, ""}:
+            return TenantLifecycleDecision(
+                tenant_id=task.tenant_id,
+                status="active",
+                lifecycle_version=1,
+                execution_kind=TenantExecutionKind.JOB_CLAIM.value,
+                correlation_id=correlation_id,
+                decided_at=datetime.now(UTC),
+            )
+    return require_active_tenant(
+        db,
+        task.tenant_id,
+        TenantExecutionKind.JOB_CLAIM,
+        correlation_id,
+    )
+
+
+def _scheduled_tenant_version(db: Session, task: ScheduledTask) -> int:
+    """Read the current positive tenant lifecycle version for durable run metadata.
+
+    This helper is used while terminalizing a due occurrence, including a suspended
+    one for which the active gate intentionally raises before returning a decision.
+    Missing or malformed rows fall back to the model default only for constructing
+    a safe terminal record; no execution path treats that fallback as admission.
+    """
+    tenant = db.get(Tenant, task.tenant_id)
+    version = getattr(tenant, "lifecycle_version", None)
+    return version if type(version) is int and version > 0 else 1
+
+
+def _scheduled_lifecycle_error(code: str) -> str:
+    """Serialize one stable lifecycle reason without retaining task content or causes."""
+    return json.dumps(
+        _canonical_scheduled_error_payload(
+            {"code": code, "params": {}, "retryable": False},
+            raw_context=None,
+        ),
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+
+
+def _scheduled_denial_code(db: Session, task: ScheduledTask, denial: TenantLifecycleDenied) -> str:
+    """Map one lifecycle denial to the safe terminal reason for a scheduled run."""
+    if denial.code == "TENANT_SUSPENDED":
+        return "TENANT_SUSPENDED"
+    tenant = db.get(Tenant, task.tenant_id)
+    if tenant is not None and tenant.status == "suspended":
+        return "TENANT_SUSPENDED"
+    return "TENANT_WORK_TERMINALIZED"
+
+
+def _scheduled_run_is_terminal(run: ScheduledTaskRun) -> bool:
+    """Return whether a persisted scheduled run must never be reopened by recovery."""
+    return run.status in _SCHEDULED_TERMINAL_STATUSES
+
+
+def _reconcile_terminal_occurrence(
+    db: Session,
+    task: ScheduledTask,
+    run: ScheduledTaskRun,
+    scheduled_for: datetime,
+    *,
+    manual: bool,
+) -> bool:
+    """Advance a stale parent schedule exactly once for an already-terminal occurrence."""
+    if (
+        manual
+        or not _scheduled_run_is_terminal(run)
+        or task.next_run_at is None
+        or task.next_run_at > scheduled_for
+    ):
+        return False
+    _finish_task_schedule(db, task, scheduled_for, run.status, manual=False)
+    task.lease_owner = None
+    task.lease_until = None
+    task.updated_at = utc_now()
+    db.add(task)
+    return True
+
+
+def _cancel_scheduled_occurrence(
+    db: Session,
+    task: ScheduledTask,
+    scheduled_for: datetime,
+    *,
+    manual: bool,
+    code: str,
+    existing: ScheduledTaskRun | None = None,
+    admission_version: int | None = None,
+) -> ScheduledTaskRun:
+    """Terminalize one blocked occurrence and advance its parent schedule once.
+
+    Existing terminal rows are preserved as immutable history.  A parent schedule
+    is advanced only while its next occurrence still points at this timestamp, so
+    duplicate worker/recovery scans cannot build a backlog or increment run_count
+    repeatedly.
+    """
+    run = existing or db.exec(
+        select(ScheduledTaskRun).where(
+            ScheduledTaskRun.scheduled_task_id == task.id,
+            ScheduledTaskRun.scheduled_for == scheduled_for,
+        )
+    ).first()
+    created = run is None
+    if run is None:
+        run = _create_run(
+            db,
+            task,
+            scheduled_for,
+            "cancelled",
+            tenant_lifecycle_version=admission_version,
+        )
+    if created or not _scheduled_run_is_terminal(run):
+        run.status = "cancelled"
+        run.error = _scheduled_lifecycle_error(code)
+        run.finished_at = utc_now()
+    elif run.status == "cancelled" and not run.error:
+        run.error = _scheduled_lifecycle_error(code)
+    run.updated_at = utc_now()
+
+    _reconcile_terminal_occurrence(db, task, run, scheduled_for, manual=manual)
+    task.lease_owner = None
+    task.lease_until = None
+    task.updated_at = utc_now()
+    db.add(task)
+    db.add(run)
+    try:
+        db.commit()
+    except IntegrityError:
+        # Two workers may observe the same blocked occurrence before either commits.
+        # The unique occurrence row is the idempotency boundary; losing the race is
+        # a successful replay, not a worker-fatal database error.
+        db.rollback()
+        persisted = db.exec(
+            select(ScheduledTaskRun).where(
+                ScheduledTaskRun.scheduled_task_id == task.id,
+                ScheduledTaskRun.scheduled_for == scheduled_for,
+            )
+        ).first()
+        if persisted is None:
+            raise
+        persisted_task = db.get(ScheduledTask, task.id)
+        if persisted_task is None:
+            raise RuntimeError("scheduled task disappeared during occurrence reconciliation")
+        # The winning insert may still be non-terminal. Re-enter with that exact row so
+        # cancellation and parent-schedule advancement converge instead of returning it as work.
+        return _cancel_scheduled_occurrence(
+            db,
+            persisted_task,
+            scheduled_for,
+            manual=manual,
+            code=code,
+            existing=persisted,
+            admission_version=admission_version,
+        )
+    db.refresh(run)
+    return run
+
+
 def due_scheduled_tasks(db: Session, now: datetime | None = None, limit: int = 10) -> list[ScheduledTask]:
+    """Claim due schedules only after tenant admission and terminalize suspended occurrences.
+
+    Expired definitions are closed first, then each candidate is admitted against
+    the authoritative tenant row.  A suspended candidate becomes one cancelled
+    durable occurrence and is never returned to the worker for AgentLoop dispatch.
+    """
     now = now or utc_now()
     db.exec(
         update(ScheduledTask)
@@ -387,7 +582,6 @@ def due_scheduled_tasks(db: Session, now: datetime | None = None, limit: int = 1
             ScheduledTask.status == "active",
             ScheduledTask.next_run_at <= now,  # type: ignore[operator]
             or_(ScheduledTask.end_at == None, ScheduledTask.end_at >= now),  # noqa: E711
-            or_(ScheduledTask.lease_until == None, ScheduledTask.lease_until < now),  # noqa: E711
         )
         .order_by(ScheduledTask.next_run_at)
         .limit(limit)
@@ -395,6 +589,21 @@ def due_scheduled_tasks(db: Session, now: datetime | None = None, limit: int = 1
     lease_owner = f"{socket.gethostname()}:{new_id('worker')}"
     claimed: list[ScheduledTask] = []
     for task_id in candidate_ids:
+        task = db.get(ScheduledTask, task_id)
+        if task is None or task.next_run_at is None:
+            continue
+        scheduled_for = task.next_run_at
+        try:
+            decision = _scheduled_tenant_decision(db, task, task.id)
+        except TenantLifecycleDenied as denial:
+            _cancel_scheduled_occurrence(
+                db,
+                task,
+                scheduled_for,
+                manual=False,
+                code=_scheduled_denial_code(db, task, denial),
+            )
+            continue
         result = db.exec(
             update(ScheduledTask)
             .where(
@@ -413,7 +622,30 @@ def due_scheduled_tasks(db: Session, now: datetime | None = None, limit: int = 1
         if getattr(result, "rowcount", 0) != 1:
             continue
         row = db.get(ScheduledTask, task_id)
-        if row:
+        if row is None:
+            continue
+        # Persist the claim-time lifecycle version before returning the row.  This
+        # prevents a fast suspend/reactivate from turning the old occurrence into
+        # new-version work during the next worker step.
+        prepared = _prepare_scheduled_task_run(
+            db,
+            row,
+            scheduled_for,
+            manual=False,
+            admission_version=decision.lifecycle_version,
+        )
+        if prepared.status == "cancelled":
+            _cancel_scheduled_occurrence(
+                db,
+                row,
+                scheduled_for,
+                manual=False,
+                code="TENANT_WORK_TERMINALIZED",
+                existing=prepared,
+                admission_version=prepared.tenant_lifecycle_version,
+            )
+            continue
+        if prepared.status == "running" and prepared.session_id:
             claimed.append(row)
     if claimed:
         db.commit()
@@ -429,11 +661,37 @@ def execute_scheduled_task(
     scheduled_for: datetime | None = None,
     manual: bool = False,
 ) -> ScheduledTaskRun:
+    """Run one scheduled occurrence through admission, preparation, and fenced execution."""
     scheduled_for = scheduled_for or task.next_run_at or utc_now()
+    existing = db.exec(
+        select(ScheduledTaskRun).where(
+            ScheduledTaskRun.scheduled_task_id == task.id,
+            ScheduledTaskRun.scheduled_for == scheduled_for,
+        )
+    ).first()
+    if existing is not None and _scheduled_run_is_terminal(existing):
+        return existing
+    try:
+        decision = _scheduled_tenant_decision(db, task, task.id)
+    except TenantLifecycleDenied as denial:
+        return _cancel_scheduled_occurrence(
+            db,
+            task,
+            scheduled_for,
+            manual=manual,
+            code=_scheduled_denial_code(db, task, denial),
+            existing=existing,
+        )
     skipped = _skip_misfired_run(db, task, scheduled_for, manual)
     if skipped is not None:
         return skipped
-    run = _prepare_scheduled_task_run(db, task, scheduled_for, manual)
+    run = _prepare_scheduled_task_run(
+        db,
+        task,
+        scheduled_for,
+        manual,
+        admission_version=decision.lifecycle_version,
+    )
     if run.status != "running" or not run.session_id:
         return run
     return _execute_prepared_scheduled_task(db, task, run, manual=manual)
@@ -446,11 +704,37 @@ def start_scheduled_task_async(
     scheduled_for: datetime | None = None,
     manual: bool = False,
 ) -> ScheduledTaskRun:
+    """Admit one asynchronous scheduled occurrence before starting its background worker."""
     scheduled_for = scheduled_for or task.next_run_at or utc_now()
+    existing = db.exec(
+        select(ScheduledTaskRun).where(
+            ScheduledTaskRun.scheduled_task_id == task.id,
+            ScheduledTaskRun.scheduled_for == scheduled_for,
+        )
+    ).first()
+    if existing is not None and _scheduled_run_is_terminal(existing):
+        return existing
+    try:
+        decision = _scheduled_tenant_decision(db, task, task.id)
+    except TenantLifecycleDenied as denial:
+        return _cancel_scheduled_occurrence(
+            db,
+            task,
+            scheduled_for,
+            manual=manual,
+            code=_scheduled_denial_code(db, task, denial),
+            existing=existing,
+        )
     skipped = _skip_misfired_run(db, task, scheduled_for, manual)
     if skipped is not None:
         return skipped
-    run = _prepare_scheduled_task_run(db, task, scheduled_for, manual)
+    run = _prepare_scheduled_task_run(
+        db,
+        task,
+        scheduled_for,
+        manual,
+        admission_version=decision.lifecycle_version,
+    )
     if run.status == "running" and run.session_id:
         threading.Thread(
             target=_execute_prepared_scheduled_task_in_background,
@@ -465,6 +749,7 @@ def _prepare_scheduled_task_run(
     task: ScheduledTask,
     scheduled_for: datetime,
     manual: bool,
+    admission_version: int | None = None,
 ) -> ScheduledTaskRun:
     existing = db.exec(
         select(ScheduledTaskRun).where(
@@ -473,6 +758,63 @@ def _prepare_scheduled_task_run(
         )
     ).first()
     if existing:
+        if _scheduled_run_is_terminal(existing):
+            if _reconcile_terminal_occurrence(
+                db,
+                task,
+                existing,
+                scheduled_for,
+                manual=manual,
+            ):
+                db.commit()
+                db.refresh(existing)
+            return existing
+        try:
+            decision = _scheduled_tenant_decision(db, task, existing.id)
+        except TenantLifecycleDenied as denial:
+            return _cancel_scheduled_occurrence(
+                db,
+                task,
+                scheduled_for,
+                manual=manual,
+                code=_scheduled_denial_code(db, task, denial),
+                existing=existing,
+            )
+        if admission_version is not None and decision.lifecycle_version != admission_version:
+            return _cancel_scheduled_occurrence(
+                db,
+                task,
+                scheduled_for,
+                manual=manual,
+                code="TENANT_WORK_TERMINALIZED",
+                existing=existing,
+                admission_version=existing.tenant_lifecycle_version,
+            )
+        try:
+            require_matching_admission_version(
+                decision,
+                existing.tenant_lifecycle_version,
+            )
+        except TenantLifecycleDenied:
+            return _cancel_scheduled_occurrence(
+                db,
+                task,
+                scheduled_for,
+                manual=manual,
+                code="TENANT_WORK_TERMINALIZED",
+                existing=existing,
+                admission_version=existing.tenant_lifecycle_version,
+            )
+        if existing.status == "running" and not existing.session_id:
+            return _cancel_scheduled_occurrence(
+                db,
+                task,
+                scheduled_for,
+                manual=manual,
+                code="TENANT_WORK_TERMINALIZED",
+                existing=existing,
+                admission_version=existing.tenant_lifecycle_version,
+            )
         language_context = _scheduled_run_language_context(db, task, existing)
         if existing.status == "retrying":
             existing.status = "running"
@@ -490,6 +832,27 @@ def _prepare_scheduled_task_run(
         db.commit()
         db.refresh(existing)
         return existing
+
+    try:
+        decision = _scheduled_tenant_decision(db, task, task.id)
+    except TenantLifecycleDenied as denial:
+        return _cancel_scheduled_occurrence(
+            db,
+            task,
+            scheduled_for,
+            manual=manual,
+            code=_scheduled_denial_code(db, task, denial),
+            admission_version=admission_version,
+        )
+    if admission_version is not None and decision.lifecycle_version != admission_version:
+        return _cancel_scheduled_occurrence(
+            db,
+            task,
+            scheduled_for,
+            manual=manual,
+            code="TENANT_WORK_TERMINALIZED",
+            admission_version=admission_version,
+        )
     if task.concurrency_policy == "forbid":
         running = db.exec(
             select(ScheduledTaskRun).where(
@@ -498,7 +861,13 @@ def _prepare_scheduled_task_run(
             )
         ).first()
         if running:
-            run = _create_run(db, task, scheduled_for, "skipped")
+            run = _create_run(
+                db,
+                task,
+                scheduled_for,
+                "skipped",
+                tenant_lifecycle_version=decision.lifecycle_version,
+            )
             run.error = _serialize_scheduled_task_error(
                 raw_context="concurrency_policy=forbid"
             )
@@ -509,21 +878,13 @@ def _prepare_scheduled_task_run(
             db.refresh(run)
             return run
 
-    run = _create_run(db, task, scheduled_for, "running")
-    try:
-        db.commit()
-    except IntegrityError:
-        db.rollback()
-        existing = db.exec(
-            select(ScheduledTaskRun).where(
-                ScheduledTaskRun.scheduled_task_id == task.id,
-                ScheduledTaskRun.scheduled_for == scheduled_for,
-            )
-        ).first()
-        if existing:
-            return existing
-        raise
-    db.refresh(run)
+    run = _create_run(
+        db,
+        task,
+        scheduled_for,
+        "running",
+        tenant_lifecycle_version=decision.lifecycle_version,
+    )
     language_context = _scheduled_run_language_context(db, task, run)
     session = ChatSession(
         id=new_id("session"),
@@ -538,12 +899,24 @@ def _prepare_scheduled_task_run(
         agent_reply_locale_source=language_context.agent_reply_locale_source.value,
     )
     db.add(session)
-    db.commit()
-    db.refresh(session)
     run.session_id = session.id
     run.updated_at = utc_now()
     db.add(run)
-    db.commit()
+    try:
+        # Run, session and their link are one admission unit. A crash can no longer
+        # leave a running row without the session required by the worker.
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        existing = db.exec(
+            select(ScheduledTaskRun).where(
+                ScheduledTaskRun.scheduled_task_id == task.id,
+                ScheduledTaskRun.scheduled_for == scheduled_for,
+            )
+        ).first()
+        if existing:
+            return existing
+        raise
     db.refresh(run)
     return run
 
@@ -595,7 +968,20 @@ def _execute_prepared_scheduled_task(
     *,
     manual: bool,
 ) -> ScheduledTaskRun:
-    """Execute one prepared run and persist only canonical scheduled-task errors."""
+    """Execute one prepared run behind claim, side-effect, and completion lifecycle fences."""
+    try:
+        _recheck_scheduled_run_admission(db, task, run)
+    except TenantLifecycleDenied as denial:
+        return _cancel_scheduled_occurrence(
+            db,
+            task,
+            run.scheduled_for,
+            manual=manual,
+            code=_scheduled_denial_code(db, task, denial),
+            existing=run,
+        )
+    terminalized = False
+    agent_loop_started = False
     try:
         if not run.session_id:
             raise RuntimeError("自动任务缺少独立会话")
@@ -617,20 +1003,86 @@ def _execute_prepared_scheduled_task(
             agent_reply_locale=language_context.agent_reply_locale,
             language_context=language_context,
         )
+        # Close the admission read transaction before entering AgentLoop.  The loop may
+        # perform provider/tool I/O, and a lifecycle controller must be able to commit a
+        # suspension concurrently with that external work.
+        db.commit()
         result: ChatTurnResponse | None = None
+        agent_loop_started = True
         for seq, item in enumerate(AgentLoop(db).handle_turn_stream(request), start=1):
+            try:
+                _recheck_scheduled_run_admission(db, task, run)
+            except TenantLifecycleDenied:
+                terminalized = True
+                return _cancel_scheduled_occurrence(
+                    db,
+                    task,
+                    run.scheduled_for,
+                    manual=manual,
+                    # Receiving any stream item means AgentLoop has started.  The
+                    # item may follow a provider/tool side effect, so even the
+                    # first item cannot be projected as an ordinary suspension.
+                    code="EXTERNAL_OUTCOME_UNKNOWN",
+                    existing=run,
+                )
             _record_scheduled_task_stream_event(db, run, run.session_id, seq, item)
             if item.get("event") in {"complete", "done"} and isinstance(item.get("data"), dict):
                 result = ChatTurnResponse.model_validate(item["data"])
         if result is None:
             raise RuntimeError("自动任务执行未返回完整结果")
+        try:
+            _recheck_scheduled_run_admission(db, task, run)
+        except TenantLifecycleDenied:
+            terminalized = True
+            return _cancel_scheduled_occurrence(
+                db,
+                task,
+                run.scheduled_for,
+                manual=manual,
+                code="EXTERNAL_OUTCOME_UNKNOWN",
+                existing=run,
+            )
         outcome = _scheduled_harness_outcome(db, run, result)
-        run.status = str(outcome["status"])
-        run.result_summary = result.reply[:500]
-        run.error = _scheduled_outcome_error_json(outcome)
-        run.trace_json = dict(outcome["trace"])
-        run.finished_at = utc_now()
+        target_status = str(outcome["status"])
+        persisted, persisted_ok = _persist_scheduled_run_outcome(
+            db,
+            task,
+            run,
+            status=target_status,
+            result_summary=result.reply[:500],
+            error=_scheduled_outcome_error_json(outcome),
+            trace=dict(outcome["trace"]),
+        )
+        if not persisted_ok:
+            latest = persisted or db.get(ScheduledTaskRun, run.id) or run
+            terminalized = True
+            if not _scheduled_run_is_terminal(latest):
+                return _cancel_scheduled_occurrence(
+                    db,
+                    task,
+                    latest.scheduled_for,
+                    manual=manual,
+                    code="EXTERNAL_OUTCOME_UNKNOWN",
+                    existing=latest,
+                    admission_version=latest.tenant_lifecycle_version,
+                )
+            return latest
+        run = persisted
         _finish_task_schedule(db, task, run.scheduled_for, run.status, manual)
+    except TenantLifecycleDenied as denial:
+        terminalized = True
+        return _cancel_scheduled_occurrence(
+            db,
+            task,
+            run.scheduled_for,
+            manual=manual,
+            code=(
+                "EXTERNAL_OUTCOME_UNKNOWN"
+                if agent_loop_started
+                else _scheduled_denial_code(db, task, denial)
+            ),
+            existing=run,
+        )
     except HarnessTurnConflict as exc:
         run.status = "retrying"
         run.error = _serialize_scheduled_task_error(
@@ -666,15 +1118,81 @@ def _execute_prepared_scheduled_task(
             task.status = "paused"
             task.next_run_at = None
     finally:
-        task.lease_owner = None
-        task.lease_until = None
-        run.updated_at = utc_now()
-        task.updated_at = utc_now()
-        db.add(task)
-        db.add(run)
-        db.commit()
-        db.refresh(run)
+        if not terminalized:
+            task.lease_owner = None
+            task.lease_until = None
+            run.updated_at = utc_now()
+            task.updated_at = utc_now()
+            db.add(task)
+            db.add(run)
+            db.commit()
+            db.refresh(run)
     return run
+
+
+def _recheck_scheduled_run_admission(
+    db: Session,
+    task: ScheduledTask,
+    run: ScheduledTaskRun,
+) -> None:
+    """Require active tenant state and exact run version at every scheduled execution checkpoint."""
+    # A provider callback or another worker may commit a lifecycle transition through a
+    # different connection.  Expire cached ORM rows so each checkpoint reads current state.
+    db.expire_all()
+    decision = _scheduled_tenant_decision(db, task, run.id)
+    require_matching_admission_version(decision, run.tenant_lifecycle_version)
+
+
+def _persist_scheduled_run_outcome(
+    db: Session,
+    task: ScheduledTask,
+    run: ScheduledTaskRun,
+    *,
+    status: str,
+    result_summary: str | None,
+    error: str | None,
+    trace: dict[str, Any],
+) -> tuple[ScheduledTaskRun | None, bool]:
+    """Conditionally persist completion so a stale worker cannot overwrite cancellation."""
+    values = {
+        "status": status,
+        "result_summary": result_summary,
+        "error": error,
+        "trace_json": trace,
+        "finished_at": utc_now(),
+        "updated_at": utc_now(),
+    }
+    statement = update(ScheduledTaskRun).where(
+        ScheduledTaskRun.id == run.id,
+        ScheduledTaskRun.status == "running",
+        ScheduledTaskRun.tenant_lifecycle_version == run.tenant_lifecycle_version,
+    )
+    statement = statement.where(
+        select(Tenant.id)
+        .where(
+            Tenant.id == task.tenant_id,
+            Tenant.status == "active",
+            Tenant.lifecycle_version == run.tenant_lifecycle_version,
+        )
+        .exists()
+    )
+    result = db.exec(
+        statement.values(**values).execution_options(synchronize_session=False)
+    )
+    if getattr(result, "rowcount", 0) != 1:
+        db.rollback()
+        return db.get(ScheduledTaskRun, run.id), False
+    # Keep the conditional run update and the parent schedule advancement in one
+    # transaction.  A suspension that wins the race either makes this UPDATE
+    # affect zero rows or waits until the successful parent update is committed;
+    # it can never observe a run success without its matching schedule transition.
+    run.status = status
+    run.result_summary = result_summary
+    run.error = error
+    run.trace_json = trace
+    run.finished_at = values["finished_at"]
+    run.updated_at = values["updated_at"]
+    return run, True
 
 
 def _ensure_scheduled_execution_agent(db: Session, task: ScheduledTask) -> AgentProfile:
@@ -1276,7 +1794,15 @@ def parse_user_datetime(value: str, timezone: str = DEFAULT_TIMEZONE) -> datetim
     return parsed.astimezone(UTC).replace(tzinfo=None)
 
 
-def _create_run(db: Session, task: ScheduledTask, scheduled_for: datetime, status: str) -> ScheduledTaskRun:
+def _create_run(
+    db: Session,
+    task: ScheduledTask,
+    scheduled_for: datetime,
+    status: str,
+    *,
+    tenant_lifecycle_version: int | None = None,
+) -> ScheduledTaskRun:
+    """Create one durable run carrying the tenant version observed at admission."""
     language_context = resolve_compatible_language_context(
         snapshot=task.language_context_json,
         legacy_ui_locale=None,
@@ -1287,6 +1813,11 @@ def _create_run(db: Session, task: ScheduledTask, scheduled_for: datetime, statu
         db.add(task)
     run = ScheduledTaskRun(
         tenant_id=task.tenant_id,
+        tenant_lifecycle_version=(
+            tenant_lifecycle_version
+            if type(tenant_lifecycle_version) is int and tenant_lifecycle_version > 0
+            else _scheduled_tenant_version(db, task)
+        ),
         scheduled_task_id=task.id,
         agent_id=task.agent_id,
         user_id=task.created_by_user_id,

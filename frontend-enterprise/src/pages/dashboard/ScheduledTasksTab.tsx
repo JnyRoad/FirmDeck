@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 
 import { ConfirmDialog } from '@/components/ConfirmDialog';
@@ -14,12 +14,13 @@ import { useAppIntl, type AppLocale, type AppTranslator, type MessageId, type Me
 import { RawContent } from '@/i18n/RawContent';
 import { MOBILE_CARD_CLASS } from '@/lib/enterprise-ui';
 
-import { api, TENANT_ID } from '../../api/client';
+import { createTenantClient } from '../../api/tenant-client';
 import IconAdd from '../../assets/icons/add.svg?react';
 import IconAlignJustify from '../../assets/icons/align-justify.svg?react';
 import IconAlarm from '../../assets/icons/profile-alarm.svg?react';
 import IconSearch from '../../assets/icons/search.svg?react';
 import { useClientPagination } from '../../hooks/useClientPagination';
+import { useTenantSession } from '../../contexts/TenantSessionContext';
 import type { AgentProfileRead, ScheduledTaskRead, ScheduledTaskRunRead } from '../../types';
 import { StatusBadge } from '../scheduled-tasks/StatusBadge';
 import { TaskActionsMenu } from '../scheduled-tasks/TaskActionsMenu';
@@ -32,6 +33,7 @@ import {
   type TaskListFilter,
 } from '../scheduled-tasks/shared';
 import { isTeamScope, readEmployeeScope } from '../../lib/agent-scope-storage';
+import { tenantUserStorageKey } from '../../lib/tenant-storage';
 import { getClientTimeZone, parseBackendDateTime } from '../../lib/timezone';
 
 export {
@@ -46,6 +48,52 @@ const MOBILE_META_CLASS =
 const MOBILE_TITLE_CLASS =
   'min-w-0 wrap-break-word text-[14px] font-semibold text-[#18181a]';
 const MOBILE_SUMMARY_CLASS = 'mt-[8px] line-clamp-2 text-[12px] leading-[1.55] text-[#858b9c]';
+const SCHEDULED_TASK_FILTER_FEATURE = 'scheduled-task-filter';
+
+const TASK_FILTER_VALUES = new Set<TaskListFilter>(['all', 'pending', 'completed', 'paused']);
+const RUN_FILTER_VALUES = new Set<RunListFilter>(['all', 'pending', 'completed', 'failed']);
+
+type StoredScheduledTaskFilters = {
+  task: TaskListFilter;
+  run: RunListFilter;
+};
+
+/** Generate the tenant/user namespace for scheduled-task view preferences. */
+function scheduledTaskFilterStorageKey(tenantId: string, userId: string): string {
+  return tenantUserStorageKey(tenantId, userId, SCHEDULED_TASK_FILTER_FEATURE);
+}
+
+/** Read only supported scheduled-task filters from one tenant/user namespace. */
+function readScheduledTaskFilters(tenantId: string, userId: string): StoredScheduledTaskFilters {
+  try {
+    const raw = window.localStorage.getItem(scheduledTaskFilterStorageKey(tenantId, userId));
+    if (!raw) return { task: 'all', run: 'all' };
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    return {
+      task: typeof parsed.task === 'string' && TASK_FILTER_VALUES.has(parsed.task as TaskListFilter)
+        ? parsed.task as TaskListFilter
+        : 'all',
+      run: typeof parsed.run === 'string' && RUN_FILTER_VALUES.has(parsed.run as RunListFilter)
+        ? parsed.run as RunListFilter
+        : 'all',
+    };
+  } catch {
+    return { task: 'all', run: 'all' };
+  }
+}
+
+/** Persist scheduled-task filters only under the verified tenant/user namespace. */
+function persistScheduledTaskFilters(
+  tenantId: string,
+  userId: string,
+  filters: StoredScheduledTaskFilters,
+): void {
+  try {
+    window.localStorage.setItem(scheduledTaskFilterStorageKey(tenantId, userId), JSON.stringify(filters));
+  } catch {
+    // A blocked or full browser store must not affect scheduled-task requests.
+  }
+}
 
 type ScheduledTasksMessageId = MessageId;
 
@@ -147,9 +195,22 @@ function formatScheduledSchedule(
 
 /** 渲染定时任务与执行记录；产品 chrome 随当前 UI locale 本地化，任务/结果正文保留 raw。 */
 export default function ScheduledTasksTab() {
+  const tenantContext = useTenantSession();
+  const tenantClient = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
+  const tenantId = tenantContext?.tenantId || '';
+  const userId = tenantContext?.userId || '';
+  const tenantScopeKey = tenantContext
+    ? `${tenantId}:${userId}:${tenantContext.generation}`
+    : '';
+  const scopeKeyRef = useRef('');
+  const loadControllerRef = useRef<AbortController | null>(null);
+  const agentIdRef = useRef('');
+  const scopeRevisionRef = useRef(0);
+  const actionControllersRef = useRef(new Set<AbortController>());
+  const [scopeReady, setScopeReady] = useState(false);
   const [rows, setRows] = useState<ScheduledTaskRead[]>([]);
   const [agents, setAgents] = useState<AgentProfileRead[]>([]);
-  const [agentId, setAgentId] = useState(readEmployeeScope);
+  const [agentId, setAgentId] = useState('');
   const [loading, setLoading] = useState(false);
   const [runsOpen, setRunsOpen] = useState(false);
   const [runRows, setRunRows] = useState<ScheduledTaskRunRead[]>([]);
@@ -163,6 +224,32 @@ export default function ScheduledTasksTab() {
   const { t: appT, locale } = useAppIntl();
   const translate = createScheduledTasksTranslator({ t: appT });
   const toast = createToastNotifier({ t: appT });
+
+  // Keep the latest employee scope visible to in-flight callbacks before passive effects run.
+  agentIdRef.current = agentId;
+
+  /** Abort task actions when the employee scope, tenant generation, or tab lifecycle changes. */
+  function cancelActionControllers() {
+    actionControllersRef.current.forEach((controller) => controller.abort());
+    actionControllersRef.current.clear();
+  }
+
+  /** Advance the scope revision synchronously and clear stale task/run UI. */
+  function updateAgentScope(nextAgentId: string) {
+    agentIdRef.current = nextAgentId;
+    scopeRevisionRef.current += 1;
+    cancelActionControllers();
+    setAgentId(nextAgentId);
+    setRows([]);
+    setRunRows([]);
+    setAllRunRows([]);
+    setRunsOpen(false);
+    setRunLoading(false);
+    setDeleteTarget(null);
+    setDeleting(false);
+  }
+
+  useEffect(() => () => cancelActionControllers(), [tenantContext?.generation]);
 
   const taskFilterTabs: UnderlineTabItem<TaskListFilter>[] = [
     { label: translate('scheduledTasksPage.filter.all'), value: 'all' },
@@ -181,51 +268,142 @@ export default function ScheduledTasksTab() {
   const createDisabled = !agentId || Boolean(selectedAgent?.is_overall);
 
   useEffect(() => {
+    if (!tenantContext || !tenantId || !userId) {
+      scopeKeyRef.current = '';
+      agentIdRef.current = '';
+      scopeRevisionRef.current += 1;
+      cancelActionControllers();
+      setScopeReady(false);
+      setAgentId('');
+      setTaskFilter('all');
+      setRunFilter('all');
+      setRows([]);
+      setRunRows([]);
+      setAllRunRows([]);
+      setRunsOpen(false);
+      return;
+    }
+    scopeKeyRef.current = tenantScopeKey;
+    const nextAgentId = readEmployeeScope(tenantId, userId);
+    agentIdRef.current = nextAgentId;
+    scopeRevisionRef.current += 1;
+    cancelActionControllers();
+    setAgentId(nextAgentId);
+    const storedFilters = readScheduledTaskFilters(tenantId, userId);
+    setTaskFilter(storedFilters.task);
+    setRunFilter(storedFilters.run);
+    setScopeReady(true);
+  }, [tenantContext, tenantId, tenantScopeKey, userId]);
+
+  useEffect(() => {
     const onScopeChange = (event: Event) => {
       const next = (event as CustomEvent<{ agentId?: string }>).detail?.agentId || '';
-      setAgentId(next && !isTeamScope(next) ? next : readEmployeeScope());
+      if (!tenantContext || !tenantId || !userId || scopeKeyRef.current !== tenantScopeKey) return;
+      updateAgentScope(next && !isTeamScope(next) ? next : readEmployeeScope(tenantId, userId));
     };
     window.addEventListener('ultrarag-enterprise-agent-scope-change', onScopeChange);
     return () => window.removeEventListener('ultrarag-enterprise-agent-scope-change', onScopeChange);
-  }, []);
+  }, [tenantContext, tenantId, tenantScopeKey, userId]);
 
   useEffect(() => {
-    void loadAgents();
-  }, []);
+    if (!tenantContext || !tenantId || !userId || !scopeReady || scopeKeyRef.current !== tenantScopeKey) return;
+    const requestController = new AbortController();
+    const generation = tenantContext.generation;
+    const isCurrent = () => (
+      !requestController.signal.aborted
+      && tenantContext.isCurrentGeneration(generation)
+      && scopeKeyRef.current === tenantScopeKey
+    );
+    void loadAgents(requestController.signal, isCurrent);
+    return () => requestController.abort();
+  }, [scopeReady, tenantClient, tenantContext, tenantId, tenantScopeKey, userId]);
 
   useEffect(() => {
-    if (agentId) void load();
-  }, [agentId]);
+    if (!agentId || !tenantContext || !tenantId || !userId || !scopeReady || scopeKeyRef.current !== tenantScopeKey) return;
+    void load();
+    return () => {
+      loadControllerRef.current?.abort();
+    };
+    // `load` is an intentionally local dispatcher; the effect dependencies above fence its captured scope.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agentId, scopeReady, tenantContext, tenantId, tenantScopeKey, userId]);
+
+  useEffect(() => {
+    if (!tenantContext || !tenantId || !userId || !scopeReady || scopeKeyRef.current !== tenantScopeKey) return;
+    persistScheduledTaskFilters(tenantId, userId, { task: taskFilter, run: runFilter });
+  }, [runFilter, scopeReady, taskFilter, tenantContext, tenantId, tenantScopeKey, userId]);
 
   /** 加载可选数字员工；员工名称和标识仅作为业务数据使用。 */
-  async function loadAgents() {
+  async function loadAgents(signal?: AbortSignal, isCurrent: () => boolean = () => true) {
+    if (!tenantContext || !tenantId || !userId) return;
     try {
-      const result = await api.get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${TENANT_ID}`);
-      setAgents(result);
+      const result = await tenantClient.get<AgentProfileRead[]>('/api/enterprise/agents', { signal });
+      if (isCurrent()) setAgents(result);
     } catch {
-      setAgents([]);
+      if (isCurrent()) setAgents([]);
     }
   }
 
   /** 加载当前员工的定时任务及执行记录；异常只产生稳定产品 toast。 */
   async function load() {
+    if (!tenantContext || !tenantId || !userId || !scopeReady || scopeKeyRef.current !== tenantScopeKey) return;
+    loadControllerRef.current?.abort();
+    const requestController = new AbortController();
+    loadControllerRef.current = requestController;
+    const generation = tenantContext.generation;
+    const capturedAgentId = agentId;
+    const capturedScopeRevision = scopeRevisionRef.current;
+    const isCurrent = () => (
+      !requestController.signal.aborted
+      && tenantContext.isCurrentGeneration(generation)
+      && scopeKeyRef.current === tenantScopeKey
+      && agentIdRef.current === capturedAgentId
+      && scopeRevisionRef.current === capturedScopeRevision
+    );
     setLoading(true);
     try {
       const [result, runResult] = await Promise.all([
-        api.get<ScheduledTaskRead[]>(
-          `/api/enterprise/scheduled-tasks?tenant_id=${TENANT_ID}&agent_id=${encodeURIComponent(agentId)}`,
+        tenantClient.get<ScheduledTaskRead[]>(
+          `/api/enterprise/scheduled-tasks?agent_id=${encodeURIComponent(agentId)}`,
+          { signal: requestController.signal },
         ),
-        api.get<ScheduledTaskRunRead[]>(
-          `/api/enterprise/scheduled-tasks/runs?tenant_id=${TENANT_ID}&agent_id=${encodeURIComponent(agentId)}&limit=200`,
+        tenantClient.get<ScheduledTaskRunRead[]>(
+          `/api/enterprise/scheduled-tasks/runs?agent_id=${encodeURIComponent(agentId)}&limit=200`,
+          { signal: requestController.signal },
         ),
       ]);
+      if (!isCurrent()) return;
       setRows(result);
       setAllRunRows(runResult);
     } catch (error) {
-      toast.error(createMessageDescriptor('scheduledTasksPage.toast.loadFailed'));
+      if (isCurrent()) toast.error(createMessageDescriptor('scheduledTasksPage.toast.loadFailed'));
     } finally {
-      setLoading(false);
+      if (loadControllerRef.current === requestController) {
+        loadControllerRef.current = null;
+        if (isCurrent()) setLoading(false);
+      }
     }
+  }
+
+  /** Create an action fence that blocks stale scheduled-task writes after tenant replacement. */
+  function beginActionFence() {
+    if (!tenantContext || !tenantId || !userId || !scopeReady || scopeKeyRef.current !== tenantScopeKey) return null;
+    const requestController = new AbortController();
+    actionControllersRef.current.add(requestController);
+    const generation = tenantContext.generation;
+    const capturedAgentId = agentId;
+    const capturedScopeRevision = scopeRevisionRef.current;
+    return {
+      signal: requestController.signal,
+      isCurrent: () => (
+        !requestController.signal.aborted
+        && tenantContext.isCurrentGeneration(generation)
+        && scopeKeyRef.current === tenantScopeKey
+        && agentIdRef.current === capturedAgentId
+        && scopeRevisionRef.current === capturedScopeRevision
+      ),
+      release: () => actionControllersRef.current.delete(requestController),
+    };
   }
 
   /** 切换定时任务状态；后端状态码映射为当前 locale 的产品提示。 */
@@ -239,19 +417,24 @@ export default function ScheduledTasksTab() {
       return;
     }
     const nextStatus = row.status === 'active' ? 'paused' : 'active';
+    const fence = beginActionFence();
+    if (!fence) return;
     try {
-      await api.put<ScheduledTaskRead>(`/api/enterprise/scheduled-tasks/${row.id}`, {
-        tenant_id: TENANT_ID,
+      await tenantClient.put<ScheduledTaskRead>(`/api/enterprise/scheduled-tasks/${row.id}`, {
         status: nextStatus,
-      });
+      }, { signal: fence.signal });
+      if (!fence.isCurrent()) return;
       toast.success(createMessageDescriptor(
         nextStatus === 'active'
           ? 'scheduledTasksPage.toast.enabled'
           : 'scheduledTasksPage.toast.paused',
       ));
+      if (!fence.isCurrent()) return;
       await load();
     } catch (error) {
-      toast.error(createMessageDescriptor('scheduledTasksPage.toast.toggleFailed'));
+      if (fence.isCurrent()) toast.error(createMessageDescriptor('scheduledTasksPage.toast.toggleFailed'));
+    } finally {
+      fence.release();
     }
   }
 
@@ -261,18 +444,26 @@ export default function ScheduledTasksTab() {
       toast.warning(createMessageDescriptor('scheduledTasksPage.toast.archivedCannotRun'));
       return;
     }
+    const fence = beginActionFence();
+    if (!fence) return;
     try {
-      const run = await api.post<ScheduledTaskRunRead>(
-        `/api/enterprise/scheduled-tasks/${row.id}/run-now?tenant_id=${TENANT_ID}`,
+      const run = await tenantClient.post<ScheduledTaskRunRead>(
+        `/api/enterprise/scheduled-tasks/${row.id}/run-now`,
+        undefined,
+        { signal: fence.signal },
       );
+      if (!fence.isCurrent()) return;
       toast.success(createMessageDescriptor(
         run.session_id
           ? 'scheduledTasksPage.toast.runCreated'
           : 'scheduledTasksPage.toast.runTriggered',
       ));
+      if (!fence.isCurrent()) return;
       await load();
     } catch (error) {
-      toast.error(createMessageDescriptor('scheduledTasksPage.toast.runNowFailed'));
+      if (fence.isCurrent()) toast.error(createMessageDescriptor('scheduledTasksPage.toast.runNowFailed'));
+    } finally {
+      fence.release();
     }
   }
 
@@ -284,32 +475,46 @@ export default function ScheduledTasksTab() {
   /** 删除定时任务并保留服务端历史执行记录；提示使用稳定语义键。 */
   async function confirmDelete() {
     if (!deleteTarget) return;
+    const fence = beginActionFence();
+    if (!fence) return;
     setDeleting(true);
     try {
-      await api.delete(`/api/enterprise/scheduled-tasks/${deleteTarget.id}?tenant_id=${TENANT_ID}`);
+      await tenantClient.delete(
+        `/api/enterprise/scheduled-tasks/${deleteTarget.id}`,
+        undefined,
+        { signal: fence.signal },
+      );
+      if (!fence.isCurrent()) return;
       toast.success(createMessageDescriptor('scheduledTasksPage.toast.deleted'));
       setDeleteTarget(null);
+      if (!fence.isCurrent()) return;
       await load();
     } catch (error) {
-      toast.error(createMessageDescriptor('scheduledTasksPage.toast.deleteFailed'));
+      if (fence.isCurrent()) toast.error(createMessageDescriptor('scheduledTasksPage.toast.deleteFailed'));
     } finally {
-      setDeleting(false);
+      if (fence.isCurrent()) setDeleting(false);
+      fence.release();
     }
   }
 
   /** 打开单任务执行记录；服务端错误不直接展示异常正文。 */
   async function openRuns(row: ScheduledTaskRead) {
+    const fence = beginActionFence();
+    if (!fence) return;
     setRunsOpen(true);
     setRunLoading(true);
     try {
-      const result = await api.get<ScheduledTaskRunRead[]>(
-        `/api/enterprise/scheduled-tasks/${row.id}/runs?tenant_id=${TENANT_ID}`,
+      const result = await tenantClient.get<ScheduledTaskRunRead[]>(
+        `/api/enterprise/scheduled-tasks/${row.id}/runs`,
+        { signal: fence.signal },
       );
+      if (!fence.isCurrent()) return;
       setRunRows(result);
     } catch (error) {
-      toast.error(createMessageDescriptor('scheduledTasksPage.toast.runsLoadFailed'));
+      if (fence.isCurrent()) toast.error(createMessageDescriptor('scheduledTasksPage.toast.runsLoadFailed'));
     } finally {
-      setRunLoading(false);
+      if (fence.isCurrent()) setRunLoading(false);
+      fence.release();
     }
   }
 

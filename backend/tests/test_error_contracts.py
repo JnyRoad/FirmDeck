@@ -168,6 +168,33 @@ _T084_EXPECTED_ENTRIES = {
     "UI_RUNTIME_NETWORK_UNAVAILABLE": ("errors.ui.runtimeNetworkUnavailable", 503, True, {}),
 }
 
+_T007_EXPECTED_ENTRIES = {
+    "SYSTEM_AUTH_UNAVAILABLE": ("errors.system.authUnavailable", 503, False, {}),
+    "SYSTEM_AUTH_INVALID_CREDENTIALS": (
+        "errors.systemAuth.invalidCredentials",
+        401,
+        False,
+        {},
+    ),
+    "SYSTEM_ADMIN_DISABLED": ("errors.system.adminDisabled", 401, False, {}),
+    "SYSTEM_CONTROL_CONFLICT": ("errors.system.controlConflict", 409, False, {}),
+    "TEMPORARY_PASSWORD_CHANGE_REQUIRED": (
+        "errors.auth.temporaryPasswordChangeRequired",
+        403,
+        False,
+        {},
+    ),
+    "TENANT_SUSPENDED": ("errors.tenant.suspended", 403, False, {}),
+    "TENANT_LIFECYCLE_CHECK_FAILED": (
+        "errors.tenant.lifecycleCheckFailed",
+        503,
+        False,
+        {},
+    ),
+    "TENANT_WORK_TERMINALIZED": ("errors.tenant.workTerminalized", 409, False, {}),
+    "EXTERNAL_OUTCOME_UNKNOWN": ("errors.tenant.externalOutcomeUnknown", 409, False, {}),
+}
+
 
 def build_registry() -> ErrorRegistry:
     """Build a small isolated registry; it has no process-global or database side effects."""
@@ -199,6 +226,21 @@ def test_t084_global_registry_covers_current_public_error_contracts() -> None:
     """Require each current public producer code to have exact registry metadata."""
     for code, (message_key, status, retryable, params_schema) in _T084_EXPECTED_ENTRIES.items():
         entry = ERROR_REGISTRY.require(code)
+        assert (entry.message_key, entry.default_http_status, entry.retryable_default) == (
+            message_key,
+            status,
+            retryable,
+        )
+        assert entry.params_schema == params_schema
+
+
+def test_t007_system_tenant_error_contracts_are_registered_with_safe_public_shapes() -> None:
+    """Require every planned auth and lifecycle error to be public, unique, and parameter-safe."""
+    entries = ERROR_REGISTRY.entries()
+    assert len(entries) == len({entry.code for entry in entries})
+    for code, (message_key, status, retryable, params_schema) in _T007_EXPECTED_ENTRIES.items():
+        entry = ERROR_REGISTRY.require(code)
+        assert entry.visibility is ErrorVisibility.PUBLIC
         assert (entry.message_key, entry.default_http_status, entry.retryable_default) == (
             message_key,
             status,

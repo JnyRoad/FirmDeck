@@ -1,7 +1,8 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 
-import { api, TENANT_ID } from '../api/client';
+import { createTenantClient } from '../api/tenant-client';
+import { useTenantSession } from '../contexts/TenantSessionContext';
 import { EnterpriseRoute } from '../enums/routes';
 import { apiErrorMessage } from '../lib/apiErrorMessages';
 import { useAppIntl, type AppTranslator, type MessageId, type MessageValues } from '@/i18n';
@@ -34,29 +35,34 @@ export default function TeamChatPage() {
   const navigate = useNavigate();
   const [error, setError] = useState('');
   const { t: appT } = useAppIntl();
+  const tenantContext = useTenantSession();
+  const tenantApi = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
 
   useEffect(() => {
     let cancelled = false;
+    const context = tenantContext;
+    const generation = context?.generation;
     if (!teamId) {
       setError(translateTeamChat({ t: appT }, 'teamChatPage.error.teamNotFound'));
       return undefined;
     }
-    api
-      .post<{ session_id: string }>(`/api/enterprise/teams/${teamId}/tl/session`, {
-        tenant_id: TENANT_ID,
-      })
+    if (!context || generation === undefined) return undefined;
+    tenantApi
+      .post<{ session_id: string }>(`/api/enterprise/teams/${teamId}/tl/session`)
       .then((result) => {
-        if (cancelled) return;
+        if (cancelled || !context.isCurrentGeneration(generation)) return;
         if (!result.session_id) throw new Error('TEAM_SESSION_MISSING');
         navigate(`${EnterpriseRoute.Chat}/${result.session_id}`, { replace: true });
       })
       .catch((reason: unknown) => {
-        if (!cancelled) setError(teamChatErrorMessage(reason, 'teamChatPage.error.openFailed', { t: appT }));
+        if (!cancelled && context.isCurrentGeneration(generation)) {
+          setError(teamChatErrorMessage(reason, 'teamChatPage.error.openFailed', { t: appT }));
+        }
       });
     return () => {
       cancelled = true;
     };
-  }, [appT, navigate, teamId]);
+  }, [appT, navigate, teamId, tenantApi, tenantContext]);
 
   return (
     <div className="grid min-h-[60vh] place-items-center px-[24px] text-center">

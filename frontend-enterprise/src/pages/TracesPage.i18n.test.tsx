@@ -5,24 +5,27 @@ import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { AppIntlProvider, type AppLocale } from '@/i18n';
+import type { TenantSessionContextValue } from '@/contexts/TenantSessionContext';
 import type { TraceSummary } from '@/types';
 
 import TracesPage from './TracesPage';
 
 const mocks = vi.hoisted(() => ({
-  get: vi.fn(),
+  tenantGet: vi.fn(),
   notifyError: vi.fn(),
   notifySuccess: vi.fn(),
+  currentContext: null as TenantSessionContextValue | null,
 }));
 
-vi.mock('../api/client', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('../api/client')>();
-  return {
-    ...actual,
-    api: { ...actual.api, get: mocks.get },
-    TENANT_ID: 'tenant_demo',
-  };
-});
+vi.mock('../api/tenant-client', () => ({
+  createTenantClient: () => ({
+    get: mocks.tenantGet,
+  }),
+}));
+
+vi.mock('../contexts/TenantSessionContext', () => ({
+  useTenantSession: () => mocks.currentContext,
+}));
 
 vi.mock('@/components/ui/app-toast', () => ({
   notify: {
@@ -84,8 +87,35 @@ const row: TraceSummary = {
   updated_at: '2026-08-30T08:44:47Z',
 };
 
+function makeTenantContext(generation = 1): TenantSessionContextValue {
+  const controller = new AbortController();
+  return {
+    tenantId: 'tenant_demo',
+    tenantSlug: 'tenant-demo',
+    userId: 'user_demo',
+    generation,
+    signal: controller.signal,
+    session: {
+      token: 'test-token',
+      scope: 'tenant',
+      tenant: { id: 'tenant_demo', slug: 'tenant-demo', display_name: 'Tenant Demo' },
+      user: {
+        id: 'user_demo',
+        tenant_id: 'tenant_demo',
+        username: 'demo',
+        display_name: 'Demo',
+        role: 'admin',
+        must_change_password: false,
+        avatar_url: null,
+      },
+    },
+    isCurrentGeneration: (candidate) => candidate === generation && !controller.signal.aborted,
+  };
+}
+
 beforeEach(() => {
-  mocks.get.mockReset();
+  mocks.currentContext = makeTenantContext();
+  mocks.tenantGet.mockReset();
   mocks.notifyError.mockReset();
   mocks.notifySuccess.mockReset();
 });
@@ -108,7 +138,7 @@ describe('TracesPage semantic locale matrix', () => {
     'localizes table chrome and accessible names in %s while preserving raw rows',
     async (locale) => {
       const text = copy[locale];
-      mocks.get.mockResolvedValue([row]);
+      mocks.tenantGet.mockResolvedValue([row]);
       renderTraces(locale);
 
       expect(screen.getByRole('heading', { name: text.pageTitle })).toBeTruthy();
@@ -139,7 +169,7 @@ describe('TracesPage semantic locale matrix', () => {
 
   it('uses a localized stable descriptor for trace load failures without exposing error.message', async () => {
     const rawProviderError = 'provider body secret: connection refused';
-    mocks.get.mockRejectedValue(new Error(rawProviderError));
+    mocks.tenantGet.mockRejectedValue(new Error(rawProviderError));
     renderTraces('en-US');
 
     await waitFor(() => {
@@ -151,7 +181,7 @@ describe('TracesPage semantic locale matrix', () => {
   it('keeps trace payload raw when the detail view is opened', async () => {
     const user = userEvent.setup();
     const rawTracePayload = 'provider stdout: raw trace payload 中文';
-    mocks.get.mockImplementation((path: string) => (
+    mocks.tenantGet.mockImplementation((path: string) => (
       path.includes(row.session_id)
         ? Promise.resolve({ trace_payload: rawTracePayload, stderr: 'provider stderr raw' })
         : Promise.resolve([row])
@@ -164,5 +194,33 @@ describe('TracesPage semantic locale matrix', () => {
     expect(rawNodes.some((node) => node.textContent?.includes(rawTracePayload))).toBe(true);
     expect(rawNodes.some((node) => node.textContent?.includes('provider stderr raw'))).toBe(true);
     expect(screen.getByText(copy['zh-CN'].detailTitle)).toBeTruthy();
+  });
+
+  it('loads trace list and detail through the verified tenant client without a fixed tenant query', async () => {
+    const user = userEvent.setup();
+    mocks.tenantGet.mockImplementation((path: string) => (
+      path.includes(row.session_id) ? Promise.resolve({ trace_payload: 'raw' }) : Promise.resolve([row])
+    ));
+    renderTraces('en-US');
+
+    await user.click(await screen.findByRole('button', { name: copy['en-US'].view }));
+    await waitFor(() => expect(mocks.tenantGet).toHaveBeenCalledTimes(2));
+    expect(mocks.tenantGet.mock.calls.every(([path]) => !String(path).includes('tenant_demo'))).toBe(true);
+    expect(mocks.tenantGet.mock.calls.every(([path]) => !String(path).includes('tenant_id='))).toBe(true);
+  });
+
+  it('does not toast when an old generation rejects a trace request', async () => {
+    const context = mocks.currentContext as TenantSessionContextValue;
+    let rejectRequest: ((reason?: unknown) => void) | undefined;
+    mocks.tenantGet.mockImplementation(() => new Promise((_resolve, reject) => {
+      rejectRequest = reject;
+    }));
+    renderTraces('en-US');
+
+    await waitFor(() => expect(mocks.tenantGet).toHaveBeenCalledTimes(1));
+    context.isCurrentGeneration = () => false;
+    rejectRequest?.(new DOMException('aborted', 'AbortError'));
+    await waitFor(() => expect(mocks.notifyError).not.toHaveBeenCalled());
+    expect(mocks.notifyError).not.toHaveBeenCalled();
   });
 });

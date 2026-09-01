@@ -36,7 +36,7 @@ from app.agents.branching import (
 from app.async_jobs import enqueue_async_job
 from app.contracts.domain_http import domain_http_error
 from app.contracts.event_registry import EVENT_REGISTRY
-from app.db import get_session
+from app.db import engine, get_session
 from app.db.models import (
     AgentEvent,
     AgentResourceBinding,
@@ -61,7 +61,12 @@ from app.security.permissions import (
     ensure_open_gallery_admin,
     require_agent_scope_viewer,
 )
-from app.security.tenant import ensure_tenant
+from app.security.tenant import (
+    TenantExecutionKind,
+    TenantLifecycleDenied,
+    ensure_tenant,
+    require_active_tenant,
+)
 from app.skills import SkillDistiller, SkillEditor
 from app.skills.nesting import (
     SopNestingError,
@@ -95,6 +100,39 @@ router = APIRouter(
     dependencies=[Depends(get_current_user)],
 )
 logger = logging.getLogger(__name__)
+
+
+def _skill_stream_lifecycle_active(tenant_id: str, correlation_id: str) -> bool:
+    """Recheck the authoritative tenant state before a Skill stream emits or persists an event."""
+    try:
+        with Session(engine) as lifecycle_db:
+            require_active_tenant(
+                lifecycle_db,
+                tenant_id,
+                TenantExecutionKind.JOB_CLAIM,
+                correlation_id,
+            )
+    except Exception:  # noqa: BLE001 - lifecycle reads fail closed for any backend failure.
+        return False
+    return True
+
+
+def _require_skill_stream_lifecycle(tenant_id: str, correlation_id: str) -> None:
+    """Reject a Skill stream before creating a job or exposing its first event."""
+    try:
+        with Session(engine) as lifecycle_db:
+            require_active_tenant(
+                lifecycle_db,
+                tenant_id,
+                TenantExecutionKind.JOB_CLAIM,
+                correlation_id,
+            )
+    except TenantLifecycleDenied as exc:
+        if exc.code == "TENANT_SUSPENDED":
+            raise _skill_error("TENANT_SUSPENDED", 403) from None
+        raise _skill_error("TENANT_LIFECYCLE_CHECK_FAILED", 503) from None
+    except Exception:  # noqa: BLE001 - project every lifecycle backend failure to one safe code.
+        raise _skill_error("TENANT_LIFECYCLE_CHECK_FAILED", 503) from None
 
 
 def _skill_error(
@@ -834,8 +872,17 @@ def distill_skill_stream(
     ensure_current_user_tenant(request.tenant_id, current_user)
     ensure_tenant(db, request.tenant_id)
     _ensure_distill_agent_scope(db, request, current_user)
+    correlation_id = f"skill-stream:{current_user.id}"
+    _require_skill_stream_lifecycle(request.tenant_id, correlation_id)
     job_id = _start_distill_stream_job(request, current_user)
-    return StreamingResponse(_stream_skill_job(job_id), media_type="text/event-stream")
+    return StreamingResponse(
+        _stream_skill_job(
+            job_id,
+            tenant_id=request.tenant_id,
+            correlation_id=correlation_id,
+        ),
+        media_type="text/event-stream",
+    )
 
 
 @router.post("/{skill_id}/rewrite/stream")
@@ -851,8 +898,17 @@ def rewrite_skill_stream(
     ensure_tenant(db, request.tenant_id)
     _ensure_rewrite_agent_scope(db, request, current_user)
     request = _with_available_context_for_rewrite(db, request)
+    correlation_id = f"skill-stream:{current_user.id}"
+    _require_skill_stream_lifecycle(request.tenant_id, correlation_id)
     job_id = _start_rewrite_stream_job(skill_id, request, current_user)
-    return StreamingResponse(_stream_skill_job(job_id), media_type="text/event-stream")
+    return StreamingResponse(
+        _stream_skill_job(
+            job_id,
+            tenant_id=request.tenant_id,
+            correlation_id=correlation_id,
+        ),
+        media_type="text/event-stream",
+    )
 
 
 @router.post("/distill/jobs")
@@ -899,8 +955,18 @@ def stream_existing_skill_job(
     after_seq: int = Query(0),
     current_user: User = Depends(get_current_user),
 ) -> StreamingResponse:
-    _owned_stream_job(job_id, current_user)
-    return StreamingResponse(_stream_skill_job(job_id, after_seq), media_type="text/event-stream")
+    job = _owned_stream_job(job_id, current_user)
+    correlation_id = f"skill-stream:{current_user.id}"
+    _require_skill_stream_lifecycle(job.tenant_id, correlation_id)
+    return StreamingResponse(
+        _stream_skill_job(
+            job_id,
+            after_seq,
+            tenant_id=job.tenant_id,
+            correlation_id=correlation_id,
+        ),
+        media_type="text/event-stream",
+    )
 
 
 @router.post("/jobs/{job_id}/cancel")
@@ -1082,6 +1148,12 @@ def _start_rewrite_stream_job(
 
 def _run_distill_stream_job(job_id: str, request_data: dict[str, object]) -> None:
     """Run distillation while canonicalizing statuses and retaining raw successful draft chunks."""
+    queued_job = stream_jobs.get(job_id)
+    if queued_job is None or not _skill_stream_lifecycle_active(
+        queued_job.tenant_id,
+        f"skill-stream:{job_id}",
+    ):
+        return
     stream_jobs.start(job_id)
     try:
         request = SkillDistillRequest.model_validate(request_data)
@@ -1090,8 +1162,15 @@ def _run_distill_stream_job(job_id: str, request_data: dict[str, object]) -> Non
             ensure_tenant(db, request.tenant_id)
             model_config = _get_request_model(db, request.tenant_id, request.model_config_id)
             enriched_request = _with_available_context_for_distill(db, request)
+            if not _skill_stream_lifecycle_active(request.tenant_id, f"skill-stream:{job_id}"):
+                return
             stream_jobs.append(job_id, "status", {})
             for item in SkillDistiller().stream_text(enriched_request, model_config):
+                if not _skill_stream_lifecycle_active(
+                    request.tenant_id,
+                    f"skill-stream:{job_id}",
+                ):
+                    return
                 if stream_jobs.is_cancelled(job_id):
                     stream_jobs.append(job_id, "status", {})
                     stream_jobs.complete(job_id)
@@ -1105,6 +1184,12 @@ def _run_distill_stream_job(job_id: str, request_data: dict[str, object]) -> Non
 
 def _run_rewrite_stream_job(job_id: str, skill_id: str, request_data: dict[str, object]) -> None:
     """Run rewrite while canonicalizing statuses and retaining raw successful assistant content."""
+    queued_job = stream_jobs.get(job_id)
+    if queued_job is None or not _skill_stream_lifecycle_active(
+        queued_job.tenant_id,
+        f"skill-stream:{job_id}",
+    ):
+        return
     stream_jobs.start(job_id)
     try:
         request = SkillRewriteRequest.model_validate(request_data)
@@ -1114,8 +1199,15 @@ def _run_rewrite_stream_job(job_id: str, skill_id: str, request_data: dict[str, 
         with Session(get_session_engine()) as db:
             ensure_tenant(db, request.tenant_id)
             model_config = _get_request_model(db, request.tenant_id, request.model_config_id)
+            if not _skill_stream_lifecycle_active(request.tenant_id, f"skill-stream:{job_id}"):
+                return
             stream_jobs.append(job_id, "status", {})
             for item in SkillEditor().stream_text(request, model_config):
+                if not _skill_stream_lifecycle_active(
+                    request.tenant_id,
+                    f"skill-stream:{job_id}",
+                ):
+                    return
                 if stream_jobs.is_cancelled(job_id):
                     stream_jobs.append(job_id, "status", {})
                     stream_jobs.complete(job_id)
@@ -1138,11 +1230,30 @@ def _bind_skill_request_to_job_locale(
     return request.model_copy(update={"language_context": job.language_context})
 
 
-def _stream_skill_job(job_id: str, after_seq: int = 0) -> Iterator[str]:
-    """Yield private Skill SSE items with stable descriptors and locale-bound status metadata."""
+def _stream_skill_job(
+    job_id: str,
+    after_seq: int = 0,
+    *,
+    tenant_id: str | None = None,
+    correlation_id: str | None = None,
+) -> Iterator[str]:
+    """Yield private Skill SSE items only while the owning tenant remains executable."""
     last_seq = max(0, after_seq)
+    initial_job = stream_jobs.get(job_id)
+    stream_tenant_id = tenant_id or (initial_job.tenant_id if initial_job is not None else None)
+    stream_correlation_id = correlation_id or f"skill-stream:{job_id}"
+    if stream_tenant_id and not _skill_stream_lifecycle_active(
+        stream_tenant_id,
+        stream_correlation_id,
+    ):
+        return
     yield _sse("job_attached", {"job_id": job_id, "after_seq": after_seq})
     while True:
+        if stream_tenant_id and not _skill_stream_lifecycle_active(
+            stream_tenant_id,
+            stream_correlation_id,
+        ):
+            return
         job, events = stream_jobs.snapshot(job_id, last_seq)
         if not job:
             yield _sse(
@@ -1154,10 +1265,16 @@ def _stream_skill_job(job_id: str, after_seq: int = 0) -> Iterator[str]:
                 },
             )
             return
+        if stream_tenant_id is None:
+            stream_tenant_id = job.tenant_id
         for event in events:
+            if not _skill_stream_lifecycle_active(stream_tenant_id, stream_correlation_id):
+                return
             last_seq = event.seq
             yield _sse_event(event, job_id)
         if job.status in {"succeeded", "failed"} and not events:
+            if not _skill_stream_lifecycle_active(stream_tenant_id, stream_correlation_id):
+                return
             yield _sse("job_complete", _skill_job_complete_payload(job))
             return
         sleep(0.15)

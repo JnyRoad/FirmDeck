@@ -250,13 +250,10 @@ class A2ATaskRunRead(BaseModel):
 
 
 class CodexA2AAdapterRead(BaseModel):
-    enabled: bool
+    available: bool
     endpoint_url: str
     agent_card_url: str
-    command: str
-    workspace_root: str
     timeout_seconds: float
-    token_configured: bool
 
 
 def _task_language_context_payload(snapshot: object) -> dict[str, Any]:
@@ -517,14 +514,17 @@ def probe_tool(
 )
 def get_codex_a2a_adapter() -> CodexA2AAdapterRead:
     settings = get_settings()
+    token = getattr(settings, "codex_a2a_token", "")
     return CodexA2AAdapterRead(
-        enabled=bool(settings.codex_a2a_enabled),
+        available=(
+            bool(getattr(settings, "codex_a2a_enabled", False))
+            and isinstance(token, str)
+            and bool(token)
+            and token == token.strip()
+        ),
         endpoint_url="/api/a2a/codex",
         agent_card_url="/.well-known/agent-card.json",
-        command=settings.codex_a2a_command,
-        workspace_root=settings.codex_a2a_workspace_root,
-        timeout_seconds=settings.codex_a2a_timeout_seconds,
-        token_configured=bool(settings.codex_a2a_token),
+        timeout_seconds=float(getattr(settings, "codex_a2a_timeout_seconds", 1800.0)),
     )
 
 

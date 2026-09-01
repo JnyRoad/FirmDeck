@@ -13,8 +13,9 @@ import { RawIdentifier } from '@/i18n/RawContent';
 import { useAppIntl } from '@/i18n/useAppIntl';
 import type { MessageId } from '@/i18n/types';
 import { backendErrorMessageDescriptor } from '@/lib/apiErrorMessages';
-import { useEffect, useRef, useState } from 'react';
-import { api, TENANT_ID } from '../api/client';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { createTenantClient } from '../api/tenant-client';
+import { useTenantSession } from '../contexts/TenantSessionContext';
 import {
   EMPLOYEE_AVATAR_PRESETS,
   employeeDisplayName,
@@ -64,6 +65,8 @@ export default function EmployeeAvatarEditor({
 }) {
   const { t } = useAppIntl();
   const toast = createToastNotifier({ t });
+  const tenantContext = useTenantSession();
+  const tenantApi = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
   const inputRef = useRef<HTMLInputElement | null>(null);
   const [mode, setMode] = useState<'preset' | 'upload'>('preset');
   const [selectedPreset, setSelectedPreset] = useState(EMPLOYEE_AVATAR_PRESETS[0].key);
@@ -98,12 +101,18 @@ export default function EmployeeAvatarEditor({
   /** Accept and normalize an image file; user-facing errors are projected to descriptors. */
   async function handleUpload(file: File | undefined) {
     if (!file) return;
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     try {
       const dataUrl = await fileToAvatarDataUrl(file);
+      if (!context.isCurrentGeneration(generation)) return;
       setUploadedImage(dataUrl);
       setMode('upload');
     } catch (error) {
-      toast.error(avatarUploadErrorDescriptor(error));
+      if (context.isCurrentGeneration(generation)) {
+        toast.error(avatarUploadErrorDescriptor(error));
+      }
     } finally {
       if (inputRef.current) inputRef.current.value = '';
     }
@@ -111,7 +120,9 @@ export default function EmployeeAvatarEditor({
 
   /** Persist the selected avatar metadata and expose only stable toast descriptors. */
   async function save() {
-    if (!agent) return;
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!agent || !context || generation === undefined) return;
     setSaving(true);
     try {
       const metadata = { ...(agent.metadata || {}) };
@@ -125,21 +136,22 @@ export default function EmployeeAvatarEditor({
         delete metadata.avatar_image;
       }
 
-      const saved = await api.put<AgentProfileRead>(`/api/enterprise/agents/${agent.id}`, {
-        tenant_id: TENANT_ID,
+      const saved = await tenantApi.put<AgentProfileRead>(`/api/enterprise/agents/${agent.id}`, {
         metadata,
       });
+      if (!context.isCurrentGeneration(generation)) return;
       toast.success(createMessageDescriptor('employeeAvatar.toast.updated'));
       onSaved?.(saved);
       onClose();
       window.dispatchEvent(new Event('ultrarag-enterprise-agent-scope-refresh'));
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       const descriptor = backendErrorMessageDescriptor(error);
       toast.error(descriptor
         ? { id: descriptor.messageId, values: descriptor.values }
         : createMessageDescriptor('employeeAvatar.toast.saveFailed'));
     } finally {
-      setSaving(false);
+      if (context.isCurrentGeneration(generation)) setSaving(false);
     }
   }
 

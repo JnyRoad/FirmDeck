@@ -22,7 +22,7 @@ from app.core.conversation_context import (
 )
 from app.core.conversation_projection import ConversationProjection
 from app.core.graph_rules import GraphRules
-from app.core.harness_agent import HarnessExecutionCancelled
+from app.core.harness_agent import HarnessExecutionCancelled, HarnessExecutionFenced
 from app.core.harness_session_lock import HarnessSessionBusy
 from app.core.harness_turn_store import (
     HarnessTurnConflict,
@@ -54,6 +54,7 @@ from app.db.models import (
     ModelConfig,
     PersonaConfig,
     Skill,
+    Tenant,
     UIConfig,
     User,
     new_id,
@@ -86,6 +87,11 @@ from app.memory.service import MemoryService
 from app.observability import EventLog
 from app.observability.product_events import record_product_event
 from app.observability.spans import llm_operation
+from app.security.tenant import (
+    TenantExecutionKind,
+    TenantLifecycleDenied,
+    require_active_tenant,
+)
 from app.session.helpers import public_session
 from app.session.message_visibility import visible_message_content, visible_message_rows
 from app.session.origin import PILOTDECK_GROUP_CHAT_CHANNEL
@@ -93,6 +99,7 @@ from app.session.session_schema import (
     ChatTurnRequest,
     ChatTurnResponse,
     RouterDecision,
+    SessionPublic,
     StepAgentResult,
 )
 from app.tools.tool_schema import ToolResult
@@ -458,7 +465,12 @@ class AgentLoop:
             payload["params"] = dict(safe_params)
         return payload
 
-    def handle_turn(self, request: ChatTurnRequest) -> ChatTurnResponse:
+    def handle_turn(
+        self,
+        request: ChatTurnRequest,
+        *,
+        wake_admission_check: Callable[[], None] | None = None,
+    ) -> ChatTurnResponse:
         """Execute one turn after binding its locale snapshot and preserve compatible error paths."""
         engine = HarnessV2Engine(self)
         chat_session: ChatSession | None = None
@@ -466,8 +478,119 @@ class AgentLoop:
         step_result = StepAgentResult(action="reply")
         runtime_error_code: str | None = None
         try:
+            if callable(wake_admission_check):
+                wake_admission_check()
             self._prepare_request_language_context(request)
-            return self._response_with_language_context(engine.run(request))
+            if callable(wake_admission_check):
+                response = engine.run(
+                    request,
+                    wake_admission_check=wake_admission_check,
+                )
+            else:
+                response = engine.run(request)
+            return self._response_with_language_context(response)
+        except HarnessExecutionFenced:
+            # A team wake whose heartbeat/claim was lost must not continue into
+            # normal error finalization. Close only the durable Harness attempt;
+            # the wake executor will fence all team-visible writes itself.
+            chat_session = engine.session
+            self.db.rollback()
+            # Never project the caught exception text into a typed/public response.
+            # The enclosing wake executor retains the precise private reason and
+            # terminalizes it; AgentLoop exposes only the stable fenced contract.
+            code = "TEAM_WAKE_CLAIM_LOST"
+            if chat_session is not None:
+                engine.mark_lifecycle_denied(code)
+                self.db.refresh(chat_session)
+                return self._response_with_language_context(ChatTurnResponse(
+                    reply=code,
+                    session_id=chat_session.id,
+                    runtime_error_code=code,
+                    step_result=step_result,
+                    session_state=public_session(chat_session),
+                ))
+            return self._response_with_language_context(ChatTurnResponse(
+                reply=code,
+                session_id=(
+                    _with_recoverable_first_session(request).session_id
+                    or "session_unbound"
+                ),
+                runtime_error_code=code,
+                step_result=step_result,
+                session_state=SessionPublic(
+                    session_id=(
+                        _with_recoverable_first_session(request).session_id
+                        or "session_unbound"
+                    ),
+                    tenant_id=request.tenant_id,
+                    user_id=request.user_id,
+                    agent_id=request.agent_id,
+                    status="active",
+                ),
+            ))
+        except TenantLifecycleDenied as exc:
+            # Lifecycle admission is a terminal fence, not a transient runtime
+            # failure.  Close any durable attempt and return without entering a
+            # model/AgentLoop retry path or appending a misleading assistant reply.
+            chat_session = engine.session
+            self.db.rollback()
+            if chat_session is None:
+                session_id = (
+                    _with_recoverable_first_session(request).session_id
+                    or "session_unbound"
+                )
+                error_code = public_error_code(exc.code)
+                return self._response_with_language_context(ChatTurnResponse(
+                    reply=format_runtime_failure_reply(
+                        localized_compat_text(
+                            self._language_context,
+                            zh_cn="当前租户暂不可执行该请求",
+                            en_us="This tenant cannot execute the request right now",
+                        ),
+                        error_code,
+                        error_code,
+                        localized_compat_text(
+                            self._language_context,
+                            zh_cn="请联系系统管理员恢复租户后重试。",
+                            en_us="Ask a system administrator to reactivate the tenant, then retry.",
+                        ),
+                        self._language_context,
+                    ),
+                    session_id=session_id,
+                    runtime_error_code=error_code,
+                    step_result=step_result,
+                    session_state=SessionPublic(
+                        session_id=session_id,
+                        tenant_id=request.tenant_id,
+                        user_id=request.user_id,
+                        agent_id=request.agent_id,
+                        status="active",
+                    ),
+                ))
+            engine.mark_lifecycle_denied(exc.code)
+            self.db.refresh(chat_session)
+            error_code = public_error_code(exc.code)
+            return self._response_with_language_context(ChatTurnResponse(
+                reply=format_runtime_failure_reply(
+                    localized_compat_text(
+                        self._language_context,
+                        zh_cn="当前租户暂不可执行该请求",
+                        en_us="This tenant cannot execute the request right now",
+                    ),
+                    error_code,
+                    error_code,
+                    localized_compat_text(
+                        self._language_context,
+                        zh_cn="请联系系统管理员恢复租户后重试。",
+                        en_us="Ask a system administrator to reactivate the tenant, then retry.",
+                    ),
+                    self._language_context,
+                ),
+                session_id=chat_session.id,
+                runtime_error_code=error_code,
+                step_result=step_result,
+                session_state=public_session(chat_session),
+            ))
         except (HarnessTurnConflict, HarnessSessionBusy) as exc:
             chat_session = engine.session
             self._abort_stream_sink()
@@ -632,13 +755,57 @@ class AgentLoop:
             session_state=public_session(chat_session),
         ))
 
-    def handle_turn_stream(self, request: ChatTurnRequest) -> Iterator[dict[str, object]]:
-        yield from self._handle_turn_stream_v2(request)
+    def handle_turn_stream(
+        self,
+        request: ChatTurnRequest,
+        *,
+        wake_admission_check: Callable[[], None] | None = None,
+    ) -> Iterator[dict[str, object]]:
+        yield from self._handle_turn_stream_v2(
+            request,
+            wake_admission_check=wake_admission_check,
+        )
 
-    def _handle_turn_stream_v2(self, request: ChatTurnRequest) -> Iterator[dict[str, object]]:
+    def _handle_turn_stream_v2(
+        self,
+        request: ChatTurnRequest,
+        *,
+        wake_admission_check: Callable[[], None] | None = None,
+    ) -> Iterator[dict[str, object]]:
         """Resolve the turn language before emitting any initial stream event."""
+        if callable(wake_admission_check):
+            wake_admission_check()
         self._prepare_request_language_context(request)
         session_request = _with_recoverable_first_session(request)
+        if self.db.get(Tenant, request.tenant_id) is not None:
+            try:
+                require_active_tenant(
+                    self.db,
+                    request.tenant_id,
+                    TenantExecutionKind.JOB_CLAIM,
+                    (
+                        str(request.client_turn_id or "").strip()
+                        or session_request.session_id
+                        or "harness-stream"
+                    ),
+                )
+            except TenantLifecycleDenied as exc:
+                # Keep denied streams side-effect free: no session_created event,
+                # user message, receipt, or worker session is persisted.
+                error_code = public_error_code(exc.code)
+                session_id = session_request.session_id or "session_unbound"
+                yield {
+                    "event": "error",
+                    "data": {
+                        "kind": "error",
+                        "sessionId": session_id,
+                        "code": error_code,
+                        "message": error_code,
+                        "client_turn_id": request.client_turn_id,
+                        "execution_engine": "harness_v2",
+                    },
+                }
+                return
         existing_session = (
             self.db.get(ChatSession, session_request.session_id)
             if session_request.session_id
@@ -647,6 +814,7 @@ class AgentLoop:
         chat_session = get_or_create_harness_session(
             self,
             session_request,
+            admission_check=wake_admission_check,
         )
         created_session = existing_session is None
         scoped_request = request.model_copy(update={"session_id": chat_session.id})
@@ -680,7 +848,15 @@ class AgentLoop:
             {"execution_engine": "harness_v2"},
             user_message_id=initial_turn_id,
         )
-        response = self.handle_turn(scoped_request)
+        if callable(wake_admission_check):
+            response = self.handle_turn(
+                scoped_request,
+                wake_admission_check=wake_admission_check,
+            )
+        else:
+            # Keep lightweight embedding/test overrides that implement the
+            # historical one-argument hook compatible when no wake token exists.
+            response = self.handle_turn(scoped_request)
         chat_session = self.db.get(ChatSession, response.session_id)
         if chat_session is None:
             return

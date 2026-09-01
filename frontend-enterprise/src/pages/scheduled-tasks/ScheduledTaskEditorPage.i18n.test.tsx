@@ -8,6 +8,7 @@ import { MemoryRouter } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { AppIntlProvider, type AppLocale } from '@/i18n';
+import { TenantSessionProvider } from '@/contexts/TenantSessionContext';
 
 const mocks = vi.hoisted(() => ({
   notifyError: vi.fn(),
@@ -37,7 +38,6 @@ vi.mock('@/components/AppHeader', () => ({
   ),
 }));
 
-import { api } from '../../api/client';
 import { ScheduledTaskNewPage } from './ScheduledTaskEditorPage';
 
 const copy = {
@@ -102,7 +102,24 @@ function renderEditor(locale: AppLocale): void {
   render(
     <AppIntlProvider locale={locale}>
       <MemoryRouter>
-        <ScheduledTaskNewPage />
+        <TenantSessionProvider
+          session={{
+            token: 'token-user-1',
+            scope: 'tenant',
+            tenant: { id: 'tenant_demo', slug: 'demo', display_name: 'Demo tenant' },
+            user: {
+              id: 'user-1',
+              tenant_id: 'tenant_demo',
+              username: 'demo',
+              display_name: null,
+              role: 'admin',
+              must_change_password: false,
+              avatar_url: null,
+            },
+          }}
+        >
+          <ScheduledTaskNewPage />
+        </TenantSessionProvider>
       </MemoryRouter>
     </AppIntlProvider>,
   );
@@ -113,12 +130,47 @@ beforeEach(() => {
   mocks.notifySuccess.mockReset();
   mocks.notifyWarning.mockReset();
   window.localStorage.clear();
-  vi.spyOn(api, 'get').mockResolvedValue([] as never);
+  vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.includes('/api/auth/me')) {
+      return {
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        json: async () => ({
+          id: 'user-1',
+          tenant_id: 'tenant_demo',
+          username: 'demo',
+          display_name: null,
+          role: 'admin',
+          must_change_password: false,
+          avatar_url: null,
+        }),
+        text: async () => JSON.stringify({
+          id: 'user-1',
+          tenant_id: 'tenant_demo',
+          username: 'demo',
+          display_name: null,
+          role: 'admin',
+          must_change_password: false,
+          avatar_url: null,
+        }),
+      } as Response;
+    }
+    return {
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      json: async () => [],
+      text: async () => JSON.stringify([]),
+    } as Response;
+  }));
 });
 
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
   window.localStorage.clear();
 });
 

@@ -124,6 +124,15 @@ def test_create_internal_job_persists_explicit_feedback_language_snapshot(
     context = _context(ui_locale, agent_reply_locale)
 
     with Session(db_engine) as db:
+        db.add(
+            Tenant(
+                id="tenant-feedback",
+                name="Feedback Tenant",
+                status="active",
+                lifecycle_version=1,
+            )
+        )
+        db.commit()
         job = public_jobs.create_internal_job(
             db,
             tenant_id="tenant-feedback",

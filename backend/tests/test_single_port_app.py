@@ -43,6 +43,23 @@ def _request(
     )
 
 
+def test_system_console_routes_serve_enterprise_spa_for_deep_links(tmp_path, monkeypatch) -> None:
+    """Make the installation control plane directly reachable at every `/system/**` URL."""
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    index = dist / "index.html"
+    index.write_text("<!doctype html><title>system console</title>", encoding="utf-8")
+    monkeypatch.setattr(single_port_app, "ENTERPRISE_DIST", dist)
+
+    route_paths = {route.path for route in single_port_app.app.routes if hasattr(route, "path")}
+    assert "/system" in route_paths
+    assert "/system/{path:path}" in route_paths
+
+    response = single_port_app.system_app("login")
+    assert Path(response.path) == index
+    assert response.headers["cache-control"] == "no-store, no-cache, must-revalidate, max-age=0"
+
+
 def test_javascript_assets_override_broken_windows_mime_mapping(tmp_path: Path) -> None:
     original_media_type = mimetypes.guess_type("bundle.js")[0]
     mimetypes.add_type("text/plain", ".js", strict=True)

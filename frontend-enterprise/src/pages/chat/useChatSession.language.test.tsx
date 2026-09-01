@@ -6,6 +6,8 @@ import { MemoryRouter } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { StreamEvent } from '@/api/client';
+import type { EnterpriseAuthSession } from '@/auth';
+import { TenantSessionProvider } from '@/contexts/TenantSessionContext';
 import { AppIntlProvider } from '@/i18n/provider';
 import type { AppLocale } from '@/i18n/locales';
 import type { ChatMessage, ChatSession, ModelConfigRead } from '@/types';
@@ -24,6 +26,25 @@ vi.mock('@/api/client', async () => {
 const AUTH_STORAGE_KEY = 'ultrarag_auth';
 const SESSION_ID = 'session-language-1';
 const RAW_USER_CONTENT = 'RAW /private/path?q=中文 & do-not-translate=true';
+
+const tenantSession: EnterpriseAuthSession = {
+  token: 'token-1',
+  scope: 'tenant',
+  tenant: {
+    id: 'tenant_demo',
+    slug: 'demo-lab',
+    display_name: 'Demo Lab',
+  },
+  user: {
+    id: 'user-1',
+    tenant_id: 'tenant_demo',
+    username: 'demo',
+    display_name: 'Demo Operator',
+    role: 'admin',
+    must_change_password: false,
+    avatar_url: null,
+  },
+};
 
 const modelConfig: ModelConfigRead = {
   id: 'model-1',
@@ -62,6 +83,7 @@ function jsonResponse(body: unknown): Response {
     ok: true,
     status: 200,
     statusText: 'OK',
+    json: async () => body ?? {},
     text: async () => JSON.stringify(body ?? {}),
   } as Response;
 }
@@ -88,6 +110,7 @@ function sessionFor(agentReplyLocale: AppLocale): ChatSession & {
 function stubChatFetch(session: ChatSession): void {
   vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input);
+    if (url.includes('/api/auth/me')) return jsonResponse(tenantSession.user);
     if (url.includes(`/api/chat/sessions/${SESSION_ID}/messages?`)) return jsonResponse(historyMessages);
     if (url.includes(`/api/chat/sessions/${SESSION_ID}/trace?`)) return jsonResponse([]);
     if (url.includes(`/api/chat/sessions/${SESSION_ID}/events?`)) return jsonResponse([]);
@@ -108,7 +131,9 @@ function renderLanguageHook(uiLocale: AppLocale) {
   let controlledLocale = uiLocale;
   const wrapper = ({ children }: { children: ReactNode }) => (
     <AppIntlProvider locale={controlledLocale}>
-      <MemoryRouter>{children}</MemoryRouter>
+      <TenantSessionProvider session={tenantSession}>
+        <MemoryRouter>{children}</MemoryRouter>
+      </TenantSessionProvider>
     </AppIntlProvider>
   );
   const hook = renderHook(() => useChatSession({ embedded: true, sessionId: SESSION_ID }), { wrapper });
@@ -133,10 +158,7 @@ async function sendRawTurn(result: ReturnType<typeof renderLanguageHook>['result
 }
 
 beforeEach(() => {
-  window.localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify({
-    token: 'token-1',
-    user: { id: 'user-1', tenant_id: 'tenant_demo', username: 'demo', role: 'admin' },
-  }));
+  window.localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify(tenantSession));
   streamChatTurnMock.mockImplementation(async (
     _body: Record<string, unknown>,
     onEvent: (event: StreamEvent) => void,
@@ -169,11 +191,14 @@ describe('useChatSession language snapshots', () => {
       setAgentReplyLocale,
     } as unknown as ReturnType<typeof useChatSession>;
 
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse(tenantSession.user)));
     render(
       <AppIntlProvider locale="en-US">
-        <MemoryRouter>
-          <ChatHeader chat={chat} />
-        </MemoryRouter>
+        <TenantSessionProvider session={tenantSession}>
+          <MemoryRouter>
+            <ChatHeader chat={chat} />
+          </MemoryRouter>
+        </TenantSessionProvider>
       </AppIntlProvider>,
     );
 

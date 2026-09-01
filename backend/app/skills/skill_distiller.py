@@ -15,6 +15,8 @@ from app.llm import LLMClient, LLMError
 from app.llm.prompts.language import language_prompt_contract, resolve_prompt_language_context
 from app.skills.llm_limits import skill_model_config
 from app.skills.skill_reflection import (
+    ExecutionFence,
+    fenced_provider_call,
     reflect_skill_response,
     reflect_skill_response_stream,
     skill_status_event,
@@ -100,21 +102,41 @@ def _model_input_payload(
 
 class SkillDistiller:
     def distill(
-        self, request: SkillDistillRequest, model_config: ModelConfig
+        self,
+        request: SkillDistillRequest,
+        model_config: ModelConfig,
+        *,
+        execution_fence: ExecutionFence | None = None,
     ) -> SkillDistillResponse:
         """Generate one Skill Card while binding all generated prose to request locale."""
         request = self._with_language_context(request)
-        return self._generate_response(request, model_config)
+        return self._generate_response(
+            request,
+            model_config,
+            execution_fence=execution_fence,
+        )
 
     def distill_stream(
-        self, request: SkillDistillRequest, model_config: ModelConfig
+        self,
+        request: SkillDistillRequest,
+        model_config: ModelConfig,
+        *,
+        execution_fence: ExecutionFence | None = None,
     ) -> SkillDistillResponse:
         """Run the compatibility non-SSE entry point with the same immutable locale contract."""
         request = self._with_language_context(request)
-        return self._generate_response(request, model_config)
+        return self._generate_response(
+            request,
+            model_config,
+            execution_fence=execution_fence,
+        )
 
     def stream_text(
-        self, request: SkillDistillRequest, model_config: ModelConfig
+        self,
+        request: SkillDistillRequest,
+        model_config: ModelConfig,
+        *,
+        execution_fence: ExecutionFence | None = None,
     ):
         """Yield progress and raw draft output with a locale-bound producer envelope."""
         request = self._with_language_context(request)
@@ -132,11 +154,17 @@ class SkillDistiller:
                 ),
                 request.language_context,
             )
-            for chunk in client.generate_text_stream(
-                prompt, _model_input_payload(payload, model_input)
-            ):
-                chunks.append(chunk)
-                yield {"event": "chunk", "data": {"content": chunk}}
+            if execution_fence is not None:
+                execution_fence()
+            try:
+                for chunk in client.generate_text_stream(
+                    prompt, _model_input_payload(payload, model_input)
+                ):
+                    chunks.append(chunk)
+                    yield {"event": "chunk", "data": {"content": chunk}}
+            finally:
+                if execution_fence is not None:
+                    execution_fence()
             yield skill_status_event(
                 _localized_skill_text(
                     request.language_context,
@@ -157,7 +185,13 @@ class SkillDistiller:
                     request.language_context,
                 )
                 response = self._repair_response(
-                    client, prompt, payload, "".join(chunks), str(exc), request
+                    client,
+                    prompt,
+                    payload,
+                    "".join(chunks),
+                    str(exc),
+                    request,
+                    execution_fence=execution_fence,
                 )
             except (LLMError, json.JSONDecodeError, TypeError, ValueError) as repair_exc:
                 try:
@@ -170,7 +204,12 @@ class SkillDistiller:
                         request.language_context,
                     )
                     response = self._staged_response(
-                        client, prompt, payload, request, str(repair_exc)
+                        client,
+                        prompt,
+                        payload,
+                        request,
+                        str(repair_exc),
+                        execution_fence=execution_fence,
                     )
                 except (LLMError, json.JSONDecodeError, TypeError, ValueError):
                     yield skill_status_event(
@@ -215,6 +254,7 @@ class SkillDistiller:
             tool_suggestions=response.tool_suggestions,
             normalize_response=lambda raw: self._normalize_response(raw, request),
             language_context=request.language_context,
+            execution_fence=execution_fence,
         )
         yield skill_status_event(
             _localized_skill_text(
@@ -247,7 +287,11 @@ class SkillDistiller:
         return request.model_copy(update={"language_context": context})
 
     def _generate_response(
-        self, request: SkillDistillRequest, model_config: ModelConfig
+        self,
+        request: SkillDistillRequest,
+        model_config: ModelConfig,
+        *,
+        execution_fence: ExecutionFence | None = None,
     ) -> SkillDistillResponse:
         """Generate, repair, and reflect a Skill Card without translating source-owned fields."""
         request = self._with_language_context(request)
@@ -257,15 +301,34 @@ class SkillDistiller:
         client = LLMClient(skill_model_config(model_config))
         output = ""
         try:
-            output = client.generate_text(prompt, _model_input_payload(payload, model_input))
+            output = fenced_provider_call(
+                lambda: client.generate_text(
+                    prompt,
+                    _model_input_payload(payload, model_input),
+                ),
+                execution_fence,
+            )
             response = self._response_from_text(output, request)
         except (LLMError, json.JSONDecodeError, TypeError, ValueError) as exc:
             try:
-                response = self._repair_response(client, prompt, payload, output, str(exc), request)
+                response = self._repair_response(
+                    client,
+                    prompt,
+                    payload,
+                    output,
+                    str(exc),
+                    request,
+                    execution_fence=execution_fence,
+                )
             except (LLMError, json.JSONDecodeError, TypeError, ValueError) as repair_exc:
                 try:
                     response = self._staged_response(
-                        client, prompt, payload, request, str(repair_exc)
+                        client,
+                        prompt,
+                        payload,
+                        request,
+                        str(repair_exc),
+                        execution_fence=execution_fence,
                     )
                 except (LLMError, json.JSONDecodeError, TypeError, ValueError):
                     response = self._fallback_response(
@@ -289,6 +352,7 @@ class SkillDistiller:
             tool_suggestions=response.tool_suggestions,
             normalize_response=lambda raw: self._normalize_response(raw, request),
             language_context=request.language_context,
+            execution_fence=execution_fence,
         )
 
     def _response_from_text(self, text: str, request: SkillDistillRequest) -> SkillDistillResponse:
@@ -303,6 +367,8 @@ class SkillDistiller:
         previous_output: str,
         previous_error: str,
         request: SkillDistillRequest,
+        *,
+        execution_fence: ExecutionFence | None = None,
     ) -> SkillDistillResponse:
         output = previous_output
         error = previous_error
@@ -317,7 +383,10 @@ class SkillDistiller:
                     "不要解释，不要使用代码围栏。必须保留原始流程中的节点、边、工具建议和闭环约束。"
                 ),
             }
-            output = client.generate_text(prompt, repair_payload)
+            output = fenced_provider_call(
+                lambda repair_payload=repair_payload: client.generate_text(prompt, repair_payload),
+                execution_fence,
+            )
             try:
                 return self._response_from_text(output, request)
             except (json.JSONDecodeError, TypeError, ValueError) as exc:
@@ -331,19 +400,22 @@ class SkillDistiller:
         payload: dict[str, Any],
         request: SkillDistillRequest,
         previous_error: str,
+        *,
+        execution_fence: ExecutionFence | None = None,
     ) -> SkillDistillResponse:
-        outline_text = client.generate_text(
-            prompt,
-            {
-                **payload,
-                "generation_mode": "outline_only",
-                "previous_error": previous_error,
-                "generation_instruction": (
-                    "先生成完整但紧凑的 Skill Card graph 大纲。nodes/edges 必须覆盖原始流程全部节点与条件推进关系，"
-                    "每个 instruction 只写一句目标说明；保留 response_rules、slot_filling_policy、"
-                    "interruption_policy 和 tool_mentions。只输出 JSON。"
-                ),
-            },
+        outline_payload = {
+            **payload,
+            "generation_mode": "outline_only",
+            "previous_error": previous_error,
+            "generation_instruction": (
+                "先生成完整但紧凑的 Skill Card graph 大纲。nodes/edges 必须覆盖原始流程全部节点与条件推进关系，"
+                "每个 instruction 只写一句目标说明；保留 response_rules、slot_filling_policy、"
+                "interruption_policy 和 tool_mentions。只输出 JSON。"
+            ),
+        }
+        outline_text = fenced_provider_call(
+            lambda: client.generate_text(prompt, outline_payload),
+            execution_fence,
         )
         outline = self._response_from_text(outline_text, request)
         draft_data = outline.draft_skill.model_dump(mode="json")
@@ -352,21 +424,22 @@ class SkillDistiller:
         nodes = [node for node in draft_data.get("nodes", []) if isinstance(node, dict)]
 
         for index, node in enumerate(nodes):
-            node_text = client.generate_text(
-                prompt,
-                {
-                    **payload,
-                    "generation_mode": "expand_node",
-                    "current_draft": draft_data,
-                    "target_node_index": index,
-                    "target_node": node,
-                    "generation_instruction": (
-                        '只扩写 target_node。输出 JSON：{"node": {...}, "warnings": [], '
-                        '"tool_mentions": []}。node 必须包含 node_id、type、name、instruction、'
-                        "expected_user_info、allowed_actions、capability_refs。capability_refs 中"
-                        "允许能力与 required_*_ids 强制能力必须区分；不要输出完整技能。"
-                    ),
-                },
+            node_payload = {
+                **payload,
+                "generation_mode": "expand_node",
+                "current_draft": draft_data,
+                "target_node_index": index,
+                "target_node": node,
+                "generation_instruction": (
+                    '只扩写 target_node。输出 JSON：{"node": {...}, "warnings": [], '
+                    '"tool_mentions": []}。node 必须包含 node_id、type、name、instruction、'
+                    "expected_user_info、allowed_actions、capability_refs。capability_refs 中"
+                    "允许能力与 required_*_ids 强制能力必须区分；不要输出完整技能。"
+                ),
+            }
+            node_text = fenced_provider_call(
+                lambda node_payload=node_payload: client.generate_text(prompt, node_payload),
+                execution_fence,
             )
             try:
                 node_raw = _raw_json_from_text(node_text)
@@ -389,17 +462,18 @@ class SkillDistiller:
             {"draft_skill": draft_data, "warnings": warnings, "tool_mentions": tool_mentions},
             request,
         )
-        review_text = client.generate_text(
-            prompt,
-            {
-                **payload,
-                "generation_mode": "final_review",
-                "current_draft": reviewed.draft_skill.model_dump(mode="json"),
-                "generation_instruction": (
-                    "检查 current_draft 是否遗漏原始流程、闭环回复、工具建议或中断策略。"
-                    "如需修正，返回完整 draft_skill；如果无需修正，也返回完整 draft_skill。只输出 JSON。"
-                ),
-            },
+        review_payload = {
+            **payload,
+            "generation_mode": "final_review",
+            "current_draft": reviewed.draft_skill.model_dump(mode="json"),
+            "generation_instruction": (
+                "检查 current_draft 是否遗漏原始流程、闭环回复、工具建议或中断策略。"
+                "如需修正，返回完整 draft_skill；如果无需修正，也返回完整 draft_skill。只输出 JSON。"
+            ),
+        }
+        review_text = fenced_provider_call(
+            lambda: client.generate_text(prompt, review_payload),
+            execution_fence,
         )
         try:
             return self._response_from_text(review_text, request)

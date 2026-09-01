@@ -43,7 +43,7 @@ from app.core.capability_manifest import (
     general_skill_snapshot_digest,
     tool_snapshot_digest,
 )
-from app.core.harness_agent import HarnessExecutionCancelled
+from app.core.harness_agent import HarnessExecutionCancelled, HarnessExecutionFenced
 from app.core.harness_session_cleanup import (
     HarnessWorkspaceArtifactConflictError,
     harness_task_workspace_path,
@@ -63,6 +63,7 @@ from app.db.models import (
     HarnessRunRecord,
     ModelConfig,
     Skill,
+    Tenant,
     Tool,
     UIConfig,
     new_id,
@@ -95,6 +96,13 @@ from app.knowledge.citations import knowledge_citations_from_results
 from app.knowledge.errors import KnowledgeError
 from app.knowledge.schema import KnowledgeSearchRequest
 from app.knowledge.service import KnowledgeService
+from app.security.tenant import (
+    TenantExecutionKind,
+    TenantLifecycleDecision,
+    TenantLifecycleDenied,
+    require_active_tenant,
+    require_matching_admission_version,
+)
 from app.tools.tool_executor import ToolExecutor
 from app.tools.tool_schema import ToolCall
 
@@ -127,6 +135,7 @@ class HarnessCapabilityInvoker:
         trace_sink: Callable[[str, dict[str, Any]], None] | None = None,
         step_deadline_monotonic: float | None = None,
         language_context: LanguageContext | dict[str, Any] | None = None,
+        admission_check: Callable[[], None] | None = None,
     ) -> None:
         """Bind capability execution to the immutable locale snapshot of its Harness run."""
         self.db = db
@@ -145,6 +154,7 @@ class HarnessCapabilityInvoker:
         self.ensure_execution_lease = ensure_execution_lease
         self.trace_sink = trace_sink
         self.step_deadline_monotonic = step_deadline_monotonic
+        self.admission_check = admission_check
         self.run_id = str(run_id or new_id("hrun"))
         self.language_context = _invoker_language_context(
             db,
@@ -204,15 +214,70 @@ class HarnessCapabilityInvoker:
     def invoke(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         """执行一个已展开能力，记录幂等调用，并在结束后调度持久摄取任务。"""
         # 先确认本轮仍可执行，并从冻结清单取得唯一能力描述。
+        self._check_admission()
         self._raise_if_cancelled()
         if callable(self.ensure_execution_lease):
             self.ensure_execution_lease()
+        admission_error: TenantLifecycleDenied | None = None
+        try:
+            admission = self._optional_tenant_admission()
+        except TenantLifecycleDenied as exc:
+            # Keep the denial observable as a failed invocation.  In particular,
+            # a suspended tenant must not make the caller retry the same logical
+            # action merely because the gate ran before the invocation row existed.
+            admission = None
+            admission_error = exc
         descriptor = self._descriptors.get(name)
         if descriptor is None:
             return _failure(
                 "TOOL_NOT_AVAILABLE",
                 "该能力不在当前 TaskFrame 的冻结清单中。",
             )
+        if admission_error is not None:
+            call_id = new_id("hcall")
+            admission_error_code = admission_error.code
+            admission_error_entry = ERROR_REGISTRY.get(admission_error_code)
+            if admission_error_entry is None:
+                admission_error_code = _INTERNAL_ERROR_CODE
+            else:
+                admission_error_code = admission_error_entry.code
+            tenant = self.db.get(Tenant, self.tenant_id)
+            invocation = HarnessInvocationRecord(
+                tenant_id=self.tenant_id,
+                tenant_lifecycle_version=(
+                    int(tenant.lifecycle_version or 1) if tenant is not None else 1
+                ),
+                session_id=self.session.id,
+                task_id=self.task_frame_id,
+                run_id=self.run_id,
+                call_id=call_id,
+                tool_name=name,
+                request_digest=_request_digest(name, arguments),
+                logical_action_key=None,
+                status="failed",
+                arguments_json=_audit_arguments(arguments),
+                language_context_json=self.language_context.model_dump(mode="json"),
+                result_json=_audit_result(
+                    _failure(
+                        admission_error_code,
+                        admission_error_code,
+                        request_id=call_id,
+                        trace_id=self.run_id,
+                    )
+                ),
+                response_cache_json=_failure(
+                    admission_error_code,
+                    admission_error_code,
+                    request_id=call_id,
+                    trace_id=self.run_id,
+                ),
+                finished_at=utc_now(),
+                updated_at=utc_now(),
+            )
+            self.db.add(invocation)
+            self._check_admission()
+            self.db.commit()
+            return dict(invocation.response_cache_json or {})
         if name not in self._activated_names:
             return _failure(
                 "CAPABILITY_NOT_ACTIVATED",
@@ -236,6 +301,9 @@ class HarnessCapabilityInvoker:
         call_id = new_id("hcall")
         invocation = HarnessInvocationRecord(
             tenant_id=self.tenant_id,
+            tenant_lifecycle_version=(
+                admission.lifecycle_version if admission is not None else 1
+            ),
             session_id=self.session.id,
             task_id=self.task_frame_id,
             run_id=self.run_id,
@@ -249,6 +317,7 @@ class HarnessCapabilityInvoker:
         )
         self.db.add(invocation)
         try:
+            self._check_admission()
             self.db.commit()
         except IntegrityError:
             self.db.rollback()
@@ -258,7 +327,13 @@ class HarnessCapabilityInvoker:
                     return replayed
             raise
         post_commit_ingest_job_id: str | None = None
+        side_effect_started = False
         try:
+            # The invocation row is committed before the side effect. Re-read the
+            # tenant immediately before dispatch so a concurrent suspension cannot
+            # turn a claimed call into an external action.
+            self._require_current_tenant_admission(admission)
+            side_effect_started = True
             # 按能力类型调用唯一适配器；知识维护动作额外保留提交后调度标记。
             self._raise_if_cancelled()
             if descriptor.kind == "internal":
@@ -319,22 +394,57 @@ class HarnessCapabilityInvoker:
             invocation.finished_at = utc_now()
             invocation.updated_at = utc_now()
             self.db.add(invocation)
+            self._check_admission()
             self.db.commit()
             raise
+        except HarnessExecutionFenced:
+            # Leave a started invocation for recovery reconciliation rather than
+            # allowing the stale worker to publish a fabricated tool result.
+            raise
         except Exception as exc:  # noqa: BLE001 - map provider failures to a stable tool result.
-            result = _failure(
-                "HARNESS_TOOL_ERROR",
-                str(exc),
-                request_id=call_id,
-                trace_id=self.run_id,
-                internal=InternalErrorContext(
-                    source="harness_capability",
-                    exception_type=type(exc).__name__,
-                    raw_message=str(exc),
-                ),
-            )
+            if isinstance(exc, TenantLifecycleDenied):
+                lifecycle_error_code = exc.code
+                lifecycle_error_entry = ERROR_REGISTRY.get(lifecycle_error_code)
+                if lifecycle_error_entry is None:
+                    lifecycle_error_code = _INTERNAL_ERROR_CODE
+                else:
+                    lifecycle_error_code = lifecycle_error_entry.code
+                result = _failure(
+                    lifecycle_error_code,
+                    lifecycle_error_code,
+                    request_id=call_id,
+                    trace_id=self.run_id,
+                )
+            else:
+                result = _failure(
+                    "HARNESS_TOOL_ERROR",
+                    str(exc),
+                    request_id=call_id,
+                    trace_id=self.run_id,
+                    internal=InternalErrorContext(
+                        source="harness_capability",
+                        exception_type=type(exc).__name__,
+                        raw_message=str(exc),
+                    ),
+                )
+        lifecycle_changed = False
+        try:
+            self._require_current_tenant_admission(admission)
+        except TenantLifecycleDenied:
+            lifecycle_changed = side_effect_started and admission is not None
+        if lifecycle_changed:
+            # Once dispatch began, a lifecycle change makes the provider outcome
+            # unknowable; never expose or replay it as ordinary success.
+            error = result.get("error")
+            if not isinstance(error, dict):
+                error = {}
+                result["error"] = error
+            error["outcome_unknown"] = True
+            result["success"] = False
         # 将业务结果与调用记录一次提交；失败类型决定 Harness 是否释放重试声明。
-        if result.get("success") is True:
+        if lifecycle_changed:
+            invocation.status = "outcome_unknown"
+        elif result.get("success") is True:
             invocation.status = "completed"
         elif _failure_was_not_sent(result):
             # Configuration/authorization failures are known to occur before
@@ -352,6 +462,7 @@ class HarnessCapabilityInvoker:
         invocation.finished_at = utc_now()
         invocation.updated_at = utc_now()
         self.db.add(invocation)
+        self._check_admission()
         self.db.commit()
         if post_commit_ingest_job_id:
             # 持久任务必须先提交，再交给复用的异步知识摄取执行器读取。
@@ -365,6 +476,36 @@ class HarnessCapabilityInvoker:
                 },
             )
         return result
+
+    def _optional_tenant_admission(self) -> TenantLifecycleDecision | None:
+        """Read the current lifecycle decision for this invocation when a Tenant exists."""
+        if self.db.get(Tenant, self.tenant_id) is None:
+            return None
+        return require_active_tenant(
+            self.db,
+            self.tenant_id,
+            TenantExecutionKind.JOB_CLAIM,
+            self.run_id,
+        )
+
+    def _check_admission(self) -> None:
+        """Run the enclosing Team wake token before any model/tool-visible step."""
+        check = self.admission_check
+        if callable(check):
+            check()
+
+    def _require_current_tenant_admission(
+        self,
+        admitted: TenantLifecycleDecision | None,
+    ) -> None:
+        """Recheck status and exact version immediately before/after a side effect."""
+        self._check_admission()
+        if admitted is None:
+            return
+        current = self._optional_tenant_admission()
+        if current is None:
+            return
+        require_matching_admission_version(current, admitted.lifecycle_version)
 
     def discover_artifacts(self) -> list[dict[str, Any]]:
         """Publish every user-facing file changed during this AgentLoop run."""

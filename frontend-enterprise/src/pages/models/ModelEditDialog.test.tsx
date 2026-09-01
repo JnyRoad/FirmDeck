@@ -5,24 +5,32 @@ import { cleanup, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { api } from '@/api/client';
 import { I18nProvider } from '@/i18n';
 import type { ModelConfigRead } from '@/types';
 import ModelEditDialog, { type ModelEditDialogProps } from './ModelEditDialog';
 
-vi.mock('@/api/client', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('@/api/client')>();
-  return {
-    ...actual,
-    api: { ...actual.api, put: vi.fn() },
+const mockedPut = vi.fn();
+
+vi.mock('@/api/tenant-client', () => ({
+  createTenantClient: vi.fn(() => ({ put: mockedPut })),
+}));
+
+vi.mock('@/contexts/TenantSessionContext', () => {
+  const context = {
+    tenantId: 'tenant_demo',
+    tenantSlug: 'tenant-demo',
+    userId: 'user_demo',
+    generation: 1,
+    signal: new AbortController().signal,
+    session: { token: 'test-token' },
+    isCurrentGeneration: () => true,
   };
+  return { useTenantSession: () => context };
 });
 
 vi.mock('@/components/ui/app-toast', () => ({
   notify: { success: vi.fn(), error: vi.fn(), warning: vi.fn(), info: vi.fn(), loading: vi.fn(), dismiss: vi.fn() },
 }));
-
-const mockedPut = vi.mocked(api.put);
 
 function stubSelectPointerCapture() {
   if (!Element.prototype.hasPointerCapture) {
@@ -120,5 +128,21 @@ describe('ModelEditDialog — numeric field validation', () => {
 
     expect(mockedPut).toHaveBeenCalled();
     expect(notify.error).not.toHaveBeenCalled();
+  });
+});
+
+describe('ModelEditDialog — secret lifecycle', () => {
+  it('clears the API key immediately when cancel closes the persistent dialog', async () => {
+    const user = userEvent.setup();
+    renderDialog();
+
+    const apiKeyInput = document.querySelector('input[type="password"]') as HTMLInputElement;
+    expect(apiKeyInput).toBeTruthy();
+    await user.type(apiKeyInput, 'temporary-secret');
+    expect(apiKeyInput.value).toBe('temporary-secret');
+
+    await user.click(screen.getByRole('button', { name: '取消' }));
+
+    expect(apiKeyInput.value).toBe('');
   });
 });

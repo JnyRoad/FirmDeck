@@ -1,6 +1,7 @@
 import os as _os
 from functools import lru_cache
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -9,6 +10,7 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///./skill_agent_loop.db"
     app_secret: str = "change-me-in-development"
     staffdeck_public_url: str = ""
+    system_admin_secret: str = Field(default="", repr=False, exclude=True)
     demo_model_base_url: str = "http://localhost:52010/v1"
     demo_model_name: str = "qwen3.6-27b"
     demo_model_api_key: str = ""
@@ -22,7 +24,7 @@ class Settings(BaseSettings):
     codex_a2a_command: str = "codex"
     codex_a2a_workspace_root: str = ""
     codex_a2a_timeout_seconds: float = 1800.0
-    codex_a2a_token: str = ""
+    codex_a2a_token: str = Field(default="", repr=False, exclude=True)
     codex_subscription_command: str = "codex"
     codex_subscription_timeout_seconds: float = 30.0
     tool_base_url: str = "http://localhost:5173"

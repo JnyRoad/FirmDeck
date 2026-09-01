@@ -1,6 +1,7 @@
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
+from typing import ClassVar
 
 import pytest
 from sqlalchemy.pool import StaticPool
@@ -49,7 +50,7 @@ def _test_engine():
 def _seed_binding(engine, *, mounts: list[tuple[str, str, bool]] | None = None) -> str:
     """创建绑定与两个员工;mounts=(agent_id, name, is_default),None 表示存量绑定(无挂载行)。"""
     with Session(engine) as db:
-        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.add(Tenant(id="tenant_demo", name="Demo", status="active", lifecycle_version=1))
         db.add(AgentProfile(id="agent_xz", tenant_id="tenant_demo", name="行政", metadata_json={}))
         db.add(AgentProfile(id="agent_cw", tenant_id="tenant_demo", name="财务", metadata_json={}))
         binding = ChannelBinding(
@@ -104,7 +105,7 @@ def _group_message(event_id: str, text: str, group_id: str = "room_123456") -> d
 
 
 class RecordingAgentLoop:
-    calls: list = []
+    calls: ClassVar[list] = []
 
     def __init__(self, db, *, event_sink=None):
         self.db = db
@@ -531,7 +532,7 @@ def test_agent_names_lookup() -> None:
 def test_staging_prefers_channel_binding_id() -> None:
     engine = _test_engine()
     with Session(engine) as db:
-        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.add(Tenant(id="tenant_demo", name="Demo", status="active", lifecycle_version=1))
         # 绑定默认员工是行政,但会话属于财务(账号化路由后的状态)
         binding = ChannelBinding(
             tenant_id="tenant_demo",
@@ -574,7 +575,7 @@ def test_staging_prefers_channel_binding_id() -> None:
 def test_staging_fallback_without_channel_binding_id() -> None:
     engine = _test_engine()
     with Session(engine) as db:
-        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.add(Tenant(id="tenant_demo", name="Demo", status="active", lifecycle_version=1))
         binding = ChannelBinding(
             tenant_id="tenant_demo",
             agent_id="agent_xz",
@@ -614,7 +615,7 @@ def test_staging_fallback_without_channel_binding_id() -> None:
 def test_staging_skips_when_binding_id_points_to_disabled() -> None:
     engine = _test_engine()
     with Session(engine) as db:
-        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.add(Tenant(id="tenant_demo", name="Demo", status="active", lifecycle_version=1))
         binding = ChannelBinding(
             tenant_id="tenant_demo", agent_id="agent_xz", channel="wechat", status="disabled"
         )
@@ -1040,7 +1041,7 @@ def _make_agent_channel_client(engine):
 
 def _seed_api_users(engine) -> dict[str, User]:
     with Session(engine) as db:
-        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.add(Tenant(id="tenant_demo", name="Demo", status="active", lifecycle_version=1))
         owner = User(id="user_owner", tenant_id="tenant_demo", username="owner", password_hash="x")
         other = User(id="user_other", tenant_id="tenant_demo", username="other", password_hash="x")
         db.add(owner)

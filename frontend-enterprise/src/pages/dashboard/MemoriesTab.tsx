@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { DataTable, type DataTableColumn } from '@/components/DataTable';
 import { DetailField } from '@/components/DetailField';
@@ -21,19 +21,22 @@ import { apiErrorMessage } from '@/lib/apiErrorMessages';
 import { cn } from '@/lib/utils';
 import { MOBILE_CARD_CLASS, formatDateTime } from '@/lib/enterprise-ui';
 
-import { api, TENANT_ID } from '../../api/client';
+import { createTenantClient } from '../../api/tenant-client';
 import IconListBulleted from '../../assets/icons/list-bulleted.svg?react';
 import IconHistory from '../../assets/icons/profile-history.svg?react';
 import IconRefresh from '../../assets/icons/refresh.svg?react';
 import IconSearch from '../../assets/icons/search.svg?react';
 import type { EnterpriseAuthUser } from '../../auth';
+import { useTenantSession } from '../../contexts/TenantSessionContext';
 import { canManageEmployeeAgent } from '../../employee';
 import { useClientPagination } from '../../hooks/useClientPagination';
 import { isTeamScope, readEmployeeScope } from '../../lib/agent-scope-storage';
+import { tenantUserStorageKey } from '../../lib/tenant-storage';
 import type { AgentProfileRead, MemoryRead } from '../../types';
 
 const MEMORY_PAGE_SIZE = 10;
 const ALL_USERS_VALUE = '__all__';
+const MEMORY_FILTER_FEATURE = 'memories-filter';
 
 type MemoryFilter = {
   username: string;
@@ -52,6 +55,37 @@ type MemoryUserGroup = {
 };
 
 const EMPTY_FILTER: MemoryFilter = { username: '', user_id: '', q: '' };
+
+/** Generate the tenant/user namespace for the memories filter state. */
+function memoryFilterStorageKey(tenantId: string, userId: string): string {
+  return tenantUserStorageKey(tenantId, userId, MEMORY_FILTER_FEATURE);
+}
+
+/** Read a validated memories filter without adopting any legacy unscoped value. */
+function readMemoryFilter(tenantId: string, userId: string): MemoryFilter {
+  try {
+    const raw = window.localStorage.getItem(memoryFilterStorageKey(tenantId, userId));
+    if (!raw) return EMPTY_FILTER;
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    if (!parsed || typeof parsed !== 'object') return EMPTY_FILTER;
+    return {
+      username: typeof parsed.username === 'string' ? parsed.username : '',
+      user_id: typeof parsed.user_id === 'string' ? parsed.user_id : '',
+      q: typeof parsed.q === 'string' ? parsed.q : '',
+    };
+  } catch {
+    return EMPTY_FILTER;
+  }
+}
+
+/** Persist the memories filter only under the verified tenant/user namespace. */
+function persistMemoryFilter(tenantId: string, userId: string, filter: MemoryFilter): void {
+  try {
+    window.localStorage.setItem(memoryFilterStorageKey(tenantId, userId), JSON.stringify(filter));
+  } catch {
+    // A blocked or full browser store must not affect server-backed memories.
+  }
+}
 
 /** 将未知异常折叠为安全语义错误，避免把原始 Error.message 直接显示给用户。 */
 function memoryTabErrorMessage(
@@ -89,45 +123,132 @@ export default function MemoriesTab({
   agent?: AgentProfileRead | null;
 } = {}) {
   const { t } = useAppIntl();
+  const tenantContext = useTenantSession();
+  const tenantClient = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
+  const tenantId = tenantContext?.tenantId || '';
+  const userId = tenantContext?.userId || '';
+  const tenantScopeKey = tenantContext
+    ? `${tenantId}:${userId}:${tenantContext.generation}`
+    : '';
+  const scopeKeyRef = useRef('');
+  const loadControllerRef = useRef<AbortController | null>(null);
+  const agentIdRef = useRef('');
+  const scopeRevisionRef = useRef(0);
+  const actionControllersRef = useRef(new Set<AbortController>());
+  const [scopeReady, setScopeReady] = useState(false);
   const [rows, setRows] = useState<MemoryRead[]>([]);
   const [detail, setDetail] = useState<MemoryUserGroup | null>(null);
   const [loading, setLoading] = useState(false);
   const [clearing, setClearing] = useState(false);
-  const [agentId, setAgentId] = useState(readEmployeeScope);
+  const [agentId, setAgentId] = useState('');
   const [filter, setFilter] = useState<MemoryFilter>(EMPTY_FILTER);
+  // Keep the latest selected employee visible to in-flight callbacks before passive effects run.
+  agentIdRef.current = agentId;
+
+  /** Abort destructive actions when the employee scope changes or this tab unmounts. */
+  function cancelActionControllers() {
+    actionControllersRef.current.forEach((controller) => controller.abort());
+    actionControllersRef.current.clear();
+  }
+
+  /** Advance the employee scope revision synchronously and clear stale action UI. */
+  function updateAgentScope(nextAgentId: string) {
+    agentIdRef.current = nextAgentId;
+    scopeRevisionRef.current += 1;
+    cancelActionControllers();
+    setClearing(false);
+    setRows([]);
+    setDetail(null);
+    setAgentId(nextAgentId);
+  }
+
+  useEffect(() => () => cancelActionControllers(), [tenantContext?.generation]);
 
   /** 读取当前筛选下的记忆列表；未知异常统一回退到安全语义错误。 */
-  async function load(next: MemoryFilter = filter) {
+  const load = useCallback(async (next: MemoryFilter) => {
+    if (!tenantContext || !tenantId || !userId || !scopeReady || scopeKeyRef.current !== tenantScopeKey) return;
+    loadControllerRef.current?.abort();
+    const requestController = new AbortController();
+    loadControllerRef.current = requestController;
+    const generation = tenantContext.generation;
+    const capturedAgentId = agentId;
+    const capturedScopeRevision = scopeRevisionRef.current;
+    const isCurrent = () => (
+      !requestController.signal.aborted
+      && tenantContext.isCurrentGeneration(generation)
+      && scopeKeyRef.current === tenantScopeKey
+      && agentIdRef.current === capturedAgentId
+      && scopeRevisionRef.current === capturedScopeRevision
+    );
     setLoading(true);
     try {
-      const params = new URLSearchParams({ tenant_id: TENANT_ID });
+      const params = new URLSearchParams();
       if (agentId) params.set('agent_id', agentId);
       if (next.username.trim()) params.set('username', next.username.trim());
       if (next.user_id.trim()) params.set('user_id', next.user_id.trim());
       if (next.q.trim()) params.set('q', next.q.trim());
       params.set('limit', '500');
-      const result = await api.get<MemoryRead[]>(`/api/enterprise/memories?${params.toString()}`);
+      const result = await tenantClient.get<MemoryRead[]>(`/api/enterprise/memories?${params.toString()}`, {
+        signal: requestController.signal,
+      });
+      if (!isCurrent()) return;
       setRows(result);
     } catch (error) {
-      notify.error(memoryTabErrorMessage(error, t('dashboard.memories.toast.loadFailed'), t('common.error.generic')));
+      if (isCurrent()) {
+        notify.error(memoryTabErrorMessage(error, t('dashboard.memories.toast.loadFailed'), t('common.error.generic')));
+      }
     } finally {
-      setLoading(false);
+      if (loadControllerRef.current === requestController) {
+        loadControllerRef.current = null;
+        if (isCurrent()) setLoading(false);
+      }
     }
-  }
+  }, [agentId, scopeReady, t, tenantClient, tenantContext, tenantId, tenantScopeKey, userId]);
+
+  useEffect(() => {
+    if (!tenantContext || !tenantId || !userId) {
+      scopeKeyRef.current = '';
+      agentIdRef.current = '';
+      scopeRevisionRef.current += 1;
+      cancelActionControllers();
+      setScopeReady(false);
+      setAgentId('');
+      setRows([]);
+      setFilter(EMPTY_FILTER);
+      return;
+    }
+    scopeKeyRef.current = tenantScopeKey;
+    const nextAgentId = readEmployeeScope(tenantId, userId);
+    agentIdRef.current = nextAgentId;
+    scopeRevisionRef.current += 1;
+    cancelActionControllers();
+    setAgentId(nextAgentId);
+    setRows([]);
+    setFilter(readMemoryFilter(tenantId, userId));
+    setScopeReady(true);
+  }, [tenantContext, tenantId, tenantScopeKey, userId]);
 
   useEffect(() => {
     const onScopeChange = (event: Event) => {
       const next = (event as CustomEvent<{ agentId?: string }>).detail?.agentId || '';
-      setAgentId(next && !isTeamScope(next) ? next : readEmployeeScope());
+      if (!tenantContext || !tenantId || !userId || scopeKeyRef.current !== tenantScopeKey) return;
+      updateAgentScope(next && !isTeamScope(next) ? next : readEmployeeScope(tenantId, userId));
     };
     window.addEventListener('ultrarag-enterprise-agent-scope-change', onScopeChange);
     return () => window.removeEventListener('ultrarag-enterprise-agent-scope-change', onScopeChange);
-  }, []);
+  }, [tenantContext, tenantId, tenantScopeKey, userId]);
 
   useEffect(() => {
     void load(filter);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [agentId]);
+    return () => {
+      loadControllerRef.current?.abort();
+    };
+  }, [agentId, load]);
+
+  useEffect(() => {
+    if (!tenantContext || !tenantId || !userId || !scopeReady || scopeKeyRef.current !== tenantScopeKey) return;
+    persistMemoryFilter(tenantId, userId, filter);
+  }, [filter, scopeReady, tenantContext, tenantId, tenantScopeKey, userId]);
 
   const groups = useMemo(() => groupMemories(rows), [rows]);
   const pagination = useClientPagination(groups, MEMORY_PAGE_SIZE, groups);
@@ -151,6 +272,27 @@ export default function MemoriesTab({
     void load(EMPTY_FILTER);
   }
 
+  /** Fence destructive memory actions to the captured employee and scope revision. */
+  function beginActionFence() {
+    if (!tenantContext || !tenantId || !userId || !scopeReady || scopeKeyRef.current !== tenantScopeKey) return null;
+    const requestController = new AbortController();
+    actionControllersRef.current.add(requestController);
+    const generation = tenantContext.generation;
+    const capturedAgentId = agentId;
+    const capturedScopeRevision = scopeRevisionRef.current;
+    return {
+      signal: requestController.signal,
+      isCurrent: () => (
+        !requestController.signal.aborted
+        && tenantContext.isCurrentGeneration(generation)
+        && scopeKeyRef.current === tenantScopeKey
+        && agentIdRef.current === capturedAgentId
+        && scopeRevisionRef.current === capturedScopeRevision
+      ),
+      release: () => actionControllersRef.current.delete(requestController),
+    };
+  }
+
   /** 仅清空当前用户在当前作用域下的长期记忆，不影响其他用户数据。 */
   async function clearOwnMemories() {
     const confirmed = window.confirm(
@@ -160,22 +302,37 @@ export default function MemoriesTab({
     );
     if (!confirmed) return;
 
+    const fence = beginActionFence();
+    if (!fence) return;
+    if (!tenantContext || !tenantId || !userId || !scopeReady || !fence.isCurrent()) {
+      fence.release();
+      return;
+    }
     setClearing(true);
     try {
-      const params = new URLSearchParams({ tenant_id: TENANT_ID });
+      const params = new URLSearchParams();
       if (agentId) params.set('agent_id', agentId);
-      const result = await api.delete<{ deleted: number }>(`/api/enterprise/memories/me?${params.toString()}`);
+      const result = await tenantClient.delete<{ deleted: number }>(
+        `/api/enterprise/memories/me?${params.toString()}`,
+        undefined,
+        { signal: fence.signal },
+      );
+      if (!fence.isCurrent()) return;
       notify.success(
         result.deleted > 0
           ? t('dashboard.memories.toast.clearSuccess', { count: result.deleted })
           : t('dashboard.memories.toast.clearEmpty'),
       );
+      if (!fence.isCurrent()) return;
       setDetail(null);
       await load(filter);
     } catch (error) {
-      notify.error(memoryTabErrorMessage(error, t('dashboard.memories.toast.clearFailed'), t('common.error.generic')));
+      if (fence.isCurrent()) {
+        notify.error(memoryTabErrorMessage(error, t('dashboard.memories.toast.clearFailed'), t('common.error.generic')));
+      }
     } finally {
-      setClearing(false);
+      if (fence.isCurrent()) setClearing(false);
+      fence.release();
     }
   }
 

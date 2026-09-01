@@ -6,7 +6,7 @@
 import { useEffect, useRef, useState, type ChangeEvent, type ReactNode } from 'react';
 import QRCode from 'qrcode';
 
-import { wechatKfApi, TENANT_ID } from '@/api/client';
+import { wechatKfApi } from '@/api/client';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
 import { Button, Input } from '@/components/ui';
 import { createToastNotifier } from '@/components/ui/app-toast';
@@ -214,7 +214,7 @@ export default function WechatKfSetup({
     setErrorId(null);
     try {
       const prepared = await wechatKfApi.prepareCallback(binding.id, {
-        tenant_id: TENANT_ID,
+        tenant_id: binding.tenant_id,
         corp_id: normalizedCorpId,
       });
       setCallbackConfig(prepared);
@@ -248,7 +248,7 @@ export default function WechatKfSetup({
         encoding_aes_key: callbackConfig.encoding_aes_key,
       } : {};
       const updated = await wechatKfApi.saveCredentials(binding.id, {
-        tenant_id: TENANT_ID,
+        tenant_id: binding.tenant_id,
         corp_id: normalizedCorpId,
         secret: submittedSecret,
         ...callbackCredentials,
@@ -267,7 +267,7 @@ export default function WechatKfSetup({
     const generation = accountRequestGeneration.current + 1;
     accountRequestGeneration.current = generation;
     try {
-      const result = await wechatKfApi.listAccounts(binding.id, TENANT_ID);
+      const result = await wechatKfApi.listAccounts(binding.id, binding.tenant_id);
       if (accountRequestGeneration.current !== generation) {
         return { accepted: false, succeeded: false };
       }
@@ -297,7 +297,7 @@ export default function WechatKfSetup({
     setErrorId(null);
     try {
       const updated = await wechatKfApi.selectAccount(binding.id, {
-        tenant_id: TENANT_ID,
+        tenant_id: binding.tenant_id,
         open_kfid: account.open_kfid,
       });
       applyBinding(updated);
@@ -349,7 +349,7 @@ export default function WechatKfSetup({
     setOperation('avatar');
     setErrorId(null);
     try {
-      const result = await wechatKfApi.uploadAvatar(binding.id, avatarFile, TENANT_ID);
+      const result = await wechatKfApi.uploadAvatar(binding.id, avatarFile, binding.tenant_id);
       setAvatarMediaId(result.media_id);
       setAvatarFile(null);
       setAvatarInputRevision((revision) => revision + 1);
@@ -376,7 +376,7 @@ export default function WechatKfSetup({
     setErrorId(null);
     try {
       const updated = await wechatKfApi.createAccount(binding.id, {
-        tenant_id: TENANT_ID,
+        tenant_id: binding.tenant_id,
         name,
         media_id: avatarMediaId,
       });
@@ -412,7 +412,7 @@ export default function WechatKfSetup({
     setErrorId(null);
     try {
       const updated = await wechatKfApi.updateAccount(binding.id, {
-        tenant_id: TENANT_ID,
+        tenant_id: binding.tenant_id,
         open_kfid: editingOpenKfid,
         name,
         ...(avatarMediaId ? { media_id: avatarMediaId } : {}),
@@ -445,7 +445,7 @@ export default function WechatKfSetup({
     setOperation('delete');
     setErrorId(null);
     try {
-      const updated = await wechatKfApi.deleteAccount(binding.id, target.open_kfid, TENANT_ID);
+      const updated = await wechatKfApi.deleteAccount(binding.id, target.open_kfid, binding.tenant_id);
       applyBinding(updated);
       setDeleteTarget(null);
       const refreshed = await refreshAccounts('channels.wechatKf.error.mutationRefresh');
@@ -479,7 +479,11 @@ export default function WechatKfSetup({
     clearContactWay(account.open_kfid);
     try {
       // 1. 请求 provider 原始咨询 URL；2. 校验 scheme/host/凭据；3. 生成 QR 并保留 raw URL。
-      const result = await wechatKfApi.createContactWay(binding.id, account.open_kfid, TENANT_ID);
+      const result = await wechatKfApi.createContactWay(
+        binding.id,
+        account.open_kfid,
+        binding.tenant_id,
+      );
       if (!isSafeWechatKfContactUrl(result.url)) {
         setErrorId(createMessageDescriptor('channels.wechatKf.contact.invalidUrl').id);
         toast.error(createMessageDescriptor('channels.wechatKf.contact.invalidUrl'));

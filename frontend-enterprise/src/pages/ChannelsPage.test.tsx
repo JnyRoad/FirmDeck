@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -15,6 +15,19 @@ import type {
 } from '@/types';
 
 import ChannelsPage from './ChannelsPage';
+
+vi.mock('../contexts/TenantSessionContext', () => {
+  const context = {
+    tenantId: 'tenant_demo',
+    tenantSlug: 'tenant-demo',
+    userId: 'user-1',
+    generation: 1,
+    signal: new AbortController().signal,
+    session: { token: 'test-token' },
+    isCurrentGeneration: () => true,
+  };
+  return { useTenantSession: () => context };
+});
 
 const adminUser: EnterpriseAuthUser = {
   id: 'user-1',
@@ -92,6 +105,14 @@ function jsonResponse(body: unknown): Response {
   } as Response;
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((nextResolve) => {
+    resolve = nextResolve;
+  });
+  return { promise, resolve };
+}
+
 function makeFetchMock(overrides: {
   bindings?: unknown;
   teams?: unknown;
@@ -105,7 +126,7 @@ function makeFetchMock(overrides: {
   return vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
     const method = init?.method || 'GET';
-    if (method === 'POST' && url.endsWith('/api/enterprise/channels')) {
+    if (method === 'POST' && url.includes('/api/enterprise/channels')) {
       return jsonResponse({ ...teamBinding, id: 'binding-new' });
     }
     if (method === 'PUT' && /\/api\/enterprise\/channels\/[^/?]+/.test(url)) {
@@ -150,7 +171,7 @@ async function openCreateDialog(user: ReturnType<typeof userEvent.setup>) {
 
 function createPostBody(fetchMock: ReturnType<typeof makeFetchMock>): Record<string, unknown> {
   const call = fetchMock.mock.calls.find(
-    ([input, init]) => init?.method === 'POST' && String(input).endsWith('/api/enterprise/channels'),
+    ([input, init]) => init?.method === 'POST' && String(input).includes('/api/enterprise/channels'),
   );
   expect(call).toBeTruthy();
   return JSON.parse(String(call?.[1]?.body)) as Record<string, unknown>;
@@ -378,5 +399,49 @@ describe('ChannelsPage', () => {
     await user.click(screen.getByRole('button', { name: '团队' }));
     expect(await screen.findByText('暂无可用团队')).toBeTruthy();
     expect(screen.getByRole('button', { name: '去创建团队' })).toBeTruthy();
+  });
+
+  it('keeps the new binding loading while an old binding request settles', async () => {
+    const user = userEvent.setup();
+    const bindingA: ChannelBindingRead = {
+      ...teamBinding,
+      id: 'binding-a',
+      name: '渠道 A',
+      team_id: null,
+      team_name: null,
+      my_role: 'owner',
+    };
+    const bindingB: ChannelBindingRead = {
+      ...teamBinding,
+      id: 'binding-b',
+      name: '渠道 B',
+      team_id: null,
+      team_name: null,
+      my_role: 'owner',
+    };
+    const baseFetch = makeFetchMock({ bindings: [bindingA, bindingB] });
+    const requestA = deferred<Response>();
+    const requestB = deferred<Response>();
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes('/binding-a/conversations')) return requestA.promise;
+      if (url.includes('/binding-b/conversations')) return requestB.promise;
+      return baseFetch(input, init);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    renderPage();
+    await user.click(await screen.findByText('渠道 A'));
+    await user.click(screen.getByRole('button', { name: '返回' }));
+    await user.click(await screen.findByText('渠道 B'));
+
+    expect(screen.getByText(/加载中/)).toBeTruthy();
+    await act(async () => {
+      requestA.resolve(jsonResponse({ items: [], total: 0, offset: 0, limit: 20 }));
+      await new Promise((resolve) => window.setTimeout(resolve, 0));
+    });
+
+    expect(screen.getByText(/加载中/)).toBeTruthy();
+    requestB.resolve(jsonResponse({ items: [], total: 0, offset: 0, limit: 20 }));
   });
 });

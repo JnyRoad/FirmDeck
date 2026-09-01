@@ -16,6 +16,7 @@ from app.config import get_settings
 from app.contracts.http import build_http_exception
 from app.db import get_session
 from app.db.models import User
+from app.security.tenant import TenantExecutionKind, TenantLifecycleDenied, require_active_tenant
 
 TOKEN_TTL_SECONDS = 60 * 60 * 24 * 14
 security = HTTPBearer(auto_error=False)
@@ -38,10 +39,20 @@ def verify_password(password: str, stored_hash: str) -> bool:
 
 
 def create_access_token(user: User) -> str:
+    """Issue one tenant-data-plane token for a valid versioned tenant user."""
+    if not _is_nonempty_string(user.tenant_id):
+        raise ValueError("Invalid tenant token principal")
+    if not _is_nonempty_string(user.id) or not _is_nonempty_string(user.username):
+        raise ValueError("Invalid tenant token principal")
+    if not _is_positive_integer(user.auth_version):
+        raise ValueError("Invalid tenant token principal")
     payload = {
         "tenant_id": user.tenant_id,
         "user_id": user.id,
         "username": user.username,
+        "principal_type": "tenant_user",
+        "aud": "tenant_data_plane",
+        "auth_version": user.auth_version,
         "exp": int(time.time()) + TOKEN_TTL_SECONDS,
     }
     body = _b64(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
@@ -53,13 +64,57 @@ def get_current_user(
     credentials: HTTPAuthorizationCredentials | None = Depends(security),
     db: Session = Depends(get_session),
 ) -> User:
-    """Authenticate the bearer token and expose only registered auth failures at the API boundary."""
+    """Authenticate a tenant bearer and reject temporary-password business access."""
+    return _get_authenticated_user(credentials, db, allow_temporary_password=False)
+
+
+def get_current_user_allowing_temporary(
+    credentials: HTTPAuthorizationCredentials | None = Depends(security),  # noqa: B008
+    db: Session = Depends(get_session),  # noqa: B008
+) -> User:
+    """Authenticate a tenant bearer for the narrowly scoped recovery endpoints."""
+    return _get_authenticated_user(credentials, db, allow_temporary_password=True)
+
+
+def authenticate_tenant_token(token: str, db: Session) -> User:
+    """Apply the same tenant bearer checks to non-FastAPI callers such as the Public API."""
+    credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
+    return _get_authenticated_user(credentials, db, allow_temporary_password=False)
+
+
+def _get_authenticated_user(
+    credentials: HTTPAuthorizationCredentials | None,
+    db: Session,
+    *,
+    allow_temporary_password: bool,
+) -> User:
+    """Resolve a current tenant user with auth-version and lifecycle admission checks."""
     if not credentials:
         raise build_http_exception("AUTH_NOT_AUTHENTICATED")
     payload = _decode_token(credentials.credentials)
-    user = db.get(User, payload.get("user_id", ""))
-    if not user or user.tenant_id != payload.get("tenant_id"):
+    user = db.get(User, payload["user_id"])
+    if (
+        not user
+        or user.tenant_id != payload["tenant_id"]
+        or not _is_positive_integer(user.auth_version)
+        or user.auth_version != payload["auth_version"]
+    ):
         raise build_http_exception("AUTH_INVALID_USER_TOKEN")
+    try:
+        require_active_tenant(
+            db,
+            user.tenant_id,
+            TenantExecutionKind.JOB_CLAIM,
+            f"tenant-bearer:{user.id}",
+        )
+    except TenantLifecycleDenied as exc:
+        # A bearer must not disclose whether its tenant row is missing/corrupt.  Suspension is
+        # deliberately distinct so the UI can stop an existing tenant session immediately.
+        if exc.code == "TENANT_SUSPENDED":
+            raise build_http_exception("TENANT_SUSPENDED") from None
+        raise build_http_exception("AUTH_INVALID_USER_TOKEN") from None
+    if not allow_temporary_password and user.must_change_password:
+        raise build_http_exception("TEMPORARY_PASSWORD_CHANGE_REQUIRED")
     return user
 
 
@@ -88,12 +143,56 @@ def _decode_token(token: str) -> dict[str, Any]:
     if not hmac.compare_digest(_sign(body), signature):
         raise build_http_exception("AUTH_INVALID_TOKEN_SIGNATURE")
     try:
-        payload = json.loads(base64.urlsafe_b64decode(_pad_b64(body)).decode("utf-8"))
+        payload = json.loads(
+            base64.b64decode(_pad_b64(body), altchars=b"-_", validate=True).decode("utf-8")
+        )
     except Exception as exc:
         raise build_http_exception("AUTH_INVALID_TOKEN_PAYLOAD") from exc
-    if int(payload.get("exp", 0)) < int(time.time()):
+    if not _is_valid_tenant_payload(payload):
+        raise build_http_exception("AUTH_INVALID_TOKEN_PAYLOAD")
+    if payload["exp"] <= int(time.time()):
         raise build_http_exception("AUTH_TOKEN_EXPIRED")
     return payload
+
+
+def _is_valid_tenant_payload(payload: object) -> bool:
+    """Accept only the exact tenant token claim set with strict scalar types and domain values."""
+    if not isinstance(payload, dict):
+        return False
+    if set(payload) != {
+        "tenant_id",
+        "user_id",
+        "username",
+        "principal_type",
+        "aud",
+        "auth_version",
+        "exp",
+    }:
+        return False
+    return (
+        _is_nonempty_string(payload["tenant_id"])
+        and _is_nonempty_string(payload["user_id"])
+        and _is_nonempty_string(payload["username"])
+        and payload["principal_type"] == "tenant_user"
+        and payload["aud"] == "tenant_data_plane"
+        and _is_positive_integer(payload["auth_version"])
+        and _is_integer(payload["exp"])
+    )
+
+
+def _is_nonempty_string(value: object) -> bool:
+    """Return whether a token identity claim is a non-empty string without coercion."""
+    return isinstance(value, str) and bool(value)
+
+
+def _is_integer(value: object) -> bool:
+    """Return whether a token numeric claim is an integer rather than a boolean subtype."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_positive_integer(value: object) -> bool:
+    """Return whether an authentication version is a strict positive integer."""
+    return _is_integer(value) and value > 0
 
 
 def _sign(body: str) -> str:

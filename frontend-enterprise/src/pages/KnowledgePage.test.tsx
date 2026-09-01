@@ -2,21 +2,39 @@
 
 import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import type { ReactNode } from 'react';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { AppIntlProvider, I18nProvider } from '@/i18n';
 import { TooltipProvider } from '@/components/ui/tooltip';
+import { TenantSessionProvider } from '@/contexts/TenantSessionContext';
+import { persistSharedAgentScope } from '@/lib/agent-scope-storage';
+import type { EnterpriseAuthSession } from '@/auth';
 import type { AgentProfileRead, KnowledgeBaseRead } from '@/types';
 
 import KnowledgeManagePage, { KnowledgeAddPage } from './KnowledgePage';
 
-const currentUser = {
-  id: 'user-admin',
-  tenant_id: 'tenant_demo',
-  username: 'admin',
-  role: 'admin' as const,
+const tenantSession: EnterpriseAuthSession = {
+  token: 'tenant-demo-token',
+  scope: 'tenant',
+  tenant: {
+    id: 'tenant_demo',
+    slug: 'demo',
+    display_name: 'Demo tenant',
+  },
+  user: {
+    id: 'user-admin',
+    tenant_id: 'tenant_demo',
+    username: 'admin',
+    display_name: 'Demo admin',
+    role: 'admin',
+    must_change_password: false,
+    avatar_url: null,
+  },
 };
+
+const currentUser = tenantSession.user;
 
 const dedicatedBase: KnowledgeBaseRead = {
   id: 'kb-dedicated',
@@ -67,6 +85,7 @@ function jsonResponse(body: unknown): Response {
     ok: true,
     status: 200,
     statusText: 'OK',
+    json: async () => body ?? {},
     text: async () => JSON.stringify(body ?? {}),
   } as Response;
 }
@@ -78,6 +97,7 @@ function stubKnowledgeFetch(options?: {
   /** 为管理页和新建页提供可按员工作用域调整的只读依赖接口。 */
   const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
+    if (url.includes('/api/auth/me')) return jsonResponse(tenantSession.user);
     if (url.includes('/agents')) return jsonResponse(options?.agents || []);
     if (url.includes('/model-configs')) return jsonResponse([]);
     if (url.includes('/knowledge/jobs')) return jsonResponse([]);
@@ -152,17 +172,24 @@ function LocationEcho() {
   return <div data-testid="location">{location.pathname}</div>;
 }
 
+/** 为页面测试挂载已验证的租户上下文，拒绝无上下文的匿名 fallback。 */
+function TenantPageBoundary({ children }: { children: ReactNode }) {
+  return <TenantSessionProvider session={tenantSession}>{children}</TenantSessionProvider>;
+}
+
 function renderAddPage() {
   /** 在真实路由边界内渲染知识库新建页。 */
   return render(
     <I18nProvider>
       <TooltipProvider>
-        <MemoryRouter initialEntries={['/enterprise/knowledge/new']}>
-          <Routes>
-            <Route path="/enterprise/knowledge/new" element={<KnowledgeAddPage currentUser={currentUser} />} />
-            <Route path="/enterprise/knowledge" element={<LocationEcho />} />
-          </Routes>
-        </MemoryRouter>
+        <TenantPageBoundary>
+          <MemoryRouter initialEntries={['/enterprise/knowledge/new']}>
+            <Routes>
+              <Route path="/enterprise/knowledge/new" element={<KnowledgeAddPage currentUser={currentUser} />} />
+              <Route path="/enterprise/knowledge" element={<LocationEcho />} />
+            </Routes>
+          </MemoryRouter>
+        </TenantPageBoundary>
       </TooltipProvider>
     </I18nProvider>,
   );
@@ -216,9 +243,11 @@ describe('KnowledgePage shared knowledge', () => {
     render(
       <I18nProvider>
         <TooltipProvider>
-          <MemoryRouter>
-            <KnowledgeManagePage currentUser={currentUser} />
-          </MemoryRouter>
+          <TenantPageBoundary>
+            <MemoryRouter>
+              <KnowledgeManagePage currentUser={currentUser} />
+            </MemoryRouter>
+          </TenantPageBoundary>
         </TooltipProvider>
       </I18nProvider>,
     );
@@ -232,14 +261,16 @@ describe('KnowledgePage shared knowledge', () => {
   it('offers conversion only for an active dedicated base in an employee scope', async () => {
     /** 验证专用员工分支出现转换入口，而共享库不出现反向转换入口。 */
     const user = userEvent.setup();
-    window.localStorage.setItem('ultrarag_enterprise_agent_scope', 'agent-source');
+    persistSharedAgentScope('agent-source', tenantSession.tenant.id, tenantSession.user.id);
     stubKnowledgeFetch({ agents: [employeeAgent] });
     render(
       <I18nProvider>
         <TooltipProvider>
-          <MemoryRouter>
-            <KnowledgeManagePage currentUser={currentUser} />
-          </MemoryRouter>
+          <TenantPageBoundary>
+            <MemoryRouter>
+              <KnowledgeManagePage currentUser={currentUser} />
+            </MemoryRouter>
+          </TenantPageBoundary>
         </TooltipProvider>
       </I18nProvider>,
     );
@@ -269,9 +300,11 @@ describe('KnowledgePage shared knowledge', () => {
     render(
       <I18nProvider>
         <TooltipProvider>
-          <MemoryRouter>
-            <KnowledgeManagePage currentUser={currentUser} />
-          </MemoryRouter>
+          <TenantPageBoundary>
+            <MemoryRouter>
+              <KnowledgeManagePage currentUser={currentUser} />
+            </MemoryRouter>
+          </TenantPageBoundary>
         </TooltipProvider>
       </I18nProvider>,
     );
@@ -308,9 +341,11 @@ describe('KnowledgePage shared knowledge', () => {
     render(
       <AppIntlProvider locale={locale}>
         <TooltipProvider>
-          <MemoryRouter>
-            <KnowledgeManagePage currentUser={currentUser} />
-          </MemoryRouter>
+          <TenantPageBoundary>
+            <MemoryRouter>
+              <KnowledgeManagePage currentUser={currentUser} />
+            </MemoryRouter>
+          </TenantPageBoundary>
         </TooltipProvider>
       </AppIntlProvider>,
     );
@@ -327,9 +362,11 @@ describe('KnowledgePage shared knowledge', () => {
     render(
       <AppIntlProvider locale="en-US">
         <TooltipProvider>
-          <MemoryRouter>
-            <KnowledgeManagePage currentUser={currentUser} />
-          </MemoryRouter>
+          <TenantPageBoundary>
+            <MemoryRouter>
+              <KnowledgeManagePage currentUser={currentUser} />
+            </MemoryRouter>
+          </TenantPageBoundary>
         </TooltipProvider>
       </AppIntlProvider>,
     );

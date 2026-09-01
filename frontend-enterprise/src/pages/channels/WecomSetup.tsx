@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { createToastNotifier } from '@/components/ui/app-toast';
 
 import { Input } from '@/components/ui';
@@ -9,7 +9,8 @@ import { useAppIntl } from '@/i18n/useAppIntl';
 import type { MessageId } from '@/i18n/types';
 import { backendErrorMessageDescriptor } from '@/lib/apiErrorMessages';
 
-import { api, TENANT_ID } from '../../api/client';
+import { createTenantClient } from '../../api/tenant-client';
+import { useTenantSession } from '../../contexts/TenantSessionContext';
 import type { ChannelBindingRead, ChannelCredentialFieldRead, ChannelMetaRead } from '../../types';
 import { StatusBadge } from '../scheduled-tasks/StatusBadge';
 
@@ -30,6 +31,16 @@ function errorDescriptor(error: unknown, fallbackId: MessageId): MessageDescript
   return descriptor
     ? { id: descriptor.messageId, values: descriptor.values }
     : createMessageDescriptor(fallbackId);
+}
+
+type WecomTenantContext = NonNullable<ReturnType<typeof useTenantSession>>;
+
+/** Prevent a stale tenant generation from publishing credential state or toasts. */
+function isCurrentTenantGeneration(
+  context: WecomTenantContext | null,
+  generation: number,
+): context is WecomTenantContext {
+  return Boolean(context && !context.signal.aborted && context.isCurrentGeneration(generation));
 }
 
 /** 将后端凭证字段键映射到稳定产品消息；未知 provider 字段标签保持 raw。 */
@@ -58,6 +69,8 @@ export default function WecomSetup({
 }) {
   const { t } = useAppIntl();
   const toast = createToastNotifier({ t });
+  const tenantContext = useTenantSession();
+  const tenantApi = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
   const fields = meta?.credential_fields?.length ? meta.credential_fields : DEFAULT_FIELDS;
   // bot_id 是 ChannelBindingRead 的顶层字段(后端 DTO 不回传 config_json)
   const configuredBotId =
@@ -79,25 +92,30 @@ export default function WecomSetup({
       toast.error(createMessageDescriptor('channels.credentials.completeRequired'));
       return;
     }
+    const context = tenantContext;
+    if (!context) return;
+    const generation = context.generation;
     setSaving(true);
     try {
-      const payload: Record<string, string> = { tenant_id: TENANT_ID };
+      const payload: Record<string, string> = {};
       fields.forEach((field) => {
         const value = String(values[field.key] || '').trim();
         if (value) payload[field.key] = value;
       });
-      const updated = await api.post<ChannelBindingRead>(
+      const updated = await tenantApi.post<ChannelBindingRead>(
         `/api/enterprise/channels/${binding.id}/wecom/credentials`,
         payload,
       );
+      if (!isCurrentTenantGeneration(context, generation)) return;
       toast.success(createMessageDescriptor('channels.toast.saved'));
       setValues({});
       setEditing(false);
       onChanged(updated);
     } catch (error) {
+      if (!isCurrentTenantGeneration(context, generation)) return;
       toast.error(errorDescriptor(error, 'channels.credentials.saveFailed'));
     } finally {
-      setSaving(false);
+      if (isCurrentTenantGeneration(context, generation)) setSaving(false);
     }
   }
 

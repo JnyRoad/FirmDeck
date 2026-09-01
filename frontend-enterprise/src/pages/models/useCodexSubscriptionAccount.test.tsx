@@ -4,21 +4,31 @@ import { createElement, type ReactNode } from 'react';
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { api } from '@/api/client';
+import type { TenantSessionContextValue } from '@/contexts/TenantSessionContext';
+import { notify } from '@/components/ui/app-toast';
 import { I18nProvider, useAppIntl } from '@/i18n';
 import type { CodexSubscriptionAccountRead } from '@/types';
 import { useCodexSubscriptionAccount } from './useCodexSubscriptionAccount';
 
-vi.mock('@/api/client', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('@/api/client')>();
-  return {
-    ...actual,
-    api: { ...actual.api, get: vi.fn(), post: vi.fn() },
-  };
-});
+const testState = vi.hoisted(() => ({
+  mockedGet: vi.fn(),
+  mockedPost: vi.fn(),
+  currentContext: null as TenantSessionContextValue | null,
+}));
 
-const mockedGet = vi.mocked(api.get);
-const mockedPost = vi.mocked(api.post);
+vi.mock('@/api/tenant-client', () => ({
+  createTenantClient: vi.fn(() => ({
+    get: testState.mockedGet,
+    post: testState.mockedPost,
+  })),
+}));
+
+vi.mock('@/contexts/TenantSessionContext', () => ({
+  useTenantSession: () => testState.currentContext,
+}));
+
+const mockedGet = testState.mockedGet;
+const mockedPost = testState.mockedPost;
 
 const requiresLogin: CodexSubscriptionAccountRead = {
   status: 'requires_login',
@@ -43,13 +53,41 @@ function Wrapper({ children }: { children: ReactNode }) {
   return createElement(I18nProvider, null, children);
 }
 
+function makeTenantContext(tenantId: string, generation = 1): TenantSessionContextValue {
+  const controller = new AbortController();
+  return {
+    session: {
+      token: `token-${tenantId}`,
+      scope: 'tenant',
+      tenant: { id: tenantId, slug: tenantId, display_name: tenantId },
+      user: {
+        id: 'user-1',
+        tenant_id: tenantId,
+        username: 'test-user',
+        display_name: 'Test User',
+        role: 'admin',
+        must_change_password: false,
+        avatar_url: null,
+      },
+    },
+    tenantId,
+    tenantSlug: tenantId,
+    userId: 'user-1',
+    generation,
+    signal: controller.signal,
+    isCurrentGeneration: (candidate) => candidate === generation && !controller.signal.aborted,
+  };
+}
+
 beforeEach(() => {
+  testState.currentContext = makeTenantContext('tenant-isolated');
   mockedGet.mockReset();
   mockedPost.mockReset();
 });
 
 afterEach(() => {
   vi.useRealTimers();
+  vi.restoreAllMocks();
   window.localStorage.setItem('staffdeck_locale', 'zh-CN');
 });
 
@@ -58,21 +96,16 @@ describe('useCodexSubscriptionAccount', () => {
     mockedGet.mockResolvedValueOnce(requiresLogin);
     mockedPost.mockResolvedValueOnce(pending);
 
-    const { result } = renderHook(
-      () => useCodexSubscriptionAccount({ tenantId: 'tenant-isolated' }),
-      { wrapper: Wrapper },
-    );
+    const { result } = renderHook(() => useCodexSubscriptionAccount(), { wrapper: Wrapper });
 
     await waitFor(() => expect(result.current.account).toEqual(requiresLogin));
-    expect(mockedGet).toHaveBeenCalledWith(
-      '/api/enterprise/model-configs/codex-subscription/account?tenant_id=tenant-isolated',
-    );
+    expect(mockedGet).toHaveBeenCalledWith('/api/enterprise/model-configs/codex-subscription/account');
+    expect(mockedGet.mock.calls[0][0]).not.toContain('tenant-isolated');
 
     await act(async () => result.current.startLogin());
 
-    expect(mockedPost).toHaveBeenCalledWith(
-      '/api/enterprise/model-configs/codex-subscription/login?tenant_id=tenant-isolated',
-    );
+    expect(mockedPost).toHaveBeenCalledWith('/api/enterprise/model-configs/codex-subscription/login');
+    expect(mockedPost.mock.calls[0][0]).not.toContain('tenant-isolated');
     expect(result.current.account).toEqual(pending);
   });
 
@@ -80,10 +113,7 @@ describe('useCodexSubscriptionAccount', () => {
     vi.useFakeTimers();
     mockedGet.mockResolvedValueOnce(pending).mockResolvedValueOnce(connected);
 
-    const { result } = renderHook(
-      () => useCodexSubscriptionAccount({ tenantId: 'tenant-isolated' }),
-      { wrapper: Wrapper },
-    );
+    const { result } = renderHook(() => useCodexSubscriptionAccount(), { wrapper: Wrapper });
 
     await act(async () => Promise.resolve());
     expect(result.current.account).toEqual(pending);
@@ -101,11 +131,31 @@ describe('useCodexSubscriptionAccount', () => {
     expect(mockedGet).toHaveBeenCalledTimes(2);
   });
 
+  it('clears a pending account and stops polling after a status refresh fails', async () => {
+    vi.useFakeTimers();
+    mockedGet.mockResolvedValueOnce(pending).mockRejectedValueOnce(new Error('status unavailable'));
+    const notifyError = vi.spyOn(notify, 'error');
+
+    const { result } = renderHook(() => useCodexSubscriptionAccount(), { wrapper: Wrapper });
+
+    await act(async () => Promise.resolve());
+    expect(result.current.account).toEqual(pending);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    expect(result.current.account).toBeNull();
+    expect(notifyError).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(4_000);
+    });
+    expect(mockedGet).toHaveBeenCalledTimes(2);
+    expect(notifyError).toHaveBeenCalledTimes(1);
+  });
+
   it('does not read subscription state when its consumer is disabled', async () => {
-    const { result } = renderHook(
-      () => useCodexSubscriptionAccount({ tenantId: 'tenant-isolated', enabled: false }),
-      { wrapper: Wrapper },
-    );
+    const { result } = renderHook(() => useCodexSubscriptionAccount({ enabled: false }), { wrapper: Wrapper });
 
     await act(async () => Promise.resolve());
     expect(result.current.account).toBeNull();
@@ -114,8 +164,8 @@ describe('useCodexSubscriptionAccount', () => {
 
   it('does not expose a stale account response after the caller tenant changes', async () => {
     let resolveFirstRequest: ((account: CodexSubscriptionAccountRead) => void) | undefined;
-    mockedGet.mockImplementation((url: unknown) => {
-      if (String(url).includes('tenant-first')) {
+    mockedGet.mockImplementation(() => {
+      if (testState.currentContext?.tenantId === 'tenant-first') {
         return new Promise<CodexSubscriptionAccountRead>((resolve) => {
           resolveFirstRequest = resolve;
         });
@@ -123,12 +173,11 @@ describe('useCodexSubscriptionAccount', () => {
       return Promise.resolve(connected);
     });
 
-    const { result, rerender } = renderHook(
-      ({ tenantId }) => useCodexSubscriptionAccount({ tenantId }),
-      { initialProps: { tenantId: 'tenant-first' }, wrapper: Wrapper },
-    );
+    testState.currentContext = makeTenantContext('tenant-first', 1);
+    const { result, rerender } = renderHook(() => useCodexSubscriptionAccount(), { wrapper: Wrapper });
 
-    rerender({ tenantId: 'tenant-second' });
+    testState.currentContext = makeTenantContext('tenant-second', 2);
+    rerender();
     await waitFor(() => expect(result.current.account).toEqual(connected));
 
     await act(async () => {
@@ -148,10 +197,7 @@ describe('useCodexSubscriptionAccount', () => {
     );
     mockedPost.mockResolvedValueOnce(pending);
 
-    const { result } = renderHook(
-      () => useCodexSubscriptionAccount({ tenantId: 'tenant-isolated' }),
-      { wrapper: Wrapper },
-    );
+    const { result } = renderHook(() => useCodexSubscriptionAccount(), { wrapper: Wrapper });
     expect(mockedGet).toHaveBeenCalledTimes(1);
 
     await act(async () => result.current.startLogin());
@@ -168,10 +214,7 @@ describe('useCodexSubscriptionAccount', () => {
     mockedGet.mockResolvedValueOnce(pending).mockResolvedValueOnce(connected);
     mockedPost.mockResolvedValueOnce(requiresLogin);
 
-    const { result } = renderHook(
-      () => useCodexSubscriptionAccount({ tenantId: 'tenant-isolated' }),
-      { wrapper: Wrapper },
-    );
+    const { result } = renderHook(() => useCodexSubscriptionAccount(), { wrapper: Wrapper });
     await waitFor(() => expect(result.current.account).toEqual(pending));
 
     await act(async () => {
@@ -197,7 +240,7 @@ describe('useCodexSubscriptionAccount', () => {
 
     const { result } = renderHook(
       () => {
-        const subscription = useCodexSubscriptionAccount({ tenantId: 'tenant-isolated' });
+        const subscription = useCodexSubscriptionAccount();
         const { setLocale } = useAppIntl();
         return { ...subscription, setLocale };
       },

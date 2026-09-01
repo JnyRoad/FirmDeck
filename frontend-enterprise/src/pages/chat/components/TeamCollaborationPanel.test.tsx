@@ -5,6 +5,8 @@ import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { ReactElement } from 'react';
+import { TenantSessionProvider } from '@/contexts/TenantSessionContext';
+import type { EnterpriseAuthSession } from '@/auth';
 import type { AgentProfileRead, ChatMessage, TeamConversationRead, TeamRead } from '@/types';
 import { AppIntlProvider } from '@/i18n';
 
@@ -67,11 +69,31 @@ const team: TeamRead = {
   updated_at: '2026-08-15T00:00:00Z',
 };
 
+const tenantSession: EnterpriseAuthSession = {
+  token: 'token-1',
+  scope: 'tenant',
+  tenant: {
+    id: 'tenant_demo',
+    slug: 'demo-lab',
+    display_name: 'Demo Lab',
+  },
+  user: {
+    id: 'user-1',
+    tenant_id: 'tenant_demo',
+    username: 'demo',
+    display_name: 'Demo Operator',
+    role: 'admin',
+    must_change_password: false,
+    avatar_url: null,
+  },
+};
+
 function jsonResponse(body: unknown): Response {
   return {
     ok: true,
     status: 200,
     statusText: 'OK',
+    json: async () => body ?? {},
     text: async () => JSON.stringify(body),
   } as Response;
 }
@@ -83,7 +105,17 @@ afterEach(() => {
 
 /** 为团队协作行为测试提供显式语义 i18n runtime，避免依赖 legacy observer。 */
 function render(ui: ReactElement) {
-  return rtlRender(<AppIntlProvider initialLocale="zh-CN">{ui}</AppIntlProvider>);
+  const delegatedFetch = globalThis.fetch;
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => (
+    String(input).includes('/api/auth/me')
+      ? Promise.resolve(jsonResponse(tenantSession.user))
+      : delegatedFetch(input, init)
+  )));
+  return rtlRender(
+    <AppIntlProvider initialLocale="zh-CN">
+      <TenantSessionProvider session={tenantSession}>{ui}</TenantSessionProvider>
+    </AppIntlProvider>,
+  );
 }
 
 describe('TeamCollaborationPanel', () => {
@@ -206,12 +238,12 @@ describe('TeamCollaborationPanel', () => {
 
     expect(await screen.findByText('已补充，任务正在继续执行')).toBeTruthy();
     expect(fetchMock).toHaveBeenCalledWith(
-      '/api/enterprise/teams/team-1/tasks/task-purchase/resume',
+      '/api/enterprise/teams/team-1/tasks/task-purchase/resume?tenant_id=tenant_demo',
       expect.objectContaining({
         method: 'POST',
         body: JSON.stringify({
-          tenant_id: 'tenant_demo',
           answer: '工号 001，需要 A4 纸 2 包。',
+          tenant_id: 'tenant_demo',
         }),
       }),
     );

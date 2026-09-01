@@ -122,3 +122,63 @@ describe('chat queue language snapshots', () => {
     expect(readQueuedChatTurns(storage, key)).toEqual([]);
   });
 });
+
+describe('tenant/user chat queue namespace', () => {
+  const languageContext: TestLanguageContext = {
+    version: 1,
+    uiLocale: 'zh-CN',
+    agentReplyLocale: 'en-US',
+    uiLocaleSource: 'user_preference',
+    agentReplyLocaleSource: 'user_preference',
+  };
+
+  it('keeps queued turns isolated across tenants and tenant-local users', () => {
+    const storage = createMemoryStorage();
+    const tenantAUserA = chatQueueStorageKey('tenant-a', 'user-a');
+    const tenantBUserA = chatQueueStorageKey('tenant-b', 'user-a');
+    const tenantAUserB = chatQueueStorageKey('tenant-a', 'user-b');
+    const turn = queuedTurn(languageContext);
+
+    expect(tenantAUserA).not.toBe(tenantBUserA);
+    expect(tenantAUserA).not.toBe(tenantAUserB);
+    expect(writeQueuedChatTurns(storage, tenantAUserA, [turn])).toBe(true);
+    expect(readQueuedChatTurns(storage, tenantAUserA)).toEqual([turn]);
+    expect(readQueuedChatTurns(storage, tenantBUserA)).toEqual([]);
+    expect(readQueuedChatTurns(storage, tenantAUserB)).toEqual([]);
+  });
+
+  it('does not adopt a queue saved under the old unscoped key', () => {
+    const storage = createMemoryStorage();
+    const legacyKey = 'skill_agent_chat_queue';
+    const scopedKey = chatQueueStorageKey('tenant-a', 'user-a');
+    const turn = queuedTurn(languageContext);
+    storage.setItem(legacyKey, JSON.stringify([turn]));
+
+    expect(readQueuedChatTurns(storage, scopedKey)).toEqual([]);
+    expect(storage.getItem(legacyKey)).toBe(JSON.stringify([turn]));
+  });
+
+  it('fails closed instead of falling back to a default tenant for malformed identity', () => {
+    let missingTenantKey: unknown;
+    let missingUserKey: unknown;
+    try {
+      missingTenantKey = chatQueueStorageKey('', 'user-a');
+      missingUserKey = chatQueueStorageKey('tenant-a', '');
+    } catch {
+      // Throwing is an acceptable fail-closed result for an unusable identity.
+    }
+
+    expect(typeof missingTenantKey).not.toBe('string');
+    expect(typeof missingUserKey).not.toBe('string');
+  });
+
+  it('round-trips raw turn text without locale rewriting in a tenant namespace', () => {
+    const storage = createMemoryStorage();
+    const key = chatQueueStorageKey('Tenant-A-中文', 'User-İ');
+    const rawText = 'RAW /workspace?q=中文&keep=İ';
+    const turn = { ...queuedTurn(languageContext), text: rawText };
+
+    expect(writeQueuedChatTurns(storage, key, [turn])).toBe(true);
+    expect(readQueuedChatTurns(storage, key)[0]?.text).toBe(rawText);
+  });
+});

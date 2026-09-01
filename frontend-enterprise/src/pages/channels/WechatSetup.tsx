@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import QRCode from 'qrcode';
 import { createToastNotifier } from '@/components/ui/app-toast';
 
@@ -9,7 +9,8 @@ import { useAppIntl } from '@/i18n/useAppIntl';
 import type { MessageId } from '@/i18n/types';
 import { backendErrorMessageDescriptor } from '@/lib/apiErrorMessages';
 
-import { api, TENANT_ID } from '../../api/client';
+import { createTenantClient } from '../../api/tenant-client';
+import { useTenantSession } from '../../contexts/TenantSessionContext';
 import type { ChannelBindingRead } from '../../types';
 import { StatusBadge } from '../scheduled-tasks/StatusBadge';
 
@@ -42,6 +43,16 @@ function errorDescriptor(error: unknown, fallbackId: MessageId): MessageDescript
     : createMessageDescriptor(fallbackId);
 }
 
+type WechatTenantContext = NonNullable<ReturnType<typeof useTenantSession>>;
+
+/** Prevent a stale tenant generation from publishing QR state or toasts. */
+function isCurrentTenantGeneration(
+  context: WechatTenantContext | null,
+  generation: number,
+): context is WechatTenantContext {
+  return Boolean(context && !context.signal.aborted && context.isCurrentGeneration(generation));
+}
+
 /** 渲染微信二维码绑定区域；二维码 payload 与验证码保持 raw，状态 chrome 使用语义消息。 */
 export default function WechatSetup({
   binding,
@@ -52,6 +63,8 @@ export default function WechatSetup({
 }) {
   const { t } = useAppIntl();
   const toast = createToastNotifier({ t });
+  const tenantContext = useTenantSession();
+  const tenantApi = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
   const [qr, setQr] = useState<QrState | null>(null);
   const [qrStatus, setQrStatus] = useState('');
   const [qrLoading, setQrLoading] = useState(false);
@@ -69,7 +82,7 @@ export default function WechatSetup({
 
   useEffect(() => {
     resetQrFlow();
-  }, [binding.id]);
+  }, [binding.id, tenantContext?.generation]);
 
   /** 清理二维码状态轮询计时器，避免卸载或重新扫码后继续写入旧会话。 */
   function clearPollTimer() {
@@ -91,52 +104,57 @@ export default function WechatSetup({
 
   /** 请求新的微信二维码并启动受控轮询；provider 返回值仅用于二维码 raw 数据。 */
   async function startQr(bindingId: string) {
+    const context = tenantContext;
+    if (!context) return;
     const session = ++qrSessionRef.current;
+    const contextGeneration = context.generation;
     clearPollTimer();
     verifyCodeRef.current = '';
     setVerifyCode('');
     setQrLoading(true);
     setQrStatus('');
     try {
-      const result = await api.post<WechatQrcodeResponse>(
-        `/api/enterprise/channels/${bindingId}/wechat/qrcode?tenant_id=${TENANT_ID}`,
+      const result = await tenantApi.post<WechatQrcodeResponse>(
+        `/api/enterprise/channels/${bindingId}/wechat/qrcode`,
       );
       const code = String(result.qrcode || '');
       const content = String(result.qrcode_img_content || result.qrcode_img_url || '');
       if (!code || !content) throw new Error('WECHAT_QR_CODE_EMPTY');
       const imageUrl = await QRCode.toDataURL(content, { width: 220, margin: 1 });
-      if (session !== qrSessionRef.current) return;
+      if (session !== qrSessionRef.current || !isCurrentTenantGeneration(context, contextGeneration)) return;
       setQr({ qrcode: code, content, imageUrl });
       setQrStatus('wait');
-      scheduleStatusPoll(bindingId, code, session);
+      scheduleStatusPoll(bindingId, code, session, contextGeneration);
     } catch (error) {
-      if (session === qrSessionRef.current) {
+      if (session === qrSessionRef.current && isCurrentTenantGeneration(context, contextGeneration)) {
         toast.error(errorDescriptor(error, 'channels.wechat.qrLoadFailed'));
       }
     } finally {
-      if (session === qrSessionRef.current) setQrLoading(false);
+      if (session === qrSessionRef.current && isCurrentTenantGeneration(context, contextGeneration)) setQrLoading(false);
     }
   }
 
   /** 调度下一次二维码状态查询，session token 保证旧请求不会污染新状态。 */
-  function scheduleStatusPoll(bindingId: string, code: string, session: number) {
+  function scheduleStatusPoll(bindingId: string, code: string, session: number, contextGeneration: number) {
     clearPollTimer();
     pollTimerRef.current = window.setTimeout(() => {
-      void pollQrStatus(bindingId, code, session);
+      void pollQrStatus(bindingId, code, session, contextGeneration);
     }, 2000);
   }
 
   /** 查询二维码确认状态并把有限状态映射为产品文案，保留 provider 状态码作为控制数据。 */
-  async function pollQrStatus(bindingId: string, code: string, session: number) {
+  async function pollQrStatus(bindingId: string, code: string, session: number, contextGeneration: number) {
+    const context = tenantContext;
+    if (!isCurrentTenantGeneration(context, contextGeneration)) return;
     try {
       const submittedCode = verifyCodeRef.current.trim();
       const verifyParam = submittedCode
         ? `&verify_code=${encodeURIComponent(submittedCode)}`
         : '';
-      const result = await api.get<WechatQrcodeStatusResponse>(
-        `/api/enterprise/channels/${bindingId}/wechat/qrcode-status?tenant_id=${TENANT_ID}&qrcode=${encodeURIComponent(code)}${verifyParam}`,
+      const result = await tenantApi.get<WechatQrcodeStatusResponse>(
+        `/api/enterprise/channels/${bindingId}/wechat/qrcode-status?qrcode=${encodeURIComponent(code)}${verifyParam}`,
       );
-      if (session !== qrSessionRef.current) return;
+      if (session !== qrSessionRef.current || !isCurrentTenantGeneration(context, contextGeneration)) return;
       const status = String(result.status || 'wait');
       if (status === 'confirmed') {
         resetQrFlow();
@@ -155,9 +173,9 @@ export default function WechatSetup({
         return;
       }
       setQrStatus(status);
-      scheduleStatusPoll(bindingId, code, session);
+      scheduleStatusPoll(bindingId, code, session, contextGeneration);
     } catch (error) {
-      if (session !== qrSessionRef.current) return;
+      if (session !== qrSessionRef.current || !isCurrentTenantGeneration(context, contextGeneration)) return;
       clearPollTimer();
       toast.error(errorDescriptor(error, 'channels.wechat.statusLoadFailed'));
     }

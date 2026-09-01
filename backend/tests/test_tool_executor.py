@@ -560,8 +560,11 @@ def test_execute_a2a_same_invocation_resumes_remote_working_task(monkeypatch) ->
         db.add(
             A2ATaskRun(
                 id="a2arun_recover",
+                owner_scope="tenant",
                 direction="client",
                 tenant_id="tenant_demo",
+                system_runtime_key=None,
+                tenant_lifecycle_version=1,
                 tool_id="tool_a2a_recover",
                 invocation_id="call-recover",
                 endpoint_url="https://agent.example.test/a2a",
@@ -1235,8 +1238,11 @@ def test_execute_a2a_recovery_reuses_persisted_locale_metadata(monkeypatch) -> N
         db.add(
             A2ATaskRun(
                 id="a2arun-recovery-locale",
+                owner_scope="tenant",
                 direction="client",
                 tenant_id="tenant_demo",
+                system_runtime_key=None,
+                tenant_lifecycle_version=1,
                 tool_id="tool_a2a_recovery_locale",
                 invocation_id="call-recovery-locale",
                 endpoint_url="https://agent.example.test/a2a",

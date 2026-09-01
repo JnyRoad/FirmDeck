@@ -125,8 +125,14 @@ class HarnessTaskAgent:
         step_timeout_seconds: int | None = None,
         checkpoint: dict[str, Any] | None = None,
         language_context: LanguageContext | None = None,
+        admission_check: Callable[[], None] | None = None,
     ) -> TaskExecutionResult:
         """Run one isolated requirement under an immutable reply-locale and raw-source contract."""
+        def check_admission() -> None:
+            if callable(admission_check):
+                admission_check()
+
+        check_admission()
         # Workflow: restore only the same frame/step checkpoint before constructing model input.
         language_context = language_context or requirement.language_context
         max_actions = max(1, min(int(max_actions), 100))
@@ -176,6 +182,9 @@ class HarnessTaskAgent:
         pending_actions: list[HarnessAction] = []
 
         def finish(result: TaskExecutionResult) -> TaskExecutionResult:
+            # A heartbeat/recovery loss after a provider response is still a
+            # fence: do not hand the stale result back to the outer engine.
+            check_admission()
             summary = " ".join(
                 str(result.task_summary or result.reply_fragment or "").split()
             ).strip()
@@ -208,6 +217,7 @@ class HarnessTaskAgent:
 
         for iteration in range(1, max_actions + 1):
             # Workflow: build a fresh stage payload so each model action sees current tool evidence.
+            check_admission()
             _raise_if_cancelled(is_cancelled)
             if _deadline_expired(step_deadline_monotonic):
                 return finish(_step_timeout_result(
@@ -268,6 +278,7 @@ class HarnessTaskAgent:
                             iteration=iteration,
                             protocol_attempt=protocol_attempt + 1,
                         ):
+                            check_admission()
                             client = _deadline_llm_client(
                                 model_config,
                                 step_deadline_monotonic,
@@ -277,6 +288,7 @@ class HarnessTaskAgent:
                                 system_prompt,
                                 payload,
                             )
+                            check_admission()
                         try:
                             actions = _harness_actions_from_raw(raw)
                             action = actions[0]
@@ -388,6 +400,7 @@ class HarnessTaskAgent:
                     action_count=iteration,
                     error=_public_harness_error("MODEL_INVALID_PROVIDER_RESPONSE"),
                 ))
+            check_admission()
             _raise_if_cancelled(is_cancelled)
             if _deadline_expired(step_deadline_monotonic):
                 return finish(_step_timeout_result(
@@ -528,8 +541,10 @@ class HarnessTaskAgent:
                         )
                 else:
                     try:
+                        check_admission()
                         _raise_if_cancelled(is_cancelled)
                         result = invoke_tool(tool_name, dict(action.arguments or {}))
+                        check_admission()
                         _raise_if_cancelled(is_cancelled)
                     except (HarnessExecutionCancelled, HarnessExecutionFenced):
                         raise

@@ -1,8 +1,9 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { ChevronDown, CircleAlert, LoaderCircle, SendHorizontal } from 'lucide-react';
 
-import { api, TENANT_ID } from '@/api/client';
+import { createTenantClient } from '@/api/tenant-client';
 import EmployeeAvatar from '@/components/EmployeeAvatar';
+import { useTenantSession } from '@/contexts/TenantSessionContext';
 import { staffdeckDisplayText } from '@/employee';
 import { RawContent, RawIdentifier } from '@/i18n/RawContent';
 import { useAppIntl } from '@/i18n/useAppIntl';
@@ -130,22 +131,28 @@ export function mergeTeamChatTimeline(
 export function useTeamCollaborations(team?: TeamRead | null): TeamConversationRead[] {
   const [conversations, setConversations] = useState<TeamConversationRead[]>([]);
   const leaderAgentId = team?.members.find((member) => member.role === 'leader')?.agent_id;
+  const tenantContext = useTenantSession();
+  const tenantClient = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
 
   useEffect(() => {
     let cancelled = false;
-    if (!team) {
+    if (!team || !tenantContext) {
       setConversations([]);
       return () => {
         cancelled = true;
       };
     }
+    const controller = new AbortController();
+    const onTenantAbort = () => controller.abort();
+    tenantContext.signal.addEventListener('abort', onTenantAbort, { once: true });
     setConversations([]);
     const loadConversations = async () => {
       try {
-        const response = await api.get<TeamConversationsResponse>(
-          `/api/enterprise/teams/${team.id}/conversations?tenant_id=${TENANT_ID}`,
+        const response = await tenantClient.get<TeamConversationsResponse>(
+          `/api/enterprise/teams/${team.id}/conversations`,
+          { signal: controller.signal },
         );
-        if (cancelled) return;
+        if (cancelled || controller.signal.aborted) return;
         const seen = new Set<string>();
         const latest = response.conversations.filter((conversation) => {
           if (conversation.kind !== 'member_task' && conversation.kind !== 'member_bid') return false;
@@ -166,9 +173,11 @@ export function useTeamCollaborations(team?: TeamRead | null): TeamConversationR
     const pollTimer = window.setInterval(() => void loadConversations(), 2_000);
     return () => {
       cancelled = true;
+      tenantContext.signal.removeEventListener('abort', onTenantAbort);
+      controller.abort();
       window.clearInterval(pollTimer);
     };
-  }, [leaderAgentId, team?.id]);
+  }, [leaderAgentId, team?.id, tenantClient, tenantContext]);
 
   return conversations;
 }
@@ -185,6 +194,9 @@ export default function TeamCollaborationPanel({
   onOpenCitation?: (citation: KnowledgeCitation) => void;
 }) {
   const { t } = useAppIntl();
+  const tenantContext = useTenantSession();
+  const tenantClient = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
+  const requestControllersRef = useRef(new Set<AbortController>());
   const loadedConversations = useTeamCollaborations(conversation ? undefined : team);
   const conversations = conversation ? [conversation] : loadedConversations;
   const [expandedSessionId, setExpandedSessionId] = useState('');
@@ -204,34 +216,58 @@ export default function TeamCollaborationPanel({
   const leaderMember = team.members.find((member) => member.role === 'leader');
   const leaderAgent = leaderMember ? agentById.get(leaderMember.agent_id) : undefined;
 
+  const beginScopedRequest = () => {
+    const controller = new AbortController();
+    requestControllersRef.current.add(controller);
+    const onTenantAbort = () => controller.abort();
+    tenantContext?.signal.addEventListener('abort', onTenantAbort, { once: true });
+    return {
+      controller,
+      cleanup: () => {
+        tenantContext?.signal.removeEventListener('abort', onTenantAbort);
+        requestControllersRef.current.delete(controller);
+      },
+    };
+  };
+
+  useEffect(() => () => {
+    requestControllersRef.current.forEach((controller) => controller.abort());
+    requestControllersRef.current.clear();
+  }, []);
+
   useEffect(() => {
-    if (!expandedSessionId) return undefined;
+    if (!expandedSessionId || !tenantContext) return undefined;
     let cancelled = false;
     let refreshing = false;
     let pollTimer: number | undefined;
+    const scopedRequest = beginScopedRequest();
+    const { controller } = scopedRequest;
     const refreshStream = async () => {
-      if (refreshing) return;
+      if (refreshing || cancelled || controller.signal.aborted) return;
       refreshing = true;
       try {
         const [stream, traces] = await Promise.all([
-          api.get<TeamConversationStreamRead>(
-            `/api/enterprise/teams/${team.id}/conversations/${expandedSessionId}/stream?tenant_id=${TENANT_ID}`,
+          tenantClient.get<TeamConversationStreamRead>(
+            `/api/enterprise/teams/${team.id}/conversations/${expandedSessionId}/stream`,
+            { signal: controller.signal },
           ),
-          api.get<TurnTraceRead[]>(
-            `/api/chat/sessions/${expandedSessionId}/trace?tenant_id=${TENANT_ID}`,
+          tenantClient.get<TurnTraceRead[]>(
+            `/api/chat/sessions/${expandedSessionId}/trace`,
+            { signal: controller.signal },
           ).catch(() => []),
         ]);
-        if (cancelled) return;
+        if (cancelled || controller.signal.aborted) return;
         setStreamBySession((current) => ({ ...current, [expandedSessionId]: stream }));
         setTracesBySession((current) => ({
           ...current,
           [expandedSessionId]: Array.isArray(traces) ? traces : [],
         }));
         if (stream.status === 'completed' || stream.status === 'failed') {
-          const rows = await api.get<TeamConversationMessageRead[]>(
-            `/api/enterprise/teams/${team.id}/conversations/${expandedSessionId}/messages?tenant_id=${TENANT_ID}`,
+          const rows = await tenantClient.get<TeamConversationMessageRead[]>(
+            `/api/enterprise/teams/${team.id}/conversations/${expandedSessionId}/messages`,
+            { signal: controller.signal },
           );
-          if (!cancelled) {
+          if (!cancelled && !controller.signal.aborted) {
             setMessagesBySession((current) => ({ ...current, [expandedSessionId]: rows }));
             if (pollTimer !== undefined) window.clearInterval(pollTimer);
           }
@@ -246,11 +282,14 @@ export default function TeamCollaborationPanel({
     void refreshStream();
     return () => {
       cancelled = true;
+      scopedRequest.cleanup();
+      controller.abort();
       if (pollTimer !== undefined) window.clearInterval(pollTimer);
     };
-  }, [expandedSessionId, team.id]);
+  }, [expandedSessionId, team.id, tenantClient, tenantContext]);
 
   async function toggleReply(conversation: TeamConversationRead) {
+    if (!tenantContext) return;
     if (expandedSessionId === conversation.session_id) {
       setExpandedSessionId('');
       return;
@@ -258,24 +297,31 @@ export default function TeamCollaborationPanel({
     setExpandedSessionId(conversation.session_id);
     if (messagesBySession[conversation.session_id] && tracesBySession[conversation.session_id]) return;
     setLoadingSessionId(conversation.session_id);
+    const scopedRequest = beginScopedRequest();
+    const { controller } = scopedRequest;
     try {
       const [rows, traces] = await Promise.all([
-        api.get<TeamConversationMessageRead[]>(
-          `/api/enterprise/teams/${team.id}/conversations/${conversation.session_id}/messages?tenant_id=${TENANT_ID}`,
+        tenantClient.get<TeamConversationMessageRead[]>(
+          `/api/enterprise/teams/${team.id}/conversations/${conversation.session_id}/messages`,
+          { signal: controller.signal },
         ),
-        api.get<TurnTraceRead[]>(
-          `/api/chat/sessions/${conversation.session_id}/trace?tenant_id=${TENANT_ID}`,
+        tenantClient.get<TurnTraceRead[]>(
+          `/api/chat/sessions/${conversation.session_id}/trace`,
+          { signal: controller.signal },
         ).catch(() => []),
       ]);
+      if (controller.signal.aborted) return;
       setMessagesBySession((current) => ({ ...current, [conversation.session_id]: rows }));
       setTracesBySession((current) => ({
         ...current,
         [conversation.session_id]: Array.isArray(traces) ? traces : [],
       }));
     } catch {
+      if (controller.signal.aborted) return;
       setMessagesBySession((current) => ({ ...current, [conversation.session_id]: [] }));
       setTracesBySession((current) => ({ ...current, [conversation.session_id]: [] }));
     } finally {
+      scopedRequest.cleanup();
       setLoadingSessionId('');
     }
   }
@@ -287,21 +333,31 @@ export default function TeamCollaborationPanel({
     if (!taskId || !answer || submittingTaskId) return;
     setSubmittingTaskId(taskId);
     setSubmitErrorByTaskId((current) => ({ ...current, [taskId]: '' }));
+    if (!tenantContext) {
+      setSubmittingTaskId('');
+      return;
+    }
+    const scopedRequest = beginScopedRequest();
+    const { controller } = scopedRequest;
     try {
-      await api.post(
+      await tenantClient.post(
         `/api/enterprise/teams/${team.id}/tasks/${taskId}/resume`,
-        { tenant_id: TENANT_ID, answer },
+        { answer },
+        { signal: controller.signal },
       );
+      if (controller.signal.aborted) return;
       setSubmittedTaskIds((current) => (
         current.includes(taskId) ? current : [...current, taskId]
       ));
     } catch (error) {
+      if (controller.signal.aborted) return;
       console.error('[team-chat] resume task failed', error);
       setSubmitErrorByTaskId((current) => ({
         ...current,
         [taskId]: t('chat.error.replyFailed'),
       }));
     } finally {
+      scopedRequest.cleanup();
       setSubmittingTaskId('');
     }
   }
@@ -497,7 +553,7 @@ export default function TeamCollaborationPanel({
                         </div>
                         <HarnessArtifactDownloads
                           artifacts={artifacts}
-                          tenantId={TENANT_ID}
+                          tenantId={tenantContext?.tenantId || ''}
                           sessionId={conversation.session_id}
                         />
                         <KnowledgeCitationList

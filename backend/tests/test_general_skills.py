@@ -1164,11 +1164,13 @@ def test_general_skill_archive_publish_and_delete_api(monkeypatch) -> None:
 
 
 @pytest.mark.anyio
-async def test_general_skill_stream_executes_through_forced_harness_v2(monkeypatch) -> None:
+async def test_general_skill_stream_executes_through_forced_harness_v2(
+    monkeypatch,
+    tmp_path,
+) -> None:
     test_engine = create_engine(
-        "sqlite://",
+        f"sqlite:///{tmp_path / 'general-skill-stream.db'}",
         connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
     )
     SQLModel.metadata.create_all(test_engine)
     captured_requests = []

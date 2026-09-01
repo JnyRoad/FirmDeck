@@ -6,6 +6,8 @@ import { MemoryRouter } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { StreamEvent } from '@/api/client';
+import type { EnterpriseAuthSession } from '@/auth';
+import { TenantSessionProvider } from '@/contexts/TenantSessionContext';
 import type { AppLocale } from '@/i18n/locales';
 import { AppIntlProvider } from '@/i18n/provider';
 import type { ChatSession, ModelConfigRead, TurnTraceRead } from '@/types';
@@ -23,6 +25,25 @@ const AUTH_STORAGE_KEY = 'ultrarag_auth';
 const SESSION_ID = 'session-i18n-event';
 const RAW_USER_INPUT = 'RAW user input /路径?q=中文';
 let traceRows: TurnTraceRead[] = [];
+
+const tenantSession: EnterpriseAuthSession = {
+  token: 'token-1',
+  scope: 'tenant',
+  tenant: {
+    id: 'tenant_demo',
+    slug: 'demo-lab',
+    display_name: 'Demo Lab',
+  },
+  user: {
+    id: 'user-1',
+    tenant_id: 'tenant_demo',
+    username: 'demo',
+    display_name: 'Demo Operator',
+    role: 'admin',
+    must_change_password: false,
+    avatar_url: null,
+  },
+};
 
 const session: ChatSession = {
   id: SESSION_ID,
@@ -64,6 +85,7 @@ function jsonResponse(body: unknown): Response {
     ok: true,
     status: 200,
     statusText: 'OK',
+    json: async () => body ?? {},
     text: async () => JSON.stringify(body ?? {}),
   } as Response;
 }
@@ -72,6 +94,7 @@ function jsonResponse(body: unknown): Response {
 function stubChatFetch(): void {
   vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input);
+    if (url.includes('/api/auth/me')) return jsonResponse(tenantSession.user);
     if (url.includes(`/api/chat/sessions/${SESSION_ID}/messages?`)) return jsonResponse([]);
     if (url.includes(`/api/chat/sessions/${SESSION_ID}/trace?`)) return jsonResponse(traceRows);
     if (url.includes(`/api/chat/sessions/${SESSION_ID}/events?`)) return jsonResponse([]);
@@ -91,7 +114,9 @@ function stubChatFetch(): void {
 function renderEventHook(locale: AppLocale) {
   const wrapper = ({ children }: { children: ReactNode }) => (
     <AppIntlProvider initialLocale={locale}>
-      <MemoryRouter>{children}</MemoryRouter>
+      <TenantSessionProvider session={tenantSession}>
+        <MemoryRouter>{children}</MemoryRouter>
+      </TenantSessionProvider>
     </AppIntlProvider>
   );
   return renderHook(() => useChatSession({ embedded: true, sessionId: SESSION_ID }), { wrapper });
@@ -137,10 +162,7 @@ function canonicalRetryEvent(overrides: Record<string, unknown> = {}): StreamEve
 
 beforeEach(() => {
   traceRows = [];
-  window.localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify({
-    token: 'token-1',
-    user: { id: 'user-1', tenant_id: 'tenant_demo', username: 'demo', role: 'admin' },
-  }));
+  window.localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify(tenantSession));
   stubChatFetch();
 });
 

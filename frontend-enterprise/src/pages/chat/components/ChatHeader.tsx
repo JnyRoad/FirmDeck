@@ -1,4 +1,4 @@
-import { useEffect, useState, type ChangeEvent } from 'react';
+import { useEffect, useMemo, useState, type ChangeEvent } from 'react';
 
 import {
   DropdownMenu,
@@ -7,7 +7,8 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import { Badge } from '@/components/ui';
-import { api, TENANT_ID } from '@/api/client';
+import { createTenantClient } from '@/api/tenant-client';
+import { useTenantSession } from '@/contexts/TenantSessionContext';
 import { staffdeckDisplayText } from '@/employee';
 import type { TeamRead } from '@/types';
 import IconEdit from '@/assets/icons/edit.svg?react';
@@ -29,6 +30,8 @@ import type { UseChatSession } from '../useChatSession';
 export default function ChatHeader({ chat }: { chat: UseChatSession }) {
   const { auth, currentSession, openRename, logout } = chat;
   const { t } = useAppIntl();
+  const tenantContext = useTenantSession();
+  const tenantClient = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
   const teamId = currentSession?.team_id || null;
   const rawName = currentSession?.title
     ? staffdeckDisplayText(currentSession.title)
@@ -51,17 +54,22 @@ export default function ChatHeader({ chat }: { chat: UseChatSession }) {
 
   useEffect(() => {
     setTeamName(sessionTeamName);
-    if (!teamId || sessionTeamName) return;
+    if (!teamId || sessionTeamName || !tenantContext) return;
     let cancelled = false;
-    api.get<TeamRead[]>(`/api/enterprise/teams?tenant_id=${TENANT_ID}`)
+    const controller = new AbortController();
+    const onTenantAbort = () => controller.abort();
+    tenantContext.signal.addEventListener('abort', onTenantAbort, { once: true });
+    tenantClient.get<TeamRead[]>('/api/enterprise/teams', { signal: controller.signal })
       .then((rows) => {
-        if (!cancelled) setTeamName(rows.find((team) => team.id === teamId)?.name || null);
+        if (!cancelled && !controller.signal.aborted) setTeamName(rows.find((team) => team.id === teamId)?.name || null);
       })
       .catch(() => {});
     return () => {
       cancelled = true;
+      tenantContext.signal.removeEventListener('abort', onTenantAbort);
+      controller.abort();
     };
-  }, [teamId, sessionTeamName]);
+  }, [teamId, sessionTeamName, tenantClient, tenantContext]);
 
   return (
     <div className={CHAT_HEADER_CLASS}>

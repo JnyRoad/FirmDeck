@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { AppIntlProvider } from '@/i18n/provider';
 import type { AppLocale } from '@/i18n/locales';
+import { TenantSessionProvider } from '@/contexts/TenantSessionContext';
 import type { AgentProfileRead, MemoryRead } from '@/types';
 
 import MemoriesTab from './MemoriesTab';
@@ -77,14 +78,44 @@ function jsonResponse(body: unknown): Response {
     ok: true,
     status: 200,
     statusText: 'OK',
+    json: async () => body ?? {},
     text: async () => JSON.stringify(body ?? {}),
   } as Response;
+}
+
+/** Build the fully validated tenant session used by the memories test harness. */
+function memoriesSession() {
+  return {
+    token: 'token-user-1',
+    scope: 'tenant' as const,
+    tenant: { id: 'tenant_demo', slug: 'demo', display_name: 'Demo tenant' },
+    user: {
+      id: 'user-1',
+      tenant_id: 'tenant_demo',
+      username: 'demo',
+      display_name: null,
+      role: 'admin' as const,
+      must_change_password: false,
+      avatar_url: null,
+    },
+  };
 }
 
 /** 为记忆页提供确定性的列表数据，避免 locale 测试依赖真实接口状态。 */
 function stubMemoryFetch(rows: MemoryRead[] = memories): void {
   vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input);
+    if (url.includes('/api/auth/me')) {
+      return jsonResponse({
+        id: 'user-1',
+        tenant_id: 'tenant_demo',
+        username: 'demo',
+        display_name: null,
+        role: 'admin',
+        must_change_password: false,
+        avatar_url: null,
+      });
+    }
     if (url.includes('/api/enterprise/memories?')) return jsonResponse(rows);
     if (url.includes('/api/enterprise/memories/me?')) return jsonResponse({ deleted: rows.length });
     return jsonResponse([]);
@@ -95,10 +126,12 @@ function stubMemoryFetch(rows: MemoryRead[] = memories): void {
 function renderMemoriesTab(locale: AppLocale): void {
   render(
     <AppIntlProvider initialLocale={locale}>
-      <MemoriesTab
-        currentUser={{ id: 'user-1', tenant_id: 'tenant_demo', username: 'demo', role: 'admin' }}
-        agent={agent}
-      />
+      <TenantSessionProvider session={memoriesSession()}>
+        <MemoriesTab
+          currentUser={{ id: 'user-1', tenant_id: 'tenant_demo', username: 'demo', role: 'admin' }}
+          agent={agent}
+        />
+      </TenantSessionProvider>
     </AppIntlProvider>,
   );
 }
@@ -125,9 +158,9 @@ describe('MemoriesTab semantic locale matrix', () => {
       expect(screen.getByRole('button', { name: copy.search })).toBeTruthy();
       expect(screen.getByRole('button', { name: copy.clear })).toBeTruthy();
       expect(screen.getByLabelText(copy.table)).toBeTruthy();
-      expect(screen.getAllByText('Raw User 1').length).toBeGreaterThan(0);
-      expect(screen.getAllByText(/Raw memory content one/).length).toBeGreaterThan(0);
-      expect(screen.getAllByText(/Raw memory content two/).length).toBeGreaterThan(0);
+      expect((await screen.findAllByText('Raw User 1')).length).toBeGreaterThan(0);
+      expect((await screen.findAllByText(/Raw memory content one/)).length).toBeGreaterThan(0);
+      expect((await screen.findAllByText(/Raw memory content two/)).length).toBeGreaterThan(0);
 
       fireEvent.click(screen.getAllByRole('button', { name: copy.view })[0]);
 

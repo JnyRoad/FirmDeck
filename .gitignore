@@ -13,8 +13,8 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .ruff_cache/
-.specify/
-/specs/
+# Spec-Kit 的共享规则与功能规格必须进入版本控制；仅忽略本机生成的集成命令副本。
+.specify/_unused/
 .mypy_cache/
 .venv/
 venv/

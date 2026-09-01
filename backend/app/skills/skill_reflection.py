@@ -47,6 +47,21 @@ RUBRICS = [
 ResponseT = TypeVar("ResponseT")
 StatusCallback = Callable[[str], None]
 NormalizeResponse = Callable[[dict[str, Any]], ResponseT]
+ExecutionFence = Callable[[], None]
+
+
+def fenced_provider_call(
+    provider_call: Callable[[], ResponseT],
+    execution_fence: ExecutionFence | None = None,
+) -> ResponseT:
+    """Run one provider call only while an optional durable execution fence is admitted."""
+    if execution_fence is not None:
+        execution_fence()
+    try:
+        return provider_call()
+    finally:
+        if execution_fence is not None:
+            execution_fence()
 
 
 def reflect_skill_response(
@@ -61,6 +76,7 @@ def reflect_skill_response(
     normalize_response: NormalizeResponse[ResponseT],
     status_callback: StatusCallback | None = None,
     language_context: LanguageContext | None = None,
+    execution_fence: ExecutionFence | None = None,
 ) -> ResponseT:
     """Run reflection synchronously with one immutable language context for every stage."""
     events = reflect_skill_response_stream(
@@ -73,6 +89,7 @@ def reflect_skill_response(
         tool_suggestions=tool_suggestions,
         normalize_response=normalize_response,
         language_context=language_context,
+        execution_fence=execution_fence,
     )
     while True:
         try:
@@ -95,6 +112,7 @@ def reflect_skill_response_stream(
     tool_suggestions: list[ToolSuggestion],
     normalize_response: NormalizeResponse[ResponseT],
     language_context: LanguageContext | None = None,
+    execution_fence: ExecutionFence | None = None,
 ):
     """Yield reflection status envelopes and model reviews under one locale/raw-source contract."""
     prompt = PROMPT_PATH.read_text(encoding="utf-8")
@@ -147,6 +165,7 @@ def reflect_skill_response_stream(
                     "max_reflection_rounds": MAX_REFLECTION_ROUNDS,
                     "reflection_history": reflection_history,
                 },
+                execution_fence=execution_fence,
             )
         except (LLMError, json.JSONDecodeError, TypeError, ValueError):
             yield status(
@@ -303,8 +322,17 @@ def reflect_skill_response_stream(
     )
 
 
-def _model_review(client: LLMClient, prompt: str, payload: dict[str, Any]) -> dict[str, Any]:
-    text = client.generate_text(prompt, payload)
+def _model_review(
+    client: LLMClient,
+    prompt: str,
+    payload: dict[str, Any],
+    *,
+    execution_fence: ExecutionFence | None = None,
+) -> dict[str, Any]:
+    text = fenced_provider_call(
+        lambda: client.generate_text(prompt, payload),
+        execution_fence,
+    )
     raw = json.loads(_extract_json(text))
     if not isinstance(raw, dict):
         raise ValueError("反思模型输出不是 JSON object")

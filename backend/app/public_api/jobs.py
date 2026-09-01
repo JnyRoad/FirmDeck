@@ -38,6 +38,7 @@ from app.db.models import (
     APIJob,
     APIJobEvent,
     ChatSession,
+    Tenant,
     WebhookDelivery,
     new_id,
     utc_now,
@@ -55,6 +56,12 @@ from app.public_api.webhooks import (
     enqueue_webhook_deliveries,
     stage_webhook_deliveries,
 )
+from app.security.tenant import (
+    TenantLifecycleDecision,
+    TenantLifecycleDenied,
+    require_active_tenant,
+    require_matching_admission_version,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +69,119 @@ router = APIRouter(prefix="/jobs", tags=["jobs"])
 JobHandler = Callable[[Session, APIJob], dict[str, Any]]
 _handlers: dict[str, JobHandler] = {}
 JOB_LEASE_SECONDS = 15 * 60
+_SIDE_EFFECT_STARTED_INFO_KEY = "public_api.job.side_effect_started"
+_EXECUTION_FENCE_INFO_KEY = "public_api.job.execution_fence"
+
+
+class JobExecutionFenceLost(RuntimeError):
+    """Raised when a handler no longer owns the claimed job generation."""
+
+
+def _require_job_execution_fence(db: Session, job: APIJob) -> None:
+    """Require the current worker owner/generation before a handler side effect.
+
+    ``run_job`` records the claimed owner and generation in ``Session.info``. Direct
+    handler calls (including compatibility callers and focused unit tests) have no
+    worker context and therefore do not acquire this extra fence. Worker calls use
+    a scalar conditional query so a recovery/reclaim cannot be mistaken for the
+    still-owned ORM object.
+    """
+    expected = db.info.get(_EXECUTION_FENCE_INFO_KEY)
+    if expected is None:
+        return
+    try:
+        owner, generation = expected
+    except (TypeError, ValueError) as exc:
+        raise JobExecutionFenceLost from exc
+    if job.execution_owner != owner or job.execution_generation != generation:
+        raise JobExecutionFenceLost
+    current = db.exec(
+        select(APIJob.id).where(
+            APIJob.id == job.id,
+            APIJob.status == "running",
+            APIJob.execution_owner == owner,
+            APIJob.execution_generation == generation,
+        )
+    ).first()
+    if current is None:
+        raise JobExecutionFenceLost
+
+
+def _commit_job_owned_write(db: Session, job: APIJob) -> None:
+    """Commit handler-owned rows only while this worker still owns the job generation.
+
+    The handler may flush a related row (for example, an SOP draft) before this
+    function runs.  The conditional APIJob update is in the same transaction, so
+    a lifecycle transition, lease reclaim, or owner change rolls back the related
+    row instead of leaving an orphaned durable side effect behind.
+    """
+    expected = db.info.get(_EXECUTION_FENCE_INFO_KEY)
+    if expected is None:
+        raise JobExecutionFenceLost
+    try:
+        owner, generation = expected
+    except (TypeError, ValueError) as exc:
+        db.rollback()
+        raise JobExecutionFenceLost from exc
+    if job.execution_owner != owner or job.execution_generation != generation:
+        db.rollback()
+        raise JobExecutionFenceLost
+
+    # Flush the related row first; the CAS below decides whether this whole
+    # transaction may become durable.
+    db.flush()
+    now = utc_now()
+    result = db.exec(
+        update(APIJob)
+        .where(
+            APIJob.id == job.id,
+            APIJob.status == "running",
+            APIJob.execution_owner == owner,
+            APIJob.execution_generation == generation,
+            select(Tenant.id)
+            .where(
+                Tenant.id == APIJob.tenant_id,
+                Tenant.status == "active",
+                Tenant.lifecycle_version == APIJob.tenant_lifecycle_version,
+            )
+            .exists(),
+        )
+        .values(updated_at=now)
+        .execution_options(synchronize_session=False)
+    )
+    if getattr(result, "rowcount", 0) != 1:
+        db.rollback()
+        current = db.get(APIJob, job.id)
+        if (
+            current is None
+            or current.status != "running"
+            or current.execution_owner != owner
+            or current.execution_generation != generation
+        ):
+            raise JobExecutionFenceLost
+        # Preserve the central denial contract so run_job terminalizes a denied
+        # attempt rather than converting it into an ordinary retryable failure.
+        _require_job_lifecycle(db, current)
+        raise JobExecutionFenceLost
+    db.commit()
+    db.refresh(job)
+
+
+def mark_side_effect_started(db: Session) -> None:
+    """Record explicit evidence that a job handler crossed its external-effect boundary.
+
+    Handlers that can raise after dispatching a provider call should invoke this helper
+    immediately before that call.  The marker lives in ``Session.info`` so it is not
+    persisted as business data and survives a rollback while the worker terminalizes
+    the uncertain attempt.
+    """
+    db.info[_SIDE_EFFECT_STARTED_INFO_KEY] = True
+
+
+def _consume_side_effect_started(db: Session) -> bool:
+    """Consume one handler boundary marker without allowing it to leak to a later job."""
+    return bool(db.info.pop(_SIDE_EFFECT_STARTED_INFO_KEY, False))
+
 
 # Feedback analysis is an application-internal worker.  Its product-facing
 # result is emitted as feedback.analysis.* rather than as a public job stream.
@@ -308,6 +428,39 @@ def job_read(row: APIJob) -> JobRead:
     )
 
 
+def _require_job_lifecycle(
+    db: Session,
+    job: APIJob,
+) -> TenantLifecycleDecision:
+    """Require the job's tenant to be active and retain its exact admission version.
+
+    The check reads authoritative tenant state for one worker boundary.  It has no
+    side effects and raises ``TenantLifecycleDenied`` for suspended, missing, stale,
+    or otherwise unproven tenant state.
+    """
+    decision = require_active_tenant(
+        db,
+        tenant_id=job.tenant_id,
+        execution_kind="job.claim",
+        correlation_id=job.id,
+    )
+    return require_matching_admission_version(
+        decision,
+        job.tenant_lifecycle_version,
+    )
+
+
+def _job_stream_lifecycle_active(job: APIJob) -> bool:
+    """Check one job's current lifecycle before a generic SSE poll or emitted chunk."""
+    try:
+        with Session(engine) as lifecycle_db:
+            _require_job_lifecycle(lifecycle_db, job)
+            lifecycle_db.rollback()
+    except Exception:  # noqa: BLE001 - SSE fails closed on all gate errors.
+        return False
+    return True
+
+
 def create_job(
     db: Session,
     principal: PublicPrincipal,
@@ -321,6 +474,12 @@ def create_job(
 ) -> APIJob:
     if not principal.credential_id:
         raise PublicAPIError(403, "API_KEY_REQUIRED", "Jobs require an API credential.")
+    admission = require_active_tenant(
+        db,
+        tenant_id=principal.tenant_id,
+        execution_kind="job.claim",
+        correlation_id=new_id("jobadmission"),
+    )
     context = language_context or resolve_language_context(
         LanguageContextInputs(
             user_ui_locale=principal.actor_user.ui_locale,
@@ -334,6 +493,7 @@ def create_job(
     }
     row = APIJob(
         tenant_id=principal.tenant_id,
+        tenant_lifecycle_version=admission.lifecycle_version,
         credential_id=principal.credential_id,
         agent_id=agent_id,
         kind=kind,
@@ -365,6 +525,12 @@ def create_internal_job(
     recoverable on the next startup instead of disappearing with the process.
     """
 
+    admission = require_active_tenant(
+        db,
+        tenant_id=tenant_id,
+        execution_kind="job.claim",
+        correlation_id=new_id("jobadmission"),
+    )
     # Workflow: explicit immutable context wins; old internal callers retain the
     # documented compatibility default until they are migrated to a source snapshot.
     context = language_context or resolve_compatible_language_context(
@@ -374,6 +540,7 @@ def create_internal_job(
     )
     row = APIJob(
         tenant_id=tenant_id,
+        tenant_lifecycle_version=admission.lifecycle_version,
         credential_id="internal",
         agent_id=agent_id,
         kind=kind,
@@ -477,10 +644,12 @@ def emit_job_event(
     delivery_ids = stage_webhook_deliveries(
         db,
         tenant_id=job.tenant_id,
+        admission_version=job.tenant_lifecycle_version,
         credential_id=job.credential_id,
         event_id=event.id,
         event_type=event_type,
         payload=payload,
+        commit=False,
     )
     if delivery_ids:
         db.info.setdefault("public_api_webhook_deliveries", []).extend(delivery_ids)
@@ -666,13 +835,16 @@ def _terminalize_job(
     db: Session,
     job: APIJob,
     *,
-    owner: str,
+    owner: str | None,
     generation: int,
     status: str,
     stage: str,
     result_json: dict[str, Any] | None = None,
     error_json: dict[str, Any] | None = None,
     retryable: bool = False,
+    terminal_reason: str | None = None,
+    outcome_unknown: bool = False,
+    enforce_active_lifecycle: bool = True,
 ) -> APIJob | None:
     """Publish a terminal job state only from the currently claimed worker."""
 
@@ -689,15 +861,40 @@ def _terminalize_job(
     if result_json is not None:
         values.update(result_json=result_json, progress=1.0, error_json={})
     if error_json is not None:
-        values["error_json"] = _project_job_error(job, error_json, retryable=retryable)
+        projected_error = _project_job_error(job, error_json, retryable=retryable)
+        if terminal_reason is not None:
+            projected_error["terminal_reason"] = terminal_reason
+            # Newer schemas may expose lifecycle evidence as first-class columns.
+            # Keep this module compatible with the current schema by retaining the
+            # same evidence in the safe error JSON when those columns are absent.
+            if hasattr(APIJob, "terminal_reason"):
+                values["terminal_reason"] = terminal_reason
+            if hasattr(APIJob, "outcome_unknown"):
+                values["outcome_unknown"] = outcome_unknown
+        if outcome_unknown:
+            projected_error["outcome_unknown"] = True
+            if hasattr(APIJob, "outcome_unknown"):
+                values["outcome_unknown"] = True
+        values["error_json"] = projected_error
+    conditions = [
+        APIJob.id == job.id,
+        APIJob.status == "running",
+        APIJob.execution_owner == owner,
+        APIJob.execution_generation == generation,
+    ]
+    if enforce_active_lifecycle:
+        conditions.append(
+            select(Tenant.id)
+            .where(
+                Tenant.id == APIJob.tenant_id,
+                Tenant.status == "active",
+                Tenant.lifecycle_version == APIJob.tenant_lifecycle_version,
+            )
+            .exists()
+        )
     update_result = db.exec(
         update(APIJob)
-        .where(
-            APIJob.id == job.id,
-            APIJob.status == "running",
-            APIJob.execution_owner == owner,
-            APIJob.execution_generation == generation,
-        )
+        .where(*conditions)
         .values(**values)
         .execution_options(synchronize_session=False)
     )
@@ -706,6 +903,85 @@ def _terminalize_job(
         return None
     db.expire_all()
     return db.get(APIJob, job.id)
+
+
+def _terminalize_job_lifecycle_denial(
+    db: Session,
+    job: APIJob,
+    *,
+    owner: str | None,
+    generation: int,
+    denial: TenantLifecycleDenied,
+    outcome_unknown: bool,
+) -> APIJob | None:
+    """Cancel a claimed job after lifecycle denial and clear every retry path.
+
+    The worker owner and generation remain the conditional fence.  The update is
+    deliberately allowed while the tenant is suspended so a denied attempt cannot
+    remain executable or be replayed after reactivation.
+    """
+    return _terminalize_job(
+        db,
+        job,
+        owner=owner,
+        generation=generation,
+        status="cancelled",
+        stage="cancelled",
+        result_json={},
+        error_json={"code": denial.code},
+        retryable=False,
+        terminal_reason=denial.code,
+        outcome_unknown=outcome_unknown,
+        enforce_active_lifecycle=False,
+    )
+
+
+def _terminalize_job_after_completion_cas_miss(
+    db: Session,
+    job_id: str,
+    *,
+    owner: str,
+    generation: int,
+    outcome_unknown: bool,
+) -> APIJob | None:
+    """Terminalize a still-owned job when completion lost a concurrent lifecycle race.
+
+    A completion UPDATE can legitimately affect zero rows when the tenant was suspended
+    between the final read-only gate and the correlated CAS predicate.  Re-read the row
+    with a fresh transaction and only cancel when the same owner/generation still holds
+    the running lease.  If another worker or recovery has taken the lease, this worker
+    must not overwrite that newer attempt.
+    """
+    db.rollback()
+    current = db.get(APIJob, job_id)
+    if (
+        current is None
+        or current.status != "running"
+        or current.execution_owner != owner
+        or current.execution_generation != generation
+    ):
+        return None
+    try:
+        _require_job_lifecycle(db, current)
+    except TenantLifecycleDenied as denial:
+        db.rollback()
+        current = db.get(APIJob, job_id)
+        if (
+            current is None
+            or current.status != "running"
+            or current.execution_owner != owner
+            or current.execution_generation != generation
+        ):
+            return None
+        return _terminalize_job_lifecycle_denial(
+            db,
+            current,
+            owner=owner,
+            generation=generation,
+            denial=denial,
+            outcome_unknown=outcome_unknown,
+        )
+    return None
 
 
 def _emit_terminal_job_event(
@@ -737,19 +1013,45 @@ def run_job(job_id: str) -> None:
         if job is None:
             return
         generation = job.execution_generation
+        db.info[_EXECUTION_FENCE_INFO_KEY] = (owner, generation)
         handler = _handlers.get(job.kind)
-        if _has_public_job_lifecycle(job.kind):
-            emit_job_event(db, job, f"{job.kind}.started", {"job_id": job.id})
-            _commit_and_dispatch(db)
+        side_effect_started = False
+        _consume_side_effect_started(db)
         try:
+            # Recheck after the durable claim so a suspension racing the lease
+            # cannot reach a handler.
+            _require_job_execution_fence(db, job)
+            _require_job_lifecycle(db, job)
+            db.rollback()
+            if _has_public_job_lifecycle(job.kind):
+                # The started event is a durable side effect (and can stage webhook
+                # deliveries), so it follows the same post-claim lifecycle fence.
+                emit_job_event(db, job, f"{job.kind}.started", {"job_id": job.id})
+                _commit_and_dispatch(db)
             if handler is None:
                 raise RuntimeError(f"JOB_HANDLER_MISSING:{job.kind}")
             if job.cancel_requested:
                 raise JobCancelled()
+            # Recheck immediately before handing control to the provider/tool-backed handler.
+            _require_job_lifecycle(db, job)
+            # The gate performs a read-only transaction; close it before entering a
+            # handler that may block on a provider call.
+            db.rollback()
             result = handler(db, job)
+            # A successful handler return is evidence that the handler boundary was
+            # crossed.  A handler that raises must opt in with mark_side_effect_started
+            # immediately before dispatching a provider call; local preparation errors
+            # therefore cannot be mislabeled as an unknown remote outcome.
+            side_effect_started = _consume_side_effect_started(db) or True
+            # Do not carry a handler transaction into the post-call lifecycle
+            # decision.  Handler-owned durable writes are committed before the
+            # result is fenced; a denial still prevents publishing this job result.
+            db.commit()
             db.refresh(job)
             if job.cancel_requested:
                 raise JobCancelled()
+            # A handler may have started a remote call and observed suspension while it ran.
+            _require_job_lifecycle(db, job)
             terminal = _terminalize_job(
                 db,
                 job,
@@ -759,9 +1061,22 @@ def run_job(job_id: str) -> None:
                 stage="completed",
                 result_json=result,
             )
+            if terminal is None:
+                terminal = _terminalize_job_after_completion_cas_miss(
+                    db,
+                    job.id,
+                    owner=owner,
+                    generation=generation,
+                    outcome_unknown=side_effect_started,
+                )
             if terminal is not None:
-                _emit_terminal_job_event(db, terminal, status="succeeded")
+                _emit_terminal_job_event(
+                    db,
+                    terminal,
+                    status="succeeded" if terminal.status == "succeeded" else "cancelled",
+                )
         except JobCancelled:
+            side_effect_started = side_effect_started or _consume_side_effect_started(db)
             logger.info(
                 "public job %s cancelled",
                 job.id,
@@ -774,22 +1089,93 @@ def run_job(job_id: str) -> None:
                     )
                 },
             )
+            db.rollback()
+            current = db.get(APIJob, job_id)
+            if current is None:
+                return
+            try:
+                _require_job_lifecycle(db, current)
+            except TenantLifecycleDenied as denial:
+                db.rollback()
+                current = db.get(APIJob, job_id)
+                if current is None:
+                    return
+                terminal = _terminalize_job_lifecycle_denial(
+                    db,
+                    current,
+                    owner=owner,
+                    generation=generation,
+                    denial=denial,
+                    outcome_unknown=side_effect_started,
+                )
+                if terminal is not None:
+                    _emit_terminal_job_event(db, terminal, status="cancelled")
+                return
             terminal = _terminalize_job(
                 db,
-                job,
+                current,
                 owner=owner,
                 generation=generation,
                 status="cancelled",
                 stage="cancelled",
+                # Cancellation is already an explicit terminal decision.  Do not
+                # leave a running lease behind if suspension races this final write.
+                enforce_active_lifecycle=False,
+            )
+            if terminal is not None:
+                _emit_terminal_job_event(db, terminal, status="cancelled")
+        except TenantLifecycleDenied as denial:
+            side_effect_started = side_effect_started or _consume_side_effect_started(db)
+            # A denial after the handler boundary makes its remote outcome
+            # uncertain; never retry it.
+            db.rollback()
+            current = db.get(APIJob, job_id)
+            if current is None:
+                return
+            terminal = _terminalize_job_lifecycle_denial(
+                db,
+                current,
+                owner=owner,
+                generation=generation,
+                denial=denial,
+                outcome_unknown=side_effect_started,
             )
             if terminal is not None:
                 _emit_terminal_job_event(db, terminal, status="cancelled")
         except Exception as exc:
+            side_effect_started = side_effect_started or _consume_side_effect_started(db)
             db.rollback()
-            job = db.get(APIJob, job_id)
-            if job is None:
+            current = db.get(APIJob, job_id)
+            if current is None:
                 return
-            code = "JOB_HANDLER_MISSING" if str(exc).startswith("JOB_HANDLER_MISSING:") else "JOB_EXECUTION_FAILED"
+            # A handler exception is not permission to retry work after a concurrent
+            # lifecycle transition.  Re-read the authoritative gate before publishing
+            # an ordinary failure; once the side-effect boundary was crossed, the
+            # remote result is unknown and the job must be terminalized without retry.
+            try:
+                _require_job_lifecycle(db, current)
+            except TenantLifecycleDenied as denial:
+                db.rollback()
+                current = db.get(APIJob, job_id)
+                if current is None:
+                    return
+                terminal = _terminalize_job_lifecycle_denial(
+                    db,
+                    current,
+                    owner=owner,
+                    generation=generation,
+                    denial=denial,
+                    outcome_unknown=side_effect_started,
+                )
+                if terminal is not None:
+                    _emit_terminal_job_event(db, terminal, status="cancelled")
+                return
+            job = current
+            code = (
+                "JOB_HANDLER_MISSING"
+                if str(exc).startswith("JOB_HANDLER_MISSING:")
+                else "JOB_EXECUTION_FAILED"
+            )
             logger.exception(
                 "public job %s failed code=%s",
                 job.id,
@@ -813,8 +1199,20 @@ def run_job(job_id: str) -> None:
                 error_json=public_error,
                 retryable=code != "JOB_HANDLER_MISSING",
             )
+            if terminal is None:
+                terminal = _terminalize_job_after_completion_cas_miss(
+                    db,
+                    job.id,
+                    owner=owner,
+                    generation=generation,
+                    outcome_unknown=side_effect_started,
+                )
             if terminal is not None:
-                _emit_terminal_job_event(db, terminal, status="failed")
+                _emit_terminal_job_event(
+                    db,
+                    terminal,
+                    status="failed" if terminal.status == "failed" else "cancelled",
+                )
 
 
 class JobCancelled(Exception):
@@ -923,6 +1321,8 @@ def stream_job_events(
                 current = event_db.get(APIJob, row.id)
                 if not current:
                     return
+                if not _job_stream_lifecycle_active(current):
+                    return
                 rows = event_db.exec(
                     select(APIJobEvent)
                     .where(
@@ -932,12 +1332,24 @@ def stream_job_events(
                     )
                     .order_by(APIJobEvent.sequence)
                 ).all()
-                for item in rows:
-                    cursor = item.sequence
-                    data = json.dumps(item.data_json or {}, ensure_ascii=False)
-                    yield f"id: {item.sequence}\nevent: {item.event_type}\ndata: {data}\n\n"
-                if current.status in {"succeeded", "failed", "cancelled"} and not rows:
+                chunks = [
+                    (
+                        item.sequence,
+                        (
+                            f"id: {item.sequence}\nevent: {item.event_type}\ndata: "
+                            f"{json.dumps(item.data_json or {}, ensure_ascii=False)}\n\n"
+                        ),
+                    )
+                    for item in rows
+                ]
+                terminal = current.status in {"succeeded", "failed", "cancelled"}
+            for sequence, chunk in chunks:
+                if not _job_stream_lifecycle_active(current):
                     return
+                cursor = sequence
+                yield chunk
+            if terminal and not chunks:
+                return
             idle_ticks += 1
             if idle_ticks % 100 == 0:
                 yield ": keepalive\n\n"
@@ -958,6 +1370,24 @@ def recover_public_jobs() -> None:
     with Session(engine) as db:
         running = db.exec(select(APIJob).where(APIJob.status == "running")).all()
         for job in running:
+            try:
+                _require_job_lifecycle(db, job)
+            except TenantLifecycleDenied as denial:
+                db.rollback()
+                current = db.get(APIJob, job.id)
+                if current is None:
+                    continue
+                terminal = _terminalize_job_lifecycle_denial(
+                    db,
+                    current,
+                    owner=current.execution_owner,
+                    generation=current.execution_generation,
+                    denial=denial,
+                    outcome_unknown=True,
+                )
+                if terminal is not None:
+                    _emit_terminal_job_event(db, terminal, status="cancelled")
+                continue
             raw_error = {
                 "code": "SERVICE_RESTARTED",
                 "message": "The service restarted while the job was running.",
@@ -965,12 +1395,19 @@ def recover_public_jobs() -> None:
             now = utc_now()
             # Incrementing the generation fences an old in-process worker that
             # returns after startup recovery has published this terminal state.
-            db.exec(
+            recovery_result = db.exec(
                 update(APIJob)
                 .where(
                     APIJob.id == job.id,
                     APIJob.status == "running",
                     APIJob.execution_generation == job.execution_generation,
+                    select(Tenant.id)
+                    .where(
+                        Tenant.id == APIJob.tenant_id,
+                        Tenant.status == "active",
+                        Tenant.lifecycle_version == APIJob.tenant_lifecycle_version,
+                    )
+                    .exists(),
                 )
                 .values(
                     status="failed",
@@ -985,6 +1422,29 @@ def recover_public_jobs() -> None:
                 )
                 .execution_options(synchronize_session=False)
             )
+            if getattr(recovery_result, "rowcount", 0) != 1:
+                db.rollback()
+                current = db.get(APIJob, job.id)
+                if current is None:
+                    continue
+                try:
+                    _require_job_lifecycle(db, current)
+                except TenantLifecycleDenied as denial:
+                    db.rollback()
+                    current = db.get(APIJob, job.id)
+                    if current is None:
+                        continue
+                    terminal = _terminalize_job_lifecycle_denial(
+                        db,
+                        current,
+                        owner=current.execution_owner,
+                        generation=current.execution_generation,
+                        denial=denial,
+                        outcome_unknown=True,
+                    )
+                    if terminal is not None:
+                        _emit_terminal_job_event(db, terminal, status="cancelled")
+                continue
             db.expire_all()
             recovered = db.get(APIJob, job.id)
             if recovered is None or recovered.status != "failed":
@@ -1011,9 +1471,60 @@ def recover_public_jobs() -> None:
                 )
         _reconcile_terminal_run_sessions(db)
         queued = db.exec(select(APIJob).where(APIJob.status == "queued")).all()
+        # Keep scalar dispatch metadata rather than detached ORM rows; the final
+        # commit expires those rows under the normal Session configuration.
+        dispatchable: list[tuple[str, str]] = []
+        for job in queued:
+            try:
+                _require_job_lifecycle(db, job)
+            except TenantLifecycleDenied as denial:
+                db.rollback()
+                current = db.get(APIJob, job.id)
+                if current is None:
+                    continue
+                # Queue rows have no live owner; claim the terminal state by ID/version atomically.
+                now = utc_now()
+                terminal_error = _project_job_error(
+                    current,
+                    {"code": denial.code},
+                    retryable=False,
+                )
+                terminal_error["terminal_reason"] = denial.code
+                terminal_values: dict[str, Any] = {
+                    "status": "cancelled",
+                    "stage": "cancelled",
+                    "retryable": False,
+                    "error_json": terminal_error,
+                    "result_json": {},
+                    "finished_at": now,
+                    "updated_at": now,
+                    "execution_owner": None,
+                    "lease_expires_at": None,
+                    "execution_generation": APIJob.execution_generation + 1,
+                }
+                if hasattr(APIJob, "terminal_reason"):
+                    terminal_values["terminal_reason"] = denial.code
+                if hasattr(APIJob, "outcome_unknown"):
+                    terminal_values["outcome_unknown"] = False
+                db.exec(
+                    update(APIJob)
+                    .where(
+                        APIJob.id == current.id,
+                        APIJob.status == "queued",
+                        APIJob.tenant_lifecycle_version == current.tenant_lifecycle_version,
+                    )
+                    .values(**terminal_values)
+                    .execution_options(synchronize_session=False)
+                )
+                db.expire_all()
+                recovered = db.get(APIJob, current.id)
+                if recovered is not None and recovered.status == "cancelled":
+                    _emit_terminal_job_event(db, recovered, status="cancelled")
+                continue
+            dispatchable.append((job.id, job.kind))
         _commit_and_dispatch(db)
-    for job in queued:
-        enqueue_async_job(f"public_api.{job.kind}", run_job, job.id)
+    for job_id, kind in dispatchable:
+        enqueue_async_job(f"public_api.{kind}", run_job, job_id)
 
 
 def cleanup_public_api_records() -> None:

@@ -37,7 +37,7 @@ import {
 import { DetailField } from '@/components/DetailField';
 import { ResourceImportDialog } from '@/components/ResourceImportDialog';
 
-import { api, TENANT_ID } from '../api/client';
+import { createTenantClient } from '../api/tenant-client';
 import IconAdd from '../assets/icons/add.svg?react';
 import IconChevronDown from '../assets/icons/chevron-down.svg?react';
 import IconClear from '../assets/icons/field-clear.svg?react';
@@ -50,6 +50,7 @@ import IconSearch from '../assets/icons/search.svg?react';
 import IconSkill from '../assets/icons/plaza-skill.svg?react';
 import IconTrash from '../assets/icons/trash.svg?react';
 import { isEnterpriseAdmin, type EnterpriseAuthUser } from '../auth';
+import { useTenantSession } from '../contexts/TenantSessionContext';
 import {
   canManageEmployeeAgent,
   openGalleryAgentId,
@@ -457,6 +458,10 @@ export default function SkillsPage({
   onLogout?: () => void;
 } = {}) {
   const { locale, t } = useAppIntl();
+  const tenantContext = useTenantSession();
+  const tenantClient = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
+  const tenantId = tenantContext?.tenantId || '';
+  const userId = tenantContext?.userId || '';
   const copy = useSkillsPageCopy();
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -469,9 +474,11 @@ export default function SkillsPage({
   const [negativeScope, setNegativeScope] = useState<RankingScope>('current');
   const [versionModalOpen, setVersionModalOpen] = useState(false);
   const [loading, setLoading] = useState(false);
-  const [agentId, setAgentId] = useState(readEmployeeScope);
+  const [agentId, setAgentId] = useState(
+    () => tenantId && userId ? readEmployeeScope(tenantId, userId) : '',
+  );
   const [isOverallAgent, setIsOverallAgent] = useState(() => {
-    const stored = readEmployeeScope();
+    const stored = tenantId && userId ? readEmployeeScope(tenantId, userId) : '';
     return !stored || stored.includes('overall');
   });
   const [searchText, setSearchText] = useState('');
@@ -494,27 +501,43 @@ export default function SkillsPage({
   const [confirmLoading, setConfirmLoading] = useState(false);
   const listLabel = isOverallAgent ? copy.listOverall : copy.listLocal;
 
+  useEffect(() => {
+    const scopedAgentId = tenantId && userId ? readEmployeeScope(tenantId, userId) : '';
+    setAgentId(scopedAgentId);
+    setIsOverallAgent(!scopedAgentId || scopedAgentId.includes('overall'));
+    setRows([]);
+    setAgents([]);
+    setVersionRows([]);
+    setVersionSkill(null);
+  }, [tenantId, userId]);
+
   /** 加载当前作用域的 SOP 与员工列表，并把未知异常收敛到安全产品文案。 */
   const load = async () => {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     setLoading(true);
     try {
       const suffix = agentId ? `&agent_id=${encodeURIComponent(agentId)}` : '';
-      const result = await api.get<SkillRead[]>(`/api/enterprise/skills?tenant_id=${TENANT_ID}${suffix}`);
+      const result = await tenantClient.get<SkillRead[]>(`/api/enterprise/skills?tenant_id=${tenantId}${suffix}`);
+      if (!context.isCurrentGeneration(generation)) return;
       setRows(result);
-      const agentRows = await api.get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${TENANT_ID}`);
+      const agentRows = await tenantClient.get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${tenantId}`);
+      if (!context.isCurrentGeneration(generation)) return;
       setAgents(agentRows);
       setIsOverallAgent(Boolean(agentRows.find((item) => item.id === agentId)?.is_overall ?? true));
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       notify.error(skillsPageErrorMessage(error, copy.loadFailed, t));
     } finally {
-      setLoading(false);
+      if (context.isCurrentGeneration(generation)) setLoading(false);
     }
   };
 
   useEffect(() => {
     void load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [agentId]);
+  }, [agentId, tenantContext, tenantClient, tenantId]);
 
   useEffect(() => {
     if (searchParams.get('add') !== 'plaza') return;
@@ -535,11 +558,11 @@ export default function SkillsPage({
   useEffect(() => {
     const onScopeChange = (event: Event) => {
       const next = (event as CustomEvent<{ agentId?: string }>).detail?.agentId || '';
-      setAgentId(next && !isTeamScope(next) ? next : readEmployeeScope());
+      setAgentId(next && !isTeamScope(next) ? next : readEmployeeScope(tenantId, userId));
     };
     window.addEventListener('ultrarag-enterprise-agent-scope-change', onScopeChange);
     return () => window.removeEventListener('ultrarag-enterprise-agent-scope-change', onScopeChange);
-  }, []);
+  }, [tenantId, userId]);
 
   const filteredRows = useMemo(() => {
     const keyword = searchText.trim().toLowerCase();
@@ -757,10 +780,14 @@ export default function SkillsPage({
   };
 
   async function openImport(mode: 'plaza' | 'employee' = 'plaza', selectedResourceId?: string) {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     try {
       const agentRows = agents.length
         ? agents
-        : await api.get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${TENANT_ID}`);
+        : await tenantClient.get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${tenantId}`);
+      if (!context.isCurrentGeneration(generation)) return;
       setAgents(agentRows);
       setImportMode(mode);
       const firstSource = mode === 'plaza'
@@ -771,6 +798,7 @@ export default function SkillsPage({
       setImportOpen(true);
       if (firstSource) {
         const sourceRows = await loadImportSourceSkills(firstSource);
+        if (!context.isCurrentGeneration(generation)) return;
         if (selectedResourceId && sourceRows.some((item) => item.id === selectedResourceId)) {
           setImportSelectedSkillIds([selectedResourceId]);
         }
@@ -778,26 +806,35 @@ export default function SkillsPage({
         setImportSourceSkills([]);
       }
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       notify.error(skillsPageErrorMessage(error, copy.loadAgentsFailed, t));
     }
   }
 
   async function loadImportSourceSkills(sourceAgentId: string): Promise<SkillRead[]> {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return [];
     setImportSourceSkills([]);
     setImportSelectedSkillIds([]);
     if (!sourceAgentId) return [];
     try {
-      const sourceRows = await api.get<SkillRead[]>(`/api/enterprise/agents/${sourceAgentId}/skills?tenant_id=${TENANT_ID}`);
+      const sourceRows = await tenantClient.get<SkillRead[]>(`/api/enterprise/agents/${sourceAgentId}/skills?tenant_id=${tenantId}`);
+      if (!context.isCurrentGeneration(generation)) return [];
       const publishedRows = sourceRows.filter((item) => item.status === 'published');
       setImportSourceSkills(publishedRows);
       return publishedRows;
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return [];
       notify.error(skillsPageErrorMessage(error, copy.loadSourceFailed, t));
       return [];
     }
   }
 
   async function submitImportSkills() {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     if (!agentId) {
       notify.warning(copy.warningSelectEmployeeFirst);
       return;
@@ -812,24 +849,26 @@ export default function SkillsPage({
     }
     setImportLoading(true);
     try {
-      const result = await api.post<{ imported: Array<Record<string, unknown>>; missing: Array<Record<string, unknown>> }>(
+      const result = await tenantClient.post<{ imported: Array<Record<string, unknown>>; missing: Array<Record<string, unknown>> }>(
         `/api/enterprise/agents/${agentId}/resources/import`,
         {
-          tenant_id: TENANT_ID,
+          tenant_id: tenantId,
           source_agent_id: importSourceAgentId,
           resource_type: 'skill',
           resource_ids: importSelectedSkillIds,
         },
       );
+      if (!context.isCurrentGeneration(generation)) return;
       const importedCount = result.imported?.length || 0;
       const missingCount = result.missing?.length || 0;
       notify.success(copiedResultText(copy, locale, importedCount, missingCount));
       setImportOpen(false);
       await load();
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       notify.error(skillsPageErrorMessage(error, copy.copyFailed, t));
     } finally {
-      setImportLoading(false);
+      if (context.isCurrentGeneration(generation)) setImportLoading(false);
     }
   }
 
@@ -848,69 +887,99 @@ export default function SkillsPage({
   }
 
   async function publish(row: SkillRead) {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     try {
-      await api.post(`/api/enterprise/skills/${row.skill_id}/publish?tenant_id=${TENANT_ID}${agentQuery()}`);
+      await tenantClient.post(`/api/enterprise/skills/${row.skill_id}/publish?tenant_id=${tenantId}${agentQuery()}`);
+      if (!context.isCurrentGeneration(generation)) return;
       notify.success(copy.enabledSuccess);
       await load();
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       notify.error(skillsPageErrorMessage(error, copy.enabledFailed, t));
     }
   }
 
   async function archive(row: SkillRead) {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     try {
-      await api.post(`/api/enterprise/skills/${row.skill_id}/archive?tenant_id=${TENANT_ID}${agentQuery()}`);
+      await tenantClient.post(`/api/enterprise/skills/${row.skill_id}/archive?tenant_id=${tenantId}${agentQuery()}`);
+      if (!context.isCurrentGeneration(generation)) return;
       notify.success(copy.archivedSuccess);
       await load();
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       notify.error(skillsPageErrorMessage(error, copy.archivedFailed, t));
     }
   }
 
   async function markDraft(row: SkillRead) {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     try {
-      await api.post(`/api/enterprise/skills/${row.skill_id}/draft?tenant_id=${TENANT_ID}${agentQuery()}`);
+      await tenantClient.post(`/api/enterprise/skills/${row.skill_id}/draft?tenant_id=${tenantId}${agentQuery()}`);
+      if (!context.isCurrentGeneration(generation)) return;
       notify.success(copy.draftSuccess);
       await load();
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       notify.error(skillsPageErrorMessage(error, copy.draftFailed, t));
     }
   }
 
   async function openVersions(row: SkillRead) {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     setVersionSkill(row);
     setVersionModalOpen(true);
     setVersionRows([]);
     try {
-      const result = await api.get<SkillVersionRead[]>(
-        `/api/enterprise/skills/${encodeURIComponent(row.skill_id)}/versions?tenant_id=${TENANT_ID}${agentQuery()}`,
+      const result = await tenantClient.get<SkillVersionRead[]>(
+        `/api/enterprise/skills/${encodeURIComponent(row.skill_id)}/versions?tenant_id=${tenantId}${agentQuery()}`,
       );
+      if (!context.isCurrentGeneration(generation)) return;
       setVersionRows(result);
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       notify.error(skillsPageErrorMessage(error, copy.loadVersionsFailed, t));
     }
   }
 
   async function showVersionDetail(row: SkillVersionRead) {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     try {
-      const result = await api.get<SkillVersionRead>(
-        `/api/enterprise/skills/${encodeURIComponent(row.skill_id)}/versions/${encodeURIComponent(row.version)}?tenant_id=${TENANT_ID}${agentQuery()}`,
+      const result = await tenantClient.get<SkillVersionRead>(
+        `/api/enterprise/skills/${encodeURIComponent(row.skill_id)}/versions/${encodeURIComponent(row.version)}?tenant_id=${tenantId}${agentQuery()}`,
       );
+      if (!context.isCurrentGeneration(generation)) return;
       setDetailVersion(result);
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       notify.error(skillsPageErrorMessage(error, copy.loadVersionDetailFailed, t));
     }
   }
 
   async function syncFromOverall(row: SkillRead) {
     if (!agentId) return;
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     try {
-      await api.post(
-        `/api/enterprise/agents/${agentId}/skills/${encodeURIComponent(row.skill_id)}/sync-from-overall?tenant_id=${TENANT_ID}`,
+      await tenantClient.post(
+        `/api/enterprise/agents/${agentId}/skills/${encodeURIComponent(row.skill_id)}/sync-from-overall?tenant_id=${tenantId}`,
       );
+      if (!context.isCurrentGeneration(generation)) return;
       notify.success(copy.syncSuccess);
       await load();
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       notify.error(skillsPageErrorMessage(error, copy.syncFailed, t));
     }
   }
@@ -919,53 +988,69 @@ export default function SkillsPage({
     const row = deleteTarget;
     if (!row) return;
     const branchMode = !isOverallAgent;
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     setConfirmLoading(true);
     try {
-      await api.delete(`/api/enterprise/skills/${row.skill_id}?tenant_id=${TENANT_ID}${agentQuery()}`);
+      await tenantClient.delete(`/api/enterprise/skills/${row.skill_id}?tenant_id=${tenantId}${agentQuery()}`);
+      if (!context.isCurrentGeneration(generation)) return;
       notify.success(branchMode ? copy.removeSuccess : copy.deleteSuccess);
       setDeleteTarget(null);
       await load();
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       notify.error(skillsPageErrorMessage(error, branchMode ? copy.removeFailed : copy.deleteFailed, t));
     } finally {
-      setConfirmLoading(false);
+      if (context.isCurrentGeneration(generation)) setConfirmLoading(false);
     }
   }
 
   async function confirmRollback() {
     const row = rollbackTarget;
     if (!row) return;
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     setConfirmLoading(true);
     try {
-      const result = await api.post<SkillRead>(
-        `/api/enterprise/skills/${encodeURIComponent(row.skill_id)}/versions/${encodeURIComponent(row.version)}/rollback?tenant_id=${TENANT_ID}${agentQuery()}`,
+      const result = await tenantClient.post<SkillRead>(
+        `/api/enterprise/skills/${encodeURIComponent(row.skill_id)}/versions/${encodeURIComponent(row.version)}/rollback?tenant_id=${tenantId}${agentQuery()}`,
       );
+      if (!context.isCurrentGeneration(generation)) return;
       notify.success(copy.rollbackSuccess.replace('{version}', row.version));
       setRollbackTarget(null);
       await load();
+      if (!context.isCurrentGeneration(generation)) return;
       await openVersions(result);
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       notify.error(skillsPageErrorMessage(error, copy.rollbackFailed, t));
     } finally {
-      setConfirmLoading(false);
+      if (context.isCurrentGeneration(generation)) setConfirmLoading(false);
     }
   }
 
   async function confirmPromote() {
     const row = promoteTarget;
     if (!row || !agentId) return;
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     setConfirmLoading(true);
     try {
-      await api.post(
-        `/api/enterprise/agents/${agentId}/skills/${encodeURIComponent(row.skill_id)}/promote-to-overall?tenant_id=${TENANT_ID}`,
+      await tenantClient.post(
+        `/api/enterprise/agents/${agentId}/skills/${encodeURIComponent(row.skill_id)}/promote-to-overall?tenant_id=${tenantId}`,
       );
+      if (!context.isCurrentGeneration(generation)) return;
       notify.success(copy.promoteSuccess);
       setPromoteTarget(null);
       await load();
     } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
       notify.error(skillsPageErrorMessage(error, copy.promoteFailed, t));
     } finally {
-      setConfirmLoading(false);
+      if (context.isCurrentGeneration(generation)) setConfirmLoading(false);
     }
   }
 

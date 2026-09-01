@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { createToastNotifier } from '@/components/ui/app-toast';
 
 import { Input } from '@/components/ui';
@@ -8,7 +8,8 @@ import { RawIdentifier } from '@/i18n/RawContent';
 import { useAppIntl } from '@/i18n/useAppIntl';
 import type { MessageId } from '@/i18n/types';
 import { backendErrorMessageDescriptor } from '@/lib/apiErrorMessages';
-import { api, TENANT_ID } from '../../api/client';
+import { createTenantClient } from '../../api/tenant-client';
+import { useTenantSession } from '../../contexts/TenantSessionContext';
 import type { ChannelBindingRead } from '../../types';
 import { StatusBadge } from '../scheduled-tasks/StatusBadge';
 
@@ -25,6 +26,16 @@ function errorDescriptor(error: unknown, fallbackId: MessageId): MessageDescript
     : createMessageDescriptor(fallbackId);
 }
 
+type DingTalkTenantContext = NonNullable<ReturnType<typeof useTenantSession>>;
+
+/** Prevent a stale tenant generation from publishing credential state or toasts. */
+function isCurrentTenantGeneration(
+  context: DingTalkTenantContext | null,
+  generation: number,
+): context is DingTalkTenantContext {
+  return Boolean(context && !context.signal.aborted && context.isCurrentGeneration(generation));
+}
+
 /** 渲染钉钉凭证配置区域；provider ID/secret 只作为 raw 表单数据处理。 */
 export default function DingTalkSetup({
   binding,
@@ -35,6 +46,8 @@ export default function DingTalkSetup({
 }) {
   const { t } = useAppIntl();
   const toast = createToastNotifier({ t });
+  const tenantContext = useTenantSession();
+  const tenantApi = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
   const configuredClientId = binding.client_id || String(binding.config_json?.client_id || '');
   const [editing, setEditing] = useState(!configuredClientId);
   const [clientId, setClientId] = useState(configuredClientId);
@@ -47,20 +60,25 @@ export default function DingTalkSetup({
       toast.error(createMessageDescriptor('channels.credentials.completeRequired'));
       return;
     }
+    const context = tenantContext;
+    if (!context) return;
+    const generation = context.generation;
     setSaving(true);
     try {
-      const updated = await api.post<ChannelBindingRead>(
+      const updated = await tenantApi.post<ChannelBindingRead>(
         `/api/enterprise/channels/${binding.id}/dingtalk/credentials`,
-        { tenant_id: TENANT_ID, client_id: clientId.trim(), client_secret: clientSecret.trim() },
+        { client_id: clientId.trim(), client_secret: clientSecret.trim() },
       );
+      if (!isCurrentTenantGeneration(context, generation)) return;
       setClientSecret('');
       setEditing(false);
       onChanged(updated);
       toast.success(createMessageDescriptor('channels.toast.saved'));
     } catch (error) {
+      if (!isCurrentTenantGeneration(context, generation)) return;
       toast.error(errorDescriptor(error, 'channels.credentials.saveFailed'));
     } finally {
-      setSaving(false);
+      if (isCurrentTenantGeneration(context, generation)) setSaving(false);
     }
   }
 

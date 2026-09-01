@@ -1,4 +1,6 @@
-import { describe, expect, it } from 'vitest';
+// @vitest-environment jsdom
+
+import { afterEach, describe, expect, it } from 'vitest';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 
@@ -10,19 +12,33 @@ import {
   MarkdownMessage,
   attachmentTypeLabel,
   canRateMessage,
+  draftConversationKey,
   formatDraftSchedule,
   harnessEventTraceLine,
   harnessWorkspaceArtifacts,
+  isDraftConversationKey,
   knowledgeCitations,
+  loadSessionReadTimes,
   messageAttachments,
+  modelStorageKey,
+  persistSessionReadTimes,
   renderInlineMarkdown,
   routerDecisionTraceLine,
   scheduledDraftForMessage,
+  sessionReadStorageKey,
   shouldDeferPersistedEventToLiveStream,
   streamErrorTraceLine,
   stripTrailingCitationSummary,
   traceSummary,
 } from './chatHelpers';
+
+function safely<T>(operation: () => T): T | undefined {
+  try {
+    return operation();
+  } catch {
+    return undefined;
+  }
+}
 
 const { t: translate } = createAppTranslator('zh-CN');
 const { t: translateEnglish } = createAppTranslator('en-US');
@@ -50,6 +66,11 @@ function message(patch: Partial<ChatMessage> = {}): ChatMessage {
     ...patch,
   };
 }
+
+afterEach(() => {
+  window.localStorage.clear();
+  window.sessionStorage.clear();
+});
 
 describe('chat history consumer contract', () => {
   it('keeps inline citations but removes duplicate trailing citation summaries', () => {
@@ -467,5 +488,69 @@ describe('chat history consumer contract', () => {
       detail: '状态：awaiting_user · 步骤 collect_user_name · 已执行 1 个动作',
       state: 'running',
     });
+  });
+});
+
+describe('tenant/user chat preference namespace', () => {
+  it('keeps read markers isolated for tenant and tenant-local user', () => {
+    const tenantAUserA = sessionReadStorageKey('tenant-a', 'user-a');
+    const tenantBUserA = sessionReadStorageKey('tenant-b', 'user-a');
+    const tenantAUserB = sessionReadStorageKey('tenant-a', 'user-b');
+    const readTimes = { 'session-a': '2026-08-31T09:00:00.000Z' };
+
+    expect(tenantAUserA).not.toBe(tenantBUserA);
+    expect(tenantAUserA).not.toBe(tenantAUserB);
+    persistSessionReadTimes('tenant-a', 'user-a', readTimes);
+
+    expect(loadSessionReadTimes('tenant-a', 'user-a')).toEqual(readTimes);
+    expect(loadSessionReadTimes('tenant-b', 'user-a')).toEqual({});
+    expect(loadSessionReadTimes('tenant-a', 'user-b')).toEqual({});
+  });
+
+  it('does not adopt an unscoped legacy read-marker key', () => {
+    window.localStorage.setItem(
+      'skill_agent_session_read_at:user-a',
+      JSON.stringify({ 'legacy-session': '2026-08-31T09:00:00.000Z' }),
+    );
+
+    expect(loadSessionReadTimes('tenant-a', 'user-a')).toEqual({});
+  });
+
+  it('isolates draft/cache and model preference keys across tenant and user', () => {
+    const draftA = draftConversationKey('tenant-a', 'user-a', 'agent-a');
+    const draftTenantB = draftConversationKey('tenant-b', 'user-a', 'agent-a');
+    const draftUserB = draftConversationKey('tenant-a', 'user-b', 'agent-a');
+    const modelA = modelStorageKey('tenant-a', 'user-a');
+    const modelTenantB = modelStorageKey('tenant-b', 'user-a');
+    const modelUserB = modelStorageKey('tenant-a', 'user-b');
+
+    expect(isDraftConversationKey(draftA)).toBe(true);
+    expect(draftA).not.toBe(draftTenantB);
+    expect(draftA).not.toBe(draftUserB);
+    expect(modelA).not.toBe(modelTenantB);
+    expect(modelA).not.toBe(modelUserB);
+
+    window.localStorage.setItem(modelA, 'model-a');
+    expect(window.localStorage.getItem(modelTenantB)).toBeNull();
+    expect(window.localStorage.getItem(modelUserB)).toBeNull();
+  });
+
+  it('preserves raw agent identity in draft keys without locale transformation', () => {
+    const rawAgentId = 'Agent-İ-中文';
+    const rawKey = draftConversationKey('tenant-a', 'user-a', rawAgentId);
+    const foldedKey = draftConversationKey(
+      'tenant-a',
+      'user-a',
+      rawAgentId.toLocaleLowerCase('tr-TR'),
+    );
+
+    expect(rawKey).not.toBe(foldedKey);
+  });
+
+  it('does not create a usable preference namespace for missing identity', () => {
+    expect(typeof safely(() => sessionReadStorageKey('', 'user-a'))).not.toBe('string');
+    expect(typeof safely(() => sessionReadStorageKey('tenant-a', ''))).not.toBe('string');
+    expect(safely(() => loadSessionReadTimes('', 'user-a')) || {}).toEqual({});
+    expect(safely(() => loadSessionReadTimes('tenant-a', '')) || {}).toEqual({});
   });
 });

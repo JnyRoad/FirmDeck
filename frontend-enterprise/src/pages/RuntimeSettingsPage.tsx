@@ -1,7 +1,9 @@
 import { SaveOutlined } from '../icons';
-import { useEffect, useState, type ReactNode } from 'react';
+import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { Button as UIButton, Card, CardContent, CardHeader, CardTitle, Input, Switch, Textarea, notify } from '@/components/ui';
-import { api, TENANT_ID } from '../api/client';
+import { api } from '../api/client';
+import { createTenantClient } from '../api/tenant-client';
+import { useTenantSession } from '../contexts/TenantSessionContext';
 import type { EnterpriseAuthUser } from '../auth';
 import AccountApiKeyDialog from '../components/AccountApiKeyDialog';
 import { apiErrorMessage } from '../lib/apiErrorMessages';
@@ -16,6 +18,15 @@ type RuntimeSettingsUIConfigRead = UIConfigRead & {
 };
 
 type RuntimeSettingsTranslator = ReturnType<typeof createAppTranslator>['t'];
+type RuntimeTenantContext = NonNullable<ReturnType<typeof useTenantSession>>;
+
+/** Prevent an old tenant generation from publishing state or user-facing errors. */
+function isCurrentTenantGeneration(
+  context: RuntimeTenantContext | null,
+  generation: number,
+): context is RuntimeTenantContext {
+  return Boolean(context && !context.signal.aborted && context.isCurrentGeneration(generation));
+}
 
 /** Maps the backend's finite sandbox status vocabulary to localized product labels. */
 function sandboxStatusLabel(status: string, t: RuntimeSettingsTranslator): string {
@@ -149,6 +160,8 @@ function runtimeSettingsErrorMessage(
 /** Renders tenant runtime controls, including the Harness-only workspace setting and effective root. */
 export default function RuntimeSettingsPage({ currentUser }: { currentUser: EnterpriseAuthUser }) {
   const { t } = useAppIntl();
+  const tenantContext = useTenantSession();
+  const tenantApi = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
   const [form, setForm] = useState<UiConfigForm>(DEFAULT_UI_CONFIG);
   const [loading, setLoading] = useState(false);
   const [updatedAt, setUpdatedAt] = useState('');
@@ -163,8 +176,12 @@ export default function RuntimeSettingsPage({ currentUser }: { currentUser: Ente
   const update = (patch: Partial<UiConfigForm>) => setForm((prev) => ({ ...prev, ...patch }));
 
   useEffect(() => {
-    api.get<RuntimeSettingsUIConfigRead>(`/api/enterprise/ui-config?tenant_id=${TENANT_ID}`)
+    const context = tenantContext;
+    if (!context) return;
+    const generation = context.generation;
+    tenantApi.get<RuntimeSettingsUIConfigRead>('/api/enterprise/ui-config')
       .then((row) => {
+        if (!isCurrentTenantGeneration(context, generation)) return;
         setForm({
           show_thinking_trace: row.show_thinking_trace,
           show_skill_trace: row.show_skill_trace,
@@ -195,17 +212,27 @@ export default function RuntimeSettingsPage({ currentUser }: { currentUser: Ente
           sandbox_remediation_params: row.sandbox_remediation_params,
         });
       })
-      .catch(() => notify.error(t('runtimeSettings.error.uiLoad')));
-  }, [t]);
+      .catch(() => {
+        if (!isCurrentTenantGeneration(context, generation)) return;
+        notify.error(t('runtimeSettings.error.uiLoad'));
+      });
+  }, [t, tenantApi, tenantContext]);
 
   useEffect(() => {
-    api.get<NetworkSettingsRead>(`/api/enterprise/network-settings?tenant_id=${TENANT_ID}`)
+    const context = tenantContext;
+    if (!context) return;
+    const generation = context.generation;
+    tenantApi.get<NetworkSettingsRead>('/api/enterprise/network-settings')
       .then((row) => {
+        if (!isCurrentTenantGeneration(context, generation)) return;
         setNetworkSettings(row);
         setNetworkForm({ mode: row.mode, port: String(row.port), public_url: row.public_url || '' });
       })
-      .catch(() => notify.error(t('runtimeSettings.error.networkLoad')));
-  }, [t]);
+      .catch(() => {
+        if (!isCurrentTenantGeneration(context, generation)) return;
+        notify.error(t('runtimeSettings.error.networkLoad'));
+      });
+  }, [t, tenantApi, tenantContext]);
 
   async function save() {
     /** Saves runtime controls while preserving the compatible Harness workspace API field. */
@@ -221,10 +248,12 @@ export default function RuntimeSettingsPage({ currentUser }: { currentUser: Ente
       notify.error(contextError);
       return;
     }
+    const context = tenantContext;
+    if (!context) return;
+    const generation = context.generation;
     setLoading(true);
     try {
-      const row = await api.put<RuntimeSettingsUIConfigRead>('/api/enterprise/ui-config', {
-        tenant_id: TENANT_ID,
+      const row = await tenantApi.put<RuntimeSettingsUIConfigRead>('/api/enterprise/ui-config', {
         show_thinking_trace: form.show_thinking_trace,
         show_skill_trace: form.show_skill_trace,
         show_tool_trace: form.show_tool_trace,
@@ -243,6 +272,7 @@ export default function RuntimeSettingsPage({ currentUser }: { currentUser: Ente
         sandbox_network_mode: form.sandbox_network_mode,
         sandbox_allowed_domains: form.sandbox_allowed_domains.split(/[\n,]/).map((item) => item.trim()).filter(Boolean),
       });
+      if (!isCurrentTenantGeneration(context, generation)) return;
       setUpdatedAt(row.updated_at);
       setEffectiveStoragePath(row.effective_harness_storage_path || '');
       setSandboxSetup({ sandbox_setup_code: row.sandbox_setup_code, sandbox_setup_params: row.sandbox_setup_params });
@@ -257,14 +287,16 @@ export default function RuntimeSettingsPage({ currentUser }: { currentUser: Ente
         setRestarting(true);
         notify.success(t('runtimeSettings.toast.restartScheduled'));
         await waitForApplicationRestart();
+        if (!isCurrentTenantGeneration(context, generation)) return;
         window.location.reload();
         return;
       }
       notify.success(t('runtimeSettings.toast.saved'));
     } catch (error) {
+      if (!isCurrentTenantGeneration(context, generation)) return;
       notify.error(runtimeSettingsErrorMessage(error, 'runtimeSettings.toast.saveFailed'));
     } finally {
-      setLoading(false);
+      if (isCurrentTenantGeneration(context, generation)) setLoading(false);
     }
   }
 
@@ -274,14 +306,17 @@ export default function RuntimeSettingsPage({ currentUser }: { currentUser: Ente
       notify.error(validationError);
       return;
     }
+    const context = tenantContext;
+    if (!context) return;
+    const generation = context.generation;
     setNetworkLoading(true);
     try {
-      const row = await api.put<NetworkSettingsRead>('/api/enterprise/network-settings', {
-        tenant_id: TENANT_ID,
+      const row = await tenantApi.put<NetworkSettingsRead>('/api/enterprise/network-settings', {
         mode: networkForm.mode,
         port: Number(networkForm.port),
         public_url: networkForm.public_url.trim(),
       });
+      if (!isCurrentTenantGeneration(context, generation)) return;
       setNetworkSettings(row);
       setNetworkForm({ mode: row.mode, port: String(row.port), public_url: row.public_url || '' });
       notify.success(
@@ -290,9 +325,10 @@ export default function RuntimeSettingsPage({ currentUser }: { currentUser: Ente
           : t('runtimeSettings.toast.networkSaved'),
       );
     } catch (error) {
+      if (!isCurrentTenantGeneration(context, generation)) return;
       notify.error(runtimeSettingsErrorMessage(error, 'runtimeSettings.toast.networkSaveFailed'));
     } finally {
-      setNetworkLoading(false);
+      if (isCurrentTenantGeneration(context, generation)) setNetworkLoading(false);
     }
   }
 
@@ -464,7 +500,16 @@ export default function RuntimeSettingsPage({ currentUser }: { currentUser: Ente
           <UIButton variant="outline" onClick={() => setApiKeyOpen(true)}><KeyRound className="size-[15px]" />{t('runtimeSettings.actions.manageApiKeys')}</UIButton>
         </CardContent>
       </Card>
-      <AccountApiKeyDialog account={currentUser} open={apiKeyOpen} onClose={() => setApiKeyOpen(false)} />
+      <AccountApiKeyDialog
+        account={{
+          id: currentUser.id,
+          username: currentUser.username,
+          display_name: currentUser.display_name ?? undefined,
+          role: currentUser.role,
+        }}
+        open={apiKeyOpen}
+        onClose={() => setApiKeyOpen(false)}
+      />
     </>
   );
 }

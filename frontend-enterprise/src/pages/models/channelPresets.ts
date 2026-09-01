@@ -1,4 +1,4 @@
-import { api } from '@/api/client';
+import type { TenantClient } from '@/api/tenant-client';
 import type { MessageId } from '@/i18n/types';
 import type { ModelAuthMode, ModelConfigRead } from '@/types';
 
@@ -227,17 +227,18 @@ export type ListModelsResult = {
  * 按协议向渠道自身的接口拉取可用模型；网络/鉴权失败一律降级为
  * { success: false, models: [] }，调用方据此回退到手动输入，不抛出异常。
  */
-export async function fetchProviderModels(params: {
-  tenantId: string;
-  apiProtocol: ModelConfigRead['api_protocol'];
-  baseUrl?: string;
-  apiKey?: string;
-}): Promise<ListModelsResult> {
+export async function fetchProviderModels(
+  client: TenantClient,
+  params: {
+    apiProtocol: ModelConfigRead['api_protocol'];
+    baseUrl?: string;
+    apiKey?: string;
+  },
+): Promise<ListModelsResult> {
   try {
-    return await api.post<ListModelsResult>(
-      `/api/enterprise/model-configs/list-models?tenant_id=${encodeURIComponent(params.tenantId)}`,
+    return await client.post<ListModelsResult>(
+      '/api/enterprise/model-configs/list-models',
       {
-        tenant_id: params.tenantId,
         api_protocol: params.apiProtocol,
         base_url: params.baseUrl,
         api_key: params.apiKey,

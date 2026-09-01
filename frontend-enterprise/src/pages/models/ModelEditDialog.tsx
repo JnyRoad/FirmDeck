@@ -1,8 +1,9 @@
-import { useEffect, useState, type ReactNode } from 'react';
+import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { LoaderCircle, LogIn, LogOut } from 'lucide-react';
 
-import { api, ApiError } from '@/api/client';
-import { TENANT_ID } from '@/api/client';
+import { ApiError } from '@/api/client';
+import { createTenantClient } from '@/api/tenant-client';
+import { useTenantSession } from '@/contexts/TenantSessionContext';
 import { useAppIntl } from '@/i18n';
 import {
   Dialog,
@@ -51,6 +52,16 @@ type ModelForm = {
   enabled: boolean;
 };
 
+type ModelEditTenantContext = NonNullable<ReturnType<typeof useTenantSession>>;
+
+/** Prevent a stale tenant generation from publishing edit results or errors. */
+function isCurrentTenantGeneration(
+  context: ModelEditTenantContext | null,
+  generation: number,
+): context is ModelEditTenantContext {
+  return Boolean(context && !context.signal.aborted && context.isCurrentGeneration(generation));
+}
+
 const BLANK_FORM: ModelForm = {
   name: '',
   auth_mode: 'api_key',
@@ -92,12 +103,17 @@ export default function ModelEditDialog({
   onSaved,
 }: ModelEditDialogProps) {
   const { t } = useAppIntl();
+  const tenantContext = useTenantSession();
+  const tenantApi = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
   const [form, setForm] = useState<ModelForm>(BLANK_FORM);
   const [saving, setSaving] = useState(false);
   const [saveStage, setSaveStage] = useState<'saving' | 'testing' | null>(null);
 
   useEffect(() => {
-    if (!open || !selected) return;
+    if (!open || !selected) {
+      if (!open) setForm(BLANK_FORM);
+      return;
+    }
     setForm({
       name: selected.name,
       auth_mode: selected.auth_mode || 'api_key',
@@ -122,6 +138,10 @@ export default function ModelEditDialog({
 
   function closeDialog() {
     if (saving) return;
+    // This dialog stays mounted in the page. Clear credentials before handing
+    // control back to the parent so they cannot remain in hidden component
+    // state after a cancel, Escape, or outside-click close.
+    setForm(BLANK_FORM);
     onOpenChange(false);
   }
 
@@ -160,7 +180,6 @@ export default function ModelEditDialog({
       }
     }
     const payload = {
-      tenant_id: TENANT_ID,
       name,
       auth_mode: form.auth_mode,
       model,
@@ -175,19 +194,25 @@ export default function ModelEditDialog({
         api_key: form.api_key || undefined,
       }),
     };
+    const context = tenantContext;
+    if (!context) return;
+    const generation = context.generation;
     setSaving(true);
     setSaveStage(form.enabled ? 'testing' : 'saving');
     try {
       const verifyQuery = form.enabled ? '?verify_before_save=true' : '';
-      await api.put<ModelConfigRead>(`/api/enterprise/model-configs/${selected.id}${verifyQuery}`, payload);
+      await tenantApi.put<ModelConfigRead>(`/api/enterprise/model-configs/${selected.id}${verifyQuery}`, payload);
+      if (!isCurrentTenantGeneration(context, generation)) return;
       if (form.enabled) {
         notify.success(form.is_default ? t('modelSetup.toast.enabledDefault') : t('modelSetup.toast.enabled'));
       } else {
         notify.success(t('modelSetup.toast.saved'));
       }
+      setForm(BLANK_FORM);
       onOpenChange(false);
       onSaved();
     } catch (error) {
+      if (!isCurrentTenantGeneration(context, generation)) return;
       const providerError = error instanceof ApiError ? providerErrorFromApiError(error) : null;
       notify.error(
         providerError
@@ -195,8 +220,10 @@ export default function ModelEditDialog({
           : modelActionError(error, t('modelSetup.toast.saveFailed')),
       );
     } finally {
-      setSaving(false);
-      setSaveStage(null);
+      if (isCurrentTenantGeneration(context, generation)) {
+        setSaving(false);
+        setSaveStage(null);
+      }
     }
   }
 

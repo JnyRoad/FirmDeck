@@ -12,7 +12,7 @@
     "i18n:check:pseudo": "node scripts/i18n/generate-pseudo.cjs --check",
     "i18n:extract": "formatjs extract 'src/**/*.{ts,tsx}' --ignore='**/*.test.*' --out-file src/i18n/generated/extracted.json",
     "i18n:pseudo": "node scripts/i18n/generate-pseudo.cjs",
-    "config:check": "node scripts/check-vite-env.cjs",
+    "config:check": "node scripts/check-vite-env.cjs && node scripts/check-tenant-context.cjs",
     "test": "vitest run",
     "test:e2e:i18n": "playwright test tests/e2e/i18n-critical.spec.ts",
     "build": "tsc -b && vite build",

@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { Button, notify } from '@/components/ui';
 import StaffdeckIcon from '@/components/StaffdeckIcon';
-import { api, TENANT_ID } from '@/api/client';
+import { createTenantClient } from '@/api/tenant-client';
+import { useTenantSession } from '@/contexts/TenantSessionContext';
 import { RawContent, RawIdentifier } from '@/i18n/RawContent';
 import type { AppTranslator } from '@/i18n/imperative';
 import { useAppIntl } from '@/i18n/useAppIntl';
@@ -99,27 +100,77 @@ function evolutionResourceTypeLabel(
 
 export default function EvolutionPanel({ agentId }: { agentId: string }) {
   const { t } = useAppIntl();
+  const tenantContext = useTenantSession();
+  const tenantClient = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
+  const tenantId = tenantContext?.tenantId || '';
+  const userId = tenantContext?.userId || '';
+  const loadControllerRef = useRef<AbortController | null>(null);
+  const agentIdRef = useRef(agentId);
+  const lastAgentIdRef = useRef(agentId);
+  const scopeRevisionRef = useRef(0);
+  const actionControllersRef = useRef(new Set<AbortController>());
   const [rows, setRows] = useState<EvolutionProposal[]>([]);
   const [instruction, setInstruction] = useState('');
   const [loading, setLoading] = useState(true);
   const [busyAction, setBusyAction] = useState('');
 
+  // Keep the latest prop visible to an in-flight callback before passive effects run.
+  agentIdRef.current = agentId;
+
+  /** Abort action requests when employee scope, tenant generation, or component lifecycle changes. */
+  function cancelActionControllers() {
+    actionControllersRef.current.forEach((controller) => controller.abort());
+    actionControllersRef.current.clear();
+  }
+
+  useEffect(() => {
+    if (lastAgentIdRef.current === agentId) return;
+    lastAgentIdRef.current = agentId;
+    scopeRevisionRef.current += 1;
+    cancelActionControllers();
+    setRows([]);
+    setBusyAction('');
+  }, [agentId]);
+
+  useEffect(() => () => cancelActionControllers(), [tenantContext?.generation]);
+
   const load = useCallback(async () => {
+    if (!tenantContext || !tenantId || !userId) return;
+    loadControllerRef.current?.abort();
+    const requestController = new AbortController();
+    loadControllerRef.current = requestController;
+    const generation = tenantContext.generation;
+    const capturedAgentId = agentId;
+    const capturedScopeRevision = scopeRevisionRef.current;
+    const isCurrent = () => (
+      !requestController.signal.aborted
+      && tenantContext.isCurrentGeneration(generation)
+      && agentIdRef.current === capturedAgentId
+      && scopeRevisionRef.current === capturedScopeRevision
+    );
     setLoading(true);
     try {
-      const result = await api.get<EvolutionProposal[]>(
-        `/api/enterprise/agents/${encodeURIComponent(agentId)}/evolution/proposals?tenant_id=${encodeURIComponent(TENANT_ID)}`,
+      const result = await tenantClient.get<EvolutionProposal[]>(
+        `/api/enterprise/agents/${encodeURIComponent(agentId)}/evolution/proposals`,
+        { signal: requestController.signal },
       );
+      if (!isCurrent()) return;
       setRows(result);
     } catch (error) {
-      notify.error(evolutionErrorMessage(error, EVOLUTION_ACTION_ERROR_IDS.load, t));
+      if (isCurrent()) notify.error(evolutionErrorMessage(error, EVOLUTION_ACTION_ERROR_IDS.load, t));
     } finally {
-      setLoading(false);
+      if (loadControllerRef.current === requestController) {
+        loadControllerRef.current = null;
+        if (isCurrent()) setLoading(false);
+      }
     }
-  }, [agentId, t]);
+  }, [agentId, t, tenantClient, tenantContext, tenantId, userId]);
 
   useEffect(() => {
     void load();
+    return () => {
+      loadControllerRef.current?.abort();
+    };
   }, [load]);
 
   const activeCount = useMemo(
@@ -129,37 +180,72 @@ export default function EvolutionPanel({ agentId }: { agentId: string }) {
 
   /** 从真实反馈生成候选，并在成功后刷新列表。 */
   async function analyze() {
+    if (!tenantContext || !tenantId || !userId) return;
+    const requestController = new AbortController();
+    actionControllersRef.current.add(requestController);
+    const generation = tenantContext.generation;
+    const capturedAgentId = agentId;
+    const capturedScopeRevision = scopeRevisionRef.current;
+    const isCurrent = () => (
+      !requestController.signal.aborted
+      && tenantContext.isCurrentGeneration(generation)
+      && agentIdRef.current === capturedAgentId
+      && scopeRevisionRef.current === capturedScopeRevision
+    );
     setBusyAction('analyze');
     try {
-      await api.post(
+      await tenantClient.post(
         `/api/enterprise/agents/${encodeURIComponent(agentId)}/evolution:analyze`,
-        { tenant_id: TENANT_ID, instruction: instruction.trim() || undefined },
+        { instruction: instruction.trim() || undefined },
+        { signal: requestController.signal },
       );
+      if (!isCurrent()) return;
       setInstruction('');
       notify.success(t(EVOLUTION_ACTION_SUCCESS_IDS.analyze));
+      if (!isCurrent()) return;
       await load();
     } catch (error) {
-      notify.error(evolutionErrorMessage(error, EVOLUTION_ACTION_ERROR_IDS.analyze, t));
+      if (isCurrent()) notify.error(evolutionErrorMessage(error, EVOLUTION_ACTION_ERROR_IDS.analyze, t));
     } finally {
-      setBusyAction('');
+      if (isCurrent()) setBusyAction('');
+      actionControllersRef.current.delete(requestController);
     }
   }
 
   /** 对候选执行审核动作；拒绝原因使用稳定英文诊断值，不进入本地化目录。 */
   async function act(proposal: EvolutionProposal, action: 'evaluate' | 'approve' | 'reject' | 'rollback') {
+    if (!tenantContext || !tenantId || !userId) return;
+    const requestController = new AbortController();
+    actionControllersRef.current.add(requestController);
+    const generation = tenantContext.generation;
+    const capturedAgentId = agentId;
+    const capturedScopeRevision = scopeRevisionRef.current;
+    const isCurrent = () => (
+      !requestController.signal.aborted
+      && tenantContext.isCurrentGeneration(generation)
+      && agentIdRef.current === capturedAgentId
+      && scopeRevisionRef.current === capturedScopeRevision
+    );
     const key = `${proposal.id}:${action}`;
     setBusyAction(key);
     try {
       const body = action === 'reject'
-        ? { tenant_id: TENANT_ID, reason: REJECT_REASON }
-        : { tenant_id: TENANT_ID };
-      await api.post(`/api/enterprise/evolution/proposals/${encodeURIComponent(proposal.id)}:${action}`, body);
+        ? { reason: REJECT_REASON }
+        : {};
+      await tenantClient.post(
+        `/api/enterprise/evolution/proposals/${encodeURIComponent(proposal.id)}:${action}`,
+        body,
+        { signal: requestController.signal },
+      );
+      if (!isCurrent()) return;
       notify.success(t(EVOLUTION_ACTION_SUCCESS_IDS[action]));
+      if (!isCurrent()) return;
       await load();
     } catch (error) {
-      notify.error(evolutionErrorMessage(error, EVOLUTION_ACTION_ERROR_IDS[action], t));
+      if (isCurrent()) notify.error(evolutionErrorMessage(error, EVOLUTION_ACTION_ERROR_IDS[action], t));
     } finally {
-      setBusyAction('');
+      if (isCurrent()) setBusyAction('');
+      actionControllersRef.current.delete(requestController);
     }
   }
 

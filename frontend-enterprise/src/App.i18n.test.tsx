@@ -5,17 +5,32 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { AppIntlProvider } from '@/i18n/provider';
 import type { AppLocale } from '@/i18n/locales';
+import type { EnterpriseAuthSession } from './auth';
 
 import App from './App';
 
 const AUTH_STORAGE_KEY = 'ultrarag_auth';
 
-const authUser = {
-  id: 'user-i18n',
-  tenant_id: 'tenant_demo',
-  username: 'admin',
-  role: 'admin',
+const authSession: EnterpriseAuthSession = {
+  token: 'token-i18n',
+  scope: 'tenant',
+  tenant: {
+    id: 'tenant_demo',
+    slug: 'demo',
+    display_name: 'Demo tenant',
+  },
+  user: {
+    id: 'user-i18n',
+    tenant_id: 'tenant_demo',
+    username: 'admin',
+    display_name: 'Demo admin',
+    role: 'admin',
+    must_change_password: false,
+    avatar_url: null,
+  },
 };
+
+const authUser = authSession.user;
 
 const shellCopy = {
   'zh-CN': {
@@ -42,6 +57,7 @@ function jsonResponse(body: unknown): Response {
     ok: true,
     status: 200,
     statusText: 'OK',
+    json: async () => body,
     text: async () => JSON.stringify(body),
   } as Response;
 }
@@ -93,10 +109,7 @@ function renderSemanticApp(locale: AppLocale) {
 beforeEach(() => {
   stubBrowserApis();
   stubShellFetch();
-  window.localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify({
-    token: 'token-i18n',
-    user: authUser,
-  }));
+  window.localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify(authSession));
   window.localStorage.setItem('staffdeck_onboarding_guide_seen', '1');
   window.localStorage.setItem('staffdeck_quick_start_guide_seen', '1');
   window.history.pushState({}, '', '/enterprise/agents');

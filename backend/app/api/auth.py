@@ -6,6 +6,8 @@ from datetime import datetime
 from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, File, Query, Request, Response, UploadFile
+from fastapi.exceptions import RequestValidationError
+from fastapi.routing import APIRoute
 from pydantic import BaseModel, Field
 from sqlmodel import Session, select
 
@@ -15,6 +17,7 @@ from app.db.models import (
     APIClient,
     APICredential,
     MCPUserOAuthGrant,
+    Tenant,
     User,
     UserAvatar,
     utc_now,
@@ -25,20 +28,52 @@ from app.security.auth import (
     create_access_token,
     ensure_current_user_tenant,
     get_current_user,
+    get_current_user_allowing_temporary,
     hash_password,
     verify_password,
 )
 from app.security.encryption import decrypt_recoverable_api_key, encrypt_secret
+from app.security.password_policy import effective_tenant_policy, validate_password
 from app.security.permissions import MEMBER_ROLE, is_admin_user
-from app.security.tenant import ensure_tenant
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api/auth", tags=["auth"])
+# A fixed, non-secret PBKDF2 value keeps credential-check work comparable when no user row exists.
+DUMMY_PASSWORD_HASH = (
+    "pbkdf2_sha256$00000000000000000000000000000000$"
+    "qQSQb7mRF8mlPkgVpTiT9eSZvfEdUy21R-C5O8gvdpU="
+)
+
+class _SafeAuthRoute(APIRoute):
+    """Keep malformed authentication payloads from echoing passwords or other inputs."""
+
+    def get_route_handler(self):
+        """Wrap auth request validation with a registered, input-free error projection."""
+        route_handler = super().get_route_handler()
+
+        async def safe_route_handler(request: Request):
+            """Translate only auth payload validation failures into safe public errors."""
+            try:
+                return await route_handler(request)
+            except RequestValidationError:
+                if request.url.path.endswith(("/login", "/change-password")):
+                    raise build_http_exception("AUTH_LOGIN_FIELDS_REQUIRED") from None
+                raise
+
+        return safe_route_handler
+
+
+router = APIRouter(
+    prefix="/api/auth",
+    tags=["auth"],
+    route_class=_SafeAuthRoute,
+)
 
 
 class LoginRequest(BaseModel):
-    tenant_id: str
+    tenant_slug: str | None = None
+    # Deprecated exact-ID compatibility for callers that have not yet migrated to slugs.
+    tenant_id: str | None = None
     username: str
     password: str
 
@@ -71,6 +106,7 @@ class UserRead(BaseModel):
     username: str
     display_name: Optional[str] = None
     role: Literal["admin", "member"]
+    must_change_password: bool = False
     source: str = "web"
     # 仅 /me 与 /login 带出:头像资源指针(存在性标识),不内联二进制——
     # 完整 data_url 可达 2.67MB,内联会把登录/会话刷新响应与前端 localStorage 撑爆
@@ -81,13 +117,42 @@ class UserRead(BaseModel):
     channel_identities: Optional[list[UserChannelIdentity]] = None
 
 
+class TenantUserRead(BaseModel):
+    """Expose the minimal authenticated tenant identity returned by ``/me``."""
+
+    id: str
+    tenant_id: str
+    username: str
+    display_name: str | None = None
+    role: Literal["admin", "member"]
+    must_change_password: bool = False
+    avatar_url: str | None = None
+
+
+class TenantRead(BaseModel):
+    """Expose only the stable tenant identity bound to a tenant session."""
+
+    id: str
+    slug: str
+    display_name: str
+
+
 class AvatarRead(BaseModel):
     avatar_url: str
 
 
 class LoginResponse(BaseModel):
     token: str
+    scope: Literal["tenant"] = "tenant"
+    tenant: TenantRead
     user: UserRead
+
+
+class ChangePasswordRequest(BaseModel):
+    """Carry opaque current and replacement password bytes to the recovery endpoint."""
+
+    current_password: str
+    new_password: str
 
 
 class AccountAPICredentialCreateRequest(BaseModel):
@@ -123,35 +188,74 @@ ACCOUNT_API_CLIENT_PREFIX = "StaffDeck 账号全量 API"
 
 @router.post("/login", response_model=LoginResponse)
 def login(request: LoginRequest, db: Session = Depends(get_session)) -> LoginResponse:
-    """Authenticate one tenant account and return a safe login response."""
-    ensure_tenant(db, request.tenant_id)
+    """Authenticate one tenant account and return a session bound to its server-resolved tenant."""
     username = request.username.strip()
     if not username or not request.password:
         raise build_http_exception("AUTH_LOGIN_FIELDS_REQUIRED")
+    tenant = _resolve_login_tenant(db, request)
 
     user = db.exec(
-        select(User).where(User.tenant_id == request.tenant_id, User.username == username)
+        select(User).where(User.tenant_id == tenant.id, User.username == username)
     ).first()
     if not user:
         display_name_matches = db.exec(
             select(User)
-            .where(User.tenant_id == request.tenant_id, User.display_name == username)
+            .where(User.tenant_id == tenant.id, User.display_name == username)
             .limit(2)
         ).all()
         if len(display_name_matches) == 1:
             user = display_name_matches[0]
-    if not user or not verify_password(request.password, user.password_hash):
+    if not user:
+        _verify_dummy_password(request.password)
+        raise build_http_exception("AUTH_INVALID_CREDENTIALS")
+    if user.tenant_id != tenant.id or not verify_password(request.password, user.password_hash):
         raise build_http_exception("AUTH_INVALID_CREDENTIALS")
 
-    return LoginResponse(
-        token=create_access_token(user),
-        user=_user_read(user, _avatar_pointer_for(db, user.id)),
-    )
+    return _login_response(db, tenant, user)
 
 
-@router.get("/me", response_model=UserRead)
-def me(user: User = Depends(get_current_user), db: Session = Depends(get_session)) -> UserRead:
-    return _user_read(user, _avatar_pointer_for(db, user.id))
+@router.get("/me", response_model=TenantUserRead)
+def me(
+    user: User = Depends(get_current_user_allowing_temporary),
+    db: Session = Depends(get_session),
+) -> TenantUserRead:
+    """Return the authenticated tenant user without exposing the login envelope."""
+    return _tenant_user_read(user, _avatar_pointer_for(db, user.id))
+
+
+@router.post("/change-password", response_model=LoginResponse)
+def change_password(
+    request: ChangePasswordRequest,
+    current_user: User = Depends(get_current_user_allowing_temporary),  # noqa: B008
+    db: Session = Depends(get_session),  # noqa: B008
+) -> LoginResponse:
+    """Replace a tenant password atomically and return a token for the new auth version."""
+    if not request.current_password or not request.new_password:
+        raise build_http_exception("AUTH_LOGIN_FIELDS_REQUIRED")
+    if not validate_password(request.new_password, effective_tenant_policy(db, current_user.tenant_id)):
+        raise build_http_exception("AUTH_LOGIN_FIELDS_REQUIRED")
+    if not verify_password(request.current_password, current_user.password_hash):
+        raise build_http_exception("AUTH_INVALID_CREDENTIALS", status_code=400)
+
+    tenant = db.get(Tenant, current_user.tenant_id)
+    if tenant is None or tenant.status != "active":
+        # The dependency normally establishes this invariant; keep the mutation boundary closed
+        # if a caller supplies a detached or concurrently invalidated principal.
+        if tenant is not None and tenant.status == "suspended":
+            raise build_http_exception("TENANT_SUSPENDED")
+        raise build_http_exception("AUTH_INVALID_USER_TOKEN")
+
+    # Mutate every credential-relevant field in one transaction so a replacement token can only
+    # be issued after the durable password and version are committed together.
+    current_user.password_hash = hash_password(request.new_password)
+    current_user.must_change_password = False
+    current_user.password_changed_at = utc_now()
+    current_user.auth_version += 1
+    current_user.updated_at = utc_now()
+    db.add(current_user)
+    db.commit()
+    db.refresh(current_user)
+    return _login_response(db, tenant, current_user)
 
 
 MAX_AVATAR_BYTES = 2 * 1024 * 1024
@@ -257,7 +361,11 @@ def create_user(
     if request.tenant_id != current_user.tenant_id:
         raise build_http_exception("TENANT_MISMATCH")
     username = request.username.strip()
-    if not username or not request.password:
+    if (
+        not username
+        or not request.password
+        or not validate_password(request.password, effective_tenant_policy(db, request.tenant_id))
+    ):
         raise build_http_exception("AUTH_LOGIN_FIELDS_REQUIRED")
     existing = db.exec(
         select(User).where(User.tenant_id == request.tenant_id, User.username == username)
@@ -496,16 +604,24 @@ def update_user(
     user = db.get(User, user_id)
     if not user or user.tenant_id != request.tenant_id:
         raise build_http_exception("AUTH_ACCOUNT_NOT_FOUND")
+    if request.role is not None and request.role != user.role and user.id == current_user.id:
+        raise build_http_exception("AUTH_SELF_ROLE_CHANGE_FORBIDDEN")
+    password_hash: str | None = None
+    if request.password is not None:
+        if not validate_password(
+            request.password,
+            effective_tenant_policy(db, request.tenant_id),
+        ):
+            raise build_http_exception("AUTH_LOGIN_FIELDS_REQUIRED")
+        password_hash = hash_password(request.password)
     if request.display_name is not None:
         display_name = request.display_name.strip()[:80]
         user.display_name = display_name or user.username
-    if request.password is not None:
-        password = request.password.strip()
-        if password:
-            user.password_hash = hash_password(password)
+    if password_hash is not None:
+        user.password_hash = password_hash
+        user.auth_version += 1
+        user.password_changed_at = utc_now()
     if request.role is not None and request.role != user.role:
-        if user.id == current_user.id:
-            raise build_http_exception("AUTH_SELF_ROLE_CHANGE_FORBIDDEN")
         user.role = request.role
     user.updated_at = utc_now()
     db.add(user)
@@ -545,6 +661,49 @@ def delete_user(
     return {"ok": True}
 
 
+def _resolve_login_tenant(db: Session, request: LoginRequest) -> Tenant:
+    """Resolve the requested tenant by slug, with an exact-ID-only migration fallback."""
+    if request.tenant_slug is None and request.tenant_id is None:
+        raise build_http_exception("AUTH_LOGIN_FIELDS_REQUIRED")
+
+    tenant: Tenant | None = None
+    if request.tenant_slug is not None:
+        tenant_slug = request.tenant_slug.strip()
+        if tenant_slug:
+            tenant = db.exec(select(Tenant).where(Tenant.slug == tenant_slug)).first()
+        if tenant is None or (
+            request.tenant_id is not None and tenant.id != request.tenant_id
+        ):
+            _verify_dummy_password(request.password)
+            raise build_http_exception("AUTH_INVALID_CREDENTIALS")
+    elif request.tenant_id is not None:
+        # The old ID path deliberately does not normalize or search by partial identity.
+        tenant = db.get(Tenant, request.tenant_id)
+        if tenant is None:
+            _verify_dummy_password(request.password)
+            raise build_http_exception("AUTH_INVALID_CREDENTIALS")
+
+    if tenant is None or tenant.status != "active":
+        _verify_dummy_password(request.password)
+        raise build_http_exception("AUTH_INVALID_CREDENTIALS")
+    return tenant
+
+
+def _login_response(db: Session, tenant: Tenant, user: User) -> LoginResponse:
+    """Build the bound tenant session only after tenant and user ownership are established."""
+    return LoginResponse(
+        token=create_access_token(user),
+        scope="tenant",
+        tenant=TenantRead(id=tenant.id, slug=tenant.slug, display_name=tenant.name),
+        user=_user_read(user, _avatar_pointer_for(db, user.id)),
+    )
+
+
+def _verify_dummy_password(password: str) -> None:
+    """Spend the same password-hash verification work when tenant or user lookup fails."""
+    verify_password(password, DUMMY_PASSWORD_HASH)
+
+
 def _user_read(
     user: User,
     avatar_url: Optional[str] = None,
@@ -556,11 +715,25 @@ def _user_read(
         username=user.username,
         display_name=user.display_name,
         role=user.role,
+        must_change_password=user.must_change_password,
         source=user.source,
         avatar_url=avatar_url,
         created_at=user.created_at.isoformat() if user.created_at else None,
         updated_at=user.updated_at.isoformat() if user.updated_at else None,
         channel_identities=channel_identities,
+    )
+
+
+def _tenant_user_read(user: User, avatar_url: str | None = None) -> TenantUserRead:
+    """Project only fields permitted in the authenticated ``/me`` response."""
+    return TenantUserRead(
+        id=user.id,
+        tenant_id=user.tenant_id,
+        username=user.username,
+        display_name=user.display_name,
+        role=user.role,
+        must_change_password=user.must_change_password,
+        avatar_url=avatar_url,
     )
 
 

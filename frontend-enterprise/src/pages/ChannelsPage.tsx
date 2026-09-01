@@ -23,7 +23,8 @@ import {
 } from '@/components/ui';
 import { Button as UIButton } from '@/components/ui/button';
 
-import { api, TENANT_ID } from '../api/client';
+import { createTenantClient } from '../api/tenant-client';
+import { useTenantSession } from '../contexts/TenantSessionContext';
 
 import { createMessageDescriptor, type MessageDescriptor } from '@/i18n/descriptors';
 import { RawContent, RawIdentifier } from '@/i18n/RawContent';
@@ -165,6 +166,23 @@ const ROLE_LABEL_IDS: Record<string, MessageId> = {
 const BINDING_NAME_MAX_LENGTH = 50;
 
 type Translate = (id: MessageId, values?: MessageValues) => string;
+type ChannelsTenantContext = NonNullable<ReturnType<typeof useTenantSession>>;
+type BindingRequestKind = 'deliveries' | 'conversations' | 'messages';
+type BindingRequestFence = {
+  kind: BindingRequestKind;
+  snapshot: string;
+  revision: number;
+  context: ChannelsTenantContext;
+  generation: number;
+};
+
+/** Prevent a stale tenant generation from publishing channel state or errors. */
+function isCurrentTenantGeneration(
+  context: ChannelsTenantContext | null,
+  generation: number,
+): context is ChannelsTenantContext {
+  return Boolean(context && !context.signal.aborted && context.isCurrentGeneration(generation));
+}
 
 /** 将稳定后端错误投影为当前渠道页面可展示的 descriptor，拒绝 raw detail 透传。 */
 function errorDescriptor(error: unknown, fallbackId: MessageId): MessageDescriptor {
@@ -293,29 +311,34 @@ function ChannelAttachmentView({
   messageId: string;
 }) {
   const { t } = useAppIntl();
+  const tenantContext = useTenantSession();
+  const tenantApi = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
   const [url, setUrl] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
-  const path = `/api/enterprise/channels/${bindingId}/conversations/${sessionId}/messages/${messageId}/attachments/${attachment.id}?tenant_id=${TENANT_ID}`;
+  const path = `/api/enterprise/channels/${bindingId}/conversations/${sessionId}/messages/${messageId}/attachments/${attachment.id}`;
 
   useEffect(() => {
     if (attachment.kind !== 'image') return;
     let disposed = false;
     let objectUrl: string | null = null;
+    const context = tenantContext;
+    if (!context) return undefined;
+    const generation = context.generation;
     setLoading(true);
-    void api.blob(path).then((blob) => {
+    void tenantApi.blob(path).then((blob) => {
       objectUrl = URL.createObjectURL(blob);
-      if (!disposed) setUrl(objectUrl);
+      if (!disposed && isCurrentTenantGeneration(context, generation)) setUrl(objectUrl);
       else URL.revokeObjectURL(objectUrl);
     }).catch(() => {
-      if (!disposed) setUrl(null);
+      if (!disposed && isCurrentTenantGeneration(context, generation)) setUrl(null);
     }).finally(() => {
-      if (!disposed) setLoading(false);
+      if (!disposed && isCurrentTenantGeneration(context, generation)) setLoading(false);
     });
     return () => {
       disposed = true;
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  }, [attachment.id, attachment.kind, path]);
+  }, [attachment.id, attachment.kind, path, tenantApi, tenantContext]);
 
   if (attachment.kind === 'image') {
     return url ? (
@@ -326,17 +349,25 @@ function ChannelAttachmentView({
     <button
       type="button"
       className="text-left text-[12px] text-[#3b63c8] underline"
-      onClick={() => void api.blob(path).then((blob) => {
-        const objectUrl = URL.createObjectURL(blob);
-        const link = document.createElement('a');
-        link.href = objectUrl;
-        link.download = attachment.filename;
-        link.style.display = 'none';
-        document.body.appendChild(link);
-        link.click();
-        link.remove();
-        window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1_000);
-      })}
+      onClick={() => {
+        const context = tenantContext;
+        if (!context) return;
+        const generation = context.generation;
+        void tenantApi.blob(path).then((blob) => {
+          if (!isCurrentTenantGeneration(context, generation)) return;
+          const objectUrl = URL.createObjectURL(blob);
+          const link = document.createElement('a');
+          link.href = objectUrl;
+          link.download = attachment.filename;
+          link.style.display = 'none';
+          document.body.appendChild(link);
+          link.click();
+          link.remove();
+          window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1_000);
+        }).catch(() => {
+          // Attachment downloads are best-effort; tenant aborts are silent.
+        });
+      }}
     >
       <RawIdentifier value={attachment.filename} />
     </button>
@@ -398,6 +429,8 @@ export default function ChannelsPage({
   onLogout?: () => void;
 } = {}) {
   const { locale, t } = useAppIntl();
+  const tenantContext = useTenantSession();
+  const tenantApi = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
   const toast = useMemo(() => createToastNotifier({ t }), [t]);
   const formatters = useMemo(() => createFormatters(locale), [locale]);
   const noValue = t('channels.placeholder.none');
@@ -492,22 +525,48 @@ export default function ChannelsPage({
     ? channelName(binding.channel)
     : localizedChannelPresentation(createChannel, metaFor(createChannel)?.name, t).name;
   const selectedIdRef = useRef('');
+  const bindingRequestRevisionRef = useRef<Record<BindingRequestKind, number>>({
+    deliveries: 0,
+    conversations: 0,
+    messages: 0,
+  });
 
   useEffect(() => {
     selectedIdRef.current = selectedId;
+    (Object.keys(bindingRequestRevisionRef.current) as BindingRequestKind[]).forEach((kind) => {
+      bindingRequestRevisionRef.current[kind] += 1;
+    });
   }, [selectedId]);
 
-  function ifStale(snapshot: string): boolean {
-    return snapshot !== selectedIdRef.current;
+  function beginBindingRequest(
+    kind: BindingRequestKind,
+    snapshot: string,
+  ): BindingRequestFence | null {
+    const context = tenantContext;
+    if (!context) return null;
+    const revision = bindingRequestRevisionRef.current[kind] + 1;
+    bindingRequestRevisionRef.current[kind] = revision;
+    return { kind, snapshot, revision, context, generation: context.generation };
+  }
+
+  function isCurrentBindingRequest(request: BindingRequestFence): boolean {
+    return request.revision === bindingRequestRevisionRef.current[request.kind]
+      && request.snapshot === selectedIdRef.current
+      && isCurrentTenantGeneration(request.context, request.generation);
   }
 
   async function loadTenantUsers() {
+    const context = tenantContext;
+    if (!context) return;
+    const generation = context.generation;
     try {
-      const rows = await api.get<Array<{ id: string; username: string; display_name?: string; source?: string; channel_identities?: Array<{ channel: string; display_name?: string; external_user_id?: string; external_account_scope?: string }> }>>(
-        `/api/auth/users?tenant_id=${TENANT_ID}&include_channel=true`,
+      const rows = await tenantApi.get<Array<{ id: string; username: string; display_name?: string; source?: string; channel_identities?: Array<{ channel: string; display_name?: string; external_user_id?: string; external_account_scope?: string }> }>>(
+        '/api/auth/users?include_channel=true',
       );
+      if (!isCurrentTenantGeneration(context, generation)) return;
       setTenantUsers(rows);
     } catch {
+      if (!isCurrentTenantGeneration(context, generation)) return;
       setTenantUsers([]);
     }
   }
@@ -532,9 +591,14 @@ export default function ChannelsPage({
     void loadChannelMetas();
     void loadTeams();
     void loadTenantUsers();
-  }, []);
+  }, [tenantContext?.generation]);
 
   useEffect(() => {
+    // Invalidate every request tied to the previous binding before starting
+    // the next pair of detail requests.
+    (Object.keys(bindingRequestRevisionRef.current) as BindingRequestKind[]).forEach((kind) => {
+      bindingRequestRevisionRef.current[kind] += 1;
+    });
     setAgentEditing(false);
     setDeliveryDays([]);
     setDeliveryTotalDays(0);
@@ -551,60 +615,80 @@ export default function ChannelsPage({
 
   /** 加载渠道绑定列表；失败时只展示稳定错误契约映射，不读取异常文本。 */
   async function load() {
+    const context = tenantContext;
+    if (!context) return;
+    const generation = context.generation;
     setLoading(true);
     try {
-      const rows = await api.get<ChannelBindingRead[]>(
-        `/api/enterprise/channels?tenant_id=${TENANT_ID}`,
+      const rows = await tenantApi.get<ChannelBindingRead[]>(
+        '/api/enterprise/channels',
       );
+      if (!isCurrentTenantGeneration(context, generation)) return;
       setBindings(rows);
     } catch (error) {
+      if (!isCurrentTenantGeneration(context, generation)) return;
       toast.error(errorDescriptor(error, 'channels.error.loadBindings'));
     } finally {
-      setLoading(false);
+      if (isCurrentTenantGeneration(context, generation)) setLoading(false);
     }
   }
 
   /** 加载当前租户的渠道身份绑定；原始外部身份数据只进入业务状态。 */
   async function loadIdentityBindings() {
+    const context = tenantContext;
+    if (!context) return;
+    const generation = context.generation;
     try {
-      const rows = await api.get<ChannelIdentityBindingRead[]>(
-        `/api/enterprise/channels/my-identity-bindings?tenant_id=${TENANT_ID}`,
+      const rows = await tenantApi.get<ChannelIdentityBindingRead[]>(
+        '/api/enterprise/channels/my-identity-bindings',
       );
+      if (!isCurrentTenantGeneration(context, generation)) return;
       setIdentityBindings(rows);
     } catch {
+      if (!isCurrentTenantGeneration(context, generation)) return;
       setIdentityBindings([]);
     }
   }
 
   /** 加载渠道能力元数据；provider 字段保持 raw，产品文案在渲染时本地化。 */
   async function loadChannelMetas() {
+    const context = tenantContext;
+    if (!context) return;
+    const generation = context.generation;
     try {
-      const rows = await api.get<ChannelMetaRead[]>(
-        `/api/enterprise/channels/meta?tenant_id=${TENANT_ID}`,
+      const rows = await tenantApi.get<ChannelMetaRead[]>(
+        '/api/enterprise/channels/meta',
       );
+      if (!isCurrentTenantGeneration(context, generation)) return;
       setChannelMetas(rows);
     } catch {
+      if (!isCurrentTenantGeneration(context, generation)) return;
       setChannelMetas([]);
     } finally {
-      setMetasLoaded(true);
+      if (isCurrentTenantGeneration(context, generation)) setMetasLoaded(true);
     }
   }
 
   /** 解除身份绑定并刷新快照，错误通过后端 code/params 安全投影。 */
   async function confirmUnbindIdentity() {
     if (!unbindIdentityTarget) return;
+    const context = tenantContext;
+    if (!context) return;
+    const generation = context.generation;
     setUnbindingIdentity(true);
     try {
-      await api.delete(
-        `/api/enterprise/channels/my-identity-bindings/${unbindIdentityTarget.channel}?tenant_id=${TENANT_ID}&external_user_id=${encodeURIComponent(unbindIdentityTarget.external_user_id)}&external_account_scope=${encodeURIComponent(unbindIdentityTarget.external_account_scope || '')}`,
+      await tenantApi.delete(
+        `/api/enterprise/channels/my-identity-bindings/${unbindIdentityTarget.channel}?external_user_id=${encodeURIComponent(unbindIdentityTarget.external_user_id)}&external_account_scope=${encodeURIComponent(unbindIdentityTarget.external_account_scope || '')}`,
       );
+      if (!isCurrentTenantGeneration(context, generation)) return;
       toast.success(createMessageDescriptor('channels.identity.unbound'));
       setUnbindIdentityTarget(null);
       await loadIdentityBindings();
     } catch (error) {
+      if (!isCurrentTenantGeneration(context, generation)) return;
       toast.error(errorDescriptor(error, 'channels.identity.unbindFailed'));
     } finally {
-      setUnbindingIdentity(false);
+      if (isCurrentTenantGeneration(context, generation)) setUnbindingIdentity(false);
     }
   }
 
@@ -625,22 +709,24 @@ export default function ChannelsPage({
   /** 加载投递日志并按当前选中渠道丢弃过期请求，错误只展示稳定产品文案。 */
   async function loadDeliveries(bindingId: string, offset = 0) {
     const snapshot = selectedId;
+    const request = beginBindingRequest('deliveries', snapshot);
+    if (!request) return;
     setDeliveriesLoading(true);
     try {
-      const page = await api.get<ChannelDeliveryDayPage>(
-        `/api/enterprise/channels/${bindingId}/deliveries/days?tenant_id=${TENANT_ID}&offset=${offset}&limit=7`,
+      const page = await tenantApi.get<ChannelDeliveryDayPage>(
+        `/api/enterprise/channels/${bindingId}/deliveries/days?offset=${offset}&limit=7`,
       );
-      if (ifStale(snapshot)) return;
+      if (!isCurrentBindingRequest(request)) return;
       setDeliveryDays((current) => (offset === 0 ? page.days : [...current, ...page.days]));
       setDeliveryTotalDays(page.total_days);
       if (offset === 0 && page.days.length > 0) {
         setExpandedDays(new Set([page.days[0].date]));
       }
     } catch (error) {
-      if (ifStale(snapshot)) return;
+      if (!isCurrentBindingRequest(request)) return;
       toast.error(errorDescriptor(error, 'channels.error.loadDeliveries'));
     } finally {
-      setDeliveriesLoading(false);
+      if (isCurrentBindingRequest(request)) setDeliveriesLoading(false);
     }
   }
 
@@ -660,19 +746,21 @@ export default function ChannelsPage({
   /** 加载渠道会话列表并保持当前 binding 快照，错误通过稳定契约本地化。 */
   async function loadConversations(bindingId: string, offset = 0) {
     const snapshot = selectedId;
+    const request = beginBindingRequest('conversations', snapshot);
+    if (!request) return;
     setConversationsLoading(true);
     try {
-      const page = await api.get<PagedResponse<ChannelConversationRead>>(
-        `/api/enterprise/channels/${bindingId}/conversations?tenant_id=${TENANT_ID}&offset=${offset}&limit=20`,
+      const page = await tenantApi.get<PagedResponse<ChannelConversationRead>>(
+        `/api/enterprise/channels/${bindingId}/conversations?offset=${offset}&limit=20`,
       );
-      if (ifStale(snapshot)) return;
+      if (!isCurrentBindingRequest(request)) return;
       setConversations((current) => (offset === 0 ? page.items : [...current, ...page.items]));
       setConversationsTotal(page.total);
     } catch (error) {
-      if (ifStale(snapshot)) return;
+      if (!isCurrentBindingRequest(request)) return;
       toast.error(errorDescriptor(error, 'channels.error.loadConversations'));
     } finally {
-      setConversationsLoading(false);
+      if (isCurrentBindingRequest(request)) setConversationsLoading(false);
     }
   }
 
@@ -680,34 +768,41 @@ export default function ChannelsPage({
   async function openConversation(item: ChannelConversationRead) {
     if (!binding) return;
     const snapshot = selectedId;
+    const request = beginBindingRequest('messages', snapshot);
+    if (!request) return;
     setActiveConversation(item);
     setMessages([]);
     setMessagesLoading(true);
     try {
-      const rows = await api.get<ChannelConversationMessageRead[]>(
-        `/api/enterprise/channels/${binding.id}/conversations/${item.session_id}/messages?tenant_id=${TENANT_ID}`,
+      const rows = await tenantApi.get<ChannelConversationMessageRead[]>(
+        `/api/enterprise/channels/${binding.id}/conversations/${item.session_id}/messages`,
       );
-      if (ifStale(snapshot)) return;
+      if (!isCurrentBindingRequest(request)) return;
       setMessages(rows);
     } catch (error) {
-      if (ifStale(snapshot)) return;
+      if (!isCurrentBindingRequest(request)) return;
       toast.error(errorDescriptor(error, 'channels.error.loadMessages'));
     } finally {
-      setMessagesLoading(false);
+      if (isCurrentBindingRequest(request)) setMessagesLoading(false);
     }
   }
 
   /** 加载团队绑定候选；团队名称与成员名称保持 raw。 */
   async function loadTeams() {
+    const context = tenantContext;
+    if (!context) return;
+    const generation = context.generation;
     setTeamsLoading(true);
     try {
-      const rows = await api.get<TeamRead[]>(`/api/enterprise/teams?tenant_id=${TENANT_ID}`);
+      const rows = await tenantApi.get<TeamRead[]>('/api/enterprise/teams');
+      if (!isCurrentTenantGeneration(context, generation)) return;
       setTeams(rows);
     } catch {
       // 团队列表仅用于绑定对象选择与名称映射，失败不影响主流程
+      if (!isCurrentTenantGeneration(context, generation)) return;
       setTeams([]);
     } finally {
-      setTeamsLoading(false);
+      if (isCurrentTenantGeneration(context, generation)) setTeamsLoading(false);
     }
   }
 
@@ -725,19 +820,24 @@ export default function ChannelsPage({
 
   /** 加载可挂载的员工候选并按权限过滤，错误通过稳定错误投影。 */
   async function loadAgentCandidates() {
+    const context = tenantContext;
+    if (!context) return;
+    const generation = context.generation;
     setCandidatesLoading(true);
     try {
-      const rows = await api.get<AgentProfileRead[]>(
-        `/api/enterprise/agents?tenant_id=${TENANT_ID}`,
+      const rows = await tenantApi.get<AgentProfileRead[]>(
+        '/api/enterprise/agents',
       );
+      if (!isCurrentTenantGeneration(context, generation)) return;
       setAgentCandidates(
         // 整体智能体(开放广场载体)是系统资源池,不是可对外服务的岗位员工,与其他页面一致排除
         rows.filter((item) => !item.is_overall && canManageEmployeeAgent(item, currentUser)),
       );
     } catch (error) {
+      if (!isCurrentTenantGeneration(context, generation)) return;
       toast.error(errorDescriptor(error, 'channels.error.loadEmployees'));
     } finally {
-      setCandidatesLoading(false);
+      if (isCurrentTenantGeneration(context, generation)) setCandidatesLoading(false);
     }
   }
 
@@ -759,26 +859,31 @@ export default function ChannelsPage({
     const agentId = createTarget === 'agent' ? createAgentId : '';
     const teamId = createTarget === 'team' ? createTeamId : '';
     if ((!agentId && !teamId) || creating) return;
+    const context = tenantContext;
+    if (!context) return;
+    const generation = context.generation;
     setCreating(true);
     try {
-      const created = await api.post<ChannelBindingRead>('/api/enterprise/channels', {
-        tenant_id: TENANT_ID,
+      const created = await tenantApi.post<ChannelBindingRead>('/api/enterprise/channels', {
         // agent_id 与 team_id 互斥，后端二选一
         ...(agentId ? { agent_id: agentId } : { team_id: teamId }),
         channel: createChannel,
         name: createName.trim(),
       });
+      if (!isCurrentTenantGeneration(context, generation)) return;
       toast.success(createMessageDescriptor('channels.toast.bindingCreated'));
       setCreateOpen(false);
       setCreateAgentId('');
       setCreateTeamId('');
       setCreateName('');
       await load();
+      if (!isCurrentTenantGeneration(context, generation)) return;
       setSelectedId(created.id);
     } catch (error) {
+      if (!isCurrentTenantGeneration(context, generation)) return;
       toast.error(errorDescriptor(error, 'channels.error.createBinding'));
     } finally {
-      setCreating(false);
+      if (isCurrentTenantGeneration(context, generation)) setCreating(false);
     }
   }
 
@@ -798,48 +903,58 @@ export default function ChannelsPage({
       toast.error(createMessageDescriptor('channels.validation.bindingNameRequired'));
       return;
     }
+    const context = tenantContext;
+    if (!context) return;
+    const generation = context.generation;
     setRenaming(true);
     try {
-      const updated = await api.put<ChannelBindingRead>(
-        `/api/enterprise/channels/${target.id}?tenant_id=${TENANT_ID}`,
-        { tenant_id: TENANT_ID, name },
+      const updated = await tenantApi.put<ChannelBindingRead>(
+        `/api/enterprise/channels/${target.id}`,
+        { name },
       );
+      if (!isCurrentTenantGeneration(context, generation)) return;
       setBindings((current) =>
         current.map((item) => (item.id === updated.id ? updated : item)),
       );
       setRenameOpen(false);
       toast.success(createMessageDescriptor('channels.toast.renamed'));
     } catch (error) {
+      if (!isCurrentTenantGeneration(context, generation)) return;
       toast.error(errorDescriptor(error, 'channels.error.renameBinding'));
     } finally {
-      setRenaming(false);
+      if (isCurrentTenantGeneration(context, generation)) setRenaming(false);
     }
   }
 
   /** 生成本人或内部成员的渠道绑定码，目标名称作为 raw 参数保留。 */
   async function openBindCode(targetUserId?: string) {
     if (bindCodeLoading) return;
+    const context = tenantContext;
+    if (!context) return;
+    const generation = context.generation;
     setBindCodeLoading(true);
     try {
       const target = targetUserId
         ? tenantUsers.find((user) => user.id === targetUserId)
         : currentUser;
       const result = targetUserId && binding
-        ? await api.post<ChannelBindCodeRead>(
-            `/api/enterprise/channels/${binding.id}/identity-bind-code?tenant_id=${TENANT_ID}`,
+        ? await tenantApi.post<ChannelBindCodeRead>(
+            `/api/enterprise/channels/${binding.id}/identity-bind-code`,
             { user_id: targetUserId },
           )
-        : await api.post<ChannelBindCodeRead>(
-            `/api/enterprise/channels/bind-code?tenant_id=${TENANT_ID}`,
+        : await tenantApi.post<ChannelBindCodeRead>(
+            '/api/enterprise/channels/bind-code',
           );
+      if (!isCurrentTenantGeneration(context, generation)) return;
       setBindCode(result);
       setBindCodeTargetName(target?.display_name || target?.username || t('channels.placeholder.currentUser'));
       setBindCodeTargetUserId(targetUserId);
       setBindCodeOpen(true);
     } catch (error) {
+      if (!isCurrentTenantGeneration(context, generation)) return;
       toast.error(errorDescriptor(error, 'channels.error.generateBindCode'));
     } finally {
-      setBindCodeLoading(false);
+      if (isCurrentTenantGeneration(context, generation)) setBindCodeLoading(false);
     }
   }
 
@@ -857,37 +972,47 @@ export default function ChannelsPage({
   /** 断开渠道接入并刷新列表；历史数据保留策略由后端执行。 */
   async function confirmUnbind() {
     if (!binding) return;
+    const context = tenantContext;
+    if (!context) return;
+    const generation = context.generation;
     setUnbinding(true);
     try {
-      await api.delete(`/api/enterprise/channels/${binding.id}?tenant_id=${TENANT_ID}`);
+      await tenantApi.delete(`/api/enterprise/channels/${binding.id}`);
+      if (!isCurrentTenantGeneration(context, generation)) return;
       toast.success(createMessageDescriptor('channels.toast.unbound'));
       setUnbindOpen(false);
       setAgentEditing(false);
       setSelectedId('');
       await load();
     } catch (error) {
+      if (!isCurrentTenantGeneration(context, generation)) return;
       toast.error(errorDescriptor(error, 'channels.error.unbindBinding'));
     } finally {
-      setUnbinding(false);
+      if (isCurrentTenantGeneration(context, generation)) setUnbinding(false);
     }
   }
 
   /** 切换渠道启停状态并保留后端稳定状态码，错误使用安全 projector。 */
   async function toggleStatus() {
     if (!binding) return;
+    const context = tenantContext;
+    if (!context) return;
+    const generation = context.generation;
     setTogglingStatus(true);
     try {
-      const updated = await api.post<ChannelBindingRead>(
-        `/api/enterprise/channels/${binding.id}/toggle-status?tenant_id=${TENANT_ID}`,
+      const updated = await tenantApi.post<ChannelBindingRead>(
+        `/api/enterprise/channels/${binding.id}/toggle-status`,
       );
+      if (!isCurrentTenantGeneration(context, generation)) return;
       setBindings((current) => current.map((item) => (item.id === updated.id ? updated : item)));
       toast.success(createMessageDescriptor(
         updated.status === 'active' ? 'channels.toast.enabled' : 'channels.toast.disabled',
       ));
     } catch (error) {
+      if (!isCurrentTenantGeneration(context, generation)) return;
       toast.error(errorDescriptor(error, 'channels.error.toggleStatus'));
     } finally {
-      setTogglingStatus(false);
+      if (isCurrentTenantGeneration(context, generation)) setTogglingStatus(false);
     }
   }
 
@@ -919,72 +1044,85 @@ export default function ChannelsPage({
   /** 保存可调度员工集合；员工名称与 ID 不进入翻译资源。 */
   async function saveAgents() {
     if (!binding || selectedAgentIds.size === 0 || savingAgents) return;
+    const context = tenantContext;
+    if (!context) return;
+    const generation = context.generation;
     setSavingAgents(true);
     try {
-      const updated = await api.put<ChannelBindingRead>(
-        `/api/enterprise/channels/${binding.id}?tenant_id=${TENANT_ID}`,
+      const updated = await tenantApi.put<ChannelBindingRead>(
+        `/api/enterprise/channels/${binding.id}`,
         {
-          tenant_id: TENANT_ID,
           agents: [...selectedAgentIds].map((id) => ({
             agent_id: id,
             is_default: id === defaultAgentId,
           })),
         },
       );
+      if (!isCurrentTenantGeneration(context, generation)) return;
       setBindings((current) =>
         current.map((item) => (item.id === updated.id ? updated : item)),
       );
       setAgentEditing(false);
       toast.success(createMessageDescriptor('channels.toast.saved'));
     } catch (error) {
+      if (!isCurrentTenantGeneration(context, generation)) return;
       toast.error(errorDescriptor(error, 'channels.error.saveEmployees'));
     } finally {
-      setSavingAgents(false);
+      if (isCurrentTenantGeneration(context, generation)) setSavingAgents(false);
     }
   }
 
   /** 保存智能分发开关，布尔值是结构化业务参数而非文案。 */
   async function toggleAutoRoute(next: boolean) {
     if (!binding || autoRouteSaving) return;
+    const context = tenantContext;
+    if (!context) return;
+    const generation = context.generation;
     setAutoRouteSaving(true);
     try {
-      const updated = await api.put<ChannelBindingRead>(
-        `/api/enterprise/channels/${binding.id}?tenant_id=${TENANT_ID}`,
-        { tenant_id: TENANT_ID, auto_route: next },
+      const updated = await tenantApi.put<ChannelBindingRead>(
+        `/api/enterprise/channels/${binding.id}`,
+        { auto_route: next },
       );
+      if (!isCurrentTenantGeneration(context, generation)) return;
       setBindings((current) =>
         current.map((item) => (item.id === updated.id ? updated : item)),
       );
       toast.success(createMessageDescriptor('channels.toast.saved'));
     } catch (error) {
+      if (!isCurrentTenantGeneration(context, generation)) return;
       toast.error(errorDescriptor(error, 'channels.error.saveAutoRoute'));
     } finally {
-      setAutoRouteSaving(false);
+      if (isCurrentTenantGeneration(context, generation)) setAutoRouteSaving(false);
     }
   }
 
   /** 保存默认人工处理人及渠道变体，用户 ID 和渠道 ID 保持 raw 协议值。 */
   async function saveHandoffAssignee(value: string) {
     if (!binding || handoffAssigneeSaving) return;
+    const context = tenantContext;
+    if (!context) return;
+    const generation = context.generation;
     const { userId, channel } = parseHandoffAssigneeValue(value === '__none__' ? '' : value);
     setHandoffAssigneeSaving(true);
     try {
-      const updated = await api.put<ChannelBindingRead>(
-        `/api/enterprise/channels/${binding.id}?tenant_id=${TENANT_ID}`,
+      const updated = await tenantApi.put<ChannelBindingRead>(
+        `/api/enterprise/channels/${binding.id}`,
         {
-          tenant_id: TENANT_ID,
           default_handoff_assignee_user_id: userId || null,
           default_handoff_assignee_channel: userId ? channel : null,
         },
       );
+      if (!isCurrentTenantGeneration(context, generation)) return;
       setBindings((current) =>
         current.map((item) => (item.id === updated.id ? updated : item)),
       );
       toast.success(createMessageDescriptor('channels.toast.saved'));
     } catch (error) {
+      if (!isCurrentTenantGeneration(context, generation)) return;
       toast.error(errorDescriptor(error, 'channels.error.saveHandoffAssignee'));
     } finally {
-      setHandoffAssigneeSaving(false);
+      if (isCurrentTenantGeneration(context, generation)) setHandoffAssigneeSaving(false);
     }
   }
 

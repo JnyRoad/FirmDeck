@@ -18,10 +18,17 @@ from app.db.models import (
     HarnessInvocationRecord,
     HarnessRunRecord,
     HarnessTaskFrameRecord,
+    Tenant,
     new_id,
     utc_now,
 )
 from app.i18n.language_context import LanguageContext
+from app.security.tenant import (
+    TenantExecutionKind,
+    TenantLifecycleDecision,
+    require_active_tenant,
+    require_matching_admission_version,
+)
 from app.session.session_schema import PlannedTaskFrame, TurnPlan
 
 TERMINAL_FRAME_STATUSES = {"completed", "cancelled", "failed"}
@@ -32,6 +39,26 @@ DEPENDENCY_WAITING_ERROR_CODES = {
 HARNESS_CONTEXT_KEY = "harness_v2"
 FRAME_LEASE_SECONDS = 900
 MAX_TASK_FRAMES_PER_TURN = 8
+
+
+def _optional_tenant_admission(
+    db: Session,
+    tenant_id: str,
+    correlation_id: str,
+) -> TenantLifecycleDecision | None:
+    """Return the current lifecycle decision for a persisted Harness tenant.
+
+    Legacy in-memory fixtures may omit the Tenant row; those trusted callers
+    retain version one behavior while every real tenant is fail-closed.
+    """
+    if db.get(Tenant, tenant_id) is None:
+        return None
+    return require_active_tenant(
+        db,
+        tenant_id,
+        TenantExecutionKind.JOB_CLAIM,
+        correlation_id,
+    )
 
 
 def _language_snapshot(
@@ -167,6 +194,11 @@ class TaskFrameStore:
         ``RuntimeError`` when their execution lease has not expired.
         """
 
+        admission = _optional_tenant_admission(
+            self.db,
+            session.tenant_id,
+            source_turn_id or session.id,
+        )
         # Project session state before reconciling its durable TaskFrame rows.
         self._apply_updates(session, plan)
         # Bound one turn before calculating dependencies between its TaskFrames.
@@ -191,6 +223,9 @@ class TaskFrameStore:
             if created:
                 row = HarnessTaskFrameRecord(
                     tenant_id=session.tenant_id,
+                    tenant_lifecycle_version=(
+                        admission.lifecycle_version if admission is not None else 1
+                    ),
                     session_id=session.id,
                     source_turn_id=source_turn_id,
                     task_id=task_id,
@@ -213,6 +248,11 @@ class TaskFrameStore:
                     raise RuntimeError(
                         f"TaskFrame {row.task_id} is already running."
                     )
+            if admission is not None:
+                require_matching_admission_version(
+                    admission,
+                    row.tenant_lifecycle_version,
+                )
             row.source_turn_id = source_turn_id
             row.language_context_json = _language_snapshot(
                 language_context,
@@ -494,6 +534,7 @@ class TaskFrameStore:
         )
         run = HarnessRunRecord(
             tenant_id=row.tenant_id,
+            tenant_lifecycle_version=int(row.tenant_lifecycle_version or 1),
             session_id=row.session_id,
             task_frame_record_id=row.id,
             agent_loop_id=row.agent_loop_id,

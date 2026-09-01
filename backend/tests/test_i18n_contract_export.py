@@ -18,6 +18,20 @@ from app.contracts.i18n_contract import (
     validate_i18n_contract,
 )
 
+EXPECTED_INTERNAL_EVENT_CODES = frozenset(
+    {
+        "internal.channel.autoroute.decision",
+        "internal.job.queued",
+        "system.auth.rejected",
+        "system.control.conflict",
+        "tenant.password.change.required",
+        "tenant.lifecycle.suspended",
+        "tenant.lifecycle.check.failed",
+        "tenant.work.terminalized",
+        "tenant.work.outcome.unknown",
+    }
+)
+
 
 def test_backend_contract_is_deterministic_and_contains_exact_error_event_fields() -> None:
     """Require one stable, JSON-serializable artifact for both backend product registries."""
@@ -172,18 +186,14 @@ def test_public_job_registration_is_idempotent_and_has_no_feedback_worker_side_e
         str(entry.get("legacy_event_type") or "").startswith("feedback.analyze.")
         for entry in first["events"]
     )
-    assert len(first["events"]) == 68
+    assert len(first["events"]) == 75
     assert sum(item["visibility"] == "public" for item in first["events"]) == 66
-    assert sum(item["visibility"] == "internal" for item in first["events"]) == 2
+    assert sum(item["visibility"] == "internal" for item in first["events"]) == 9
     assert {
-        item["event_code"]
-        for item in first["events"]
-        if item["visibility"] == "internal"
-    } == {"internal.channel.autoroute.decision", "internal.job.queued"}
+        item["event_code"] for item in first["events"] if item["visibility"] == "internal"
+    } == EXPECTED_INTERNAL_EVENT_CODES
     assert {
-        item["legacy_event_type"]
-        for item in first["events"]
-        if item["raw_source_allowed"]
+        item["legacy_event_type"] for item in first["events"] if item["raw_source_allowed"]
     } == {"run.output.completed", "run.output.delta", "run.output.replace"}
 
     # Workflow: replay the same registration operation twice, as application imports do, then
@@ -195,7 +205,7 @@ def test_public_job_registration_is_idempotent_and_has_no_feedback_worker_side_e
 
     assert second == first
     assert third == first
-    assert len({entry.event_code for entry in EVENT_REGISTRY.entries()}) == 68
+    assert len({entry.event_code for entry in EVENT_REGISTRY.entries()}) == 75
 
 
 def test_test_job_registration_isolated_from_canonical_contract() -> None:
@@ -208,5 +218,5 @@ def test_test_job_registration_isolated_from_canonical_contract() -> None:
 
     after = tuple(entry.model_dump(mode="json") for entry in EVENT_REGISTRY.entries())
     assert after == before
-    assert len(EVENT_REGISTRY.entries()) == 68
+    assert len(EVENT_REGISTRY.entries()) == 75
     assert len(_TEST_JOB_EVENT_REGISTRY.entries()) == 4

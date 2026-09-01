@@ -9,24 +9,32 @@ from sqlmodel import Session
 
 from app.db import engine, init_db
 from app.db.seed import seed_demo_data
-from app.scheduled_tasks.service import WORKER_SLEEP_SECONDS, due_scheduled_tasks, execute_scheduled_task
-
+from app.scheduled_tasks.service import (
+    WORKER_SLEEP_SECONDS,
+    due_scheduled_tasks,
+    execute_scheduled_task,
+)
 
 _stopped = False
 _background_thread: threading.Thread | None = None
 
 
 def _handle_stop(_signum: int, _frame: object) -> None:
+    """Signal the polling loop to stop without interrupting an in-flight database transaction."""
     global _stopped
     _stopped = True
 
 
 def run_worker(*, once: bool = False, poll_seconds: float = WORKER_SLEEP_SECONDS) -> None:
+    """Run scheduled polling; service admission decides which due rows are executable."""
     init_db()
     with Session(engine) as db:
         seed_demo_data(db)
     while not _stopped:
         with Session(engine) as db:
+            # ``due_scheduled_tasks`` performs the authoritative tenant check,
+            # durable run-version capture, and suspended-occurrence terminalization
+            # before this worker receives any row.
             due = due_scheduled_tasks(db)
             for task in due:
                 execute_scheduled_task(db, task)
@@ -36,6 +44,7 @@ def run_worker(*, once: bool = False, poll_seconds: float = WORKER_SLEEP_SECONDS
 
 
 def start_background_worker(*, poll_seconds: float = WORKER_SLEEP_SECONDS) -> None:
+    """Start one daemon polling thread and leave duplicate starts idempotent."""
     global _background_thread, _stopped
     if _background_thread and _background_thread.is_alive():
         return
@@ -50,11 +59,13 @@ def start_background_worker(*, poll_seconds: float = WORKER_SLEEP_SECONDS) -> No
 
 
 def stop_background_worker() -> None:
+    """Request shutdown of the background polling loop; the current iteration may finish."""
     global _stopped
     _stopped = True
 
 
 def main() -> None:
+    """Parse worker CLI options and run the scheduled-task polling loop."""
     parser = argparse.ArgumentParser(description="Run StaffDeck scheduled task worker")
     parser.add_argument("--once", action="store_true", help="scan and execute due tasks once, then exit")
     parser.add_argument("--poll-seconds", type=float, default=WORKER_SLEEP_SECONDS)

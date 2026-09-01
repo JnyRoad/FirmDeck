@@ -1,5 +1,6 @@
 import threading
 from datetime import timedelta
+from typing import ClassVar
 
 import pytest
 from sqlalchemy import text as sa_text
@@ -60,7 +61,7 @@ def _group_message(event_id: str, text: str) -> dict:
 
 def _seed_binding(engine) -> str:
     with Session(engine) as db:
-        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.add(Tenant(id="tenant_demo", name="Demo", status="active", lifecycle_version=1))
         binding = ChannelBinding(
             tenant_id="tenant_demo",
             agent_id="agent_1",
@@ -158,7 +159,7 @@ def _make_lazy_account(engine) -> User:
 
 
 class RecordingAgentLoop:
-    calls: list = []
+    calls: ClassVar[list] = []
 
     def __init__(self, db, *, event_sink=None):
         self.db = db
@@ -253,7 +254,7 @@ def test_user_source_backfill_marks_wechat_accounts(monkeypatch, tmp_path) -> No
 def test_list_users_hides_channel_accounts_by_default() -> None:
     engine = _test_engine()
     with Session(engine) as db:
-        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.add(Tenant(id="tenant_demo", name="Demo", status="active", lifecycle_version=1))
         admin = User(
             id="admin_user",
             tenant_id="tenant_demo",
@@ -329,7 +330,7 @@ def test_list_users_hides_channel_accounts_by_default() -> None:
 def test_create_bind_code_invalidates_stale_codes() -> None:
     engine = _test_engine()
     with Session(engine) as db:
-        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.add(Tenant(id="tenant_demo", name="Demo", status="active", lifecycle_version=1))
         owner = User(id="user_web", tenant_id="tenant_demo", username="zhangsan", display_name="张三", password_hash="x")
         db.add(owner)
         db.commit()
@@ -354,7 +355,7 @@ def test_bind_code_generation_retries_tenant_code_collision(monkeypatch) -> None
 
     engine = _test_engine()
     with Session(engine) as db:
-        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.add(Tenant(id="tenant_demo", name="Demo", status="active", lifecycle_version=1))
         first_user = User(
             id="user_first", tenant_id="tenant_demo", username="first", password_hash="x"
         )
@@ -405,7 +406,7 @@ def test_bind_code_is_claimed_once_under_concurrency(tmp_path) -> None:
         try:
             gate.wait(timeout=5.0)
             process_inbound(binding, message, db_engine=engine)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - preserve worker error for the race assertion.
             errors.append(exc)
 
     threads = [
@@ -929,7 +930,7 @@ def _wecom_inbound(event_id: str, text: str, *, group: bool = False):
 def _seed_wecom_binding(engine) -> str:
     with Session(engine) as db:
         if not db.get(Tenant, "tenant_demo"):
-            db.add(Tenant(id="tenant_demo", name="Demo"))
+            db.add(Tenant(id="tenant_demo", name="Demo", status="active", lifecycle_version=1))
         binding = ChannelBinding(
             tenant_id="tenant_demo",
             agent_id="agent_1",

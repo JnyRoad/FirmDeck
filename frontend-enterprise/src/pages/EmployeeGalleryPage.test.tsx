@@ -12,6 +12,38 @@ import { I18nProvider } from '@/i18n';
 import type { EnterpriseAuthUser } from '@/auth';
 import type { AgentProfileRead, TeamRead } from '@/types';
 
+const tenantContextMock = vi.hoisted(() => {
+  const controller = new AbortController();
+  return {
+    context: {
+      session: {
+        token: 'tenant-demo-token',
+        scope: 'tenant' as const,
+        tenant: { id: 'tenant_demo', slug: 'tenant-demo', display_name: 'Tenant Demo' },
+        user: {
+          id: 'user-1',
+          tenant_id: 'tenant_demo',
+          username: 'demo',
+          display_name: 'Demo',
+          role: 'admin' as const,
+          must_change_password: false,
+          avatar_url: null,
+        },
+      },
+      tenantId: 'tenant_demo',
+      tenantSlug: 'tenant-demo',
+      userId: 'user-1',
+      generation: 1,
+      signal: controller.signal,
+      isCurrentGeneration: (generation: number) => generation === 1,
+    },
+  };
+});
+
+vi.mock('../contexts/TenantSessionContext', () => ({
+  useTenantSession: () => tenantContextMock.context,
+}));
+
 /** 隔离仍使用 legacy locale 的全局页头，使语义矩阵不依赖 DOM observer。 */
 vi.mock('../components/AppHeader', () => ({
   default: ({ title, left }: { title?: ReactNode; left?: ReactNode }) => (

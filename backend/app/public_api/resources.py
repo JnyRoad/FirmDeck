@@ -26,7 +26,15 @@ from app.knowledge.schema import (
 from app.public_api.auth import PublicPrincipal, enforce_agent_access, require_scopes
 from app.public_api.errors import PublicAPIError
 from app.public_api.idempotency import replay_idempotent_response, store_idempotent_response
-from app.public_api.jobs import create_job, job_read, register_job_handler, update_job
+from app.public_api.jobs import (
+    _require_job_execution_fence,
+    _require_job_lifecycle,
+    create_job,
+    job_read,
+    mark_side_effect_started,
+    register_job_handler,
+    update_job,
+)
 from app.public_api.runs import _job_actor
 from app.public_api.schemas import KnowledgeEntriesUpsert, ScheduledTaskPublicCreate
 from app.public_api.sessions import ensure_public_agent
@@ -359,6 +367,11 @@ def execute_knowledge_ingest(db: Session, job: APIJob) -> dict[str, Any]:
     ] + documents
     results: list[dict[str, Any]] = []
     for index, entry in enumerate(work_items):
+        # Each status event is a durable side effect of this multi-entry job;
+        # do not rely on the admission used by the previous entry.
+        _require_job_execution_fence(db, job)
+        _require_job_lifecycle(db, job)
+        db.rollback()
         update_job(
             db,
             job,
@@ -375,15 +388,29 @@ def execute_knowledge_ingest(db: Session, job: APIJob) -> dict[str, Any]:
             content_base64=str(entry.get("content_base64") or ""),
             metadata={**dict(entry.get("metadata") or {}), "source_ref": entry.get("source_ref"), "external_id": entry.get("external_id")},
         )
+        # Uploading starts the nested ingest worker, which may cross a provider
+        # boundary while extracting and indexing the document.
+        _require_job_execution_fence(db, job)
+        _require_job_lifecycle(db, job)
+        db.rollback()
+        mark_side_effect_started(db)
         inner = internal_knowledge.upload_document(upload, str(job.agent_id), db, actor)
         while True:
+            # The nested worker can run for an unbounded provider-backed interval.
+            # Close every prior read transaction, admit the next observation, and
+            # close that decision before polling or sleeping again.
+            db.rollback()
+            _require_job_lifecycle(db, job)
+            db.rollback()
             db.expire_all()
             current = db.get(KnowledgeIngestJob, inner.id)
             if not current:
                 raise RuntimeError("Knowledge ingest job disappeared")
             if current.status in {"succeeded", "failed", "cancelled"}:
                 break
+            db.rollback()
             sleep(0.1)
+            db.rollback()
         if current.status != "succeeded":
             raise RuntimeError(f"Knowledge ingest failed at {current.stage}: {current.error or current.status}")
         results.append(

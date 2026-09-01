@@ -1,11 +1,59 @@
 // @vitest-environment jsdom
 
+import type { ReactNode } from 'react';
 import { cleanup, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { AppIntlProvider, type AppLocale } from '@/i18n';
 import type { AgentProfileRead } from '@/types';
+
+const tenantContextMock = vi.hoisted(() => {
+  const controller = new AbortController();
+  return {
+    context: {
+      session: {
+        token: 'tenant-demo-token',
+        scope: 'tenant' as const,
+        tenant: { id: 'tenant_demo', slug: 'tenant-demo', display_name: 'Tenant Demo' },
+        user: {
+          id: 'user-1',
+          tenant_id: 'tenant_demo',
+          username: 'demo',
+          display_name: 'Demo',
+          role: 'admin' as const,
+          must_change_password: false,
+          avatar_url: null,
+        },
+      },
+      tenantId: 'tenant_demo',
+      tenantSlug: 'tenant-demo',
+      userId: 'user-1',
+      generation: 1,
+      signal: controller.signal,
+      isCurrentGeneration: (generation: number) => generation === 1,
+    },
+  };
+});
+
+vi.mock('../contexts/TenantSessionContext', () => ({
+  useTenantSession: () => tenantContextMock.context,
+}));
+
+// Keep the dialog content mounted in this unit contract so open=false can be
+// asserted as an immediate transient-secret cleanup, independent of Radix's
+// portal/unmount animation.
+vi.mock('@/components/ui/dialog', () => {
+  const childrenOnly = ({ children }: { children?: ReactNode }) => <>{children}</>;
+  const element = ({ children }: { children?: ReactNode }) => <div>{children}</div>;
+  return {
+    Dialog: childrenOnly,
+    DialogContent: element,
+    DialogDescription: ({ children }: { children?: ReactNode }) => <p>{children}</p>,
+    DialogHeader: element,
+    DialogTitle: ({ children }: { children?: ReactNode }) => <h2>{children}</h2>,
+  };
+});
 
 import EmployeeApiKeyDialog from './EmployeeApiKeyDialog';
 
@@ -183,6 +231,57 @@ describe('EmployeeApiKeyDialog', () => {
       '/api/enterprise/agents/agent-1/api-credentials/employee-key-1/reveal?tenant_id=tenant_demo',
       expect.objectContaining({ method: 'POST' }),
     );
+  });
+
+  it('clears a revealed key immediately when the mounted dialog is hidden', async () => {
+    const user = userEvent.setup();
+    const created = {
+      id: 'employee-key-created',
+      agent_id: agent.id,
+      name: '新员工运行密钥',
+      access: 'runtime',
+      key_prefix: 'sd_live_created…',
+      can_reveal: true,
+      scopes: ['runs:*'],
+      status: 'active',
+      created_at: EMPLOYEE_CREDENTIAL_CREATED_AT,
+      api_key: 'sd_live_created_employee_key',
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (
+        init?.method === 'POST'
+        && url.endsWith('/api/enterprise/agents/agent-1/api-credentials?tenant_id=tenant_demo')
+      ) {
+        return jsonResponse(created);
+      }
+      if (url.endsWith('/api/enterprise/agents/agent-1/api-credentials?tenant_id=tenant_demo')) {
+        return jsonResponse([]);
+      }
+      return jsonResponse({});
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const onClose = vi.fn();
+    const view = render(
+      <AppIntlProvider locale="zh-CN">
+        <EmployeeApiKeyDialog agent={agent} open onClose={onClose} />
+      </AppIntlProvider>,
+    );
+
+    await screen.findByText('API 密钥 · 小艾');
+    await user.click(screen.getByRole('button', { name: '创建运行密钥' }));
+    await screen.findByDisplayValue('sd_live_created_employee_key');
+    await user.click(screen.getByRole('button', { name: '复制' }));
+    await screen.findByRole('button', { name: '已复制' });
+
+    view.rerender(
+      <AppIntlProvider locale="zh-CN">
+        <EmployeeApiKeyDialog agent={agent} open={false} onClose={onClose} />
+      </AppIntlProvider>,
+    );
+
+    expect(screen.queryByDisplayValue('sd_live_created_employee_key')).toBeNull();
+    expect(screen.queryByRole('button', { name: '已复制' })).toBeNull();
   });
 
   it('guides employee managers to rotate legacy keys that cannot be recovered', async () => {

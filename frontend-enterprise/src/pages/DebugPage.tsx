@@ -1,7 +1,7 @@
 /** Agent 调试页：产品 chrome 由语义 i18n 投影，用户输入与执行诊断保持 raw。 */
 
 import { SendOutlined } from '../icons';
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import {
   Accordion,
   AccordionContent,
@@ -20,7 +20,8 @@ import { RawContent } from '@/i18n/RawContent';
 import { useAppIntl } from '@/i18n/useAppIntl';
 import type { MessageId } from '@/i18n/types';
 import { backendErrorMessageDescriptor } from '@/lib/apiErrorMessages';
-import { api, TENANT_ID } from '../api/client';
+import { createTenantClient } from '../api/tenant-client';
+import { useTenantSession } from '../contexts/TenantSessionContext';
 import type { ChatTurnResponse } from '../types';
 
 type ChatMessage = { role: 'user' | 'assistant'; content: string };
@@ -55,10 +56,19 @@ function serializeDebugPayload(value: unknown): string {
   }
 }
 
+function isCurrentTenantGeneration(
+  context: ReturnType<typeof useTenantSession>,
+  generation: number,
+): boolean {
+  return Boolean(context && !context.signal.aborted && context.isCurrentGeneration(generation));
+}
+
 /** 渲染 Agent 调试页；副作用仅限提交调试请求与显示安全 toast。 */
 export default function DebugPage() {
   const { t } = useAppIntl();
   const toast = createToastNotifier({ t });
+  const tenantContext = useTenantSession();
+  const tenantApi = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
   const [sessionId, setSessionId] = useState('');
   const [input, setInput] = useState('');
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -67,28 +77,31 @@ export default function DebugPage() {
 
   /** 提交调试消息并保存服务端返回的会话、回复和 raw 诊断快照。 */
   async function send() {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined || !isCurrentTenantGeneration(context, generation)) return;
     if (!input.trim()) return;
     const userText = input;
     setInput('');
     setMessages((items) => [...items, { role: 'user', content: userText }]);
     setLoading(true);
     try {
-      const result = await api.post<ChatTurnResponse>('/api/chat/turn', {
-        tenant_id: TENANT_ID,
+      const result = await tenantApi.post<ChatTurnResponse>('/api/chat/turn', {
         session_id: sessionId || undefined,
-        user_id: 'enterprise_debugger',
         message: userText,
         channel: 'enterprise_debug',
         debug: true,
       });
+      if (!isCurrentTenantGeneration(context, generation)) return;
       setSessionId(result.session_id);
       setLastTurn(result);
       setMessages((items) => [...items, { role: 'assistant', content: result.reply }]);
     } catch (error) {
+      if (!isCurrentTenantGeneration(context, generation)) return;
       console.error('[debug-page] turn failed', error);
       toast.error(debugErrorDescriptor(error));
     } finally {
-      setLoading(false);
+      if (isCurrentTenantGeneration(context, generation)) setLoading(false);
     }
   }
 

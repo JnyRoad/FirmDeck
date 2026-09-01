@@ -2,10 +2,53 @@
 
 import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { AppIntlProvider, I18nProvider } from '@/i18n';
 import type { KnowledgeBaseRead, KnowledgeBaseVersionRead, TeamRead } from '@/types';
+
+const tenantContextMock = vi.hoisted(() => {
+  const controller = new AbortController();
+  return {
+    context: {
+      session: {
+        token: 'tenant-demo-token',
+        scope: 'tenant' as const,
+        tenant: { id: 'tenant_demo', slug: 'tenant-demo', display_name: 'Tenant Demo' },
+        user: {
+          id: 'user-admin',
+          tenant_id: 'tenant_demo',
+          username: 'admin',
+          display_name: 'Admin',
+          role: 'admin' as const,
+          must_change_password: false,
+          avatar_url: null,
+        },
+      },
+      tenantId: 'tenant_demo',
+      tenantSlug: 'tenant-demo',
+      userId: 'user-admin',
+      generation: 1,
+      signal: controller.signal,
+      isCurrentGeneration: (generation: number) => generation === 1,
+    },
+  };
+});
+
+const toastMocks = vi.hoisted(() => ({
+  error: vi.fn(),
+  info: vi.fn(),
+  success: vi.fn(),
+  warning: vi.fn(),
+}));
+
+vi.mock('@/contexts/TenantSessionContext', () => ({
+  useTenantSession: () => tenantContextMock.context,
+}));
+
+vi.mock('@/components/ui/app-toast', () => ({
+  notify: toastMocks,
+}));
 
 import { SharedKnowledgeConversionDialog } from './SharedKnowledgeConversionDialog';
 
@@ -168,6 +211,14 @@ beforeAll(() => {
   window.HTMLElement.prototype.releasePointerCapture = vi.fn();
 });
 
+beforeEach(() => {
+  tenantContextMock.context.isCurrentGeneration = (generation: number) => generation === 1;
+  toastMocks.error.mockReset();
+  toastMocks.info.mockReset();
+  toastMocks.success.mockReset();
+  toastMocks.warning.mockReset();
+});
+
 afterEach(() => {
   /** 隔离每个向导用例的 DOM、fetch 与 spy。 */
   cleanup();
@@ -209,7 +260,7 @@ describe('SharedKnowledgeConversionDialog', () => {
 
     await waitFor(() => {
       const call = fetchMock.mock.calls.find(([input, init]) => (
-        String(input).endsWith('/knowledge-bases/kb-dedicated/convert-to-shared')
+        new URL(String(input), window.location.origin).pathname === '/api/enterprise/knowledge-bases/kb-dedicated/convert-to-shared'
         && init?.method === 'POST'
       ));
       expect(JSON.parse(String(call?.[1]?.body))).toEqual({
@@ -224,6 +275,38 @@ describe('SharedKnowledgeConversionDialog', () => {
       });
       expect(onConverted).toHaveBeenCalledWith(conversionResponse);
     });
+  });
+
+  it('does not warn or clear submitting state when the conversion callback rejects after a tenant switch', async () => {
+    const user = userEvent.setup();
+    let resolveCallback!: () => void;
+    let rejectCallback!: (reason?: unknown) => void;
+    const callbackPromise = new Promise<void>((resolve, reject) => {
+      resolveCallback = resolve;
+      rejectCallback = reject;
+    });
+    const onConverted = vi.fn(() => callbackPromise);
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === 'POST') return jsonResponse(conversionResponse);
+      if (String(input).includes('/versions?')) return jsonResponse(sourceVersions);
+      if (String(input).includes('/teams?')) return jsonResponse(teams);
+      return jsonResponse([]);
+    }));
+    const { onClose } = renderDialog(onConverted);
+    const dialog = await screen.findByRole('dialog', { name: /转换为共享知识库：个人素材库/ });
+    await user.type(within(dialog).getByLabelText('转换原因'), '租户切换中的转换');
+    const confirmButton = within(dialog).getByRole('button', { name: '确认转换' }) as HTMLButtonElement;
+    await user.click(confirmButton);
+    await waitFor(() => expect(onConverted).toHaveBeenCalledWith(conversionResponse));
+
+    tenantContextMock.context.isCurrentGeneration = (_generation: number): _generation is 1 => false;
+    rejectCallback(new Error('stale conversion callback'));
+    await Promise.resolve();
+    await waitFor(() => expect(confirmButton.disabled).toBe(true));
+
+    expect(toastMocks.warning).not.toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
+    resolveCallback();
   });
 
   it('states that the dedicated source remains usable when conversion fails', async () => {
