@@ -228,6 +228,10 @@ def _ensure_frontend_dependencies() -> None:
 
 
 def _ensure_sandbox_runtime() -> None:
+    """Ensure the reviewed sandbox runtime and domain patch are installed.
+
+    A valid runtime is reused; otherwise the fetch script writes runtime files and failures propagate.
+    """
     runtime = ROOT_DIR / "packaging" / "sandbox_runtime"
     cli = runtime / "node_modules" / "@anthropic-ai" / "sandbox-runtime" / "dist" / "cli.js"
     node = runtime / "bin" / ("node.exe" if sys.platform == "win32" else "node")
@@ -272,6 +276,10 @@ def _url_ready(url: str) -> bool:
 
 
 def _wait_for_url(label: str, url: str, log_file: Path) -> None:
+    """Wait for a ready URL or raise with recent log context after the timeout.
+
+    Polling sends HTTP requests and sleeps; timeout prints the log tail before raising RuntimeError.
+    """
     deadline = time.monotonic() + _env_int("DEV_STARTUP_TIMEOUT", 180)
     while time.monotonic() < deadline:
         if _url_ready(url):

@@ -244,6 +244,10 @@ class Service:
 
 
 def build_services() -> list[Service]:
+    """Build unstarted services for the configured development port mode.
+
+    The returned definitions read module configuration but do not launch processes or write files.
+    """
     backend_python = _backend_python()
     if SINGLE_PORT:
         return [

@@ -37,6 +37,7 @@ def test_pid_alive_recognizes_current_process() -> None:
 
 
 def test_dev_cli_uses_next_port_in_packaged_app_range(monkeypatch) -> None:
+    """Verify packaged-app startup advances past an occupied default port."""
     dev = _load_script("dev")
     monkeypatch.delenv("ULTRARAG_PORT_RANGE_START", raising=False)
     monkeypatch.delenv("ULTRARAG_PORT_RANGE_END", raising=False)
@@ -138,6 +139,7 @@ def test_supervisor_healthy_ignores_response_close_failure(monkeypatch) -> None:
 
 
 def test_dev_cli_honors_packaged_app_port_range(monkeypatch) -> None:
+    """Verify packaged-app startup stays within its configured port range."""
     dev = _load_script("dev")
     monkeypatch.setenv("ULTRARAG_PORT_RANGE_START", "6200")
     monkeypatch.setenv("ULTRARAG_PORT_RANGE_END", "6202")
