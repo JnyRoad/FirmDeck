@@ -49,3 +49,27 @@ def test_wechat_kf_notice_target_does_not_require_legacy_context_token() -> None
         "wechat_kf",
         {"to_user_id": "external-user-1"},
     )
+
+
+def test_wechat_kf_unbind_uses_the_receiving_account_scope(monkeypatch) -> None:
+    """多账号绑定下，解绑只能影响收到该命令的客服账号身份。"""
+    binding = ChannelBinding(
+        tenant_id="tenant_demo",
+        agent_id="agent_1",
+        channel="wechat_kf",
+        status="active",
+        identity_scope_key="ww-corp:wk-default",
+        config_json={"corp_id": "ww-corp"},
+    )
+    inbound = _inbound("ww-corp:wk-account-1")
+    observed_scopes: list[str] = []
+
+    def fake_unbind(_db, _tenant_id, _channel, _external_user_id, scope):
+        observed_scopes.append(scope)
+        return None
+
+    monkeypatch.setattr(service_intake, "unbind_external_identity", fake_unbind)
+
+    service_intake._unbind_external_identity(None, binding, inbound)
+
+    assert observed_scopes == ["ww-corp:wk-account-1"]

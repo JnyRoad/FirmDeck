@@ -568,7 +568,7 @@ def test_wecom_stale_processing_event_is_recovered() -> None:
         assert db.get(ChannelInboundEvent, staged.event_pk).status == "done"
 
 
-def test_wecom_stale_processing_event_recovers_after_binding_disabled() -> None:
+def test_wecom_stale_processing_event_stops_after_binding_disabled() -> None:
     engine = _test_engine()
     binding_id = _seed_wecom_binding(
         engine,
@@ -594,9 +594,14 @@ def test_wecom_stale_processing_event_recovers_after_binding_disabled() -> None:
         db.add(binding)
         db.commit()
 
-    assert intake_module.sweep_stale_inbound_events(db_engine=engine) == 1
+    assert intake_module.sweep_stale_inbound_events(db_engine=engine) == 0
+    assert RecordingAgentLoop.calls == []
     with Session(engine) as db:
-        assert db.get(ChannelInboundEvent, staged.event_pk).status == "done"
+        event = db.get(ChannelInboundEvent, staged.event_pk)
+        assert event.status == "failed"
+        assert event.error == "binding_inactive"
+        assert event.processor_run_id is None
+        assert event.processor_lease_expires_at is None
 
 
 # ---------- send ----------

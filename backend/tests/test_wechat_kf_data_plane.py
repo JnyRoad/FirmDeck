@@ -986,6 +986,44 @@ def test_wechat_kf_staged_event_is_claimable_and_uses_durable_stale_recovery(
     assert recovered == [staged.event_pk]
 
 
+def test_wechat_kf_stale_recovery_terminalizes_event_for_inactive_binding(monkeypatch) -> None:
+    """停用绑定的过期事件不得进入 AgentLoop，并应退出永久 processing 状态。"""
+    module = _wechat_kf_inbox_module()
+    engine = _test_engine()
+    binding = _seed_binding_and_account(engine)
+    staged = module.stage_wechat_kf_inbound(
+        db_engine=engine,
+        binding_id=binding.id,
+        expected_revision=7,
+        account_scope="ww-tenant-a:wk-support",
+        inbound=_inbound(text="must-not-run"),
+    )
+    assert intake_module.claim_staged_inbound(staged.event_pk, db_engine=engine) is True
+    with Session(engine) as db:
+        event = db.get(ChannelInboundEvent, staged.event_pk)
+        event.processor_run_id = "dead-worker"
+        event.processor_lease_expires_at = db_models.utc_now() - timedelta(seconds=1)
+        stored_binding = db.get(ChannelBinding, binding.id)
+        stored_binding.status = "inactive"
+        db.add(event)
+        db.add(stored_binding)
+        db.commit()
+
+    monkeypatch.setattr(
+        intake_module,
+        "process_staged_inbound",
+        lambda *_args, **_kwargs: pytest.fail("inactive binding must not dispatch"),
+    )
+
+    assert intake_module.sweep_stale_inbound_events(db_engine=engine) == 0
+    with Session(engine) as db:
+        event = db.get(ChannelInboundEvent, staged.event_pk)
+        assert event.status == "failed"
+        assert event.error == "binding_inactive"
+        assert event.processor_run_id is None
+        assert event.processor_lease_expires_at is None
+
+
 @pytest.mark.parametrize(
     "mutation",
     [

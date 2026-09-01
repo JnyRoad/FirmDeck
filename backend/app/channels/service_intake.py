@@ -776,7 +776,7 @@ def _bind_external_identity(
     if not code:
         return render_channel_notice(ChannelNotice("binding.usage"), context)
     external_id = inbound.from_user_id
-    scope = external_account_scope(db, binding)
+    scope = _resolved_inbound_account_scope(binding, inbound)
     # 限流:按完整身份键计数,连续错码/过期码达上限后冷却,冷却期内连正确码也拒绝
     if _bind_cooldown_remaining(binding.tenant_id, binding.channel, scope, external_id) > 0:
         return render_channel_notice(ChannelNotice("binding.cooldown"), context)
@@ -857,7 +857,7 @@ def _unbind_external_identity(
         legacy_ui_locale=None,
         legacy_agent_reply_locale=None,
     )
-    scope = external_account_scope(db, binding)
+    scope = _resolved_inbound_account_scope(binding, inbound)
     current = unbind_external_identity(
         db, binding.tenant_id, binding.channel, inbound.from_user_id, scope
     )
@@ -2185,6 +2185,14 @@ def _recover_stale_durable_event(event_pk: str, *, db_engine=None) -> bool:
         if not _claim_stale_event(db, event_pk):
             return False
         event = db.get(ChannelInboundEvent, event_pk)
+        if binding.status != "active":
+            _finish_owned_inbound(
+                db,
+                event_pk,
+                status="failed",
+                error="binding_inactive",
+            )
+            return False
         try:
             inbound = _decode_and_validate_staged_event(event, binding)
         except ValueError as exc:
