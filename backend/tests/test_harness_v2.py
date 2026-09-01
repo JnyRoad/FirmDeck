@@ -1205,6 +1205,27 @@ def test_turn_planner_handoff_human_picks_reachable_handoff_node() -> None:
     assert frame.target_step_id == "handoff_tech"
 
 
+def test_resume_turn_distinguishes_new_handoff_decision_from_resumed_terminal_status() -> None:
+    """恢复轮次可再次决定转人工，但不能仅因旧 handoff 终态重复创建。"""
+    should_create = harness_v2_engine_module._should_create_conversation_handoff
+
+    assert should_create(
+        request_channel="human_handoff_resume",
+        decision="handoff_human",
+        result_status="completed",
+    )
+    assert not should_create(
+        request_channel="human_handoff_resume",
+        decision="answer_only",
+        result_status="handoff",
+    )
+    assert should_create(
+        request_channel="web",
+        decision="answer_only",
+        result_status="handoff",
+    )
+
+
 def test_turn_plan_defaults_null_container_fields() -> None:
     plan = TurnPlan.model_validate(
         {

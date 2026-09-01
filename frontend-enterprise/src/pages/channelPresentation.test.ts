@@ -10,6 +10,7 @@ import {
 describe('channel presentation', () => {
   it.each([
     ['wechat', '微信', '微信用户', '机器人 ID'],
+    ['wechat_kf', '微信客服', '微信客服用户', '客服账号 ID'],
     ['wecom', '企业微信', '企业微信用户', '机器人 ID'],
     ['feishu', '飞书', '飞书用户', 'App ID'],
   ])('%s uses its actual channel labels', (channel, name, userLabel, identifierLabel) => {

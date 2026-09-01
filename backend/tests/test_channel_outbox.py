@@ -7,6 +7,7 @@ from sqlmodel import Session, SQLModel, create_engine, select
 
 from app.channels.adapters import base as adapter_registry
 from app.channels.adapters.base import register_channel_adapter
+from app.channels.crypto import encrypt_channel_secret
 from app.channels.service_durable_inbox import reaction_target
 from app.channels.service_outbox import (
     cleanup_channel_reactions_before_binding_delete,
@@ -15,7 +16,7 @@ from app.channels.service_outbox import (
     stage_channel_delivery,
 )
 from app.config import get_settings
-from app.channels.crypto import encrypt_channel_secret
+from app.core.agent_loop import AgentLoop
 from app.db.models import (
     ChannelBinding,
     ChannelDelivery,
@@ -283,6 +284,115 @@ def test_channel_session_stages_delivery_in_same_transaction() -> None:
         assert delivery.target_json == {"to_user_id": "u1", "context_token": "ctx"}
 
 
+def test_channel_session_can_defer_durable_stream_fallback() -> None:
+    """A stream candidate must retain a durable outbox fallback without racing the stream."""
+    engine = _test_engine()
+    with Session(engine) as db:
+        binding = _seed_binding(db)
+        chat_session = _channel_session(binding)
+        message = _assistant_message(chat_session.id, "msg_stream_fallback")
+        db.add(chat_session)
+        db.add(message)
+        db.commit()
+        not_before = utc_now() + timedelta(seconds=120)
+
+        delivery = stage_channel_delivery(
+            db,
+            chat_session,
+            message,
+            not_before=not_before,
+        )
+        db.commit()
+
+        assert delivery is not None
+        assert delivery.status == "pending"
+        assert delivery.next_attempt_at == not_before
+        assert db.get(ChannelDelivery, delivery.id) is not None
+
+
+@pytest.mark.parametrize(
+    ("stream_succeeded", "expected_status"),
+    [(True, "delivered"), (False, "pending")],
+)
+def test_agent_loop_settles_durable_stream_fallback(
+    stream_succeeded: bool,
+    expected_status: str,
+) -> None:
+    """After the durable commit, stream success retires fallback and failure releases it."""
+    engine = _test_engine()
+    with Session(engine) as db:
+        binding = _seed_binding(db)
+        chat_session = _channel_session(binding)
+        message = _assistant_message(chat_session.id, f"msg_stream_{expected_status}")
+        db.add(chat_session)
+        db.add(message)
+        db.commit()
+        delivery = stage_channel_delivery(
+            db,
+            chat_session,
+            message,
+            not_before=utc_now() + timedelta(seconds=120),
+        )
+        db.commit()
+        assert delivery is not None
+        loop = AgentLoop(db)
+        loop.stream_delivery_id = delivery.id
+
+        loop._settle_stream_delivery(succeeded=stream_succeeded)
+
+        settled = db.get(ChannelDelivery, delivery.id)
+        assert settled is not None
+        assert settled.status == expected_status
+        if stream_succeeded:
+            assert settled.next_attempt_at is None
+            assert settled.delivered_at is not None
+        else:
+            assert settled.next_attempt_at is not None
+            assert settled.next_attempt_at <= utc_now()
+            assert settled.delivered_at is None
+
+
+@pytest.mark.parametrize("finish_succeeds", [True, False])
+def test_agent_loop_prepares_stream_without_publishing_terminal_frame(
+    finish_succeeds: bool,
+) -> None:
+    """Preparing persisted text must not call the provider terminal API before commit."""
+
+    class RecordingStream:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str | None]] = []
+
+        def replace_answer(self, answer: str) -> None:
+            self.calls.append(("replace", answer))
+
+        def finish(self) -> bool:
+            self.calls.append(("finish", None))
+            return finish_succeeds
+
+        def abort(self) -> None:
+            self.calls.append(("abort", None))
+
+    engine = _test_engine()
+    with Session(engine) as db:
+        sink = RecordingStream()
+        loop = AgentLoop(db, stream_sink=sink)
+
+        loop._prepare_stream_delivery("persisted reply", "raw reply")
+
+        assert sink.calls == [("replace", "persisted reply")]
+        assert loop.stream_delivery_pending is True
+        assert loop.stream_delivery_succeeded is False
+
+        loop._complete_stream_delivery()
+
+        expected_tail = [("finish", None)]
+        if not finish_succeeds:
+            expected_tail.append(("abort", None))
+        assert sink.calls[1:] == expected_tail
+        assert loop.stream_delivery_pending is False
+        assert loop.stream_delivery_succeeded is finish_succeeds
+
+
 def test_channel_staging_copies_message_language_snapshot_and_raw_reply() -> None:
     """Copy the assistant snapshot into outbox while preserving generated external text verbatim."""
     engine = _test_engine()
@@ -306,6 +416,37 @@ def test_channel_staging_copies_message_language_snapshot_and_raw_reply() -> Non
         assert delivery.language_context_json == _language_snapshot()
         assert delivery.text == "外部回复《保持原样》"
         assert message.content == "外部回复《保持原样》"
+
+
+def test_wechat_kf_staging_uses_account_target_and_stable_nonempty_key() -> None:
+    """Stage WeChat客服 replies without a legacy context token and keep the locale snapshot."""
+    engine = _test_engine()
+    with Session(engine) as db:
+        binding = _seed_binding(db, channel="wechat_kf")
+        chat_session = _channel_session(binding)
+        chat_session.channel_target_json = {
+            "to_user_id": "external-user-1",
+            "open_kfid": "wk-account-1",
+        }
+        message = _assistant_message(
+            chat_session.id,
+            "msg_wechat_kf_language",
+            "回复《保持原样》",
+        )
+        message.metadata_json = {"language_context": _language_snapshot()}
+        db.add(chat_session)
+        db.add(message)
+        db.commit()
+
+        stage_channel_delivery(db, chat_session, message)
+        db.commit()
+
+        delivery = db.exec(select(ChannelDelivery)).one()
+        assert delivery.status == "pending"
+        assert delivery.target_json == chat_session.channel_target_json
+        assert delivery.idempotency_key == message.id
+        assert delivery.idempotency_key
+        assert delivery.language_context_json == _language_snapshot()
 
 
 def test_channel_staging_without_snapshot_uses_controlled_legacy_context() -> None:

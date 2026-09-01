@@ -1097,6 +1097,8 @@ export type ChannelBindingRead = {
   baseurl?: string | null;
   bot_id?: string | null;
   corp_id?: string | null;
+  open_kfid?: string | null;
+  callback_ready?: boolean;
   app_id?: string | null;
   client_id?: string | null;
   bot_open_id?: string | null;
@@ -1109,6 +1111,7 @@ export type ChannelBindingRead = {
   created_by_name?: string | null;
   config_json?: Record<string, unknown>;
   agents: ChannelBindingAgentRead[];
+  wechat_kf_accounts?: WeChatKfAccountRead[];
   /** 团队绑定（与 agent 挂载互斥，后端逐步放开，可能缺省）。 */
   team_id?: string | null;
   team_name?: string | null;
@@ -1123,6 +1126,78 @@ export type ChannelBindingRead = {
   my_role?: string | null;
   created_at: string;
   updated_at: string;
+};
+
+/** 微信客服 binding 中的账号路由投影；不包含 provider Secret 或私有错误正文。 */
+export type WeChatKfAccountRead = {
+  open_kfid: string;
+  name: string;
+  agent_id?: string | null;
+  team_id?: string | null;
+  status: string;
+  sync_cursor: string;
+};
+
+/** provider 账号清单项；原始账号 ID、名称和头像 URL 必须逐字保留。 */
+export type WeChatKfProviderAccountRead = {
+  open_kfid: string;
+  name: string;
+  avatar: string;
+  manage_privilege: boolean;
+  bound: boolean;
+  bound_binding_id?: string | null;
+};
+
+/** callback 凭据准备的一次性响应；值只在当前受控 UI 会话中展示与复制。 */
+export type WeChatKfCallbackConfigRead = {
+  callback_url: string;
+  callback_path: string;
+  callback_token: string;
+  encoding_aes_key: string;
+};
+
+/** callback 准备请求；corp ID 是 provider 原始租户标识。 */
+export type WeChatKfCallbackConfigWrite = {
+  tenant_id: string;
+  corp_id: string;
+};
+
+/** 微信客服凭据写入请求；Secret 只允许发送，不得持久化到客户端。 */
+export type WeChatKfCredentialsWrite = WeChatKfCallbackConfigWrite & {
+  secret: string;
+  callback_token?: string;
+  encoding_aes_key?: string;
+};
+
+/** 选择现有 provider 客服账号的请求。 */
+export type WeChatKfAccountSelectWrite = {
+  tenant_id: string;
+  open_kfid: string;
+};
+
+/** 创建 provider 客服账号的请求；media ID 来自受控头像上传。 */
+export type WeChatKfAccountCreateWrite = {
+  tenant_id: string;
+  name: string;
+  media_id: string;
+};
+
+/** 更新已绑定 provider 客服账号的请求。 */
+export type WeChatKfAccountUpdateWrite = {
+  tenant_id: string;
+  open_kfid: string;
+  name: string;
+  media_id?: string | null;
+};
+
+/** 微信客服头像上传响应；media ID 是 provider 原始标识。 */
+export type WeChatKfAvatarUploadRead = {
+  media_id: string;
+};
+
+/** 微信客服咨询方式响应；URL 必须逐字展示与复制。 */
+export type WeChatKfContactWayRead = {
+  url: string;
 };
 
 export type ChannelBindingManagerRead = {

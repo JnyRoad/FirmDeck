@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Iterator
+from datetime import timedelta
 from time import sleep
 from typing import Any, Literal
 
@@ -45,6 +46,7 @@ from app.core.turn_finalizer import TurnFinalizer
 from app.db.models import (
     AgentProfile,
     ChannelBinding,
+    ChannelDelivery,
     ChatSession,
     HarnessTurnRecord,
     HumanHandoffRequest,
@@ -96,6 +98,8 @@ from app.session.session_schema import (
 from app.tools.tool_schema import ToolResult
 
 logger = logging.getLogger(__name__)
+
+_STREAM_FALLBACK_GRACE_SECONDS = 120
 
 STREAM_CHUNK_INTERVAL_SECONDS = 0.045
 MAX_TOOL_ACTIONS_PER_TURN = 32
@@ -181,13 +185,108 @@ class AgentLoop:
         db: Session,
         *,
         event_sink: Callable[[str, dict[str, Any]], None] | None = None,
+        stream_sink: Any | None = None,
     ) -> None:
+        """Initialize the turn runtime with optional progress and answer streaming."""
         self.db = db
         self.events = EventLog(db, event_sink=event_sink)
+        self.stream_sink = stream_sink
+        self.stream_delivery_succeeded = False
+        self.stream_delivery_pending = False
+        self.stream_delivery_id: str | None = None
         self.runtime = SkillRuntime()
         self.response_generator = ResponseGenerator()
         self.memory = MemoryService(db)
         self._language_context: LanguageContext | None = None
+
+    def _abort_stream_sink(self) -> None:
+        """Retire an unfinished channel stream without exposing provider failures."""
+        self.stream_delivery_pending = False
+        if self.stream_sink is None:
+            return
+        abort = getattr(self.stream_sink, "abort", None)
+        if not callable(abort):
+            return
+        try:
+            abort()
+        except Exception:
+            logger.exception("stream sink abort failed")
+
+    def _prepare_stream_delivery(self, reply: str, streamed_reply: str) -> None:
+        """Freeze the persisted answer in the sink without publishing a terminal frame."""
+        self.stream_delivery_succeeded = False
+        self.stream_delivery_pending = False
+        if self.stream_sink is None:
+            return
+        try:
+            replace_answer = getattr(self.stream_sink, "replace_answer", None)
+            if callable(replace_answer):
+                replace_answer(reply)
+                self.stream_delivery_pending = True
+            elif streamed_reply == reply:
+                self.stream_delivery_pending = True
+        except Exception:
+            logger.exception("stream sink answer preparation failed")
+        if not self.stream_delivery_pending:
+            abort = getattr(self.stream_sink, "abort", None)
+            if callable(abort):
+                try:
+                    abort()
+                except Exception:
+                    logger.exception("stream sink abort failed")
+
+    def _complete_stream_delivery(self) -> None:
+        """Publish the terminal frame only after the answer and fallback commit durably."""
+        if self.stream_sink is None:
+            return
+        succeeded = False
+        if self.stream_delivery_pending:
+            try:
+                succeeded = bool(self.stream_sink.finish())
+            except Exception:
+                logger.exception("stream sink finalization failed")
+            if not succeeded:
+                abort = getattr(self.stream_sink, "abort", None)
+                if callable(abort):
+                    try:
+                        abort()
+                    except Exception:
+                        logger.exception("stream sink abort failed")
+        self.stream_delivery_succeeded = succeeded
+        self.stream_delivery_pending = False
+        try:
+            self._settle_stream_delivery(succeeded=succeeded)
+        except Exception:
+            logger.exception("stream fallback settlement failed")
+            self.db.rollback()
+            try:
+                self._settle_stream_delivery(succeeded=succeeded)
+            except Exception:
+                logger.exception("stream fallback settlement retry failed")
+                self.db.rollback()
+
+    def _settle_stream_delivery(self, *, succeeded: bool) -> None:
+        """Retire or release the durable fallback after the stream terminal attempt."""
+        delivery_id = self.stream_delivery_id
+        if not delivery_id:
+            return
+        delivery = self.db.get(ChannelDelivery, delivery_id)
+        if delivery is None or delivery.status != "pending":
+            self.stream_delivery_id = None
+            return
+        delivery.updated_at = utc_now()
+        if succeeded:
+            delivery.status = "delivered"
+            delivery.next_attempt_at = None
+            delivery.last_error = None
+            delivery.delivered_at = delivery.updated_at
+        else:
+            delivery.next_attempt_at = delivery.updated_at
+            delivery.last_error = "stream_delivery_failed"
+            delivery.delivered_at = None
+        self.db.add(delivery)
+        self.db.commit()
+        self.stream_delivery_id = None
 
     def _record_legacy_event(
         self,
@@ -371,6 +470,7 @@ class AgentLoop:
             return self._response_with_language_context(engine.run(request))
         except (HarnessTurnConflict, HarnessSessionBusy) as exc:
             chat_session = engine.session
+            self._abort_stream_sink()
             self.db.rollback()
             chat_session = chat_session or self._get_or_create_session(request)
             raw_error_code = (
@@ -411,6 +511,7 @@ class AgentLoop:
         except HarnessExecutionCancelled:
             chat_session = engine.session
             user_message_id = engine.user_message_id
+            self._abort_stream_sink()
             engine.mark_cancelled()
             chat_session = chat_session or self._get_or_create_session(request)
             if user_message_id:
@@ -439,6 +540,7 @@ class AgentLoop:
         except LLMError as exc:
             chat_session = engine.session
             user_message_id = engine.user_message_id
+            self._abort_stream_sink()
             runtime_error_code = public_error_code(
                 getattr(exc, "code", None),
                 fallback="MODEL_UPSTREAM_ERROR",
@@ -465,6 +567,7 @@ class AgentLoop:
         except Exception:
             chat_session = engine.session
             user_message_id = engine.user_message_id
+            self._abort_stream_sink()
             runtime_error_code = "INTERNAL_ERROR"
             logger.exception(
                 "agent loop runtime failure",
@@ -1926,6 +2029,7 @@ class AgentLoop:
         self, chat_session: ChatSession, code: str, message: str
     ) -> ChatTurnResponse:
         """Finalize a configuration error while preserving the active language snapshot."""
+        self._abort_stream_sink()
         reply = format_runtime_failure_reply(
             localized_compat_text(
                 self._language_context,
@@ -2008,7 +2112,24 @@ class AgentLoop:
             reply,
             metadata=assistant_metadata,
         )
-        stage_channel_delivery(self.db, chat_session, assistant_message)
+        if not self.stream_delivery_succeeded:
+            not_before = (
+                utc_now() + timedelta(seconds=_STREAM_FALLBACK_GRACE_SECONDS)
+                if self.stream_delivery_pending
+                else None
+            )
+            delivery = stage_channel_delivery(
+                self.db,
+                chat_session,
+                assistant_message,
+                not_before=not_before,
+            )
+            if (
+                self.stream_delivery_pending
+                and delivery is not None
+                and delivery.status == "pending"
+            ):
+                self.stream_delivery_id = delivery.id
         event_payload: dict[str, Any] = {
             "message_id": assistant_message.id,
             "assistant_message_id": assistant_message.id,

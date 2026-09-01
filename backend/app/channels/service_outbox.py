@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from sqlalchemy import func, or_, update
 from sqlmodel import Session, select
@@ -155,7 +155,13 @@ def _find_active_binding_for_agent(db: Session, chat_session: ChatSession) -> Ch
     return None
 
 
-def stage_channel_delivery(db: Session, chat_session: ChatSession, message: Message) -> None:
+def stage_channel_delivery(
+    db: Session,
+    chat_session: ChatSession,
+    message: Message,
+    *,
+    not_before: datetime | None = None,
+) -> ChannelDelivery | None:
     """把 assistant 回复登记为渠道 outbox 投递（随主事务提交，不单独 commit）。
 
     Web 会话不受渠道 staging 影响；渠道会话必须留下 delivery 或让事务失败。
@@ -227,9 +233,11 @@ def stage_channel_delivery(db: Session, chat_session: ChatSession, message: Mess
             select(ChannelDelivery).where(ChannelDelivery.idempotency_key == idempotency_key)
         ).first()
         if existing:
-            return
+            return existing
         if binding.channel == "feishu":
             valid_target = bool(target.get("message_id") or target.get("receive_id"))
+        elif binding.channel == "wechat_kf":
+            valid_target = bool(target.get("to_user_id") and target.get("open_kfid"))
         else:
             valid_target = bool(target.get("to_user_id") and target.get("context_token"))
         if not valid_target:
@@ -243,22 +251,22 @@ def stage_channel_delivery(db: Session, chat_session: ChatSession, message: Mess
                 language_context=language_context,
                 idempotency_key=idempotency_key,
             )
-            return
-        db.add(
-            ChannelDelivery(
-                tenant_id=chat_session.tenant_id,
-                binding_id=binding.id,
-                session_id=chat_session.id,
-                message_id=message.id,
-                target_json=target,
-                kind="reply",
-                text=message.content,
-                status="pending",
-                next_attempt_at=utc_now(),
-                idempotency_key=idempotency_key,
-                language_context_json=language_context.model_dump(mode="json"),
-            )
+            return None
+        delivery = ChannelDelivery(
+            tenant_id=chat_session.tenant_id,
+            binding_id=binding.id,
+            session_id=chat_session.id,
+            message_id=message.id,
+            target_json=target,
+            kind="reply",
+            text=message.content,
+            status="pending",
+            next_attempt_at=not_before or utc_now(),
+            idempotency_key=idempotency_key,
+            language_context_json=language_context.model_dump(mode="json"),
         )
+        db.add(delivery)
+        return delivery
     except Exception:
         logger.exception("渠道投递登记失败 session=%s", getattr(chat_session, "id", None))
         if getattr(chat_session, "channel", None):
@@ -953,6 +961,9 @@ def resolve_assignee_channel_identity(
 # 钉钉/微信适配器只能回会话内消息(依赖 session_webhook/context_token),
 # 无法主动私聊处理人,故不在集合内。
 HANDOFF_NOTIFY_CHANNELS = frozenset({"feishu", "wecom"})
+# Avoid repeated notifications for a pending request while permitting a new
+# notice after a delivered notification has remained unanswered for five minutes.
+HANDOFF_NOTIFY_RETRY_SECONDS = 300
 
 # 各渠道 handoff 通知的投递 target 构造。
 _HANDOFF_NOTIFY_TARGET_BUILDERS = {
@@ -1136,14 +1147,26 @@ def notify_handoff_assignee(
         if handoff.language_context_json is None:
             handoff.language_context_json = language_context.model_dump(mode="json")
         existing_notice = db.exec(
-            select(ChannelDelivery).where(
+            select(ChannelDelivery)
+            .where(
                 ChannelDelivery.tenant_id == binding.tenant_id,
                 ChannelDelivery.binding_id == binding.id,
                 ChannelDelivery.kind == "handoff_notice",
                 ChannelDelivery.session_id == f"handoff:{handoff.id}",
             )
+            .order_by(ChannelDelivery.created_at.desc())
         ).first()
-        if existing_notice:
+        if existing_notice and (
+            existing_notice.status in {"pending", "sending"}
+            or (
+                existing_notice.status == "delivered"
+                and (
+                    utc_now()
+                    - (existing_notice.delivered_at or existing_notice.created_at)
+                ).total_seconds()
+                < HANDOFF_NOTIFY_RETRY_SECONDS
+            )
+        ):
             if existing_notice.language_context_json is None:
                 existing_notice.language_context_json = language_context.model_dump(mode="json")
                 db.add(existing_notice)
@@ -1190,9 +1213,12 @@ def notify_handoff_assignee(
             )
             text_parts.append(context_summary[:800])
         text_parts.append("")
-        text_parts.append(
-            render_channel_notice(ChannelNotice("handoff.reply_instructions"), language_context)
+        instructions = (
+            ChannelNotice("handoff.reply_instructions")
+            if binding.channel == "feishu"
+            else ChannelNotice("handoff.reply_instructions_wecom", {"handoff_id": handoff.id})
         )
+        text_parts.append(render_channel_notice(instructions, language_context))
         text = "\n".join(text_parts)
         build_target = _HANDOFF_NOTIFY_TARGET_BUILDERS[binding.channel]
         target = build_target(external_user_id, handoff.id)

@@ -1,4 +1,16 @@
 import { getEnterpriseAuthSession } from '../auth';
+import type {
+  ChannelBindingRead,
+  WeChatKfAccountCreateWrite,
+  WeChatKfAccountSelectWrite,
+  WeChatKfAccountUpdateWrite,
+  WeChatKfAvatarUploadRead,
+  WeChatKfCallbackConfigRead,
+  WeChatKfCallbackConfigWrite,
+  WeChatKfContactWayRead,
+  WeChatKfCredentialsWrite,
+  WeChatKfProviderAccountRead,
+} from '../types';
 
 const resolveApiBase = () => {
   if (import.meta.env.VITE_API_BASE_URL) {
@@ -50,6 +62,22 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
       ...(options.headers || {}),
     },
     ...options,
+    credentials: 'include',
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new ApiError(response.status, text, response.statusText);
+  }
+  const text = await response.text();
+  return (text ? JSON.parse(text) : {}) as T;
+}
+
+/** 发送 multipart 请求并让浏览器生成 boundary；失败仍复用 ApiError 的安全诊断边界。 */
+async function requestForm<T>(path: string, body: FormData): Promise<T> {
+  const response = await fetch(`${API_BASE}${path}`, {
+    method: 'POST',
+    headers: { ...authHeader() },
+    body,
     credentials: 'include',
   });
   if (!response.ok) {
@@ -125,6 +153,130 @@ export const api = {
     }
     return response.blob();
   },
+};
+
+/** 构造微信客服 binding 的受控 API 前缀；binding ID 仅作为 URL path 标识。 */
+function wechatKfBindingPath(bindingId: string): string {
+  return `/api/enterprise/channels/${encodeURIComponent(bindingId)}/wechat_kf`;
+}
+
+/** 准备 callback URL、token 与 AES key；响应仅返回给当前调用方。 */
+async function prepareWechatKfCallback(
+  bindingId: string,
+  payload: WeChatKfCallbackConfigWrite,
+): Promise<WeChatKfCallbackConfigRead> {
+  return request<WeChatKfCallbackConfigRead>(`${wechatKfBindingPath(bindingId)}/callback-config`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+/** 保存微信客服 Secret 与 callback 凭据；函数不缓存或回传 Secret。 */
+async function saveWechatKfCredentials(
+  bindingId: string,
+  payload: WeChatKfCredentialsWrite,
+): Promise<ChannelBindingRead> {
+  return request<ChannelBindingRead>(`${wechatKfBindingPath(bindingId)}/credentials`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+/** 读取当前用户可管理的 provider 客服账号清单。 */
+async function listWechatKfAccounts(
+  bindingId: string,
+  tenantId: string,
+): Promise<{ accounts: WeChatKfProviderAccountRead[] }> {
+  return request(`${wechatKfBindingPath(bindingId)}/accounts?tenant_id=${encodeURIComponent(tenantId)}`);
+}
+
+/** 将一个现有 provider 客服账号绑定到当前 StaffDeck 路由。 */
+async function selectWechatKfAccount(
+  bindingId: string,
+  payload: WeChatKfAccountSelectWrite,
+): Promise<ChannelBindingRead> {
+  return request<ChannelBindingRead>(`${wechatKfBindingPath(bindingId)}/account`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+/** 创建 provider 客服账号并绑定当前路由。 */
+async function createWechatKfAccount(
+  bindingId: string,
+  payload: WeChatKfAccountCreateWrite,
+): Promise<ChannelBindingRead> {
+  return request<ChannelBindingRead>(`${wechatKfBindingPath(bindingId)}/accounts`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+/** 更新已绑定客服账号名称；只有选择新头像时才携带可选 media ID。 */
+async function updateWechatKfAccount(
+  bindingId: string,
+  payload: WeChatKfAccountUpdateWrite,
+): Promise<ChannelBindingRead> {
+  return request<ChannelBindingRead>(`${wechatKfBindingPath(bindingId)}/account`, {
+    method: 'PATCH',
+    body: JSON.stringify(payload),
+  });
+}
+
+/** 删除已绑定客服账号；账号 ID 只进入编码后的 path。 */
+async function deleteWechatKfAccount(
+  bindingId: string,
+  openKfid: string,
+  tenantId: string,
+): Promise<ChannelBindingRead> {
+  return request<ChannelBindingRead>(
+    `${wechatKfBindingPath(bindingId)}/account/${encodeURIComponent(openKfid)}?tenant_id=${encodeURIComponent(tenantId)}`,
+    { method: 'DELETE' },
+  );
+}
+
+/** 上传已由调用方校验的头像文件；文件只存在于本次 multipart 请求。 */
+async function uploadWechatKfAvatar(
+  bindingId: string,
+  file: File,
+  tenantId: string,
+): Promise<WeChatKfAvatarUploadRead> {
+  const form = new FormData();
+  form.append('file', file);
+  return requestForm(
+    `${wechatKfBindingPath(bindingId)}/avatar?tenant_id=${encodeURIComponent(tenantId)}`,
+    form,
+  );
+}
+
+/** 为已绑定客服账号生成咨询链接；返回 URL 保持 provider 原值。 */
+async function createWechatKfContactWay(
+  bindingId: string,
+  openKfid: string,
+  tenantId: string,
+): Promise<WeChatKfContactWayRead> {
+  const query = new URLSearchParams({
+    tenant_id: tenantId,
+    open_kfid: openKfid,
+    scene: 'staffdeck',
+  });
+  return request<WeChatKfContactWayRead>(
+    `${wechatKfBindingPath(bindingId)}/contact-way?${query.toString()}`,
+    { method: 'POST' },
+  );
+}
+
+/** 微信客服 setup 的完整类型化 API 边界；每个方法只映射一个 Task 2 路由。 */
+export const wechatKfApi = {
+  prepareCallback: prepareWechatKfCallback,
+  saveCredentials: saveWechatKfCredentials,
+  listAccounts: listWechatKfAccounts,
+  selectAccount: selectWechatKfAccount,
+  createAccount: createWechatKfAccount,
+  updateAccount: updateWechatKfAccount,
+  deleteAccount: deleteWechatKfAccount,
+  uploadAvatar: uploadWechatKfAvatar,
+  createContactWay: createWechatKfContactWay,
 };
 
 export async function uploadChatAttachments<T>(

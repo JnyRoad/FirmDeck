@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from sqlmodel import Session
 
@@ -29,11 +30,17 @@ from app.api import (
     tools,
     traces,
     ui_config,
+    wechat_kf,
 )
 from app.async_jobs import shutdown_async_jobs, start_async_jobs
 from app.channels import start_channel_services, stop_channel_services
+from app.channels.service_wechat_kf_recovery import (
+    start_wechat_kf_account_recovery,
+    stop_wechat_kf_account_recovery,
+)
 from app.codex_subscription import stop_codex_subscription_service
 from app.config import get_settings
+from app.contracts.fastapi import request_validation_error_handler
 from app.core.harness_recovery import (
     recover_orphan_harness_runs,
     start_harness_recovery_sweeper,
@@ -61,6 +68,9 @@ app = FastAPI(
     openapi_url=None,
 )
 
+app.add_exception_handler(RequestValidationError, request_validation_error_handler)
+app.add_middleware(wechat_kf.WeChatKfAvatarRequestLimitMiddleware)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origin_list,
@@ -72,6 +82,7 @@ app.add_middleware(
 
 @app.on_event("startup")
 def on_startup() -> None:
+    """Initialize durable stores and recover bounded work before starting live services."""
     acquire_runtime_instance_lock()
     try:
         start_async_jobs()
@@ -83,6 +94,9 @@ def on_startup() -> None:
         recover_a2a_client_tasks()
         start_background_worker()
         start_channel_services()
+        start_wechat_kf_account_recovery(
+            channels.reconcile_wechat_kf_account_operations
+        )
         start_timeout_sweeper()
         start_harness_recovery_sweeper()
         # Internal durable jobs (for example feedback analysis) use the same
@@ -93,23 +107,32 @@ def on_startup() -> None:
             enqueue_due_webhook_deliveries()
             start_public_api_maintenance()
     except Exception:
-        release_runtime_instance_lock()
+        recovery_stopped = stop_wechat_kf_account_recovery(
+            on_stopped=release_runtime_instance_lock
+        )
+        if recovery_stopped:
+            release_runtime_instance_lock()
         raise
 
 
 @app.on_event("shutdown")
 def on_shutdown() -> None:
+    recovery_stopped = False
     try:
         stop_codex_a2a_tasks()
         stop_codex_subscription_service()
         stop_public_api_maintenance()
+        recovery_stopped = stop_wechat_kf_account_recovery(
+            on_stopped=release_runtime_instance_lock
+        )
         stop_channel_services()
         stop_background_worker()
         stop_timeout_sweeper()
         stop_harness_recovery_sweeper()
         shutdown_async_jobs()
     finally:
-        release_runtime_instance_lock()
+        if recovery_stopped:
+            release_runtime_instance_lock()
 
 
 @app.get("/api/health", tags=["health"])
@@ -139,6 +162,7 @@ app.include_router(scheduled_tasks.chat_draft_router)
 app.include_router(ui_config.enterprise_router)
 app.include_router(ui_config.network_router)
 app.include_router(channels.router)
+app.include_router(wechat_kf.router)
 app.include_router(teams.router)
 app.include_router(teams.threads_router)
 app.include_router(tools.router)

@@ -85,6 +85,18 @@ from app.skills.nesting import discoverable_sops, expand_visible_sops
 logger = logging.getLogger(__name__)
 
 
+def _should_create_conversation_handoff(
+    *,
+    request_channel: str,
+    decision: str,
+    result_status: str,
+) -> bool:
+    """区分恢复旧 handoff 终态与恢复轮次中新产生的转人工决策。"""
+    if decision == "handoff_human":
+        return True
+    return request_channel != "human_handoff_resume" and result_status == "handoff"
+
+
 def _public_harness_error(value: object) -> object:
     """Project a Harness error for durable/event boundaries while preserving empty success values."""
     if value is None or value == {}:
@@ -716,6 +728,7 @@ class HarnessV2Engine:
         )
         self._renew_session_lease()
         reply = _single_task_reply(execution_results)
+        streamed_reply = ""
         if team_publish_result is not None and not execution_results:
             task_count = len(team_publish_result.task_ids)
             reply = localized_compat_text(
@@ -723,8 +736,21 @@ class HarnessV2Engine:
                 zh_cn=f"已完成 {task_count} 个团队任务的拆分与派发。",
                 en_us=f"Split and dispatched {task_count} team tasks.",
             )
-        if reply is None:
-            reply = self.owner.response_generator.generate(
+        is_handoff = any(result.status == "handoff" for result in execution_results)
+        if is_handoff:
+            # A handoff is a successful queued transition; keep the user-facing
+            # acknowledgement localized and stream it through the same sink.
+            reply = localized_compat_text(
+                request.language_context,
+                zh_cn="已为你提交人工处理请求，请稍候，工作人员会尽快回复。",
+                en_us="Your request was sent to a human. Please wait for a response.",
+            )
+            if self.owner.stream_sink is not None:
+                for chunk in self.owner.response_generator.chunk_text(reply):
+                    streamed_reply += chunk
+                    self.owner.stream_sink.on_delta(chunk)
+        elif reply is None:
+            response_args = (
                 execution_request.message,
                 session,
                 response_skill,
@@ -736,8 +762,26 @@ class HarnessV2Engine:
                 memory_context,
                 conversation_context,
                 execution_payloads,
-                language_context=request.language_context,
             )
+            if self.owner.stream_sink is not None:
+                streamed_parts: list[str] = []
+                for chunk in self.owner.response_generator.generate_stream(
+                    *response_args,
+                    language_context=request.language_context,
+                ):
+                    streamed_parts.append(chunk)
+                    streamed_reply += chunk
+                    self.owner.stream_sink.on_delta(chunk)
+                reply = "".join(streamed_parts)
+            else:
+                reply = self.owner.response_generator.generate(
+                    *response_args,
+                    language_context=request.language_context,
+                )
+        elif self.owner.stream_sink is not None:
+            for chunk in self.owner.response_generator.chunk_text(reply):
+                streamed_reply += chunk
+                self.owner.stream_sink.on_delta(chunk)
         self._renew_session_lease()
         reply, citations = compact_knowledge_citation_labels(reply, citations)
         artifacts = _aggregate_artifacts(execution_results)
@@ -761,12 +805,16 @@ class HarnessV2Engine:
         if artifacts:
             assistant_metadata["harness_artifacts"] = artifacts
         if self.slash_command:
-            assistant_metadata["slash_command"] = self.slash_command.model_dump(
-                mode="json"
-            )
+            assistant_metadata["slash_command"] = self.slash_command.model_dump(mode="json")
         # Cancellation and normal projection compete for this durable receipt.
         # Only the winner may append a terminal assistant message.
         self._raise_if_cancelled(request, session)
+        if self.owner.stream_sink is not None:
+            # Reserve a deferred outbox row before projection.  The provider
+            # terminal frame is sent only after the assistant message and turn
+            # receipt commit, so a crash retains a recoverable fallback.
+            self.owner.stream_delivery_succeeded = False
+            self.owner.stream_delivery_pending = True
         self.turn_store.begin_completion(self.turn_record)
         reply = self.owner._finalize_turn(
             session,
@@ -777,16 +825,8 @@ class HarnessV2Engine:
             user_message_id=user_message.id,
             assistant_metadata_override=assistant_metadata,
         )
-        self.db.commit()
-        self.db.refresh(session)
-        if request.message_visibility == "visible":
-            self.owner._enqueue_memory_capture(
-                request,
-                session,
-                last_step_result,
-                None,
-                model_config,
-            )
+        if self.owner.stream_sink is not None:
+            self.owner._prepare_stream_delivery(reply, streamed_reply)
         response = ChatTurnResponse(
             reply=reply,
             session_id=session.id,
@@ -796,6 +836,19 @@ class HarnessV2Engine:
             session_state=public_session(session),
         )
         self.turn_store.complete(self.turn_record, response)
+        self.db.commit()
+        self.db.refresh(session)
+        if self.owner.stream_sink is not None:
+            self.owner._complete_stream_delivery()
+        if request.message_visibility == "visible":
+            self.owner._enqueue_memory_capture(
+                request,
+                session,
+                last_step_result,
+                None,
+                model_config,
+            )
+        response = response.model_copy(update={"session_state": public_session(session)})
         return response
 
     def close(self) -> None:
@@ -1040,13 +1093,9 @@ class HarnessV2Engine:
                 active_step_id=frame.target_step_id,
                 agent_id=session.agent_id,
                 run_id=run.id,
-                initially_activated_names=(
-                    requirement.capability_manifest.allowed_names()
-                ),
+                initially_activated_names=(requirement.capability_manifest.allowed_names()),
                 is_cancelled=lambda: self._is_cancelled(request, session),
-                ensure_execution_lease=lambda: self._renew_execution_leases(
-                    row
-                ),
+                ensure_execution_lease=lambda: self._renew_execution_leases(row),
                 trace_sink=trace,
                 step_deadline_monotonic=step_deadline_monotonic,
                 language_context=request.language_context,
@@ -1065,6 +1114,10 @@ class HarnessV2Engine:
                 checkpoint=loop_checkpoint,
                 language_context=request.language_context,
             )
+            if request.channel == "human_handoff_resume" and result.status == "handoff":
+                # The human reply is already the handoff completion signal. Do not
+                # re-enter the same terminal handoff node during the resume turn.
+                result.status = "completed"
             deferred_continuation = False
             if frame.kind == "sop":
                 deferred_result = _defer_failed_step_after_completed_checkpoint(
@@ -1104,9 +1157,10 @@ class HarnessV2Engine:
                 break
 
             if frame.kind == "conversation":
-                if (
-                    frame.decision == "handoff_human"
-                    or result.status == "handoff"
+                if _should_create_conversation_handoff(
+                    request_channel=request.channel,
+                    decision=frame.decision,
+                    result_status=result.status,
                 ):
                     result.status = "handoff"
                     last_step_result = _step_result(result)

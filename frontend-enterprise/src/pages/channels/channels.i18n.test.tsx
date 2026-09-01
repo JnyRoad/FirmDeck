@@ -123,7 +123,7 @@ describe('channels semantic locale matrix', () => {
 
       const copy = managersCopy[locale];
       expect(await screen.findByText(copy.title)).toBeTruthy();
-      expect(screen.getByText('Raw Manager Name')).toBeTruthy();
+      expect(await screen.findByText('Raw Manager Name')).toBeTruthy();
       expect(screen.getByText(/Raw Granter Name/)).toBeTruthy();
       expect(screen.getByRole('button', { name: locale === 'zh-CN' ? '移除' : 'Remove' })).toBeTruthy();
     },

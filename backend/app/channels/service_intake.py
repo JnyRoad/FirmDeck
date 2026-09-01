@@ -8,6 +8,7 @@ from datetime import timedelta
 
 from sqlalchemy import or_, update
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import object_session
 from sqlmodel import Session, select
 
 from app.channels.adapters.base import (
@@ -51,6 +52,7 @@ from app.db.models import (
     Message,
     Team,
     User,
+    WeChatKfAccount,
     new_id,
     utc_now,
 )
@@ -66,6 +68,8 @@ logger = logging.getLogger(__name__)
 # handoff_reply 命令成功时返回此哨兵,跳过通用 _stage_notice(已自行创建 handoff_ack)
 _HANDOFF_REPLY_HANDLED: object = object()
 _DEDUP_LOOKBACK = 50
+_HANDOFF_LOOKUP_LIMIT = 100
+_DURABLE_INBOX_CHANNELS = frozenset({"feishu", "wecom", "dingtalk", "wechat_kf"})
 _processor_run_pid: int | None = None
 _processor_run_id: str | None = None
 _processor_run_guard = threading.Lock()
@@ -201,7 +205,7 @@ def claim_staged_inbound(event_id: str, *, db_engine=None) -> bool:
             update(ChannelInboundEvent)
             .where(
                 ChannelInboundEvent.id == event_id,
-                ChannelInboundEvent.channel.in_({"feishu", "wecom", "dingtalk"}),
+                ChannelInboundEvent.channel.in_(_DURABLE_INBOX_CHANNELS),
                 ChannelInboundEvent.status == "received",
             )
             .values(
@@ -596,9 +600,26 @@ def _build_name_resolver(binding: ChannelBinding):
 
 
 def _valid_notice_target(channel: str, target: dict) -> bool:
+    """Validate the immutable outbound target fields required by one channel."""
     if channel == "feishu":
         return bool(target.get("message_id") or target.get("receive_id"))
+    if channel == "wechat_kf":
+        return bool(target.get("to_user_id") and target.get("open_kfid"))
     return bool(target.get("to_user_id") and target.get("context_token"))
+
+
+def _resolved_inbound_account_scope(
+    binding: ChannelBinding,
+    inbound: ChannelInbound,
+) -> str:
+    """Resolve processing scope while preserving WeChat客服 account isolation."""
+    if binding.channel != "wechat_kf":
+        return external_account_scope(None, binding)
+    corp_id = str((binding.config_json or {}).get("corp_id") or "").strip()
+    expected_scope = f"{corp_id}:{inbound.to_user_id}" if corp_id else ""
+    if not expected_scope or inbound.account_scope != expected_scope:
+        raise ValueError("wechat_kf_account_scope_mismatch")
+    return expected_scope
 
 
 def _reaction_staging_enabled(channel: str) -> bool:
@@ -755,7 +776,7 @@ def _bind_external_identity(
     if not code:
         return render_channel_notice(ChannelNotice("binding.usage"), context)
     external_id = inbound.from_user_id
-    scope = external_account_scope(db, binding)
+    scope = _resolved_inbound_account_scope(binding, inbound)
     # 限流:按完整身份键计数,连续错码/过期码达上限后冷却,冷却期内连正确码也拒绝
     if _bind_cooldown_remaining(binding.tenant_id, binding.channel, scope, external_id) > 0:
         return render_channel_notice(ChannelNotice("binding.cooldown"), context)
@@ -836,7 +857,7 @@ def _unbind_external_identity(
         legacy_ui_locale=None,
         legacy_agent_reply_locale=None,
     )
-    scope = external_account_scope(db, binding)
+    scope = _resolved_inbound_account_scope(binding, inbound)
     current = unbind_external_identity(
         db, binding.tenant_id, binding.channel, inbound.from_user_id, scope
     )
@@ -926,24 +947,28 @@ def _stage_feishu_assignee_reply(
     rendered_text = (
         render_channel_notice(text, context) if isinstance(text, ChannelNotice) else text
     )
-    db.add(
-        ChannelDelivery(
-            tenant_id=binding.tenant_id,
-            binding_id=binding.id,
-            session_id=session_id,
-            message_id=None,
-            target_json={
-                "receive_id_type": "open_id",
-                "receive_id": inbound.from_user_id,
-            },
-            kind="handoff_ack",
-            text=rendered_text,
-            status="pending",
-            next_attempt_at=utc_now(),
-            idempotency_key=new_id("hreplyack"),
-            language_context_json=context.model_dump(mode="json"),
+    ack_key = f"handoff-ack:{binding.id}:{session_id}:{inbound.event_id}"
+    if not db.exec(
+        select(ChannelDelivery).where(ChannelDelivery.idempotency_key == ack_key)
+    ).first():
+        db.add(
+            ChannelDelivery(
+                tenant_id=binding.tenant_id,
+                binding_id=binding.id,
+                session_id=session_id,
+                message_id=None,
+                target_json={
+                    "receive_id_type": "open_id",
+                    "receive_id": inbound.from_user_id,
+                },
+                kind="handoff_ack",
+                text=rendered_text,
+                status="pending",
+                next_attempt_at=utc_now(),
+                idempotency_key=ack_key,
+                language_context_json=context.model_dump(mode="json"),
+            )
         )
-    )
     event.status = "done"
     event.processed_at = utc_now()
     event.updated_at = utc_now()
@@ -1079,11 +1104,12 @@ def _run_handoff_reply_command(
     *,
     language_context: LanguageContext | dict | None = None,
 ) -> str:
-    """/回复反馈 指令处理:处理人通过飞书发送 /回复反馈 <内容> 回复人工转接通知。
+    """处理人通过渠道发送 /回复反馈,并恢复对应人工转接请求。
 
     匹配策略(按优先级):
     1. 引用通知(parent_id):按 handoff.notify_message_id == parent_id 精确匹配。
-    2. 非引用:查发送者在当前 binding scope 下的 ChannelIdentity → staffdeck_user_id,
+    2. 企业微信显式 handoff ID 或最近一次已投递通知。
+    3. 其他渠道查发送者在当前 binding scope 下的 ChannelIdentity → staffdeck_user_id,
        再查该 user 名下 status=pending 的 handoff。恰好一个时直接使用;多个时拒绝,
        提示处理人回复对应通知消息。
     命中后复用 _apply_handoff_reply 置 answered + 恢复 SOP,并给处理人回确认。
@@ -1096,7 +1122,12 @@ def _run_handoff_reply_command(
     )
     reply_text = command.query.strip()
     if not reply_text:
-        return render_channel_notice(ChannelNotice("handoff.command_usage"), context)
+        usage_code = (
+            "handoff.wecom_command_usage" if binding.channel == "wecom" else "handoff.command_usage"
+        )
+        return render_channel_notice(ChannelNotice(usage_code), context)
+    if binding.channel == "wecom" and ("<答复内容>" in reply_text or "<response>" in reply_text):
+        return render_channel_notice(ChannelNotice("handoff.wecom_placeholder"), context)
     # 查发送者身份(用当前 binding scope 隔离)
     scope = external_account_scope(db, binding)
     identity = db.exec(
@@ -1111,7 +1142,79 @@ def _run_handoff_reply_command(
     if not assignee_user_id:
         return render_channel_notice(ChannelNotice("handoff.identity_missing"), context)
 
+    if binding.channel == "wecom":
+        # A redelivered callback may arrive after the first invocation already
+        # answered the handoff.  Check the deterministic ack key before status
+        # matching so the duplicate is consumed idempotently instead of falling
+        # through to a misleading "no pending request" response.
+        ack_suffix = f":{inbound.event_id}"
+        like_event_id = (
+            inbound.event_id.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        )
+        existing_acks = db.exec(
+            select(ChannelDelivery)
+            .where(
+                ChannelDelivery.tenant_id == binding.tenant_id,
+                ChannelDelivery.binding_id == binding.id,
+                ChannelDelivery.kind == "handoff_ack",
+                ChannelDelivery.idempotency_key.like(
+                    f"handoff-ack:{binding.id}:%:{like_event_id}",
+                    escape="\\",
+                ),
+            )
+            .limit(_HANDOFF_LOOKUP_LIMIT)
+        ).all()
+        if any(
+            str(row.idempotency_key or "").startswith(f"handoff-ack:{binding.id}:")
+            and str(row.idempotency_key or "").endswith(ack_suffix)
+            and str((row.target_json or {}).get("to_user_id") or "").strip() == inbound.from_user_id
+            for row in existing_acks
+        ):
+            return _HANDOFF_REPLY_HANDLED
+
     handoff: HumanHandoffRequest | None = None
+    if binding.channel == "wecom":
+        # WeCom does not expose a stable quoted-message parent. Require the
+        # displayed handoff id when supplied, then verify the notice target.
+        command_parts = reply_text.split(maxsplit=1)
+        explicit_handoff_id = (
+            command_parts[0].strip()
+            if command_parts and command_parts[0].startswith("handoff_")
+            else ""
+        )
+        if explicit_handoff_id:
+            if len(command_parts) != 2:
+                return render_channel_notice(ChannelNotice("handoff.wecom_reply_required"), context)
+            candidate = db.get(HumanHandoffRequest, explicit_handoff_id)
+            if (
+                not candidate
+                or candidate.tenant_id != binding.tenant_id
+                or candidate.status != "pending"
+                or candidate.assignee_user_id != assignee_user_id
+            ):
+                return render_channel_notice(ChannelNotice("handoff.wecom_id_missing"), context)
+            reply_text = command_parts[1].strip()
+            if not reply_text:
+                return render_channel_notice(ChannelNotice("handoff.wecom_reply_required"), context)
+            notice = db.exec(
+                select(ChannelDelivery)
+                .where(
+                    ChannelDelivery.tenant_id == binding.tenant_id,
+                    ChannelDelivery.binding_id == binding.id,
+                    ChannelDelivery.kind == "handoff_notice",
+                    ChannelDelivery.session_id == f"handoff:{candidate.id}",
+                    ChannelDelivery.status == "delivered",
+                )
+                .order_by(ChannelDelivery.created_at.desc())
+            ).first()
+            if (
+                not notice
+                or str((notice.target_json or {}).get("to_user_id") or "").strip()
+                != inbound.from_user_id
+            ):
+                return render_channel_notice(ChannelNotice("handoff.wecom_notice_missing"), context)
+            handoff = candidate
+
     # 策略 1:引用通知 — 按 parent_id -> notify_message_id 精确匹配
     reply_ids = _feishu_reply_message_ids(inbound)
     if reply_ids:
@@ -1143,7 +1246,37 @@ def _run_handoff_reply_command(
             # 同时校验通知实际目标与当前 StaffDeck 身份，防止引用或身份变更后越权。
             return render_channel_notice(ChannelNotice("handoff.forbidden"), context)
 
-    # 策略 2:非引用 — 按 assignee 查 pending handoff
+    # 策略 2:企业微信没有统一的引用消息字段,按当前绑定下最近一次已投递的
+    # handoff 通知匹配;仍限制在当前账号和当前 StaffDeck 身份作用域内。
+    if not handoff and binding.channel == "wecom":
+        notices = db.exec(
+            select(ChannelDelivery)
+            .where(
+                ChannelDelivery.tenant_id == binding.tenant_id,
+                ChannelDelivery.binding_id == binding.id,
+                ChannelDelivery.kind == "handoff_notice",
+                ChannelDelivery.status == "delivered",
+            )
+            .order_by(ChannelDelivery.created_at.desc())
+            .limit(_HANDOFF_LOOKUP_LIMIT)
+        ).all()
+        for notice in notices:
+            target = notice.target_json or {}
+            if str(target.get("to_user_id") or "").strip() != inbound.from_user_id:
+                continue
+            handoff_id = str(target.get("handoff_id") or "").strip()
+            candidate = db.get(HumanHandoffRequest, handoff_id) if handoff_id else None
+            if (
+                candidate
+                and candidate.tenant_id == binding.tenant_id
+                and candidate.status == "pending"
+                and candidate.assignee_user_id == assignee_user_id
+            ):
+                handoff = candidate
+                break
+
+    # 策略 3:非引用 — 按 assignee 查 pending handoff。飞书/无可用企微通知
+    # 时保留原有的单请求和多请求保护,避免误回错人工请求。
     if not handoff:
         pending = db.exec(
             select(HumanHandoffRequest)
@@ -1169,6 +1302,10 @@ def _run_handoff_reply_command(
         handoff.language_context_json = context.model_dump(mode="json")
         db.add(handoff)
 
+    ack_key = f"handoff-ack:{binding.id}:{handoff.id}:{inbound.event_id}"
+    if db.exec(select(ChannelDelivery).where(ChannelDelivery.idempotency_key == ack_key)).first():
+        return _HANDOFF_REPLY_HANDLED
+
     from app.api.chat import _apply_handoff_reply
 
     answered_by = assignee_user_id or handoff.assignee_user_id
@@ -1177,19 +1314,24 @@ def _run_handoff_reply_command(
         handoff,
         reply_text,
         answered_by_user_id=answered_by,
-        source="feishu",
+        source=binding.channel,
     )
     # 给处理人回一条确认(经 outbox 投递)
+    ack_target = (
+        {"to_user_id": inbound.from_user_id}
+        if binding.channel == "wecom"
+        else {
+            "receive_id_type": "open_id",
+            "receive_id": inbound.from_user_id,
+        }
+    )
     db.add(
         ChannelDelivery(
             tenant_id=binding.tenant_id,
             binding_id=binding.id,
             session_id=f"handoff:{handoff.id}",
             message_id=None,
-            target_json={
-                "receive_id_type": "open_id",
-                "receive_id": inbound.from_user_id,
-            },
+            target_json=ack_target,
             kind="handoff_ack",
             text=render_channel_notice(
                 ChannelNotice("handoff.ack", {"reply_preview": reply_text[:120]}),
@@ -1197,7 +1339,7 @@ def _run_handoff_reply_command(
             ),
             status="pending",
             next_attempt_at=utc_now(),
-            idempotency_key=new_id("hreplyack"),
+            idempotency_key=ack_key,
             language_context_json=context.model_dump(mode="json"),
         )
     )
@@ -1229,13 +1371,24 @@ def process_inbound(
     if inbound is None:
         return False
     # 作用域以绑定配置为准(适配器侧可能拿的是启动时旧值):统一覆盖后再使用
-    scope = external_account_scope(None, binding)
+    scope = _resolved_inbound_account_scope(binding, inbound)
     inbound.account_scope = scope
     command = parse_command(inbound.text)
     target = {
         "to_user_id": inbound.conv_key if inbound.is_group else inbound.from_user_id,
         "context_token": inbound.context_token,
     }
+    if binding.channel == "wecom" and inbound.is_group:
+        target.update(
+            {
+                "reply_to_user_id": inbound.from_user_id,
+                "is_group": True,
+                "reply_quote": {
+                    "sender_name": inbound.sender_name or inbound.from_user_id,
+                    "text": inbound.text,
+                },
+            }
+        )
 
     with Session(use_engine) as db:
         event = db.get(ChannelInboundEvent, staged_event_pk) if staged_event_pk else None
@@ -1248,6 +1401,9 @@ def process_inbound(
                 or event.processor_run_id != current_processor_run_id()
             ):
                 return False
+            # Durable inbox targets are immutable channel-owned snapshots.
+            # Rebuilding/merging them here would leak WeCom-only compatibility
+            # keys into Feishu and other channel contracts.
             target = dict(event.target_json or {})
             language_context = resolve_compatible_language_context(
                 snapshot=event.language_context_json,
@@ -1601,6 +1757,23 @@ def process_inbound(
             _send_wechat_typing(
                 binding, inbound.from_user_id, inbound.context_token, 1, db_engine=use_engine
             )
+            stream_sink = None
+            if binding.channel == "wecom" and isinstance(inbound.raw, dict):
+                adapter = get_channel_adapter(binding.channel)
+                create_stream_reply = getattr(adapter, "create_stream_reply", None)
+                if callable(create_stream_reply):
+                    try:
+                        stream_sink = create_stream_reply(
+                            binding,
+                            inbound.raw,
+                            language_context=language_context,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "企微流式回复初始化失败 binding=%s event=%s",
+                            binding.id,
+                            inbound.event_id,
+                        )
             from app.channels.feishu_trace import FeishuTraceStreamer, is_feishu_trace_enabled
 
             trace_streamer: FeishuTraceStreamer | None = None
@@ -1629,15 +1802,44 @@ def process_inbound(
                     db.commit()
 
                 with bind_span_sink(persist_span):
-                    response = AgentLoop(
-                        db, event_sink=trace_streamer.on_event if trace_streamer else None
-                    ).handle_turn(request)
+                    event_sink = trace_streamer.on_event if trace_streamer else None
+                    if stream_sink is not None:
+                        original_event_sink = event_sink
+
+                        def event_sink(event_type: str, payload: dict[str, object]) -> None:
+                            """Fan execution events out to WeCom progress and Feishu tracing."""
+                            try:
+                                stream_sink.on_event(event_type, payload)
+                            except Exception:  # noqa: BLE001 - optional progress UI is isolated
+                                logger.exception(
+                                    "企微进度事件投递失败 binding=%s event=%s",
+                                    binding.id,
+                                    inbound.event_id,
+                                )
+                            if original_event_sink:
+                                original_event_sink(event_type, payload)
+
+                    agent_loop_kwargs: dict[str, object] = {"event_sink": event_sink}
+                    if stream_sink is not None:
+                        agent_loop_kwargs["stream_sink"] = stream_sink
+                    agent_loop = AgentLoop(db, **agent_loop_kwargs)
+                    response = agent_loop.handle_turn(request)
+                    if stream_sink is not None and not agent_loop.stream_delivery_succeeded:
+                        # Error/cancellation or an oversized stream falls back to
+                        # the durable outbox; retire the unfinished stream worker.
+                        abort_stream = getattr(stream_sink, "abort", None)
+                        if callable(abort_stream):
+                            abort_stream()
             except Exception as exc:
                 logger.exception(
                     "渠道入站处理失败 binding=%s event=%s", binding.id, inbound.event_id
                 )
                 if trace_streamer:
                     trace_streamer.abort(str(exc)[:200])
+                if stream_sink is not None:
+                    abort_stream = getattr(stream_sink, "abort", None)
+                    if callable(abort_stream):
+                        abort_stream()
                 db.rollback()
                 event = db.get(ChannelInboundEvent, event_id)
                 chat_session = db.get(ChatSession, session_id)
@@ -1745,7 +1947,7 @@ def process_staged_inbound(event_pk: str, *, db_engine=None) -> bool:
                 update(ChannelInboundEvent)
                 .where(
                     ChannelInboundEvent.id == event_pk,
-                    ChannelInboundEvent.channel.in_({"feishu", "wecom", "dingtalk"}),
+                    ChannelInboundEvent.channel.in_(_DURABLE_INBOX_CHANNELS),
                     ChannelInboundEvent.status == "processing",
                     ChannelInboundEvent.processor_run_id == current_processor_run_id(),
                 )
@@ -1763,6 +1965,7 @@ def process_staged_inbound(event_pk: str, *, db_engine=None) -> bool:
 
 
 def _process_claimed_staged_inbound(event_pk: str, *, db_engine=None) -> bool:
+    """Decode one claimed durable event and hand it to the normal intake transaction."""
     use_engine = db_engine or engine
     with Session(use_engine) as db:
         event = db.get(ChannelInboundEvent, event_pk)
@@ -1836,6 +2039,7 @@ def run_staged_inbound_daemon(
     poll_seconds: float = 1.0,
     db_engine=None,
 ) -> None:
+    """Poll supported durable inbox lanes and dispatch each claimed event once."""
     use_engine = db_engine or engine
     while True:
         try:
@@ -1843,7 +2047,7 @@ def run_staged_inbound_daemon(
                 event_ids = db.exec(
                     select(ChannelInboundEvent.id)
                     .where(
-                        ChannelInboundEvent.channel.in_({"feishu", "wecom", "dingtalk"}),
+                        ChannelInboundEvent.channel.in_(_DURABLE_INBOX_CHANNELS),
                         ChannelInboundEvent.status == "received",
                     )
                     .order_by(ChannelInboundEvent.created_at)
@@ -1891,6 +2095,7 @@ def _decode_and_validate_staged_event(
     event: ChannelInboundEvent,
     binding: ChannelBinding,
 ) -> ChannelInbound:
+    """Decode one durable envelope and revalidate its immutable provider account scope."""
     payload = event.payload_json or {}
     account = payload.get("account") if isinstance(payload, dict) else None
     if event.tenant_id != binding.tenant_id or event.channel != binding.channel:
@@ -1941,10 +2146,36 @@ def _decode_and_validate_staged_event(
         ):
             raise ValueError("replay_account_mismatch")
         return inbound
+    if event.channel == "wechat_kf":
+        from app.channels.service_wechat_kf_inbox import decode_replay_envelope
+
+        if event.config_revision != binding.config_revision:
+            raise ValueError("replay_account_mismatch")
+        inbound = decode_replay_envelope(payload)
+        scope = str((account or {}).get("scope") or "").strip()
+        corp_id = str((binding.config_json or {}).get("corp_id") or "").strip()
+        expected_scope = f"{corp_id}:{inbound.to_user_id}" if corp_id else ""
+        if not scope or scope != expected_scope:
+            raise ValueError("replay_account_mismatch")
+        replay_db = object_session(event)
+        if replay_db is None:
+            raise ValueError("replay_account_mismatch")
+        account_row = replay_db.exec(
+            select(WeChatKfAccount).where(
+                WeChatKfAccount.tenant_id == binding.tenant_id,
+                WeChatKfAccount.binding_id == binding.id,
+                WeChatKfAccount.open_kfid == inbound.to_user_id,
+                WeChatKfAccount.status == "active",
+            )
+        ).first()
+        if account_row is None:
+            raise ValueError("replay_account_mismatch")
+        return inbound
     raise ValueError("unsupported_envelope_channel")
 
 
 def _recover_stale_durable_event(event_pk: str, *, db_engine=None) -> bool:
+    """Recover one stale processing event without rebuilding its language snapshot."""
     use_engine = db_engine or engine
     with Session(use_engine) as db:
         event = db.get(ChannelInboundEvent, event_pk)
@@ -1954,6 +2185,14 @@ def _recover_stale_durable_event(event_pk: str, *, db_engine=None) -> bool:
         if not _claim_stale_event(db, event_pk):
             return False
         event = db.get(ChannelInboundEvent, event_pk)
+        if binding.status != "active":
+            _finish_owned_inbound(
+                db,
+                event_pk,
+                status="failed",
+                error="binding_inactive",
+            )
+            return False
         try:
             inbound = _decode_and_validate_staged_event(event, binding)
         except ValueError as exc:
@@ -2029,11 +2268,11 @@ def sweep_stale_inbound_events(*, db_engine=None) -> int:
             binding = db.get(ChannelBinding, binding_id)
             if not binding:
                 continue
-            if channel not in {"feishu", "wecom", "dingtalk"} and binding.status != "active":
+            if channel not in _DURABLE_INBOX_CHANNELS and binding.status != "active":
                 continue
             db.expunge(binding)
         try:
-            if channel in {"feishu", "wecom", "dingtalk"}:
+            if channel in _DURABLE_INBOX_CHANNELS:
                 if _recover_stale_durable_event(event_pk, db_engine=use_engine):
                     taken += 1
                 continue

@@ -2,13 +2,13 @@ from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine
 
 from app.api.mock import (
+    MockOrderQueryRequest,
     MockOrderRefundRequest,
     MockProductPurchaseRequest,
     mock_order_query,
     mock_order_refund,
     mock_product_purchase,
 )
-from app.api.mock import MockOrderQueryRequest
 from app.core.harness_agent import HarnessAction, _finish_result
 from app.core.task_request_compiler import TaskRequirement
 from app.db.seed import DEMO_TOOLS, REFUND_SKILL
@@ -59,6 +59,32 @@ def test_terminal_handoff_node_still_forces_handoff() -> None:
     result = _finish_result(
         requirement,
         HarnessAction(action="finish", status="completed", reply_fragment="为您转人工。"),
+        [],
+        [],
+        [],
+        [],
+        action_count=1,
+    )
+
+    assert result.status == "handoff"
+
+
+def test_terminal_handoff_node_normalizes_model_failure_to_handoff() -> None:
+    """A terminal handoff node remains a handoff even when the model reports failure."""
+    requirement = TaskRequirement(
+        task_frame_id="task-handoff-failed-model",
+        kind="sop",
+        goal="转人工",
+        sop_context={"step": {"node_id": "handoff", "type": "handoff"}},
+    )
+
+    result = _finish_result(
+        requirement,
+        HarnessAction(
+            action="finish",
+            status="failed",
+            reply_fragment="当前没有可用的人工转接能力。",
+        ),
         [],
         [],
         [],

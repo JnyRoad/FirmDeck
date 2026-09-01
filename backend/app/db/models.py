@@ -980,6 +980,59 @@ class ChannelBinding(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=utc_now)
 
 
+class WeChatKfAccount(SQLModel, table=True):
+    """Persist one WeChat客服 account route under a tenant-owned channel binding."""
+
+    __tablename__ = "wechat_kf_accounts"
+    __table_args__ = (
+        UniqueConstraint("binding_id", "open_kfid", name="uq_wechat_kf_account_binding_kfid"),
+        UniqueConstraint("tenant_id", "open_kfid", name="uq_wechat_kf_account_tenant_kfid"),
+    )
+
+    id: str = Field(default_factory=lambda: new_id("wka"), primary_key=True)
+    tenant_id: str = Field(index=True)
+    binding_id: str = Field(index=True)
+    open_kfid: str = Field(index=True)
+    name: str = ""
+    agent_id: str | None = Field(default=None, index=True)
+    team_id: str | None = Field(default=None, index=True)
+    status: str = Field(default="active", index=True)
+    sync_cursor: str = ""
+    last_error: str | None = None
+    last_sync_at: datetime | None = None
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class WeChatKfAccountOperation(SQLModel, table=True):
+    """Persist a recoverable provider/local account-management operation intent."""
+
+    __tablename__ = "wechat_kf_account_operations"
+    __table_args__ = (
+        Index(
+            "ix_wechat_kf_account_operations_binding_status",
+            "binding_id",
+            "status",
+        ),
+    )
+
+    id: str = Field(default_factory=lambda: new_id("wko"), primary_key=True)
+    tenant_id: str = Field(index=True)
+    binding_id: str = Field(index=True)
+    kind: str = Field(index=True)
+    status: str = Field(default="prepared", index=True)
+    open_kfid: str | None = Field(default=None, index=True)
+    desired_name: str = ""
+    desired_media_id: str | None = None
+    binding_revision: int = 0
+    attempts: int = 0
+    last_error_code: str | None = None
+    provider_applied_at: datetime | None = None
+    completed_at: datetime | None = None
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
 class ChannelBindingAgent(SQLModel, table=True):
     """渠道账号可调度的员工集合（一个微信号挂载多个数字员工，恰好一个默认）。"""
 
