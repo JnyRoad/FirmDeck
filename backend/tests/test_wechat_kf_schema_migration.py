@@ -132,3 +132,52 @@ def test_wechat_kf_accounts_migration_is_additive_idempotent_and_backfills(
                 "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
             )
         )
+
+
+def test_wechat_kf_backfill_runs_after_metadata_created_target_tables(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """create_all 先建新表时，marker 缺失仍必须执行 legacy 数据回填且只执行一次。"""
+    db_path = tmp_path / "wechat-kf-create-all-first.db"
+    engine = create_engine(f"sqlite:///{db_path}")
+    SQLModel.metadata.create_all(engine)
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO tenants (id, name, created_at, updated_at) "
+                "VALUES ('tenant_b', 'Tenant B', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO channel_bindings "
+                "(id, tenant_id, agent_id, channel, status, config_json, config_revision, "
+                "connected, created_at, updated_at) VALUES "
+                "('chan-kf-existing-table', 'tenant_b', 'agent_b', 'wechat_kf', 'active', "
+                ":config_json, 1, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            ),
+            {"config_json": json.dumps({"corp_id": "corp-b", "open_kfid": "wk-backfill"})},
+        )
+    monkeypatch.setattr(database, "database_url", f"sqlite:///{db_path}")
+    monkeypatch.setattr(database, "engine", engine)
+
+    database._migrate_sqlite_skill_schema()
+    database._migrate_sqlite_skill_schema()
+
+    with engine.begin() as conn:
+        rows = conn.execute(text("SELECT binding_id, open_kfid FROM wechat_kf_accounts")).all()
+        markers = {
+            row[0]
+            for row in conn.execute(
+                text(
+                    "SELECT id FROM app_data_migrations "
+                    "WHERE id LIKE '20260831_wechat_kf_%'"
+                )
+                ).all()
+            }
+    assert rows == [("chan-kf-existing-table", "wk-backfill")]
+    assert markers == {
+        "20260831_wechat_kf_accounts_v1",
+        "20260831_wechat_kf_account_operations_v1",
+    }

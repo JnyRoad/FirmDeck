@@ -810,6 +810,52 @@ def test_notify_handoff_assignee_retries_old_delivered_wecom_notice() -> None:
         assert any(row.status == "pending" and row.text != "旧通知" for row in notices)
 
 
+def test_notify_handoff_assignee_deduplicates_recently_delivered_old_notice() -> None:
+    """排队很久但刚投递成功的通知，重试窗口必须从 delivered_at 计算。"""
+    from datetime import timedelta
+
+    from app.channels.service_outbox import notify_handoff_assignee
+
+    engine = _test_engine()
+    with Session(engine) as db:
+        _seed_tenant(db)
+        binding = _wecom_binding()
+        db.add(binding)
+        db.add(
+            _channel_identity(
+                channel="wecom",
+                external_user_id="staff_assignee",
+                scope="corp_1",
+            )
+        )
+        handoff = _pending_handoff()
+        db.add(handoff)
+        db.add(
+            ChannelDelivery(
+                tenant_id="tenant_demo",
+                binding_id=binding.id,
+                session_id=f"handoff:{handoff.id}",
+                kind="handoff_notice",
+                text="刚刚投递的旧排队通知",
+                target_json={"to_user_id": "staff_assignee"},
+                status="delivered",
+                idempotency_key="recently-delivered-handoff-notice",
+                created_at=utc_now() - timedelta(seconds=3600),
+                delivered_at=utc_now() - timedelta(seconds=30),
+            )
+        )
+        db.commit()
+
+        notify_handoff_assignee(db, binding, handoff, "新问题", "")
+        notices = db.exec(
+            select(ChannelDelivery).where(
+                ChannelDelivery.kind == "handoff_notice",
+                ChannelDelivery.session_id == f"handoff:{handoff.id}",
+            )
+        ).all()
+        assert len(notices) == 1
+
+
 def test_run_wecom_handoff_reply_records_wecom_source(monkeypatch) -> None:
     """A WeCom command resumes the matching handoff and records its channel source."""
     import app.api.chat as chat_api

@@ -200,6 +200,7 @@ describe('WeChat Customer Service API client', () => {
       method: init?.method || 'GET',
       headers: init?.headers as Record<string, string> | undefined,
       body: init?.body,
+      credentials: init?.credentials,
     }));
     expect(calls.map(({ url, method }) => [method, url])).toEqual([
       ['POST', '/api/enterprise/channels/binding-1/wechat_kf/callback-config'],
@@ -220,5 +221,6 @@ describe('WeChat Customer Service API client', () => {
     }));
     expect(calls[7]?.body).toBeInstanceOf(FormData);
     expect(calls[7]?.headers).not.toHaveProperty('Content-Type');
+    expect(calls[7]?.credentials).toBe('include');
   });
 });

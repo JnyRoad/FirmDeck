@@ -78,6 +78,7 @@ async function requestForm<T>(path: string, body: FormData): Promise<T> {
     method: 'POST',
     headers: { ...authHeader() },
     body,
+    credentials: 'include',
   });
   if (!response.ok) {
     const text = await response.text();

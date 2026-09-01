@@ -643,21 +643,22 @@ def _resume_human_handoff_worker(handoff_id: str) -> None:
             if not chat_session or chat_session.tenant_id != handoff.tenant_id:
                 return
             resume_payload = dict(handoff.resume_payload_json or {})
-            original_channel = str(resume_payload.get("channel") or "").strip()
-            original_binding_id = str(
-                resume_payload.get("channel_binding_id") or ""
-            ).strip()
-            original_account_key = str(
-                resume_payload.get("channel_account_key") or ""
-            ).strip()
+            if "channel" in resume_payload:
+                chat_session.channel = str(resume_payload.get("channel") or "web").strip()
+            if "channel_binding_id" in resume_payload:
+                chat_session.channel_binding_id = (
+                    str(resume_payload.get("channel_binding_id") or "").strip() or None
+                )
+            if "channel_account_key" in resume_payload:
+                chat_session.channel_account_key = (
+                    str(resume_payload.get("channel_account_key") or "").strip() or None
+                )
+            if "external_conv_id" in resume_payload:
+                chat_session.external_conv_id = (
+                    str(resume_payload.get("external_conv_id") or "").strip() or None
+                )
             original_target = resume_payload.get("channel_target")
-            if original_channel:
-                chat_session.channel = original_channel
-            if original_binding_id:
-                chat_session.channel_binding_id = original_binding_id
-            if original_account_key:
-                chat_session.channel_account_key = original_account_key
-            if isinstance(original_target, dict) and original_target:
+            if "channel_target" in resume_payload and isinstance(original_target, dict):
                 chat_session.channel_target_json = dict(original_target)
             elif chat_session.channel_target_json:
                 # Legacy handoffs predate the target snapshot; preserve the

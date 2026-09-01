@@ -1160,7 +1160,10 @@ def notify_handoff_assignee(
             existing_notice.status in {"pending", "sending"}
             or (
                 existing_notice.status == "delivered"
-                and (utc_now() - existing_notice.created_at).total_seconds()
+                and (
+                    utc_now()
+                    - (existing_notice.delivered_at or existing_notice.created_at)
+                ).total_seconds()
                 < HANDOFF_NOTIFY_RETRY_SECONDS
             )
         ):

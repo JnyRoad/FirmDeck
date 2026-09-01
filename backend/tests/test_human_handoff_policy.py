@@ -871,13 +871,13 @@ def test_handoff_resume_worker_restores_original_wecom_group_target(monkeypatch)
             tenant_id="tenant_demo",
             user_id=user.id,
             agent_id="agent_demo",
-            channel="wecom",
-            channel_binding_id="binding_wecom",
-            channel_account_key="wecom:corp:4:corp:bot:3:bot",
-            external_conv_id="wecom_corp_group_chat_123",
+            channel="web",
+            channel_binding_id=None,
+            channel_account_key=None,
+            external_conv_id="temporary_human_direct_target",
             channel_target_json={
-                "to_user_id": "group_chat_123",
-                "context_token": "group_chat_123",
+                "to_user_id": "admin_user",
+                "context_token": "temporary_human_direct_target",
             },
             status="active",
         )
@@ -895,7 +895,8 @@ def test_handoff_resume_worker_restores_original_wecom_group_target(monkeypatch)
                 resume_payload_json={
                     "channel": "wecom",
                     "channel_binding_id": "binding_wecom",
-                    "channel_account_key": session.channel_account_key,
+                    "channel_account_key": "wecom:corp:4:corp:bot:3:bot",
+                    "external_conv_id": "wecom_corp_group_chat_123",
                     "channel_target": {
                         "to_user_id": "group_chat_123",
                         "context_token": "group_chat_123",
@@ -913,6 +914,8 @@ def test_handoff_resume_worker_restores_original_wecom_group_target(monkeypatch)
         assert restored is not None
         assert restored.channel == "wecom"
         assert restored.channel_binding_id == "binding_wecom"
+        assert restored.channel_account_key == "wecom:corp:4:corp:bot:3:bot"
+        assert restored.external_conv_id == "wecom_corp_group_chat_123"
         assert restored.channel_target_json == {
             "to_user_id": "group_chat_123",
             "context_token": "group_chat_123",

@@ -85,6 +85,18 @@ from app.skills.nesting import discoverable_sops, expand_visible_sops
 logger = logging.getLogger(__name__)
 
 
+def _should_create_conversation_handoff(
+    *,
+    request_channel: str,
+    decision: str,
+    result_status: str,
+) -> bool:
+    """区分恢复旧 handoff 终态与恢复轮次中新产生的转人工决策。"""
+    if decision == "handoff_human":
+        return True
+    return request_channel != "human_handoff_resume" and result_status == "handoff"
+
+
 def _public_harness_error(value: object) -> object:
     """Project a Harness error for durable/event boundaries while preserving empty success values."""
     if value is None or value == {}:
@@ -1145,8 +1157,10 @@ class HarnessV2Engine:
                 break
 
             if frame.kind == "conversation":
-                if request.channel != "human_handoff_resume" and (
-                    frame.decision == "handoff_human" or result.status == "handoff"
+                if _should_create_conversation_handoff(
+                    request_channel=request.channel,
+                    decision=frame.decision,
+                    result_status=result.status,
                 ):
                     result.status = "handoff"
                     last_step_result = _step_result(result)

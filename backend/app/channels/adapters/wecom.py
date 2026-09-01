@@ -200,11 +200,16 @@ def is_self_frame(frame: dict[str, Any]) -> bool:
     return bool(sender) and bool(bot_id) and sender == bot_id
 
 
-def _strip_bot_mention(text: str, *, is_group: bool) -> str:
+def _strip_bot_mention(text: str, *, is_group: bool, bot_id: str) -> str:
     """Remove only the leading bot mention for group command parsing and preserve the rest verbatim."""
-    if not is_group:
+    if not is_group or not bot_id:
         return text
-    return re.sub(r"^\s*(?:<@[^>\s]+>|@[^\s]+)\s*", "", text).strip()
+    escaped_bot_id = re.escape(bot_id)
+    return re.sub(
+        rf"^\s*(?:<@{escaped_bot_id}>|@{escaped_bot_id})(?=\s|$)\s*",
+        "",
+        text,
+    ).strip()
 
 
 def normalize_wecom_frame(
@@ -316,7 +321,11 @@ def normalize_wecom_frame(
     # 官方文档：chatid 仅群聊返回
     is_group = bool(chat_id)
     if text:
-        text = _strip_bot_mention(text, is_group=is_group)
+        text = _strip_bot_mention(
+            text,
+            is_group=is_group,
+            bot_id=str(body.get("aibotid") or "").strip(),
+        )
     if not text and not attachments:
         return None
     headers = frame.get("headers") or {}

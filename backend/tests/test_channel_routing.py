@@ -1,3 +1,5 @@
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 import threading
 
 import pytest
@@ -1205,10 +1207,120 @@ def test_put_agents_replaces_mounts_and_normalizes_default() -> None:
     with Session(engine) as db:
         binding = db.get(ChannelBinding, binding_id)
         assert binding.agent_id == "agent_xz"
+        assert binding.config_revision == 2
         mounts = db.exec(
             select(ChannelBindingAgent).where(ChannelBindingAgent.binding_id == binding_id)
         ).all()
         assert len(mounts) == 2
+
+
+def test_binding_revision_claim_allows_only_one_stale_snapshot_winner(tmp_path) -> None:
+    """两个进程快照使用同一 revision 时，数据库 CAS 只能允许第一个提交。"""
+    import app.channels.service_routing_locks as routing_locks
+
+    claim = getattr(routing_locks, "claim_channel_binding_revision", None)
+    assert callable(claim), "durable binding revision claim is missing"
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'routing-revision-cas.db'}",
+        connect_args={"check_same_thread": False, "timeout": 5},
+    )
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as db:
+        db.add(Tenant(id="tenant_cas", name="CAS"))
+        binding = ChannelBinding(
+            tenant_id="tenant_cas",
+            agent_id="agent_cas",
+            channel="wechat",
+            config_revision=4,
+        )
+        db.add(binding)
+        db.commit()
+        binding_id = binding.id
+
+    first = Session(engine)
+    second = Session(engine)
+    try:
+        first_binding = first.get(ChannelBinding, binding_id)
+        second_binding = second.get(ChannelBinding, binding_id)
+        assert first_binding is not None and second_binding is not None
+        assert claim(first, first_binding, 4)
+        first.commit()
+        assert not claim(second, second_binding, 4)
+        second.rollback()
+    finally:
+        first.close()
+        second.close()
+
+    with Session(engine) as db:
+        assert db.get(ChannelBinding, binding_id).config_revision == 5
+
+
+def test_put_binding_concurrent_stale_snapshots_return_one_conflict_without_partial_state(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """模拟两个 worker 同时改名：仅一项提交，另一项稳定 409 且不覆盖胜者状态。"""
+    import app.api.channels as channels_api
+    import app.channels.service_routing_locks as routing_locks
+
+    engine = _concurrent_test_engine(tmp_path)
+    users = _seed_api_users(engine)
+    with Session(engine) as db:
+        binding = ChannelBinding(
+            tenant_id="tenant_demo",
+            agent_id="agent_xz",
+            channel="wechat",
+            status="active",
+            name="初始名称",
+            created_by_user_id="user_owner",
+        )
+        db.add(binding)
+        db.flush()
+        db.add(
+            ChannelBindingAgent(
+                tenant_id="tenant_demo",
+                binding_id=binding.id,
+                agent_id="agent_xz",
+                is_default=True,
+                sort_order=0,
+            )
+        )
+        db.commit()
+        binding_id = binding.id
+
+    barrier = threading.Barrier(2)
+    real_claim = routing_locks.claim_channel_binding_revision
+
+    def synchronized_claim(db, binding, expected_revision):
+        barrier.wait(timeout=2)
+        return real_claim(db, binding, expected_revision)
+
+    monkeypatch.setattr(channels_api, "binding_lifecycle_lock", lambda _id: nullcontext())
+    monkeypatch.setattr(channels_api, "claim_channel_binding_revision", synchronized_claim)
+    client = _make_api_client(engine)
+
+    def rename(name: str):
+        return client.put(
+            f"/api/enterprise/channels/{binding_id}?tenant_id=tenant_demo",
+            json={"name": name},
+            headers=_auth(users["owner"]),
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        responses = list(pool.map(rename, ("并发名称 A", "并发名称 B")))
+
+    assert sorted(response.status_code for response in responses) == [200, 409]
+    conflict = next(response for response in responses if response.status_code == 409)
+    winner = next(response for response in responses if response.status_code == 200)
+    assert conflict.json()["detail"]["code"] == "CHANNEL_CONFLICT"
+    with Session(engine) as db:
+        binding = db.get(ChannelBinding, binding_id)
+        mounts = db.exec(
+            select(ChannelBindingAgent).where(ChannelBindingAgent.binding_id == binding_id)
+        ).all()
+        assert binding.name == winner.json()["name"]
+        assert binding.config_revision == 1
+        assert [(row.agent_id, row.is_default) for row in mounts] == [("agent_xz", True)]
 
 
 def test_put_agents_validations() -> None:

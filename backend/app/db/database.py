@@ -52,6 +52,10 @@ _CHANNEL_BINDINGS_MULTI_MIGRATION_ID = "20260721_channel_bindings_multi"
 _CHANNEL_ACCOUNT_KEY_MIGRATION_ID = "20260723_channel_account_key_v1"
 _FEISHU_CHANNEL_SCHEMA_MIGRATION_ID = "20260724_feishu_channel_schema_v1"
 _I18N_LANGUAGE_SCHEMA_MIGRATION_ID = "20260830_i18n_language_context_v1"
+_WECHAT_KF_ACCOUNTS_MIGRATION_ID = "20260831_wechat_kf_accounts_v1"
+_WECHAT_KF_ACCOUNT_OPERATIONS_MIGRATION_ID = (
+    "20260831_wechat_kf_account_operations_v1"
+)
 _CAPABILITY_SCOPE_TABLES = (
     "general_skills",
     "tools",
@@ -1425,10 +1429,6 @@ def _migrate_wechat_kf_accounts(conn, tables: set[str]) -> None:
     binding that already carries ``open_kfid``. Repeated execution is a no-op. Invalid legacy
     JSON or bindings without an account identifier are skipped instead of aborting startup.
     """
-    if "wechat_kf_accounts" in tables:
-        return
-
-    # Create both provider-account uniqueness fences before any legacy row is backfilled.
     conn.execute(
         text(
             """
@@ -1454,8 +1454,31 @@ def _migrate_wechat_kf_accounts(conn, tables: set[str]) -> None:
             """
         )
     )
+    for column in ("tenant_id", "binding_id", "open_kfid", "agent_id", "team_id", "status"):
+        conn.execute(
+            text(
+                f"CREATE INDEX IF NOT EXISTS ix_wechat_kf_accounts_{column} "
+                f"ON wechat_kf_accounts ({column})"
+            )
+        )
+    conn.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS app_data_migrations (
+                id VARCHAR PRIMARY KEY,
+                applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+    )
+    applied = conn.execute(
+        text("SELECT id FROM app_data_migrations WHERE id = :id"),
+        {"id": _WECHAT_KF_ACCOUNTS_MIGRATION_ID},
+    ).first()
+    if applied:
+        return
 
-    # Preserve the single-account legacy binding as the first explicit routing row.
+    # Metadata creation may have created the target table before this data backfill runs.
     if "channel_bindings" in tables:
         binding_columns = _sqlite_table_columns(conn, "channel_bindings")
         team_id_projection = "team_id" if "team_id" in binding_columns else "NULL AS team_id"
@@ -1473,9 +1496,9 @@ def _migrate_wechat_kf_accounts(conn, tables: set[str]) -> None:
             conn.execute(
                 text(
                     "INSERT OR IGNORE INTO wechat_kf_accounts "
-                    "(id, tenant_id, binding_id, open_kfid, agent_id, team_id, status, "
+                    "(id, tenant_id, binding_id, open_kfid, name, agent_id, team_id, status, "
                     "sync_cursor, created_at, updated_at) "
-                    "VALUES (:id, :tenant_id, :binding_id, :open_kfid, :agent_id, :team_id, "
+                    "VALUES (:id, :tenant_id, :binding_id, :open_kfid, '', :agent_id, :team_id, "
                     "'active', '', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
                 ),
                 {
@@ -1487,22 +1510,14 @@ def _migrate_wechat_kf_accounts(conn, tables: set[str]) -> None:
                     "team_id": row["team_id"],
                 },
             )
-
-    # Add lookup indexes after backfill so migration writes do not maintain them row by row.
-    for column in ("tenant_id", "binding_id", "open_kfid", "agent_id", "team_id", "status"):
-        conn.execute(
-            text(
-                f"CREATE INDEX IF NOT EXISTS ix_wechat_kf_accounts_{column} "
-                f"ON wechat_kf_accounts ({column})"
-            )
-        )
+    conn.execute(
+        text("INSERT OR IGNORE INTO app_data_migrations (id) VALUES (:id)"),
+        {"id": _WECHAT_KF_ACCOUNTS_MIGRATION_ID},
+    )
 
 
 def _migrate_wechat_kf_account_operations(conn, tables: set[str]) -> None:
     """Create the additive durable operation-intent table for existing SQLite installs."""
-    if "wechat_kf_account_operations" in tables:
-        return
-
     # Keep only desired state and stable error codes; provider bodies and credentials never persist.
     conn.execute(
         text(
@@ -1526,6 +1541,20 @@ def _migrate_wechat_kf_account_operations(conn, tables: set[str]) -> None:
             )
             """
         )
+    )
+    conn.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS app_data_migrations (
+                id VARCHAR PRIMARY KEY,
+                applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+    )
+    conn.execute(
+        text("INSERT OR IGNORE INTO app_data_migrations (id) VALUES (:id)"),
+        {"id": _WECHAT_KF_ACCOUNT_OPERATIONS_MIGRATION_ID},
     )
     for column in ("tenant_id", "binding_id", "kind", "status", "open_kfid"):
         conn.execute(

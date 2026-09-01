@@ -356,7 +356,7 @@ def test_normalize_group_frame() -> None:
     assert inbound.sender_name == "张三"
 
 
-@pytest.mark.parametrize("mention", ["@StaffDeck", "@机器人", "<@bot-id>"])
+@pytest.mark.parametrize("mention", ["@aib_bot1", "<@aib_bot1>"])
 def test_normalize_group_frame_strips_leading_bot_mention(mention: str) -> None:
     frame = _text_frame(
         chatid="wr_group",
@@ -366,6 +366,18 @@ def test_normalize_group_frame_strips_leading_bot_mention(mention: str) -> None:
     inbound = normalize_wecom_frame(frame)
     assert inbound is not None
     assert inbound.text == "/帮助"
+
+
+def test_normalize_group_frame_preserves_leading_colleague_mention() -> None:
+    """群聊中其他成员的开头 mention 是用户内容，不能当作机器人 mention 删除。"""
+    frame = _text_frame(
+        chatid="wr_group",
+        chattype="group",
+        text={"content": "  @zhangsan   请一起处理"},
+    )
+    inbound = normalize_wecom_frame(frame)
+    assert inbound is not None
+    assert inbound.text == "@zhangsan   请一起处理"
 
 
 def test_normalize_single_frame_preserves_leading_mention() -> None:
@@ -378,7 +390,7 @@ def test_normalize_group_mention_only_frame_is_ignored() -> None:
     frame = _text_frame(
         chatid="wr_group",
         chattype="group",
-        text={"content": "  @StaffDeck  "},
+        text={"content": "  @aib_bot1  "},
     )
     assert normalize_wecom_frame(frame) is None
 

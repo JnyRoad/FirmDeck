@@ -138,6 +138,7 @@ class HumanHandoffService:
                 "channel": chat_session.channel,
                 "channel_binding_id": chat_session.channel_binding_id,
                 "channel_account_key": chat_session.channel_account_key,
+                "external_conv_id": chat_session.external_conv_id,
                 "channel_target": dict(chat_session.channel_target_json or {}),
             },
             metadata_json={

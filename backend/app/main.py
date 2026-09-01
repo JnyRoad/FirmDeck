@@ -34,6 +34,10 @@ from app.api import (
 )
 from app.async_jobs import shutdown_async_jobs, start_async_jobs
 from app.channels import start_channel_services, stop_channel_services
+from app.channels.service_wechat_kf_recovery import (
+    start_wechat_kf_account_recovery,
+    stop_wechat_kf_account_recovery,
+)
 from app.codex_subscription import stop_codex_subscription_service
 from app.config import get_settings
 from app.contracts.fastapi import request_validation_error_handler
@@ -89,8 +93,10 @@ def on_startup() -> None:
         recover_codex_a2a_tasks()
         recover_a2a_client_tasks()
         start_background_worker()
-        channels.reconcile_wechat_kf_account_operations()
         start_channel_services()
+        start_wechat_kf_account_recovery(
+            channels.reconcile_wechat_kf_account_operations
+        )
         start_timeout_sweeper()
         start_harness_recovery_sweeper()
         # Internal durable jobs (for example feedback analysis) use the same
@@ -101,6 +107,7 @@ def on_startup() -> None:
             enqueue_due_webhook_deliveries()
             start_public_api_maintenance()
     except Exception:
+        stop_wechat_kf_account_recovery()
         release_runtime_instance_lock()
         raise
 
@@ -111,6 +118,7 @@ def on_shutdown() -> None:
         stop_codex_a2a_tasks()
         stop_codex_subscription_service()
         stop_public_api_maintenance()
+        stop_wechat_kf_account_recovery()
         stop_channel_services()
         stop_background_worker()
         stop_timeout_sweeper()

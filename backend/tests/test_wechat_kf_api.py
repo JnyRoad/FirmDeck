@@ -183,17 +183,25 @@ def test_callback_config_and_credentials_encrypt_secrets_without_echo(monkeypatc
                 "tenant_id": "tenant_demo",
                 "corp_id": "ww1234567890",
                 "secret": "replacement-provider-secret",
+                "callback_token": "replacement-callback-token",
+                "encoding_aes_key": base64.b64encode(bytes(range(32))).decode().rstrip("="),
             },
         ),
     ],
 )
-def test_wechat_kf_reconfiguration_projects_corrupt_credentials_as_bad_request(
+def test_wechat_kf_reconfiguration_recovers_from_corrupt_credentials(
+    monkeypatch,
     endpoint: str,
     payload: dict[str, str],
 ) -> None:
-    """密钥轮换或密文损坏不得让重新配置路径泄漏为未投影的 500。"""
+    """完整重配必须能替换密钥轮换或损坏后无法解密的旧凭据。"""
     db_engine = _engine()
     users, binding_id = _seed(db_engine)
+    monkeypatch.setattr(
+        channels_api.WeChatKfTokenProvider,
+        "get",
+        lambda self, binding: "access-token",
+    )
     with Session(db_engine) as db:
         binding = db.get(ChannelBinding, binding_id)
         assert binding is not None
@@ -204,6 +212,31 @@ def test_wechat_kf_reconfiguration_projects_corrupt_credentials_as_bad_request(
     response = _client(db_engine, raise_server_exceptions=False).post(
         f"/api/enterprise/channels/{binding_id}/wechat_kf/{endpoint}",
         json=payload,
+        headers=_auth(users["owner"]),
+    )
+
+    assert response.status_code == 200
+    assert "not-a-valid-fernet-token" not in response.text
+
+
+def test_corrupt_wechat_kf_credentials_reject_partial_secret_only_replacement() -> None:
+    """损坏旧凭据时只补 Secret 仍缺回调材料，必须保持显式失败。"""
+    db_engine = _engine()
+    users, binding_id = _seed(db_engine)
+    with Session(db_engine) as db:
+        binding = db.get(ChannelBinding, binding_id)
+        assert binding is not None
+        binding.credentials_enc = "not-a-valid-fernet-token"
+        db.add(binding)
+        db.commit()
+
+    response = _client(db_engine, raise_server_exceptions=False).post(
+        f"/api/enterprise/channels/{binding_id}/wechat_kf/credentials",
+        json={
+            "tenant_id": "tenant_demo",
+            "corp_id": "ww1234567890",
+            "secret": "replacement-provider-secret",
+        },
         headers=_auth(users["owner"]),
     )
 
@@ -1014,6 +1047,58 @@ def test_binding_write_resumes_after_pending_operation_reconciliation(monkeypatc
         assert db.get(ChannelBinding, binding_id).config_revision == 2
 
 
+@pytest.mark.parametrize("operation_kind", ["update", "delete"])
+def test_provider_applied_stale_revision_becomes_terminal_and_unblocks_binding(
+    operation_kind: str,
+) -> None:
+    """provider 已成功但 binding 代际过期时必须终结 intent，delete 还需恢复 tombstone。"""
+    operation_model = _wechat_kf_operation_model()
+    reconcile = _wechat_kf_reconciler()
+    db_engine = _engine()
+    users, binding_id = _seed(db_engine)
+    with Session(db_engine) as db:
+        binding = db.get(ChannelBinding, binding_id)
+        binding.config_revision = 1
+        account = WeChatKfAccount(
+            tenant_id="tenant_demo",
+            binding_id=binding_id,
+            open_kfid="wk-stale-provider-applied",
+            name="旧名称",
+            agent_id="agent_1",
+            status="deleting" if operation_kind == "delete" else "active",
+        )
+        db.add(binding)
+        db.add(account)
+        db.add(
+            operation_model(
+                tenant_id="tenant_demo",
+                binding_id=binding_id,
+                kind=operation_kind,
+                status="provider_applied",
+                open_kfid=account.open_kfid,
+                desired_name="不得落账",
+                binding_revision=0,
+            )
+        )
+        db.commit()
+
+    assert reconcile(db_engine=db_engine, adapter=WeChatKfAdapter()) == 0
+    with Session(db_engine) as db:
+        operation = db.exec(select(operation_model)).one()
+        account = db.exec(select(WeChatKfAccount)).one()
+        assert operation.status == "failed"
+        assert operation.last_error_code == "CHANNEL_CONFLICT"
+        assert account.name == "旧名称"
+        assert account.status == "active"
+
+    response = _client(db_engine).post(
+        f"/api/enterprise/channels/{binding_id}/wechat_kf/account",
+        json={"tenant_id": "tenant_demo", "open_kfid": account.open_kfid},
+        headers=_auth(users["owner"]),
+    )
+    assert response.status_code != 409
+
+
 def test_update_intent_replays_desired_local_state_without_second_provider_write(
     monkeypatch,
 ) -> None:
@@ -1191,3 +1276,55 @@ def test_reconcile_does_not_log_unexpected_provider_or_secret_detail(caplog) -> 
 
     assert private_detail not in caplog.text
     assert "provider-private" not in caplog.text
+
+
+@pytest.mark.parametrize("kind", ["update", "delete"])
+def test_reconcile_terminalizes_stale_revision_without_provider_call(kind: str) -> None:
+    """永远无法匹配的旧 revision 必须终结，delete tombstone 还要恢复可用。"""
+    operation_model = _wechat_kf_operation_model()
+    reconcile = _wechat_kf_reconciler()
+    db_engine = _engine()
+    _users, binding_id = _seed(db_engine)
+    with Session(db_engine) as db:
+        binding = db.get(ChannelBinding, binding_id)
+        assert binding is not None
+        binding.config_revision = 2
+        account = WeChatKfAccount(
+            tenant_id="tenant_demo",
+            binding_id=binding_id,
+            open_kfid="wk-stale-revision",
+            name="旧账号",
+            agent_id="agent_1",
+            status="deleting" if kind == "delete" else "active",
+        )
+        db.add_all(
+            [
+                binding,
+                account,
+                operation_model(
+                    tenant_id="tenant_demo",
+                    binding_id=binding_id,
+                    kind=kind,
+                    status="prepared",
+                    open_kfid=account.open_kfid,
+                    desired_name="新名称",
+                    binding_revision=1,
+                ),
+            ]
+        )
+        db.commit()
+
+    class NoProviderCalls(WeChatKfAdapter):
+        def update_account(self, *args, **kwargs) -> None:
+            raise AssertionError("stale revision must fail before provider update")
+
+        def delete_account(self, *args, **kwargs) -> None:
+            raise AssertionError("stale revision must fail before provider delete")
+
+    assert reconcile(db_engine=db_engine, adapter=NoProviderCalls()) == 0
+    with Session(db_engine) as db:
+        operation = db.exec(select(operation_model)).one()
+        account = db.exec(select(WeChatKfAccount)).one()
+        assert operation.status == "failed"
+        assert operation.last_error_code == "CHANNEL_CONFLICT"
+        assert account.status == "active"

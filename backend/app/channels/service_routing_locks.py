@@ -11,6 +11,11 @@ import threading
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 
+from sqlalchemy import update
+from sqlmodel import Session
+
+from app.db.models import ChannelBinding, utc_now
+
 
 class _AgentRoutingLockEntry:
     """保存一个可重入员工路由锁及其已持有或正在等待的 context 引用数。"""
@@ -25,6 +30,34 @@ class _AgentRoutingLockEntry:
 
 _agent_routing_locks: dict[str, _AgentRoutingLockEntry] = {}
 _agent_routing_locks_guard = threading.Lock()
+
+
+def claim_channel_binding_revision(
+    db: Session,
+    binding: ChannelBinding,
+    expected_revision: int,
+) -> bool:
+    """以数据库 compare-and-swap 领取一次 binding 路由写入代际。"""
+    if binding.config_revision != expected_revision:
+        return False
+    db.flush()
+    result = db.exec(
+        update(ChannelBinding)
+        .where(
+            ChannelBinding.id == binding.id,
+            ChannelBinding.config_revision == expected_revision,
+        )
+        .values(
+            config_revision=expected_revision + 1,
+            updated_at=utc_now(),
+        )
+        .execution_options(synchronize_session=False)
+    )
+    if result.rowcount != 1:
+        return False
+    db.expire(binding)
+    db.refresh(binding)
+    return True
 
 
 @contextmanager

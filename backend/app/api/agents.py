@@ -48,7 +48,10 @@ from app.channels import binding_lifecycle_lock
 from app.channels.service_account_operations import (
     ensure_channel_binding_has_no_blocking_account_operation,
 )
-from app.channels.service_routing_locks import agent_routing_lifecycle_locks
+from app.channels.service_routing_locks import (
+    agent_routing_lifecycle_locks,
+    claim_channel_binding_revision,
+)
 from app.contracts.domain_http import domain_http_error
 from app.contracts.http import build_http_exception
 from app.db import get_session
@@ -588,6 +591,13 @@ def delete_agent(
                 for binding_id in affected_binding_ids
                 if (binding := db.get(ChannelBinding, binding_id)) is not None
             }
+            if len(affected_bindings) != len(affected_binding_ids):
+                db.rollback()
+                raise build_http_exception("CHANNEL_CONFLICT", status_code=409)
+            expected_revisions = {
+                binding_id: binding.config_revision
+                for binding_id, binding in affected_bindings.items()
+            }
 
             # 所有 guard 必须在首个数据库写入前完成，任一未决 operation 都是零部分提交。
             for binding_id in affected_binding_ids:
@@ -618,7 +628,6 @@ def delete_agent(
                     remaining.is_default = True
                     channel_binding.agent_id = remaining.agent_id
                     db.add(remaining)
-                channel_binding.config_revision += 1
                 channel_binding.updated_at = utc_now()
                 db.add(channel_binding)
 
@@ -661,6 +670,14 @@ def delete_agent(
                 handoff.updated_at = utc_now()
                 db.add(handoff)
             db.delete(row)
+            for binding_id, channel_binding in affected_bindings.items():
+                if not claim_channel_binding_revision(
+                    db,
+                    channel_binding,
+                    expected_revisions[binding_id],
+                ):
+                    db.rollback()
+                    raise build_http_exception("CHANNEL_CONFLICT", status_code=409)
             db.commit()
 
     # 数据库提交并释放全部 binding 锁后，再清理每个已删除会话的工作区。
