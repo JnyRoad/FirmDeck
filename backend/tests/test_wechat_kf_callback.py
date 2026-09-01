@@ -48,8 +48,9 @@ def _encrypt(plaintext: str, aes_key: str, receive_id: str) -> str:
 def _signature(token: str, timestamp: str, nonce: str, ciphertext: str) -> str:
     """为受控测试密文生成回调签名，无持久化副作用。"""
     values = sorted((token, timestamp, nonce, ciphertext))
-    # codeql[py/weak-sensitive-data-hashing]
-    return hashlib.sha1("".join(values).encode(), usedforsecurity=False).hexdigest()
+    return hashlib.sha1(  # lgtm[py/weak-sensitive-data-hashing]
+        "".join(values).encode(), usedforsecurity=False
+    ).hexdigest()
 
 
 def _client(monkeypatch) -> tuple[TestClient, Any, str, dict[str, str]]:
