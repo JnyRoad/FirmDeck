@@ -719,7 +719,7 @@ export default function OpenPlatformPage({
         await tenantApi.delete(platformDeleteUrl(platformKind, item));
       }
       if (!isCurrentTenantGeneration(context, generation)) return;
-      notify.success(platformKind === 'agents' ? copy.unpublishSuccess : copy.removeSuccess);
+      notify.successText(platformKind === 'agents' ? copy.unpublishSuccess : copy.removeSuccess);
       setDetailItem((current) => (
         current && current.kind === platformKind && current.item.id === item.id ? null : current
       ));

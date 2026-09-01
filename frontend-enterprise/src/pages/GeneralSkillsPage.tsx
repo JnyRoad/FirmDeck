@@ -988,7 +988,7 @@ function GeneralSkillsPageContent({ embedded = false, currentUser, onLogout }: {
       );
       if (!isCurrentTenantRequest(context, generation, controller)) return;
       setRows((current) => current.map((item) => (item.id === next.id ? next : item)));
-      notify.success(published ? copy.enabledSuccess : copy.archivedSuccess);
+      notify.successText(published ? copy.enabledSuccess : copy.archivedSuccess);
     } catch (error) {
       if (!isCurrentTenantRequest(context, generation, controller)) return;
       notify.error(generalSkillsPageErrorMessage(error, published ? copy.enableFailed : copy.archiveFailed, t));
@@ -1013,7 +1013,7 @@ function GeneralSkillsPageContent({ embedded = false, currentUser, onLogout }: {
       );
       if (!isCurrentTenantRequest(context, generation, controller)) return;
       setRows((current) => current.map((item) => (item.id === next.id ? next : item)));
-      notify.success(copy.publishToMarketplaceSuccess);
+      notify.successText(copy.publishToMarketplaceSuccess);
     } catch (error) {
       if (!isCurrentTenantRequest(context, generation, controller)) return;
       notify.error(generalSkillsPageErrorMessage(error, copy.publishToMarketplaceFailed, t));
@@ -1042,7 +1042,7 @@ function GeneralSkillsPageContent({ embedded = false, currentUser, onLogout }: {
       );
       if (!isCurrentTenantRequest(context, generation, controller)) return;
       setRows((current) => current.filter((item) => item.id !== row.id));
-      notify.success(branchMode ? copy.removedSuccess : copy.deletedSuccess);
+      notify.successText(branchMode ? copy.removedSuccess : copy.deletedSuccess);
       setDeleteTarget(null);
     } catch (error) {
       if (!isCurrentTenantRequest(context, generation, controller)) return;
@@ -1165,7 +1165,7 @@ function GeneralSkillsPageContent({ embedded = false, currentUser, onLogout }: {
         resource_ids: agentImportSelectedSkillIds,
       }, { signal: controller.signal });
       if (!isCurrentTenantRequest(context, generation, controller)) return;
-      notify.success(interpolate(copy.copiedSkillsSuccess, { count: agentImportSelectedSkillIds.length }));
+      notify.successText(interpolate(copy.copiedSkillsSuccess, { count: agentImportSelectedSkillIds.length }));
       setAgentImportOpen(false);
       await load();
     } catch (error) {
@@ -1197,7 +1197,7 @@ function GeneralSkillsPageContent({ embedded = false, currentUser, onLogout }: {
         status: 'published',
       }, controller.signal);
       if (!isCurrentTenantRequest(context, generation, controller)) return;
-      notify.success(interpolate(copy.importedOpenSourceSuccess, { name: row.name }));
+      notify.successText(interpolate(copy.importedOpenSourceSuccess, { name: row.name }));
       setRows((current) => [row, ...current.filter((item) => item.id !== row.id && item.slug !== row.slug)]);
       setClawhubModalOpen(false);
       navigate(`/enterprise/general-skills/${encodeURIComponent(row.slug)}/edit`);
@@ -2381,7 +2381,7 @@ function GeneralSkillEditorPageContent({ mode, currentUser, onLogout }: { mode: 
         original_slug: editingSlug || undefined,
       }, { signal: controller.signal });
       if (!isCurrentTenantRequest(context, generation, controller)) return null;
-      notify.success(interpolate(editingSlug ? copy.saveUpdated : copy.saveCreated, { name: row.name }));
+      notify.successText(interpolate(editingSlug ? copy.saveUpdated : copy.saveCreated, { name: row.name }));
       setSelectedSlug(row.slug);
       setEditingSlug(row.slug);
       setMarkdown(row.skill_markdown);
@@ -2488,7 +2488,7 @@ function GeneralSkillEditorPageContent({ mode, currentUser, onLogout }: { mode: 
       );
       if (!isCurrentTenantRequest(context, generation, controller)) return;
       replaceRow(next);
-      notify.success(published ? copy.enabledSuccess : copy.archivedSuccess);
+      notify.successText(published ? copy.enabledSuccess : copy.archivedSuccess);
     } catch (error) {
       if (isCurrentTenantRequest(context, generation, controller)) {
         notify.error(generalSkillsPageErrorMessage(error, published ? copy.enableFailed : copy.archiveFailed, t));
@@ -2532,7 +2532,7 @@ function GeneralSkillEditorPageContent({ mode, currentUser, onLogout }: { mode: 
           newSkill();
         }
       }
-      notify.success(branchMode ? copy.removedSuccess : copy.deletedSuccess);
+      notify.successText(branchMode ? copy.removedSuccess : copy.deletedSuccess);
     } catch (error) {
       if (isCurrentTenantRequest(context, generation, controller)) {
         notify.error(generalSkillsPageErrorMessage(error, branchMode ? copy.removeFailed : copy.deleteSkillFailed, t));
@@ -2701,7 +2701,7 @@ function GeneralSkillEditorPageContent({ mode, currentUser, onLogout }: { mode: 
         resource_ids: agentImportSelectedSkillIds,
       }, { signal: controller.signal });
       if (!isCurrentTenantRequest(context, generation, controller)) return;
-      notify.success(interpolate(copy.copiedSkillsSuccess, { count: agentImportSelectedSkillIds.length }));
+      notify.successText(interpolate(copy.copiedSkillsSuccess, { count: agentImportSelectedSkillIds.length }));
       setAgentImportOpen(false);
       await load();
     } catch (error) {
@@ -2734,7 +2734,7 @@ function GeneralSkillEditorPageContent({ mode, currentUser, onLogout }: { mode: 
         status: 'published',
       }, controller.signal);
       if (!isCurrentTenantRequest(context, generation, controller)) return;
-      notify.success(interpolate(copy.importedOpenSourceSuccess, { name: row.name }));
+      notify.successText(interpolate(copy.importedOpenSourceSuccess, { name: row.name }));
       setRows((current) => [row, ...current.filter((item) => item.id !== row.id && item.slug !== row.slug)]);
       setSelectedSlug(row.slug);
       editSkill(row);
@@ -2774,7 +2774,7 @@ function GeneralSkillEditorPageContent({ mode, currentUser, onLogout }: { mode: 
         status: 'published',
       }, controller.signal);
       if (!isCurrentTenantRequest(context, generation, controller)) return;
-      notify.success(interpolate(copy.uploadPackageSuccess, { name: row.name }));
+      notify.successText(interpolate(copy.uploadPackageSuccess, { name: row.name }));
       setRows((current) => [row, ...current.filter((item) => item.id !== row.id && item.slug !== row.slug)]);
       setSelectedSlug(row.slug);
       editSkill(row);
@@ -3117,7 +3117,7 @@ function GeneralSkillEditorPageContent({ mode, currentUser, onLogout }: { mode: 
                 : receivedTrace,
             });
             setLiveResult(null);
-            notify.success(copy.runComplete);
+            notify.successText(copy.runComplete);
           }
           if (item.event === 'error') {
             const text = generalSkillsPageErrorMessage(item.data, copy.runFailed, t);
@@ -3170,7 +3170,7 @@ function GeneralSkillEditorPageContent({ mode, currentUser, onLogout }: { mode: 
     setMarkdown(text);
     setMarkdownPreviewOpen(false);
     applyMetadata(text, { setSkillName, setSkillSlug, setSkillDescription, setSkillHomepage });
-    notify.success(interpolate(copy.importedSingleFile, { name: target.name }));
+    notify.successText(interpolate(copy.importedSingleFile, { name: target.name }));
   }
 
   async function importSkillPackage(targets: DroppedSkillFile[]) {
@@ -3205,7 +3205,7 @@ function GeneralSkillEditorPageContent({ mode, currentUser, onLogout }: { mode: 
       setSelectedFilePath(skillFile.path);
       setSelectedFolderPath(null);
       applyMetadata(skillFile.content, { setSkillName, setSkillSlug, setSkillDescription, setSkillHomepage });
-      notify.success(interpolate(copy.importedFiles, {
+      notify.successText(interpolate(copy.importedFiles, {
         count: nextFiles.length,
         skipped: failedCount ? interpolate(copy.importedFilesSkipped, { count: failedCount }) : '',
       }));

@@ -143,6 +143,15 @@ function localizedLegacyMessage(message: ReactNode): string {
 export const notify = {
   success: (message: ReactNode, options?: AppToastOptions) =>
     showVariant('success', localizedLegacyMessage(message), options),
+  /**
+   * 已在产品调用点审核、且已完成本地化的成功文案。
+   *
+   * `success` 仍维持旧错误码兼容与原始数据脱敏；业务页面只有在文案完全由
+   * catalog 或本地固定 copy 生成时，才能调用此入口。这样不会再把“保存成功”
+   * 错当作错误码，同时也不放宽 error/warning/info/loading 对 provider 原文的拦截。
+   */
+  successText: (message: string, options?: AppToastOptions) =>
+    showVariant('success', message, options),
   error: (message: ReactNode, options?: AppToastOptions) =>
     showVariant('error', localizedLegacyMessage(message), options),
   warning: (message: ReactNode, options?: AppToastOptions) => (

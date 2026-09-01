@@ -194,7 +194,7 @@ export default function AccountsPage({
         role: createDraft.role,
       });
       if (!context.isCurrentGeneration(generation)) return;
-      notify.success(t('accountsPage.toast.created'));
+      notify.successText(t('accountsPage.toast.created'));
       setCreateOpen(false);
       await load();
     } catch (error) {
@@ -219,7 +219,7 @@ export default function AccountsPage({
         role: draft.role,
       });
       if (!context.isCurrentGeneration(generation)) return;
-      notify.success(t('accountsPage.toast.saved'));
+      notify.successText(t('accountsPage.toast.saved'));
       setEditing(null);
       await load();
     } catch (error) {
@@ -241,7 +241,7 @@ export default function AccountsPage({
     try {
       await tenantApi.delete(`/api/auth/users/${row.id}`);
       if (!context.isCurrentGeneration(generation)) return;
-      notify.success(t('accountsPage.toast.deleted'));
+      notify.successText(t('accountsPage.toast.deleted'));
       setDeleteTarget(null);
       await load();
     } catch (error) {

@@ -215,14 +215,14 @@ export default function PersonaPage() {
         }
         if (!isCurrentPersona()) return;
         window.dispatchEvent(new CustomEvent('ultrarag-enterprise-agent-scope-change', { detail: { agentId: row.id } }));
-        notify.success(t(row.is_overall ? 'personaPage.toast.savedOverall' : 'personaPage.toast.saved'));
+        notify.successText(t(row.is_overall ? 'personaPage.toast.savedOverall' : 'personaPage.toast.saved'));
       } else {
         const row = await tenantApi.put<PersonaRead>('/api/enterprise/persona', {
           system_prompt: form.system_prompt,
         });
         if (!isCurrentPersona()) return;
         setUpdatedAt(row.updated_at);
-        notify.success(t('personaPage.toast.savedOverall'));
+        notify.successText(t('personaPage.toast.savedOverall'));
       }
     } catch (error) {
       if (isCurrentPersona()) {

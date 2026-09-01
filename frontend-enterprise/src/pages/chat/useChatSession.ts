@@ -1806,7 +1806,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     try {
       await tenantClient.post<HumanHandoffRead>(`/api/chat/handoffs/${handoff.id}/reply`, { reply });
       if (!isWorkspaceCurrent()) return false;
-      notify.success(t('chat.notice.handoffReplied'));
+      notify.successText(t('chat.notice.handoffReplied'));
       setHandoffs((rows) => rows.filter((item) => item.id !== handoff.id));
       setHandoffReplies((prev) => {
         const next = { ...prev };
@@ -2200,7 +2200,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       setSessions((items) => items.map((item) => (item.id === updated.id ? updated : item)));
       setRenameSession(null);
       setRenameTitle('');
-      notify.success(t('chat.notice.renamed'));
+      notify.successText(t('chat.notice.renamed'));
     } catch (error) {
       if (!isWorkspaceCurrent()) return;
       console.error('[chat] rename session failed', error);
@@ -2228,7 +2228,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
       if (target.id === sessionId) {
         navigate(CHAT_BASE_PATH);
       }
-      notify.success(t('chat.notice.deleted'));
+      notify.successText(t('chat.notice.deleted'));
     } catch (error) {
       if (!isWorkspaceCurrent()) return;
       if (isAuthError(error)) {
@@ -2365,7 +2365,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
         delete next[sessionId];
         return next;
       });
-      notify.success(t('chat.notice.scheduledEnabled', { title: saved.title }));
+      notify.successText(t('chat.notice.scheduledEnabled', { title: saved.title }));
     } catch (error) {
       if (!isWorkspaceCurrent()) return;
       if (isAuthError(error)) {

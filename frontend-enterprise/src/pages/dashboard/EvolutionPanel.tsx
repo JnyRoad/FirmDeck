@@ -201,7 +201,7 @@ export default function EvolutionPanel({ agentId }: { agentId: string }) {
       );
       if (!isCurrent()) return;
       setInstruction('');
-      notify.success(t(EVOLUTION_ACTION_SUCCESS_IDS.analyze));
+      notify.successText(t(EVOLUTION_ACTION_SUCCESS_IDS.analyze));
       if (!isCurrent()) return;
       await load();
     } catch (error) {
@@ -238,7 +238,7 @@ export default function EvolutionPanel({ agentId }: { agentId: string }) {
         { signal: requestController.signal },
       );
       if (!isCurrent()) return;
-      notify.success(t(EVOLUTION_ACTION_SUCCESS_IDS[action]));
+      notify.successText(t(EVOLUTION_ACTION_SUCCESS_IDS[action]));
       if (!isCurrent()) return;
       await load();
     } catch (error) {

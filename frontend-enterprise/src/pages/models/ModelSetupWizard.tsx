@@ -54,6 +54,8 @@ export type ModelSetupWizardProps = {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onCreated: (model: ModelConfigRead, options?: { tested: boolean }) => void;
+  /** 编辑时复用同一套引导式界面；未提供则创建新模型。 */
+  editingModel?: ModelConfigRead | null;
   availableProtocols: ApiKeyProtocol[];
   subscriptionAccount: CodexSubscriptionAccountRead | null;
   subscriptionLoading: boolean;
@@ -126,11 +128,36 @@ function protocolLabel(protocol: ApiKeyProtocol, t: ReturnType<typeof useAppIntl
   }
 }
 
+/** 统一比较渠道地址，避免尾随斜杠把已有厂商配置误判为自定义渠道。 */
+function normalizedBaseUrl(value: string | null | undefined): string {
+  return (value ?? '').trim().replace(/\/+$/, '').toLowerCase();
+}
+
+/** 将已有配置映射回可编辑的引导渠道；无法精确匹配预设时保留为自定义渠道。 */
+function channelForExistingModel(model: ModelConfigRead): ChannelPreset {
+  if (model.auth_mode === 'chatgpt_subscription') {
+    return CHANNEL_PRESETS.find((preset) => preset.id === 'chatgpt_subscription')!;
+  }
+  // Older OpenAI-compatible configurations left the SDK's default endpoint
+  // implicit. Present them as the OpenAI preset, but keep `base_url` omitted
+  // when saving so their existing key and effective destination remain intact.
+  if (model.base_url === null && model.api_protocol === 'openai_chat_completions') {
+    return CHANNEL_PRESETS.find((preset) => preset.id === 'openai')!;
+  }
+  const matchedVendor = CHANNEL_PRESETS.find((preset) => (
+    preset.category === 'vendor'
+    && preset.apiProtocol === model.api_protocol
+    && normalizedBaseUrl(preset.baseUrl) === normalizedBaseUrl(model.base_url)
+  ));
+  return matchedVendor ?? CHANNEL_PRESETS.find((preset) => preset.id === 'custom')!;
+}
+
 /** 引导管理员在调用方租户内配置模型，并只接受当前请求代次的异步结果。 */
 export default function ModelSetupWizard({
   open,
   onOpenChange,
   onCreated,
+  editingModel = null,
   availableProtocols,
   subscriptionAccount,
   subscriptionLoading,
@@ -153,6 +180,7 @@ export default function ModelSetupWizard({
   const [configName, setConfigName] = useState('');
   const [configNameTouched, setConfigNameTouched] = useState(false);
   const [isDefault, setIsDefault] = useState(false);
+  const [isEnabled, setIsEnabled] = useState(true);
   const [saving, setSaving] = useState(false);
   const [saveResult, setSaveResult] = useState<'idle' | 'error'>('idle');
   const [saveErrorMessage, setSaveErrorMessage] = useState<string | null>(null);
@@ -173,6 +201,11 @@ export default function ModelSetupWizard({
     () => CHANNEL_PRESETS.find((preset) => preset.id === selectedChannelId) ?? null,
     [selectedChannelId],
   );
+  const editingChannel = useMemo(
+    () => (editingModel ? channelForExistingModel(editingModel) : null),
+    [editingModel],
+  );
+  const isEditing = editingModel !== null;
 
   const filteredPresets = useMemo(() => {
     const keyword = search.trim().toLowerCase();
@@ -208,6 +241,7 @@ export default function ModelSetupWizard({
     setConfigName('');
     setConfigNameTouched(false);
     setIsDefault(false);
+    setIsEnabled(true);
     setSaving(false);
     setSaveResult('idle');
     setSaveErrorMessage(null);
@@ -233,6 +267,49 @@ export default function ModelSetupWizard({
     // 租户代次是列表请求的隔离边界；其余表单状态由当前打开流程继续管理。
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tenantContext?.generation]);
+
+  /** 打开已有模型时预填同一套向导，并直接落在凭证配置步骤。 */
+  useEffect(() => {
+    if (!open || !editingModel || !editingChannel) return;
+
+    const protocol = editingModel.api_protocol === 'codex_app_server'
+      ? 'openai_chat_completions'
+      : editingModel.api_protocol as ApiKeyProtocol;
+    setStep(2);
+    setSelectedChannelId(editingChannel.id);
+    setSearch('');
+    setVendorForm(editingChannel.category === 'vendor'
+      ? { apiKey: '', model: editingModel.model }
+      : BLANK_VENDOR_FORM);
+    setCustomForm(editingChannel.category === 'custom'
+      ? {
+        apiProtocol: protocol,
+        baseUrl: editingModel.base_url ?? '',
+        apiKey: '',
+        model: editingModel.model,
+        temperature: String(editingModel.temperature),
+        maxOutputTokens: String(editingModel.max_output_tokens),
+        extraBody: JSON.stringify(editingModel.extra_body ?? {}, null, 2),
+      }
+      : BLANK_CUSTOM_FORM);
+    setSubscriptionForm(editingChannel.category === 'subscription'
+      ? { model: editingModel.model }
+      : BLANK_SUBSCRIPTION_FORM);
+    setShowAdvanced(false);
+    setShowCustomAdvanced(false);
+    setConfigName(editingModel.name);
+    setConfigNameTouched(true);
+    setIsDefault(editingModel.is_default);
+    setIsEnabled(editingModel.enabled);
+    setSaving(false);
+    setSaveResult('idle');
+    setSaveErrorMessage(null);
+    resetModelListRequests();
+    onSubscriptionSelected?.(editingChannel.category === 'subscription');
+    // `editingModel` identity represents the selected row. Reinitializing only
+    // on that identity/open transition keeps user edits intact while the dialog is open.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, editingModel, editingChannel]);
 
   /** 关闭向导并撤销仅在订阅渠道选中期间启用的状态查询。 */
   function handleClose() {
@@ -357,9 +434,26 @@ export default function ModelSetupWizard({
         : subscriptionForm
     : null;
 
-  const vendorStepComplete = vendorForm.apiKey.trim() !== '' && vendorForm.model.trim() !== '';
+  const canReuseExistingApiKey = Boolean(
+    editingModel
+    && editingModel.auth_mode === 'api_key'
+    && editingModel.api_key_masked
+    && selectedChannelId === editingChannel?.id
+    && (
+      selectedChannel?.category === 'vendor'
+      || (
+        selectedChannel?.category === 'custom'
+        && customForm.apiProtocol === editingModel.api_protocol
+        && normalizedBaseUrl(customForm.baseUrl) === normalizedBaseUrl(editingModel.base_url)
+      )
+    ),
+  );
+  const vendorStepComplete =
+    (vendorForm.apiKey.trim() !== '' || canReuseExistingApiKey) && vendorForm.model.trim() !== '';
   const customStepComplete =
-    customForm.baseUrl.trim() !== '' && customForm.apiKey.trim() !== '' && customForm.model.trim() !== '';
+    customForm.baseUrl.trim() !== ''
+    && (customForm.apiKey.trim() !== '' || canReuseExistingApiKey)
+    && customForm.model.trim() !== '';
   // Drives the connection-gated UI (model field enabled, auto-fetch effect) —
   // it must stay based on connection status alone, not the model field, or
   // the model list would never fetch before a model is typed.
@@ -430,12 +524,12 @@ export default function ModelSetupWizard({
   // it themselves — step 2 now includes naming, so this has to stay live
   // instead of being seeded once when moving to a separate naming step.
   useEffect(() => {
-    if (configNameTouched) return;
+    if (isEditing || configNameTouched) return;
     setConfigName(suggestedName());
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedChannel, currentFormValues?.model, configNameTouched]);
+  }, [selectedChannel, currentFormValues?.model, configNameTouched, isEditing]);
 
-  /** 先由后端验证候选配置，再原子地创建并启用模型；验证失败不会留下草稿。 */
+  /** 创建或更新候选配置；启用模型保存前只做一次后端连通性验证。 */
   async function persistVerified(): Promise<ModelConfigRead | null> {
     const context = tenantContext;
     if (!selectedChannel || !context) return null;
@@ -443,13 +537,37 @@ export default function ModelSetupWizard({
     const name = configName.trim() || suggestedName();
     const payload = buildModelConfigPayload(selectedChannel, currentFormValues!, {
       name,
-      isDefault,
-      enabled: true,
+      isDefault: isEnabled && isDefault,
+      enabled: isEnabled,
     });
-    const saved = await tenantApi.post<ModelConfigRead>(
-      '/api/enterprise/model-configs?verify_before_save=true',
-      payload,
-    );
+    // The preset-vendor and subscription flows intentionally keep sampling
+    // values out of their compact UI. Preserve existing values on edit instead
+    // of silently resetting them to the creation defaults.
+    if (editingModel && selectedChannel.category !== 'custom') {
+      payload.temperature = editingModel.temperature;
+      payload.max_output_tokens = editingModel.max_output_tokens;
+    }
+    if (
+      editingModel?.base_url === null
+      && editingModel.api_protocol === 'openai_chat_completions'
+      && selectedChannel.id === 'openai'
+      && !payload.api_key
+    ) {
+      // Do not turn an implicit legacy OpenAI endpoint into a different API
+      // destination during an unrelated edit. This also lets the server keep
+      // the already encrypted key without widening the endpoint contract.
+      delete payload.base_url;
+    }
+    const verifyQuery = isEnabled ? '?verify_before_save=true' : '';
+    const saved = editingModel
+      ? await tenantApi.put<ModelConfigRead>(
+        `/api/enterprise/model-configs/${editingModel.id}${verifyQuery}`,
+        payload,
+      )
+      : await tenantApi.post<ModelConfigRead>(
+        `/api/enterprise/model-configs${verifyQuery}`,
+        payload,
+      );
     if (!isCurrentTenantGeneration(context, requestGeneration)) return null;
     return saved;
   }
@@ -466,7 +584,7 @@ export default function ModelSetupWizard({
       const saved = await persistVerified();
       if (!isCurrentTenantGeneration(context, requestGeneration)) return;
       if (!saved) return;
-      onCreated(saved, { tested: true });
+      onCreated(saved, { tested: isEnabled });
       resetAllSteps();
       onOpenChange(false);
     } catch (error) {
@@ -492,7 +610,9 @@ export default function ModelSetupWizard({
         showCloseButton={false}
         className="flex h-[720px] max-h-[calc(100dvh-4rem)] w-[calc(100%-2rem)] flex-col overflow-hidden rounded-[14px] p-0 sm:max-w-[860px]"
       >
-        <DialogTitle className="sr-only">{t('modelSetup.title')}</DialogTitle>
+        <DialogTitle className="sr-only">
+          {editingModel ? t('modelsPage.edit.title', { name: editingModel.name }) : t('modelSetup.title')}
+        </DialogTitle>
         <div className="flex min-h-0 flex-1">
           <nav className="flex w-[220px] shrink-0 flex-col gap-[4px] border-r border-[#f0f1f4] bg-[#fafbfc] p-[20px_14px]">
             <span className="px-[10px] pb-[14px] text-[12px] font-semibold text-[#858b9c]">{t('modelSetup.title')}</span>
@@ -570,7 +690,9 @@ export default function ModelSetupWizard({
                     <Input
                       type="password"
                       value={vendorForm.apiKey}
-                      placeholder={t('modelSetup.field.apiKeyPlaceholder')}
+                      placeholder={canReuseExistingApiKey
+                        ? t('chat.modelSetup.keepExistingKey')
+                        : t('modelSetup.field.apiKeyPlaceholder')}
                       onChange={(event) => setVendorForm((prev) => ({ ...prev, apiKey: event.target.value }))}
                       onBlur={() => void fetchVendorModelsNow(selectedChannel, vendorForm.apiKey)}
                     />
@@ -657,7 +779,9 @@ export default function ModelSetupWizard({
                     <Input
                       type="password"
                       value={customForm.apiKey}
-                      placeholder={t('modelSetup.field.apiKeyPlaceholder')}
+                      placeholder={canReuseExistingApiKey
+                        ? t('chat.modelSetup.keepExistingKey')
+                        : t('modelSetup.field.apiKeyPlaceholder')}
                       onChange={(event) => setCustomForm((prev) => ({ ...prev, apiKey: event.target.value }))}
                       onBlur={() => void fetchCustomModelsNow(customForm)}
                     />
@@ -785,9 +909,25 @@ export default function ModelSetupWizard({
                 <div className="mt-[4px] flex flex-col gap-[16px] border-t border-[#f0f1f4] pt-[16px]">
                   <div className="flex flex-wrap items-center gap-[24px]">
                     <label className="flex cursor-pointer items-center gap-[8px]">
-                      <Switch checked={isDefault} onCheckedChange={setIsDefault} />
+                      <Switch
+                        checked={isDefault}
+                        disabled={!isEnabled}
+                        onCheckedChange={setIsDefault}
+                      />
                       <span className="text-[12px] font-medium text-[#464c5e]">{t('modelSetup.toggle.default')}</span>
                     </label>
+                    {isEditing && (
+                      <label className="flex cursor-pointer items-center gap-[8px]">
+                        <Switch
+                          checked={isEnabled}
+                          onCheckedChange={(next) => {
+                            setIsEnabled(next);
+                            if (!next) setIsDefault(false);
+                          }}
+                        />
+                        <span className="text-[12px] font-medium text-[#464c5e]">{t('modelSetup.toggle.enabled')}</span>
+                      </label>
+                    )}
                   </div>
 
                   {saveResult === 'error' && saveErrorMessage && (
@@ -836,7 +976,9 @@ export default function ModelSetupWizard({
                   className="h-[34px] gap-[6px] rounded-[10px] bg-[#18181a] px-[20px] text-[13px] text-white hover:bg-[#303030] disabled:opacity-40"
                 >
                   {saving && <LoaderCircle className="size-[14px] animate-spin" />}
-                  {saving ? t('modelSetup.actions.testing') : t('common.action.save')}
+                  {saving
+                    ? (isEnabled ? t('modelSetup.actions.testing') : t('modelSetup.actions.saving'))
+                    : t('common.action.save')}
                 </UIButton>
               )}
             </div>

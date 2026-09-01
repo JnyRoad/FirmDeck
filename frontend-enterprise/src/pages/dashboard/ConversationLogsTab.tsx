@@ -712,7 +712,7 @@ export default function ConversationLogsTab() {
       );
       if (!fence.isCurrent()) return;
       downloadBlob(blob, `staffdeck-conversation-log-${safeFilenamePart(row.id)}.json`);
-      notify.success(t('dashboard.conversationLogs.toast.exportSingleSuccess'));
+      notify.successText(t('dashboard.conversationLogs.toast.exportSingleSuccess'));
     } catch (error) {
       if (fence.isCurrent()) {
         notify.error(conversationLogErrorMessage(error, 'dashboard.conversationLogs.error.exportSingle', t));
@@ -745,7 +745,7 @@ export default function ConversationLogsTab() {
       );
       if (!fence.isCurrent()) return;
       downloadBlob(blob, `staffdeck-conversation-logs-${filenameTimestamp()}.json`);
-      notify.success(t('dashboard.conversationLogs.toast.exportBatchSuccess', { count: sessionIds.length }));
+      notify.successText(t('dashboard.conversationLogs.toast.exportBatchSuccess', { count: sessionIds.length }));
     } catch (error) {
       if (fence.isCurrent()) {
         notify.error(conversationLogErrorMessage(error, 'dashboard.conversationLogs.error.exportBatch', t));
@@ -802,7 +802,7 @@ export default function ConversationLogsTab() {
         { signal: fence.signal },
       );
       if (!fence.isCurrent()) return;
-      notify.success(t('dashboard.conversationLogs.toast.reanalyzeSuccess'));
+      notify.successText(t('dashboard.conversationLogs.toast.reanalyzeSuccess'));
       await reloadCurrentDetail();
       if (!fence.isCurrent()) return;
       await load();

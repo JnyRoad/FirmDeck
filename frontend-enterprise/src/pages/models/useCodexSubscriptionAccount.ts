@@ -110,16 +110,16 @@ export function useCodexSubscriptionAccount({
         setAccount(nextAccount);
         switch (nextAccount.status) {
           case 'connected':
-            notify.success(t('modelsPage.subscription.connected'));
+            notify.successText(t('modelsPage.subscription.connected'));
             break;
           case 'pending':
-            notify.success(t('modelsPage.subscription.pending'));
+            notify.successText(t('modelsPage.subscription.pending'));
             break;
           case 'requires_login':
-            notify.success(t('modelsPage.subscription.requiresLogin'));
+            notify.successText(t('modelsPage.subscription.requiresLogin'));
             break;
           default:
-            notify.success(t('modelsPage.subscription.unavailable'));
+            notify.successText(t('modelsPage.subscription.unavailable'));
         }
       } catch (error) {
         if (!isCurrentRequest(requestGeneration, contextGeneration)) {

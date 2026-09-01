@@ -506,6 +506,42 @@ def test_security_change_invalidates_and_disables_legacy_config(tmp_path) -> Non
         assert updated.security_revision == 2
 
 
+def test_update_rejects_endpoint_or_protocol_change_without_a_new_api_key(tmp_path) -> None:
+    with _db(tmp_path) as db:
+        original_secret = encrypt_secret("old-secret")
+        db.add(
+            ModelConfig(
+                id="model_a",
+                tenant_id="tenant_a",
+                name="Chat",
+                api_protocol="openai_chat_completions",
+                base_url="https://old-provider.example/v1",
+                api_key_encrypted=original_secret,
+                model="model-a",
+            )
+        )
+        db.commit()
+
+        with pytest.raises(HTTPException) as exc_info:
+            update_model_config(
+                "model_a",
+                ModelConfigUpdateRequest(
+                    tenant_id="tenant_a",
+                    base_url="https://new-provider.example/v1",
+                ),
+                db=db,
+                current_user=_admin(),
+            )
+
+        assert exc_info.value.status_code == 422
+        assert exc_info.value.detail["code"] == "MODEL_API_KEY_REQUIRED"
+        db.expire_all()
+        stored = db.get(ModelConfig, "model_a")
+        assert stored is not None
+        assert stored.base_url == "https://old-provider.example/v1"
+        assert stored.api_key_encrypted == original_secret
+
+
 def test_failed_verified_update_preserves_existing_model(tmp_path, monkeypatch) -> None:
     class FailingClient:
         def __init__(self, _config) -> None:  # noqa: ANN001
@@ -666,7 +702,7 @@ def test_read_returns_only_current_protocol_options(tmp_path) -> None:
     assert model_config_read(row).protocol_options == {"thinking": {"type": "disabled"}}
 
 
-def test_verification_runs_bounded_text_stream_and_json_probes(tmp_path, monkeypatch) -> None:
+def test_verification_runs_one_bounded_connectivity_probe(tmp_path, monkeypatch) -> None:
     calls = []
 
     class FakeClient:
@@ -676,14 +712,6 @@ def test_verification_runs_bounded_text_stream_and_json_probes(tmp_path, monkeyp
         def generate_text(self, _prompt, _payload):  # noqa: ANN001
             calls.append(("text",))
             return "ok"
-
-        def generate_text_stream(self, _prompt, _payload):  # noqa: ANN001
-            calls.append(("stream",))
-            yield "ok"
-
-        def generate_json(self, _prompt, _payload):  # noqa: ANN001
-            calls.append(("json",))
-            return {"ok": True}
 
     monkeypatch.setattr("app.api.model_configs.LLMClient", FakeClient)
     with _db(tmp_path) as db:
@@ -704,19 +732,15 @@ def test_verification_runs_bounded_text_stream_and_json_probes(tmp_path, monkeyp
         result = run_model_config_test("model_a", tenant_id="tenant_a", db=db)
 
         assert result.success is True
-        assert [item.id for item in result.capabilities] == ["text", "stream", "json"]
+        assert [item.id for item in result.capabilities] == ["text"]
         assert calls == [
             ("init", 64, 25.0),
             ("text",),
-            ("init", 64, 25.0),
-            ("stream",),
-            ("init", 64, 35.0),
-            ("json",),
         ]
 
 
 def test_subscription_verification_uses_the_codex_app_server_protocol(tmp_path, monkeypatch) -> None:
-    """订阅模型验证沿用三项探针，但每项都保留 runtime 协议而非退回 API Key 分支。"""
+    """订阅模型也只跑一次连通性探针，并保留本机 runtime 协议。"""
     observed_protocols: list[str] = []
 
     class FakeClient:
@@ -763,7 +787,7 @@ def test_subscription_verification_uses_the_codex_app_server_protocol(tmp_path, 
         )
 
     assert result.success is True
-    assert observed_protocols == ["codex_app_server"] * 3
+    assert observed_protocols == ["codex_app_server"]
 
 
 def test_initial_verification_can_atomically_activate_first_model(tmp_path, monkeypatch) -> None:

@@ -65,11 +65,11 @@ router = APIRouter(
     dependencies=[Depends(get_current_user)],
 )
 
+# 保存前只做一次有界连通性探测，不再把流式和 JSON 能力校验串在管理员保存流程中。
+# 总截止时间仍保留为外层安全阀；唯一探针自身最多运行 25 秒。
 MODEL_VERIFICATION_DEADLINE_SECONDS = 90.0
 MODEL_VERIFICATION_PROBES = (
     ("text", 25.0),
-    ("stream", 25.0),
-    ("json", 35.0),
 )
 
 
@@ -330,6 +330,15 @@ def update_model_config(
             if (request.api_protocol is not None or request.provider is not None)
             else ModelApiProtocol(row.api_protocol)
         )
+        # Existing credentials are scoped to a specific provider endpoint and
+        # protocol. Never silently carry one to a newly supplied destination;
+        # the browser validation is a UX aid, while this check is the API
+        # contract for every caller.
+        endpoint_changed = protocol.value != row.api_protocol or (
+            request.base_url is not None and request.base_url != row.base_url
+        )
+        if endpoint_changed and not request.api_key:
+            raise build_http_exception("MODEL_API_KEY_REQUIRED")
     target_temperature = request.temperature if request.temperature is not None else row.temperature
     target_tokens = (
         request.max_output_tokens
@@ -571,7 +580,11 @@ def test_model_config(
             db.commit()
         completed_ids = {item.id for item in capabilities}
         failed_id = next(
-            (item for item in ("text", "stream", "json") if item not in completed_ids),
+            (
+                capability_id
+                for capability_id, _ in MODEL_VERIFICATION_PROBES
+                if capability_id not in completed_ids
+            ),
             None,
         )
         if failed_id is not None:
@@ -691,20 +704,6 @@ def _run_verification_probes(
                 "你是一个连接测试助手。请用一句中文回复连接成功。",
                 {"message": "ping"},
             )
-        elif capability_id == "stream":
-            stream_text = "".join(
-                probe_client.generate_text_stream(
-                    "你是一个连接测试助手。", {"message": "请回复 stream-ok"}
-                )
-            )
-            if not stream_text.strip():
-                raise LLMError("MODEL_EMPTY_OUTPUT")
-        else:
-            json_output = probe_client.generate_json(
-                "只返回 JSON object。", {"message": '返回 {"ok": true}'}
-            )
-            if not isinstance(json_output, dict):
-                raise LLMError("MODEL_INVALID_JSON")
         capabilities.append(ModelCapabilityTestResult(id=capability_id, success=True))
     return capabilities, output
 

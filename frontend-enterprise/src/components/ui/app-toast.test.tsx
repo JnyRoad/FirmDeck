@@ -186,4 +186,16 @@ describe('descriptor-based application toasts', () => {
       }
     }
   });
+
+  /**
+   * 已由产品调用方生成并审核过的本地化成功文案，必须保留原文；不能再被 legacy
+   * 错误码兼容逻辑替换为“操作失败”。这覆盖知识库、模型等所有共享 success 调用点。
+   */
+  it('renders audited product success text without treating it as an error code', () => {
+    notify.successText('知识库已保存');
+
+    expect(sonnerSpies.custom).toHaveBeenCalledTimes(1);
+    expect(renderLatestCustomToast()).toContain('知识库已保存');
+    expect(renderLatestCustomToast()).not.toContain('操作失败');
+  });
 });

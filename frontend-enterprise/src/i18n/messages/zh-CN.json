@@ -2916,6 +2916,7 @@
   "modelsPage.toast.subscriptionLogoutFailed": "无法退出 ChatGPT 订阅",
   "modelsPage.toast.subscriptionStatusLoadFailed": "无法读取 ChatGPT 订阅状态",
   "modelsPage.toast.testFailed": "模型连接测试失败",
+  "modelsPage.toast.testSucceeded": "模型连接测试成功",
   "onboarding.action.close": "关闭引导",
   "onboarding.action.next": "下一步",
   "onboarding.action.previous": "上一步",

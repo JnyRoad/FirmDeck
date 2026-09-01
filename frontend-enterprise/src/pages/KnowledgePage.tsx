@@ -778,7 +778,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
       if (!context.isCurrentGeneration(generation)) return;
       const importedCount = result.imported?.length || 0;
       const missingCount = result.missing?.length || 0;
-      notify.success(t('knowledgePage.toast.importedKnowledgeBases', { importedCount, missingCount }));
+      notify.successText(t('knowledgePage.toast.importedKnowledgeBases', { importedCount, missingCount }));
       setImportOpen(false);
       await refresh();
     } catch (error) {
@@ -822,7 +822,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
         content_base64: contentBase64,
       });
       if (!context.isCurrentGeneration(generation)) return;
-      notify.success(t('knowledgePage.toast.importedBackup'));
+      notify.successText(t('knowledgePage.toast.importedBackup'));
       setOkfImportOpen(false);
       await refresh();
     } catch (error) {
@@ -853,7 +853,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
         targetKnowledgeBase.name || targetKnowledgeBase.id,
         'okf.zip',
       );
-      notify.success(t('knowledgePage.toast.exportedBackup'));
+      notify.successText(t('knowledgePage.toast.exportedBackup'));
     } catch (error) {
       if (!context.isCurrentGeneration(generation)) return;
       notify.error(knowledgeErrorMessage(error, 'knowledgePage.error.exportBackup'));
@@ -881,7 +881,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
       setOkfLintIssues(result.issues || []);
       setOkfLintKnowledgeBase(targetKnowledgeBase);
       setOkfLintReportOpen(true);
-      notify.success(result.issue_count
+      notify.successText(result.issue_count
         ? t('knowledgePage.toast.graphLintIssues', { count: result.issue_count })
         : t('knowledgePage.toast.graphLintPassed'));
     } catch (error) {
@@ -927,7 +927,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
       if (!context.isCurrentGeneration(generation)) return;
       setOkfConcepts((current) => current.map((item) => (item.id === next.id ? next : item)));
       setEditingConcept(null);
-      notify.success(t('knowledgePage.toast.savedGraph'));
+      notify.successText(t('knowledgePage.toast.savedGraph'));
       await loadOkfConcepts(selectedKnowledgeBase.id, false);
     } catch (error) {
       if (!context.isCurrentGeneration(generation)) return;
@@ -962,7 +962,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
       if (!context.isCurrentGeneration(generation)) return;
       setKnowledgeBases((current) => current.map((item) => (item.id === next.id ? next : item)));
       setEditingKnowledgeBase(null);
-      notify.success(t('knowledgePage.toast.savedKnowledgeBase'));
+      notify.successText(t('knowledgePage.toast.savedKnowledgeBase'));
       await refresh();
     } catch (error) {
       if (!context.isCurrentGeneration(generation)) return;
@@ -982,7 +982,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
       });
       if (!context.isCurrentGeneration(generation)) return;
       setKnowledgeBases((current) => current.map((item) => (item.id === next.id ? next : item)));
-      notify.success(active ? t('knowledgePage.toast.publishedKnowledgeBase') : t('knowledgePage.toast.archivedKnowledgeBase'));
+      notify.successText(active ? t('knowledgePage.toast.publishedKnowledgeBase') : t('knowledgePage.toast.archivedKnowledgeBase'));
       await refresh();
     } catch (error) {
       if (!context.isCurrentGeneration(generation)) return;
@@ -1005,7 +1005,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
     try {
       await tenantClient.delete(`/api/enterprise/knowledge-bases/${row.id}?tenant_id=${tenantId}${suffix}`);
       if (!context.isCurrentGeneration(generation)) return;
-      notify.success(branchMode ? t('knowledgePage.toast.removedKnowledgeBase') : t('knowledgePage.toast.deletedKnowledgeBase'));
+      notify.successText(branchMode ? t('knowledgePage.toast.removedKnowledgeBase') : t('knowledgePage.toast.deletedKnowledgeBase'));
       setDeleteKbTarget(null);
       await refresh();
     } catch (error) {
@@ -1064,7 +1064,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
     try {
       await tenantClient.post(`/api/enterprise/knowledge-bases/${row.id}/sync-from-overall?tenant_id=${tenantId}&agent_id=${encodeURIComponent(agentId)}`);
       if (!context.isCurrentGeneration(generation)) return;
-      notify.success(t('knowledgePage.toast.syncedFromMarketplace'));
+      notify.successText(t('knowledgePage.toast.syncedFromMarketplace'));
       await refresh();
     } catch (error) {
       if (!context.isCurrentGeneration(generation)) return;
@@ -1083,7 +1083,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
     try {
       await tenantClient.post(`/api/enterprise/knowledge-bases/${row.id}/promote-to-overall?tenant_id=${tenantId}&agent_id=${encodeURIComponent(agentId)}`);
       if (!context.isCurrentGeneration(generation)) return;
-      notify.success(t('knowledgePage.toast.publishedToMarketplace'));
+      notify.successText(t('knowledgePage.toast.publishedToMarketplace'));
       await refresh();
     } catch (error) {
       if (!context.isCurrentGeneration(generation)) return;
@@ -1103,7 +1103,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
         version: version.version,
       });
       if (!context.isCurrentGeneration(generation)) return;
-      notify.success(t('knowledgePage.toast.rolledBackVersion', { version: version.version }));
+      notify.successText(t('knowledgePage.toast.rolledBackVersion', { version: version.version }));
       await openKnowledgeBaseVersions(versionKnowledgeBase);
       if (!context.isCurrentGeneration(generation)) return;
       await refresh();
@@ -1182,7 +1182,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
       setEditingDocument(null);
       await refresh(effectiveAgentId, next);
       if (!context.isCurrentGeneration(generation)) return;
-      notify.success(t('knowledgePage.toast.savedDocument'));
+      notify.successText(t('knowledgePage.toast.savedDocument'));
     } catch (error) {
       if (!context.isCurrentGeneration(generation)) return;
       notify.error(knowledgeErrorMessage(error, 'knowledgePage.error.saveDocument'));
@@ -1233,7 +1233,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
         if (!context.isCurrentGeneration(generation)) return;
       }
       if (!context.isCurrentGeneration(generation)) return;
-      notify.success(t('knowledgePage.toast.savedKnowledgeContent'));
+      notify.successText(t('knowledgePage.toast.savedKnowledgeContent'));
       setEditingBucket(null);
       if (selectedDocument) {
         await loadBuckets(selectedDocument, false);
@@ -2272,7 +2272,7 @@ export function KnowledgeAddPage({ currentUser }: KnowledgePageProps = {}) {
         capability_scope: capabilityScope,
       });
       if (!context.isCurrentGeneration(generation)) return;
-      notify.success(newBaseMode === 'shared' ? t('knowledgePage.add.toast.createdShared') : t('knowledgePage.add.toast.createdDedicated'));
+      notify.successText(newBaseMode === 'shared' ? t('knowledgePage.add.toast.createdShared') : t('knowledgePage.add.toast.createdDedicated'));
       navigate('/enterprise/knowledge');
     } catch (error) {
       if (!context.isCurrentGeneration(generation)) return;
@@ -2305,7 +2305,7 @@ export function KnowledgeAddPage({ currentUser }: KnowledgePageProps = {}) {
       setJobs((prev) => ({ ...prev, [job.id]: job }));
       await refreshKnowledgeBases();
       if (!context.isCurrentGeneration(generation)) return;
-      notify.success(t('knowledgePage.add.toast.createdJob'));
+      notify.successText(t('knowledgePage.add.toast.createdJob'));
     } catch (error) {
       if (!context.isCurrentGeneration(generation)) return;
       notify.error(apiErrorMessage(error, 'knowledgePage.add.error.upload', { t }));
@@ -2324,7 +2324,7 @@ export function KnowledgeAddPage({ currentUser }: KnowledgePageProps = {}) {
       );
       if (!context.isCurrentGeneration(generation)) return;
       setJobs((prev) => ({ ...prev, [next.id]: next }));
-      notify.success(next.status === 'cancelled' ? t('knowledgePage.add.toast.cancelledJob') : t('knowledgePage.add.toast.cancelRequested'));
+      notify.successText(next.status === 'cancelled' ? t('knowledgePage.add.toast.cancelledJob') : t('knowledgePage.add.toast.cancelRequested'));
     } catch (error) {
       if (!context.isCurrentGeneration(generation)) return;
       notify.error(apiErrorMessage(error, 'knowledgePage.add.error.cancelJob', { t }));
@@ -2370,7 +2370,7 @@ export function KnowledgeAddPage({ currentUser }: KnowledgePageProps = {}) {
     try {
       await tenantClient.post(`/api/enterprise/knowledge/discoveries/${item.id}/confirm?tenant_id=${tenantId}`);
       if (!context.isCurrentGeneration(generation)) return;
-      notify.success(t('knowledgePage.add.toast.confirmedSuggestion'));
+      notify.successText(t('knowledgePage.add.toast.confirmedSuggestion'));
       setPendingDiscoveries((current) => current.filter((entry) => entry.id !== item.id));
       await refreshKnowledgeBases();
     } catch (error) {
@@ -2386,7 +2386,7 @@ export function KnowledgeAddPage({ currentUser }: KnowledgePageProps = {}) {
     try {
       await tenantClient.post(`/api/enterprise/knowledge/discoveries/${item.id}/reject?tenant_id=${tenantId}`);
       if (!context.isCurrentGeneration(generation)) return;
-      notify.success(t('knowledgePage.add.toast.rejectedSuggestion'));
+      notify.successText(t('knowledgePage.add.toast.rejectedSuggestion'));
       setPendingDiscoveries((current) => current.filter((entry) => entry.id !== item.id));
     } catch (error) {
       if (!context.isCurrentGeneration(generation)) return;

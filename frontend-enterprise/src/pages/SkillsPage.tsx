@@ -861,7 +861,7 @@ export default function SkillsPage({
       if (!context.isCurrentGeneration(generation)) return;
       const importedCount = result.imported?.length || 0;
       const missingCount = result.missing?.length || 0;
-      notify.success(copiedResultText(copy, locale, importedCount, missingCount));
+      notify.successText(copiedResultText(copy, locale, importedCount, missingCount));
       setImportOpen(false);
       await load();
     } catch (error) {
@@ -893,7 +893,7 @@ export default function SkillsPage({
     try {
       await tenantClient.post(`/api/enterprise/skills/${row.skill_id}/publish?tenant_id=${tenantId}${agentQuery()}`);
       if (!context.isCurrentGeneration(generation)) return;
-      notify.success(copy.enabledSuccess);
+      notify.successText(copy.enabledSuccess);
       await load();
     } catch (error) {
       if (!context.isCurrentGeneration(generation)) return;
@@ -908,7 +908,7 @@ export default function SkillsPage({
     try {
       await tenantClient.post(`/api/enterprise/skills/${row.skill_id}/archive?tenant_id=${tenantId}${agentQuery()}`);
       if (!context.isCurrentGeneration(generation)) return;
-      notify.success(copy.archivedSuccess);
+      notify.successText(copy.archivedSuccess);
       await load();
     } catch (error) {
       if (!context.isCurrentGeneration(generation)) return;
@@ -923,7 +923,7 @@ export default function SkillsPage({
     try {
       await tenantClient.post(`/api/enterprise/skills/${row.skill_id}/draft?tenant_id=${tenantId}${agentQuery()}`);
       if (!context.isCurrentGeneration(generation)) return;
-      notify.success(copy.draftSuccess);
+      notify.successText(copy.draftSuccess);
       await load();
     } catch (error) {
       if (!context.isCurrentGeneration(generation)) return;
@@ -976,7 +976,7 @@ export default function SkillsPage({
         `/api/enterprise/agents/${agentId}/skills/${encodeURIComponent(row.skill_id)}/sync-from-overall?tenant_id=${tenantId}`,
       );
       if (!context.isCurrentGeneration(generation)) return;
-      notify.success(copy.syncSuccess);
+      notify.successText(copy.syncSuccess);
       await load();
     } catch (error) {
       if (!context.isCurrentGeneration(generation)) return;
@@ -995,7 +995,7 @@ export default function SkillsPage({
     try {
       await tenantClient.delete(`/api/enterprise/skills/${row.skill_id}?tenant_id=${tenantId}${agentQuery()}`);
       if (!context.isCurrentGeneration(generation)) return;
-      notify.success(branchMode ? copy.removeSuccess : copy.deleteSuccess);
+      notify.successText(branchMode ? copy.removeSuccess : copy.deleteSuccess);
       setDeleteTarget(null);
       await load();
     } catch (error) {
@@ -1018,7 +1018,7 @@ export default function SkillsPage({
         `/api/enterprise/skills/${encodeURIComponent(row.skill_id)}/versions/${encodeURIComponent(row.version)}/rollback?tenant_id=${tenantId}${agentQuery()}`,
       );
       if (!context.isCurrentGeneration(generation)) return;
-      notify.success(copy.rollbackSuccess.replace('{version}', row.version));
+      notify.successText(copy.rollbackSuccess.replace('{version}', row.version));
       setRollbackTarget(null);
       await load();
       if (!context.isCurrentGeneration(generation)) return;
@@ -1043,7 +1043,7 @@ export default function SkillsPage({
         `/api/enterprise/agents/${agentId}/skills/${encodeURIComponent(row.skill_id)}/promote-to-overall?tenant_id=${tenantId}`,
       );
       if (!context.isCurrentGeneration(generation)) return;
-      notify.success(copy.promoteSuccess);
+      notify.successText(copy.promoteSuccess);
       setPromoteTarget(null);
       await load();
     } catch (error) {

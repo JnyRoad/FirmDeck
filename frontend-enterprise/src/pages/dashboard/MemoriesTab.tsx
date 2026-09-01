@@ -318,7 +318,7 @@ export default function MemoriesTab({
         { signal: fence.signal },
       );
       if (!fence.isCurrent()) return;
-      notify.success(
+      notify.successText(
         result.deleted > 0
           ? t('dashboard.memories.toast.clearSuccess', { count: result.deleted })
           : t('dashboard.memories.toast.clearEmpty'),

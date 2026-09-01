@@ -131,7 +131,7 @@ export default function AccountApiKeyDialog({
       setRevealed(created);
       setCopied(false);
       await load();
-      notify.success(t('accountApiKey.toast.createSuccess'));
+      notify.successText(t('accountApiKey.toast.createSuccess'));
     } catch (error) {
       notify.error(error instanceof Error ? error.message : t('accountApiKey.toast.createFailed'));
     } finally {
@@ -151,7 +151,7 @@ export default function AccountApiKeyDialog({
       setRevealed(rotated);
       setCopied(false);
       await load();
-      notify.success(t('accountApiKey.toast.rotateSuccess'));
+      notify.successText(t('accountApiKey.toast.rotateSuccess'));
     } catch (error) {
       notify.error(error instanceof Error ? error.message : t('accountApiKey.toast.rotateFailed'));
     } finally {
@@ -168,7 +168,7 @@ export default function AccountApiKeyDialog({
         {},
       );
       await copyTextToClipboard(revealedKey.api_key);
-      notify.success(t('accountApiKey.toast.copyFullSuccess'));
+      notify.successText(t('accountApiKey.toast.copyFullSuccess'));
     } catch (error) {
       notify.error(error instanceof Error ? error.message : t('accountApiKey.toast.copyFullFailed'));
     } finally {
@@ -184,7 +184,7 @@ export default function AccountApiKeyDialog({
       await api.post(`/api/auth/me/api-credentials/${encodeURIComponent(row.id)}/revoke`, {});
       if (revealed?.id === row.id) setRevealed(null);
       await load();
-      notify.success(t('accountApiKey.toast.revokeSuccess'));
+      notify.successText(t('accountApiKey.toast.revokeSuccess'));
     } catch (error) {
       notify.error(error instanceof Error ? error.message : t('accountApiKey.toast.revokeFailed'));
     } finally {
@@ -201,7 +201,7 @@ export default function AccountApiKeyDialog({
       await api.delete(`/api/auth/me/api-credentials/${encodeURIComponent(row.id)}`);
       if (revealed?.id === row.id) setRevealed(null);
       await load();
-      notify.success(t('accountApiKey.toast.deleteSuccess'));
+      notify.successText(t('accountApiKey.toast.deleteSuccess'));
     } catch (error) {
       notify.error(error instanceof Error ? error.message : t('accountApiKey.toast.deleteFailed'));
     } finally {
@@ -216,7 +216,7 @@ export default function AccountApiKeyDialog({
     try {
       await copyTextToClipboard(revealed.api_key);
       setCopied(true);
-      notify.success(t('accountApiKey.toast.copySuccess'));
+      notify.successText(t('accountApiKey.toast.copySuccess'));
     } catch {
       revealedKeyRef.current?.focus();
       revealedKeyRef.current?.select();

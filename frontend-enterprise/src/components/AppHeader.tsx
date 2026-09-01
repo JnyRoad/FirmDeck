@@ -204,7 +204,7 @@ export default function AppHeader({
       if (!tenantContext) throw new Error(t('shell.account.avatarUploadFailed'));
       await tenantClient.put('/api/auth/me/avatar', form, { signal: controller.signal });
       if (controller.signal.aborted) return;
-      notify.success(t('shell.account.avatarUpdated'));
+      notify.successText(t('shell.account.avatarUpdated'));
       await refreshSessionUser(controller.signal);
       // 覆盖上传时指针字符串不变,effect 不会重触发,显式重拉头像字节
       await loadAvatar();
@@ -232,7 +232,7 @@ export default function AppHeader({
       if (!tenantContext) throw new Error(t('shell.account.avatarRemoveFailed'));
       await tenantClient.delete('/api/auth/me/avatar', undefined, { signal: controller.signal });
       if (controller.signal.aborted) return;
-      notify.success(t('shell.account.avatarRemoved'));
+      notify.successText(t('shell.account.avatarRemoved'));
       await refreshSessionUser(controller.signal);
       await loadAvatar();
     } catch (error) {

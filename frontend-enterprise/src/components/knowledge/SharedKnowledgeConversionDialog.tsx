@@ -200,7 +200,7 @@ export function SharedKnowledgeConversionDialog({
     if (controller.signal.aborted || !context.isCurrentGeneration(generation)) return;
     // 页面回调只负责定位新共享库；即使刷新失败，也不能把已完成的转换误报为失败。
     setConversionResult(result);
-    notify.success(t('sharedKnowledgeConversion.toast.created', { name: result.new_knowledge_base.name }));
+    notify.successText(t('sharedKnowledgeConversion.toast.created', { name: result.new_knowledge_base.name }));
     try {
       await onConverted(result);
     } catch {

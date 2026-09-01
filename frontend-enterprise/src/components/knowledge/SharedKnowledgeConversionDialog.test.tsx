@@ -39,6 +39,7 @@ const toastMocks = vi.hoisted(() => ({
   error: vi.fn(),
   info: vi.fn(),
   success: vi.fn(),
+  successText: vi.fn(),
   warning: vi.fn(),
 }));
 
