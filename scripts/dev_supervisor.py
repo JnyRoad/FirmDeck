@@ -221,6 +221,10 @@ class Service:
                 self.start()
 
     def healthy(self) -> bool:
+        """Return whether the configured health URL responds below 500.
+
+        A missing URL is healthy, request failures are unhealthy, and close-time OSError is ignored.
+        """
         if not self.health_url:
             return True
         response = None

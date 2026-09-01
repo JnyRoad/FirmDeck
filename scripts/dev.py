@@ -251,6 +251,10 @@ def _ensure_sandbox_runtime() -> None:
 
 
 def _url_ready(url: str) -> bool:
+    """Return whether a URL responds below 500 without consuming its body.
+
+    Request failures return false; an OSError raised while closing the response is ignored.
+    """
     response = None
     try:
         response = urllib.request.urlopen(url, timeout=2)

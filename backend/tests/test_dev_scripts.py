@@ -5,7 +5,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-
+from typing import Self
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 SCRIPTS_DIR = ROOT_DIR / "scripts"
@@ -46,18 +46,24 @@ def test_dev_cli_uses_next_port_in_packaged_app_range(monkeypatch) -> None:
 
 
 def test_url_ready_does_not_require_reading_response_body(monkeypatch) -> None:
+    """Verify readiness succeeds without consuming a body that resets."""
     dev = _load_script("dev")
 
     class Response:
+        """Model a successful response whose body cannot be consumed."""
+
         status = 200
 
-        def __enter__(self):
+        def __enter__(self) -> Self:
+            """Return the fake response for context-manager compatibility."""
             return self
 
-        def __exit__(self, *_args):
+        def __exit__(self, *_args: object) -> bool:
+            """Propagate exceptions raised while the fake response is in use."""
             return False
 
-        def read(self):
+        def read(self) -> bytes:
+            """Simulate a reset if readiness code consumes the response body."""
             raise ConnectionResetError("body connection closed")
 
     monkeypatch.setattr(dev.urllib.request, "urlopen", lambda *_args, **_kwargs: Response())
@@ -65,16 +71,48 @@ def test_url_ready_does_not_require_reading_response_body(monkeypatch) -> None:
 
 
 def test_url_ready_ignores_response_close_failure(monkeypatch) -> None:
+    """Verify readiness stays successful when response cleanup resets."""
     dev = _load_script("dev")
 
     class Response:
+        """Model a successful response that resets while being closed."""
+
         status = 200
 
-        def close(self):
+        def close(self) -> None:
+            """Simulate a connection reset while releasing the response."""
             raise ConnectionResetError("connection closed")
 
     monkeypatch.setattr(dev.urllib.request, "urlopen", lambda *_args, **_kwargs: Response())
     assert dev._url_ready("http://127.0.0.1:5173/api/health") is True
+
+
+def test_supervisor_healthy_ignores_response_close_failure(monkeypatch) -> None:
+    """Verify supervisor health stays true when response cleanup resets."""
+    supervisor = _load_script("dev_supervisor")
+
+    class Response:
+        """Model a healthy supervisor response that resets while being closed."""
+
+        status = 200
+
+        def close(self) -> None:
+            """Simulate a connection reset while releasing the response."""
+            raise ConnectionResetError("connection closed")
+
+    monkeypatch.setattr(
+        supervisor.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: Response(),
+    )
+    service = supervisor.Service(
+        name="app",
+        cwd=ROOT_DIR,
+        command=["unused"],
+        health_url="http://127.0.0.1:5173/api/health",
+    )
+
+    assert service.healthy() is True
 
 
 def test_dev_cli_honors_packaged_app_port_range(monkeypatch) -> None:
