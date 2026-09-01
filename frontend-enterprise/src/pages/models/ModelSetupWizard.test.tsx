@@ -705,6 +705,42 @@ describe('ModelSetupWizard — ChatGPT subscription branch (US3)', () => {
 
     expect(saveButton().disabled).toBe(false);
   });
+
+  it('allows an existing subscription model to be disabled while disconnected', async () => {
+    const editingSubscription: ModelConfigRead = {
+      id: 'subscription-edit-1',
+      tenant_id: 'tenant-isolated',
+      name: 'ChatGPT subscription · gpt-5.6-terra',
+      provider: 'openai_compatible',
+      auth_mode: 'chatgpt_subscription',
+      api_protocol: 'codex_app_server',
+      base_url: null,
+      api_key_masked: '',
+      model: 'gpt-5.6-terra',
+      temperature: 0.2,
+      max_output_tokens: 8192,
+      extra_body: {},
+      protocol_options: {},
+      legacy_unmapped_options: {},
+      trust_status: 'unverified',
+      verification_attempt_status: 'idle',
+      config_revision: 1,
+      security_revision: 1,
+      is_default: true,
+      enabled: true,
+      updated_at: '2026-09-01T00:00:00Z',
+    };
+    const user = userEvent.setup();
+    renderWizard({
+      editingModel: editingSubscription,
+      subscriptionAccount: { status: 'requires_login', plan_type: null, message: '未登录' },
+    });
+
+    expect(saveButton().disabled).toBe(true);
+    await user.click(screen.getAllByRole('switch')[1]!);
+
+    expect(saveButton().disabled).toBe(false);
+  });
 });
 
 describe('ModelSetupWizard — switching channels clears stale credentials (FR-013)', () => {

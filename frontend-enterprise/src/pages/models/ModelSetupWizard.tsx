@@ -461,7 +461,11 @@ export default function ModelSetupWizard({
   // Gates 测试/保存: connected alone isn't enough — without a model, a "test"
   // would silently run against whatever default the backend happens to pick,
   // wasting an API call on a result the user never actually asked to verify.
-  const subscriptionFormComplete = subscriptionStepComplete && subscriptionForm.model.trim() !== '';
+  // Disabling an existing subscription model does not contact Codex, so a
+  // disconnected account must not prevent that safety operation. Enabling or
+  // creating one still requires a connected subscription and an explicit model.
+  const subscriptionFormComplete = subscriptionForm.model.trim() !== ''
+    && (!isEnabled || subscriptionStepComplete);
 
   // The local Codex app-server has a real model/list RPC — fetch it once as
   // soon as the subscription connects, the same way the API-key branches
