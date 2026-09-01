@@ -5,7 +5,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-
+from typing import Self
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 SCRIPTS_DIR = ROOT_DIR / "scripts"
@@ -37,6 +37,7 @@ def test_pid_alive_recognizes_current_process() -> None:
 
 
 def test_dev_cli_uses_next_port_in_packaged_app_range(monkeypatch) -> None:
+    """Verify packaged-app startup advances past an occupied default port."""
     dev = _load_script("dev")
     monkeypatch.delenv("ULTRARAG_PORT_RANGE_START", raising=False)
     monkeypatch.delenv("ULTRARAG_PORT_RANGE_END", raising=False)
@@ -45,7 +46,100 @@ def test_dev_cli_uses_next_port_in_packaged_app_range(monkeypatch) -> None:
     assert dev._select_available_port("127.0.0.1", 5173) == 5174
 
 
+def test_url_ready_does_not_require_reading_response_body(monkeypatch) -> None:
+    """Verify readiness succeeds without consuming a body that resets."""
+    dev = _load_script("dev")
+
+    class Response:
+        """Model a successful response whose body cannot be consumed."""
+
+        status = 200
+
+        def __enter__(self) -> Self:
+            """Return the fake response for context-manager compatibility."""
+            return self
+
+        def __exit__(self, *_args: object) -> bool:
+            """Propagate exceptions raised while the fake response is in use."""
+            return False
+
+        def read(self) -> bytes:
+            """Simulate a reset if readiness code consumes the response body."""
+            raise ConnectionResetError("body connection closed")
+
+    def open_response(*_args: object, **_kwargs: object) -> Response:
+        """Return the controlled response without performing network I/O."""
+        return Response()
+
+    monkeypatch.setattr(dev.urllib.request, "urlopen", open_response)
+    assert dev._url_ready("http://127.0.0.1:5173/api/health") is True
+
+
+def test_url_ready_ignores_response_close_failure(monkeypatch) -> None:
+    """Verify readiness stays successful when response cleanup resets."""
+    dev = _load_script("dev")
+
+    class Response:
+        """Model a successful response that resets while being closed."""
+
+        status = 200
+        closed = False
+
+        def close(self) -> None:
+            """Simulate a connection reset while releasing the response."""
+            self.closed = True
+            raise ConnectionResetError("connection closed")
+
+    response = Response()
+
+    def open_response(*_args: object, **_kwargs: object) -> Response:
+        """Return the tracked response without performing network I/O."""
+        return response
+
+    monkeypatch.setattr(dev.urllib.request, "urlopen", open_response)
+    assert dev._url_ready("http://127.0.0.1:5173/api/health") is True
+    assert response.closed is True
+
+
+def test_supervisor_healthy_ignores_response_close_failure(monkeypatch) -> None:
+    """Verify supervisor health stays true when response cleanup resets."""
+    supervisor = _load_script("dev_supervisor")
+
+    class Response:
+        """Model a healthy supervisor response that resets while being closed."""
+
+        status = 200
+        closed = False
+
+        def close(self) -> None:
+            """Simulate a connection reset while releasing the response."""
+            self.closed = True
+            raise ConnectionResetError("connection closed")
+
+    response = Response()
+
+    def open_response(*_args: object, **_kwargs: object) -> Response:
+        """Return the tracked response without performing network I/O."""
+        return response
+
+    monkeypatch.setattr(
+        supervisor.urllib.request,
+        "urlopen",
+        open_response,
+    )
+    service = supervisor.Service(
+        name="app",
+        cwd=ROOT_DIR,
+        command=["unused"],
+        health_url="http://127.0.0.1:5173/api/health",
+    )
+
+    assert service.healthy() is True
+    assert response.closed is True
+
+
 def test_dev_cli_honors_packaged_app_port_range(monkeypatch) -> None:
+    """Verify packaged-app startup stays within its configured port range."""
     dev = _load_script("dev")
     monkeypatch.setenv("ULTRARAG_PORT_RANGE_START", "6200")
     monkeypatch.setenv("ULTRARAG_PORT_RANGE_END", "6202")

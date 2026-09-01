@@ -228,6 +228,10 @@ def _ensure_frontend_dependencies() -> None:
 
 
 def _ensure_sandbox_runtime() -> None:
+    """Ensure the reviewed sandbox runtime and domain patch are installed.
+
+    A valid runtime is reused; otherwise the fetch script writes runtime files and failures propagate.
+    """
     runtime = ROOT_DIR / "packaging" / "sandbox_runtime"
     cli = runtime / "node_modules" / "@anthropic-ai" / "sandbox-runtime" / "dist" / "cli.js"
     node = runtime / "bin" / ("node.exe" if sys.platform == "win32" else "node")
@@ -251,15 +255,31 @@ def _ensure_sandbox_runtime() -> None:
 
 
 def _url_ready(url: str) -> bool:
+    """Return whether a URL responds below 500 without consuming its body.
+
+    Request failures return false; an OSError raised while closing the response is ignored.
+    """
+    response = None
     try:
-        with urllib.request.urlopen(url, timeout=2) as response:
-            response.read()
-            return response.status < 500
+        response = urllib.request.urlopen(url, timeout=2)
+        return response.status < 500
     except (OSError, urllib.error.URLError):
         return False
+    finally:
+        if response is not None:
+            try:
+                close = getattr(response, "close", None)
+                if close:
+                    close()
+            except OSError:
+                pass
 
 
 def _wait_for_url(label: str, url: str, log_file: Path) -> None:
+    """Wait for a ready URL or raise with recent log context after the timeout.
+
+    Polling sends HTTP requests and sleeps; timeout prints the log tail before raising RuntimeError.
+    """
     deadline = time.monotonic() + _env_int("DEV_STARTUP_TIMEOUT", 180)
     while time.monotonic() < deadline:
         if _url_ready(url):
