@@ -45,6 +45,7 @@ from app.db.models import (
     KnowledgeIngestJob,
     Team,
     TeamKnowledgeBaseBinding,
+    TeamKnowledgeBaseGrant,
     TeamMember,
     User,
     utc_now,
@@ -1136,6 +1137,11 @@ def delete_knowledge_base(
     db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ) -> dict[str, str]:
+    """删除知识库：普通员工分支仅隐藏，公开画廊分支解除公开，租户 admin 分支硬删。
+
+    硬删除会在同一事务清理版本、文档、分块、任务、员工分支/绑定，以及团队绑定、
+    团队授权，并重置指向该库的团队默认写入目标，避免留下悬挂引用。
+    """
     agent = ensure_agent_scope_manager(db, tenant_id, agent_id, current_user)
     if agent and not agent.is_overall:
         row = _get_knowledge_base(db, tenant_id, knowledge_base_id)
@@ -1191,6 +1197,8 @@ def delete_knowledge_base(
         KnowledgeDocument,
         KnowledgeBaseVersion,
         AgentKnowledgeBranch,
+        TeamKnowledgeBaseBinding,
+        TeamKnowledgeBaseGrant,
     ):
         children = db.exec(
             select(model).where(
@@ -1209,6 +1217,17 @@ def delete_knowledge_base(
     ).all()
     for binding in bindings:
         db.delete(binding)
+    # 共享库可能仍被团队设为默认写入目标；硬删时同事务重置，避免悬挂引用。
+    default_teams = db.exec(
+        select(Team).where(
+            Team.tenant_id == tenant_id,
+            Team.default_knowledge_base_id == row.id,
+        )
+    ).all()
+    for team in default_teams:
+        team.default_knowledge_base_id = None
+        team.updated_at = utc_now()
+        db.add(team)
     db.delete(row)
     db.commit()
     return {"status": "deleted"}
