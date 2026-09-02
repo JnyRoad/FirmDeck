@@ -1,10 +1,14 @@
 // @vitest-environment jsdom
 
-import { cleanup, render, screen } from '@testing-library/react';
+import { cleanup, render as rtlRender, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import type { ReactElement } from 'react';
+import { TenantSessionProvider } from '@/contexts/TenantSessionContext';
+import type { EnterpriseAuthSession } from '@/auth';
 import type { AgentProfileRead, ChatMessage, TeamConversationRead, TeamRead } from '@/types';
+import { AppIntlProvider } from '@/i18n';
 
 import TeamCollaborationPanel, {
   collaborationQuestion,
@@ -65,11 +69,31 @@ const team: TeamRead = {
   updated_at: '2026-08-15T00:00:00Z',
 };
 
+const tenantSession: EnterpriseAuthSession = {
+  token: 'token-1',
+  scope: 'tenant',
+  tenant: {
+    id: 'tenant_demo',
+    slug: 'demo-lab',
+    display_name: 'Demo Lab',
+  },
+  user: {
+    id: 'user-1',
+    tenant_id: 'tenant_demo',
+    username: 'demo',
+    display_name: 'Demo Operator',
+    role: 'admin',
+    must_change_password: false,
+    avatar_url: null,
+  },
+};
+
 function jsonResponse(body: unknown): Response {
   return {
     ok: true,
     status: 200,
     statusText: 'OK',
+    json: async () => body ?? {},
     text: async () => JSON.stringify(body),
   } as Response;
 }
@@ -78,6 +102,21 @@ afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
 });
+
+/** 为团队协作行为测试提供显式语义 i18n runtime，避免依赖 legacy observer。 */
+function render(ui: ReactElement) {
+  const delegatedFetch = globalThis.fetch;
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => (
+    String(input).includes('/api/auth/me')
+      ? Promise.resolve(jsonResponse(tenantSession.user))
+      : delegatedFetch(input, init)
+  )));
+  return rtlRender(
+    <AppIntlProvider initialLocale="zh-CN">
+      <TenantSessionProvider session={tenantSession}>{ui}</TenantSessionProvider>
+    </AppIntlProvider>,
+  );
+}
 
 describe('TeamCollaborationPanel', () => {
   it('renders leader mentions and expands only the member reply inline', async () => {
@@ -161,7 +200,11 @@ describe('TeamCollaborationPanel', () => {
       preview: '',
       created_at: '2026-08-15T00:00:30Z',
       updated_at: '2026-08-15T00:01:00Z',
-    })).toBe('@行政，请处理「季度报告」');
+    })).toEqual({
+      messageId: 'chat.team.memberTaskPromptTail',
+      memberName: '行政',
+      title: '季度报告',
+    });
   });
 
   it('lets the user answer a member question and resume the same team task', async () => {
@@ -195,12 +238,12 @@ describe('TeamCollaborationPanel', () => {
 
     expect(await screen.findByText('已补充，任务正在继续执行')).toBeTruthy();
     expect(fetchMock).toHaveBeenCalledWith(
-      '/api/enterprise/teams/team-1/tasks/task-purchase/resume',
+      '/api/enterprise/teams/team-1/tasks/task-purchase/resume?tenant_id=tenant_demo',
       expect.objectContaining({
         method: 'POST',
         body: JSON.stringify({
-          tenant_id: 'tenant_demo',
           answer: '工号 001，需要 A4 纸 2 包。',
+          tenant_id: 'tenant_demo',
         }),
       }),
     );
@@ -253,7 +296,7 @@ describe('TeamCollaborationPanel', () => {
       if (url.includes('/stream')) {
         return jsonResponse({
           status: 'completed',
-          content: '## 制度结论\n\n请参考制度 [1]。',
+          content: '## 制度结论\n\n请参考制度 [1]。\n\n```json\n{"blackboard_suggestions": []}\n```',
           updated_at: '2026-08-15T00:01:00Z',
         });
       }
@@ -310,10 +353,90 @@ describe('TeamCollaborationPanel', () => {
     expect(await screen.findByRole('heading', { name: '制度结论' })).toBeTruthy();
     expect(screen.getByRole('button', { name: /报销制度/ })).toBeTruthy();
     expect(screen.getByRole('button', { name: /下载文件 policy.md/ })).toBeTruthy();
+    expect(screen.queryByText(/blackboard_suggestions/)).toBeNull();
 
     await user.click(screen.getByRole('button', { name: /报销制度/ }));
     expect(onOpenCitation).toHaveBeenCalledWith(
       expect.objectContaining({ id: '1', title: '报销制度' }),
+    );
+  });
+
+  it('externalizes each member safe execution record in the collaboration card', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/trace')) {
+        return jsonResponse([
+          {
+            turn_id: 'turn-member-1',
+            started_at: '2026-08-15T00:00:40Z',
+            completed_at: '2026-08-15T00:01:00Z',
+            lines: [
+              {
+                id: 'line-plan',
+                kind: 'decision',
+                text: '已拆分资料检索与制度比对',
+                state: 'completed',
+              },
+              {
+                id: 'line-tool',
+                kind: 'tool',
+                text: '已调用制度知识库',
+                detail: '返回 3 条可引用结果',
+                state: 'completed',
+              },
+            ],
+          },
+        ]);
+      }
+      if (url.includes('/stream')) {
+        return jsonResponse({
+          status: 'completed',
+          content: '制度比对完成。',
+          updated_at: '2026-08-15T00:01:00Z',
+        });
+      }
+      if (url.includes('/messages')) {
+        return jsonResponse([
+          {
+            id: 'message-traced',
+            role: 'assistant',
+            content: '制度比对完成。',
+            created_at: '2026-08-15T00:01:00Z',
+          },
+        ]);
+      }
+      return jsonResponse({});
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const user = userEvent.setup();
+    const conversation: TeamConversationRead = {
+      session_id: 'session-traced',
+      kind: 'member_task',
+      agent_id: 'agent-admin',
+      agent_name: '行政',
+      task_id: 'task-traced',
+      task_status: 'done',
+      title: '团队任务:制度比对',
+      preview: '制度比对完成。',
+      created_at: '2026-08-15T00:00:30Z',
+      updated_at: '2026-08-15T00:01:00Z',
+    };
+
+    render(
+      <AppIntlProvider initialLocale="zh-CN">
+        <TeamCollaborationPanel team={team} agents={agents} conversation={conversation} />
+      </AppIntlProvider>,
+    );
+    await user.click(screen.getByRole('button', { name: '展开行政的回复' }));
+
+    const record = await screen.findByRole('button', { name: /执行记录/ });
+    await user.click(record);
+    expect(screen.getByText('已拆分资料检索与制度比对')).toBeTruthy();
+    expect(screen.getByText('已调用制度知识库')).toBeTruthy();
+    expect(screen.getByText('返回 3 条可引用结果')).toBeTruthy();
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining('/session-traced/trace'),
+      expect.any(Object),
     );
   });
 

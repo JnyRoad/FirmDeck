@@ -7,16 +7,19 @@ import {
   useLocation,
   useNavigate,
 } from "react-router-dom";
-import { api, isAuthError, TENANT_ID } from "./api/client";
+import { createTenantClient } from "./api/tenant-client";
 import {
   clearEnterpriseAuthSession,
   getEnterpriseAuthSession,
   isEnterpriseAdmin,
   isGalleryEmployee,
-  setEnterpriseAuthSession,
   type EnterpriseAuthSession,
-  type EnterpriseAuthUser,
 } from "./auth";
+import {
+  TenantSessionProvider,
+  useTenantSession,
+  useTenantSessionVerification,
+} from "./contexts/TenantSessionContext";
 import AppSidebar from "./components/AppSidebar";
 import OnboardingGuide, { ONBOARDING_SEEN_KEY } from "./components/OnboardingGuide";
 import QuickStartGuide, {
@@ -42,6 +45,7 @@ import AgentsPage from "./pages/AgentsPage";
 import ChannelsPage from "./pages/ChannelsPage";
 import ChatPage from "./pages/chat/ChatPage";
 import ChatGalleryPage from "./pages/chat/ChatGalleryPage";
+import ChangePasswordPage, { type PasswordPolicy } from "./pages/ChangePasswordPage";
 import DashboardPage from "./pages/dashboard/DashboardPage";
 import EmptyEmployeeState from "./components/EmptyEmployeeState";
 import DistillPage from "./pages/DistillPage";
@@ -56,6 +60,7 @@ import RuntimeSettingsPage from "./pages/RuntimeSettingsPage";
 import OpenPlatformPage from "./pages/OpenPlatformPage";
 import PersonaPage from "./pages/PersonaPage";
 import SkillsPage from "./pages/SkillsPage";
+import SystemApp from "./SystemApp";
 import TeamChatPage from "./pages/TeamChatPage";
 import TeamDetailPage from "./pages/TeamDetailPage";
 import TeamsPage from "./pages/TeamsPage";
@@ -89,12 +94,12 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { notify } from "@/components/ui/app-toast";
 import {
   emitAgentScopeChange,
-  ENTERPRISE_AGENT_STORAGE_KEY,
   isTeamScope,
   persistSharedAgentScope,
   teamIdFromScope,
   toTeamScope,
 } from "@/lib/agent-scope-storage";
+import { tenantUserStorageKey } from "@/lib/tenant-storage";
 import { cn } from "@/lib/utils";
 import {
   SELECT_TRIGGER_CLASS,
@@ -103,10 +108,22 @@ import {
   DIALOG_PRIMARY_BUTTON_CLASS,
 } from "@/lib/enterprise-ui";
 import type { AgentProfileRead, ModelConfigRead, TeamRead } from "./types";
-import { useI18n } from "./i18n";
+import { useAppIntl } from "./i18n/useAppIntl";
 
 const ENTERPRISE_SIDEBAR_STORAGE_KEY = "ultrarag_enterprise_sidebar_expanded";
 const MODEL_CONFIGS_UPDATED_EVENT = "ultrarag-enterprise-model-configs-updated";
+
+/** 读取当前 tenant/user 的完整员工或团队作用域，不读取旧的全局存储键。 */
+function readStoredAgentScope(tenantId: string, userId: string): string {
+  if (!tenantId || !userId) return "";
+  try {
+    return window.localStorage.getItem(
+      tenantUserStorageKey(tenantId, userId, "selected-agent"),
+    ) || "";
+  } catch {
+    return "";
+  }
+}
 type AgentCreateMode = "copy" | "blank";
 
 type AgentCreateFormState = {
@@ -125,6 +142,7 @@ const EMPTY_AGENT_FORM: AgentCreateFormState = {
   copyFromAgentId: "",
 };
 
+/** 组合认证后的应用壳、导航和共享创建流程，并直接消费语义消息运行时。 */
 function Shell({
   auth,
   onLogout,
@@ -136,12 +154,16 @@ function Shell({
 }) {
   const navigate = useNavigate();
   const location = useLocation();
-  const { t } = useI18n();
+  const { t } = useAppIntl();
+  const tenantContext = useTenantSession();
+  const tenantApi = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
+  const tenantId = tenantContext?.tenantId || auth.tenant.id;
+  const userId = tenantContext?.userId || auth.user.id;
   const [agents, setAgents] = useState<AgentProfileRead[]>([]);
   const [agentsLoaded, setAgentsLoaded] = useState(false);
   const [scopeTeams, setScopeTeams] = useState<TeamRead[]>([]);
   const [selectedAgentId, setSelectedAgentId] = useState(
-    () => window.localStorage.getItem(ENTERPRISE_AGENT_STORAGE_KEY) || "",
+    () => readStoredAgentScope(tenantId, userId),
   );
   const [sidebarExpanded, setSidebarExpanded] = useState(() => {
     const stored = window.localStorage.getItem(ENTERPRISE_SIDEBAR_STORAGE_KEY);
@@ -154,7 +176,7 @@ function Shell({
   const [modelConfigsLoaded, setModelConfigsLoaded] = useState(false);
   const isMobile = useIsMobile();
   const isAdmin = isEnterpriseAdmin(auth.user);
-  const accountRoleLabel = isAdmin ? "管理员" : "";
+  const accountRoleLabel = isAdmin ? t("shell.account.roleAdmin") : "";
   const isDistillRoute = location.pathname === "/enterprise/skills/distill";
   const selected =
     location.pathname === "/enterprise"
@@ -196,8 +218,8 @@ function Shell({
   }, []);
 
   const loadModelConfigs = useCallback(() => {
-    return api
-      .get<ModelConfigRead[]>(`/api/enterprise/model-configs?tenant_id=${TENANT_ID}`)
+    return tenantApi
+      .get<ModelConfigRead[]>("/api/enterprise/model-configs")
       .then((items) => {
         setModelConfigs(items);
         setModelConfigsLoaded(true);
@@ -206,7 +228,7 @@ function Shell({
         setModelConfigs([]);
         setModelConfigsLoaded(false);
       });
-  }, []);
+  }, [tenantApi]);
 
   useEffect(() => {
     void loadModelConfigs();
@@ -257,10 +279,10 @@ function Shell({
     const onScopeChange = (event: Event) => {
       const nextAgentId =
         (event as CustomEvent<{ agentId?: string }>).detail?.agentId ||
-        window.localStorage.getItem(ENTERPRISE_AGENT_STORAGE_KEY) ||
+        readStoredAgentScope(tenantId, userId) ||
         "";
       if (nextAgentId && !isTeamScope(nextAgentId)) {
-        persistSharedAgentScope(nextAgentId, auth.user.id);
+        persistSharedAgentScope(nextAgentId, tenantId, userId);
         const knownSelectableAgent = agents.some(
           (item) => item.id === nextAgentId && canUseAgentScope(item),
         );
@@ -277,7 +299,7 @@ function Shell({
         "ultrarag-enterprise-agent-scope-change",
         onScopeChange,
       );
-  }, [agents, auth.user.id]);
+  }, [agents, tenantId, userId]);
 
   useEffect(() => {
     const onCreateAgent = () => openCreateAgentModal();
@@ -290,15 +312,15 @@ function Shell({
   }, []);
 
   function loadTeams() {
-    return api
-      .get<TeamRead[]>(`/api/enterprise/teams?tenant_id=${TENANT_ID}`)
+    return tenantApi
+      .get<TeamRead[]>("/api/enterprise/teams")
       .then((rows) => setScopeTeams(rows))
       .catch(() => setScopeTeams([]));
   }
 
   function loadAgents(preferredAgentId = "") {
-    return api
-      .get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${TENANT_ID}`)
+    return tenantApi
+      .get<AgentProfileRead[]>("/api/enterprise/agents")
       .then((rows) => {
         setAgents(rows);
         const selectableRows = rows.filter((item) => canUseAgentScope(item));
@@ -310,7 +332,7 @@ function Shell({
             requestedAgentId &&
             selectableRows.some((item) => item.id === requestedAgentId)
           ) {
-            persistSharedAgentScope(requestedAgentId, auth.user.id);
+            persistSharedAgentScope(requestedAgentId, tenantId, userId);
             return requestedAgentId;
           }
           const manageableRows = selectableRows.filter((item) =>
@@ -322,7 +344,7 @@ function Shell({
               preferredEmployeeAgent(selectableRows)?.id ||
               "";
           if (next) {
-            persistSharedAgentScope(next, auth.user.id);
+            persistSharedAgentScope(next, tenantId, userId);
             if (next !== current) {
               emitAgentScopeChange(next);
             }
@@ -340,24 +362,25 @@ function Shell({
 
   function changeAgentScope(agentId: string) {
     setSelectedAgentId(agentId);
-    persistSharedAgentScope(agentId, auth.user.id);
+    persistSharedAgentScope(agentId, tenantId, userId);
     emitAgentScopeChange(agentId);
   }
 
+  /** 创建团队会话并切换到团队作用域；服务端原始错误优先直出。 */
   async function selectTeamScope(teamId: string) {
     const scope = toTeamScope(teamId);
     try {
-      const result = await api.post<{ session_id: string }>(
+      const result = await tenantApi.post<{ session_id: string }>(
         `/api/enterprise/teams/${teamId}/tl/session`,
-        { tenant_id: TENANT_ID },
+        {},
       );
-      if (!result.session_id) throw new Error("发起群聊失败");
+      if (!result.session_id) throw new Error(t("shell.teamChat.startFailure"));
       setSelectedAgentId(scope);
-      persistSharedAgentScope(scope, auth.user.id);
+      persistSharedAgentScope(scope, tenantId, userId);
       emitAgentScopeChange(scope);
       navigate(`/workspace/chat/${result.session_id}`);
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : "发起群聊失败");
+      notify.error(error instanceof Error ? error.message : t("shell.teamChat.startFailure"));
     }
   }
 
@@ -373,8 +396,8 @@ function Shell({
   const hasUsableModelConfig = modelConfigs.some((item) => item.enabled);
   const showModelSetupNotice = guidesCompleted && modelConfigsLoaded && !hasUsableModelConfig;
   const modelSetupNoticeText = isAdmin
-    ? t("还没有可用模型配置，数字员工暂不能调用模型。请先完成模型配置。")
-    : t("系统管理员尚未配置可用模型，数字员工暂不能调用模型。请联系管理员完成模型配置。");
+    ? t("shell.modelSetup.adminNotice")
+    : t("shell.modelSetup.memberNotice");
   const selectedAgent = scopeAgents.find((item) => item.id === selectedAgentId);
   const sidebarAgent = selectedAgent;
   // Routes that operate on a specific employee; show the empty guide when none exist.
@@ -402,12 +425,13 @@ function Shell({
   );
   const selectedAgentName = selectedAgent
     ? employeeDisplayName(selectedAgent)
-    : "未选择";
+    : t("sidebar.notSelected");
   const selectedAgentCaption = selectedAgent
     ? selectedAgent.is_overall
-      ? "开放广场"
+      ? t("sidebar.marketplaceShort")
       : employeeProfile(selectedAgent).roleName
     : "-";
+  /** 使用当前可复制员工初始化创建表单，不翻译员工名称或已有员工档案字段。 */
   function openCreateAgentModal() {
     setAgentForm({
       ...EMPTY_AGENT_FORM,
@@ -416,10 +440,11 @@ function Shell({
     setAgentCreateOpen(true);
   }
 
+  /** 校验并创建数字员工；用户输入和复制的员工元数据保持原始值。 */
   async function saveAgentCreateModal() {
     const name = agentForm.name.trim();
     if (!name) {
-      notify.error("请填写数字员工姓名");
+      notify.error(t("shell.agentCreate.nameRequired"));
       return;
     }
     const isBlankOnboarding = agentForm.sourceMode === "blank";
@@ -435,7 +460,7 @@ function Shell({
     const roleName =
       agentForm.roleName.trim() ||
       (!isBlankOnboarding ? sourceRoleName : "") ||
-      "待补充职位";
+      t("shell.agentCreate.roleFallback");
     const description =
       agentForm.description.trim() ||
       (!isBlankOnboarding
@@ -460,10 +485,9 @@ function Shell({
       blank_onboarding: isBlankOnboarding,
     };
     try {
-      const created = await api.post<AgentProfileRead>(
+      const created = await tenantApi.post<AgentProfileRead>(
         "/api/enterprise/agents",
         {
-          tenant_id: TENANT_ID,
           name,
           description,
           source_mode: agentForm.sourceMode,
@@ -479,9 +503,9 @@ function Shell({
       await loadAgents();
       changeAgentScope(created.id);
       setAgentCreateOpen(false);
-      notify.success("数字员工创建成功");
+      notify.successText(t("shell.agentCreate.success"));
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : "创建数字员工失败");
+      notify.error(error instanceof Error ? error.message : t("shell.agentCreate.failure"));
     }
   }
 
@@ -491,7 +515,7 @@ function Shell({
       onOpenChange={handleSidebarOpenChange}
       style={
         {
-          "--sidebar-width": "220px",
+          "--sidebar-width": "240px",
           "--sidebar-width-icon": "72px",
         } as CSSProperties
       }
@@ -538,7 +562,7 @@ function Shell({
                   onClick={() => navigate(EnterpriseRoute.Models)}
                   className="h-[32px] shrink-0 rounded-[8px] bg-[#1a71ff] px-[12px] text-[12px] text-white hover:bg-[#0f5ed7]"
                 >
-                  {t("去配置")}
+                  {t("shell.modelSetup.configure")}
                 </UIButton>
               )}
             </div>
@@ -830,15 +854,15 @@ function Shell({
       <Dialog open={agentCreateOpen} onOpenChange={setAgentCreateOpen}>
         <DialogContent className="flex max-h-[calc(100dvh-32px)] w-[calc(100%-32px)] flex-col gap-0 overflow-hidden rounded-[16px] p-0 sm:max-w-[520px]">
           <DialogTitle className="shrink-0 px-[24px] py-[16px] text-[16px] font-semibold text-foreground">
-            新建数字员工
+            {t("shell.agentCreate.title")}
           </DialogTitle>
           <div className="agent-editor-form min-h-0 flex-1 overflow-y-auto px-[24px] pb-[16px]">
             <label>
-              创建方式
+              {t("shell.agentCreate.method")}
               <div className="inline-flex w-fit gap-[4px] rounded-[10px] border border-border p-[2px]">
                 {[
-                  { label: "从广场复制", value: "copy" as const },
-                  { label: "从空白开始", value: "blank" as const },
+                  { label: t("shell.agentCreate.copyMarketplace"), value: "copy" as const },
+                  { label: t("shell.agentCreate.startBlank"), value: "blank" as const },
                 ].map((option) => (
                   <button
                     key={option.value}
@@ -864,7 +888,7 @@ function Shell({
               </div>
             </label>
             <label>
-              职位
+              {t("shell.agentCreate.role")}
               <Input
                 value={agentForm.roleName}
                 onChange={(event) =>
@@ -873,13 +897,13 @@ function Shell({
                     roleName: event.target.value,
                   }))
                 }
-                placeholder="例如 研发工程师、财务助理"
+                placeholder={t("shell.agentCreate.rolePlaceholder")}
               />
             </label>
             <div className="grid content-start gap-[6px]">
             {agentForm.sourceMode === "copy" && (
               <label>
-                复制来源
+                {t("shell.agentCreate.copySource")}
                 <UISelect
                   value={agentForm.copyFromAgentId || undefined}
                   onValueChange={(value) =>
@@ -900,14 +924,14 @@ function Shell({
                   }
                 >
                   <SelectTrigger className={cn(SELECT_TRIGGER_CLASS, "w-full")}>
-                    <SelectValue placeholder="选择复制来源" />
+                    <SelectValue placeholder={t("shell.agentCreate.copySourcePlaceholder")} />
                   </SelectTrigger>
                   <SelectContent>
                     {sourceAgents.map((agent) => (
                       <SelectItem key={agent.id} value={agent.id}>
                         {agent.is_overall
-                          ? "开放广场"
-                          : `${employeeDisplayNameWithCreator(agent)} · ${employeeProfile(agent).roleName}${isGalleryEmployee(agent) ? " · 广场" : ""}`}
+                          ? t("shell.agentCreate.marketplace")
+                          : `${employeeDisplayNameWithCreator(agent)} · ${employeeProfile(agent).roleName}${isGalleryEmployee(agent) ? ` · ${t("shell.agentCreate.marketplaceSuffix")}` : ""}`}
                       </SelectItem>
                     ))}
                   </SelectContent>
@@ -916,12 +940,12 @@ function Shell({
             )}
             {agentForm.sourceMode === "blank" && (
               <div className="agent-definition-note">
-                从空白开始创建，不继承任何已有配置。
+                {t("shell.agentCreate.blankHint")}
               </div>
             )}
             </div>
             <label>
-              数字员工姓名
+              {t("shell.agentCreate.name")}
               <Input
                 value={agentForm.name}
                 onChange={(event) =>
@@ -933,7 +957,7 @@ function Shell({
               />
             </label>
             <label>
-              岗位描述
+              {t("shell.agentCreate.description")}
               <Textarea
                 rows={3}
                 value={agentForm.description}
@@ -943,7 +967,7 @@ function Shell({
                     description: event.target.value,
                   }))
                 }
-                placeholder="概括这个数字员工的岗位边界、服务风格和执行重点"
+                placeholder={t("shell.agentCreate.descriptionPlaceholder")}
               />
             </label>
           </div>
@@ -953,13 +977,13 @@ function Shell({
               className={DIALOG_CANCEL_BUTTON_CLASS}
               onClick={() => setAgentCreateOpen(false)}
             >
-              取消
+              {t("common.action.cancel")}
             </UIButton>
             <UIButton
               className={DIALOG_PRIMARY_BUTTON_CLASS}
               onClick={() => void saveAgentCreateModal()}
             >
-              创建
+              {t("common.action.create")}
             </UIButton>
           </div>
         </DialogContent>
@@ -971,13 +995,30 @@ function Shell({
 function AuthedApp({
   auth,
   onLogout,
+  onSessionChange,
   guidesCompleted,
 }: {
   auth: EnterpriseAuthSession;
   onLogout: () => void;
+  onSessionChange: (session: EnterpriseAuthSession) => void;
   guidesCompleted: boolean;
 }) {
   const location = useLocation();
+  if (auth.user.must_change_password && location.pathname !== "/change-password") {
+    return <Navigate to="/change-password" replace />;
+  }
+  if (location.pathname === "/change-password") {
+    if (!auth.user.must_change_password) {
+      return <Navigate to={EnterpriseRoute.Gallery} replace />;
+    }
+    return (
+      <TenantChangePasswordRoute
+        session={auth}
+        onComplete={onSessionChange}
+        onCancel={onLogout}
+      />
+    );
+  }
   if (location.pathname === "/") {
     return <Navigate to={EnterpriseRoute.Gallery} replace />;
   }
@@ -1023,14 +1064,89 @@ function AuthedApp({
   return <Shell auth={auth} onLogout={onLogout} guidesCompleted={guidesCompleted} />;
 }
 
-export default function App() {
-  // Subscribe the application tree to locale changes so locale-sensitive dates
-  // and computed labels update without remounting or losing form state.
-  useI18n();
+function TenantChangePasswordRoute({
+  session,
+  onComplete,
+  onCancel,
+}: {
+  session: EnterpriseAuthSession;
+  onComplete: (session: EnterpriseAuthSession) => void;
+  onCancel: () => void;
+}) {
+  const tenantContext = useTenantSession();
+  const tenantApi = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
+  return (
+    <ChangePasswordPage
+      session={session}
+      client={{
+        getPasswordPolicy: () => tenantApi.get<PasswordPolicy>("/api/auth/password-policy"),
+        changePassword: (input) => tenantApi.post<EnterpriseAuthSession>(
+          "/api/auth/change-password",
+          input,
+        ),
+      }}
+      onComplete={onComplete}
+      onCancel={onCancel}
+    />
+  );
+}
+
+function VerifiedTenantApp({
+  onLogout,
+  onSessionChange,
+  guidesCompleted,
+}: {
+  onLogout: () => void;
+  onSessionChange: (session: EnterpriseAuthSession) => void;
+  guidesCompleted: boolean;
+}) {
+  const { t } = useAppIntl();
+  const tenantContext = useTenantSession();
+  const verification = useTenantSessionVerification();
+  if (!tenantContext) {
+    if (verification.status !== 'error') return null;
+    return (
+      <main className="flex min-h-screen items-center justify-center bg-[#f7f9fc] px-5">
+        <section className="w-full max-w-md rounded-[18px] border border-[#e3e8f1] bg-white p-8 text-center shadow-[0_18px_55px_rgba(35,61,102,0.08)]">
+          <p role="alert" className="text-[14px] text-[#464c5e]">
+            {t('auth.sessionVerification.failure')}
+          </p>
+          <UIButton className="mt-5" onClick={verification.retry}>
+            {t('auth.sessionVerification.retry')}
+          </UIButton>
+        </section>
+      </main>
+    );
+  }
+  const auth = tenantContext.session;
+
+  return (
+    <>
+      <Routes>
+        <Route
+          path="/*"
+          element={
+            <AuthedApp
+              auth={auth}
+              onLogout={onLogout}
+              onSessionChange={onSessionChange}
+              guidesCompleted={guidesCompleted}
+            />
+          }
+        />
+      </Routes>
+      {auth.user.must_change_password ? null : <OnboardingGuide />}
+      {auth.user.must_change_password ? null : <QuickStartGuide isAdmin={isEnterpriseAdmin(auth.user)} />}
+      {auth.user.must_change_password ? null : <UpdateReminder enabled={guidesCompleted} />}
+    </>
+  );
+}
+
+/** Tenant workspace route tree; mounted only outside the `/system/**` domain. */
+function TenantApp() {
   const [auth, setAuth] = useState<EnterpriseAuthSession | null>(() =>
     getEnterpriseAuthSession(),
   );
-  const [authChecked, setAuthChecked] = useState(() => !auth?.token);
   const [guidesCompleted, setGuidesCompleted] = useState(() => Boolean(
     window.localStorage.getItem(ONBOARDING_SEEN_KEY)
     && window.localStorage.getItem(QUICK_START_SEEN_KEY),
@@ -1042,62 +1158,56 @@ export default function App() {
     return () => window.removeEventListener(QUICK_START_COMPLETED_EVENT, onQuickStartCompleted);
   }, []);
 
-  useEffect(() => {
-    if (!auth?.token) {
-      setAuthChecked(true);
-      return undefined;
-    }
-    let cancelled = false;
-    setAuthChecked(false);
-    void api.get<EnterpriseAuthUser>("/api/auth/me")
-      .then((user) => {
-        if (cancelled) return;
-        const refreshed = { token: auth.token, user };
-        setEnterpriseAuthSession(refreshed);
-        setAuth(refreshed);
-        setAuthChecked(true);
-      })
-      .catch((error) => {
-        if (cancelled) return;
-        if (isAuthError(error)) {
-          clearEnterpriseAuthSession();
-          setAuth(null);
-        }
-        setAuthChecked(true);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [auth?.token]);
-
   function logout() {
     clearEnterpriseAuthSession();
     setAuth(null);
-    setAuthChecked(true);
   }
+
+  if (!auth) {
+    return (
+      <Routes>
+        <Route path="/*" element={<LoginPage onLogin={setAuth} />} />
+      </Routes>
+    );
+  }
+
+  return (
+    <TenantSessionProvider
+      session={auth}
+      onInvalidSession={() => {
+        clearEnterpriseAuthSession();
+        setAuth(null);
+      }}
+    >
+      <VerifiedTenantApp
+        onLogout={logout}
+        onSessionChange={setAuth}
+        guidesCompleted={guidesCompleted}
+      />
+    </TenantSessionProvider>
+  );
+}
+
+/** Select the security domain before mounting any tenant auth/effects/guides. */
+function AppDomainBoundary() {
+  const location = useLocation();
+  const isSystemPath = location.pathname === "/system"
+    || location.pathname.startsWith("/system/");
+  return isSystemPath ? <SystemApp /> : <TenantApp />;
+}
+
+/** Render one router with a strict URL-domain boundary and semantic document title. */
+export default function App() {
+  const { locale, t } = useAppIntl();
+
+  useEffect(() => {
+    document.title = t("app.document.title");
+  }, [locale, t]);
 
   return (
     <TooltipProvider>
       <BrowserRouter>
-        <Routes>
-          <Route
-            path="/*"
-            element={
-              auth && !authChecked ? null : auth ? (
-                <AuthedApp
-                  auth={auth}
-                  onLogout={logout}
-                  guidesCompleted={guidesCompleted}
-                />
-              ) : (
-                <LoginPage onLogin={setAuth} />
-              )
-            }
-          />
-        </Routes>
-        {auth && authChecked ? <OnboardingGuide /> : null}
-        {auth && authChecked ? <QuickStartGuide isAdmin={isEnterpriseAdmin(auth.user)} /> : null}
-        {auth && authChecked ? <UpdateReminder enabled={guidesCompleted} /> : null}
+        <AppDomainBoundary />
       </BrowserRouter>
       <Toaster richColors closeButton position="top-center" />
     </TooltipProvider>

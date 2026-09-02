@@ -24,8 +24,10 @@ import { teamIdFromScope, toTeamScope } from '@/lib/agent-scope-storage';
 import EmployeeAvatar from './EmployeeAvatar';
 import BrandLogo from './BrandLogo';
 import StaffdeckIcon from './StaffdeckIcon';
-import { employeeDisplayNameWithCreator, employeeProfile, staffdeckDisplayText } from '../employee';
+import { employeeDisplayNameWithCreator, employeeProfile } from '../employee';
 import { EnterpriseRoute } from '../enums/routes';
+import type { MessageId } from '../i18n/types';
+import { useAppIntl } from '../i18n/useAppIntl';
 import type { AgentProfileRead, ChatSession, TeamRead } from '../types';
 import IconPlatform from '../assets/icons/nav-platform.svg?react';
 import IconAgents from '../assets/icons/nav-agents.svg?react';
@@ -57,37 +59,38 @@ type IconComponent = ComponentType<SVGProps<SVGSVGElement>>;
 
 type NavItem = {
   route: EnterpriseRoute;
-  label: string;
+  labelId: MessageId;
   Icon: IconComponent;
 };
 
 const PRIMARY_NAV: NavItem[] = [
-  { route: EnterpriseRoute.Platform, label: '开放广场平台', Icon: IconPlatform },
-  { route: EnterpriseRoute.Agents, label: '我的数字员工', Icon: IconAgents },
-  { route: EnterpriseRoute.Teams, label: '我的团队', Icon: IconTeams },
-  { route: EnterpriseRoute.Channels, label: '渠道接入', Icon: IconGlobe },
+  { route: EnterpriseRoute.Platform, labelId: 'shell.nav.marketplacePlatform', Icon: IconPlatform },
+  { route: EnterpriseRoute.Agents, labelId: 'shell.nav.myEmployees', Icon: IconAgents },
+  { route: EnterpriseRoute.Teams, labelId: 'shell.nav.myTeams', Icon: IconTeams },
+  { route: EnterpriseRoute.Channels, labelId: 'shell.nav.channels', Icon: IconGlobe },
 ];
 
 const PROFILE_NAV: NavItem[] = [
-  { route: EnterpriseRoute.Dashboard, label: '员工档案', Icon: IconFile },
-  { route: EnterpriseRoute.ScheduledTasks, label: '定时任务', Icon: IconAlarm },
-  { route: EnterpriseRoute.Memories, label: '记忆', Icon: IconHistory },
-  { route: EnterpriseRoute.Feedback, label: '对话日志', Icon: IconCalendar },
+  { route: EnterpriseRoute.Dashboard, labelId: 'shell.nav.employeeProfile', Icon: IconFile },
+  { route: EnterpriseRoute.ScheduledTasks, labelId: 'shell.nav.scheduledTasks', Icon: IconAlarm },
+  { route: EnterpriseRoute.Memories, labelId: 'shell.nav.memories', Icon: IconHistory },
+  { route: EnterpriseRoute.Feedback, labelId: 'shell.nav.conversationLogs', Icon: IconCalendar },
 ];
 
 const CAPABILITY_NAV: NavItem[] = [
-  { route: EnterpriseRoute.Knowledge, label: '知识库', Icon: IconFolder },
-  { route: EnterpriseRoute.GeneralSkills, label: '技能', Icon: IconMagicWand },
-  { route: EnterpriseRoute.Skills, label: 'SOP', Icon: IconClipboard },
-  { route: EnterpriseRoute.Tools, label: '工具', Icon: IconBriefcase },
+  { route: EnterpriseRoute.Knowledge, labelId: 'shell.nav.knowledge', Icon: IconFolder },
+  { route: EnterpriseRoute.GeneralSkills, labelId: 'shell.nav.generalSkills', Icon: IconMagicWand },
+  { route: EnterpriseRoute.Skills, labelId: 'shell.nav.sop', Icon: IconClipboard },
+  { route: EnterpriseRoute.Tools, labelId: 'shell.nav.tools', Icon: IconBriefcase },
 ];
 
 const SYSTEM_NAV: NavItem[] = [
-  { route: EnterpriseRoute.Accounts, label: '账号管理', Icon: IconAccounts },
-  { route: EnterpriseRoute.Models, label: '模型配置', Icon: IconModels },
-  { route: EnterpriseRoute.RuntimeSettings, label: '运行设置', Icon: IconSettings },
+  { route: EnterpriseRoute.Accounts, labelId: 'shell.nav.accounts', Icon: IconAccounts },
+  { route: EnterpriseRoute.Models, labelId: 'shell.nav.models', Icon: IconModels },
+  { route: EnterpriseRoute.RuntimeSettings, labelId: 'shell.nav.runtimeSettings', Icon: IconSettings },
 ];
 
+/** 按权限组合固定语义导航项，不读取或变换任何员工数据。 */
 function primaryNavItems(isAdmin: boolean): NavItem[] {
   return isAdmin ? [...PRIMARY_NAV, ...SYSTEM_NAV] : PRIMARY_NAV;
 }
@@ -141,6 +144,7 @@ export type AppSidebarProps = AppSidebarManagementProps | AppSidebarChatProps;
 const SIDEBAR_SHELL_CLASS =
   'overflow-hidden border-r border-sidebar-border bg-sidebar backdrop-blur-[9.5px] **:data-[slot=sidebar-inner]:bg-sidebar';
 
+/** 渲染一级语义导航按钮，并让 tooltip 与可见文案共享同一消息。 */
 function PrimaryNavButton({
   item,
   selected,
@@ -152,15 +156,17 @@ function PrimaryNavButton({
   onNavigate: (route: string) => void;
   attention?: boolean;
 }) {
+  const { t } = useAppIntl();
+  const label = t(item.labelId);
   return (
     <SidebarMenuItem>
       <SidebarMenuButton
         data-guide-target={`route-${item.route}`}
-        tooltip={item.label}
+        tooltip={label}
         isActive={selected === item.route}
         onClick={() => onNavigate(item.route)}
         className={cn(
-          'h-[40px] gap-[10px] rounded-[14px] px-[20px] py-[10px] text-[14px] text-sidebar-foreground',
+          'h-[40px] gap-[10px] rounded-[14px] px-[16px] py-[10px] text-[14px] text-sidebar-foreground',
           'hover:bg-sidebar-accent hover:text-sidebar-accent-foreground',
           'data-active:bg-sidebar-accent data-active:text-sidebar-accent-foreground data-active:font-normal',
           attention && selected !== item.route && 'bg-[#fff7e8] text-[#8a4b00] ring-1 ring-[#ffd58a]',
@@ -168,7 +174,7 @@ function PrimaryNavButton({
         )}
       >
         <item.Icon className="size-[16px]!" />
-        <span className="text-[14px]">{item.label}</span>
+        <span className="min-w-0 flex-1 truncate whitespace-nowrap text-[14px]">{label}</span>
         {attention && (
           <span className="ml-auto size-[6px] rounded-full bg-[#f59e0b] group-data-[collapsible=icon]:hidden" />
         )}
@@ -177,6 +183,7 @@ function PrimaryNavButton({
   );
 }
 
+/** 渲染员工资料卡片中的二级语义导航按钮。 */
 function CardNavButton({
   item,
   selected,
@@ -186,11 +193,13 @@ function CardNavButton({
   selected: string;
   onNavigate: (route: string) => void;
 }) {
+  const { t } = useAppIntl();
+  const label = t(item.labelId);
   return (
     <SidebarMenuItem>
       <SidebarMenuButton
         data-guide-target={`route-${item.route}`}
-        tooltip={item.label}
+        tooltip={label}
         isActive={selected === item.route}
         onClick={() => onNavigate(item.route)}
         className={cn(
@@ -201,7 +210,7 @@ function CardNavButton({
         )}
       >
         <item.Icon className="size-[14px]!" />
-        <span>{item.label}</span>
+        <span>{label}</span>
       </SidebarMenuButton>
     </SidebarMenuItem>
   );
@@ -215,16 +224,18 @@ function GroupLabel({ children }: { children: string }) {
   );
 }
 
+/** 渲染团队作用域选项；团队名称始终按服务端原始值展示。 */
 function TeamScopeItems({
   scopeTeams,
   selectedAgentId,
   onSelectAgent,
 }: Pick<AppSidebarManagementProps, 'selectedAgentId' | 'onSelectAgent'> & { scopeTeams: TeamRead[] }) {
+  const { t } = useAppIntl();
   if (scopeTeams.length === 0) return null;
   return (
     <>
       <DropdownMenuLabel className="px-[8px] pt-[6px] pb-[2px] text-[10px] leading-none text-[#464c5e]">
-        团队
+        {t('sidebar.team')}
       </DropdownMenuLabel>
       {scopeTeams.map((team) => (
         <DropdownMenuItem
@@ -243,7 +254,7 @@ function TeamScopeItems({
             variant="secondary"
             className="ml-auto shrink-0 rounded-full bg-[#e8f0ff] text-[10px] font-normal text-[#1a71ff]"
           >
-            团队
+            {t('sidebar.team')}
           </Badge>
         </DropdownMenuItem>
       ))}
@@ -251,6 +262,7 @@ function TeamScopeItems({
   );
 }
 
+/** 渲染展开态员工/团队选择器；只翻译产品标签，不翻译实体名称和职位。 */
 function AgentSwitcher({
   sidebarAgent,
   scopeAgents,
@@ -258,15 +270,20 @@ function AgentSwitcher({
   selectedAgentId,
   onSelectAgent,
 }: Pick<AppSidebarManagementProps, 'sidebarAgent' | 'scopeAgents' | 'scopeTeams' | 'selectedAgentId' | 'onSelectAgent'>) {
+  const { t } = useAppIntl();
   const employeeAgents = scopeAgents.filter((agent) => !agent.is_overall);
   const currentAgent = sidebarAgent && !sidebarAgent.is_overall ? sidebarAgent : undefined;
   const selectedTeamId = teamIdFromScope(selectedAgentId);
   const currentTeam = selectedTeamId
     ? scopeTeams.find((team) => team.id === selectedTeamId)
     : undefined;
-  const caption = selectedTeamId ? '当前团队' : currentAgent ? '当前员工' : '未选择';
+  const caption = selectedTeamId
+    ? t('sidebar.currentTeam')
+    : currentAgent
+      ? t('sidebar.currentEmployee')
+      : t('sidebar.notSelected');
   const nameLabel = selectedTeamId
-    ? currentTeam?.name || '团队'
+    ? currentTeam?.name || t('sidebar.team')
     : currentAgent
       ? employeeDisplayNameWithCreator(currentAgent)
       : '-';
@@ -275,7 +292,7 @@ function AgentSwitcher({
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
         <div
-          aria-label="切换当前员工"
+          aria-label={t('sidebar.employeeSwitcher')}
           className={cn(
             'flex w-full items-center gap-[12px] rounded-[18px] px-[8px] pt-[8px] pb-[4px] text-left transition-colors',
             'group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:px-0 group-data-[collapsible=icon]:py-0',
@@ -337,7 +354,9 @@ function AgentSwitcher({
   );
 }
 
+/** 渲染从管理端进入对话端的本地化动作。 */
 function SidebarFooterActions({ onOpenChat }: { onOpenChat: () => void }) {
+  const { t } = useAppIntl();
   return (
     <div
       className={cn(
@@ -349,20 +368,20 @@ function SidebarFooterActions({ onOpenChat }: { onOpenChat: () => void }) {
         type="button"
         data-guide-target="open-chat"
         onClick={onOpenChat}
-        title="对话端"
+        title={t('sidebar.chatApp')}
         className={cn(
           'flex h-[40px] w-[130px] items-center justify-center gap-[6px] rounded-[10px] border-[0.5px] border-[#E3E7F1] bg-[#F6F6F6] px-[20px] py-[4px] text-[14px] text-sidebar-accent-foreground transition-opacity hover:opacity-70',
           'group-data-[collapsible=icon]:size-[40px] group-data-[collapsible=icon]:w-[40px] group-data-[collapsible=icon]:px-0',
         )}
       >
         <IconChat className="size-[16px]!" />
-        <span className="group-data-[collapsible=icon]:hidden">对话端</span>
+        <span className="group-data-[collapsible=icon]:hidden">{t('sidebar.chatApp')}</span>
       </button>
       <button
         type="button"
         onClick={onOpenChat}
-        title="切换到对话端"
-        aria-label="切换到对话端"
+        title={t('sidebar.switchToChat')}
+        aria-label={t('sidebar.switchToChat')}
         className="flex size-[32px] shrink-0 items-center justify-center rounded-[8px] rotate-90 text-sidebar-foreground transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
       >
         <IconToggle className="size-[16px]!" />
@@ -379,6 +398,7 @@ function CollapsedGroupLabel({ children }: { children: string }) {
   );
 }
 
+/** 渲染收起态导航图标，并使用语义消息同步 ARIA 与 tooltip。 */
 function CollapsedNavButton({
   item,
   selected,
@@ -394,13 +414,15 @@ function CollapsedNavButton({
   iconSize: number;
   attention?: boolean;
 }) {
+  const { t } = useAppIntl();
   const active = selected === item.route;
+  const label = t(item.labelId);
   return (
     <Tooltip>
       <TooltipTrigger asChild>
         <button
           type="button"
-          aria-label={item.label}
+          aria-label={label}
           onClick={() => onNavigate(item.route)}
           className={cn(
             'relative flex size-[32px] shrink-0 items-center justify-center text-sidebar-foreground transition-colors',
@@ -417,12 +439,13 @@ function CollapsedNavButton({
         </button>
       </TooltipTrigger>
       <TooltipContent side="right" align="center">
-        {item.label}
+        {label}
       </TooltipContent>
     </Tooltip>
   );
 }
 
+/** 渲染收起态员工/团队选择器，保留所有实体字段原文。 */
 function CollapsedAgentSwitcher({
   sidebarAgent,
   scopeAgents,
@@ -433,6 +456,7 @@ function CollapsedAgentSwitcher({
 }: Pick<AppSidebarManagementProps, 'sidebarAgent' | 'scopeAgents' | 'scopeTeams' | 'selectedAgentId' | 'onSelectAgent'> & {
   nameLabel: string;
 }) {
+  const { t } = useAppIntl();
   const employeeAgents = scopeAgents.filter((agent) => !agent.is_overall);
   const currentAgent = sidebarAgent && !sidebarAgent.is_overall ? sidebarAgent : undefined;
   const selectedTeamId = teamIdFromScope(selectedAgentId);
@@ -441,7 +465,7 @@ function CollapsedAgentSwitcher({
       <DropdownMenuTrigger asChild>
         <button
           type="button"
-          aria-label="切换当前员工"
+          aria-label={t('sidebar.employeeSwitcher')}
           className="flex flex-col items-center gap-[2px] pt-[8px]"
         >
           {currentAgent ? (
@@ -485,6 +509,7 @@ function CollapsedAgentSwitcher({
   );
 }
 
+/** 渲染收起态管理导航并本地化所有 StaffDeck 自有控件。 */
 function CollapsedSidebar({
   selected,
   onNavigate,
@@ -501,23 +526,24 @@ function CollapsedSidebar({
   AppSidebarManagementProps,
   'selected' | 'onNavigate' | 'isAdmin' | 'sidebarAgent' | 'scopeAgents' | 'scopeTeams' | 'selectedAgentId' | 'onSelectAgent' | 'onOpenChat' | 'modelSetupAttention'
 > & { onToggle: () => void }) {
+  const { t } = useAppIntl();
   const selectedTeamId = teamIdFromScope(selectedAgentId);
   const selectedTeam = selectedTeamId
     ? scopeTeams.find((team) => team.id === selectedTeamId)
     : undefined;
   const nameLabel = selectedTeamId
-    ? selectedTeam?.name || '团队'
+    ? selectedTeam?.name || t('sidebar.team')
     : sidebarAgent
       ? sidebarAgent.is_overall
-        ? '未选择'
+        ? t('sidebar.notSelected')
         : employeeDisplayNameWithCreator(sidebarAgent)
-      : '未选择';
+      : t('sidebar.notSelected');
   const primaryItems = primaryNavItems(isAdmin);
 
   return (
     <div className="flex h-full w-(--sidebar-width-icon) shrink-0 flex-col items-center gap-[32px] px-[16px] pt-[42px] pb-[10px]">
       <div className="flex w-full flex-col items-center gap-[10px]">
-        <button type="button" title="开放广场" className="flex items-center justify-center p-[10px]">
+        <button type="button" title={t('sidebar.marketplaceShort')} className="flex items-center justify-center p-[10px]">
           <BrandLogo markOnly />
         </button>
         <Tooltip>
@@ -525,14 +551,14 @@ function CollapsedSidebar({
             <button
               type="button"
               onClick={onToggle}
-              aria-label="展开边栏"
+              aria-label={t('sidebar.expand')}
               className="flex size-[16px] items-center justify-center text-sidebar-foreground transition-colors hover:text-sidebar-accent-foreground"
             >
               <IconHeaderCollapse className="size-[16px]! -rotate-90" />
             </button>
           </TooltipTrigger>
           <TooltipContent side="right" align="center">
-            展开边栏
+            {t('sidebar.expand')}
           </TooltipContent>
         </Tooltip>
       </div>
@@ -566,7 +592,7 @@ function CollapsedSidebar({
           <div className="h-px w-[28px] bg-sidebar-border" />
 
           <div className="flex flex-col items-center gap-[4px]">
-            <CollapsedGroupLabel>资料</CollapsedGroupLabel>
+            <CollapsedGroupLabel>{t('sidebar.profileGroup')}</CollapsedGroupLabel>
             {PROFILE_NAV.map((item) => (
               <CollapsedNavButton
                 key={item.route}
@@ -578,7 +604,7 @@ function CollapsedSidebar({
               />
             ))}
 
-            <CollapsedGroupLabel>能力</CollapsedGroupLabel>
+            <CollapsedGroupLabel>{t('sidebar.capabilityGroup')}</CollapsedGroupLabel>
             {CAPABILITY_NAV.map((item) => (
               <CollapsedNavButton
                 key={item.route}
@@ -598,14 +624,14 @@ function CollapsedSidebar({
               <button
                 type="button"
                 onClick={onOpenChat}
-                aria-label="切换到对话端"
+                aria-label={t('sidebar.switchToChat')}
                 className="flex size-[32px] shrink-0 items-center justify-center rounded-[10px] border-[0.5px] border-[#E3E7F1] bg-[#F6F6F6] text-sidebar-accent-foreground transition-opacity hover:opacity-70"
               >
                 <IconChat className="size-[16px]!" />
               </button>
             </TooltipTrigger>
             <TooltipContent side="right" align="center">
-              切换到对话端
+              {t('sidebar.switchToChat')}
             </TooltipContent>
           </Tooltip>
         </div>
@@ -614,6 +640,7 @@ function CollapsedSidebar({
   );
 }
 
+/** 渲染展开态管理侧栏，实体内容直出且所有导航/控制文案来自语义目录。 */
 function ManagementSidebar({
   selected,
   onNavigate,
@@ -626,6 +653,7 @@ function ManagementSidebar({
   onOpenChat,
   modelSetupAttention,
 }: AppSidebarManagementProps) {
+  const { t } = useAppIntl();
   const { toggleSidebar, state } = useSidebar();
   const brandCollapsed = useMemo(() => state === 'collapsed', [state]);
   const primaryItems = useMemo(() => primaryNavItems(isAdmin), [isAdmin]);
@@ -655,15 +683,15 @@ function ManagementSidebar({
       <div className="flex h-full w-(--sidebar-width) shrink-0 flex-col">
       <SidebarHeader className="gap-[24px] px-[20px] pt-[42px] group-data-[collapsible=icon]:px-[20px]">
         <div className="flex items-center justify-between">
-          <button type="button" title="开放广场">
+          <button type="button" title={t('sidebar.marketplaceShort')}>
             <BrandLogo wordmarkClassName="group-data-[collapsible=icon]:hidden" />
           </button>
           {!brandCollapsed && (
             <button
               type="button"
               onClick={toggleSidebar}
-              title="收起边栏"
-              aria-label="收起边栏"
+              title={t('sidebar.collapse')}
+              aria-label={t('sidebar.collapse')}
               className="flex size-[28px] shrink-0 items-center justify-center rounded-[8px] text-sidebar-foreground transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
             >
               <IconHeaderCollapse className="size-[14px]! -rotate-90" />
@@ -704,14 +732,14 @@ function ManagementSidebar({
           <div className="mx-[8px] h-px bg-sidebar-border group-data-[collapsible=icon]:hidden" />
 
           <div className="flex flex-col gap-[2px] px-[10px] group-data-[collapsible=icon]:px-0">
-            <GroupLabel>基本资料</GroupLabel>
+            <GroupLabel>{t('sidebar.profileGroup')}</GroupLabel>
             <SidebarMenu className="gap-[2px]">
               {PROFILE_NAV.map((item) => (
                 <CardNavButton key={item.route} item={item} selected={selected} onNavigate={onNavigate} />
               ))}
             </SidebarMenu>
 
-            <GroupLabel>员工能力</GroupLabel>
+            <GroupLabel>{t('sidebar.capabilityGroup')}</GroupLabel>
             <SidebarMenu className="gap-[2px]">
               {CAPABILITY_NAV.map((item) => (
                 <CardNavButton key={item.route} item={item} selected={selected} onNavigate={onNavigate} />
@@ -739,14 +767,16 @@ function sessionAgentFor(session: ChatSession, agents: AgentProfileRead[]): Agen
   return agents.find((agent) => agent.id === session.agent_id) || null;
 }
 
-function sessionTitleFor(session: ChatSession, _agent: AgentProfileRead | null): string {
-  if (session.title) return staffdeckDisplayText(session.title);
-  return session.id || '新对话';
+/** 返回会话原始标题；只有数据缺失时才使用调用方传入的本地化占位。 */
+function sessionTitleFor(session: ChatSession, fallbackTitle: string): string {
+  if (session.title) return session.title;
+  return session.id || fallbackTitle;
 }
 
-function sessionSubtitleFor(session: ChatSession, _agent: AgentProfileRead | null): string {
+/** 返回会话原始摘要并仅移除旧协议前缀；不翻译 Agent 或用户生成内容。 */
+function sessionSubtitleFor(session: ChatSession, fallbackTitle: string): string {
   const recent = (session.last_agent_question || session.summary || '').replace(/^最近回复[:：]\s*/, '');
-  return recent ? staffdeckDisplayText(recent) : '新对话';
+  return recent || fallbackTitle;
 }
 
 function TeamGroupAvatar({
@@ -781,6 +811,7 @@ function TeamGroupAvatar({
   );
 }
 
+/** 渲染会话筛选器；调用方提供的选项标签保持原样，仅翻译组件自有控制文案。 */
 function ChatSessionFilter({
   sessionFilter,
   sessionFilterOptions,
@@ -789,10 +820,11 @@ function ChatSessionFilter({
 }: Pick<AppSidebarChatProps, 'sessionFilter' | 'sessionFilterOptions' | 'onSessionFilterChange'> & {
   collapsed?: boolean;
 }) {
+  const { t } = useAppIntl();
   const current = sessionFilterOptions.find((option) => option.value === sessionFilter) || sessionFilterOptions[0];
   const [namePart, countPart] = current
     ? current.label.split('·').map((part) => part.trim())
-    : ['全部员工', ''];
+    : [t('sidebar.allEmployees'), ''];
 
   return (
     <DropdownMenu>
@@ -800,7 +832,7 @@ function ChatSessionFilter({
         {collapsed ? (
           <button
             type="button"
-            aria-label="筛选会话"
+            aria-label={t('sidebar.conversationFilter')}
             className="flex h-[32px] w-full items-center justify-center rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-[#f6f6f6] transition-colors hover:border-[#c9d2e4]"
           >
             <IconSort className="size-[14px]! shrink-0 text-[#858b9c]" />
@@ -808,7 +840,7 @@ function ChatSessionFilter({
         ) : (
           <button
             type="button"
-            aria-label="筛选会话"
+            aria-label={t('sidebar.conversationFilter')}
             className="flex h-[40px] w-full items-center justify-between rounded-[14px] border-[0.5px] border-[#e3e7f1] bg-[#f6f6f6] px-[20px] py-[10px] text-left transition-colors hover:border-[#c9d2e4]"
           >
             <span className="flex min-w-0 items-center gap-[6px]">
@@ -874,6 +906,7 @@ function ChatSessionFilter({
   );
 }
 
+/** 渲染待回答入口，并以语义消息组合有界计数。 */
 function ChatHandoffButton({
   count = 0,
   onOpen,
@@ -883,6 +916,7 @@ function ChatHandoffButton({
   onOpen?: () => void;
   collapsed?: boolean;
 }) {
+  const { t } = useAppIntl();
   if (!onOpen) return null;
   const badge = count > 99 ? '99+' : String(count);
 
@@ -893,7 +927,7 @@ function ChatHandoffButton({
           <button
             type="button"
             onClick={onOpen}
-            aria-label="待回答"
+            aria-label={t('sidebar.pendingAnswer')}
             className="relative flex h-[32px] w-full items-center justify-center rounded-[8px] text-sidebar-foreground transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
           >
             <IconChatBubble className="size-[16px]!" />
@@ -905,7 +939,9 @@ function ChatHandoffButton({
           </button>
         </TooltipTrigger>
         <TooltipContent side="right" align="center">
-          {count > 0 ? `待回答 ${badge}` : '待回答'}
+          {count > 0
+            ? t('sidebar.pendingAnswerWithCount', { count: badge })
+            : t('sidebar.pendingAnswer')}
         </TooltipContent>
       </Tooltip>
     );
@@ -919,7 +955,7 @@ function ChatHandoffButton({
     >
       <span className="flex min-w-0 items-center gap-[12px]">
         <IconChatBubble className="size-[16px]! shrink-0" />
-        <span className="truncate">待回答</span>
+        <span className="truncate">{t('sidebar.pendingAnswer')}</span>
       </span>
       {count > 0 && (
         <span className="inline-flex h-[18px] min-w-[18px] items-center justify-center rounded-full bg-white px-[6px] text-[11px] leading-none text-[#f5483b] shadow-[0_0_0_0.5px_rgba(245,72,59,0.18)]">
@@ -930,6 +966,7 @@ function ChatHandoffButton({
   );
 }
 
+/** 渲染会话行；会话、员工与团队名称保持原文，周边产品标签使用语义消息。 */
 function ChatSessionRow({
   session,
   agent,
@@ -951,14 +988,19 @@ function ChatSessionRow({
   onRenameSession: (session: ChatSession) => void;
   onDeleteSession: (session: ChatSession) => void;
 }) {
-  const title = sessionTitleFor(session, agent);
-  const subtitle = sessionSubtitleFor(session, agent);
+  const { t } = useAppIntl();
+  const fallbackTitle = t('sidebar.newConversation');
+  const title = sessionTitleFor(session, fallbackTitle);
+  const subtitle = sessionSubtitleFor(session, fallbackTitle);
   const isTeamGroup = Boolean(session.team_id);
+  // 兼容旧团队会话标题封套，只剥离产品前后缀，团队名称本身保持原始值。
   const displayTitle = isTeamGroup
     ? team?.name || session.team_name || title.replace(/^团队\s*/, '').replace(/\s*·\s*TL 对话$/, '')
     : title;
   const displaySubtitle = isTeamGroup
-    ? team ? `${team.members.length} 位成员 · 团队群聊` : '团队群聊'
+    ? team
+      ? t('sidebar.teamMemberChat', { count: team.members.length })
+      : t('sidebar.teamChat')
     : subtitle;
 
   return (
@@ -995,35 +1037,43 @@ function ChatSessionRow({
         </TooltipTrigger>
         {(agent || isTeamGroup) && (
           <TooltipContent side="right" align="center">
-            {isTeamGroup ? `${displayTitle} · 团队群聊` : agent?.name}
+            {isTeamGroup ? t('sidebar.teamChatWithName', { name: displayTitle }) : agent?.name}
           </TooltipContent>
         )}
       </Tooltip>
-      <span className="flex min-w-0 flex-1 flex-col justify-between self-stretch py-[3px]">
-        <span className="flex min-w-0 items-center gap-[4px]">
-          <span className="truncate text-[14px] leading-none text-[#464c5e] capitalize" title={displayTitle}>
-            {displayTitle}
-          </span>
-          {isTeamGroup && (
-            <span
-              aria-label="群聊"
-              className="inline-flex h-[16px] shrink-0 items-center rounded-full bg-[#e8f0ff] px-[5px] text-[10px] font-medium leading-none text-[#1a71ff]"
-            >
-              群聊
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <span className="flex min-w-0 flex-1 flex-col justify-between self-stretch py-[3px]">
+            <span className="flex min-w-0 items-center gap-[4px]">
+              <span className="truncate text-[14px] leading-none text-[#464c5e] capitalize">
+                {displayTitle}
+              </span>
+              {isTeamGroup && (
+                <span
+                  aria-label={t('sidebar.groupChat')}
+                  className="inline-flex h-[16px] shrink-0 items-center rounded-full bg-[#e8f0ff] px-[5px] text-[10px] font-medium leading-none text-[#1a71ff]"
+                >
+                  {t('sidebar.groupChat')}
+                </span>
+              )}
             </span>
-          )}
-        </span>
-        <span className="truncate text-[12px] leading-none text-[#757f9c]" title={displaySubtitle}>
-          {displaySubtitle}
-        </span>
-      </span>
+            <span className="truncate text-[12px] leading-none text-[#757f9c]">
+              {displaySubtitle}
+            </span>
+          </span>
+        </TooltipTrigger>
+        <TooltipContent side="right" align="start" className="flex-col items-start gap-0.5 whitespace-normal text-left max-w-[260px]">
+          <span className="font-medium">{displayTitle}</span>
+          {displaySubtitle && <span className="text-background/70">{displaySubtitle}</span>}
+        </TooltipContent>
+      </Tooltip>
       {unread && (
-        <span className="ml-[2px] size-[7px] shrink-0 rounded-full bg-[#f5483b]" aria-label="未读回复" />
+        <span className="ml-[2px] size-[7px] shrink-0 rounded-full bg-[#f5483b]" aria-label={t('sidebar.unreadReply')} />
       )}
       {!isTeamGroup && <span className="ml-auto hidden shrink-0 items-center gap-[6px] group-hover/session:flex">
         <button
           type="button"
-          aria-label="重命名会话"
+          aria-label={t('sidebar.renameConversation')}
           onClick={(event) => {
             event.stopPropagation();
             onRenameSession(session);
@@ -1034,7 +1084,7 @@ function ChatSessionRow({
         </button>
         <button
           type="button"
-          aria-label="删除会话"
+          aria-label={t('sidebar.deleteConversation')}
           onClick={(event) => {
             event.stopPropagation();
             onDeleteSession(session);
@@ -1070,23 +1120,25 @@ function ChatSessionSkeletonList({ rows = 5 }: { rows?: number }) {
   );
 }
 
+/** 渲染从对话端返回管理端的本地化动作。 */
 function ChatFooterActions({ onOpenAdmin }: { onOpenAdmin: () => void }) {
+  const { t } = useAppIntl();
   return (
     <div className="flex items-center justify-center gap-[10px] pb-[20px]">
       <button
         type="button"
         onClick={onOpenAdmin}
-        title="管理端"
+        title={t('sidebar.managementApp')}
         className="flex h-[40px] w-[130px] items-center justify-center gap-[6px] rounded-[10px] border-[0.5px] border-[#E3E7F1] bg-[#F6F6F6] px-[20px] py-[4px] text-[14px] text-[#858b9c] transition-opacity hover:opacity-70"
       >
         <IconViewMasonry className="size-[16px]!" />
-        <span>管理端</span>
+        <span>{t('sidebar.managementApp')}</span>
       </button>
       <button
         type="button"
         onClick={onOpenAdmin}
-        title="切换到管理端"
-        aria-label="切换到管理端"
+        title={t('sidebar.switchToManagement')}
+        aria-label={t('sidebar.switchToManagement')}
         className="flex size-[32px] shrink-0 items-center justify-center rounded-[8px] rotate-90 text-sidebar-foreground transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
       >
         <IconToggle className="size-[16px]!" />
@@ -1095,6 +1147,7 @@ function ChatFooterActions({ onOpenAdmin }: { onOpenAdmin: () => void }) {
   );
 }
 
+/** 渲染收起态对话侧栏；会话标题保持原始值，所有壳层控件使用语义消息。 */
 function CollapsedChatSidebar({
   sessions,
   sessionsLoading = false,
@@ -1117,10 +1170,11 @@ function CollapsedChatSidebar({
   AppSidebarChatProps,
   'sessions' | 'sessionsLoading' | 'agents' | 'scopeTeams' | 'activeSessionId' | 'sessionFilter' | 'onSessionFilterChange' | 'sessionFilterOptions' | 'isSessionUnread' | 'onOpenSession' | 'onNewConversation' | 'onOpenGallery' | 'galleryActive' | 'handoffCount' | 'onOpenHandoffs' | 'onOpenAdmin'
 > & { onToggle: () => void }) {
+  const { t } = useAppIntl();
   return (
     <div className="flex h-full w-(--sidebar-width-icon) shrink-0 flex-col items-center gap-[32px] px-[20px] pt-[42px] pb-[10px]">
       <div className="flex w-full flex-col items-center gap-[10px]">
-        <button type="button" title="数字员工广场" onClick={onOpenGallery} className="flex items-center justify-center p-[10px]">
+        <button type="button" title={t('sidebar.marketplace')} onClick={onOpenGallery} className="flex items-center justify-center p-[10px]">
           <BrandLogo markOnly />
         </button>
         <Tooltip>
@@ -1128,14 +1182,14 @@ function CollapsedChatSidebar({
             <button
               type="button"
               onClick={onToggle}
-              aria-label="展开边栏"
+              aria-label={t('sidebar.expand')}
               className="flex size-[16px] items-center justify-center text-sidebar-foreground transition-colors hover:text-sidebar-accent-foreground"
             >
               <IconHeaderCollapse className="size-[16px]! -rotate-90" />
             </button>
           </TooltipTrigger>
           <TooltipContent side="right" align="center">
-            展开边栏
+            {t('sidebar.expand')}
           </TooltipContent>
         </Tooltip>
       </div>
@@ -1146,7 +1200,7 @@ function CollapsedChatSidebar({
             <button
               type="button"
               onClick={onOpenGallery}
-              aria-label="数字员工广场"
+              aria-label={t('sidebar.marketplace')}
               aria-current={galleryActive ? 'page' : undefined}
               className={cn(
                 'flex h-[32px] w-full items-center justify-center rounded-[8px] transition-colors',
@@ -1159,7 +1213,7 @@ function CollapsedChatSidebar({
             </button>
           </TooltipTrigger>
           <TooltipContent side="right" align="center">
-            数字员工广场
+            {t('sidebar.marketplace')}
           </TooltipContent>
         </Tooltip>
 
@@ -1180,19 +1234,19 @@ function CollapsedChatSidebar({
               <button
                 type="button"
                 onClick={onNewConversation}
-                aria-label="新建对话"
+                aria-label={t('sidebar.newConversation')}
                 className="flex h-[32px] w-full items-center justify-center rounded-[8px] bg-[#18181a] text-white transition-colors hover:bg-[#303030]"
               >
                 <IconAdd className="size-[16px]!" />
               </button>
             </TooltipTrigger>
             <TooltipContent side="right" align="center">
-              新建对话
+              {t('sidebar.newConversation')}
             </TooltipContent>
           </Tooltip>
         )}
 
-        <span className="text-[10px] leading-none text-[#464c5e]">会话</span>
+        <span className="text-[10px] leading-none text-[#464c5e]">{t('sidebar.conversations')}</span>
 
         <div className="no-scrollbar mx-[-8px] flex min-h-0 w-[calc(100%+16px)] flex-1 flex-col items-center gap-[10px] overflow-y-auto py-[2px]">
           {sessionsLoading
@@ -1203,7 +1257,7 @@ function CollapsedChatSidebar({
                 const agent = sessionAgentFor(session, agents);
                 const active = session.id === activeSessionId;
                 const unread = isSessionUnread(session);
-                const title = sessionTitleFor(session, agent);
+                const title = sessionTitleFor(session, t('sidebar.newConversation'));
                 const team = session.team_id
                   ? scopeTeams.find((item) => item.id === session.team_id) || null
                   : null;
@@ -1229,13 +1283,13 @@ function CollapsedChatSidebar({
                           <IconChatBubble className="size-[18px]!" />
                         )}
                         {unread && (
-                          <span className="absolute right-[2px] top-[2px] size-[7px] rounded-full bg-[#f5483b] ring-[1.5px] ring-white" aria-label="未读回复" />
+                          <span className="absolute right-[2px] top-[2px] size-[7px] rounded-full bg-[#f5483b] ring-[1.5px] ring-white" aria-label={t('sidebar.unreadReply')} />
                         )}
                       </button>
                     </TooltipTrigger>
                     <TooltipContent side="right" align="center">
                       {session.team_id
-                        ? `${team?.name || session.team_name || title} · 团队群聊`
+                        ? t('sidebar.teamChatWithName', { name: team?.name || session.team_name || title })
                         : agent ? `${agent.name} · ${title}` : title}
                     </TooltipContent>
                   </Tooltip>
@@ -1250,14 +1304,14 @@ function CollapsedChatSidebar({
             <button
               type="button"
               onClick={onOpenAdmin}
-              aria-label="切换到管理端"
+              aria-label={t('sidebar.switchToManagement')}
               className="flex size-[32px] shrink-0 items-center justify-center rounded-[10px] border-[0.5px] border-[#E3E7F1] bg-[#F6F6F6] text-[#858b9c] transition-opacity hover:opacity-70"
             >
               <IconViewMasonry className="size-[16px]!" />
             </button>
           </TooltipTrigger>
           <TooltipContent side="right" align="center">
-            切换到管理端
+            {t('sidebar.switchToManagement')}
           </TooltipContent>
         </Tooltip>
       </div>
@@ -1265,6 +1319,7 @@ function CollapsedChatSidebar({
   );
 }
 
+/** 渲染展开态对话侧栏；实体标题直出，壳层操作和空状态全部语义化。 */
 function ChatSidebarVariant({
   sessions,
   sessionsLoading = false,
@@ -1285,6 +1340,7 @@ function ChatSidebarVariant({
   onDeleteSession,
   onOpenAdmin,
 }: AppSidebarChatProps) {
+  const { t } = useAppIntl();
   const { toggleSidebar, state } = useSidebar();
   const collapsed = state === 'collapsed';
   const showSkeleton = sessionsLoading && sessions.length === 0;
@@ -1321,14 +1377,14 @@ function ChatSidebarVariant({
       <div className="flex h-full w-(--sidebar-width) shrink-0 flex-col">
         <SidebarHeader className="gap-[24px] px-[20px] pt-[42px]">
           <div className="flex items-center justify-between">
-            <button type="button" title="数字员工广场" onClick={onOpenGallery}>
+            <button type="button" title={t('sidebar.marketplace')} onClick={onOpenGallery}>
               <BrandLogo />
             </button>
             <button
               type="button"
               onClick={toggleSidebar}
-              title="收起边栏"
-              aria-label="收起边栏"
+              title={t('sidebar.collapse')}
+              aria-label={t('sidebar.collapse')}
               className="flex size-[28px] shrink-0 items-center justify-center rounded-[8px] text-sidebar-foreground transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
             >
               <IconHeaderCollapse className="size-[14px]! -rotate-90" />
@@ -1348,7 +1404,7 @@ function ChatSidebarVariant({
               )}
             >
               <IconGlobe className="size-[16px]! shrink-0" />
-              <span className="truncate">数字员工广场</span>
+              <span className="truncate">{t('sidebar.marketplace')}</span>
             </button>
             <ChatHandoffButton count={handoffCount} onOpen={onOpenHandoffs} />
             <div className="h-px w-full bg-sidebar-border" />
@@ -1364,10 +1420,10 @@ function ChatSidebarVariant({
                 className="flex h-[40px] w-full items-center justify-center gap-[8px] rounded-[10px] bg-[#18181a] px-[16px] text-[14px] font-medium text-white transition-colors hover:bg-[#303030]"
               >
                 <IconAdd className="size-[16px]! shrink-0" />
-                <span>新建对话</span>
+                <span>{t('sidebar.newConversation')}</span>
               </button>
             )}
-            <span className="text-[12px] leading-none text-[#858b9c]">会话</span>
+            <span className="text-[12px] leading-none text-[#858b9c]">{t('sidebar.conversations')}</span>
           </div>
         </SidebarHeader>
 
@@ -1378,7 +1434,7 @@ function ChatSidebarVariant({
             ) : sessions.length === 0 ? (
               <div className="flex flex-col items-center gap-[8px] py-[28px] text-center text-[12px] text-[#a2a8b8]">
                 <StaffdeckIcon name="inbox" size={22} />
-                <span>暂无历史会话</span>
+                <span>{t('sidebar.noHistory')}</span>
               </div>
             ) : (
               <div className="flex flex-col gap-[2px]">

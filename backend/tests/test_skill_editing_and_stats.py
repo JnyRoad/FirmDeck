@@ -11,6 +11,7 @@ from app.api.chat import _active_skill_context_for_assistant_message, _active_sk
 from app.api.skills import (
     _extract_uploaded_skill_file,
     _skill_stats,
+    _validate_handoff_assignees,
     create_skill,
     draft_skill,
     distill_skill,
@@ -22,8 +23,9 @@ from app.api.skills import (
     update_skill,
 )
 from app.agents.branching import ensure_open_gallery_binding, visible_published_skills
-from app.db.models import AgentEvent, AgentProfile, Message, Skill, SkillFeedback, SkillVersion, Tenant, Tool, User
+from app.db.models import AgentEvent, AgentProfile, ChannelBinding, ChannelIdentity, Message, Skill, SkillFeedback, SkillVersion, Tenant, Tool, User
 from app.db.models import ModelConfig
+from app.llm import LLMError
 from app.skills.skill_distiller import SkillDistiller
 from app.skills.skill_editor import SkillEditor
 from app.skills.nesting import SopNestingError
@@ -431,7 +433,7 @@ def test_skill_editor_stream_repairs_invalid_json_once(monkeypatch) -> None:
         assert self.max_output_tokens == 8192
         if payload.get("reflection_round"):
             return _reflection_passes_json()
-        assert "previous_error" in payload
+        assert payload["previous_error_code"] == "SKILL_REWRITE_OUTPUT_INVALID"
         return json.dumps(
             {
                 "assistant_message": "已精简回复规则。",
@@ -642,7 +644,8 @@ def test_skill_id_cannot_be_modified_after_create() -> None:
             )
 
         assert exc_info.value.status_code == 400
-        assert exc_info.value.detail == "SOP skill_id cannot be modified"
+        assert exc_info.value.detail["code"] == "SKILL_ID_IMMUTABLE"
+        assert exc_info.value.detail["params"] == {}
 
 
 def test_skill_can_return_to_draft_without_leaving_runtime_list() -> None:
@@ -1231,11 +1234,15 @@ def test_persisted_skill_promotes_required_capabilities_without_weakening_schema
 
 
 def test_skill_distiller_stream_uses_generation_status(monkeypatch) -> None:
-    def fake_stream(self, _system_prompt: str, _payload: str):  # noqa: ANN001
+    def fake_stream(self, _system_prompt: str, _payload: dict):  # noqa: ANN001
         assert self.max_output_tokens == 8192
-        assert isinstance(_payload, str)
-        assert _payload.startswith("技能标题：商品比价\n原始流程：")
-        assert not _payload.lstrip().startswith("{")
+        assert _payload["input"].startswith("技能标题：商品比价\n原始流程：")
+        assert _payload["language_context"]["agent_reply_locale"] == "zh-CN"
+        assert _payload["language_directive"]["new_prose_locale"] == "zh-CN"
+        assert any(
+            marker["json_pointer"] == "/raw_content"
+            for marker in _payload["raw_source_markers"]
+        )
         yield """
         {
           "draft_skill": {
@@ -1673,6 +1680,116 @@ def test_skill_distiller_stream_uses_staged_generation_after_repair_failure(monk
     assert any("扩写步骤 2" in instruction for instruction in instructions)
 
 
+def test_skill_distiller_typed_reflection_warning_keeps_private_model_error(
+    monkeypatch,
+) -> None:
+    """Typed distill responses should keep reflection exceptions out of public warnings."""
+    raw_error = "provider token=do-not-publish path=/private/reflection.sock"
+
+    def fake_text(self, _system_prompt: str, payload: dict):  # noqa: ANN001
+        """Return one valid draft and then raise the seeded reflection error."""
+        assert self.max_output_tokens == 8192
+        if isinstance(payload, dict) and payload.get("reflection_round"):
+            raise LLMError(raw_error)
+        return json.dumps(
+            {
+                "draft_skill": {
+                    "skill_id": "skill_compare_price",
+                    "name": "商品比价",
+                    "version": "1.0.0",
+                    "business_domain": "ecommerce",
+                    "description": "比较两个商品价格。",
+                    "trigger_intents": ["compare_price"],
+                    "user_utterance_examples": ["比较 A 和 B"],
+                    "goal": ["收集两个商品名称", "反馈比价结果"],
+                    "required_info": ["product_name_1", "product_name_2"],
+                    "slot_filling_policy": {"enabled": True},
+                    "response_rules": [],
+                    "nodes": [
+                        {
+                            "node_id": "collect_names",
+                            "name": "收集商品名称",
+                            "instruction": "收集两个商品名称。",
+                            "expected_user_info": ["product_name_1", "product_name_2"],
+                            "allowed_actions": ["ask_user"],
+                        },
+                        {
+                            "node_id": "reply_result",
+                            "name": "反馈结果",
+                            "instruction": "反馈结果。",
+                            "expected_user_info": [],
+                            "allowed_actions": ["answer_user"],
+                        },
+                    ],
+                    "interruption_policy": {},
+                },
+                "warnings": [],
+            },
+            ensure_ascii=False,
+        )
+
+    monkeypatch.setattr("app.skills.skill_distiller.LLMClient.generate_text", fake_text)
+
+    response = SkillDistiller().distill(
+        SkillDistillRequest(
+            tenant_id="tenant_demo",
+            title="商品比价",
+            raw_content="用户提供两个商品的名称，系统根据商品价格进行比价",
+        ),
+        _model_config(),
+    )
+
+    assert any("模型校验未能完成" in warning for warning in response.warnings)
+    assert all(raw_error not in warning for warning in response.warnings)
+
+
+def test_skill_distiller_stream_fallback_warning_keeps_private_model_error(
+    monkeypatch,
+) -> None:
+    """Stream fallback should keep raw repair/staged errors in prompts only, not in warnings."""
+    raw_error = "provider token=do-not-publish path=/private/staged.sock"
+    captured_payloads: list[dict[str, object]] = []
+
+    def fake_stream(self, _system_prompt: str, _payload: dict):  # noqa: ANN001
+        """Return one truncated JSON payload so stream mode enters repair flow."""
+        assert self.max_output_tokens == 8192
+        yield '{"draft_skill": {"name": "截断"'
+
+    def fake_text(self, _system_prompt: str, payload: dict):  # noqa: ANN001
+        """Capture repair/staged payloads and raise the seeded provider error until fallback."""
+        assert self.max_output_tokens == 8192
+        captured_payloads.append(json.loads(json.dumps(payload, ensure_ascii=False)))
+        if payload.get("reflection_round"):
+            return _reflection_passes_json()
+        if "repair_instruction" in payload:
+            raise LLMError(raw_error)
+        if payload.get("generation_mode") == "outline_only":
+            assert payload["previous_error"] == raw_error
+            raise LLMError(raw_error)
+        raise AssertionError(f"unexpected payload: {payload}")
+
+    monkeypatch.setattr("app.skills.skill_distiller.LLMClient.generate_text_stream", fake_stream)
+    monkeypatch.setattr("app.skills.skill_distiller.LLMClient.generate_text", fake_text)
+
+    events = list(
+        SkillDistiller().stream_text(
+            SkillDistillRequest(
+                tenant_id="tenant_demo",
+                title="商品比价",
+                raw_content="用户提供两个商品的名称，系统根据商品价格进行比价",
+            ),
+            _model_config(),
+        )
+    )
+    complete = next(event for event in events if event["event"] == "complete")
+    warnings = complete["data"]["warnings"]
+
+    assert any(payload.get("generation_mode") == "outline_only" for payload in captured_payloads)
+    assert any("模型多轮生成未能完成" in warning for warning in warnings)
+    assert all(raw_error not in warning for warning in warnings)
+    assert raw_error not in json.dumps(complete["data"], ensure_ascii=False)
+
+
 def test_distill_skill_uses_selected_model_config(monkeypatch) -> None:
     captured: dict[str, str] = {}
 
@@ -1846,3 +1963,207 @@ def _test_session():
     )
     SQLModel.metadata.create_all(engine)
     return Session(engine)
+
+
+def _handoff_skill_card(
+    assignee_user_id: str | None,
+    assignee_notify_channel: str | None = None,
+) -> SkillCard:
+    card = _skill_card().model_copy(deep=True)
+    card.nodes[1].type = "handoff"
+    card.nodes[1].assignee_user_id = assignee_user_id
+    card.nodes[1].assignee_notify_channel = assignee_notify_channel
+    return card
+
+
+def _scope_binding(
+    *,
+    binding_id: str = "binding_feishu",
+    channel: str = "feishu",
+    scope: str = "",
+) -> ChannelBinding:
+    return ChannelBinding(
+        id=binding_id,
+        tenant_id="tenant_demo",
+        agent_id="agent_1",
+        channel=channel,
+        status="active",
+        identity_scope_key=scope,
+    )
+
+
+def test_validate_handoff_assignees_accepts_internal_and_bound_channel_variants() -> None:
+    with _test_session() as db:
+        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.add(User(id="user_owner", tenant_id="tenant_demo", username="owner", password_hash="x"))
+        # 渠道可达性要求:active 员工绑定 + 该 binding scope 下的非群聊身份
+        db.add(_scope_binding(scope="app:cli_a:tenant:t_a"))
+        db.add(
+            ChannelIdentity(
+                tenant_id="tenant_demo",
+                channel="feishu",
+                external_account_scope="app:cli_a:tenant:t_a",
+                external_user_id="ou_owner",
+                staffdeck_user_id="user_owner",
+            )
+        )
+        db.commit()
+
+        _validate_handoff_assignees(db, _handoff_skill_card("user_owner"), "tenant_demo")
+        _validate_handoff_assignees(db, _handoff_skill_card("user_owner", "web"), "tenant_demo")
+        _validate_handoff_assignees(db, _handoff_skill_card("user_owner", "feishu"), "tenant_demo")
+
+
+def test_validate_handoff_assignees_rejects_unbound_channel_variant() -> None:
+    with _test_session() as db:
+        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.add(User(id="user_owner", tenant_id="tenant_demo", username="owner", password_hash="x"))
+        db.add(_scope_binding(scope="app:cli_a:tenant:t_a"))
+        # 仅群聊虚拟身份不算有效渠道绑定
+        db.add(
+            ChannelIdentity(
+                tenant_id="tenant_demo",
+                channel="feishu",
+                external_account_scope="app:cli_a:tenant:t_a",
+                external_user_id="group:chat_1",
+                staffdeck_user_id="user_owner",
+            )
+        )
+        db.commit()
+
+        with pytest.raises(HTTPException) as exc_info:
+            _validate_handoff_assignees(
+                db, _handoff_skill_card("user_owner", "feishu"), "tenant_demo"
+            )
+        assert exc_info.value.status_code == 400
+
+
+def test_validate_handoff_assignees_scope_level_reachability() -> None:
+    """scope 级可达性:身份挂在其他企业 binding 的 scope 下时不可达,应拒绝。
+
+    用户可能绑定过另一个飞书企业(不同 binding scope),但租户内当前
+    active 绑定的作用域无法触达该身份,渠道转接会静默失败,校验必须拦下。
+    """
+    with _test_session() as db:
+        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.add(User(id="user_owner", tenant_id="tenant_demo", username="owner", password_hash="x"))
+        # 租户内唯一 active 飞书绑定,scope 是本企业 A
+        db.add(_scope_binding(scope="app:cli_a:tenant:t_a"))
+        # 但用户身份绑定在另一个企业 B 的 scope 下(该企业无 active 绑定)
+        db.add(
+            ChannelIdentity(
+                tenant_id="tenant_demo",
+                channel="feishu",
+                external_account_scope="app:cli_b:tenant:t_b",
+                external_user_id="ou_other_org",
+                staffdeck_user_id="user_owner",
+            )
+        )
+        db.commit()
+
+        with pytest.raises(HTTPException) as exc_info:
+            _validate_handoff_assignees(
+                db, _handoff_skill_card("user_owner", "feishu"), "tenant_demo"
+            )
+        assert exc_info.value.status_code == 400
+        assert exc_info.value.detail["code"] == "SKILL_HANDOFF_ASSIGNEE_UNREACHABLE"
+        assert exc_info.value.detail["params"] == {}
+
+        # 多绑定任一可达即可:再挂一个企业 B 的 active 绑定后通过
+        db.add(_scope_binding(binding_id="binding_feishu_b", scope="app:cli_b:tenant:t_b"))
+        db.commit()
+        _validate_handoff_assignees(db, _handoff_skill_card("user_owner", "feishu"), "tenant_demo")
+
+
+def test_validate_handoff_assignees_ignores_team_and_inactive_bindings() -> None:
+    """团队绑定与停用绑定的 scope 不参与可达性计算。"""
+    with _test_session() as db:
+        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.add(User(id="user_owner", tenant_id="tenant_demo", username="owner", password_hash="x"))
+        team_binding = _scope_binding(binding_id="binding_team", scope="app:cli_team:tenant:t")
+        team_binding.team_id = "team_1"
+        disabled = _scope_binding(binding_id="binding_disabled", scope="app:cli_a:tenant:t_a")
+        disabled.status = "disabled"
+        db.add(team_binding)
+        db.add(disabled)
+        db.add(
+            ChannelIdentity(
+                tenant_id="tenant_demo",
+                channel="feishu",
+                external_account_scope="app:cli_team:tenant:t",
+                external_user_id="ou_team",
+                staffdeck_user_id="user_owner",
+            )
+        )
+        db.commit()
+
+        with pytest.raises(HTTPException) as exc_info:
+            _validate_handoff_assignees(
+                db, _handoff_skill_card("user_owner", "feishu"), "tenant_demo"
+            )
+        assert exc_info.value.status_code == 400
+
+
+def test_validate_handoff_assignees_accepts_wecom_scope_reachability() -> None:
+    """渠道已通用化:企微渠道按同样 scope 规则校验可达。"""
+    with _test_session() as db:
+        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.add(User(id="user_owner", tenant_id="tenant_demo", username="owner", password_hash="x"))
+        db.add(_scope_binding(binding_id="binding_wecom", channel="wecom", scope="corp_1"))
+        db.add(
+            ChannelIdentity(
+                tenant_id="tenant_demo",
+                channel="wecom",
+                external_account_scope="corp_1",
+                external_user_id="staff_owner",
+                staffdeck_user_id="user_owner",
+            )
+        )
+        db.commit()
+
+        _validate_handoff_assignees(db, _handoff_skill_card("user_owner", "wecom"), "tenant_demo")
+
+
+def test_validate_handoff_assignees_rejects_channel_customer() -> None:
+    with _test_session() as db:
+        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.add(
+            User(
+                id="user_channel",
+                tenant_id="tenant_demo",
+                username="feishu_customer",
+                source="feishu",
+                password_hash="x",
+            )
+        )
+        db.commit()
+
+        with pytest.raises(HTTPException) as exc_info:
+            _validate_handoff_assignees(db, _handoff_skill_card("user_channel"), "tenant_demo")
+        assert exc_info.value.status_code == 400
+
+
+def test_validate_handoff_assignees_rejects_unsupported_private_message_channel() -> None:
+    """钉钉/微信不支持主动私聊通知:即使身份已绑定也拒绝。"""
+    with _test_session() as db:
+        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.add(User(id="user_owner", tenant_id="tenant_demo", username="owner", password_hash="x"))
+        db.add(_scope_binding(binding_id="binding_ding", channel="dingtalk", scope="ding_scope"))
+        db.add(
+            ChannelIdentity(
+                tenant_id="tenant_demo",
+                channel="dingtalk",
+                external_account_scope="ding_scope",
+                external_user_id="staff_owner",
+                staffdeck_user_id="user_owner",
+            )
+        )
+        db.commit()
+
+        with pytest.raises(HTTPException) as exc_info:
+            _validate_handoff_assignees(
+                db, _handoff_skill_card("user_owner", "dingtalk"), "tenant_demo"
+            )
+        assert exc_info.value.status_code == 400
+        assert exc_info.value.detail["code"] == "SKILL_HANDOFF_CHANNEL_UNSUPPORTED"
+        assert exc_info.value.detail["params"] == {}

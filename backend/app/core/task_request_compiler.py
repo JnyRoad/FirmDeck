@@ -5,8 +5,9 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 from app.db.models import ChatSession, Skill
+from app.i18n.language_context import LanguageContext
+from app.llm.prompts.language import resolve_prompt_language_context
 from app.session.session_schema import PlannedTaskFrame
-
 
 CapabilityKind = Literal[
     "general_skill",
@@ -69,7 +70,9 @@ class TaskRequirement(BaseModel):
     memory_projection: list[dict[str, str]] = Field(default_factory=list)
     prior_task_results: list[dict[str, Any]] = Field(default_factory=list)
     attachments: list[dict[str, Any]] = Field(default_factory=list)
+    published_deliverables: list[dict[str, Any]] = Field(default_factory=list)
     capability_manifest: CapabilityManifest = Field(default_factory=CapabilityManifest)
+    language_context: LanguageContext | None = None
 
 
 class TaskExecutionResult(BaseModel):
@@ -108,9 +111,13 @@ class TaskRequestCompiler:
         memory_context: list[dict[str, object]] | None = None,
         prior_task_results: list[dict[str, Any]] | None = None,
         attachments: list[dict[str, Any]] | None = None,
+        published_deliverables: list[dict[str, Any]] | None = None,
         source_user_message: str | None = None,
         out_of_scope_task_intents: list[str] | None = None,
+        language_context: LanguageContext | None = None,
     ) -> TaskRequirement:
+        """Compile one frame and bind its immutable language snapshot for retries and recovery."""
+        # Workflow: derive task constraints from the persisted frame and current SOP node.
         current_node = _current_node(skill, frame.target_step_id or session.active_step_id)
         expected_fields = _text_list((current_node or {}).get("expected_user_info"))
         known_slots = (
@@ -182,11 +189,18 @@ class TaskRequestCompiler:
             memory_projection=_memory_projection(memory_context),
             prior_task_results=list(prior_task_results or []),
             attachments=list(attachments or []),
+            published_deliverables=list(published_deliverables or []),
             capability_manifest=manifest,
+            language_context=resolve_prompt_language_context(language_context),
         )
 
 
 def current_step_capability_refs(skill: Skill | None, step_id: str | None) -> dict[str, list[str]]:
+    """Return normalized capability references for one active SOP node.
+
+    Missing or malformed SOP content yields empty lists, while legacy ``allowed_actions`` and
+    knowledge scope fields are folded into the stable result without mutating the persisted skill.
+    """
     node = _current_node(skill, step_id)
     refs = (node or {}).get("capability_refs")
     result = {
@@ -210,6 +224,33 @@ def current_step_capability_refs(skill: Skill | None, step_id: str | None) -> di
             if kb_id not in result["knowledge_base_ids"]:
                 result["knowledge_base_ids"].append(kb_id)
     return result
+
+
+def current_step_authorization_skill_ids(
+    skill: Skill | None,
+    step_id: str | None,
+) -> set[str]:
+    """Return every SOP identity that authorizes the current expanded node.
+
+    Nested SOP nodes execute inside the parent's persisted task frame, so the
+    runtime ``Skill`` keeps the parent ``skill_id``. The expansion metadata is
+    the authoritative source for the child call path. Keeping both identities
+    preserves parent-level tool grants while allowing a child-only grant to
+    remain valid after expansion.
+    """
+    if skill is None:
+        return set()
+    authorized = {str(skill.skill_id or "").strip()}
+    node = _current_node(skill, step_id)
+    metadata = (node or {}).get("metadata")
+    if isinstance(metadata, dict):
+        nested_path = metadata.get("nested_sop_path")
+        if isinstance(nested_path, list):
+            authorized.update(_text_list(nested_path))
+        source_sop_id = str(metadata.get("source_sop_id") or "").strip()
+        if source_sop_id:
+            authorized.add(source_sop_id)
+    return {value for value in authorized if value}
 
 
 def _current_node(skill: Skill | None, step_id: str | None) -> dict[str, Any] | None:

@@ -11,8 +11,9 @@ import {
 } from '@/components/ui/dropdown-menu';
 import { HoverCard, HoverCardContent, HoverCardTrigger } from '@/components/ui/hover-card';
 import { employeeDisplayName } from '@/employee';
+import { RawContent, RawIdentifier } from '@/i18n/RawContent';
+import { useAppIntl } from '@/i18n/useAppIntl';
 import { cn } from '@/lib/utils';
-import { useI18n } from '@/i18n';
 import type { ChatSlashCommand } from '@/types';
 
 import {
@@ -61,8 +62,9 @@ import {
 import type { UseChatSession } from '../useChatSession';
 import SlashCommandChip from './SlashCommandChip';
 
+/** 渲染聊天输入区：产品控件走 AppIntlProvider，附件名和上传诊断保持 raw。 */
 export default function Composer({ chat }: { chat: UseChatSession }) {
-  const { t } = useI18n();
+  const { locale, t } = useAppIntl();
   const {
     input,
     setInput,
@@ -201,7 +203,7 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
                 onClick={() => setModelSetupOpen(true)}
                 className="h-[30px] shrink-0 rounded-[8px] bg-[#18181a] px-[12px] text-[12px] text-white transition-colors hover:bg-[#303030]"
               >
-                {t('配置模型')}
+                {t('chat.composer.modelSetup')}
               </button>
             )}
           </div>
@@ -211,7 +213,7 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
             <HoverCardTrigger asChild>
               <button
                 type="button"
-                aria-label="员工信息"
+                aria-label={t('chat.composer.employeeInfo')}
                 className={cn(CHAT_COMPOSER_AVATAR_CLASS, 'block cursor-pointer outline-none')}
               >
                 <EmployeeAvatar profile={displayedProfile} size={44} className="size-full" />
@@ -301,7 +303,9 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
             multiple
             onChange={handleComposerFileChange}
           />
-          {composerDragActive && <div className={CHAT_COMPOSER_DROP_HINT_CLASS}>松开上传文件</div>}
+          {composerDragActive && (
+            <div className={CHAT_COMPOSER_DROP_HINT_CLASS}>{t('chat.composer.dropHint')}</div>
+          )}
 
           {composerAttachments.length > 0 && (
             <div className={CHAT_COMPOSER_ATTACHMENTS_CLASS}>
@@ -321,16 +325,18 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
                   <span className={CHAT_COMPOSER_ATTACHMENT_COPY_CLASS}>
                     <span className={CHAT_COMPOSER_ATTACHMENT_NAME_CLASS}>{attachment.filename}</span>
                     <span className={CHAT_COMPOSER_ATTACHMENT_STATUS_CLASS}>
-                      {attachment.uploadStatus === 'uploading' && '解析中'}
-                      {attachment.uploadStatus === 'ready' && attachmentTypeLabel(attachment)}
-                      {attachment.uploadStatus === 'error' && (attachment.error || '上传失败')}
+                      {attachment.uploadStatus === 'uploading' && t('chat.composer.parsing')}
+                      {attachment.uploadStatus === 'ready' && attachmentTypeLabel(attachment, locale, t)}
+                      {attachment.uploadStatus === 'error' && (attachment.error
+                        ? <RawContent value={attachment.error} />
+                        : t('chat.composer.uploadFailed'))}
                     </span>
                   </span>
                   <button
                     type="button"
                     className={CHAT_COMPOSER_ATTACHMENT_REMOVE_CLASS}
                     onClick={() => removeComposerAttachment(attachment.uploadKey)}
-                    aria-label="移除附件"
+                    aria-label={t('chat.composer.removeAttachment')}
                   >
                     ×
                   </button>
@@ -344,7 +350,7 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
               ref={slashMenuRef}
               className="absolute bottom-[calc(100%+8px)] left-0 z-30 grid max-h-[320px] w-full overflow-y-auto rounded-[14px] border border-[#e3e7f1] bg-white p-[6px] shadow-[0_18px_42px_rgba(24,24,26,0.16)]"
               role="listbox"
-              aria-label={t('可用斜杠指令')}
+              aria-label={t('chat.composer.slashCommands')}
             >
               {slashMatches.map((command, index) => (
                 <button
@@ -389,7 +395,7 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
               <SlashCommandChip
                 command={activeSlashCommand}
                 onRemove={removeActiveSlashCommand}
-                removeLabel={`${t('移除命令')} ${activeSlashCommand.label}`}
+                removeLabel={`${t('chat.composer.removeCommand')} ${activeSlashCommand.label}`}
               />
             )}
             <textarea
@@ -400,7 +406,7 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
               )}
               value={composerText}
               rows={activeSlashCommand ? 1 : 2}
-              placeholder={t('输入消息，按 Enter 发送...')}
+              placeholder={t('chat.composer.placeholder')}
               onChange={(event) => {
                 setInput(activeSlashCommand
                   ? slashCommandInput(activeSlashCommand, event.target.value)
@@ -464,8 +470,8 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
                   <button
                     type="button"
                     className={CHAT_COMPOSER_PLUS_BTN_CLASS}
-                    aria-label="添加"
-                    title="添加"
+                    aria-label={t('chat.composer.add')}
+                    title={t('chat.composer.add')}
                   >
                     <StaffdeckIcon name="plus" size={16} />
                   </button>
@@ -473,11 +479,11 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
                 <DropdownMenuContent align="start" side="top" className={cn(CHAT_MENU_CONTENT_CLASS, 'min-w-[160px]')}>
                   <DropdownMenuItem className={CHAT_MENU_ITEM_CLASS} onSelect={() => handleComposerPlusAction('upload')}>
                     <StaffdeckIcon name="upload" size={16} />
-                    <span>上传文件</span>
+                    <span>{t('chat.composer.uploadFile')}</span>
                   </DropdownMenuItem>
                   <DropdownMenuItem className={CHAT_MENU_ITEM_CLASS} onSelect={() => handleComposerPlusAction('scheduled_task')}>
                     <StaffdeckIcon name="clock" size={16} />
-                    <span>定时任务</span>
+                    <span>{t('chat.composer.scheduledTask')}</span>
                   </DropdownMenuItem>
                 </DropdownMenuContent>
               </DropdownMenu>
@@ -490,8 +496,8 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
                   onFocus={() => setScheduleIntentHovered(true)}
                   onBlur={() => setScheduleIntentHovered(false)}
                   onClick={() => setComposerIntent(null)}
-                  aria-label="取消定时任务"
-                  title="取消定时任务"
+                  aria-label={t('chat.composer.cancelScheduledTask')}
+                  title={t('chat.composer.cancelScheduledTask')}
                 >
                   <span className={cn(
                     'relative inline-grid size-[16px] shrink-0 place-items-center rounded-full transition-colors',
@@ -510,10 +516,10 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
                       style={{ width: 9, height: 9 }}
                     />
                   </span>
-                  <span>定时任务</span>
+                  <span>{t('chat.composer.scheduledTask')}</span>
                 </button>
               )}
-              <div className={CHAT_COMPOSER_HINT_CLASS}>Enter 发送 / Shift+Enter 换行</div>
+              <div className={CHAT_COMPOSER_HINT_CLASS}>{t('chat.composer.enterHint')}</div>
             </div>
             <div className={CHAT_COMPOSER_ACTIONS_ROW_CLASS}>
               <DropdownMenu>
@@ -523,13 +529,19 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
                     className={CHAT_COMPOSER_MODEL_BTN_CLASS}
                     disabled={!enabledModelConfigs.length}
                   >
-                    <span>{selectedModelConfig ? modelDisplayName(selectedModelConfig) : '默认模型'}</span>
+                    <span>
+                      {selectedModelConfig
+                        ? <RawIdentifier value={modelDisplayName(selectedModelConfig, t)} />
+                        : t('chat.composer.defaultModel')}
+                    </span>
                     <StaffdeckIcon name="arrow" size={14} style={{ transform: 'rotate(90deg)' }} />
                   </button>
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="end" side="top" className={cn(CHAT_MENU_CONTENT_CLASS, 'max-h-[360px] min-w-[240px] overflow-y-auto')}>
                   {enabledModelConfigs.length === 0 ? (
-                    <DropdownMenuItem className={CHAT_MENU_ITEM_CLASS} disabled>暂无可用模型</DropdownMenuItem>
+                    <DropdownMenuItem className={CHAT_MENU_ITEM_CLASS} disabled>
+                      {t('chat.composer.noModels')}
+                    </DropdownMenuItem>
                   ) : (
                     enabledModelConfigs.map((model) => (
                       <DropdownMenuItem
@@ -538,8 +550,12 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
                         onSelect={() => changeModelConfig(model.id)}
                       >
                         <span className={CHAT_MODEL_MENU_COPY_CLASS}>
-                          <span className={CHAT_MODEL_MENU_NAME_CLASS}>{modelDisplayName(model)}</span>
-                          <span className={CHAT_MODEL_MENU_DETAIL_CLASS}>{modelDetailText(model)}</span>
+                        <span className={CHAT_MODEL_MENU_NAME_CLASS}>
+                          <RawIdentifier value={modelDisplayName(model, t)} />
+                        </span>
+                        <span className={CHAT_MODEL_MENU_DETAIL_CLASS}>
+                          <RawIdentifier value={modelDetailText(model, t)} />
+                        </span>
                         </span>
                         {selectedModelConfig?.id === model.id && <StaffdeckIcon name="check" size={15} />}
                       </DropdownMenuItem>
@@ -552,8 +568,8 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
                   type="button"
                   className={cn(CHAT_COMPOSER_SEND_BTN_CLASS, CHAT_COMPOSER_STOP_BTN_CLASS)}
                   onClick={abortStream}
-                  aria-label="停止生成"
-                  title="停止生成"
+                  aria-label={t('chat.composer.stopGeneration')}
+                  title={t('chat.composer.stopGeneration')}
                 >
                   <StaffdeckIcon name="stop" size={18} />
                 </button>
@@ -562,8 +578,12 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
                 type="submit"
                 className={CHAT_COMPOSER_SEND_BTN_CLASS}
                 disabled={sendDisabled}
-                aria-label={currentSessionRunning ? '加入发送队列' : '发送'}
-                title={currentSessionRunning ? '加入发送队列' : '发送'}
+                aria-label={currentSessionRunning
+                  ? t('chat.composer.queueMessage')
+                  : t('chat.composer.send')}
+                title={currentSessionRunning
+                  ? t('chat.composer.queueMessage')
+                  : t('chat.composer.send')}
               >
                 <StaffdeckIcon name="send" size={18} />
               </button>

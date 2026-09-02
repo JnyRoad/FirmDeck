@@ -1,0 +1,5 @@
+{
+  "fixture.action.save": "保存",
+  "fixture.message.greeting": "你好，{name}",
+  "fixture.panel.aria": "国际化测试面板"
+}

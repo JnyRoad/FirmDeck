@@ -1,9 +1,11 @@
 // @vitest-environment jsdom
 
 import { cleanup, render, screen, waitFor } from '@testing-library/react';
+import type { ReactElement } from 'react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { AppIntlProvider } from '@/i18n';
 import type { KnowledgeConceptRead } from '@/types';
 import { KnowledgeGraphVisualization } from './KnowledgeGraphVisualization';
 
@@ -69,6 +71,11 @@ function concept(
   };
 }
 
+/** Render legacy graph assertions under the canonical provider without changing their raw fixtures. */
+function renderChineseGraph(element: ReactElement): void {
+  render(<AppIntlProvider locale="zh-CN">{element}</AppIntlProvider>);
+}
+
 beforeEach(() => {
   cytoscapeMock.mockReset().mockImplementation(createCore);
   Object.defineProperty(window, 'matchMedia', {
@@ -86,7 +93,7 @@ afterEach(cleanup);
 
 describe('KnowledgeGraphVisualization', () => {
   it('shows active concepts by default and reveals archived concepts on request', async () => {
-    render(
+    renderChineseGraph(
       <KnowledgeGraphVisualization
         concepts={[
           concept('topics/active', { title: 'Active Topic' }),
@@ -107,7 +114,7 @@ describe('KnowledgeGraphVisualization', () => {
   it('opens the existing full concept viewer from the selected node detail', async () => {
     const onViewConcept = vi.fn();
     const selected = concept('topics/hub', { title: 'Knowledge Hub' });
-    render(
+    renderChineseGraph(
       <KnowledgeGraphVisualization
         concepts={[selected]}
         knowledgeBaseKey="kb-1"
@@ -121,7 +128,7 @@ describe('KnowledgeGraphVisualization', () => {
   });
 
   it('renders a safe Markdown summary and navigates resolvable graph links', async () => {
-    render(
+    renderChineseGraph(
       <KnowledgeGraphVisualization
         concepts={[
           concept('topics/a', {
@@ -160,7 +167,7 @@ describe('KnowledgeGraphVisualization', () => {
     const concepts = Array.from({ length: 501 }, (_, index) => concept(`topics/node-${index}`, {
       title: index === 317 ? 'only-match' : `Topic ${index}`,
     }));
-    render(
+    renderChineseGraph(
       <KnowledgeGraphVisualization
         concepts={concepts}
         knowledgeBaseKey="kb-large"
@@ -176,6 +183,58 @@ describe('KnowledgeGraphVisualization', () => {
     expect(drawButton).toBeTruthy();
     await userEvent.click(drawButton as HTMLButtonElement);
     await waitFor(() => expect(cytoscapeMock).toHaveBeenCalledOnce());
-    expect(screen.getByText(/当前绘制筛选后的 1 个节点/)).toBeTruthy();
+    expect(screen.getByText(/筛选后的 1 个节点/)).toBeTruthy();
+  });
+
+  it.each([
+    ['zh-CN', '搜索知识图谱', '显示已归档', '知识节点详情', '查看完整内容'],
+    ['en-US', 'Search knowledge graph', 'Show archived', 'Knowledge node details', 'View full content'],
+  ] as const)('localizes graph controls and ARIA in %s while preserving raw knowledge', async (
+    locale,
+    searchLabel,
+    archivedLabel,
+    detailLabel,
+    viewLabel,
+  ) => {
+    /** 图谱控件和无障碍文案应翻译，标题、正文、引用标识与文件名必须逐字保留。 */
+    const rawTitle = '原始标题 / RAW TITLE';
+    const rawBody = '正文 Ω RAW BODY · citation://原始引用 · source-file_日本語.md';
+    render(
+      <AppIntlProvider locale={locale}>
+        <KnowledgeGraphVisualization
+          concepts={[concept('topics/raw', {
+            title: rawTitle,
+            description: rawBody,
+            content_md: rawBody,
+            citations: [{ source_ref: 'citation://原始引用' }],
+            source_refs: [{ filename: 'source-file_日本語.md' }],
+          })]}
+          knowledgeBaseKey="kb-raw"
+          onViewConcept={vi.fn()}
+        />
+      </AppIntlProvider>,
+    );
+
+    expect(await screen.findByRole('searchbox', { name: searchLabel })).toBeTruthy();
+    expect(screen.getByRole('button', { name: archivedLabel })).toBeTruthy();
+    expect(screen.getByLabelText(detailLabel)).toBeTruthy();
+    expect(screen.getByRole('button', { name: viewLabel })).toBeTruthy();
+    expect(screen.getByText(rawTitle)).toBeTruthy();
+    expect(screen.getByText(rawBody)).toBeTruthy();
+  });
+
+  it('localizes the English empty graph state without mutating the canvas contract', () => {
+    /** 无数据状态应直接由英文目录渲染，并提供英文关系图可访问名称。 */
+    render(
+      <AppIntlProvider locale="en-US">
+        <KnowledgeGraphVisualization
+          concepts={[]}
+          knowledgeBaseKey="kb-empty"
+          onViewConcept={vi.fn()}
+        />
+      </AppIntlProvider>,
+    );
+
+    expect(screen.getByText('No visual knowledge yet')).toBeTruthy();
   });
 });

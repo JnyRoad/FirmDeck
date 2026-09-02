@@ -1,3 +1,6 @@
+import type { LanguageContextSource } from '@/i18n/languagePreferences';
+import type { AppLocale } from '@/i18n/locales';
+
 export type CapabilityScope = 'general' | 'sop_specific';
 
 export type SkillCapabilityRefs = {
@@ -14,6 +17,8 @@ export type SkillGraphNode = Record<string, unknown> & {
   sub_sop_id?: string | null;
   /** 人工节点指定处理人（handoff / handoff_human 节点）。 */
   assignee_user_id?: string | null;
+  /** 处理人投递渠道:null=默认;'web'=仅网页端;'feishu' 等绑定渠道=按该渠道转接。 */
+  assignee_notify_channel?: string | null;
 };
 
 export type SkillCard = {
@@ -36,6 +41,34 @@ export type SkillCard = {
   response_rules: string[];
 };
 
+export type KnowledgeErrorDescriptor = {
+  code: string;
+  params: Record<string, unknown>;
+  retryable: boolean;
+  request_id?: string | null;
+  trace_id?: string | null;
+};
+
+export type KnowledgeStageDescriptor = {
+  code: string;
+  params: Record<string, unknown>;
+};
+
+export type KnowledgeIngestStep = {
+  key: string;
+  code: string;
+  params: Record<string, unknown>;
+  progress: number;
+  status: 'pending' | 'running' | 'done';
+};
+
+export type KnowledgeIngestMetadata = Record<string, unknown> & {
+  stage_code?: string;
+  stage_params?: Record<string, unknown>;
+  stage_detail?: KnowledgeStageDescriptor;
+  ingest_steps?: KnowledgeIngestStep[];
+};
+
 export type KnowledgeIngestJobRead = {
   id: string;
   tenant_id: string;
@@ -45,8 +78,8 @@ export type KnowledgeIngestJobRead = {
   status: string;
   stage: string;
   progress: number;
-  error?: string;
-  metadata?: Record<string, unknown>;
+  error?: KnowledgeErrorDescriptor | null;
+  metadata?: KnowledgeIngestMetadata;
   created_at: string;
   started_at?: string;
   finished_at?: string;
@@ -60,6 +93,10 @@ export type KnowledgeBaseRead = {
   description?: string;
   capability_scope?: CapabilityScope;
   status: string;
+  mode?: 'dedicated' | 'shared';
+  published_version_id?: string | null;
+  published_version?: string | null;
+  bound_team_count?: number;
   version?: string;
   branch_sync_state?: string;
   branch_base_version?: string;
@@ -70,6 +107,65 @@ export type KnowledgeBaseRead = {
   chunk_count: number;
   created_at: string;
   updated_at: string;
+};
+
+export type KnowledgeBaseVersionRead = {
+  id: string;
+  tenant_id: string;
+  knowledge_base_id: string;
+  version: string;
+  name: string;
+  description?: string;
+  status: string;
+  publication_state?: 'draft' | 'released' | 'rejected';
+  parent_version_id?: string | null;
+  source_team_id?: string | null;
+  created_by_agent_id?: string | null;
+  created_by_user_id?: string | null;
+  change_reason?: string | null;
+  published_at?: string | null;
+  is_published_head?: boolean;
+  is_head?: boolean;
+  is_base?: boolean;
+  capability_scope?: CapabilityScope;
+  metadata?: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+};
+
+export type KnowledgeBaseConversionRead = {
+  source_knowledge_base_id: string;
+  source_version_id: string;
+  new_knowledge_base: KnowledgeBaseRead;
+  released_version: KnowledgeBaseVersionRead;
+  binding_ids: string[];
+  default_for_team_id?: string | null;
+  source_archived: boolean;
+  audit_event_id: string;
+};
+
+export type KnowledgeBaseAuditEventRead = {
+  id: string;
+  knowledge_base_id: string;
+  team_id?: string | null;
+  team_name?: string | null;
+  knowledge_base_version_id?: string | null;
+  knowledge_base_version?: string | null;
+  actor_type: 'user' | 'agent' | 'system' | string;
+  actor_id: string;
+  actor_name: string;
+  action: string;
+  reason?: string | null;
+  details: Record<string, unknown>;
+  created_at: string;
+};
+
+export type KnowledgeBaseAuditPageRead = {
+  items: KnowledgeBaseAuditEventRead[];
+  total: number;
+  offset: number;
+  limit: number;
+  has_more: boolean;
 };
 
 export type KnowledgeDocumentRead = {
@@ -167,11 +263,24 @@ export type KnowledgeSearchEvidence = {
   confidence_reason?: string;
 };
 
+export type KnowledgeSearchTrace = {
+  phase: string;
+  code: string;
+  params: Record<string, unknown>;
+  candidate_count?: number;
+  selected_count?: number;
+  section_count?: number;
+  chunk_count?: number;
+  evidence_count?: number;
+  mode?: string;
+  selected_document_ids?: string[];
+};
+
 export type KnowledgeSearchResponse = {
   selected_buckets: KnowledgeBucketRead[];
   chunks: KnowledgeChunkRead[];
-  trace: Array<Record<string, unknown>>;
-  route_trace: Array<Record<string, unknown>>;
+  trace: KnowledgeSearchTrace[];
+  route_trace: KnowledgeSearchTrace[];
   selected_documents: Array<Record<string, unknown>>;
   expanded_sections: Array<Record<string, unknown>>;
   selected_concepts: Array<Record<string, unknown>>;
@@ -321,13 +430,22 @@ export type GeneralSkillRunResponse = {
   reply: string;
 };
 
+export type ModelAuthMode = 'api_key' | 'chatgpt_subscription';
+
+export type CodexSubscriptionAccountRead = {
+  status: 'connected' | 'pending' | 'requires_login' | 'unavailable';
+  plan_type?: string | null;
+  message: string;
+};
+
 export type ModelConfigRead = {
   id: string;
   tenant_id: string;
   name: string;
   provider: string;
-  api_protocol: 'openai_chat_completions' | 'openai_responses' | 'anthropic_messages' | 'gemini_generate_content';
-  base_url?: string;
+  auth_mode: ModelAuthMode;
+  api_protocol: 'openai_chat_completions' | 'openai_responses' | 'anthropic_messages' | 'gemini_generate_content' | 'codex_app_server';
+  base_url?: string | null;
   api_key_masked: string;
   model: string;
   temperature: number;
@@ -350,6 +468,21 @@ export type PersonaRead = {
   updated_at: string;
 };
 
+/** Raw sandbox runtime metadata returned beside a localized status code. */
+export type SandboxStatusParams = {
+  backend: string | null;
+};
+
+/** Raw command values associated with a localized sandbox remediation. */
+export type SandboxRemediationParams = {
+  command: string | null;
+};
+
+/** Raw administrator command kept separate from localized sandbox setup prose. */
+export type SandboxSetupParams = {
+  command: string;
+};
+
 export type UIConfigRead = {
   tenant_id: string;
   show_thinking_trace: boolean;
@@ -357,6 +490,14 @@ export type UIConfigRead = {
   show_tool_trace: boolean;
   reflection_max_rounds: number;
   agent_loop_max_actions: number;
+  context_token_budget: number;
+  context_compaction_trigger_ratio: number;
+  context_recent_round_limit: number;
+  context_long_summary_token_budget: number;
+  context_medium_summary_token_budget: number;
+  context_allowed_roles: Array<'user' | 'assistant'>;
+  context_long_summary_prefix: string;
+  context_medium_summary_prefix: string;
   sandbox_enabled: boolean;
   harness_storage_path: string;
   effective_harness_storage_path: string;
@@ -365,12 +506,27 @@ export type UIConfigRead = {
   sandbox_allowed_domains: string[];
   sandbox_backend?: string | null;
   sandbox_setup_required?: boolean;
-  sandbox_setup_instructions?: string | null;
   sandbox_status?: 'ready' | 'unavailable' | 'degraded' | 'disabled';
   sandbox_status_code?: string | null;
-  sandbox_status_message?: string | null;
-  sandbox_status_remediation?: string | null;
+  sandbox_status_params?: SandboxStatusParams;
+  sandbox_remediation_code?: string | null;
+  sandbox_remediation_params?: SandboxRemediationParams | null;
+  sandbox_setup_code?: string | null;
+  sandbox_setup_params?: SandboxSetupParams | null;
   updated_at: string;
+};
+
+export type NetworkSettingsRead = {
+  active_base_url: string;
+  active_docs_url: string;
+  active_openapi_url: string;
+  active_mode: 'local' | 'lan' | 'public';
+  active_public_base_url?: string | null;
+  mode: 'local' | 'lan' | 'public';
+  port: number;
+  public_url: string;
+  pending_base_url: string;
+  restart_required: boolean;
 };
 
 export type MemoryRead = {
@@ -442,17 +598,15 @@ export type A2ATaskRunRead = {
 };
 
 export type CodexA2AAdapterRead = {
-  enabled: boolean;
+  available: boolean;
   endpoint_url: string;
   agent_card_url: string;
-  command: string;
-  workspace_root: string;
   timeout_seconds: number;
-  token_configured: boolean;
 };
 
 export type MCPTransport = 'stdio' | 'streamable_http' | 'sse' | 'builtin';
 export type MCPAppsMode = 'disabled' | 'auto';
+export type MCPAuthMode = 'none' | 'oauth_personal';
 
 export type MCPServerConnection = {
   transport: MCPTransport;
@@ -473,6 +627,10 @@ export type MCPServerRead = {
   bucket: string;
   connection: MCPServerConnection;
   apps_mode: MCPAppsMode;
+  auth_mode: MCPAuthMode;
+  oauth_client_id?: string | null;
+  oauth_client_metadata_url?: string | null;
+  oauth_redirect_uri?: string | null;
   apps_negotiated: boolean;
   negotiated_capabilities: Record<string, unknown>;
   capability_scope?: CapabilityScope;
@@ -481,6 +639,21 @@ export type MCPServerRead = {
   tool_count: number;
   created_at: string;
   updated_at: string;
+};
+
+export type MCPOAuthStatusRead = {
+  server_id: string;
+  auth_mode: MCPAuthMode;
+  state: 'not_required' | 'disconnected' | 'authorizing' | 'connected' | 'reconnect_required';
+  expires_at?: string | null;
+  scopes: string[];
+  error_code?: string | null;
+};
+
+export type MCPOAuthStartResult = {
+  authorization_url: string;
+  flow_id: string;
+  expires_at: string;
 };
 
 export type MCPDiscoveredTool = {
@@ -589,6 +762,11 @@ export type ChatSession = {
   /** 团队会话归属（后端逐步放开，可能缺省）。 */
   team_id?: string | null;
   team_name?: string | null;
+  /** 稳定的机器会话类型；旧 API 响应可能缺省。 */
+  session_kind?: string | null;
+  /** 已绑定会话的 Agent 回复语言；一旦存在即优先于后续用户偏好。 */
+  agent_reply_locale?: AppLocale | null;
+  agent_reply_locale_source?: LanguageContextSource | null;
   updated_at: string;
 };
 
@@ -791,6 +969,10 @@ export type TraceLineRead = {
   kind: 'thinking' | 'decision' | 'skill' | 'tool' | 'code' | 'knowledge';
   text: string;
   detail?: string | null;
+  event_type?: string | null;
+  event_code?: string | null;
+  params?: Record<string, unknown> | null;
+  event_data?: Record<string, unknown> | null;
   code?: string | null;
   language?: string | null;
   output?: string | null;
@@ -906,12 +1088,16 @@ export type ChannelBindingRead = {
   tenant_id: string;
   agent_id: string;
   channel: string;
+  /** 用户可编辑的接入显示名；为空时回退展示渠道类型名。 */
+  name?: string | null;
   status: string;
   connected: boolean;
   ilink_bot_id?: string | null;
   baseurl?: string | null;
   bot_id?: string | null;
   corp_id?: string | null;
+  open_kfid?: string | null;
+  callback_ready?: boolean;
   app_id?: string | null;
   client_id?: string | null;
   bot_open_id?: string | null;
@@ -924,6 +1110,7 @@ export type ChannelBindingRead = {
   created_by_name?: string | null;
   config_json?: Record<string, unknown>;
   agents: ChannelBindingAgentRead[];
+  wechat_kf_accounts?: WeChatKfAccountRead[];
   /** 团队绑定（与 agent 挂载互斥，后端逐步放开，可能缺省）。 */
   team_id?: string | null;
   team_name?: string | null;
@@ -931,11 +1118,85 @@ export type ChannelBindingRead = {
   /** 渠道默认人工处理人（SOP 节点未指定 assignee 时回退到此值）。 */
   default_handoff_assignee_user_id?: string | null;
   default_handoff_assignee_name?: string | null;
+  /** 处理人投递渠道:null=默认;'web'=仅网页端;'feishu' 等绑定渠道=按该渠道转接。 */
+  default_handoff_assignee_channel?: string | null;
   identity_scope_key?: string | null;
   /** 当前请求者对该绑定的管理角色:admin/owner/collaborator;无关系时为 null */
   my_role?: string | null;
   created_at: string;
   updated_at: string;
+};
+
+/** 微信客服 binding 中的账号路由投影；不包含 provider Secret 或私有错误正文。 */
+export type WeChatKfAccountRead = {
+  open_kfid: string;
+  name: string;
+  agent_id?: string | null;
+  team_id?: string | null;
+  status: string;
+  sync_cursor: string;
+};
+
+/** provider 账号清单项；原始账号 ID、名称和头像 URL 必须逐字保留。 */
+export type WeChatKfProviderAccountRead = {
+  open_kfid: string;
+  name: string;
+  avatar: string;
+  manage_privilege: boolean;
+  bound: boolean;
+  bound_binding_id?: string | null;
+};
+
+/** callback 凭据准备的一次性响应；值只在当前受控 UI 会话中展示与复制。 */
+export type WeChatKfCallbackConfigRead = {
+  callback_url: string;
+  callback_path: string;
+  callback_token: string;
+  encoding_aes_key: string;
+};
+
+/** callback 准备请求；corp ID 是 provider 原始租户标识。 */
+export type WeChatKfCallbackConfigWrite = {
+  tenant_id: string;
+  corp_id: string;
+};
+
+/** 微信客服凭据写入请求；Secret 只允许发送，不得持久化到客户端。 */
+export type WeChatKfCredentialsWrite = WeChatKfCallbackConfigWrite & {
+  secret: string;
+  callback_token?: string;
+  encoding_aes_key?: string;
+};
+
+/** 选择现有 provider 客服账号的请求。 */
+export type WeChatKfAccountSelectWrite = {
+  tenant_id: string;
+  open_kfid: string;
+};
+
+/** 创建 provider 客服账号的请求；media ID 来自受控头像上传。 */
+export type WeChatKfAccountCreateWrite = {
+  tenant_id: string;
+  name: string;
+  media_id: string;
+};
+
+/** 更新已绑定 provider 客服账号的请求。 */
+export type WeChatKfAccountUpdateWrite = {
+  tenant_id: string;
+  open_kfid: string;
+  name: string;
+  media_id?: string | null;
+};
+
+/** 微信客服头像上传响应；media ID 是 provider 原始标识。 */
+export type WeChatKfAvatarUploadRead = {
+  media_id: string;
+};
+
+/** 微信客服咨询方式响应；URL 必须逐字展示与复制。 */
+export type WeChatKfContactWayRead = {
+  url: string;
 };
 
 export type ChannelBindingManagerRead = {
@@ -1054,11 +1315,40 @@ export type TeamRead = {
   name: string;
   description?: string | null;
   owner_user_id: string;
+  default_knowledge_base_id?: string | null;
   config: Record<string, unknown>;
   status: 'active' | 'archived' | string;
   members: TeamMemberRead[];
   created_at: string;
   updated_at: string;
+};
+
+export type KnowledgePermission = 'reader' | 'editor' | 'publisher';
+
+export type TeamKnowledgeGrantRead = {
+  agent_id: string;
+  permission: KnowledgePermission;
+  status: string;
+};
+
+export type TeamKnowledgeBindingRead = {
+  id: string;
+  team_id: string;
+  knowledge_base_id: string;
+  knowledge_base_name: string;
+  status: string;
+  revision: number;
+  is_default: boolean;
+  published_version_id?: string | null;
+  published_version?: string | null;
+  grants: TeamKnowledgeGrantRead[];
+  created_at: string;
+  updated_at: string;
+};
+
+export type TeamKnowledgeGrantInput = {
+  agent_id: string;
+  permission: KnowledgePermission | null;
 };
 
 export type TeamConversationKind = 'tl_chat' | 'member_task' | 'member_bid' | 'tl_review';
@@ -1133,6 +1423,8 @@ export type TeamTaskRead = {
   id: string;
   team_id: string;
   tenant_id: string;
+  team_run_id?: string | null;
+  source_turn_id?: string | null;
   parent_task_id?: string | null;
   title: string;
   description?: string | null;

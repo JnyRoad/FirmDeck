@@ -78,8 +78,9 @@ def enrich_turn_traces_with_timings(
                 {
                     "id": "response_generation",
                     "kind": "decision",
-                    "text": "生成最终回复",
-                    "detail": f"模型调用 {len(response_spans)} 次",
+                    "text": "",
+                    "event_code": "trace.response.generation",
+                    "params": {"model_call_count": len(response_spans)},
                     "state": "completed",
                 }
             )
@@ -212,8 +213,15 @@ def _project_harness_model_calls(
                     "_insert_before": index,
                     "id": f"harness_model_{frame_id}_{iteration}{suffix}_{span.span_id}",
                     "kind": "thinking",
-                    "text": _harness_model_call_text(line, iteration, call_index, len(matches)),
-                    "detail": _harness_model_call_detail(span),
+                    "text": "",
+                    "event_code": "trace.harness.model.decision",
+                    "params": _harness_model_call_params(
+                        line,
+                        iteration,
+                        call_index,
+                        len(matches),
+                        span,
+                    ),
                     "state": "completed",
                     "depth": 1,
                     "model_duration_ms": round(span.duration_ms, 3),
@@ -246,30 +254,31 @@ def _harness_action_line_key(line_id: str) -> tuple[str, str] | None:
     return None
 
 
-def _harness_model_call_text(
+def _harness_model_call_params(
     action_line: dict[str, Any],
     iteration: str,
     call_index: int,
     call_count: int,
-) -> str:
-    action_text = str(action_line.get("text") or "")
-    if action_line.get("kind") == "tool" or "能力调用" in action_text:
-        decision = "决定调用能力"
-    elif action_text == "整理任务结果":
-        decision = "决定完成任务"
+    span: _ModelSpan,
+) -> dict[str, str | int]:
+    """Project one Harness model call as stable parameters without localized UI prose."""
+    line_id = str(action_line.get("id") or "")
+    if line_id.startswith("harness_finish_"):
+        decision = "finish"
+    elif action_line.get("kind") == "tool":
+        decision = "tool"
     else:
-        decision = "模型决策"
-    retry = f"（尝试 {call_index}/{call_count}）" if call_count > 1 else ""
-    return f"第 {iteration} 轮{decision}{retry}"
-
-
-def _harness_model_call_detail(span: _ModelSpan) -> str:
-    parts = ["Harness 模型决策"]
-    if span.json_max_attempts > 1:
-        parts.append(f"JSON 尝试 {span.json_attempt}/{span.json_max_attempts}")
-    if span.request_max_attempts > 1:
-        parts.append(f"请求尝试 {span.request_attempt}/{span.request_max_attempts}")
-    return " · ".join(parts)
+        decision = "other"
+    return {
+        "iteration": iteration,
+        "decision": decision,
+        "call_index": call_index,
+        "call_count": call_count,
+        "json_attempt": span.json_attempt,
+        "json_max_attempts": span.json_max_attempts,
+        "request_attempt": span.request_attempt,
+        "request_max_attempts": span.request_max_attempts,
+    }
 
 
 def _turn_aliases(events: list[AgentEvent]) -> dict[str, str]:

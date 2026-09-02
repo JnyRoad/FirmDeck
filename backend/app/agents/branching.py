@@ -5,6 +5,7 @@ from typing import Any
 
 from sqlmodel import Session, select
 
+from app.contracts.domain_http import domain_http_error
 from app.db.models import (
     AgentKnowledgeBranch,
     AgentProfile,
@@ -30,7 +31,6 @@ from app.llm.model_config_resolver import (
     ResolvedModelConfig,
     resolve_model_config_for_runtime,
 )
-
 
 DEFAULT_AGENT_ROLES = ("default", "router", "step", "response", "general_skill")
 OPEN_GALLERY_SCOPE = "open_gallery"
@@ -147,10 +147,8 @@ def require_overall_agent(db: Session, tenant_id: str, agent_id: str | None) -> 
     if not agent_id and not get_overall_agent(db, tenant_id):
         return
     if not is_overall_agent(db, tenant_id, agent_id):
-        from fastapi import HTTPException
-
-        raise HTTPException(
-            status_code=403, detail="Only the overall agent can delete global resources"
+        raise domain_http_error(
+            "AGENT_OVERALL_ONLY_REQUIRED", source="agents.branching", status_code=403
         )
 
 
@@ -288,8 +286,14 @@ def resource_binding_metadata(
 def is_open_gallery_resource(
     db: Session, tenant_id: str, resource_type: str, resource: object
 ) -> bool:
+    """Return whether a resource belongs to the tenant's dedicated gallery template pool."""
     resource_id = getattr(resource, "id", None)
     if not resource_id or getattr(resource, "tenant_id", None) != tenant_id:
+        return False
+    if (
+        resource_type == "knowledge_base"
+        and getattr(resource, "mode", "dedicated") != "dedicated"
+    ):
         return False
     overall = get_overall_agent(db, tenant_id)
     if not overall:
@@ -314,10 +318,14 @@ def is_bound_resource_visible_for_agent(
     resource: object,
     binding: AgentResourceBinding,
 ) -> bool:
+    """Evaluate one employee binding without treating shared knowledge as a private resource."""
     if binding.status == "deleted":
         return False
     if getattr(resource, "tenant_id", None) != tenant_id:
         return False
+    if resource_type == "knowledge_base":
+        # Legacy dedicated branches are authoritative even when old bindings lack scope metadata.
+        return getattr(resource, "mode", "dedicated") == "dedicated"
     if _binding_is_private(binding) or _metadata_is_private(_resource_metadata(resource)):
         return True
     return is_open_gallery_resource(db, tenant_id, resource_type, resource)
@@ -589,10 +597,8 @@ def sync_branch_from_overall(
     db: Session, tenant_id: str, agent_id: str, skill: Skill
 ) -> AgentSkillBranch:
     if skill.status != "published" or not is_open_gallery_resource(db, tenant_id, "skill", skill):
-        from fastapi import HTTPException
-
-        raise HTTPException(
-            status_code=400, detail="Disabled skill cannot be learned from the open gallery"
+        raise domain_http_error(
+            "AGENT_SKILL_NOT_PUBLISHED", source="agents.branching", status_code=400
         )
     branch = ensure_agent_skill_branch(db, tenant_id, agent_id, skill)
     branch.base_version = skill.version
@@ -610,9 +616,7 @@ def promote_branch_to_overall(db: Session, tenant_id: str, branch: AgentSkillBra
         select(Skill).where(Skill.tenant_id == tenant_id, Skill.skill_id == branch.skill_id)
     ).first()
     if not skill:
-        from fastapi import HTTPException
-
-        raise HTTPException(status_code=404, detail="Skill not found")
+        raise domain_http_error("SKILL_NOT_FOUND", source="agents.branching", status_code=404)
     next_version = next_global_version(skill.version)
     content = dict(branch.content_json)
     content["version"] = next_version
@@ -657,9 +661,9 @@ def rollback_branch(
         )
     ).first()
     if not branch:
-        from fastapi import HTTPException
-
-        raise HTTPException(status_code=404, detail="Branch not found")
+        raise domain_http_error(
+            "AGENT_SKILL_BRANCH_NOT_FOUND", source="agents.branching", status_code=404
+        )
     version_row = db.exec(
         select(AgentSkillBranchVersion).where(
             AgentSkillBranchVersion.tenant_id == tenant_id,
@@ -669,9 +673,9 @@ def rollback_branch(
         )
     ).first()
     if not version_row:
-        from fastapi import HTTPException
-
-        raise HTTPException(status_code=404, detail="Branch version not found")
+        raise domain_http_error(
+            "AGENT_SKILL_VERSION_NOT_FOUND", source="agents.branching", status_code=404
+        )
     branch.content_json = dict(version_row.content_json)
     branch.head_version = version_row.version
     branch.status = version_row.status
@@ -838,9 +842,9 @@ def knowledge_version_for_upload(
 ) -> KnowledgeBaseVersion:
     kb = db.get(KnowledgeBase, knowledge_base_id)
     if not kb or kb.tenant_id != tenant_id or kb.status == "archived":
-        from fastapi import HTTPException
-
-        raise HTTPException(status_code=404, detail="Knowledge base not found")
+        raise domain_http_error(
+            "KNOWLEDGE_BASE_NOT_FOUND", source="agents.branching", status_code=404
+        )
     agent = get_agent(db, tenant_id, agent_id)
     if not agent or agent.is_overall:
         version = ensure_knowledge_base_version(db, kb, _current_knowledge_version(kb))
@@ -894,6 +898,59 @@ def ensure_agent_private_knowledge_branch(
     return branch
 
 
+def archive_agent_private_knowledge_branch(
+    db: Session,
+    *,
+    tenant_id: str,
+    agent_id: str,
+    knowledge_base_id: str,
+    converted_to_knowledge_base_id: str,
+    converted_to_version_id: str,
+) -> AgentKnowledgeBranch:
+    """Archive exactly one employee branch and its private binding after conversion."""
+    branch = db.exec(
+        select(AgentKnowledgeBranch).where(
+            AgentKnowledgeBranch.tenant_id == tenant_id,
+            AgentKnowledgeBranch.agent_id == agent_id,
+            AgentKnowledgeBranch.knowledge_base_id == knowledge_base_id,
+            AgentKnowledgeBranch.status == "active",
+        )
+    ).first()
+    binding = db.exec(
+        select(AgentResourceBinding).where(
+            AgentResourceBinding.tenant_id == tenant_id,
+            AgentResourceBinding.agent_id == agent_id,
+            AgentResourceBinding.resource_type == "knowledge_base",
+            AgentResourceBinding.resource_id == knowledge_base_id,
+            AgentResourceBinding.status == "active",
+        )
+    ).first()
+    if branch is None or binding is None:
+        raise RuntimeError("Selected dedicated knowledge branch is not active.")
+
+    conversion_metadata = {
+        "converted_to_knowledge_base_id": converted_to_knowledge_base_id,
+        "converted_to_version_id": converted_to_version_id,
+        "converted_at": utc_now().isoformat(),
+    }
+    branch.status = "archived"
+    branch.sync_state = "converted"
+    branch.metadata_json = {
+        **dict(branch.metadata_json or {}),
+        **conversion_metadata,
+    }
+    branch.updated_at = utc_now()
+    binding.status = "archived"
+    binding.metadata_json = {
+        **dict(binding.metadata_json or {}),
+        **conversion_metadata,
+    }
+    binding.updated_at = utc_now()
+    db.add(branch)
+    db.add(binding)
+    return branch
+
+
 def sync_knowledge_branch_from_overall(
     db: Session,
     tenant_id: str,
@@ -902,11 +959,10 @@ def sync_knowledge_branch_from_overall(
 ) -> AgentKnowledgeBranch:
     kb = _get_knowledge_base(db, tenant_id, knowledge_base_id)
     if kb.status != "active" or not is_open_gallery_resource(db, tenant_id, "knowledge_base", kb):
-        from fastapi import HTTPException
-
-        raise HTTPException(
+        raise domain_http_error(
+            "AGENT_KNOWLEDGE_BASE_NOT_PUBLISHED",
+            source="agents.branching",
             status_code=400,
-            detail="Disabled knowledge base cannot be learned from the open gallery",
         )
     branch = _ensure_knowledge_branch(db, tenant_id, agent_id, kb)
     current_version = _current_knowledge_version(kb)
@@ -934,9 +990,9 @@ def promote_knowledge_branch_to_overall(
         )
     ).first()
     if not branch:
-        from fastapi import HTTPException
-
-        raise HTTPException(status_code=404, detail="Knowledge branch not found")
+        raise domain_http_error(
+            "AGENT_KNOWLEDGE_BRANCH_NOT_FOUND", source="agents.branching", status_code=404
+        )
     source = ensure_knowledge_base_version(db, kb, branch.head_version)
     next_version = next_global_version(_current_knowledge_version(kb))
     target = ensure_knowledge_base_version(db, kb, next_version)
@@ -1220,9 +1276,9 @@ def _ensure_knowledge_branch(
 def _get_knowledge_base(db: Session, tenant_id: str, knowledge_base_id: str) -> KnowledgeBase:
     kb = db.get(KnowledgeBase, knowledge_base_id)
     if not kb or kb.tenant_id != tenant_id or kb.status == "archived":
-        from fastapi import HTTPException
-
-        raise HTTPException(status_code=404, detail="Knowledge base not found")
+        raise domain_http_error(
+            "KNOWLEDGE_BASE_NOT_FOUND", source="agents.branching", status_code=404
+        )
     return kb
 
 
@@ -1284,8 +1340,12 @@ def clone_knowledge_version_assets(
     knowledge_base_id: str,
     source_version_id: str,
     target_version_id: str,
+    *,
+    target_knowledge_base_id: str | None = None,
 ) -> None:
-    if source_version_id == target_version_id:
+    """Clone versioned assets within one base or into a separate target lineage."""
+    target_base_id = target_knowledge_base_id or knowledge_base_id
+    if source_version_id == target_version_id and knowledge_base_id == target_base_id:
         return
 
     document_id_map: dict[str, str] = {}
@@ -1302,7 +1362,7 @@ def clone_knowledge_version_assets(
     target_has_documents = db.exec(
         select(KnowledgeDocument.id).where(
             KnowledgeDocument.tenant_id == tenant_id,
-            KnowledgeDocument.knowledge_base_id == knowledge_base_id,
+            KnowledgeDocument.knowledge_base_id == target_base_id,
             KnowledgeDocument.knowledge_base_version_id == target_version_id,
         )
     ).first()
@@ -1311,7 +1371,7 @@ def clone_knowledge_version_assets(
         for document in source_documents:
             clone = KnowledgeDocument(
                 tenant_id=document.tenant_id,
-                knowledge_base_id=document.knowledge_base_id,
+                knowledge_base_id=target_base_id,
                 knowledge_base_version_id=target_version_id,
                 filename=document.filename,
                 file_type=document.file_type,
@@ -1340,7 +1400,7 @@ def clone_knowledge_version_assets(
         for bucket in source_buckets:
             clone = KnowledgeBucket(
                 tenant_id=bucket.tenant_id,
-                knowledge_base_id=bucket.knowledge_base_id,
+                knowledge_base_id=target_base_id,
                 knowledge_base_version_id=target_version_id,
                 document_id=document_id_map.get(bucket.document_id, bucket.document_id),
                 bucket_key=bucket.bucket_key,
@@ -1367,7 +1427,7 @@ def clone_knowledge_version_assets(
         for chunk in source_chunks:
             clone = KnowledgeChunk(
                 tenant_id=chunk.tenant_id,
-                knowledge_base_id=chunk.knowledge_base_id,
+                knowledge_base_id=target_base_id,
                 knowledge_base_version_id=target_version_id,
                 document_id=document_id_map.get(chunk.document_id, chunk.document_id),
                 bucket_id=bucket_id_map.get(chunk.bucket_id, chunk.bucket_id),
@@ -1393,7 +1453,7 @@ def clone_knowledge_version_assets(
         for suggestion in source_suggestions:
             clone = KnowledgeDiscoverySuggestion(
                 tenant_id=suggestion.tenant_id,
-                knowledge_base_id=suggestion.knowledge_base_id,
+                knowledge_base_id=target_base_id,
                 knowledge_base_version_id=target_version_id,
                 document_id=document_id_map.get(suggestion.document_id, suggestion.document_id),
                 bucket_id=bucket_id_map.get(suggestion.bucket_id or "", suggestion.bucket_id),
@@ -1414,7 +1474,7 @@ def clone_knowledge_version_assets(
         target_documents = db.exec(
             select(KnowledgeDocument).where(
                 KnowledgeDocument.tenant_id == tenant_id,
-                KnowledgeDocument.knowledge_base_id == knowledge_base_id,
+                KnowledgeDocument.knowledge_base_id == target_base_id,
                 KnowledgeDocument.knowledge_base_version_id == target_version_id,
             )
         ).all()
@@ -1436,7 +1496,7 @@ def clone_knowledge_version_assets(
         existing_target_concepts = db.exec(
             select(KnowledgeConcept).where(
                 KnowledgeConcept.tenant_id == tenant_id,
-                KnowledgeConcept.knowledge_base_id == knowledge_base_id,
+                KnowledgeConcept.knowledge_base_id == target_base_id,
                 KnowledgeConcept.knowledge_base_version_id == target_version_id,
             )
         ).all()
@@ -1459,7 +1519,7 @@ def clone_knowledge_version_assets(
         for concept_id in db.exec(
             select(KnowledgeConcept.concept_id).where(
                 KnowledgeConcept.tenant_id == tenant_id,
-                KnowledgeConcept.knowledge_base_id == knowledge_base_id,
+                KnowledgeConcept.knowledge_base_id == target_base_id,
                 KnowledgeConcept.knowledge_base_version_id == target_version_id,
             )
         ).all()
@@ -1479,7 +1539,7 @@ def clone_knowledge_version_assets(
             continue
         clone = KnowledgeConcept(
             tenant_id=concept.tenant_id,
-            knowledge_base_id=concept.knowledge_base_id,
+            knowledge_base_id=target_base_id,
             knowledge_base_version_id=target_version_id,
             document_id=document_id_map.get(concept.document_id or "", concept.document_id),
             concept_id=concept.concept_id,

@@ -20,7 +20,13 @@ cp .env.example .env
 .venv/bin/uvicorn single_port_app:app --host 127.0.0.1 --port 5173
 ```
 
-Swagger UI: `http://localhost:5173/docs`
+StaffDeck Open API documentation: `http://localhost:5173/api/v1/docs`
+
+When using the packaged desktop application, do not assume port `5173`. An administrator can
+open **运行设置 → 网络与 API** to copy the active same-machine API Base URL. The same card can
+save a local, LAN, or externally published next-launch port; a full desktop restart is required
+before the new listener takes effect. Account API keys are managed separately and are never
+embedded in a Base URL.
 
 The current production schema migration path supports SQLite only. Non-SQLite
 database URLs are not a supported deployment configuration.
@@ -28,6 +34,15 @@ database URLs are not a supported deployment configuration.
 `CORS_ORIGINS` controls the allowed frontend origins. The root `scripts/dev_up.sh`
 sets the local single-port origin by default and can add a public tunnel origin with
 `PUBLIC_APP_ORIGIN`.
+
+## ChatGPT Subscription Runtime
+
+ChatGPT subscription models use the local Codex CLI's `app-server` runtime. Install and sign in
+to Codex on the same machine, then set `CODEX_SUBSCRIPTION_COMMAND` only when `codex` is not
+already on the service process `PATH`. StaffDeck resolves that command when a session starts and
+does not store ChatGPT OAuth codes, access tokens, refresh tokens, or subscription credentials.
+Signing out from the model configuration signs the local Codex CLI out of ChatGPT and can affect
+other local applications that use the same Codex login.
 
 ## Agent process sandbox
 

@@ -1,10 +1,24 @@
 from __future__ import annotations
 
 from typing import Any, Literal, Optional
+from urllib.parse import urlparse
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_serializer, model_validator
 
 from app.capability_scope import CapabilityScope
+from app.contracts.error_registry import (
+    ERROR_REGISTRY,
+    ErrorContractViolation,
+    ErrorVisibility,
+)
+from app.contracts.errors import (
+    ErrorDescriptor,
+    ErrorOccurrence,
+    InternalErrorContext,
+    JsonValue,
+)
+from app.i18n.language_context import LanguageContext
+from app.tools.mcp_oauth_policy import validate_mcp_oauth_redirect_uri
 
 
 class ToolExecutionPolicy(BaseModel):
@@ -73,11 +87,103 @@ class ToolBucketRead(BaseModel):
 class ToolCall(BaseModel):
     name: str
     arguments: dict[str, Any] = Field(default_factory=dict)
+    # Server-only immutable locale context; never serialize it as provider arguments.
+    language_context: LanguageContext | None = Field(default=None, exclude=True)
 
 
 class ToolError(BaseModel):
+    """Canonical Tool error with a deprecated safe message and excluded diagnostic context."""
+
     code: str
     message: str
+    params: dict[str, JsonValue] = Field(default_factory=dict)
+    retryable: bool = False
+    request_id: str | None = None
+    trace_id: str | None = None
+    deprecated_fields: list[Literal["message"]] = Field(default_factory=lambda: ["message"])
+    internal_context: InternalErrorContext | None = Field(
+        default=None,
+        exclude=True,
+        repr=False,
+    )
+
+    def model_post_init(self, __context: Any, /) -> None:
+        """Retain legacy prose only for internal consumers and private diagnostic inspection."""
+        raw_message = self.message
+        if self.internal_context is None and raw_message != self.code:
+            self.internal_context = InternalErrorContext(
+                source="tool",
+                raw_message=raw_message,
+                upstream_code=self.code,
+            )
+
+    @model_serializer(mode="wrap")
+    def serialize_public(self, handler: Any) -> dict[str, Any]:
+        """Serialize the legacy message as a stable code while excluding private diagnostics."""
+        payload = handler(self)
+        # Workflow: use the same registry-resolved descriptor for every public field;
+        # remote/raw codes and prose never cross the Tool result boundary.
+        descriptor = self.to_descriptor()
+        payload["code"] = descriptor.code
+        payload["params"] = descriptor.params
+        payload["retryable"] = descriptor.retryable
+        payload["message"] = descriptor.code
+        payload["deprecated_fields"] = ["message"]
+        return payload
+
+    @classmethod
+    def from_occurrence(cls, occurrence: ErrorOccurrence) -> "ToolError":
+        """Create a ToolError from an already projected occurrence without reintroducing prose."""
+        descriptor = occurrence.descriptor
+        return cls(
+            code=descriptor.code,
+            message=descriptor.code,
+            params=descriptor.params,
+            retryable=descriptor.retryable,
+            request_id=descriptor.request_id,
+            trace_id=descriptor.trace_id,
+            internal_context=occurrence.internal,
+        )
+
+    def to_descriptor(self) -> ErrorDescriptor:
+        """Validate exact registry params before a Tool error can cross a public boundary."""
+        # Workflow: resolve dynamic tool codes before descriptor construction and
+        # fail closed for unregistered/internal remote values or mismatched params.
+        entry = ERROR_REGISTRY.get(self.code)
+        if entry is None or entry.visibility is not ErrorVisibility.PUBLIC:
+            fallback = ERROR_REGISTRY.require("INTERNAL_ERROR")
+            return ErrorDescriptor(
+                code=fallback.code,
+                params={},
+                retryable=fallback.retryable_default,
+                request_id=self.request_id,
+                trace_id=self.trace_id,
+            )
+        try:
+            descriptor = ErrorDescriptor(
+                code=entry.code,
+                params=self.params,
+                retryable=self.retryable,
+                request_id=self.request_id,
+                trace_id=self.trace_id,
+            )
+            return ERROR_REGISTRY.validate(descriptor)
+        except (ErrorContractViolation, ValueError, TypeError):
+            fallback = ERROR_REGISTRY.require("INTERNAL_ERROR")
+            return ErrorDescriptor(
+                code=fallback.code,
+                params={},
+                retryable=fallback.retryable_default,
+                request_id=self.request_id,
+                trace_id=self.trace_id,
+            )
+
+    def to_occurrence(self) -> ErrorOccurrence:
+        """Pair public-safe Tool metadata with its excluded diagnostic context."""
+        return ErrorOccurrence(
+            descriptor=self.to_descriptor(),
+            internal=self.internal_context,
+        )
 
 
 class MCPAppDescriptor(BaseModel):
@@ -136,6 +242,7 @@ class ToolProbeResponse(BaseModel):
 
 MCPTransport = Literal["stdio", "streamable_http", "sse", "builtin"]
 MCPAppsMode = Literal["disabled", "auto"]
+MCPAuthMode = Literal["none", "oauth_personal"]
 
 
 class MCPServerConnection(BaseModel):
@@ -158,8 +265,30 @@ class MCPServerCreateRequest(BaseModel):
     bucket: str = "MCP 工具"
     connection: MCPServerConnection = Field(default_factory=MCPServerConnection)
     apps_mode: MCPAppsMode = "disabled"
+    auth_mode: MCPAuthMode = "none"
+    oauth_client_id: Optional[str] = None
+    oauth_client_metadata_url: Optional[str] = None
+    oauth_redirect_uri: Optional[str] = None
     capability_scope: CapabilityScope = "general"
     enabled: bool = True
+
+    @model_validator(mode="after")
+    def validate_oauth_policy(self) -> "MCPServerCreateRequest":
+        """Keep personal OAuth on its supported transport and public client shapes."""
+        if self.auth_mode != "oauth_personal":
+            return self
+        if self.connection.transport != "streamable_http" or not self.connection.url:
+            raise ValueError("personal OAuth requires a streamable_http MCP server URL")
+        if self.oauth_client_id and self.oauth_client_metadata_url:
+            raise ValueError("configure only one OAuth client identification mode")
+        if self.oauth_client_metadata_url:
+            metadata = urlparse(self.oauth_client_metadata_url)
+            if metadata.scheme != "https" or not metadata.netloc or metadata.path in {"", "/"}:
+                raise ValueError("OAuth client metadata URL must use HTTPS with a non-root path")
+        if not self.oauth_redirect_uri:
+            raise ValueError("personal OAuth requires a redirect URI")
+        self.oauth_redirect_uri = validate_mcp_oauth_redirect_uri(self.oauth_redirect_uri)
+        return self
 
 
 class MCPServerUpdateRequest(MCPServerCreateRequest):
@@ -191,6 +320,10 @@ class MCPServerRead(BaseModel):
     bucket: str
     connection: MCPServerConnection
     apps_mode: MCPAppsMode = "disabled"
+    auth_mode: MCPAuthMode = "none"
+    oauth_client_id: Optional[str] = None
+    oauth_client_metadata_url: Optional[str] = None
+    oauth_redirect_uri: Optional[str] = None
     apps_negotiated: bool = False
     negotiated_capabilities: dict[str, Any] = Field(default_factory=dict)
     capability_scope: CapabilityScope

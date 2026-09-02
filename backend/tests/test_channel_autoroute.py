@@ -1,5 +1,6 @@
 import json
 from datetime import timedelta
+from typing import ClassVar
 
 import pytest
 from sqlalchemy.pool import StaticPool
@@ -13,9 +14,12 @@ from app.channels.service_autoroute import (
     RouteDecision,
     classify_intent,
     maybe_auto_route,
+    record_auto_route_event,
 )
 from app.channels.service_intake import process_inbound
 from app.channels.service_routing import resolve_current_agent, set_current_agent
+from app.contracts.event_registry import EVENT_REGISTRY
+from app.contracts.events import EventVisibility
 from app.db.models import (
     AgentEvent,
     AgentProfile,
@@ -43,9 +47,9 @@ def _test_engine():
 
 
 class FakeLLMClient:
-    calls: list[dict] = []
-    script: object = json.dumps({"agent_id": "stay", "confidence": 0.9, "reason": "意图不明"})
-    error: Exception | None = None
+    calls: ClassVar[list[dict]] = []
+    script: ClassVar[object] = json.dumps({"agent_id": "stay", "confidence": 0.9, "reason": "意图不明"})
+    error: ClassVar[Exception | None] = None
 
     def __init__(self, model_config):
         self.model_config = model_config
@@ -154,7 +158,7 @@ def test_classify_without_model_config_stays(monkeypatch) -> None:
 
 def _seed_binding(engine, *, auto_route=None, single_mount=False) -> str:
     with Session(engine) as db:
-        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.add(Tenant(id="tenant_demo", name="Demo", status="active", lifecycle_version=1))
         db.add(
             AgentProfile(
                 id="agent_xz",
@@ -397,7 +401,7 @@ def _p2p_message(event_id: str, text: str) -> dict:
 
 
 class RecordingAgentLoop:
-    calls: list = []
+    calls: ClassVar[list] = []
 
     def __init__(self, db, *, event_sink=None):
         self.db = db
@@ -433,7 +437,7 @@ def test_intake_auto_route_switches_with_notice_and_event() -> None:
             select(AgentEvent).where(AgentEvent.event_type == "auto_route_decision")
         ).all()
         assert len(events) == 1
-        payload = events[0].payload_json
+        payload = events[0].payload_json["params"]
         assert payload["switched"] is True
         assert payload["agent_id"] == "agent_cw"
         assert payload["current_agent_id"] == "agent_xz"
@@ -479,7 +483,7 @@ def test_intake_sop_event_carries_effective_threshold() -> None:
             select(AgentEvent).where(AgentEvent.event_type == "auto_route_decision")
         ).all()
         assert len(events) == 1
-        payload = events[0].payload_json
+        payload = events[0].payload_json["params"]
         assert payload["switched"] is False
         assert payload["threshold"] == 0.9
 
@@ -500,7 +504,7 @@ def test_intake_auto_route_stay_no_notice() -> None:
             select(AgentEvent).where(AgentEvent.event_type == "auto_route_decision")
         ).all()
         assert len(events) == 1
-        assert events[0].payload_json["switched"] is False
+        assert events[0].payload_json["params"]["switched"] is False
 
 
 def test_intake_new_conversation_initial_dispatch() -> None:
@@ -580,8 +584,9 @@ def test_intake_classification_failure_still_runs_turn() -> None:
         ).all()
         assert len(route_events) == 1
         payload = route_events[0].payload_json
-        assert payload["switched"] is False
-        assert "LLM 超时" in payload["error"]
+        assert payload["params"]["switched"] is False
+        assert payload["params"]["error_code"] == "AUTO_ROUTE_CLASSIFICATION_FAILED"
+        assert "LLM 超时" not in str(payload)
 
 
 def test_intake_bad_json_error_in_decision_event() -> None:
@@ -597,9 +602,9 @@ def test_intake_bad_json_error_in_decision_event() -> None:
         ).all()
         assert len(route_events) == 1
         payload = route_events[0].payload_json
-        assert payload["switched"] is False
-        # 坏 JSON 的解析失败摘要可辨
-        assert "Expecting value" in payload["error"]
+        assert payload["params"]["switched"] is False
+        assert payload["params"]["error_code"] == "AUTO_ROUTE_CLASSIFICATION_FAILED"
+        assert "Expecting value" not in str(payload)
 
 
 def test_normal_decision_event_error_empty() -> None:
@@ -613,7 +618,64 @@ def test_normal_decision_event_error_empty() -> None:
             select(AgentEvent).where(AgentEvent.event_type == "auto_route_decision")
         ).all()
         assert len(route_events) == 1
-        assert route_events[0].payload_json["error"] == ""
+        assert route_events[0].payload_json["params"]["error_code"] == ""
+
+
+def test_auto_route_event_is_internal_canonical_and_drops_classifier_prose() -> None:
+    """Persist routing telemetry as typed internal params without classifier prose or raw errors."""
+    engine = _test_engine()
+    binding_id = _seed_binding(engine)
+    decision = RouteDecision(
+        agent_id="agent_xz",
+        switched=False,
+        confidence=0.0,
+        reason="secret classifier rationale",
+        target_agent_id=None,
+        threshold=0.75,
+        error="provider response leaked secret token",
+    )
+
+    with Session(engine) as db:
+        binding = db.get(ChannelBinding, binding_id)
+        record_auto_route_event(db, binding, "session_route", decision, "agent_xz")
+        event = db.exec(
+            select(AgentEvent).where(AgentEvent.event_type == "auto_route_decision")
+        ).one()
+
+    payload = event.payload_json
+    assert payload["event_code"] == "internal.channel.autoroute.decision"
+    assert payload["visibility"] == "internal"
+    assert payload["params"] == {
+        "current_agent_id": "agent_xz",
+        "agent_id": "agent_xz",
+        "target_agent_id": "",
+        "switched": False,
+        "confidence": 0.0,
+        "threshold": 0.75,
+        "error_code": "AUTO_ROUTE_CLASSIFICATION_FAILED",
+    }
+    assert "reason" not in payload
+    assert "secret classifier rationale" not in str(payload)
+    assert "provider response leaked secret token" not in str(payload)
+
+
+def test_auto_route_event_registry_is_internal_with_exact_typed_params() -> None:
+    """Keep the non-UI routing event private and fail closed on parameter drift."""
+    entry = EVENT_REGISTRY.require("internal.channel.autoroute.decision")
+    assert entry.visibility is EventVisibility.INTERNAL
+    assert entry.message_key is None
+    assert entry.raw_source_allowed is False
+    assert entry.requires_language_context is False
+    assert entry.legacy_event_type == "auto_route_decision"
+    assert entry.params_schema == {
+        "current_agent_id": "string",
+        "agent_id": "string",
+        "target_agent_id": "string",
+        "switched": "boolean",
+        "confidence": "number",
+        "threshold": "number",
+        "error_code": "string",
+    }
 
 
 # ---------- PUT auto_route 读写 ----------
@@ -639,7 +701,7 @@ def _make_api_client(engine):
 
 def _seed_api_users(engine) -> dict[str, User]:
     with Session(engine) as db:
-        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.add(Tenant(id="tenant_demo", name="Demo", status="active", lifecycle_version=1))
         owner = User(id="user_owner", tenant_id="tenant_demo", username="owner", password_hash="x")
         db.add(owner)
         db.add(

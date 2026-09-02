@@ -23,6 +23,7 @@ import {
 import { Maximize2, Minimize2, PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen } from 'lucide-react';
 import {
   useEffect,
+  useContext,
   useCallback,
   useLayoutEffect,
   useMemo,
@@ -65,6 +66,9 @@ import {
 } from '@/components/ui';
 import { Button as UIButton } from '@/components/ui/button';
 import { notify } from '@/components/ui/app-toast';
+import { createAppTranslator, getStoredLocale } from '@/i18n';
+import { RawContent, RawIdentifier } from '@/i18n/RawContent';
+import { AppIntlContext } from '@/i18n/provider';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
 import AppHeader from '@/components/AppHeader';
 import {
@@ -77,6 +81,8 @@ import { cn } from '@/lib/utils';
 import { isTeamScope, readEmployeeScope } from '@/lib/agent-scope-storage';
 import { subscribeEnterpriseCapabilityCatalogRefresh } from '@/lib/capability-catalog-events';
 import { SELECT_TRIGGER_CLASS } from '@/lib/enterprise-ui';
+import { formatHandoffAssigneeValue, parseHandoffAssigneeValue } from '@/lib/handoff-assignee';
+import { apiErrorMessage } from '@/lib/apiErrorMessages';
 import type { EnterpriseAuthUser } from '../auth';
 import {
   ACTION_EMPTY_CLASS,
@@ -297,6 +303,7 @@ import {
 } from './distillPageStyles';
 import { buildDistillFailure, type DistillFailure } from './distillFailure';
 import {
+  countSkillFlowEdgeLabels,
   normalizeSkillFlowWheelDelta,
   reanchorSkillFlowConnection,
   skillNodeFlowPosition,
@@ -305,8 +312,11 @@ import {
   type SkillFlowConnectionPreview,
   type SkillFlowPosition,
 } from './skillFlowModel';
-import { api, ApiError, streamGet, streamPost, TENANT_ID } from '../api/client';
+import { API_BASE, ApiError } from '../api/client';
+import { createTenantClient } from '../api/tenant-client';
+import { useTenantSession, type TenantSessionContextValue } from '../contexts/TenantSessionContext';
 import { copyTextToClipboard } from '@/lib/clipboard';
+import { tenantUserStorageKey } from '@/lib/tenant-storage';
 import type {
   GeneralSkillRead,
   KnowledgeBaseRead,
@@ -398,59 +408,79 @@ const REQUIRED_CAPABILITY_FIELD_BY_ALLOWED: Record<string, string> = {
   knowledge_base_ids: 'required_knowledge_base_ids',
 };
 
-const NODE_TYPE_OPTIONS: SelectOption[] = [
-  { value: 'collect_info', label: '收集信息' },
-  { value: 'decision', label: '条件判断' },
-  { value: 'tool_call', label: '调用工具' },
-  { value: 'knowledge_query', label: '检索知识' },
-  { value: 'response', label: '回复用户' },
-  { value: 'handoff', label: '转人工' },
-  { value: 'subflow', label: '调用子 SOP' },
-];
+/** 返回 Distill 节点类型选项，确保所有产品可见标签都从稳定 MessageId 取值。 */
+function nodeTypeOptions(locale?: string): SelectOption[] {
+  const { t } = currentDistillTranslator(locale);
+  return [
+    { value: 'collect_info', label: t('distillPage.nodeType.collectInfo') },
+    { value: 'decision', label: t('distillPage.nodeType.decision') },
+    { value: 'tool_call', label: t('distillPage.nodeType.toolCall') },
+    { value: 'knowledge_query', label: t('distillPage.nodeType.knowledgeQuery') },
+    { value: 'response', label: t('distillPage.nodeType.response') },
+    { value: 'handoff', label: t('distillPage.nodeType.handoff') },
+    { value: 'subflow', label: t('distillPage.nodeType.subflow') },
+  ];
+}
 
-const BASE_ACTION_OPTIONS: SelectOption[] = [
-  { value: 'ask_user', label: '询问用户' },
-  { value: 'continue_flow', label: '继续流程' },
-  { value: 'answer_user', label: '回复用户' },
-  { value: 'handoff_human', label: '转人工' },
-  { value: 'ask_clarification', label: '澄清问题' },
-  { value: 'clarify_user', label: '澄清用户需求' },
-  { value: 'update_memory', label: '更新记忆' },
-  { value: 'reflect', label: '反思检查' },
-  { value: 'finish', label: '结束流程' },
-  { value: 'stop', label: '停止流程' },
-];
+/** 返回 Distill 允许动作选项，避免把动作文案直接写在常量表中。 */
+function baseActionOptions(locale?: string): SelectOption[] {
+  const { t } = currentDistillTranslator(locale);
+  return [
+    { value: 'ask_user', label: t('distillPage.action.askUser') },
+    { value: 'continue_flow', label: t('distillPage.action.continueFlow') },
+    { value: 'answer_user', label: t('distillPage.action.answerUser') },
+    { value: 'handoff_human', label: t('distillPage.action.handoffHuman') },
+    { value: 'ask_clarification', label: t('distillPage.action.askClarification') },
+    { value: 'clarify_user', label: t('distillPage.action.clarifyUser') },
+    { value: 'update_memory', label: t('distillPage.action.updateMemory') },
+    { value: 'reflect', label: t('distillPage.action.reflect') },
+    { value: 'finish', label: t('distillPage.action.finish') },
+    { value: 'stop', label: t('distillPage.action.stop') },
+  ];
+}
 
-const CONDITION_PRESET_OPTIONS: SelectOption[] = [
-  { value: '__always__', label: '总是可进入' },
-  { value: 'missing_required_info', label: '缺少任一必填信息' },
-  { value: 'missing_slots([])', label: '缺少指定字段' },
-  { value: 'all_required_info_collected', label: '必填信息已收集完成' },
-  { value: 'tool_success', label: '工具执行成功' },
-  { value: 'tool_failed', label: '工具执行失败' },
-  { value: 'user_confirmed', label: '用户已确认' },
-  { value: 'user_rejected', label: '用户已拒绝' },
-  { value: '__custom__', label: '自定义条件' },
-];
+/** 返回流转条件预设及说明，确保条件语义和可读说明统一通过 i18n 输出。 */
+function conditionPresetOptions(locale?: string): SelectOption[] {
+  const { t } = currentDistillTranslator(locale);
+  return [
+    { value: '__always__', label: t('distillPage.conditionPreset.always') },
+    { value: 'missing_required_info', label: t('distillPage.conditionPreset.missingRequiredInfo') },
+    { value: 'missing_slots([])', label: t('distillPage.conditionPreset.missingSlots') },
+    { value: 'all_required_info_collected', label: t('distillPage.conditionPreset.allRequiredInfoCollected') },
+    { value: 'tool_success', label: t('distillPage.conditionPreset.toolSuccess') },
+    { value: 'tool_failed', label: t('distillPage.conditionPreset.toolFailed') },
+    { value: 'user_confirmed', label: t('distillPage.conditionPreset.userConfirmed') },
+    { value: 'user_rejected', label: t('distillPage.conditionPreset.userRejected') },
+    { value: '__custom__', label: t('distillPage.conditionPreset.custom') },
+  ];
+}
 
-const CONDITION_PRESET_TEXT: Record<string, string> = {
-  missing_required_info: '还有必填信息没有收集到时进入',
-  'missing_slots([])': '缺少某个指定字段时进入',
-  all_required_info_collected: '所有必填信息都收集完成后进入',
-  tool_success: '上一步工具调用成功后进入',
-  tool_failed: '上一步工具调用失败后进入',
-  user_confirmed: '用户明确确认后进入',
-  user_rejected: '用户明确拒绝后进入',
-};
+/** 返回条件预设的自然语言解释，供摘要和占位提示复用。 */
+function conditionPresetText(locale?: string): Record<string, string> {
+  const { t } = currentDistillTranslator(locale);
+  return {
+    missing_required_info: t('distillPage.conditionPresetText.missingRequiredInfo'),
+    'missing_slots([])': t('distillPage.conditionPresetText.missingSlots'),
+    all_required_info_collected: t('distillPage.conditionPresetText.allRequiredInfoCollected'),
+    tool_success: t('distillPage.conditionPresetText.toolSuccess'),
+    tool_failed: t('distillPage.conditionPresetText.toolFailed'),
+    user_confirmed: t('distillPage.conditionPresetText.userConfirmed'),
+    user_rejected: t('distillPage.conditionPresetText.userRejected'),
+  };
+}
 
-const RETRY_STRATEGY_OPTIONS: SelectOption[] = [
-  { value: 'ask_user', label: '继续追问用户' },
-  { value: 'reflect', label: '反思并修正' },
-  { value: 'retry_tool', label: '重新调用工具' },
-  { value: 'handoff_human', label: '转人工处理' },
-  { value: 'skip', label: '跳过当前节点' },
-  { value: 'stop', label: '停止流程' },
-];
+/** 返回失败重试策略选项，保证 UI 文案和后续说明保持同一事实来源。 */
+function retryStrategyOptions(locale?: string): SelectOption[] {
+  const { t } = currentDistillTranslator(locale);
+  return [
+    { value: 'ask_user', label: t('distillPage.retry.askUser') },
+    { value: 'reflect', label: t('distillPage.retry.reflect') },
+    { value: 'retry_tool', label: t('distillPage.retry.retryTool') },
+    { value: 'handoff_human', label: t('distillPage.retry.handoffHuman') },
+    { value: 'skip', label: t('distillPage.retry.skip') },
+    { value: 'stop', label: t('distillPage.retry.stop') },
+  ];
+}
 
 type PendingChange = {
   assistantId: string;
@@ -483,16 +513,125 @@ type ActiveDistillJob = {
 };
 
 const DEFAULT_TARGET_PATHS: string[] = [];
-const DEFAULT_DISTILL_MESSAGES: ChatItem[] = [
-  {
-    id: 'welcome',
-    role: 'assistant',
-    content: '请粘贴原始技能说明，或点击右侧某一块后告诉我需要怎样改写。',
-  },
-];
+/** 返回 Distill 默认欢迎消息，确保首次进入工作台也走稳定翻译键。 */
+function defaultDistillMessages(locale?: string): ChatItem[] {
+  return [
+    {
+      id: 'welcome',
+      role: 'assistant',
+      content: currentDistillTranslator(locale).t('distillPage.chat.welcome'),
+    },
+  ];
+}
 const DISTILL_REWRITE_MODEL_STORAGE_KEY = 'skill-distill-rewrite-model';
-const _CHANNEL_LABELS: Record<string, string> = { feishu: '飞书', dingtalk: '钉钉', wecom: '企业微信', wechat: '微信' };
 const UNASSIGNED_USER_VALUE = '__unassigned__';
+// 渠道转接通知运行时已支持飞书/企微私聊,处理人选项提供对应渠道标注
+// (后端同样拒绝其他渠道)。钉钉/微信适配器只能回会话内消息,不在此列。
+const HANDOFF_NOTIFY_CHANNELS = new Set(['feishu', 'wecom']);
+
+type HandoffAssigneeUser = {
+  id: string;
+  username: string;
+  display_name?: string;
+  source?: string;
+  channel_identities?: Array<{ channel: string; display_name?: string; external_user_id?: string }>;
+};
+
+/** 为 Distill 页面局部控件提供稳定翻译入口；无 Provider 时回退当前持久化 locale。 */
+function useDistillIntl() {
+  const context = useContext(AppIntlContext);
+  return useMemo(() => context ?? createAppTranslator(getStoredLocale()), [context]);
+}
+
+/** 为纯函数和非组件分支提供 Distill 语义翻译；允许测试显式覆盖 locale。 */
+function currentDistillTranslator(locale?: string) {
+  return createAppTranslator(locale || getStoredLocale());
+}
+
+/** 返回 Distill 能力引用的不可用原因，避免在多个编辑器里散落硬编码状态文案。 */
+function capabilityUnavailableReason(
+  kind: 'skill' | 'tool' | 'knowledgeBase' | 'resource',
+  locale?: string,
+): string {
+  const { t } = currentDistillTranslator(locale);
+  if (kind === 'skill') return t('distillPage.capability.unavailable.skill');
+  if (kind === 'tool') return t('distillPage.capability.unavailable.tool');
+  if (kind === 'knowledgeBase') return t('distillPage.capability.unavailable.knowledgeBase');
+  return t('distillPage.capability.unavailable.resource');
+}
+
+/** 返回未显式指定 handoff 处理人的占位选项，强调会回退到渠道默认路由。 */
+function unassignedHandoffUserLabel(locale?: string): string {
+  return currentDistillTranslator(locale).t('distillPage.handoff.unassigned');
+}
+
+/** 返回 Distill 草稿和导入文件名的默认标题，避免把产品名称直接写入解析辅助函数。 */
+function defaultDistillSkillTitle(locale?: string): string {
+  return currentDistillTranslator(locale).t('distillPage.skill.defaultTitle');
+}
+
+/** 返回节点顺序标签，供源码视图、流程图和流式预览统一复用。 */
+function indexedNodeLabel(index: number, locale?: string): string {
+  return currentDistillTranslator(locale).t('distillPage.node.indexLabel', { index: index + 1 });
+}
+
+/** 返回节点目标标签，统一“节点序号 + 原始名称/标识”的展示格式。 */
+function indexedNodeTargetLabel(index: number, name: string, locale?: string): string {
+  return currentDistillTranslator(locale).t('distillPage.target.node', { index: index + 1, name });
+}
+
+/** 返回节点状态标签列表，确保起始/终止/可选状态都通过稳定 MessageId 输出。 */
+function nodeStateLabels({
+  isStart = false,
+  optional = false,
+  terminal = false,
+  locale,
+}: {
+  isStart?: boolean;
+  optional?: boolean;
+  terminal?: boolean;
+  locale?: string;
+}): string[] {
+  const { t } = currentDistillTranslator(locale);
+  return [
+    isStart ? t('distillPage.nodeState.start') : '',
+    optional ? t('distillPage.nodeState.optional') : t('distillPage.nodeState.required'),
+    terminal ? t('distillPage.nodeState.terminal') : t('distillPage.nodeState.flow'),
+  ].filter(Boolean);
+}
+
+export function handoffAssigneeUserOptions(tenantUsers: HandoffAssigneeUser[], locale?: string): SelectOption[] {
+  // 内部成员一律可选(网页端投递);已绑定支持渠道身份的成员追加"姓名（渠道）"选项,
+  // 选中后运行时按该渠道转接。其他渠道身份不生成选项(通知未实现),
+  // 渠道懒建账号(渠道客户/群聊)也不进入处理人选项。
+  const { t } = currentDistillTranslator(locale);
+  const options: SelectOption[] = [];
+  tenantUsers.filter((user) => !user.source || user.source === 'web').forEach((user) => {
+    const name = user.display_name || user.username || user.id;
+    options.push({ value: user.id, label: t('distillPage.handoff.userChannelLabel', { name, channel: t('distillPage.channel.web') }) });
+    const channels = new Set<string>();
+    (user.channel_identities || []).forEach((identity) => {
+      const channel = String(identity.channel || '').trim();
+      if (channel && HANDOFF_NOTIFY_CHANNELS.has(channel)) channels.add(channel);
+    });
+    channels.forEach((channel) => {
+      options.push({
+        value: `${user.id}::${channel}`,
+        label: t('distillPage.handoff.userChannelLabel', {
+          name,
+          channel: t(
+            channel === 'feishu'
+              ? 'distillPage.channel.feishu'
+              : channel === 'wecom'
+                ? 'distillPage.channel.wecom'
+                : 'distillPage.channel.web',
+          ),
+        }),
+      });
+    });
+  });
+  return options;
+}
 
 type DistillCacheSnapshot = {
   draft: SkillCard | null;
@@ -551,6 +690,174 @@ type DistillPageProps = {
   onLogout?: () => void;
 };
 
+type TenantStreamEvent = {
+  event: string;
+  data: Record<string, unknown>;
+};
+
+type TenantStreamRequestBody = Record<string, unknown>;
+
+/**
+ * Check both the captured tenant generation and the request-local abort
+ * signal before publishing an asynchronous result.  A tenant context can be
+ * replaced while a request is still settling, so checking only the latest
+ * context object would allow an old rejection/finally callback to affect the
+ * new tenant's UI.
+ */
+export function isCurrentTenantRequest(
+  context: Pick<TenantSessionContextValue, 'signal' | 'isCurrentGeneration'> | null | undefined,
+  generation: number | undefined,
+  requestSignal?: AbortSignal,
+): boolean {
+  return Boolean(
+    context
+      && generation !== undefined
+      && !context.signal.aborted
+      && !requestSignal?.aborted
+      && context.isCurrentGeneration(generation),
+  );
+}
+
+/** Build a stream URL from the verified tenant and reject caller-supplied mismatches. */
+function tenantStreamUrl(path: string, tenantId: string): string {
+  const hasAbsoluteBase = /^(?:https?:|blob:)/i.test(path);
+  const url = new URL(hasAbsoluteBase ? path : `${API_BASE}${path}`, window.location.origin);
+  const requestedTenantIds = url.searchParams.getAll('tenant_id');
+  if (requestedTenantIds.some((value) => value !== tenantId)) {
+    throw new Error('租户请求上下文不匹配');
+  }
+  url.searchParams.set('tenant_id', tenantId);
+  return !API_BASE && !hasAbsoluteBase
+    ? `${url.pathname}${url.search}${url.hash}`
+    : url.toString();
+}
+
+/** Link a request abort signal to the verified tenant generation signal. */
+function combineTenantStreamSignals(
+  tenantSignal: AbortSignal,
+  requestSignal?: AbortSignal,
+): { signal: AbortSignal; cleanup: () => void } {
+  if (!requestSignal || requestSignal === tenantSignal) {
+    return { signal: tenantSignal, cleanup: () => undefined };
+  }
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  if (tenantSignal.aborted || requestSignal.aborted) controller.abort();
+  else {
+    tenantSignal.addEventListener('abort', abort, { once: true });
+    requestSignal.addEventListener('abort', abort, { once: true });
+  }
+  return {
+    signal: controller.signal,
+    cleanup: () => {
+      tenantSignal.removeEventListener('abort', abort);
+      requestSignal.removeEventListener('abort', abort);
+    },
+  };
+}
+
+/** Parse one SSE block while keeping malformed payloads diagnosable to callers. */
+function parseTenantSseBlock(block: string): TenantStreamEvent | null {
+  const lines = block.split('\n').map((line) => line.trimEnd());
+  const eventLine = lines.find((line) => line.startsWith('event:'));
+  const dataLines = lines.filter((line) => line.startsWith('data:'));
+  if (!eventLine || dataLines.length === 0) return null;
+  const event = eventLine.replace(/^event:\s*/, '');
+  const rawData = dataLines.map((line) => line.replace(/^data:\s*/, '')).join('\n');
+  try {
+    return { event, data: JSON.parse(rawData) as Record<string, unknown> };
+  } catch {
+    return { event, data: { raw: rawData } };
+  }
+}
+
+/** Stream an enterprise endpoint with the verified bearer, tenant query and generation fence. */
+async function streamTenantRequest(
+  context: TenantSessionContextValue | null,
+  method: 'GET' | 'POST',
+  path: string,
+  body: TenantStreamRequestBody | undefined,
+  onEvent: (item: TenantStreamEvent) => void,
+  requestSignal?: AbortSignal,
+): Promise<void> {
+  if (!context) throw new Error('租户请求上下文不可用');
+  const generation = context.generation;
+  const combined = combineTenantStreamSignals(context.signal, requestSignal);
+  const isCurrent = () => isCurrentTenantRequest(context, generation, combined.signal);
+  try {
+    if (!isCurrent()) return;
+    let requestBody: string | undefined;
+    if (method === 'POST') {
+      if (!body || Array.isArray(body)) throw new Error('租户请求体格式无效');
+      if (body.tenant_id !== undefined && body.tenant_id !== context.tenantId) {
+        throw new Error('租户请求上下文不匹配');
+      }
+      requestBody = JSON.stringify({ ...body, tenant_id: context.tenantId });
+    }
+    const response = await fetch(tenantStreamUrl(path, context.tenantId), {
+      method,
+      headers: {
+        ...(method === 'POST' ? { 'Content-Type': 'application/json' } : {}),
+        Authorization: `Bearer ${context.session.token}`,
+      },
+      body: requestBody,
+      signal: combined.signal,
+    });
+    if (!isCurrent()) return;
+    if (!response.ok) {
+      const text = await response.text();
+      if (!isCurrent()) return;
+      throw new ApiError(response.status, text, response.statusText);
+    }
+    if (!response.body) throw new Error('当前浏览器不支持流式响应');
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder('utf-8');
+    let buffer = '';
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!isCurrent()) {
+        await reader.cancel().catch(() => undefined);
+        return;
+      }
+      buffer += decoder.decode(value, { stream: true });
+      const blocks = buffer.split('\n\n');
+      buffer = blocks.pop() || '';
+      blocks.forEach((block) => {
+        if (!isCurrent()) return;
+        const parsed = parseTenantSseBlock(block);
+        if (parsed) onEvent(parsed);
+      });
+    }
+    if (!isCurrent()) return;
+    buffer += decoder.decode();
+    const parsed = parseTenantSseBlock(buffer);
+    if (parsed && isCurrent()) onEvent(parsed);
+  } finally {
+    combined.cleanup();
+  }
+}
+
+function streamTenantGet(
+  context: TenantSessionContextValue | null,
+  path: string,
+  onEvent: (item: TenantStreamEvent) => void,
+  requestSignal?: AbortSignal,
+): Promise<void> {
+  return streamTenantRequest(context, 'GET', path, undefined, onEvent, requestSignal);
+}
+
+function streamTenantPost(
+  context: TenantSessionContextValue | null,
+  path: string,
+  body: TenantStreamRequestBody,
+  onEvent: (item: TenantStreamEvent) => void,
+  requestSignal?: AbortSignal,
+): Promise<void> {
+  return streamTenantRequest(context, 'POST', path, body, onEvent, requestSignal);
+}
+
 function lockSkillIdForDraft(draft: SkillCard, lockedSkillId: string): SkillCard {
   if (!lockedSkillId || draft.skill_id === lockedSkillId) return draft;
   return { ...cloneSkill(draft), skill_id: lockedSkillId };
@@ -570,23 +877,36 @@ function lockPendingChangeSkillId(change: PendingChange | null, lockedSkillId: s
 }
 
 export default function DistillPage({ active = true, searchParamsOverride, currentUser, onLogout }: DistillPageProps = {}) {
+  const { t } = useDistillIntl();
+  const tenantContext = useTenantSession();
+  const tenantClient = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
+  const tenantId = tenantContext?.tenantId || '';
+  const userId = tenantContext?.userId || '';
   const navigate = useNavigate();
   const [routerSearchParams] = useSearchParams();
   const searchParams = searchParamsOverride || routerSearchParams;
   const skillId = searchParams.get('skill_id');
   const mode = searchParams.get('mode') || '';
   const workspaceId = searchParams.get('workspace_id') || '';
-  const [selectedAgentId, setSelectedAgentId] = useState(readEmployeeScope);
+  const [selectedAgentId, setSelectedAgentId] = useState(
+    () => tenantId && userId ? readEmployeeScope(tenantId, userId) : '',
+  );
   const activeAgentId = searchParams.get('agent_id') || selectedAgentId;
   const agentQuery = activeAgentId ? `&agent_id=${encodeURIComponent(activeAgentId)}` : '';
   const agentSearchParam = activeAgentId ? `agent_id=${encodeURIComponent(activeAgentId)}` : '';
   const agentOnlyQuery = agentSearchParam ? `?${agentSearchParam}` : '';
   const cacheIdentity = skillId || (mode === 'create' ? `create:${workspaceId || 'pending'}` : mode || 'new');
-  const cacheKey = `skill-distill:${TENANT_ID}:${activeAgentId || 'default'}:${cacheIdentity}`;
+  const cacheKey = tenantId && userId
+    ? tenantUserStorageKey(
+      tenantId,
+      userId,
+      `skill-distill:${activeAgentId || 'default'}:${cacheIdentity}`,
+    )
+    : '';
   const [draft, setDraft] = useState<SkillCard | null>(null);
   const [loadedSkill, setLoadedSkill] = useState<SkillRead | null>(null);
   const [lastSavedDraft, setLastSavedDraft] = useState<SkillCard | null>(null);
-  const [messages, setMessages] = useState<ChatItem[]>(DEFAULT_DISTILL_MESSAGES);
+  const [messages, setMessages] = useState<ChatItem[]>(() => defaultDistillMessages());
   const [input, setInput] = useState('');
   const [selectedPaths, setSelectedPaths] = useState<string[]>(DEFAULT_TARGET_PATHS);
   const [highlightedPaths, setHighlightedPaths] = useState<string[]>([]);
@@ -625,7 +945,11 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
   const [tenantUsers, setTenantUsers] = useState<Array<{ id: string; username: string; display_name?: string; source?: string; channel_identities?: Array<{ channel: string; display_name?: string; external_user_id?: string; external_account_scope?: string }> }>>([]);
   const [modelConfigs, setModelConfigs] = useState<ModelConfigRead[]>([]);
   const [selectedRewriteModelId, setSelectedRewriteModelId] = useState(
-    () => window.localStorage.getItem(`${DISTILL_REWRITE_MODEL_STORAGE_KEY}:${TENANT_ID}`) || '',
+    () => tenantId && userId
+      ? window.localStorage.getItem(
+        tenantUserStorageKey(tenantId, userId, DISTILL_REWRITE_MODEL_STORAGE_KEY),
+      ) || ''
+      : '',
   );
   const [streamStatus, setStreamStatus] = useState('');
   const [activeJob, setActiveJob] = useState<ActiveDistillJob | null>(null);
@@ -634,6 +958,10 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
   const abortRef = useRef<AbortController | null>(null);
   const manualStopRef = useRef(false);
   const uploadControllersRef = useRef<Record<string, AbortController>>({});
+  const saveControllerRef = useRef<AbortController | null>(null);
+  const probeControllersRef = useRef<Record<string, AbortController>>({});
+  const commitToolsControllerRef = useRef<AbortController | null>(null);
+  const rerunControllerRef = useRef<AbortController | null>(null);
   const dragDepthRef = useRef(0);
   const animationTimersRef = useRef<number[]>([]);
   const capabilityCatalogRequestRef = useRef(0);
@@ -643,13 +971,25 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
   const [hydratedCacheKey, setHydratedCacheKey] = useState('');
 
   useEffect(() => {
+    setSelectedAgentId(tenantId && userId ? readEmployeeScope(tenantId, userId) : '');
+    setDraft(null);
+    setLoadedSkill(null);
+    setLastSavedDraft(null);
+    setMessages(defaultDistillMessages());
+    setAttachments([]);
+    setActiveJob(null);
+    setCacheReady(false);
+    setHydratedCacheKey('');
+  }, [tenantId, userId]);
+
+  useEffect(() => {
     const onScopeChange = (event: Event) => {
       const next = (event as CustomEvent<{ agentId?: string }>).detail?.agentId || '';
-      setSelectedAgentId(next && !isTeamScope(next) ? next : readEmployeeScope());
+      setSelectedAgentId(next && !isTeamScope(next) ? next : readEmployeeScope(tenantId, userId));
     };
     window.addEventListener('ultrarag-enterprise-agent-scope-change', onScopeChange);
     return () => window.removeEventListener('ultrarag-enterprise-agent-scope-change', onScopeChange);
-  }, []);
+  }, [tenantId, userId]);
 
   useEffect(() => {
     if (!active || skillId || mode !== 'create' || workspaceId) return;
@@ -659,9 +999,24 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
   }, [active, mode, navigate, searchParams, skillId, workspaceId]);
 
   useEffect(() => {
+    if (!tenantContext) return;
+    const context = tenantContext;
+    const generation = context.generation;
+    const controller = new AbortController();
+    let requestActive = true;
+    const isCurrent = () => (
+      requestActive
+      && !controller.signal.aborted
+      && context.isCurrentGeneration(generation)
+    );
     setCacheReady(false);
     setHydratedCacheKey('');
-    if (mode === 'create' && !workspaceId) return;
+    if (mode === 'create' && !workspaceId) {
+      return () => {
+        requestActive = false;
+        controller.abort();
+      };
+    }
     const cached = readDistillCache(cacheKey);
     if (cached) {
       if (skillId && isBlankDistillWorkspace(cached)) {
@@ -671,7 +1026,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
         setDraft(lockNullableSkillIdForDraft(cached.draft, cachedLockedSkillId));
         setLoadedSkill(cached.loadedSkill);
         setLastSavedDraft(lockNullableSkillIdForDraft(cached.lastSavedDraft, cachedLockedSkillId));
-        setMessages(cached.messages.length > 0 ? cached.messages : DEFAULT_DISTILL_MESSAGES);
+        setMessages(cached.messages.length > 0 ? cached.messages : defaultDistillMessages());
         setInput(cached.input);
         setSelectedPaths(normalizeInitialSelectedPaths(cached.selectedPaths));
         setHighlightedPaths(cached.highlightedPaths);
@@ -689,7 +1044,10 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
         setSaveDraftSnapshot(null);
         setHydratedCacheKey(cacheKey);
         setCacheReady(true);
-        return;
+        return () => {
+          requestActive = false;
+          controller.abort();
+        };
       }
     }
 
@@ -697,7 +1055,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
       setDraft(null);
       setLoadedSkill(null);
       setLastSavedDraft(null);
-      setMessages(DEFAULT_DISTILL_MESSAGES);
+      setMessages(defaultDistillMessages());
       setInput('');
       setSelectedPaths(DEFAULT_TARGET_PATHS);
       setPendingChange(null);
@@ -710,12 +1068,19 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
       setSaveDraftSnapshot(null);
       setHydratedCacheKey(cacheKey);
       setCacheReady(true);
-      return;
+      return () => {
+        requestActive = false;
+        controller.abort();
+      };
     }
 
-    api
-      .get<SkillRead>(`/api/enterprise/skills/${encodeURIComponent(skillId)}?tenant_id=${TENANT_ID}${agentQuery}`)
+    tenantClient
+      .get<SkillRead>(
+        `/api/enterprise/skills/${encodeURIComponent(skillId)}?tenant_id=${tenantId}${agentQuery}`,
+        { signal: controller.signal },
+      )
       .then((result) => {
+        if (!isCurrent()) return;
         const nextContent = lockSkillIdForDraft(result.content, result.skill_id || skillId || '');
         const nextResult = nextContent === result.content ? result : { ...result, content: nextContent };
         setDraft(nextContent);
@@ -734,18 +1099,23 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
           {
             id: 'loaded',
             role: 'assistant',
-            content: `已加载「${result.name}」。你可以在右侧选择一个或多个区域，然后在这里描述需要怎样改写。`,
+            content: t('distillPage.chat.loadedSkill', { name: result.name }),
           },
         ]);
         setHydratedCacheKey(cacheKey);
         setCacheReady(true);
       })
       .catch((error) => {
-        notify.error(error instanceof Error ? error.message : '加载技能失败');
+        if (!isCurrent()) return;
+        notify.error(apiErrorMessage(error, 'distillPage.error.loadSkill', { t }));
         setHydratedCacheKey(cacheKey);
         setCacheReady(true);
       });
-  }, [agentQuery, cacheKey, mode, skillId, workspaceId]);
+    return () => {
+      requestActive = false;
+      controller.abort();
+    };
+  }, [agentQuery, cacheKey, mode, skillId, tenantContext, tenantClient, tenantId, workspaceId]);
 
   useEffect(() => {
     if (!cacheReady || hydratedCacheKey !== cacheKey) return;
@@ -792,30 +1162,37 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
     return () => {
       abortRef.current?.abort();
       Object.values(uploadControllersRef.current).forEach((controller) => controller.abort());
+      saveControllerRef.current?.abort();
+      Object.values(probeControllersRef.current).forEach((controller) => controller.abort());
+      commitToolsControllerRef.current?.abort();
+      rerunControllerRef.current?.abort();
       clearAnimationTimers();
     };
-  }, []);
+  }, [tenantContext]);
 
   useEffect(() => {
-    if (!cacheReady || hydratedCacheKey !== cacheKey || !activeJob) return;
+    if (!tenantContext || !cacheReady || hydratedCacheKey !== cacheKey || !activeJob) return;
     if (activeJob.status === 'succeeded' || activeJob.status === 'failed') return;
     if (abortRef.current) return;
+    const context = tenantContext;
+    const generation = context.generation;
     const controller = new AbortController();
     manualStopRef.current = false;
     abortRef.current = controller;
     setLoading(true);
-    void streamGet(
+    void streamTenantGet(
+      context,
       `/api/enterprise/skills/jobs/${encodeURIComponent(activeJob.jobId)}/stream?after_seq=${activeJob.lastSeq || 0}`,
       (item) => handleResumedJobEvent(activeJob, item),
       controller.signal,
     )
       .catch((error) => {
-        if (controller.signal.aborted) return;
-        updateMessage(activeJob.assistantId, '生成连接已断开，后端任务仍可继续。', { thinking: 'done' });
-        notify.error(error instanceof Error ? error.message : '恢复生成失败');
+        if (!isCurrentTenantRequest(context, generation, controller.signal)) return;
+        updateMessage(activeJob.assistantId, t('distillPage.chat.streamDisconnected'), { thinking: 'done' });
+        notify.error(apiErrorMessage(error, 'distillPage.error.resumeGeneration', { t }));
       })
-      .finally(() => finishStream(controller));
-  }, [activeJob, cacheKey, cacheReady, hydratedCacheKey]);
+      .finally(() => finishStream(controller, context, generation));
+  }, [activeJob, cacheKey, cacheReady, hydratedCacheKey, tenantContext]);
 
   useEffect(() => {
     if (!active) {
@@ -829,25 +1206,27 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
   }, [active]);
 
   const refreshCapabilityCatalog = useCallback(async () => {
-    if (!active) return;
+    if (!active || !tenantContext) return;
+    const context = tenantContext;
+    const generation = context.generation;
     const requestId = capabilityCatalogRequestRef.current + 1;
     capabilityCatalogRequestRef.current = requestId;
     const [toolResult, skillResult, knowledgeResult, sopResult] = await Promise.allSettled([
-      api.get<ToolRead[]>(`/api/enterprise/tools?tenant_id=${TENANT_ID}${agentQuery}`),
-      api.get<GeneralSkillRead[]>(
-        `/api/enterprise/general-skills?tenant_id=${TENANT_ID}${agentQuery}`,
+      tenantClient.get<ToolRead[]>(`/api/enterprise/tools?tenant_id=${tenantId}${agentQuery}`),
+      tenantClient.get<GeneralSkillRead[]>(
+        `/api/enterprise/general-skills?tenant_id=${tenantId}${agentQuery}`,
       ),
-      api.get<KnowledgeBaseRead[]>(
-        `/api/enterprise/knowledge-bases?tenant_id=${TENANT_ID}${agentQuery}`,
+      tenantClient.get<KnowledgeBaseRead[]>(
+        `/api/enterprise/knowledge-bases?tenant_id=${tenantId}${agentQuery}`,
       ),
-      api.get<SkillRead[]>(`/api/enterprise/skills?tenant_id=${TENANT_ID}${agentQuery}`),
+      tenantClient.get<SkillRead[]>(`/api/enterprise/skills?tenant_id=${tenantId}${agentQuery}`),
     ]);
-    if (requestId !== capabilityCatalogRequestRef.current) return;
+    if (requestId !== capabilityCatalogRequestRef.current || !context.isCurrentGeneration(generation)) return;
     if (toolResult.status === 'fulfilled') setTools(toolResult.value);
     if (skillResult.status === 'fulfilled') setGeneralSkills(skillResult.value);
     if (knowledgeResult.status === 'fulfilled') setKnowledgeBases(knowledgeResult.value);
     if (sopResult.status === 'fulfilled') setSopSkills(sopResult.value);
-  }, [active, agentQuery]);
+  }, [active, agentQuery, tenantContext, tenantClient, tenantId]);
 
   useEffect(() => {
     void refreshCapabilityCatalog();
@@ -864,31 +1243,47 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
   }, [active, refreshCapabilityCatalog]);
 
   useEffect(() => {
-    api
+    if (!tenantContext) return;
+    const context = tenantContext;
+    const generation = context.generation;
+    tenantClient
       .get<Array<{ id: string; username: string; display_name?: string; source?: string; channel_identities?: Array<{ channel: string; display_name?: string; external_user_id?: string }> }>>(
-        `/api/auth/users?tenant_id=${TENANT_ID}&include_channel=true`,
+        `/api/auth/users?tenant_id=${tenantId}&include_channel=true`,
       )
-      .then(setTenantUsers)
-      .catch(() => setTenantUsers([]));
-  }, []);
+      .then((rows) => {
+        if (context.isCurrentGeneration(generation)) setTenantUsers(rows);
+      })
+      .catch(() => {
+        if (context.isCurrentGeneration(generation)) setTenantUsers([]);
+      });
+  }, [tenantClient, tenantContext, tenantId]);
 
   useEffect(() => {
-    api
-      .get<ModelConfigRead[]>(`/api/enterprise/model-configs?tenant_id=${TENANT_ID}`)
+    if (!tenantContext) return;
+    const context = tenantContext;
+    const generation = context.generation;
+    tenantClient
+      .get<ModelConfigRead[]>(`/api/enterprise/model-configs?tenant_id=${tenantId}`)
       .then((rows) => {
+        if (!context.isCurrentGeneration(generation)) return;
         const enabled = rows.filter((item) => item.enabled);
         setModelConfigs(enabled);
         setSelectedRewriteModelId((current) => {
           if (current && enabled.some((item) => item.id === current)) return current;
           const fallback = enabled.find((item) => item.is_default)?.id || enabled[0]?.id || '';
           if (fallback) {
-            window.localStorage.setItem(`${DISTILL_REWRITE_MODEL_STORAGE_KEY}:${TENANT_ID}`, fallback);
+            window.localStorage.setItem(
+              tenantUserStorageKey(tenantId, userId, DISTILL_REWRITE_MODEL_STORAGE_KEY),
+              fallback,
+            );
           }
           return fallback;
         });
       })
-      .catch(() => setModelConfigs([]));
-  }, []);
+      .catch(() => {
+        if (context.isCurrentGeneration(generation)) setModelConfigs([]);
+      });
+  }, [tenantClient, tenantContext, tenantId, userId]);
 
   useEffect(() => {
     if (!chatMessagesRef.current) return;
@@ -960,10 +1355,13 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
   }
 
   async function createDraftFromText(text: string) {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     const payload = parseInitialSkillPrompt(text);
     setLoading(true);
     setSourceAutoScroll(true);
-    setStreamStatus('正在生成 SOP 草稿');
+    setStreamStatus(t('distillPage.status.generatingDraft'));
     let streamBuffer = '';
     let latestPreview = createStreamingDraftSeed(payload);
     let latestPreviewSignature = JSON.stringify(latestPreview);
@@ -974,7 +1372,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
     setTextDiffs([]);
     const assistantId = pushMessage('assistant', '', {
       thinking: 'running',
-      thinkingDetails: ['正在理解技能目标与输入信息'],
+      thinkingDetails: [t('distillPage.thinking.understandingGoal')],
       thinkingOpen: false,
     });
     const baseJob: ActiveDistillJob = {
@@ -988,13 +1386,19 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
     const controller = new AbortController();
     abortRef.current = controller;
     try {
-      await streamPost(
+      await streamTenantPost(
+        context,
         '/api/enterprise/skills/distill/stream',
-        { tenant_id: TENANT_ID, ...payload, model_config_id: selectedRewriteModelId || undefined },
+        {
+          tenant_id: tenantId,
+          agent_id: activeAgentId || undefined,
+          ...payload,
+          model_config_id: selectedRewriteModelId || undefined,
+        },
         (item) => {
           trackActiveJobEvent(item, baseJob);
           if (item.event === 'status') {
-            appendThinkingDetail(assistantId, String(item.data.text || '正在处理'));
+            appendThinkingDetail(assistantId, String(item.data.text || t('distillPage.status.processing')));
             return;
           }
           if (item.event === 'chunk_reset') {
@@ -1014,7 +1418,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
               latestPreview = preview;
               latestPreviewSignature = previewSignature;
               setDraft(preview);
-              setStreamStatus('正在解码技能结构');
+              setStreamStatus(t('distillPage.status.decodingDraft'));
             }
             return;
           }
@@ -1022,7 +1426,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
             const draftSkill = lockSkillIdForDraft(item.data.draft_skill as SkillCard, lockedSkillId);
             const nextWarnings = Array.isArray(item.data.warnings) ? item.data.warnings.map(String) : [];
             const nextToolSuggestions = normalizeToolSuggestions(item.data.tool_suggestions);
-            appendThinkingDetail(assistantId, `已生成 SOP 草稿：${draftSkill.name}`);
+            appendThinkingDetail(assistantId, t('distillPage.thinking.generatedDraft', { name: draftSkill.name }));
             clearAnimationTimers();
             setDraft(draftSkill);
             setHighlightedPaths([]);
@@ -1031,15 +1435,15 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
             setSelectedPaths(DEFAULT_TARGET_PATHS);
             updateMessage(
               assistantId,
-              `已生成「${draftSkill.name}」草稿。你可以在右侧选择一个或多个区域继续改写。`,
+              t('distillPage.chat.generatedDraft', { name: draftSkill.name }),
               {
                 thinking: 'done',
                 warnings: nextWarnings,
                 toolSuggestions: nextToolSuggestions,
-                operations: [{ kind: 'skill_change', label: `生成 SOP 草稿：${draftSkill.name}`, skillId: draftSkill.skill_id }],
+                operations: [{ kind: 'skill_change', label: t('distillPage.operation.generatedDraft', { name: draftSkill.name }), skillId: draftSkill.skill_id }],
               },
             );
-            setStreamStatus('生成完成');
+            setStreamStatus(t('distillPage.status.generationComplete'));
             if (nextToolSuggestions.length > 0) {
               void autoProbeToolSuggestions(assistantId, nextToolSuggestions);
             }
@@ -1054,16 +1458,17 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
         controller.signal,
       );
     } catch (error) {
+      if (context.signal.aborted || !context.isCurrentGeneration(generation)) return;
       if (controller.signal.aborted && !manualStopRef.current) return;
-      appendThinkingDetail(assistantId, '生成失败，已保留当前草稿');
+      appendThinkingDetail(assistantId, t('distillPage.thinking.generationFailed'));
       applyDistillFailure(assistantId, error, 'distill');
       if (controller.signal.aborted) {
-        notify.info('已停止生成');
+        notify.info(t('distillPage.toast.stoppedGenerating'));
       } else {
-        notify.error(error instanceof Error ? error.message : '生成失败');
+        notify.error(apiErrorMessage(error, 'distillPage.error.generate', { t }));
       }
     } finally {
-      finishStream(controller);
+      finishStream(controller, context, generation);
     }
   }
 
@@ -1075,6 +1480,9 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
     conversationOverride?: ChatItem[],
   ) {
     if (!currentDraft) return;
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     setSourceAutoScroll(false);
     const editableDraft = canonicalizeSkillCapabilityRefs(lockSkillIdForDraft(currentDraft, lockedSkillId));
     const previousDraft = cloneSkill(editableDraft);
@@ -1085,10 +1493,10 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
         : allTargetPaths(editableDraft);
     const scopeLabel = targetLabel(targets, editableDraft);
     setLoading(true);
-    setStreamStatus('正在改写选中内容');
+    setStreamStatus(t('distillPage.status.rewritingSelection'));
     const assistantId = pushMessage('assistant', '', {
       thinking: 'running',
-      thinkingDetails: initialThinkingDetails || [`改写范围：${scopeLabel}`],
+      thinkingDetails: initialThinkingDetails || [t('distillPage.thinking.rewriteScope', { label: scopeLabel })],
       thinkingOpen: false,
     });
     const baseJob: ActiveDistillJob = {
@@ -1105,10 +1513,11 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
     manualStopRef.current = false;
     abortRef.current = controller;
     try {
-      await streamPost(
+      await streamTenantPost(
+        context,
         `/api/enterprise/skills/${encodeURIComponent(editableDraft.skill_id)}/rewrite/stream`,
         {
-          tenant_id: TENANT_ID,
+          tenant_id: tenantId,
           agent_id: activeAgentId || undefined,
           current_skill: editableDraft,
           instruction: text,
@@ -1121,7 +1530,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
         (item) => {
           trackActiveJobEvent(item, baseJob);
           if (item.event === 'status') {
-            appendThinkingDetail(assistantId, String(item.data.text || '正在处理'));
+            appendThinkingDetail(assistantId, String(item.data.text || t('distillPage.status.processing')));
             return;
           }
           if (item.event === 'message_chunk') {
@@ -1137,24 +1546,24 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
             const nextWarnings = Array.isArray(item.data.warnings) ? item.data.warnings.map(String) : [];
             const nextToolSuggestions = normalizeToolSuggestions(item.data.tool_suggestions);
             const changedPaths = diffTargetPaths(previousDraft, nextDraft, targets);
-            const changedLabel = changedPaths.length > 0 ? targetLabel(changedPaths, nextDraft) : '未检测到结构变化';
-            appendThinkingDetail(assistantId, `模型返回改写结果：${changedLabel}`);
-            appendThinkingDetail(assistantId, '右侧已更新预览，等待确认或拒绝');
+            const changedLabel = changedPaths.length > 0 ? targetLabel(changedPaths, nextDraft) : t('distillPage.status.noStructuralChanges');
+            appendThinkingDetail(assistantId, t('distillPage.thinking.rewriteResult', { label: changedLabel }));
+            appendThinkingDetail(assistantId, t('distillPage.thinking.previewUpdated'));
             animateDraftChange(previousDraft, nextDraft, changedPaths);
             setPendingChange({ assistantId, previousDraft, nextDraft, changedPaths });
             setSelectedPaths((current) => reconcileSelectedPaths(current, nextDraft));
-            setStreamStatus('改写完成');
+            setStreamStatus(t('distillPage.status.rewriteComplete'));
             if (!receivedMessageChunk) {
               updateMessage(
                 assistantId,
-                String(item.data.assistant_message || '已完成局部改写。'),
+                String(item.data.assistant_message || t('distillPage.chat.rewriteComplete')),
                 {
                   thinking: 'done',
                   warnings: nextWarnings,
                   toolSuggestions: nextToolSuggestions,
                   actionState: 'pending',
                   operations: changedPaths.length
-                    ? [{ kind: 'skill_change', label: `改写：${changedLabel}`, skillId: nextDraft.skill_id }]
+                    ? [{ kind: 'skill_change', label: t('distillPage.operation.rewrite', { label: changedLabel }), skillId: nextDraft.skill_id }]
                     : [],
                 },
               );
@@ -1165,7 +1574,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
                 toolSuggestions: nextToolSuggestions,
                 actionState: 'pending',
                 operations: changedPaths.length
-                  ? [{ kind: 'skill_change', label: `改写：${changedLabel}`, skillId: nextDraft.skill_id }]
+                  ? [{ kind: 'skill_change', label: t('distillPage.operation.rewrite', { label: changedLabel }), skillId: nextDraft.skill_id }]
                   : [],
               });
             }
@@ -1183,16 +1592,17 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
         controller.signal,
       );
     } catch (error) {
+      if (context.signal.aborted || !context.isCurrentGeneration(generation)) return;
       if (controller.signal.aborted && !manualStopRef.current) return;
-      appendThinkingDetail(assistantId, '改写失败，已保留当前草稿');
+      appendThinkingDetail(assistantId, t('distillPage.thinking.rewriteFailed'));
       applyDistillFailure(assistantId, error, 'rewrite');
       if (controller.signal.aborted) {
-        notify.info('已停止改写');
+        notify.info(t('distillPage.toast.stoppedRewriting'));
       } else {
-        notify.error(error instanceof Error ? error.message : '改写失败');
+        notify.error(apiErrorMessage(error, 'distillPage.error.rewrite', { t }));
       }
     } finally {
-      finishStream(controller);
+      finishStream(controller, context, generation);
     }
   }
 
@@ -1200,7 +1610,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
     const targetDraft = lockNullableSkillIdForDraft(pendingChange?.nextDraft || draft, lockedSkillId);
     if (!targetDraft) return;
     if (!hasSkillContentChanges(targetDraft, lastSavedDraft)) {
-      notify.info('当前没有内容变化，无需保存草稿。');
+      notify.info(t('distillPage.toast.noDraftChanges'));
       return;
     }
     confirmPendingChange(false);
@@ -1215,7 +1625,17 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
   async function saveDraft() {
     if (!saveReviewDraft) return;
     if (!hasSkillContentChanges(saveReviewDraft, lastSavedDraft)) {
-      notify.info('当前没有内容变化，无需保存草稿。');
+      notify.info(t('distillPage.toast.noDraftChanges'));
+      return;
+    }
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
+    const controller = new AbortController();
+    saveControllerRef.current?.abort();
+    saveControllerRef.current = controller;
+    if (!isCurrentTenantRequest(context, generation, controller.signal)) {
+      if (saveControllerRef.current === controller) saveControllerRef.current = null;
       return;
     }
     let finalDraft: SkillCard = canonicalizeSkillCapabilityRefs(
@@ -1225,24 +1645,34 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
     try {
       let savedSkill: SkillRead;
       if (loadedSkill) {
-        savedSkill = await api.put<SkillRead>(`/api/enterprise/skills/${loadedSkill.skill_id}${agentOnlyQuery}`, {
-          tenant_id: TENANT_ID,
+        savedSkill = await tenantClient.put<SkillRead>(`/api/enterprise/skills/${loadedSkill.skill_id}${agentOnlyQuery}`, {
+          tenant_id: tenantId,
           content: finalDraft,
           status: loadedSkill.status,
-        });
+        }, { signal: controller.signal });
       } else {
         try {
-          savedSkill = await api.post<SkillRead>(`/api/enterprise/skills${agentOnlyQuery}`, { tenant_id: TENANT_ID, content: finalDraft, status: 'published' });
+          savedSkill = await tenantClient.post<SkillRead>(
+            `/api/enterprise/skills${agentOnlyQuery}`,
+            { tenant_id: tenantId, content: finalDraft, status: 'published' },
+            { signal: controller.signal },
+          );
         } catch (error) {
+          if (!isCurrentTenantRequest(context, generation, controller.signal)) throw error;
           if (!(error instanceof ApiError) || error.status !== 409) throw error;
           finalDraft = {
             ...cloneSkill(finalDraft),
             skill_id: uniqueDraftSkillId(finalDraft.skill_id),
           };
           renamedSkillId = finalDraft.skill_id;
-          savedSkill = await api.post<SkillRead>(`/api/enterprise/skills${agentOnlyQuery}`, { tenant_id: TENANT_ID, content: finalDraft, status: 'published' });
+          savedSkill = await tenantClient.post<SkillRead>(
+            `/api/enterprise/skills${agentOnlyQuery}`,
+            { tenant_id: tenantId, content: finalDraft, status: 'published' },
+            { signal: controller.signal },
+          );
         }
       }
+      if (!isCurrentTenantRequest(context, generation, controller.signal)) return;
       const savedContent = lockSkillIdForDraft(savedSkill.content, savedSkill.skill_id || lockedSkillId);
       if (savedContent !== savedSkill.content) {
         savedSkill = { ...savedSkill, content: savedContent };
@@ -1256,19 +1686,22 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
       setSaveReviewOpen(false);
       appendOperationToLatestMessage({
         kind: 'version_save',
-        label: `保存版本 ${savedSkill.version}`,
+        label: t('distillPage.operation.savedVersion', { version: savedSkill.version }),
         skillId: savedSkill.skill_id,
         version: savedSkill.version,
       });
       if (clearAfterSave) {
         setClearAfterSave(false);
         clearDistillWorkspace();
-        notify.success('SOP 已保存，当前改写已清空');
+        notify.successText(t('distillPage.toast.savedAndCleared'));
       } else {
-        notify.success(renamedSkillId ? `SOP ID 已存在，已另存为 ${renamedSkillId}` : 'SOP 已保存');
+        notify.successText(renamedSkillId ? t('distillPage.toast.savedAsRenamed', { skillId: renamedSkillId }) : t('distillPage.toast.saved'));
       }
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '保存失败');
+      if (!isCurrentTenantRequest(context, generation, controller.signal)) return;
+      notify.error(apiErrorMessage(error, 'distillPage.error.save', { t }));
+    } finally {
+      if (saveControllerRef.current === controller) saveControllerRef.current = null;
     }
   }
 
@@ -1276,13 +1709,15 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
     const jobId = activeJob?.jobId;
     manualStopRef.current = true;
     if (jobId) {
-      void api.post(`/api/enterprise/skills/jobs/${encodeURIComponent(jobId)}/cancel`);
+      void tenantClient
+        .post(`/api/enterprise/skills/jobs/${encodeURIComponent(jobId)}/cancel`)
+        .catch(() => undefined);
     }
     abortRef.current?.abort();
     abortRef.current = null;
     setLoading(false);
     setActiveJob(null);
-    setStreamStatus('已停止');
+    setStreamStatus(t('distillPage.status.stopped'));
   }
 
   function trackActiveJobEvent(item: { event: string; data: Record<string, unknown> }, baseJob: ActiveDistillJob) {
@@ -1302,7 +1737,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
   function handleResumedJobEvent(job: ActiveDistillJob, item: { event: string; data: Record<string, unknown> }) {
     trackActiveJobEvent(item, job);
     if (item.event === 'status') {
-      appendThinkingDetail(job.assistantId, String(item.data.text || '正在处理'));
+      appendThinkingDetail(job.assistantId, String(item.data.text || t('distillPage.status.processing')));
       return;
     }
     if (item.event === 'message_chunk') {
@@ -1346,18 +1781,18 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
     setUpdatingPaths([]);
     setTextDiffs([]);
     setSelectedPaths(DEFAULT_TARGET_PATHS);
-    appendThinkingDetail(job.assistantId, `已生成 SOP 草稿：${draftSkill.name}`);
+    appendThinkingDetail(job.assistantId, t('distillPage.thinking.generatedDraft', { name: draftSkill.name }));
     updateMessage(
       job.assistantId,
-      `已生成「${draftSkill.name}」草稿。你可以在右侧选择一个或多个区域继续改写。`,
+      t('distillPage.chat.generatedDraft', { name: draftSkill.name }),
       {
         thinking: 'done',
         warnings: nextWarnings,
         toolSuggestions: nextToolSuggestions,
-        operations: [{ kind: 'skill_change', label: `生成 SOP 草稿：${draftSkill.name}`, skillId: draftSkill.skill_id }],
+        operations: [{ kind: 'skill_change', label: t('distillPage.operation.generatedDraft', { name: draftSkill.name }), skillId: draftSkill.skill_id }],
       },
     );
-    setStreamStatus('生成完成');
+    setStreamStatus(t('distillPage.status.generationComplete'));
     if (nextToolSuggestions.length > 0) {
       void autoProbeToolSuggestions(job.assistantId, nextToolSuggestions);
     }
@@ -1370,27 +1805,27 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
     const previousDraft = lockNullableSkillIdForDraft(job.previousDraft || draft, lockedSkillId);
     if (!previousDraft) {
       setDraft(nextDraft);
-      updateMessage(job.assistantId, String(data.assistant_message || '已完成改写。'), { thinking: 'done' });
+      updateMessage(job.assistantId, String(data.assistant_message || t('distillPage.chat.rewriteFinished')), { thinking: 'done' });
       return;
     }
     const targets = job.targets?.length ? job.targets : allTargetPaths(previousDraft);
     const nextWarnings = Array.isArray(data.warnings) ? data.warnings.map(String) : [];
     const nextToolSuggestions = normalizeToolSuggestions(data.tool_suggestions);
     const changedPaths = diffTargetPaths(previousDraft, nextDraft, targets);
-    const changedLabel = changedPaths.length > 0 ? targetLabel(changedPaths, nextDraft) : '未检测到结构变化';
-    appendThinkingDetail(job.assistantId, `模型返回改写结果：${changedLabel}`);
-    appendThinkingDetail(job.assistantId, '右侧已更新预览，等待确认或拒绝');
+    const changedLabel = changedPaths.length > 0 ? targetLabel(changedPaths, nextDraft) : t('distillPage.status.noStructuralChanges');
+    appendThinkingDetail(job.assistantId, t('distillPage.thinking.rewriteResult', { label: changedLabel }));
+    appendThinkingDetail(job.assistantId, t('distillPage.thinking.previewUpdated'));
     animateDraftChange(previousDraft, nextDraft, changedPaths);
     setPendingChange({ assistantId: job.assistantId, previousDraft, nextDraft, changedPaths });
     setSelectedPaths((current) => reconcileSelectedPaths(current, nextDraft));
-    setStreamStatus('改写完成');
-    updateMessage(job.assistantId, String(data.assistant_message || '已完成局部改写。'), {
+    setStreamStatus(t('distillPage.status.rewriteComplete'));
+    updateMessage(job.assistantId, String(data.assistant_message || t('distillPage.chat.rewriteComplete')), {
       thinking: 'done',
       warnings: nextWarnings,
       toolSuggestions: nextToolSuggestions,
       actionState: 'pending',
       operations: changedPaths.length
-        ? [{ kind: 'skill_change', label: `改写：${changedLabel}`, skillId: nextDraft.skill_id }]
+        ? [{ kind: 'skill_change', label: t('distillPage.operation.rewrite', { label: changedLabel }), skillId: nextDraft.skill_id }]
         : [],
     });
     if (nextToolSuggestions.length > 0) {
@@ -1399,10 +1834,12 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
   }
 
   async function stageFileUpload(file: File) {
-    if (loading) return;
+    if (loading || !tenantContext) return;
+    const context = tenantContext;
+    const generation = context.generation;
     const suffix = file.name.toLowerCase().split('.').pop() || '';
     if (!['md', 'txt', 'doc', 'docx'].includes(suffix)) {
-      notify.error('仅支持 .md、.doc、.docx、.txt 文件');
+      notify.error(t('distillPage.error.unsupportedUploadType'));
       return;
     }
     const id = `file_${Date.now()}_${Math.random().toString(16).slice(2)}`;
@@ -1411,8 +1848,8 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
     setAttachments((current) => [...current, { id, name: file.name, status: 'uploading' }]);
     try {
       const contentBase64 = await fileToBase64(file);
-      if (controller.signal.aborted) return;
-      const result = await api.postWithSignal<{ filename: string; text: string }>(
+      if (controller.signal.aborted || !context.isCurrentGeneration(generation)) return;
+      const result = await tenantClient.postWithSignal<{ filename: string; text: string }>(
         '/api/enterprise/skills/files/extract',
         {
           filename: file.name,
@@ -1420,17 +1857,18 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
         },
         controller.signal,
       );
+      if (controller.signal.aborted || !context.isCurrentGeneration(generation)) return;
       setAttachments((current) =>
         current.map((item) =>
           item.id === id ? { id, name: result.filename, status: 'ready', text: result.text } : item,
         ),
       );
     } catch (error) {
-      if (controller.signal.aborted) return;
+      if (controller.signal.aborted || !context.isCurrentGeneration(generation)) return;
       setAttachments((current) =>
         current.map((item) =>
           item.id === id
-            ? { ...item, status: 'error', error: error instanceof Error ? error.message : '读取文件失败' }
+            ? { ...item, status: 'error', error: error instanceof Error ? error.message : t('distillPage.error.readFile') }
             : item,
         ),
       );
@@ -1496,15 +1934,15 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
 
     appendThinkingDetail(
       messageId,
-      `正在抽取工具：${extractedSuggestions.map((item) => item.display_name || item.name).join('、')}`,
+      t('distillPage.thinking.extractingTools', { names: extractedSuggestions.map((item) => item.display_name || item.name).join('、') }),
     );
     const existingSuggestions = suggestions.filter((suggestion) => toolSuggestionResolution(suggestion) === 'existing');
     existingSuggestions.forEach((suggestion) => {
-      appendThinkingDetail(messageId, `已匹配现有工具：${suggestion.matched_tool_display_name || suggestion.display_name || suggestion.name}`);
+      appendThinkingDetail(messageId, t('distillPage.thinking.matchedExistingTool', { name: suggestion.matched_tool_display_name || suggestion.display_name || suggestion.name }));
     });
     if (pendingSuggestions.length === 0) return;
-    appendThinkingDetail(messageId, '正在测试工具接口');
-    setStreamStatus('正在测试工具接口');
+    appendThinkingDetail(messageId, t('distillPage.thinking.probingTools'));
+    setStreamStatus(t('distillPage.status.probingTools'));
 
     let successCount = 0;
     let failureCount = 0;
@@ -1515,21 +1953,21 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
       });
       if (!result) {
         failureCount += 1;
-        appendThinkingDetail(messageId, `工具测试失败：${suggestion.display_name || suggestion.name}`);
+        appendThinkingDetail(messageId, t('distillPage.thinking.toolProbeFailed', { name: suggestion.display_name || suggestion.name }));
         continue;
       }
       if (result.success) {
         successCount += 1;
-        appendThinkingDetail(messageId, `工具测试成功：${suggestion.display_name || suggestion.name}`);
+        appendThinkingDetail(messageId, t('distillPage.thinking.toolProbeSucceeded', { name: suggestion.display_name || suggestion.name }));
       } else {
         failureCount += 1;
         const reason = result.error?.message ? `，${result.error.message}` : '';
-        appendThinkingDetail(messageId, `工具测试失败：${suggestion.display_name || suggestion.name}${reason}`);
+        appendThinkingDetail(messageId, t('distillPage.thinking.toolProbeFailedWithReason', { name: suggestion.display_name || suggestion.name, reason }));
       }
     }
 
-    appendThinkingDetail(messageId, `工具测试完成：${successCount} 个成功，${failureCount} 个失败`);
-    setStreamStatus('工具测试完成');
+    appendThinkingDetail(messageId, t('distillPage.thinking.toolProbeSummary', { successCount, failureCount }));
+    setStreamStatus(t('distillPage.status.toolProbeComplete'));
   }
 
   async function probeToolSuggestion(
@@ -1541,14 +1979,25 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
     if ((!options.allowWhileLoading && loading) || suggestion.probeStatus === 'probing') return null;
     const args = options.sampleArguments || suggestion.sample_arguments || {};
     if (Object.keys(args).length === 0) {
-      if (!options.silent) notify.warning('缺少样例参数，无法测试接口');
+      if (!options.silent) notify.warning(t('distillPage.toast.missingProbeArguments'));
       const result: ToolProbeResponse = {
         success: false,
         inferred_output_schema: {},
-        error: { code: 'MISSING_SAMPLE_ARGUMENTS', message: '缺少样例参数，无法测试接口' },
+        error: { code: 'MISSING_SAMPLE_ARGUMENTS', message: t('distillPage.toast.missingProbeArguments') },
       };
       setToolSuggestionPatch(messageId, suggestion.name, { probeStatus: 'error', probe_result: result });
       return result;
+    }
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return null;
+    const controller = new AbortController();
+    const requestKey = `${messageId}:${suggestion.name}`;
+    probeControllersRef.current[requestKey]?.abort();
+    probeControllersRef.current[requestKey] = controller;
+    if (!isCurrentTenantRequest(context, generation, controller.signal)) {
+      if (probeControllersRef.current[requestKey] === controller) delete probeControllersRef.current[requestKey];
+      return null;
     }
     setToolSuggestionPatch(messageId, suggestion.name, { probeStatus: 'probing' });
     try {
@@ -1556,7 +2005,10 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
         ...toolPayloadFromSuggestion(suggestion, lockNullableSkillIdForDraft(pendingChange?.nextDraft || draft, lockedSkillId)?.skill_id),
         sample_arguments: args,
       };
-      const result = await api.post<ToolProbeResponse>('/api/enterprise/tools/probe', payload);
+      const result = await tenantClient.post<ToolProbeResponse>('/api/enterprise/tools/probe', payload, {
+        signal: controller.signal,
+      });
+      if (!isCurrentTenantRequest(context, generation, controller.signal)) return null;
       const nextOutputSchema = result.success && result.inferred_output_schema
         ? result.inferred_output_schema
         : suggestion.output_schema;
@@ -1567,23 +2019,26 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
         output_schema: nextOutputSchema || {},
       });
       if (result.success) {
-        if (!options.silent) notify.success('接口测试成功');
+        if (!options.silent) notify.successText(t('distillPage.toast.toolProbeSucceeded'));
       } else {
-        if (!options.silent) notify.error(result.error?.message || '接口测试失败');
+        if (!options.silent) notify.error(result.error?.message || t('distillPage.error.toolProbe'));
       }
       return result;
     } catch (error) {
+      if (!isCurrentTenantRequest(context, generation, controller.signal)) return null;
       const result: ToolProbeResponse = {
         success: false,
         inferred_output_schema: {},
-        error: { code: 'CLIENT_ERROR', message: error instanceof Error ? error.message : '接口测试失败' },
+        error: { code: 'CLIENT_ERROR', message: error instanceof Error ? error.message : t('distillPage.error.toolProbe') },
       };
       setToolSuggestionPatch(messageId, suggestion.name, {
         probeStatus: 'error',
         probe_result: result,
       });
-      if (!options.silent) notify.error(result.error?.message || '接口测试失败');
+      if (!options.silent) notify.error(result.error?.message || t('distillPage.error.toolProbe'));
       return result;
+    } finally {
+      if (probeControllersRef.current[requestKey] === controller) delete probeControllersRef.current[requestKey];
     }
   }
 
@@ -1591,19 +2046,19 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
     if (!toolDetail || !toolDetailMessageId) return;
     const parsed = parseJsonObject(probeArgsText);
     if (!parsed) {
-      notify.error('样例参数必须是 JSON 对象');
+      notify.error(t('distillPage.error.probeArgsMustBeObject'));
       return;
     }
     setToolSuggestionPatch(toolDetailMessageId, toolDetail.name, { sample_arguments: parsed });
     setToolDetail({ ...toolDetail, sample_arguments: parsed });
-    notify.success('样例参数已更新');
+    notify.successText(t('distillPage.toast.probeArgsUpdated'));
   }
 
   function probeToolDetail() {
     if (!toolDetail || !toolDetailMessageId) return;
     const parsed = parseJsonObject(probeArgsText);
     if (!parsed) {
-      notify.error('样例参数必须是 JSON 对象');
+      notify.error(t('distillPage.error.probeArgsMustBeObject'));
       return;
     }
     void probeToolSuggestion(toolDetailMessageId, { ...toolDetail, sample_arguments: parsed }, { sampleArguments: parsed });
@@ -1612,18 +2067,18 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
   async function confirmToolSuggestion(messageId: string, suggestion: ToolSuggestionItem) {
     if (loading) return;
     if (toolSuggestionResolution(suggestion) !== 'new_candidate') {
-      notify.warning('该工具不是可新增候选');
+      notify.warning(t('distillPage.toast.toolNotNewCandidate'));
       return;
     }
     if (!suggestion.probe_result?.success) {
-      notify.warning('请先测试接口成功后再新增工具');
+      notify.warning(t('distillPage.toast.probeBeforeCreate'));
       return;
     }
     const nextSuggestions = nextToolSuggestionsWithPatch(messageId, suggestion.name, { status: 'accepted' });
     setToolSuggestionStatus(messageId, suggestion.name, 'accepted');
     const shouldCommit = toolSuggestionSelectionsComplete(nextSuggestions);
     if (!shouldCommit) {
-      notify.success('已确认，等待其他工具建议处理完成后统一更新 SOP');
+      notify.successText(t('distillPage.toast.toolSuggestionAcceptedPending'));
       return;
     }
     await commitToolSuggestionSelections(messageId, nextSuggestions);
@@ -1635,35 +2090,56 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
       (item) => toolSuggestionResolution(item) === 'new_candidate' && item.status === 'accepted',
     );
     if (acceptedSuggestions.length === 0) {
-      notify.info('所有工具建议已拒绝，SOP 草稿未变更');
+      notify.info(t('distillPage.toast.allToolSuggestionsRejected'));
+      return;
+    }
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
+    const controller = new AbortController();
+    commitToolsControllerRef.current?.abort();
+    commitToolsControllerRef.current = controller;
+    if (!isCurrentTenantRequest(context, generation, controller.signal)) {
+      if (commitToolsControllerRef.current === controller) commitToolsControllerRef.current = null;
       return;
     }
     try {
       const createdTools: ToolRead[] = [];
       const createdNewTools: ToolRead[] = [];
       for (const suggestion of acceptedSuggestions) {
+        if (!isCurrentTenantRequest(context, generation, controller.signal)) return;
         if (!suggestion.probe_result?.success) {
-          throw new Error(`工具「${suggestion.display_name || suggestion.name}」尚未测试通过`);
+          throw new Error(t('distillPage.error.toolNotProbePassed', { name: suggestion.display_name || suggestion.name }));
         }
         const payload = toolPayloadFromSuggestion(suggestion, activeDraft?.skill_id);
         let createdTool: ToolRead;
         let createdNewTool = false;
         try {
-          createdTool = await api.post<ToolRead>(`/api/enterprise/tools${agentQuery ? `?${agentQuery.slice(1)}` : ''}`, payload);
+          createdTool = await tenantClient.post<ToolRead>(
+            `/api/enterprise/tools${agentQuery ? `?${agentQuery.slice(1)}` : ''}`,
+            payload,
+            { signal: controller.signal },
+          );
           createdNewTool = true;
         } catch (error) {
+          if (!isCurrentTenantRequest(context, generation, controller.signal)) throw error;
           if (!(error instanceof ApiError) || error.status !== 409) throw error;
-          createdTool = toolReadFromSuggestion(suggestion, activeDraft?.skill_id);
+          createdTool = {
+            ...toolReadFromSuggestion(suggestion, activeDraft?.skill_id),
+            tenant_id: tenantId,
+          };
         }
+        if (!isCurrentTenantRequest(context, generation, controller.signal)) return;
         createdTools.push(createdTool);
         if (createdNewTool) createdNewTools.push(createdTool);
         setToolSuggestionStatus(messageId, suggestion.name, 'created');
       }
+      if (!isCurrentTenantRequest(context, generation, controller.signal)) return;
       setTools((current) => createdTools.reduce((nextTools, tool) => upsertToolRead(nextTools, tool), current));
       createdNewTools.forEach((createdTool) => {
         appendOperationToMessage(messageId, {
           kind: 'tool_add',
-          label: `新增工具：${createdTool.display_name || createdTool.name}`,
+          label: t('distillPage.operation.createdTool', { name: createdTool.display_name || createdTool.name }),
           toolId: createdTool.id,
           toolName: createdTool.name,
         });
@@ -1679,6 +2155,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
         lockedSkillId,
       );
       const changedPaths = diffTargetPaths(activeDraft, nextDraft, allTargetPaths(nextDraft));
+      if (!isCurrentTenantRequest(context, generation, controller.signal)) return;
       confirmPendingChange(false);
       clearAnimationTimers();
       setDraft(nextDraft);
@@ -1690,13 +2167,16 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
         setDirtyPaths((current) => mergePaths(current, changedPaths));
         appendOperationToMessage(messageId, {
           kind: 'skill_change',
-          label: `接入工具：${toolNames}`,
+          label: t('distillPage.operation.integratedTools', { names: toolNames }),
           skillId: nextDraft.skill_id,
         });
       }
-      notify.success(`已确认 ${acceptedSuggestions.length} 个工具，当前草稿已局部更新`);
+      notify.successText(t('distillPage.toast.toolSuggestionsCommitted', { count: acceptedSuggestions.length }));
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '新增工具或更新 SOP 失败');
+      if (!isCurrentTenantRequest(context, generation, controller.signal)) return;
+      notify.error(apiErrorMessage(error, 'distillPage.error.commitToolSuggestions', { t }));
+    } finally {
+      if (commitToolsControllerRef.current === controller) commitToolsControllerRef.current = null;
     }
   }
 
@@ -1762,10 +2242,10 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
     if (loading) return;
     if (!hasUnsavedSkillChanges()) {
       setClearNewConfirm({
-        title: skillId ? '清空并新建 SOP？' : '清空当前改写？',
+        title: skillId ? t('distillPage.clearDialog.newTitle') : t('distillPage.clearDialog.currentTitle'),
         description: skillId
-          ? '清空只会进入一个新的 SOP 草稿工作台，不会删除或替换当前正在编辑的 SOP。'
-          : '当前技能没有未保存变更，确认清空当前改写内容和对话记录？',
+          ? t('distillPage.clearDialog.newDescription')
+          : t('distillPage.clearDialog.currentDescription'),
       });
       return;
     }
@@ -1787,7 +2267,11 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
     const nextParams = new URLSearchParams({ mode: 'create', workspace_id: nextWorkspaceId });
     if (activeAgentId) nextParams.set('agent_id', activeAgentId);
     const nextRoute = `/enterprise/skills/distill?${nextParams.toString()}`;
-    const nextCacheKey = `skill-distill:${TENANT_ID}:${activeAgentId || 'default'}:create:${nextWorkspaceId}`;
+    const nextCacheKey = tenantUserStorageKey(
+      tenantId,
+      userId,
+      `skill-distill:${activeAgentId || 'default'}:create:${nextWorkspaceId}`,
+    );
     removeDistillCache(cacheKey);
     removeDistillCache(nextCacheKey);
     setCacheReady(false);
@@ -1795,7 +2279,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
     setDraft(null);
     setLoadedSkill(null);
     setLastSavedDraft(null);
-    setMessages(DEFAULT_DISTILL_MESSAGES);
+    setMessages(defaultDistillMessages());
     setInput('');
     setSelectedPaths(DEFAULT_TARGET_PATHS);
     setHighlightedPaths([]);
@@ -1856,7 +2340,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
     kind: ActiveDistillJob['kind'],
   ) {
     const failure = buildDistillFailure(error, kind);
-    updateMessage(assistantId, '当前草稿未变更，可以调整要求或模型配置后重试。', {
+    updateMessage(assistantId, t('distillPage.chat.failureUnchanged'), {
       thinking: 'done',
       failure,
       failureOpen: false,
@@ -1874,16 +2358,16 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
   async function copyFailureDetails(failure: DistillFailure) {
     const text = [
       `${failure.summary} · ${failure.stage}`,
-      failure.code ? `错误码：${failure.code}` : '',
+      failure.code ? t('distillPage.failure.codeLine', { code: failure.code }) : '',
       failure.detail,
     ]
       .filter(Boolean)
       .join('\n');
     try {
       await copyTextToClipboard(text);
-      notify.success('错误详情已复制');
+      notify.successText(t('distillPage.toast.failureCopied'));
     } catch {
-      notify.error('复制错误详情失败');
+      notify.error(t('distillPage.error.copyFailure'));
     }
   }
 
@@ -1931,9 +2415,15 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
     );
   }
 
-  function finishStream(controller: AbortController) {
+  function finishStream(
+    controller: AbortController,
+    context: Pick<TenantSessionContextValue, 'signal' | 'isCurrentGeneration'> | null | undefined,
+    generation: number | undefined,
+  ) {
     if (abortRef.current === controller) abortRef.current = null;
-    setLoading(false);
+    if (isCurrentTenantRequest(context, generation, controller.signal)) {
+      setLoading(false);
+    }
   }
 
   function createHistorySnapshot(): DistillHistorySnapshot {
@@ -2000,7 +2490,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
     setTextDiffs([]);
     updateMessage(pendingChange.assistantId, undefined, { actionState: 'confirmed' });
     setPendingChange(null);
-    if (showToast) notify.success('已确认改写');
+    if (showToast) notify.successText(t('distillPage.toast.confirmedRewrite'));
   }
 
   function rejectPendingChange() {
@@ -2012,7 +2502,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
     setTextDiffs([]);
     updateMessage(pendingChange.assistantId, undefined, { actionState: 'rejected' });
     setPendingChange(null);
-    notify.info('已拒绝改写并还原');
+    notify.info(t('distillPage.toast.rejectedRewrite'));
   }
 
   function requestEditHistoryMessage(item: ChatItem, index: number) {
@@ -2024,9 +2514,9 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
     const text = visibleChatContent(item);
     try {
       await navigator.clipboard.writeText(text);
-      notify.success('已复制');
+      notify.successText(t('common.toast.copied'));
     } catch {
-      notify.error('复制失败');
+      notify.error(t('common.toast.copyFailed'));
     }
   }
 
@@ -2066,8 +2556,15 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
     displayText: string,
     outgoingText: string,
   ) {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
+    const controller = new AbortController();
+    rerunControllerRef.current?.abort();
+    rerunControllerRef.current = controller;
     try {
-      await rollbackPersistedOperations(snapshot, operations);
+      await rollbackPersistedOperations(snapshot, operations, context, generation, controller.signal);
+      if (!isCurrentTenantRequest(context, generation, controller.signal)) return;
       const snapshotLockedSkillId = snapshot.loadedSkill?.skill_id || lockedSkillId;
       const confirmedDraft = lockNullableSkillIdForDraft(snapshot.pendingChange?.nextDraft || snapshot.draft, snapshotLockedSkillId);
       restoreHistorySnapshot({
@@ -2089,51 +2586,76 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
       const nextMessages = [...previousMessages, editedUser];
       setMessages(nextMessages);
       setEditingMessage(null);
+      if (!isCurrentTenantRequest(context, generation, controller.signal)) return;
       if (!confirmedDraft) {
         await createDraftFromText(outgoingText);
         return;
       }
       await rewriteSelectedTarget(outgoingText, confirmedDraft, undefined, undefined, nextMessages);
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '回退失败');
+      if (!isCurrentTenantRequest(context, generation, controller.signal)) return;
+      notify.error(apiErrorMessage(error, 'distillPage.error.rollback', { t }));
+    } finally {
+      if (rerunControllerRef.current === controller) rerunControllerRef.current = null;
     }
   }
 
   async function rollbackPersistedOperations(
     snapshot: DistillHistorySnapshot,
     operations: DistillHistoryOperation[],
+    context: TenantSessionContextValue | null | undefined = tenantContext,
+    generation: number | undefined = context?.generation,
+    requestSignal?: AbortSignal,
   ) {
+    if (!context || generation === undefined) return;
+    const isCurrent = () => isCurrentTenantRequest(context, generation, requestSignal);
     const toolOps = operations.filter((operation) => operation.kind === 'tool_add' && operation.toolId);
     for (const operation of toolOps) {
+      if (!isCurrent()) return;
       try {
-        await api.delete(`/api/enterprise/tools/${encodeURIComponent(String(operation.toolId))}?tenant_id=${TENANT_ID}${agentQuery}`);
-      } catch {
+        await tenantClient.delete(
+          `/api/enterprise/tools/${encodeURIComponent(String(operation.toolId))}?tenant_id=${tenantId}${agentQuery}`,
+          undefined,
+          { signal: requestSignal },
+        );
+      } catch (error) {
+        if (!isCurrent()) return;
         // Tool may already have been removed. Local state is restored from the snapshot below.
       }
     }
 
     const versionOps = operations.filter((operation) => operation.kind === 'version_save' && operation.skillId);
     for (const operation of versionOps) {
+      if (!isCurrent()) return;
       const skillId = String(operation.skillId);
       if (snapshot.loadedSkill) {
-        await api.put<SkillRead>(`/api/enterprise/skills/${encodeURIComponent(snapshot.loadedSkill.skill_id)}${agentOnlyQuery}`, {
-          tenant_id: TENANT_ID,
+        await tenantClient.put<SkillRead>(`/api/enterprise/skills/${encodeURIComponent(snapshot.loadedSkill.skill_id)}${agentOnlyQuery}`, {
+          tenant_id: tenantId,
           content: snapshot.loadedSkill.content,
           status: snapshot.loadedSkill.status,
-        });
+        }, { signal: requestSignal });
+        if (!isCurrent()) return;
         if (operation.version && operation.version !== snapshot.loadedSkill.version) {
           try {
-            await api.delete(
-              `/api/enterprise/skills/${encodeURIComponent(skillId)}/versions/${encodeURIComponent(operation.version)}?tenant_id=${TENANT_ID}${agentQuery}`,
+            await tenantClient.delete(
+              `/api/enterprise/skills/${encodeURIComponent(skillId)}/versions/${encodeURIComponent(operation.version)}?tenant_id=${tenantId}${agentQuery}`,
+              undefined,
+              { signal: requestSignal },
             );
-          } catch {
+          } catch (error) {
+            if (!isCurrent()) return;
             // A saved version may be shared with current state or already removed. The active draft has been restored.
           }
         }
       } else {
         try {
-          await api.delete(`/api/enterprise/skills/${encodeURIComponent(skillId)}?tenant_id=${TENANT_ID}${agentQuery}`);
-        } catch {
+          await tenantClient.delete(
+            `/api/enterprise/skills/${encodeURIComponent(skillId)}?tenant_id=${tenantId}${agentQuery}`,
+            undefined,
+            { signal: requestSignal },
+          );
+        } catch (error) {
+          if (!isCurrent()) return;
           // If the skill was not persisted, there is nothing else to roll back.
         }
       }
@@ -2193,7 +2715,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
     animationTimersRef.current = [];
   }
 
-  const pageTitle = mode === 'create' && !skillId ? '新建 SOP' : '编辑 SOP';
+  const pageTitle = mode === 'create' && !skillId ? t('distillPage.page.createTitle') : t('distillPage.page.editTitle');
 
   return (
     <div className={DISTILL_PAGE_CLASS}>
@@ -2201,7 +2723,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
       <div className={DISTILL_ACTIONS_CLASS}>
         <UIButton variant="outline" className={RETURN_BUTTON_CLASS} onClick={() => navigate('/enterprise/skills')}>
           <ArrowLeftOutlined />
-          返回
+          {t('common.action.back')}
         </UIButton>
       </div>
       <div className={WORKBENCH_CLASS}>
@@ -2213,14 +2735,14 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
             flowFullscreen && flowAssistantPanelOpen && CHAT_CARD_FULLSCREEN_CLASS,
           )}
           bodyClassName={CHAT_CARD_BODY_CLASS}
-          title={flowFullscreen ? 'AI 修改' : '对话蒸馏'}
+          title={flowFullscreen ? t('distillPage.panel.aiEdit') : t('distillPage.panel.chatDistill')}
           extra={flowFullscreen && flowAssistantPanelOpen ? (
             <UIButton
               variant="ghost"
               size="icon"
               className="size-7 rounded-[8px] text-[#858b9c] hover:bg-[#f1f3f6] hover:text-[#18181a]"
-              aria-label="收起 AI 修改面板"
-              title="收起 AI 修改面板"
+              aria-label={t('distillPage.panel.collapseAi')}
+              title={t('distillPage.panel.collapseAi')}
               onClick={() => setFlowAssistantPanelOpen(false)}
             >
               <PanelLeftClose />
@@ -2232,7 +2754,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
           onDrop={handleDrop}
         >
           <div className={CHAT_PANEL_CLASS}>
-            {dragActive && <div className={CHAT_UPLOAD_DROP_HINT_CLASS}>松开上传文档</div>}
+            {dragActive && <div className={CHAT_UPLOAD_DROP_HINT_CLASS}>{t('distillPage.upload.dropHint')}</div>}
             <div className={CHAT_MESSAGES_CLASS} ref={chatMessagesRef}>
               {messages.map((item, index) => (
                 <div key={item.id} className={chatRowClass(item.role)}>
@@ -2251,7 +2773,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
                           onClick={() => toggleThinking(item.id)}
                         >
                           {item.thinking === 'running' ? <LoadingOutlined /> : <CheckOutlined />}
-                          <span>{item.thinking === 'running' ? '正在学习' : '学习记录'}</span>
+                          <span>{item.thinking === 'running' ? t('distillPage.thinking.running') : t('distillPage.thinking.history')}</span>
                           {item.thinkingOpen ? <DownOutlined /> : <RightOutlined />}
                         </button>
                         {item.thinkingOpen && (
@@ -2283,10 +2805,10 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
                         {item.failureOpen && (
                           <div className={CHAT_FAILURE_DETAILS_CLASS}>
                             <div className={CHAT_FAILURE_META_CLASS}>
-                              <span className={CHAT_FAILURE_LABEL_CLASS}>阶段</span>
+                              <span className={CHAT_FAILURE_LABEL_CLASS}>{t('distillPage.failure.stage')}</span>
                               <span className={CHAT_FAILURE_VALUE_CLASS}>{item.failure.stage}</span>
-                              <span className={CHAT_FAILURE_LABEL_CLASS}>错误码</span>
-                              <span className={CHAT_FAILURE_VALUE_CLASS}>{item.failure.code || '未提供'}</span>
+                              <span className={CHAT_FAILURE_LABEL_CLASS}>{t('distillPage.failure.code')}</span>
+                              <span className={CHAT_FAILURE_VALUE_CLASS}>{item.failure.code || t('distillPage.failure.codeMissing')}</span>
                             </div>
                             <pre className={CHAT_FAILURE_RAW_CLASS}>{item.failure.detail}</pre>
                             <button
@@ -2295,7 +2817,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
                               onClick={() => void copyFailureDetails(item.failure!)}
                             >
                               <CopyGlyph />
-                              复制错误详情
+                              {t('distillPage.failure.copy')}
                             </button>
                           </div>
                         )}
@@ -2337,9 +2859,9 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
                           }}
                         />
                         <div className={CHAT_EDIT_ACTIONS_CLASS}>
-                          <UIButton variant="outline" onClick={cancelEditingMessage}>取消</UIButton>
+                          <UIButton variant="outline" onClick={cancelEditingMessage}>{t('common.action.cancel')}</UIButton>
                           <UIButton onClick={submitEditingMessage} disabled={!(editingMessage?.text || '').trim()}>
-                            发送
+                            {t('common.action.send')}
                           </UIButton>
                         </div>
                       </div>
@@ -2355,18 +2877,18 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
                             {visibleChatContent(item)}
                           </div>
                         ) : item.role === 'assistant' && item.thinking === 'running' ? null : item.role === 'assistant' ? (
-                          '正在处理...'
+                          t('distillPage.status.processingEllipsis')
                         ) : null}
                         {item.role === 'user' && (
                           <div className={CHAT_HOVER_ACTIONS_CLASS}>
                             <span className={CHAT_TIME_CLASS}>{formatMessageTime(item.createdAt)}</span>
-                            <button type="button" className={CHAT_HOVER_BUTTON_CLASS} title="复制" onClick={() => void copyHistoryMessage(item)}>
+                            <button type="button" className={CHAT_HOVER_BUTTON_CLASS} title={t('common.action.copy')} onClick={() => void copyHistoryMessage(item)}>
                               <CopyGlyph />
                             </button>
                             <button
                               type="button"
                               className={CHAT_HOVER_BUTTON_CLASS}
-                              title="修改"
+                              title={t('common.action.edit')}
                               onClick={() => requestEditHistoryMessage(item, index)}
                               disabled={loading}
                             >
@@ -2383,7 +2905,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
                         <div className={CHAT_WARNING_CLASS}>
                           <div className={CHAT_WARNING_TITLE_CLASS}>
                             <WarningOutlined />
-                            <span>提示</span>
+                            <span>{t('distillPage.warning.title')}</span>
                           </div>
                           {warnings.map((warning, index) => (
                             <div key={`${item.id}_warning_${index}`} className={CHAT_WARNING_ITEM_CLASS} title={warning.title}>
@@ -2414,13 +2936,13 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
                                   {suggestion.reason || suggestion.description || suggestion.name}
                                 </div>
                                 <div className={TOOL_SUGGESTION_META_CLASS}>
-                                  <span className={TOOL_METHOD_CLASS}>{suggestion.method || 'POST'}</span>
-                                  <span>{suggestion.url || '-'}</span>
+                                  <span className={TOOL_METHOD_CLASS}><RawIdentifier value={suggestion.method || 'POST'} /></span>
+                                  <span>{suggestion.url ? <RawIdentifier value={suggestion.url} /> : t('distillPage.placeholder.none')}</span>
                                 </div>
                               </div>
                               <div className={TOOL_SUGGESTION_ACTIONS_CLASS}>
                                 <span className={cn(TOOL_ACTION_GROUP_CLASS, TOOL_ACTION_GROUP_DETAIL_CLASS)}>
-                                  <SimpleTooltip title="查看详情">
+                                  <SimpleTooltip title={t('distillPage.tool.viewDetails')}>
                                     <UIButton
                                       className={TOOL_ACTION_BUTTON_CLASS}
                                       variant="ghost"
@@ -2433,7 +2955,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
                                 </span>
                                 {canResolveSuggestion && (
                                   <span className={TOOL_ACTION_GROUP_CLASS}>
-                                    <SimpleTooltip title="确认新增">
+                                    <SimpleTooltip title={t('distillPage.tool.confirmCreate')}>
                                       <UIButton
                                         className={cn(TOOL_ACTION_BUTTON_CLASS, TOOL_ACTION_CONFIRM_CLASS)}
                                         variant="ghost"
@@ -2444,7 +2966,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
                                         <CheckCircleOutlined />
                                       </UIButton>
                                     </SimpleTooltip>
-                                    <SimpleTooltip title="拒绝">
+                                    <SimpleTooltip title={t('distillPage.tool.reject')}>
                                       <UIButton
                                         className={cn(TOOL_ACTION_BUTTON_CLASS, TOOL_ACTION_REJECT_CLASS)}
                                         variant="ghost"
@@ -2465,15 +2987,15 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
                     {item.actionState === 'pending' && (
                       <div className={CHAT_CONFIRM_CLASS}>
                         <UIButton size="sm" onClick={() => confirmPendingChange()}>
-                          确认
+                          {t('common.action.confirm')}
                         </UIButton>
                         <UIButton size="sm" variant="outline" onClick={rejectPendingChange}>
-                          拒绝
+                          {t('common.action.reject')}
                         </UIButton>
                       </div>
                     )}
-                    {item.actionState === 'confirmed' && <div className={CHAT_DECISION_CLASS}>已确认</div>}
-                    {item.actionState === 'rejected' && <div className={CHAT_DECISION_CLASS}>已拒绝</div>}
+                    {item.actionState === 'confirmed' && <div className={CHAT_DECISION_CLASS}>{t('distillPage.decision.confirmed')}</div>}
+                    {item.actionState === 'rejected' && <div className={CHAT_DECISION_CLASS}>{t('distillPage.decision.rejected')}</div>}
                   </div>
                 </div>
               ))}
@@ -2487,9 +3009,9 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
                       <FileTextOutlined />
                       <span className={UPLOAD_NAME_CLASS}>{attachment.name}</span>
                       <span className={UPLOAD_STATUS_CLASS}>
-                        {attachment.status === 'uploading' && '读取中'}
-                        {attachment.status === 'ready' && '已读取'}
-                        {attachment.status === 'error' && (attachment.error || '读取失败')}
+                        {attachment.status === 'uploading' && t('distillPage.upload.reading')}
+                        {attachment.status === 'ready' && t('distillPage.upload.ready')}
+                        {attachment.status === 'error' && (attachment.error || t('distillPage.error.readFile'))}
                       </span>
                       <UIButton
                         size="icon"
@@ -2516,8 +3038,8 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
                 rows={4}
                 placeholder={
                   draft
-                    ? '说明你要如何改写右侧选中的部分'
-                    : '输入或粘贴需要整理的 SOP 流程说明'
+                    ? t('distillPage.input.rewritePlaceholder')
+                    : t('distillPage.input.createPlaceholder')
                 }
               />
               <div className={cn(CHAT_ACTIONS_CLASS, flowFullscreen && 'flex-nowrap gap-[6px]')}>
@@ -2544,7 +3066,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
                     >
                       <span>
                         <UploadOutlined />
-                        {flowFullscreen ? '上传' : '上传文件'}
+                        {flowFullscreen ? t('common.action.upload') : t('distillPage.upload.button')}
                       </span>
                     </UIButton>
                   </label>
@@ -2555,7 +3077,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
                       onClick={stopStream}
                     >
                       <StopOutlined />
-                      停止
+                      {t('common.action.stop')}
                     </UIButton>
                   )}
                   <ModelConfigDropdown
@@ -2563,7 +3085,10 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
                     value={selectedRewriteModelId}
                     onChange={(modelId) => {
                       setSelectedRewriteModelId(modelId);
-                      window.localStorage.setItem(`${DISTILL_REWRITE_MODEL_STORAGE_KEY}:${TENANT_ID}`, modelId);
+                      window.localStorage.setItem(
+                        tenantUserStorageKey(tenantId, userId, DISTILL_REWRITE_MODEL_STORAGE_KEY),
+                        modelId,
+                      );
                     }}
                     buttonClassName={cn(
                       REWRITE_MODEL_BUTTON_CLASS,
@@ -2577,7 +3102,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
                     onClick={() => void send()}
                   >
                     {loading ? <LoadingOutlined className="animate-spin" /> : <SendOutlined />}
-                    发送
+                    {t('common.action.send')}
                   </UIButton>
                 </div>
               </div>
@@ -2588,13 +3113,13 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
         <DistillSectionCard
           className={cn(SOURCE_CARD_CLASS, 'h-full min-h-0')}
           bodyClassName={DISTILL_CARD_BODY_CLASS}
-          title={viewMode === 'source' ? '源码' : '流程图'}
+          title={viewMode === 'source' ? t('distillPage.panel.source') : t('distillPage.panel.flow')}
           extra={
             <div className="flex flex-wrap justify-end gap-[8px]">
               <UIButton variant="outline" className={CARD_OUTLINE_BUTTON_CLASS} disabled={loading} onClick={handleClearClick}>
-                清空
+                {t('common.action.clear')}
               </UIButton>
-              <SimpleTooltip title={draft && !hasSaveableDraftChanges ? '当前没有内容变化' : ''}>
+              <SimpleTooltip title={draft && !hasSaveableDraftChanges ? t('distillPage.toast.noDraftChanges') : ''}>
                 <UIButton
                   variant="outline"
                   className={CARD_OUTLINE_BUTTON_CLASS}
@@ -2602,7 +3127,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
                   onClick={() => openSaveReview()}
                 >
                   <SaveOutlined />
-                  保存草稿
+                  {t('distillPage.action.saveDraft')}
                 </UIButton>
               </SimpleTooltip>
             </div>
@@ -2616,18 +3141,18 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
                 onClick={() => setViewMode(viewMode === 'source' ? 'flow' : 'source')}
               >
                 {viewMode === 'source' ? <BranchesOutlined /> : <CodeOutlined />}
-                {viewMode === 'source' ? '显示流程' : '显示源码'}
+                {viewMode === 'source' ? t('distillPage.action.showFlow') : t('distillPage.action.showSource')}
               </UIButton>
               <UIButton variant="outline" className={CARD_OUTLINE_BUTTON_CLASS} disabled={!draft} onClick={toggleAllTargets}>
-                {allSelected ? '清空选择' : '全选'}
+                {allSelected ? t('distillPage.action.clearSelection') : t('distillPage.action.selectAll')}
               </UIButton>
             </div>
           </div>
           {!draft ? (
             <div className={SOURCE_EMPTY_STATE_CLASS}>
               <FileTextOutlined className="text-[28px] text-[#c0c6d4]" />
-              <p className={SOURCE_EMPTY_TEXT_CLASS}>暂无 SOP 草稿</p>
-              <p className="text-[12px] leading-[18px] text-[#c0c6d4]">在左侧输入说明或上传文档后开始生成</p>
+              <p className={SOURCE_EMPTY_TEXT_CLASS}>{t('distillPage.empty.noDraft')}</p>
+              <p className="text-[12px] leading-[18px] text-[#c0c6d4]">{t('distillPage.empty.createHint')}</p>
             </div>
           ) : viewMode === 'source' ? (
             <SkillSource
@@ -2680,11 +3205,11 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
       <KDialog
         open={clearConfirmOpen}
         onOpenChange={(open) => !open && setClearConfirmOpen(false)}
-        title="清空前是否保存？"
+        title={t('distillPage.clearDialog.title')}
         width={520}
         footer={
           <div className="flex flex-wrap justify-end gap-[8px]">
-            <UIButton variant="outline" onClick={() => setClearConfirmOpen(false)}>取消</UIButton>
+            <UIButton variant="outline" onClick={() => setClearConfirmOpen(false)}>{t('common.action.cancel')}</UIButton>
             <UIButton
               variant="outline"
               onClick={() => {
@@ -2692,7 +3217,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
                 clearDistillWorkspace();
               }}
             >
-              不保存清空
+              {t('distillPage.clearDialog.clearWithoutSave')}
             </UIButton>
             <UIButton
               onClick={() => {
@@ -2700,45 +3225,45 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
                 openSaveReview({ clearAfterSave: true });
               }}
             >
-              保存并清空
+              {t('distillPage.clearDialog.saveAndClear')}
             </UIButton>
           </div>
         }
       >
         <p className="m-0 text-[14px] leading-[22px] text-foreground">
-          检测到当前 SOP 有未保存变更。你可以先保存当前内容；清空后会进入新的 SOP 草稿工作台，不会把原 SOP 替换为空。
+          {t('distillPage.clearDialog.description')}
         </p>
       </KDialog>
       <KDialog
         open={saveReviewOpen}
         onOpenChange={(open) => !open && closeSaveReview()}
-        title="保存SOP版本"
+        title={t('distillPage.saveDialog.title')}
         width={820}
         footer={
           <div className="flex flex-wrap justify-end gap-[8px]">
-            <UIButton variant="outline" onClick={closeSaveReview}>取消</UIButton>
-            <UIButton disabled={!saveReviewHasContentChanges} onClick={() => void saveDraft()}>保存</UIButton>
+            <UIButton variant="outline" onClick={closeSaveReview}>{t('common.action.cancel')}</UIButton>
+            <UIButton disabled={!saveReviewHasContentChanges} onClick={() => void saveDraft()}>{t('common.action.save')}</UIButton>
           </div>
         }
       >
         <div className={SAVE_REVIEW_FORM_CLASS}>
           <label className={SAVE_REVIEW_FORM_LABEL_CLASS}>
-            <span>SOP名称</span>
+            <span>{t('distillPage.saveDialog.name')}</span>
             <Input value={saveName} onChange={(event) => setSaveName(event.target.value)} />
           </label>
           <label className={SAVE_REVIEW_FORM_LABEL_CLASS}>
-            <span>业务域</span>
+            <span>{t('distillPage.saveDialog.domain')}</span>
             <Input value={saveDomain} onChange={(event) => setSaveDomain(event.target.value)} />
           </label>
           <label className={SAVE_REVIEW_FORM_LABEL_CLASS}>
-            <span>版本号</span>
+            <span>{t('distillPage.saveDialog.version')}</span>
             <Input value={saveVersion} disabled={!saveReviewHasContentChanges} onChange={(event) => setSaveVersion(event.target.value)} />
           </label>
         </div>
         <div className={SAVE_REVIEW_DIFF_CLASS}>
-          <strong className="text-[13px] font-semibold text-foreground">本轮修改 diff</strong>
+          <strong className="text-[13px] font-semibold text-foreground">{t('distillPage.saveDialog.diffTitle')}</strong>
           {saveReviewDiffs.length === 0 ? (
-            <EmptyState description="暂无结构差异" />
+            <EmptyState description={t('distillPage.saveDialog.noDiff')} />
           ) : (
             saveReviewDiffs.map((diff) => (
               <div key={diff.key} className={SAVE_REVIEW_DIFF_ROW_CLASS}>
@@ -2752,20 +3277,20 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
       <KDialog
         open={Boolean(toolDetail)}
         onOpenChange={(open) => !open && setToolDetail(null)}
-        title="工具详情"
+        title={t('distillPage.toolDialog.title')}
         width={1040}
         footer={
           <div className={cn(TOOL_SUGGESTION_DETAIL_FOOTER_CLASS, "flex flex-wrap justify-end gap-[8px]")}>
-            <UIButton variant="outline" onClick={() => setToolDetail(null)}>关闭</UIButton>
+            <UIButton variant="outline" onClick={() => setToolDetail(null)}>{t('common.action.close')}</UIButton>
             {toolDetail && toolSuggestionResolution(toolDetail) === 'new_candidate' && (
               <>
-                <UIButton variant="outline" onClick={applyProbeArgumentsFromDetail}>应用样例参数</UIButton>
+                <UIButton variant="outline" onClick={applyProbeArgumentsFromDetail}>{t('distillPage.toolDialog.applyProbeArgs')}</UIButton>
                 <UIButton
                   disabled={toolDetail?.probeStatus === 'probing'}
                   onClick={probeToolDetail}
                 >
                   {toolDetail?.probeStatus === 'probing' ? <LoadingOutlined className="animate-spin" /> : <ApiOutlined />}
-                  {toolDetail?.probe_result ? '再次测试' : '测试接口'}
+                  {toolDetail?.probe_result ? t('distillPage.toolDialog.retest') : t('distillPage.toolDialog.test')}
                 </UIButton>
               </>
             )}
@@ -2774,31 +3299,31 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
       >
         {toolDetail && (
           <div className={TOOL_SUGGESTION_DETAIL_CLASS}>
-            <div><strong>解析状态：</strong>{toolSuggestionResolutionLabel(toolDetail)}</div>
+            <div><strong>{t('distillPage.toolDialog.resolutionStatus')}</strong>{toolSuggestionResolutionLabel(toolDetail)}</div>
             {toolDetail.matched_tool_name && (
-              <div><strong>匹配工具：</strong>{toolDetail.matched_tool_display_name || toolDetail.matched_tool_name}</div>
+              <div><strong>{t('distillPage.toolDialog.matchedTool')}</strong>{toolDetail.matched_tool_display_name ? <RawContent value={toolDetail.matched_tool_display_name} /> : <RawIdentifier value={toolDetail.matched_tool_name} />}</div>
             )}
-            <div><strong>工具名：</strong>{toolDetail.name}</div>
-            <div><strong>显示名：</strong>{toolDetail.display_name || '-'}</div>
-            <div><strong>说明：</strong>{toolDetail.description || '-'}</div>
-            <div><strong>方法：</strong>{toolDetail.method}</div>
-            <div><strong>URL：</strong>{toolDetail.url}</div>
-            {toolDetail.missing_reason && <div><strong>缺失原因：</strong>{toolDetail.missing_reason}</div>}
-            <div><strong>原因：</strong>{toolDetail.reason || '-'}</div>
-            <div><strong>来源：</strong>{toolDetail.source_excerpt || '-'}</div>
-            <strong className="text-[13px] font-semibold text-foreground">样例参数</strong>
+            <div><strong>{t('distillPage.toolDialog.toolName')}</strong><RawIdentifier value={toolDetail.name} /></div>
+            <div><strong>{t('distillPage.toolDialog.displayName')}</strong>{toolDetail.display_name ? <RawContent value={toolDetail.display_name} /> : t('distillPage.placeholder.none')}</div>
+            <div><strong>{t('distillPage.toolDialog.description')}</strong>{toolDetail.description ? <RawContent value={toolDetail.description} /> : t('distillPage.placeholder.none')}</div>
+            <div><strong>{t('distillPage.toolDialog.method')}</strong><RawIdentifier value={toolDetail.method} /></div>
+            <div><strong>{t('distillPage.toolDialog.url')}</strong><RawIdentifier value={toolDetail.url} /></div>
+            {toolDetail.missing_reason && <div><strong>{t('distillPage.toolDialog.missingReason')}</strong><RawContent value={toolDetail.missing_reason} /></div>}
+            <div><strong>{t('distillPage.toolDialog.reason')}</strong>{toolDetail.reason ? <RawContent value={toolDetail.reason} /> : t('distillPage.placeholder.none')}</div>
+            <div><strong>{t('distillPage.toolDialog.sourceExcerpt')}</strong>{toolDetail.source_excerpt ? <RawContent value={toolDetail.source_excerpt} /> : t('distillPage.placeholder.none')}</div>
+            <strong className="text-[13px] font-semibold text-foreground">{t('distillPage.toolDialog.probeArgs')}</strong>
             <Textarea
               value={probeArgsText}
               rows={5}
               onChange={(event) => setProbeArgsText(event.target.value)}
             />
-            <strong className="text-[13px] font-semibold text-foreground">输入 Schema</strong>
+            <strong className="text-[13px] font-semibold text-foreground">{t('distillPage.toolDialog.inputSchema')}</strong>
             <pre className={TOOL_SUGGESTION_DETAIL_PRE_CLASS}>{JSON.stringify(toolDetail.input_schema || {}, null, 2)}</pre>
-            <strong className="text-[13px] font-semibold text-foreground">输出 Schema</strong>
+            <strong className="text-[13px] font-semibold text-foreground">{t('distillPage.toolDialog.outputSchema')}</strong>
             <pre className={TOOL_SUGGESTION_DETAIL_PRE_CLASS}>{JSON.stringify(toolDetail.output_schema || {}, null, 2)}</pre>
             {toolDetail.probe_result && (
               <>
-                <strong className="text-[13px] font-semibold text-foreground">测试结果</strong>
+                <strong className="text-[13px] font-semibold text-foreground">{t('distillPage.toolDialog.result')}</strong>
                 <pre className={TOOL_SUGGESTION_DETAIL_PRE_CLASS}>{JSON.stringify(toolDetail.probe_result, null, 2)}</pre>
               </>
             )}
@@ -2811,7 +3336,8 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
           onOpenChange={(open) => !open && setClearNewConfirm(null)}
           title={clearNewConfirm.title}
           description={clearNewConfirm.description}
-          confirmText="清空"
+          confirmText={t('common.action.clear')}
+          cancelText={t('common.action.cancel')}
           destructive={false}
           onConfirm={() => {
             setClearNewConfirm(null);
@@ -2823,12 +3349,13 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
         <ConfirmDialog
           open
           onOpenChange={(open) => !open && setRerunConfirm(null)}
-          title="重新编辑这条消息？"
-          confirmText="确认回退"
+          title={t('distillPage.rerunDialog.title')}
+          confirmText={t('distillPage.rerunDialog.confirm')}
+          cancelText={t('common.action.cancel')}
           destructive={false}
           description={
             <div>
-              <p className="m-0 mb-[8px]">重新编辑会回到这条消息发送前的 SOP 草稿，并截断之后的推理记录。</p>
+              <p className="m-0 mb-[8px]">{t('distillPage.rerunDialog.description')}</p>
               <div className="rollback-operation-list flex flex-wrap gap-[6px]">
                 {rerunConfirm.rollbackOperations.map((operation, operationIndex) => (
                   <DistillTag key={`${operation.kind}_${operationIndex}`}>{operation.label}</DistillTag>
@@ -3068,7 +3595,7 @@ function SourceNumberInput({
 function ActionCombobox({
   value,
   options,
-  placeholder = '选择一个动作',
+  placeholder,
   onSelect,
 }: {
   value?: string;
@@ -3076,8 +3603,10 @@ function ActionCombobox({
   placeholder?: string;
   onSelect: (value: string) => void;
 }) {
+  const { t } = useDistillIntl();
   const [open, setOpen] = useState(true);
   const [query, setQuery] = useState('');
+  const resolvedPlaceholder = placeholder || t('distillPage.actionPicker.placeholder');
   const normalizedQuery = query.trim().toLowerCase();
   const filtered = normalizedQuery
     ? options.filter(
@@ -3103,7 +3632,7 @@ function ActionCombobox({
           className={SOURCE_ACTION_SELECT_CLASS}
           autoFocus
           value={query}
-          placeholder={placeholder}
+          placeholder={resolvedPlaceholder}
           onChange={(event) => {
             setQuery(event.target.value);
             setOpen(true);
@@ -3125,7 +3654,7 @@ function ActionCombobox({
         className="z-[130] max-h-[280px] w-[320px] overflow-y-auto p-[4px]"
       >
         {filtered.length === 0 ? (
-          <div className="px-[10px] py-[12px] text-center text-[13px] text-[#858b9c]">无匹配动作</div>
+          <div className="px-[10px] py-[12px] text-center text-[13px] text-[#858b9c]">{t('distillPage.actionPicker.empty')}</div>
         ) : (
           filtered.map((option) => (
             <button
@@ -3213,6 +3742,7 @@ function SkillSource({
   onToggle: (target: TargetSelection) => void;
   onEdit: (nextDraft: SkillCard, path: string) => void;
 }) {
+  const { t } = useDistillIntl();
   const [deleteNodeIndex, setDeleteNodeIndex] = useState<number | null>(null);
 
   function editBasic(
@@ -3256,14 +3786,14 @@ function SkillSource({
       const previousId = String(currentNode.node_id || currentNode.step_id || `node_${index + 1}`);
       const nextId = String(listValue || '').trim();
       if (!nextId) {
-        notify.warning('节点 ID 不能为空');
+        notify.warning(t('distillPage.node.idRequired'));
         return;
       }
       const duplicated = next.nodes.some((node, nodeIndex) => (
         nodeIndex !== index && String(node?.node_id || node?.step_id || '') === nextId
       ));
       if (duplicated) {
-        notify.warning(`节点 ID「${nextId}」已经存在`);
+        notify.warning(t('distillPage.node.idDuplicate', { id: nextId }));
         return;
       }
       currentNode.node_id = nextId;
@@ -3278,7 +3808,13 @@ function SkillSource({
       onEdit(next, stepTargetPath(index));
       return;
     }
-    if (CAPABILITY_REFERENCE_FIELDS.includes(nodeField)) {
+    if (nodeField === 'assignee_user_id') {
+      const { userId, channel } = parseHandoffAssigneeValue(String(listValue));
+      currentNode.assignee_user_id = userId || null;
+      currentNode.assignee_notify_channel = userId ? channel : null;
+    } else if (nodeField === 'type') {
+      applyNodeTypeChange(currentNode, String(listValue));
+    } else if (CAPABILITY_REFERENCE_FIELDS.includes(nodeField)) {
       const currentRefs = nodeCapabilityRefs(currentNode);
       currentNode.capability_refs = updateCapabilityRefs(
         currentRefs,
@@ -3326,7 +3862,7 @@ function SkillSource({
         next_node_id: targetId,
         condition: '',
         priority,
-        label: targetId ? '新增流转' : '',
+        label: targetId ? t('distillPage.flow.newEdge') : '',
       },
     ];
     onEdit(next, stepTargetPath(index));
@@ -3355,8 +3891,8 @@ function SkillSource({
     const newNode = {
       node_id: newNodeId,
       type: 'collect_info',
-      name: '新增节点',
-      instruction: '说明这个节点要完成的目标。',
+      name: t('distillPage.node.newName'),
+      instruction: t('distillPage.node.newInstruction'),
       optional: false,
       condition: '',
       expected_user_info: [],
@@ -3387,7 +3923,7 @@ function SkillSource({
           edges[edgeIndex] = {
             ...edges[edgeIndex],
             next_node_id: newNodeId,
-            label: String(edges[edgeIndex].label || '').trim() || '进入新增节点',
+            label: String(edges[edgeIndex].label || '').trim() || t('distillPage.flow.enterNewNode'),
           };
         });
         const maxPriority = Math.max(...directEdgeIndexes.map((edgeIndex, localIndex) => edgePriority(edges[edgeIndex], localIndex)));
@@ -3396,7 +3932,7 @@ function SkillSource({
           next_node_id: targetId,
           condition: '',
           priority: maxPriority + 1,
-          label: `继续到 ${String(targetNode?.name || targetId)}`,
+          label: t('distillPage.flow.continueToNode', { name: String(targetNode?.name || targetId) }),
         });
       } else {
         const sourcePriority = edges
@@ -3407,14 +3943,14 @@ function SkillSource({
           next_node_id: newNodeId,
           condition: '',
           priority: sourcePriority,
-          label: '进入新增节点',
+          label: t('distillPage.flow.enterNewNode'),
         });
         edges.push({
           source_node_id: newNodeId,
           next_node_id: targetId,
           condition: '',
           priority: 1,
-          label: `继续到 ${String(targetNode?.name || targetId)}`,
+          label: t('distillPage.flow.continueToNode', { name: String(targetNode?.name || targetId) }),
         });
       }
     } else if (!sourceId && targetId) {
@@ -3423,7 +3959,7 @@ function SkillSource({
         next_node_id: targetId,
         condition: '',
         priority: 1,
-        label: `继续到 ${String(targetNode?.name || targetId)}`,
+        label: t('distillPage.flow.continueToNode', { name: String(targetNode?.name || targetId) }),
       });
       next.start_node_id = newNodeId;
     } else if (sourceId && !targetId) {
@@ -3435,7 +3971,7 @@ function SkillSource({
         next_node_id: newNodeId,
         condition: '',
         priority: sourcePriority,
-        label: '进入新增节点',
+        label: t('distillPage.flow.enterNewNode'),
       });
       const previousTerminalIds = asStringList(next.terminal_node_ids);
       next.terminal_node_ids = previousTerminalIds.length > 0
@@ -3456,7 +3992,7 @@ function SkillSource({
   function confirmDeleteNode(index: number) {
     const nodes = normalizeSkillNodes(skill);
     if (nodes.length <= 1) {
-      notify.warning('至少需要保留一个节点');
+      notify.warning(t('distillPage.node.minCount'));
       return;
     }
     setDeleteNodeIndex(index);
@@ -3496,12 +4032,12 @@ function SkillSource({
       <ConfirmDialog
         open
         onOpenChange={(open) => !open && setDeleteNodeIndex(null)}
-        title={`确认删除 Node ${index + 1}：${String(node.name || nodeId)}？`}
-        confirmText="确认删除"
+        title={t('distillPage.node.deleteTitle', { index: index + 1, name: String(node.name || nodeId) })}
+        confirmText={t('distillPage.node.deleteConfirm')}
         description={
           <div className={NODE_DELETE_CONFIRM_CLASS}>
-            <p>删除后会同时移除所有连接到这个节点、或从这个节点发出的流转规则。</p>
-            <strong>将受影响的连接</strong>
+            <p>{t('distillPage.node.deleteDescription')}</p>
+            <strong>{t('distillPage.node.deleteAffectedConnections')}</strong>
             <ul>
               {affected.length > 0 ? (
                 affected.map((edge, edgeIndex) => (
@@ -3509,11 +4045,11 @@ function SkillSource({
                     {nodeDisplayNameById(nodes, String(edge.source_node_id || ''))}
                     {' -> '}
                     {nodeDisplayNameById(nodes, String(edge.next_node_id || ''))}
-                    {String(edge.label || edge.condition || '').trim() ? `：${String(edge.label || edge.condition)}` : ''}
+                    {String(edge.label || edge.condition || '').trim() ? `: ${String(edge.label || edge.condition)}` : ''}
                   </li>
                 ))
               ) : (
-                <li>无直接连接关系</li>
+                <li>{t('distillPage.node.deleteNoConnections')}</li>
               )}
             </ul>
           </div>
@@ -3539,7 +4075,7 @@ function SkillSource({
     const nodeId = String(step.node_id || step.step_id || `node_${index + 1}`);
     return {
       value: nodeId,
-      label: `Node ${index + 1} · ${String(step.name || nodeId)}`,
+      label: t('distillPage.node.optionLabel', { index: index + 1, name: String(step.name || nodeId) }),
     };
   });
   const actionOptions = buildActionOptions(toolDescriptions, toolStatuses, steps);
@@ -3548,21 +4084,21 @@ function SkillSource({
     label: item.name || item.slug,
     description: item.description || item.slug,
     capabilityScope: item.capability_scope,
-    unavailableReason: item.status === 'published' ? undefined : '技能未启用',
+    unavailableReason: item.status === 'published' ? undefined : capabilityUnavailableReason('skill'),
   }));
   const toolOptions: CapabilityReferenceOption[] = tools.map((item) => ({
     value: item.id,
     label: item.display_name || item.name,
     description: item.description || item.name,
     capabilityScope: item.capability_scope,
-    unavailableReason: item.enabled ? undefined : '工具已停用',
+    unavailableReason: item.enabled ? undefined : capabilityUnavailableReason('tool'),
   }));
   const knowledgeBaseOptions: CapabilityReferenceOption[] = knowledgeBases.map((item) => ({
     value: item.id,
     label: item.name,
     description: item.description,
     capabilityScope: item.capability_scope,
-    unavailableReason: item.status === 'active' || item.status === 'published' ? undefined : '知识库已下线',
+    unavailableReason: item.status === 'active' || item.status === 'published' ? undefined : capabilityUnavailableReason('knowledgeBase'),
   }));
   const sopOptions: SelectOption[] = sopSkills
     .filter((item) => (
@@ -3575,22 +4111,16 @@ function SkillSource({
       label: `${item.name} · ${item.skill_id}`,
     }));
   const tenantUserOptions: SelectOption[] = [
-    { value: UNASSIGNED_USER_VALUE, label: '未指定（使用渠道默认）' },
-    ...tenantUsers.filter((user) => !user.source || user.source === 'web').map((user) => {
-      const channelLabel = user.channel_identities?.[0]
-        ? ` (${_CHANNEL_LABELS[user.channel_identities[0].channel] || user.channel_identities[0].channel})`
-        : '';
-      const name = user.display_name || user.username || user.id;
-      return { value: user.id, label: `${name}${channelLabel}` };
-    }),
+    { value: UNASSIGNED_USER_VALUE, label: unassignedHandoffUserLabel() },
+    ...handoffAssigneeUserOptions(tenantUsers),
   ];
 
   return (
     <div className={SOURCE_MD_CLASS} ref={containerRef}>
-      <div className={SOURCE_GROUP_TITLE_CLASS}>基础信息</div>
+      <div className={SOURCE_GROUP_TITLE_CLASS}>{t('distillPage.section.basic')}</div>
       <SelectableTarget
         className={distillSourceSectionClass('basic', selectedPaths, highlightedPaths, updatingPaths, dirtyPaths)}
-        target={{ path: 'basic', label: '基础信息' }}
+        target={{ path: 'basic', label: t('distillPage.section.basic') }}
         onToggle={onToggle}
       >
         {selectedPaths.includes('basic') && <span className={SELECTION_MARK_CLASS}><CheckOutlined /></span>}
@@ -3617,7 +4147,7 @@ function SkillSource({
               value={skill.step_timeout_seconds}
               min={1}
               max={3600}
-              placeholder="不单独限制"
+              placeholder={t('distillPage.placeholder.notRestricted')}
               onChange={(value) => editBasic('step_timeout_seconds', value)}
             />
             <EditableSourceListLine label={fieldLabel('trigger_intents')} values={skill.trigger_intents} onChange={(value) => editBasic('trigger_intents', value)} />
@@ -3628,12 +4158,12 @@ function SkillSource({
           </div>
         </div>
       </SelectableTarget>
-      <div className={SOURCE_GROUP_TITLE_CLASS}>详细节点</div>
+      <div className={SOURCE_GROUP_TITLE_CLASS}>{t('distillPage.section.nodes')}</div>
       <div className={SOURCE_STEPS_CLASS}>
         <div className={cn(NODE_INSERT_ROW_CLASS, NODE_INSERT_ROW_EDGE_CLASS)}>
           <UIButton variant="outline" size="sm" className={NODE_INSERT_BUTTON_CLASS} onClick={() => insertNodeBetween(-1)}>
             <PlusOutlined />
-            {steps.length > 0 ? '在最前新增节点' : '新增第一个节点'}
+            {steps.length > 0 ? t('distillPage.node.insertAtStart') : t('distillPage.node.insertFirst')}
           </UIButton>
         </div>
         {steps.map((step, index) => {
@@ -3641,27 +4171,27 @@ function SkillSource({
           const path = stepTargetPath(index);
           const outgoingEdges = edgeMap[stepId] || [];
           const isSubflow = String(step.type || '') === 'subflow';
-          const isHandoffNode =
-            String(step.type || '') === 'handoff' ||
-            asStringList(step.allowed_actions).includes('handoff_human');
-          const nodeState = [
-            stepId === startNodeId ? '起始节点' : '',
-            Boolean(step.optional) ? '可选' : '必选',
-            terminalNodeIds.has(stepId) ? '终止节点' : '流程节点',
-          ].filter(Boolean).join(' · ');
+          // 处理人仅对 handoff 节点有意义;转人工动作只允许出现在 handoff 节点上,
+          // 回复/收集等其他节点一律不展示处理人与转人工动作。
+          const isHandoffNode = String(step.type || '') === 'handoff';
+          const nodeState = nodeStateLabels({
+            isStart: stepId === startNodeId,
+            optional: Boolean(step.optional),
+            terminal: terminalNodeIds.has(stepId),
+          }).join(' · ');
           return (
             <div className={SOURCE_STEP_BLOCK_CLASS} key={path}>
               {index > 0 && (
                 <div className={NODE_INSERT_ROW_CLASS}>
                   <UIButton variant="outline" size="sm" className={NODE_INSERT_BUTTON_CLASS} onClick={() => insertNodeBetween(index - 1)}>
                     <PlusOutlined />
-                    在 Node {index} 和 Node {index + 1} 之间新增节点
+                    {t('distillPage.node.insertBetween', { previous: index, next: index + 1 })}
                   </UIButton>
                 </div>
               )}
               <SelectableTarget
                 className={distillSourceSectionClass(path, selectedPaths, highlightedPaths, updatingPaths, dirtyPaths)}
-                target={{ path, label: `节点 ${index + 1}：${step.name || stepId}` }}
+                target={{ path, label: indexedNodeTargetLabel(index, String(step.name || stepId)) }}
                 onToggle={onToggle}
               >
                 {selectedPaths.includes(path) && <span className={SELECTION_MARK_CLASS}><CheckOutlined /></span>}
@@ -3676,7 +4206,7 @@ function SkillSource({
                     <EditableSourceField>
                       <UIButton variant="destructive" size="sm" onClick={() => confirmDeleteNode(index)}>
                         <DeleteOutlined />
-                        删除节点
+                        {t('distillPage.node.deleteAction')}
                       </UIButton>
                     </EditableSourceField>
                   </div>
@@ -3685,34 +4215,41 @@ function SkillSource({
                     <EditableSourceSelectLine
                       label={fieldLabel('type')}
                       value={String(step.type || 'collect_info')}
-                      options={NODE_TYPE_OPTIONS}
+                      options={nodeTypeOptions()}
                       onChange={(value) => editStep(index, 'type', value)}
                     />
                     {isSubflow && (
                       <EditableSourceSelectLine
-                        label="调用子 SOP"
+                        label={t('distillPage.field.callSubSop')}
                         value={String(step.sub_sop_id || '')}
                         options={sopOptions}
                         onChange={(value) => editStep(index, 'sub_sop_id', value)}
                       />
                     )}
-                    <SourceReadonlyLine label="节点状态" value={nodeState} />
+                    <SourceReadonlyLine label={t('distillPage.field.nodeState')} value={nodeState} />
                     {isSubflow ? (
-                      <SourceReadonlyLine label="执行职责" value="仅进入所选子 SOP；父子流程共享当前 TaskFrame 字段。" />
+                      <SourceReadonlyLine label={t('distillPage.field.executionScope')} value={t('distillPage.subflow.executionSource')} />
                     ) : (
                       <>
                         <EditableSourceTextLine label={fieldLabel('instruction')} value={String(step.instruction || '')} multiline collapsible onChange={(value) => editStep(index, 'instruction', value)} />
                         <EditableSourceListLine label={fieldLabel('expected_user_info')} values={asStringList(step.expected_user_info)} onChange={(value) => editStep(index, 'expected_user_info', value)} />
-                        <EditableSourceActionLine values={asStringList(step.allowed_actions)} options={actionOptions} toolDescriptions={toolDescriptions} toolStatuses={toolStatuses} onChange={(value) => editStep(index, 'allowed_actions', value)} />
-                        <EditableCapabilityReferencesLine label="SOP 技能" values={asStringList(step.general_skill_ids)} requiredValues={asStringList(step.required_general_skill_ids)} options={generalSkillOptions} emptyText="未指定技能" onChange={(value) => editStep(index, 'general_skill_ids', value)} onRequiredChange={(value) => editStep(index, 'required_general_skill_ids', value)} />
-                        <EditableCapabilityReferencesLine label="SOP 工具" values={asStringList(step.tool_ids)} requiredValues={asStringList(step.required_tool_ids)} options={toolOptions} emptyText="未指定工具" onChange={(value) => editStep(index, 'tool_ids', value)} onRequiredChange={(value) => editStep(index, 'required_tool_ids', value)} />
-                        <EditableCapabilityReferencesLine label="SOP 知识库" values={asStringList(step.knowledge_base_ids)} requiredValues={asStringList(step.required_knowledge_base_ids)} options={knowledgeBaseOptions} emptyText="未指定知识库" onChange={(value) => editStep(index, 'knowledge_base_ids', value)} onRequiredChange={(value) => editStep(index, 'required_knowledge_base_ids', value)} />
+                        <EditableSourceActionLine values={asStringList(step.allowed_actions)} options={filterActionOptionsForNodeType(actionOptions, String(step.type || ''))} toolDescriptions={toolDescriptions} toolStatuses={toolStatuses} onChange={(value) => editStep(index, 'allowed_actions', value)} />
+                        <EditableCapabilityReferencesLine label={fieldLabel('general_skill_ids')} values={asStringList(step.general_skill_ids)} requiredValues={asStringList(step.required_general_skill_ids)} options={generalSkillOptions} emptyText={t('distillPage.capability.emptySkill')} onChange={(value) => editStep(index, 'general_skill_ids', value)} onRequiredChange={(value) => editStep(index, 'required_general_skill_ids', value)} />
+                        <EditableCapabilityReferencesLine label={fieldLabel('tool_ids')} values={asStringList(step.tool_ids)} requiredValues={asStringList(step.required_tool_ids)} options={toolOptions} emptyText={t('distillPage.capability.emptyTool')} onChange={(value) => editStep(index, 'tool_ids', value)} onRequiredChange={(value) => editStep(index, 'required_tool_ids', value)} />
+                        <EditableCapabilityReferencesLine label={fieldLabel('knowledge_base_ids')} values={asStringList(step.knowledge_base_ids)} requiredValues={asStringList(step.required_knowledge_base_ids)} options={knowledgeBaseOptions} emptyText={t('distillPage.capability.emptyKnowledgeBase')} onChange={(value) => editStep(index, 'knowledge_base_ids', value)} onRequiredChange={(value) => editStep(index, 'required_knowledge_base_ids', value)} />
                       </>
                     )}
                     {isHandoffNode && (
                       <EditableSourceSelectLine
-                        label="处理人"
-                        value={String(step.assignee_user_id || UNASSIGNED_USER_VALUE)}
+                        label={t('distillPage.field.assignee')}
+                        value={
+                          step.assignee_user_id
+                            ? formatHandoffAssigneeValue(
+                              String(step.assignee_user_id),
+                              String(step.assignee_notify_channel || ''),
+                            )
+                            : UNASSIGNED_USER_VALUE
+                        }
                         options={tenantUserOptions}
                         onChange={(value) => editStep(
                           index,
@@ -3731,7 +4268,7 @@ function SkillSource({
                       onUpdate={(edgeIndex, patch) => updateEdge(index, edgeIndex, patch)}
                       onDelete={(edgeIndex) => deleteEdge(index, edgeIndex)}
                     />
-                    {!isSubflow && <SourceJsonLine label="知识范围" value={step.knowledge_scope} />}
+                    {!isSubflow && <SourceJsonLine label={t('distillPage.field.knowledgeScope')} value={step.knowledge_scope} />}
                     {!isSubflow && <EditableRetryPolicyLine value={step.retry_policy} onChange={(value) => editStep(index, 'retry_policy', value)} />}
                   </div>
                 </div>
@@ -3741,11 +4278,11 @@ function SkillSource({
         })}
         {steps.length > 0 && (
           <div className={cn(NODE_INSERT_ROW_CLASS, NODE_INSERT_ROW_EDGE_CLASS)}>
-            <UIButton variant="outline" size="sm" className={NODE_INSERT_BUTTON_CLASS} onClick={() => insertNodeBetween(steps.length - 1)}>
-              <PlusOutlined />
-              在最后新增节点
-            </UIButton>
-          </div>
+          <UIButton variant="outline" size="sm" className={NODE_INSERT_BUTTON_CLASS} onClick={() => insertNodeBetween(steps.length - 1)}>
+            <PlusOutlined />
+            {t('distillPage.node.insertAtEnd')}
+          </UIButton>
+        </div>
         )}
       </div>
       {renderDeleteNodeConfirm()}
@@ -3753,6 +4290,7 @@ function SkillSource({
   );
 }
 
+/** 渲染可缩放的 SOP 流程视图，并在当前语言下提供流程统计与编辑控制。 */
 function SkillFlow({
   skill,
   selectedPaths,
@@ -3796,6 +4334,7 @@ function SkillFlow({
   onToggle: (target: TargetSelection) => void;
   onEdit: (nextDraft: SkillCard, path: string) => void;
 }) {
+  const { locale, t } = useDistillIntl();
   const [flowZoom, setFlowZoom] = useState(0.64);
   const [flowPreset, setFlowPreset] = useState<'fit' | '100' | null>('fit');
   const [flowPan, setFlowPan] = useState({ x: 0, y: 0 });
@@ -3853,29 +4392,34 @@ function SkillFlow({
     : String(selectedNode?.node_id || selectedNode?.step_id || `node_${selectedNodeIndex + 1}`);
   const nodeOptions = nodes.map((node, index) => {
     const nodeId = String(node.node_id || node.step_id || `node_${index + 1}`);
-    return { value: nodeId, label: `Node ${index + 1} · ${String(node.name || nodeId)}` };
+    return { value: nodeId, label: t('distillPage.node.optionLabel', { index: index + 1, name: String(node.name || nodeId) }) };
   });
   const actionOptions = buildActionOptions(toolDescriptions, toolStatuses, nodes);
+  // 流程视图当前选中的节点在非 handoff 类型下不提供转人工动作
+  const selectedNodeType = selectedNodeIndex === null
+    ? ''
+    : String(nodes[selectedNodeIndex]?.type || '');
+  const inspectorActionOptions = filterActionOptionsForNodeType(actionOptions, selectedNodeType);
   const generalSkillOptions: CapabilityReferenceOption[] = generalSkills.map((item) => ({
     value: item.id,
     label: item.name || item.slug,
     description: item.description || item.slug,
     capabilityScope: item.capability_scope,
-    unavailableReason: item.status === 'published' ? undefined : '技能未启用',
+    unavailableReason: item.status === 'published' ? undefined : capabilityUnavailableReason('skill'),
   }));
   const toolOptions: CapabilityReferenceOption[] = tools.map((item) => ({
     value: item.id,
     label: item.display_name || item.name,
     description: item.description || item.name,
     capabilityScope: item.capability_scope,
-    unavailableReason: item.enabled ? undefined : '工具已停用',
+    unavailableReason: item.enabled ? undefined : capabilityUnavailableReason('tool'),
   }));
   const knowledgeBaseOptions: CapabilityReferenceOption[] = knowledgeBases.map((item) => ({
     value: item.id,
     label: item.name,
     description: item.description,
     capabilityScope: item.capability_scope,
-    unavailableReason: item.status === 'active' || item.status === 'published' ? undefined : '知识库已下线',
+    unavailableReason: item.status === 'active' || item.status === 'published' ? undefined : capabilityUnavailableReason('knowledgeBase'),
   }));
   const sopOptions: SelectOption[] = sopSkills
     .filter((item) => (
@@ -3888,14 +4432,8 @@ function SkillFlow({
       label: `${item.name} · ${item.skill_id}`,
     }));
   const tenantUserOptions: SelectOption[] = [
-    { value: UNASSIGNED_USER_VALUE, label: '未指定（使用渠道默认）' },
-    ...tenantUsers.filter((user) => !user.source || user.source === 'web').map((user) => {
-      const channelLabel = user.channel_identities?.[0]
-        ? ` (${_CHANNEL_LABELS[user.channel_identities[0].channel] || user.channel_identities[0].channel})`
-        : '';
-      const name = user.display_name || user.username || user.id;
-      return { value: user.id, label: `${name}${channelLabel}` };
-    }),
+    { value: UNASSIGNED_USER_VALUE, label: unassignedHandoffUserLabel() },
+    ...handoffAssigneeUserOptions(tenantUsers),
   ];
 
   const editFlowNode = (
@@ -3923,14 +4461,14 @@ function SkillFlow({
       const previousId = String(currentNode.node_id || currentNode.step_id || `node_${index + 1}`);
       const nextId = String(listValue || '').trim();
       if (!nextId) {
-        notify.warning('节点 ID 不能为空');
+        notify.warning(t('distillPage.node.idRequired'));
         return;
       }
       const duplicated = next.nodes.some((node, nodeIndex) => (
         nodeIndex !== index && String(node?.node_id || node?.step_id || '') === nextId
       ));
       if (duplicated) {
-        notify.warning(`节点 ID「${nextId}」已经存在`);
+        notify.warning(t('distillPage.node.idDuplicate', { id: nextId }));
         return;
       }
       currentNode.node_id = nextId;
@@ -3941,6 +4479,12 @@ function SkillFlow({
       }));
       if (next.start_node_id === previousId) next.start_node_id = nextId;
       next.terminal_node_ids = asStringList(next.terminal_node_ids).map((nodeId) => (nodeId === previousId ? nextId : nodeId));
+    } else if (nodeField === 'assignee_user_id') {
+      const { userId, channel } = parseHandoffAssigneeValue(String(listValue));
+      currentNode.assignee_user_id = userId || null;
+      currentNode.assignee_notify_channel = userId ? channel : null;
+    } else if (nodeField === 'type') {
+      applyNodeTypeChange(currentNode, String(listValue));
     } else if (CAPABILITY_REFERENCE_FIELDS.includes(nodeField)) {
       const currentRefs = nodeCapabilityRefs(currentNode);
       currentNode.capability_refs = updateCapabilityRefs(
@@ -4004,7 +4548,7 @@ function SkillFlow({
       next_node_id: targetId,
       condition: '',
       priority,
-      label: targetId ? '新增流转' : '',
+      label: targetId ? t('distillPage.flow.newEdge') : '',
     }];
     onEdit(next, stepTargetPath(index));
   };
@@ -4027,7 +4571,7 @@ function SkillFlow({
     if (edges.some((edge) => (
       String(edge.source_node_id || '') === sourceNodeId && String(edge.next_node_id || '') === targetNodeId
     ))) {
-      notify.warning('这两个节点之间已经存在流转规则');
+      notify.warning(t('distillPage.flow.duplicateEdge'));
       return;
     }
     const sourceIndex = nodes.findIndex((node, index) => String(node.node_id || node.step_id || `node_${index + 1}`) === sourceNodeId);
@@ -4041,11 +4585,11 @@ function SkillFlow({
       next_node_id: targetNodeId,
       condition: '',
       priority,
-      label: `连接到 ${targetName}`,
+      label: t('distillPage.flow.connectedToNode', { name: targetName }),
     }];
     if (sourceIndex >= 0) setSelectedNodeIndex(sourceIndex);
     onEdit(next, stepTargetPath(Math.max(sourceIndex, 0)));
-    notify.success(`已连接到「${targetName}」，右侧流转规则已同步`);
+    notify.successText(t('distillPage.toast.connectedEdge', { name: targetName }));
   };
   const deleteFlowEdgeAt = (edgeIndex: number) => {
     const edge = normalizeSkillEdges(skill)[edgeIndex];
@@ -4057,7 +4601,10 @@ function SkillFlow({
     ));
     onEdit(withoutSkillEdgeAt(skill, edgeIndex), stepTargetPath(Math.max(sourceIndex, 0)));
     setSelectedEdgeId('');
-    notify.success(`已删除「${nodeNameMap[sourceNodeId] || sourceNodeId} → ${nodeNameMap[targetNodeId] || targetNodeId}」流转`);
+    notify.successText(t('distillPage.toast.deletedEdge', {
+      source: nodeNameMap[sourceNodeId] || sourceNodeId,
+      target: nodeNameMap[targetNodeId] || targetNodeId,
+    }));
   };
   const startNodeDrag = (
     event: ReactPointerEvent<HTMLDivElement>,
@@ -4437,7 +4984,7 @@ function SkillFlow({
       className={cn(FLOW_VIEWER_CLASS, isFullscreen && FLOW_VIEWER_FULLSCREEN_CLASS)}
       role={isFullscreen ? 'dialog' : undefined}
       aria-modal={isFullscreen || undefined}
-      aria-label={isFullscreen ? 'SOP 流程图全屏查看' : undefined}
+      aria-label={isFullscreen ? t('distillPage.flow.fullscreenAria') : undefined}
       onPointerMove={(event) => {
         handleConnectionPointerMove(event);
         handleNodePointerMove(event);
@@ -4452,14 +4999,20 @@ function SkillFlow({
       }}
     >
       <div className={cn(FLOW_VIEWER_CLASS, isFullscreen && FLOW_VIEWER_FULLSCREEN_PANEL_CLASS)}>
-        <div className={cn(FLOW_ZOOM_TOOLBAR_CLASS, isFullscreen && FLOW_ZOOM_TOOLBAR_FULLSCREEN_CLASS)} aria-label="流程图控制">
+        <div className={cn(FLOW_ZOOM_TOOLBAR_CLASS, isFullscreen && FLOW_ZOOM_TOOLBAR_FULLSCREEN_CLASS)} aria-label={t('distillPage.flow.controlsAria')}>
           {isFullscreen && (
             <div className={FLOW_VIEWER_TITLE_CLASS}>
               <span className={FLOW_VIEWER_TITLE_MARK_CLASS}><BranchesOutlined /></span>
               <span className="grid min-w-0 gap-[2px]">
-                <strong className="truncate text-[14px] font-medium text-[#18181a]">{skill.name || 'SOP 流程图'}</strong>
+                <strong className="truncate text-[14px] font-medium text-[#18181a]">{skill.name || t('distillPage.flow.defaultTitle')}</strong>
                 <span className={FLOW_VIEWER_TITLE_META_CLASS}>
-                  {nodes.length} 个节点 · {graphLayout.edges.length} 条连线 · {armedConnectionSourceId ? '点击目标节点完成连接' : '拖动节点调整排版，选择连线可删除'}
+                  {new Intl.NumberFormat(locale).format(nodes.length)} {t('distillPage.section.nodes')}
+                  {' · '}
+                  {t('distillPage.flow.outgoingCount', { count: graphLayout.edges.length, parallel: '' })}
+                  {' · '}
+                  {armedConnectionSourceId
+                    ? t('distillPage.flow.connectHint')
+                    : t('distillPage.flow.canvasAria')}
                 </span>
               </span>
             </div>
@@ -4477,7 +5030,7 @@ function SkillFlow({
                   }}
                 >
                   {assistantPanelOpen ? <PanelLeftClose /> : <PanelLeftOpen />}
-                  AI 修改
+                  {t('distillPage.panel.aiEdit')}
                 </UIButton>
                 <UIButton
                   variant="outline"
@@ -4489,16 +5042,16 @@ function SkillFlow({
                   }}
                 >
                   {inspectorOpen ? <PanelRightClose /> : <PanelRightOpen />}
-                  结构编辑
+                  {t('distillPage.panel.structureEdit')}
                 </UIButton>
               </>
             )}
-            <span className="shrink-0">缩放</span>
-            <UIButton variant="outline" size="sm" className={FLOW_ZOOM_STEP_BUTTON_CLASS} onClick={() => updateZoom(flowZoom - 0.08)} aria-label="缩小">
+            <span className="shrink-0">{t('distillPage.flow.zoom')}</span>
+            <UIButton variant="outline" size="sm" className={FLOW_ZOOM_STEP_BUTTON_CLASS} onClick={() => updateZoom(flowZoom - 0.08)} aria-label={t('distillPage.flow.zoomOut')}>
               -
             </UIButton>
             <span className={FLOW_ZOOM_VALUE_CLASS}>{Math.round(flowZoom * 100)}%</span>
-            <UIButton variant="outline" size="sm" className={FLOW_ZOOM_STEP_BUTTON_CLASS} onClick={() => updateZoom(flowZoom + 0.08)} aria-label="放大">
+            <UIButton variant="outline" size="sm" className={FLOW_ZOOM_STEP_BUTTON_CLASS} onClick={() => updateZoom(flowZoom + 0.08)} aria-label={t('distillPage.flow.zoomIn')}>
               +
             </UIButton>
             <UIButton
@@ -4508,7 +5061,7 @@ function SkillFlow({
               aria-pressed={isFitZoom}
               onClick={() => fitFlowToViewport()}
             >
-              适配
+              {t('distillPage.flow.fit')}
             </UIButton>
             <UIButton
               variant="outline"
@@ -4525,10 +5078,10 @@ function SkillFlow({
               size="sm"
               className={CARD_OUTLINE_BUTTON_CLASS}
               onClick={toggleFullscreen}
-              aria-label={isFullscreen ? '退出全屏' : '全屏查看流程图'}
+              aria-label={isFullscreen ? t('distillPage.flow.exitFullscreenAria') : t('distillPage.flow.fullscreenButtonAria')}
             >
               {isFullscreen ? <Minimize2 /> : <Maximize2 />}
-              {isFullscreen ? '退出全屏' : '全屏查看'}
+              {isFullscreen ? t('distillPage.flow.exitFullscreen') : t('distillPage.flow.fullscreenButton')}
             </UIButton>
           </div>
         </div>
@@ -4546,7 +5099,7 @@ function SkillFlow({
           onPointerUp={stopPan}
           onPointerCancel={stopPan}
           onWheel={handleCanvasWheel}
-          aria-label={isFullscreen ? 'SOP 流程图画布，可拖拽空白区域移动' : undefined}
+          aria-label={isFullscreen ? t('distillPage.flow.canvasAria') : undefined}
           style={isFullscreen ? { backgroundPosition: `${flowPan.x}px ${flowPan.y}px` } : undefined}
         >
         <div
@@ -4568,7 +5121,7 @@ function SkillFlow({
               width={graphLayout.width}
               height={graphLayout.height}
               viewBox={`0 0 ${graphLayout.width} ${graphLayout.height}`}
-              aria-label="SOP 流程连线"
+              aria-label={t('distillPage.flow.edgesAria')}
             >
               <defs>
                 <marker id="skill-flow-arrow" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
@@ -4602,7 +5155,7 @@ function SkillFlow({
                       className="cursor-pointer [pointer-events:stroke]"
                       role="button"
                       tabIndex={0}
-                      aria-label={`选择流转 ${edge.title}`}
+                      aria-label={t('distillPage.flow.selectEdge', { title: edge.title })}
                       onPointerDown={(event) => event.stopPropagation()}
                       onPointerEnter={() => setHoveredEdgeId(edge.id)}
                       onPointerLeave={() => setHoveredEdgeId((current) => current === edge.id ? '' : current)}
@@ -4654,7 +5207,7 @@ function SkillFlow({
                   <button
                     type="button"
                     className="min-w-0 cursor-pointer truncate border-0 bg-transparent p-0 text-inherit focus-visible:outline-none"
-                    aria-label={`选择流转 ${edge.title}`}
+                    aria-label={t('distillPage.flow.selectEdge', { title: edge.title })}
                     onClick={() => setSelectedEdgeId(edge.id)}
                   >
                     {edge.label}
@@ -4670,8 +5223,8 @@ function SkillFlow({
                       (hoveredEdgeId === edge.id || selectedEdgeId === edge.id)
                         && 'pointer-events-auto opacity-100',
                     )}
-                    aria-label={`删除流转 ${edge.title}`}
-                    title="删除这条流转规则"
+                    aria-label={t('distillPage.flow.deleteEdge', { title: edge.title })}
+                    title={t('distillPage.flow.deleteEdgeTitle')}
                     onClick={(event) => {
                       event.preventDefault();
                       event.stopPropagation();
@@ -4689,7 +5242,7 @@ function SkillFlow({
             >
               <SelectableTarget
                 className={distillFlowNodeClass('basic', true, selectedPaths, highlightedPaths, updatingPaths, dirtyPaths)}
-                target={{ path: 'basic', label: '基础信息' }}
+                target={{ path: 'basic', label: t('distillPage.section.basic') }}
                 onToggle={(target) => {
                   setSelectedNodeIndex(null);
                   setBasicInspectorOpen(true);
@@ -4697,23 +5250,23 @@ function SkillFlow({
                 }}
               >
                 {selectedPaths.includes('basic') && <span className={SELECTION_MARK_CLASS}><CheckOutlined /></span>}
-                <span>基础信息</span>
+                <span>{t('distillPage.section.basic')}</span>
                 <strong><InlineDiffText path="basic" field="name" value={skill.name} diffs={textDiffs} /></strong>
                 <small>{skill.skill_id}</small>
-                <p><InlineDiffText path="basic" field="description" value={skill.description || '暂无描述'} diffs={textDiffs} /></p>
+                <p><InlineDiffText path="basic" field="description" value={skill.description || t('distillPage.flow.noDescription')} diffs={textDiffs} /></p>
                 <div className={FLOW_META_CLASS}>
-                  <FlowMetaRow label="业务域">
+                  <FlowMetaRow label={fieldLabel('business_domain')}>
                     <span className={FLOW_CHIP_CLASS}>{skill.business_domain || '-'}</span>
                   </FlowMetaRow>
-                  <FlowMetaRow label="单步上限">
+                  <FlowMetaRow label={fieldLabel('step_timeout_seconds')}>
                     <span className={FLOW_CHIP_CLASS}>
-                      {skill.step_timeout_seconds ? `${skill.step_timeout_seconds} 秒` : '未单独限制'}
+                      {skill.step_timeout_seconds ? t('distillPage.flow.timeoutSeconds', { seconds: skill.step_timeout_seconds }) : t('distillPage.placeholder.notRestricted')}
                     </span>
                   </FlowMetaRow>
-                  <FlowMetaRow label="必填信息">
+                  <FlowMetaRow label={fieldLabel('required_info')}>
                     <PlainChipList values={skill.required_info} />
                   </FlowMetaRow>
-                  <FlowMetaRow label="触发意图">
+                  <FlowMetaRow label={fieldLabel('trigger_intents')}>
                     <PlainChipList values={skill.trigger_intents} />
                   </FlowMetaRow>
                 </div>
@@ -4785,7 +5338,7 @@ function SkillFlow({
             nodeOptions={nodeOptions}
             outgoingEdges={selectedNodeId ? edgeMap[selectedNodeId] || [] : []}
             terminal={selectedNodeId ? terminalSet.has(selectedNodeId) : false}
-            actionOptions={actionOptions}
+            actionOptions={inspectorActionOptions}
             toolDescriptions={toolDescriptions}
             toolStatuses={toolStatuses}
             generalSkillOptions={generalSkillOptions}
@@ -4857,19 +5410,20 @@ function SkillFlowBasicInspector({
     value: string | string[] | number | null,
   ) => void;
 }) {
+  const { t } = useDistillIntl();
   return (
-    <aside className={FLOW_INSPECTOR_CLASS} aria-label="编辑 SOP 基础信息">
+    <aside className={FLOW_INSPECTOR_CLASS} aria-label={t('distillPage.inspector.basicAria')}>
       <div className={FLOW_INSPECTOR_HEADER_CLASS}>
         <div className="grid min-w-0 gap-[3px]">
-          <strong className="truncate text-[14px] font-semibold text-[#18181a]">基础信息 · {skill.name || '未命名 SOP'}</strong>
-          <span className="text-[11px] leading-[1.45] text-[#858b9c]">这里与源码视图的基础信息使用同一份草稿，修改会实时同步。</span>
+          <strong className="truncate text-[14px] font-semibold text-[#18181a]">{t('distillPage.inspector.basicTitle', { name: skill.name || t('distillPage.inspector.unnamedSkill') })}</strong>
+          <span className="text-[11px] leading-[1.45] text-[#858b9c]">{t('distillPage.inspector.basicHint')}</span>
         </div>
-        <span className="shrink-0 rounded-full bg-[#edf8f5] px-[8px] py-[4px] text-[11px] text-[#04756f]">实时同步</span>
+        <span className="shrink-0 rounded-full bg-[#edf8f5] px-[8px] py-[4px] text-[11px] text-[#04756f]">{t('distillPage.inspector.liveSync')}</span>
       </div>
       <div className={FLOW_INSPECTOR_BODY_CLASS}>
         <div className="grid min-w-0 gap-[12px]">
-          <FlowInspectorSection title="身份与版本" description="定义 SOP 的稳定标识、展示名称和所属业务域。">
-            <EditableSourceTextLine label="SOP 名称" value={skill.name || ''} onChange={(value) => onEditBasic('name', value)} />
+          <FlowInspectorSection title={t('distillPage.inspector.identityTitle')} description={t('distillPage.inspector.identityDescription')}>
+            <EditableSourceTextLine label={t('distillPage.field.skillName')} value={skill.name || ''} onChange={(value) => onEditBasic('name', value)} />
             <EditableSourceTextLine label={fieldLabel('skill_id')} value={skill.skill_id || ''} readOnly={lockSkillId} onChange={(value) => onEditBasic('skill_id', value)} />
             <EditableSourceTextLine label={fieldLabel('version')} value={skill.version || ''} onChange={(value) => onEditBasic('version', value)} />
             <EditableSourceTextLine label={fieldLabel('business_domain')} value={skill.business_domain || ''} onChange={(value) => onEditBasic('business_domain', value)} />
@@ -4878,7 +5432,7 @@ function SkillFlowBasicInspector({
               value={skill.step_timeout_seconds}
               min={1}
               max={3600}
-              placeholder="不单独限制"
+              placeholder={t('distillPage.placeholder.notRestricted')}
               onChange={(value) => onEditBasic('step_timeout_seconds', value)}
             />
             <CapabilityScopeControl
@@ -4888,13 +5442,13 @@ function SkillFlowBasicInspector({
               onChange={(value) => onEditBasic('capability_scope', value)}
             />
           </FlowInspectorSection>
-          <FlowInspectorSection title="触发与目标" description="说明何时进入流程，以及模型需要完成什么。">
+          <FlowInspectorSection title={t('distillPage.inspector.goalTitle')} description={t('distillPage.inspector.goalDescription')}>
             <EditableSourceTextLine label={fieldLabel('description')} value={skill.description || ''} multiline onChange={(value) => onEditBasic('description', value)} />
             <EditableSourceListLine label={fieldLabel('trigger_intents')} values={skill.trigger_intents} onChange={(value) => onEditBasic('trigger_intents', value)} />
             <EditableSourceListLine label={fieldLabel('user_utterance_examples')} values={skill.user_utterance_examples} onChange={(value) => onEditBasic('user_utterance_examples', value)} />
             <EditableSourceListLine label={fieldLabel('goal')} values={skill.goal} onChange={(value) => onEditBasic('goal', value)} />
           </FlowInspectorSection>
-          <FlowInspectorSection title="输入与回复约束" description="列出完成流程所需的信息和最终回复规则。">
+          <FlowInspectorSection title={t('distillPage.inspector.constraintsTitle')} description={t('distillPage.inspector.constraintsDescription')}>
             <EditableSourceListLine label={fieldLabel('required_info')} values={skill.required_info} onChange={(value) => onEditBasic('required_info', value)} />
             <EditableSourceListLine label={fieldLabel('response_rules')} values={skill.response_rules} minRows={5} maxRows={14} onChange={(value) => onEditBasic('response_rules', value)} />
           </FlowInspectorSection>
@@ -4945,56 +5499,64 @@ function SkillFlowInspector({
   onUpdateEdge: (index: number, edgeIndex: number, patch: Record<string, unknown>) => void;
   onDeleteEdge: (index: number, edgeIndex: number) => void;
 }) {
+  const { t } = useDistillIntl();
   if (!node || nodeIndex === null) {
     return (
-      <aside className={FLOW_INSPECTOR_CLASS} aria-label="节点编辑器">
+      <aside className={FLOW_INSPECTOR_CLASS} aria-label={t('distillPage.inspector.nodeEditorAria')}>
         <div className={FLOW_INSPECTOR_EMPTY_CLASS}>
-          选择一个节点后，可在这里编辑对应的源码字段和流转规则。
+          {t('distillPage.inspector.nodeEditorEmpty')}
         </div>
       </aside>
     );
   }
-  const nodeState = [
-    Boolean(node.optional) ? '可选' : '必选',
-    terminal ? '终止节点' : '流程节点',
-  ].join(' · ');
+  const nodeState = nodeStateLabels({
+    optional: Boolean(node.optional),
+    terminal,
+  }).join(' · ');
   const isSubflow = String(node.type || '') === 'subflow';
-  const isHandoffNode =
-    String(node.type || '') === 'handoff' ||
-    asStringList(node.allowed_actions).includes('handoff_human');
+  // 处理人仅对 handoff 节点有意义;转人工动作只允许出现在 handoff 节点上,
+  // 回复/收集等其他节点一律不展示处理人与转人工动作。
+  const isHandoffNode = String(node.type || '') === 'handoff';
   return (
-    <aside className={FLOW_INSPECTOR_CLASS} aria-label={`编辑节点 ${String(node.name || nodeId)}`}>
+    <aside className={FLOW_INSPECTOR_CLASS} aria-label={t('distillPage.inspector.nodeAria', { name: String(node.name || nodeId) })}>
       <div className={FLOW_INSPECTOR_HEADER_CLASS}>
         <div className="grid min-w-0 gap-[3px]">
-          <strong className="truncate text-[14px] font-semibold text-[#18181a]">Node {nodeIndex + 1} · {String(node.name || nodeId)}</strong>
-          <span className="text-[11px] leading-[1.45] text-[#858b9c]">拖动左侧画布浏览；从节点右侧连接点拖到目标节点，可新增流转。</span>
+          <strong className="truncate text-[14px] font-semibold text-[#18181a]">{t('distillPage.inspector.nodeTitle', { index: nodeIndex + 1, name: String(node.name || nodeId) })}</strong>
+          <span className="text-[11px] leading-[1.45] text-[#858b9c]">{t('distillPage.inspector.nodeHint')}</span>
         </div>
-        <span className="shrink-0 rounded-full bg-[#edf8f5] px-[8px] py-[4px] text-[11px] text-[#04756f]">实时同步</span>
+        <span className="shrink-0 rounded-full bg-[#edf8f5] px-[8px] py-[4px] text-[11px] text-[#04756f]">{t('distillPage.inspector.liveSync')}</span>
       </div>
       <div className={FLOW_INSPECTOR_BODY_CLASS}>
         <div className="grid min-w-0 gap-[12px]">
-          <FlowInspectorSection title="节点定义" description="节点名称、类型和执行目标会直接进入 TaskFrame。">
-            <EditableSourceTextLine label="节点名称" value={String(node.name || '')} onChange={(value) => onEditNode(nodeIndex, 'name', value)} />
+          <FlowInspectorSection title={t('distillPage.inspector.nodeDefinitionTitle')} description={t('distillPage.inspector.nodeDefinitionDescription')}>
+            <EditableSourceTextLine label={t('distillPage.field.nodeName')} value={String(node.name || '')} onChange={(value) => onEditNode(nodeIndex, 'name', value)} />
             <EditableSourceTextLine label={fieldLabel('step_id')} value={nodeId} onChange={(value) => onEditNode(nodeIndex, 'step_id', value)} />
-            <EditableSourceSelectLine label={fieldLabel('type')} value={String(node.type || 'collect_info')} options={NODE_TYPE_OPTIONS} onChange={(value) => onEditNode(nodeIndex, 'type', value)} />
+            <EditableSourceSelectLine label={fieldLabel('type')} value={String(node.type || 'collect_info')} options={nodeTypeOptions()} onChange={(value) => onEditNode(nodeIndex, 'type', value)} />
             {String(node.type || '') === 'subflow' && (
               <EditableSourceSelectLine
-                label="调用子 SOP"
+                label={t('distillPage.field.callSubSop')}
                 value={String(node.sub_sop_id || '')}
                 options={sopOptions}
                 onChange={(value) => onEditNode(nodeIndex, 'sub_sop_id', value)}
               />
             )}
-            <SourceReadonlyLine label="节点状态" value={nodeState} />
+            <SourceReadonlyLine label={t('distillPage.field.nodeState')} value={nodeState} />
             {isSubflow ? (
-              <SourceReadonlyLine label="执行职责" value="仅进入所选子 SOP；字段、动作和能力由子 SOP 自己定义。" />
+              <SourceReadonlyLine label={t('distillPage.field.executionScope')} value={t('distillPage.subflow.executionInspector')} />
             ) : (
               <EditableSourceTextLine label={fieldLabel('instruction')} value={String(node.instruction || '')} multiline onChange={(value) => onEditNode(nodeIndex, 'instruction', value)} />
             )}
             {isHandoffNode && (
               <EditableSourceSelectLine
-                label="处理人"
-                value={String(node.assignee_user_id || UNASSIGNED_USER_VALUE)}
+                label={t('distillPage.field.assignee')}
+                value={
+                  node.assignee_user_id
+                    ? formatHandoffAssigneeValue(
+                      String(node.assignee_user_id),
+                      String(node.assignee_notify_channel || ''),
+                    )
+                    : UNASSIGNED_USER_VALUE
+                }
                 options={tenantUserOptions}
                 onChange={(value) => onEditNode(
                   nodeIndex,
@@ -5006,20 +5568,20 @@ function SkillFlowInspector({
           </FlowInspectorSection>
           {!isSubflow && (
             <>
-              <FlowInspectorSection title="输入与允许动作" description="明确本节点需要收集的字段，以及模型可以自主选择的动作。">
+              <FlowInspectorSection title={t('distillPage.inspector.nodeInputTitle')} description={t('distillPage.inspector.nodeInputDescription')}>
                 <EditableSourceListLine label={fieldLabel('expected_user_info')} values={asStringList(node.expected_user_info)} onChange={(value) => onEditNode(nodeIndex, 'expected_user_info', value)} />
                 <EditableSourceActionLine values={asStringList(node.allowed_actions)} options={actionOptions} toolDescriptions={toolDescriptions} toolStatuses={toolStatuses} onChange={(value) => onEditNode(nodeIndex, 'allowed_actions', value)} />
               </FlowInspectorSection>
-              <FlowInspectorSection title="节点专用能力" description="SOP-specific 能力只有在这里明确引用后，才会进入当前节点的 Harness 能力清单。">
-                <EditableCapabilityReferencesLine label="SOP 技能" values={asStringList(node.general_skill_ids)} requiredValues={asStringList(node.required_general_skill_ids)} options={generalSkillOptions} emptyText="未指定技能" onChange={(value) => onEditNode(nodeIndex, 'general_skill_ids', value)} onRequiredChange={(value) => onEditNode(nodeIndex, 'required_general_skill_ids', value)} />
-                <EditableCapabilityReferencesLine label="SOP 工具" values={asStringList(node.tool_ids)} requiredValues={asStringList(node.required_tool_ids)} options={toolOptions} emptyText="未指定工具" onChange={(value) => onEditNode(nodeIndex, 'tool_ids', value)} onRequiredChange={(value) => onEditNode(nodeIndex, 'required_tool_ids', value)} />
-                <EditableCapabilityReferencesLine label="SOP 知识库" values={asStringList(node.knowledge_base_ids)} requiredValues={asStringList(node.required_knowledge_base_ids)} options={knowledgeBaseOptions} emptyText="未指定知识库" onChange={(value) => onEditNode(nodeIndex, 'knowledge_base_ids', value)} onRequiredChange={(value) => onEditNode(nodeIndex, 'required_knowledge_base_ids', value)} />
+              <FlowInspectorSection title={t('distillPage.inspector.nodeCapabilityTitle')} description={t('distillPage.inspector.nodeCapabilityDescription')}>
+                <EditableCapabilityReferencesLine label={fieldLabel('general_skill_ids')} values={asStringList(node.general_skill_ids)} requiredValues={asStringList(node.required_general_skill_ids)} options={generalSkillOptions} emptyText={t('distillPage.capability.emptySkill')} onChange={(value) => onEditNode(nodeIndex, 'general_skill_ids', value)} onRequiredChange={(value) => onEditNode(nodeIndex, 'required_general_skill_ids', value)} />
+                <EditableCapabilityReferencesLine label={fieldLabel('tool_ids')} values={asStringList(node.tool_ids)} requiredValues={asStringList(node.required_tool_ids)} options={toolOptions} emptyText={t('distillPage.capability.emptyTool')} onChange={(value) => onEditNode(nodeIndex, 'tool_ids', value)} onRequiredChange={(value) => onEditNode(nodeIndex, 'required_tool_ids', value)} />
+                <EditableCapabilityReferencesLine label={fieldLabel('knowledge_base_ids')} values={asStringList(node.knowledge_base_ids)} requiredValues={asStringList(node.required_knowledge_base_ids)} options={knowledgeBaseOptions} emptyText={t('distillPage.capability.emptyKnowledgeBase')} onChange={(value) => onEditNode(nodeIndex, 'knowledge_base_ids', value)} onRequiredChange={(value) => onEditNode(nodeIndex, 'required_knowledge_base_ids', value)} />
               </FlowInspectorSection>
             </>
           )}
-          <FlowInspectorSection title="流转与失败处理" description="按优先级判断规则；未命中时使用重试策略或终止流程。">
+          <FlowInspectorSection title={t('distillPage.inspector.nodeFlowTitle')} description={t('distillPage.inspector.nodeFlowDescription')}>
             <EditableFlowRulesLine sourceNodeId={nodeId} edges={outgoingEdges} nodes={nodes} nodeOptions={nodeOptions} terminal={terminal} onAdd={() => onAddEdge(nodeIndex)} onUpdate={(edgeIndex, patch) => onUpdateEdge(nodeIndex, edgeIndex, patch)} onDelete={(edgeIndex) => onDeleteEdge(nodeIndex, edgeIndex)} />
-            {!isSubflow && <SourceJsonLine label="知识范围" value={node.knowledge_scope} />}
+            {!isSubflow && <SourceJsonLine label={t('distillPage.field.knowledgeScope')} value={node.knowledge_scope} />}
             {!isSubflow && <EditableRetryPolicyLine value={node.retry_policy} onChange={(value) => onEditNode(nodeIndex, 'retry_policy', value)} />}
           </FlowInspectorSection>
         </div>
@@ -5073,11 +5635,12 @@ function SkillFlowNodeCard({
   onSelect: () => void;
   onToggle: (target: TargetSelection) => void;
 }) {
+  const { t } = useDistillIntl();
   const nodeId = String(step.node_id || step.step_id || `node_${index + 1}`);
   const path = stepTargetPath(index);
   const expectedInfo = asStringList(step.expected_user_info);
   const actionList = asStringList(step.allowed_actions);
-  const instruction = String(step.instruction || '暂无说明');
+  const instruction = String(step.instruction || t('distillPage.node.noInstruction'));
   const isSubflow = String(step.type || '') === 'subflow';
   const childSop = isSubflow
     ? sopSkills.find((item) => item.skill_id === String(step.sub_sop_id || ''))
@@ -5091,20 +5654,20 @@ function SkillFlowNodeCard({
           selected && 'border-[#04756f]! shadow-[0_0_0_3px_rgba(4,117,111,0.10),0_12px_30px_rgba(4,117,111,0.08)]',
           dropTarget && 'border-[#04756f]! shadow-[0_0_0_4px_rgba(4,117,111,0.12),0_12px_30px_rgba(4,117,111,0.10)]',
         )}
-        target={{ path, label: `节点 ${index + 1}：${step.name || nodeId}` }}
+        target={{ path, label: indexedNodeTargetLabel(index, String(step.name || nodeId)) }}
         onToggle={(target) => {
           onSelect();
           onToggle(target);
         }}
       >
         {selectedPaths.includes(path) && <span className={SELECTION_MARK_CLASS}><CheckOutlined /></span>}
-        <span>节点 {index + 1}</span>
+        <span>{indexedNodeLabel(index)}</span>
         <strong><InlineDiffText path={path} field="name" value={String(step.name || nodeId)} diffs={textDiffs} /></strong>
         <small>{nodeId}</small>
         <div className={FLOW_NODE_BADGES_CLASS}>
           <span className={FLOW_CHIP_CLASS}>{nodeTypeLabel(String(step.type || 'collect_info'))}</span>
-          {Boolean(step.optional) && <span className={FLOW_CHIP_CLASS}>可选</span>}
-          {terminal && <span className={FLOW_CHIP_CLASS}>终止</span>}
+          {Boolean(step.optional) && <span className={FLOW_CHIP_CLASS}>{t('distillPage.nodeState.optional')}</span>}
+          {terminal && <span className={FLOW_CHIP_CLASS}>{t('distillPage.nodeState.terminalShort')}</span>}
         </div>
         {isSubflow ? (
           <NestedSopPreview childSop={childSop} subSopId={String(step.sub_sop_id || '')} />
@@ -5116,13 +5679,13 @@ function SkillFlowNodeCard({
         <div className={FLOW_COMPACT_META_CLASS}>
           {!isSubflow && expectedInfo.length > 0 && (
             <div className={FLOW_COMPACT_ROW_CLASS}>
-              <span>字段</span>
+              <span>{t('distillPage.field.expectedUserInfo')}</span>
               <PlainChipList values={expectedInfo} />
             </div>
           )}
           {!isSubflow && actionList.length > 0 && (
             <div className={FLOW_COMPACT_ROW_CLASS}>
-              <span>动作</span>
+              <span>{t('distillPage.field.allowedActions')}</span>
               <FlowActionList actions={actionList} toolDescriptions={toolDescriptions} toolStatuses={toolStatuses} />
             </div>
           )}
@@ -5135,8 +5698,8 @@ function SkillFlowNodeCard({
           data-flow-connect-handle
           className={cn(FLOW_NODE_CONNECT_HANDLE_CLASS, connecting && FLOW_NODE_CONNECT_HANDLE_ACTIVE_CLASS)}
           style={{ transform: `translateX(-50%) scale(${connectHandleScale})` }}
-          aria-label={`从「${String(step.name || nodeId)}」拖线连接节点`}
-          title="拖到另一个节点以新增流转规则"
+          aria-label={t('distillPage.flow.connectFromNode', { name: String(step.name || nodeId) })}
+          title={t('distillPage.flow.connectHint')}
           onPointerDown={(event) => onConnectStart(event, nodeId)}
           onClick={(event) => onConnectClick(event, nodeId)}
         >
@@ -5147,23 +5710,25 @@ function SkillFlowNodeCard({
   );
 }
 
+/** 渲染子 SOP 的紧凑预览；子 SOP 名称和节点内容保持原始业务数据，不参与翻译。 */
 function NestedSopPreview({ childSop, subSopId }: { childSop?: SkillRead; subSopId: string }) {
+  const { t } = useDistillIntl();
   const childNodes = childSop ? skillGraphSteps(childSop.content) : [];
   const visibleNodes = childNodes.slice(0, 4);
   return (
     <div className="grid gap-[7px] rounded-[10px] border border-[#cfe5df] bg-[#f3faf7] p-[9px] text-[#315e59]">
       <div className="flex min-w-0 items-center justify-between gap-[8px]">
-        <strong className="truncate text-[12px] font-semibold">{childSop?.name || '未找到子 SOP'}</strong>
-        <span className="shrink-0 rounded-full bg-white px-[7px] py-[2px] text-[10px] text-[#04756f]">共享字段</span>
+        <strong className="truncate text-[12px] font-semibold">{childSop?.name || t('distillPage.subflow.notFound')}</strong>
+        <span className="shrink-0 rounded-full bg-white px-[7px] py-[2px] text-[10px] text-[#04756f]">{t('distillPage.subflow.sharedFields')}</span>
       </div>
-      <span className="truncate font-mono text-[10px] text-[#66817d]">{subSopId || '尚未选择 SOP'}</span>
+      <span className="truncate font-mono text-[10px] text-[#66817d]">{subSopId || t('distillPage.subflow.unselected')}</span>
       {visibleNodes.length > 0 ? (
-        <div className="flex min-w-0 items-center gap-[4px] overflow-hidden" aria-label="子 SOP 节点预览">
+        <div className="flex min-w-0 items-center gap-[4px] overflow-hidden" aria-label={t('distillPage.subflow.previewAria')}>
           {visibleNodes.map((node, index) => (
             <div className="contents" key={String(node.node_id || index)}>
               {index > 0 && <span className="shrink-0 text-[#8aa39f]">→</span>}
               <span className="min-w-0 truncate rounded-md border border-[#d8e9e4] bg-white px-[6px] py-[3px] text-[10px]">
-                {String(node.name || node.node_id || `节点 ${index + 1}`)}
+                {String(node.name || node.node_id || indexedNodeLabel(index))}
               </span>
             </div>
           ))}
@@ -5172,7 +5737,7 @@ function NestedSopPreview({ childSop, subSopId }: { childSop?: SkillRead; subSop
           )}
         </div>
       ) : (
-        <span className="text-[10px] text-[#8a9694]">发布子 SOP 后将在这里显示其流程节点</span>
+        <span className="text-[10px] text-[#8a9694]">{t('distillPage.subflow.previewAfterPublish')}</span>
       )}
     </div>
   );
@@ -5227,7 +5792,7 @@ function skillGraphSteps(skill: SkillCard): Array<Record<string, unknown>> {
         step_id: node.node_id || `node_${index + 1}`,
         node_id: node.node_id || `node_${index + 1}`,
         type: node.type || 'collect_info',
-        name: node.name || node.node_id || `节点 ${index + 1}`,
+        name: node.name || node.node_id || indexedNodeLabel(index),
         instruction: node.instruction || '',
         optional: Boolean(node.optional),
         condition: node.condition || '',
@@ -5243,6 +5808,8 @@ function skillGraphSteps(skill: SkillCard): Array<Record<string, unknown>> {
         retry_policy: isRecord(node.retry_policy) ? node.retry_policy : {},
         metadata: isRecord(node.metadata) ? node.metadata : {},
         sub_sop_id: stringValue(node.sub_sop_id, ''),
+        assignee_user_id: stringValue(node.assignee_user_id, ''),
+        assignee_notify_channel: stringValue(node.assignee_notify_channel, ''),
       };
     });
   }
@@ -5345,9 +5912,9 @@ function uniqueNodeId(nodes: Array<Record<string, unknown>>, preferred: string):
 
 function nodeDisplayNameById(nodes: Array<Record<string, unknown>>, nodeId: string): string {
   const index = nodes.findIndex((node) => String(node.node_id || node.step_id || '') === nodeId);
-  if (index < 0) return nodeId || '未指定节点';
+  if (index < 0) return nodeId || currentDistillTranslator().t('distillPage.node.unspecified');
   const node = nodes[index];
-  return `Node ${index + 1} · ${String(node.name || nodeId)}`;
+  return currentDistillTranslator().t('distillPage.node.optionLabel', { index: index + 1, name: String(node.name || nodeId) });
 }
 
 type SkillFlowCanvasNode = {
@@ -5383,7 +5950,7 @@ function estimatedWrappedLines(value: unknown, charactersPerLine: number): numbe
 
 function estimateSkillFlowNodeHeight(nodes: Array<Record<string, unknown>>): number {
   return Math.max(324, ...nodes.map((node) => {
-    const instructionHeight = estimatedWrappedLines(node.instruction || '暂无说明', 24) * 21;
+    const instructionHeight = estimatedWrappedLines(node.instruction || currentDistillTranslator().t('distillPage.node.noInstruction'), 24) * 21;
     const fieldRows = Math.ceil(asStringList(node.expected_user_info).length / 3) * 28;
     const actionRows = Math.ceil(asStringList(node.allowed_actions).length / 2) * 28;
     return 182 + instructionHeight + fieldRows + actionRows + 48;
@@ -5391,7 +5958,7 @@ function estimateSkillFlowNodeHeight(nodes: Array<Record<string, unknown>>): num
 }
 
 function estimateSkillFlowRootHeight(skill: SkillCard): number {
-  const descriptionHeight = estimatedWrappedLines(skill.description || '暂无描述', 38) * 21;
+  const descriptionHeight = estimatedWrappedLines(skill.description || currentDistillTranslator().t('distillPage.flow.noDescription'), 38) * 21;
   const infoRows = Math.ceil(asStringList(skill.required_info).length / 4) * 28;
   const intentRows = Math.ceil(asStringList(skill.trigger_intents).length / 4) * 28;
   return Math.max(270, 154 + descriptionHeight + infoRows + intentRows + 72);
@@ -5459,14 +6026,10 @@ function buildSkillFlowCanvasLayout(
     if (sourceId) acc[sourceId] = (acc[sourceId] || 0) + 1;
     return acc;
   }, {});
-  const sourceEdgeLabelCounts = rawEdges.reduce<Record<string, Record<string, number>>>((acc, edge) => {
-    const sourceId = String(edge.source_node_id || '').trim();
-    if (!sourceId) return acc;
-    const label = normalizedEdgeLabel(edge, nodeNameMap);
-    if (!acc[sourceId]) acc[sourceId] = {};
-    acc[sourceId][label] = (acc[sourceId][label] || 0) + 1;
-    return acc;
-  }, {});
+  const sourceEdgeLabelCounts = countSkillFlowEdgeLabels(
+    rawEdges,
+    (edge) => normalizedEdgeLabel(edge, nodeNameMap),
+  );
   const incomingCounts = rawEdges.reduce<Record<string, number>>((acc, edge) => {
     const targetId = String(edge.next_node_id || '');
     if (targetId) acc[targetId] = (acc[targetId] || 0) + 1;
@@ -5497,8 +6060,8 @@ function buildSkillFlowCanvasLayout(
       id: `root_${startNode.nodeId}`,
       kind: 'root',
       labelTone: 'root',
-      label: '开始',
-      title: `开始 -> ${nodeNameMap[startNode.nodeId] || startNode.nodeId}`,
+      label: currentDistillTranslator().t('distillPage.flow.start'),
+      title: currentDistillTranslator().t('distillPage.flow.startToNode', { name: nodeNameMap[startNode.nodeId] || startNode.nodeId }),
       path: forwardFlowPath(sourceX, sourceY, targetX, targetY, laneY),
       labelX: labelAnchor.x,
       labelY: labelAnchor.y,
@@ -5512,7 +6075,7 @@ function buildSkillFlowCanvasLayout(
     if (!source || !target) return;
     const siblingCount = edgeSiblingCounts[sourceId] || 1;
     const baseLabel = normalizedEdgeLabel(edge, nodeNameMap);
-    const hasDuplicateSourceLabel = (sourceEdgeLabelCounts[sourceId]?.[baseLabel] || 0) > 1;
+    const hasDuplicateSourceLabel = (sourceEdgeLabelCounts.get(sourceId)?.get(baseLabel) || 0) > 1;
     const isParallelFlow = hasDuplicateSourceLabel;
     const label = flowEdgeDisplayLabel(edge, nodeNameMap, siblingCount, hasDuplicateSourceLabel);
     const title = incomingEdgeLabel(edge, nodeNameMap);
@@ -5935,6 +6498,7 @@ function sideReturnFlowPath(
 }
 
 function incomingEdgeLabel(edge: Record<string, unknown>, nodeNameMap: Record<string, string> = {}): string {
+  const { t } = currentDistillTranslator();
   const source = String(edge.source_node_id || '');
   const sourceName = source && nodeNameMap[source] ? nodeNameMap[source] : source;
   const targetName = edgeTargetName(edge, nodeNameMap);
@@ -5944,21 +6508,22 @@ function incomingEdgeLabel(edge: Record<string, unknown>, nodeNameMap: Record<st
   const detail = label && condition ? `${label}（${condition}）` : label || condition;
   if (route && detail) return `${route}：${detail}`;
   if (route) return route;
-  return detail || '流转';
+  return detail || t('distillPage.flow.edgeDefault');
 }
 
 function edgeDisplayLabel(edge: Record<string, unknown>, nodeNameMap: Record<string, string> = {}): string {
+  const { t } = currentDistillTranslator();
   const label = String(edge.label || '').trim();
   if (label) return label;
   const condition = conditionNaturalText(String(edge.condition || '')).trim();
   if (condition) return condition;
   const source = String(edge.source_node_id || '');
   const sourceName = source && nodeNameMap[source] ? nodeNameMap[source] : source;
-  return sourceName ? `来自 ${sourceName}` : '流转';
+  return sourceName ? t('distillPage.flow.edgeFromNode', { name: sourceName }) : t('distillPage.flow.edgeDefault');
 }
 
 function normalizedEdgeLabel(edge: Record<string, unknown>, nodeNameMap: Record<string, string> = {}): string {
-  return edgeDisplayLabel(edge, nodeNameMap).replace(/\s+/g, ' ').trim() || '流转';
+  return edgeDisplayLabel(edge, nodeNameMap).replace(/\s+/g, ' ').trim() || currentDistillTranslator().t('distillPage.flow.edgeDefault');
 }
 
 function edgeTargetName(edge: Record<string, unknown>, nodeNameMap: Record<string, string> = {}): string {
@@ -5994,7 +6559,11 @@ function hasDuplicateOutgoingEdgeLabel(
 }
 
 function outgoingRouteCountLabel(edges: Array<Record<string, unknown>>): string {
-  return `${edges.length} 条${hasDuplicateOutgoingEdgeLabel(edges) ? '并行' : ''}流转`;
+  const { t } = currentDistillTranslator();
+  return t('distillPage.flow.outgoingCount', {
+    count: edges.length,
+    parallel: hasDuplicateOutgoingEdgeLabel(edges) ? t('distillPage.flow.parallelShort') : '',
+  });
 }
 
 function flowEdgeDisplayLabel(
@@ -6006,11 +6575,11 @@ function flowEdgeDisplayLabel(
   const label = normalizedEdgeLabel(edge, nodeNameMap);
   const targetName = edgeTargetName(edge, nodeNameMap);
   if (hasDuplicateSourceLabel && targetName) {
-    return `并行执行 · ${targetName}`;
+    return currentDistillTranslator().t('distillPage.flow.parallelToNode', { name: targetName });
   }
   const hasExplicitLabel = Boolean(String(edge.label || '').trim() || String(edge.condition || '').trim());
   if (siblingCount > 1 && targetName && (hasDuplicateSourceLabel || !hasExplicitLabel)) {
-    return `${label} · 到${targetName}`;
+    return currentDistillTranslator().t('distillPage.flow.edgeToNode', { label, name: targetName });
   }
   return label;
 }
@@ -6021,14 +6590,15 @@ function sourceEdgeSummary(
   index = 0,
   siblingEdges: Array<Record<string, unknown>> = [],
 ): string {
-  const targetName = edgeTargetName(edge, nodeNameMap) || '未指定节点';
+  const { t } = currentDistillTranslator();
+  const targetName = edgeTargetName(edge, nodeNameMap) || t('distillPage.node.unspecified');
   const label = String(edge.label || '').trim();
   const condition = conditionNaturalText(String(edge.condition || '')).trim();
   const hasPriority = edge.priority !== undefined && edge.priority !== null && String(edge.priority).trim() !== '';
   const priority = hasPriority && typeof edge.priority === 'number' ? edge.priority : hasPriority && Number.isFinite(Number(edge.priority)) ? Number(edge.priority) : index;
   const prefix = label || condition;
-  const parallelText = hasDuplicateSiblingEdgeLabel(edge, siblingEdges, nodeNameMap) ? '并行执行 · ' : '';
-  const priorityText = hasPriority && Number.isFinite(priority) ? ` · 优先级 ${priority}` : '';
+  const parallelText = hasDuplicateSiblingEdgeLabel(edge, siblingEdges, nodeNameMap) ? `${t('distillPage.flow.parallelPrefix')} · ` : '';
+  const priorityText = hasPriority && Number.isFinite(priority) ? ` · ${t('distillPage.flow.priority', { priority })}` : '';
   return `${parallelText}${prefix ? `${prefix} -> ` : ''}${targetName}${priorityText}`;
 }
 
@@ -6039,7 +6609,7 @@ function compactEdgeLabel(value: string): string {
 }
 
 function nodeTypeLabel(type: string): string {
-  return NODE_TYPE_OPTIONS.find((item) => item.value === type)?.label || type || '节点';
+  return nodeTypeOptions().find((item) => item.value === type)?.label || type || currentDistillTranslator().t('distillPage.nodeType.default');
 }
 
 function knowledgeScopeLabels(value: unknown): string[] {
@@ -6069,8 +6639,9 @@ function sourceInputStyle(value: string, multiline = false): CSSProperties {
 }
 
 function previewSourceText(value: string): string {
+  const { t } = currentDistillTranslator();
   const text = value.replace(/\s+/g, ' ').trim();
-  if (!text) return '暂无节点说明';
+  if (!text) return t('distillPage.node.noInstruction');
   return text.length > 96 ? `${text.slice(0, 96)}...` : text;
 }
 
@@ -6098,10 +6669,11 @@ function EditableSourceStepHeading({
   fallback: string;
   onChange: (value: string) => void;
 }) {
+  const { t } = useDistillIntl();
   return (
     <EditableSourceField>
       <div className={SOURCE_STEP_TITLE_EDIT_CLASS}>
-        <span>Node {index + 1}:</span>
+        <span>{t('distillPage.node.indexLabel', { index: index + 1 })}:</span>
         <SourceInput
           value={value}
           placeholder={fallback}
@@ -6128,6 +6700,7 @@ function EditableSourceTextLine({
   readOnly?: boolean;
   onChange: (value: string) => void;
 }) {
+  const { t } = useDistillIntl();
   const canCollapse = collapsible && multiline;
   const shouldStartCollapsed = canCollapse && value.trim().length > 90;
   const [collapsed, setCollapsed] = useState(shouldStartCollapsed);
@@ -6151,11 +6724,11 @@ function EditableSourceTextLine({
                 onClick={() => setCollapsed((current) => !current)}
               >
                 <span className={cn(SOURCE_COLLAPSIBLE_PREVIEW_CLASS, !collapsed && SOURCE_COLLAPSIBLE_PREVIEW_MUTED_CLASS)}>
-                  {collapsed ? previewSourceText(value) : '正在编辑节点说明'}
+                  {collapsed ? previewSourceText(value) : t('distillPage.node.editingInstruction')}
                 </span>
                 <span className={SOURCE_COLLAPSIBLE_TOGGLE_CLASS}>
                   {collapsed ? <RightOutlined /> : <DownOutlined />}
-                  {collapsed ? '展开' : '收起'}
+                  {collapsed ? t('distillPage.common.expand') : t('distillPage.common.collapse')}
                 </span>
               </button>
               {!collapsed && (
@@ -6315,6 +6888,7 @@ function EditableConditionLine({
   value: string;
   onChange: (value: string) => void;
 }) {
+  const { t } = useDistillIntl();
   const presetValue = conditionPresetValue(value);
   const naturalValue = conditionNaturalText(value);
   return (
@@ -6326,7 +6900,7 @@ function EditableConditionLine({
             <SourceSelect
               className={CONDITION_PRESET_CLASS}
               value={presetValue}
-              options={CONDITION_PRESET_OPTIONS}
+              options={conditionPresetOptions()}
               onChange={(nextValue) => {
                 if (nextValue === '__custom__') {
                   onChange(naturalValue);
@@ -6338,7 +6912,7 @@ function EditableConditionLine({
             <AutoGrowTextarea
               className={cn(SOURCE_EDIT_INPUT_CLASS, CONDITION_INPUT_CLASS)}
               value={naturalValue}
-              placeholder="用一句话描述什么时候进入，例如：用户已经提供商品名称后进入"
+              placeholder={t('distillPage.condition.placeholder')}
               minRows={1}
               onChange={(event) => onChange(event.target.value)}
             />
@@ -6378,6 +6952,7 @@ function EditableRetryPolicyLine({
   value: unknown;
   onChange: (value: Record<string, unknown>) => void;
 }) {
+  const { t } = useDistillIntl();
   const policy = isRecord(value) ? value : {};
   const attemptKey = Object.prototype.hasOwnProperty.call(policy, 'max_retries') ? 'max_retries' : 'max_attempts';
   const strategyKey = Object.prototype.hasOwnProperty.call(policy, 'strategy') ? 'strategy' : 'on_failure';
@@ -6386,7 +6961,7 @@ function EditableRetryPolicyLine({
   const strategy = retryPolicyString(policy.strategy ?? policy.on_failure);
   const retryMessage = retryPolicyString(policy.retry_message ?? policy.message);
   const strategyOptions = mergeSelectOptions(
-    RETRY_STRATEGY_OPTIONS,
+    retryStrategyOptions(),
     strategy ? [{ value: strategy, label: retryStrategyLabel(strategy) }] : [],
   );
 
@@ -6415,33 +6990,33 @@ function EditableRetryPolicyLine({
 
   return (
     <div className={SOURCE_LINE_CLASS}>
-      <span className={SOURCE_KEY_CLASS}>重试策略</span>
+      <span className={SOURCE_KEY_CLASS}>{t('distillPage.retry.title')}</span>
       <span className={SOURCE_VALUE_CLASS}>
         <EditableSourceField>
           <div className={RETRY_POLICY_EDITOR_CLASS}>
             <label className={RETRY_POLICY_FIELD_CLASS}>
-              <span>最多重试</span>
+              <span>{t('distillPage.retry.maxAttempts')}</span>
               <SourceNumberInput
                 min={0}
                 value={maxAttempts}
-                placeholder="不限制"
+                placeholder={t('distillPage.placeholder.unlimited')}
                 onChange={updateAttempts}
               />
             </label>
             <label className={RETRY_POLICY_FIELD_CLASS}>
-              <span>失败后</span>
+              <span>{t('distillPage.retry.onFailure')}</span>
               <SourceSelect
                 value={strategy || undefined}
                 options={strategyOptions}
-                placeholder="选择处理方式"
+                placeholder={t('distillPage.retry.placeholder')}
                 onChange={(nextValue) => updateStrategy(nextValue)}
               />
             </label>
             <label className={RETRY_POLICY_FIELD_CLASS}>
-              <span>追问文案</span>
+              <span>{t('distillPage.retry.message')}</span>
               <SourceInput
                 value={retryMessage}
-                placeholder="例如：请补充需要校验的报文内容。"
+                placeholder={t('distillPage.retry.messagePlaceholder')}
                 onChange={(event) => updateMessage(event.target.value)}
               />
             </label>
@@ -6462,7 +7037,7 @@ function retryPolicyString(value: unknown): string {
 }
 
 function retryStrategyLabel(value: string): string {
-  return RETRY_STRATEGY_OPTIONS.find((item) => item.value === value)?.label || value;
+  return retryStrategyOptions().find((item) => item.value === value)?.label || value;
 }
 
 function hasReadableSourceObject(value: unknown): boolean {
@@ -6518,6 +7093,7 @@ export function EditableCapabilityReferencesLine({
   onChange: (value: string[]) => void;
   onRequiredChange: (value: string[]) => void;
 }) {
+  const { t } = useDistillIntl();
   const [query, setQuery] = useState('');
   const selectedValues = new Set(values);
   const mergedOptions = mergeCapabilityReferenceOptions(
@@ -6584,7 +7160,7 @@ export function EditableCapabilityReferencesLine({
                         >
                           <span className="truncate">{option?.label || value}</span>
                           <span className="shrink-0 text-[9px] opacity-75">
-                            {required.has(value) ? '强制' : '可选'}
+                            {required.has(value) ? t('distillPage.capability.requiredShort') : t('distillPage.capability.optionalShort')}
                           </span>
                         </span>
                       );
@@ -6592,7 +7168,7 @@ export function EditableCapabilityReferencesLine({
                   )}
                 </span>
                 <span className="shrink-0 text-[11px] text-[#1a71ff]">
-                  {values.length > 0 ? `已选择 ${values.length} 个` : '选择'}
+                  {values.length > 0 ? t('distillPage.capability.selectedCount', { count: values.length }) : t('distillPage.capability.select')}
                 </span>
               </button>
             </PopoverTrigger>
@@ -6601,13 +7177,13 @@ export function EditableCapabilityReferencesLine({
                 <Input
                   value={query}
                   onChange={(event) => setQuery(event.target.value)}
-                  placeholder={`搜索${label}`}
+                  placeholder={t('distillPage.capability.searchPlaceholder', { label })}
                   className="h-[32px]"
                 />
               </div>
               <div className="max-h-[300px] overflow-y-auto p-[6px]">
                 {filteredOptions.length === 0 ? (
-                  <div className="px-[10px] py-[24px] text-center text-[12px] text-[#858b9c]">暂无可选能力</div>
+                  <div className="px-[10px] py-[24px] text-center text-[12px] text-[#858b9c]">{t('distillPage.capability.empty')}</div>
                 ) : (
                   filteredOptions.map((option) => {
                     const checked = selected.has(option.value);
@@ -6625,7 +7201,7 @@ export function EditableCapabilityReferencesLine({
                           disabled={disabled}
                           className="mt-[2px]"
                           onCheckedChange={(next) => toggle(option.value, next === true)}
-                          aria-label={`${checked ? '取消选择' : '选择'}${option.label}`}
+                          aria-label={t(checked ? 'distillPage.capability.unselect' : 'distillPage.capability.selectItem', { label: option.label })}
                         />
                         <span className="min-w-0 flex-1">
                           <span className="flex min-w-0 flex-wrap items-center gap-[6px]">
@@ -6651,7 +7227,7 @@ export function EditableCapabilityReferencesLine({
                               )}
                               onClick={() => setRequired(option.value, false)}
                             >
-                              可选执行
+                              {t('distillPage.capability.optionalAction')}
                             </button>
                             <button
                               type="button"
@@ -6663,7 +7239,7 @@ export function EditableCapabilityReferencesLine({
                               )}
                               onClick={() => setRequired(option.value, true)}
                             >
-                              强制执行
+                              {t('distillPage.capability.requiredAction')}
                             </button>
                           </span>
                         )}
@@ -6673,7 +7249,7 @@ export function EditableCapabilityReferencesLine({
                 )}
               </div>
               <div className="border-t border-[#eceef1] px-[12px] py-[8px] text-[11px] leading-[1.45] text-[#858b9c]">
-                通用能力始终可由模型自主选择；仅限 SOP 的能力需在当前节点选择。标记为强制执行后，成功调用才允许推进节点。
+                {t('distillPage.capability.footer')}
               </div>
             </PopoverContent>
           </Popover>
@@ -6695,8 +7271,8 @@ function mergeCapabilityReferenceOptions(
       .map((value) => ({
         value,
         label: value,
-        description: '资源当前不可用，可取消引用',
-        unavailableReason: '资源不可用',
+        description: currentDistillTranslator().t('distillPage.capability.unavailable.resourceDescription'),
+        unavailableReason: capabilityUnavailableReason('resource'),
       })),
   ];
 }
@@ -6714,6 +7290,7 @@ function EditableActionList({
   toolStatuses: ToolStatusMap;
   onChange: (value: string) => void;
 }) {
+  const { t } = useDistillIntl();
   const [editingIndex, setEditingIndex] = useState<number | null>(null);
   const mergedOptions = mergeSelectOptions(options, actions.map((action) => ({
     value: action,
@@ -6735,7 +7312,7 @@ function EditableActionList({
     }
     const duplicateIndex = next.findIndex((item, itemIndex) => item === nextAction && itemIndex !== index);
     if (duplicateIndex >= 0) {
-      notify.info('这个动作已经添加过了');
+      notify.info(t('distillPage.actionList.duplicate'));
       setEditingIndex(null);
       return;
     }
@@ -6760,7 +7337,7 @@ function EditableActionList({
       <ActionCombobox
         value={value || undefined}
         options={mergedOptions}
-        placeholder="选择一个动作"
+        placeholder={t('distillPage.actionPicker.placeholder')}
         onSelect={(nextValue) => commitAction(index, String(nextValue || ''))}
       />
     );
@@ -6783,7 +7360,7 @@ function EditableActionList({
               >
                 <ActionChip action={action} toolDescriptions={toolDescriptions} toolStatuses={toolStatuses} editable />
               </button>
-              <button type="button" className={SOURCE_ACTION_REMOVE_CLASS} onClick={() => removeAction(index)} aria-label={`移除 ${actionLabel(action)}`}>
+              <button type="button" className={SOURCE_ACTION_REMOVE_CLASS} onClick={() => removeAction(index)} aria-label={t('distillPage.actionList.remove', { action: actionLabel(action) })}>
                 <CloseOutlined />
               </button>
             </span>
@@ -6796,21 +7373,21 @@ function EditableActionList({
         )}
         {actions.length === 0 && editingIndex === null && (
           <div className={SOURCE_ACTION_EMPTY_CLASS}>
-            <span>当前节点还没有允许动作</span>
+            <span>{t('distillPage.actionList.empty')}</span>
             <button type="button" className={SOURCE_ACTION_ADD_CLASS} onClick={() => setEditingIndex(0)}>
               <PlusOutlined />
-              添加动作
+              {t('distillPage.actionList.add')}
             </button>
           </div>
         )}
         {actions.length > 0 && editingIndex === null && (
           <button type="button" className={SOURCE_ACTION_ADD_CLASS} onClick={() => setEditingIndex(actions.length)}>
             <PlusOutlined />
-            新增动作
+            {t('distillPage.actionList.addAnother')}
           </button>
         )}
       </div>
-      <span className={SOURCE_EDIT_HINT_CLASS}>每次新增一个动作；点击已有动作可重新选择。</span>
+      <span className={SOURCE_EDIT_HINT_CLASS}>{t('distillPage.actionList.hint')}</span>
     </div>
   );
 }
@@ -6834,54 +7411,55 @@ function EditableFlowRulesLine({
   onUpdate: (edgeIndex: number, patch: Record<string, unknown>) => void;
   onDelete: (edgeIndex: number) => void;
 }) {
+  const { t } = useDistillIntl();
   const orderedEdges = edges
     .map((edge, index) => ({ edge, index }))
     .sort((a, b) => edgePriority(a.edge, a.index) - edgePriority(b.edge, b.index));
   return (
     <div className={SOURCE_LINE_CLASS}>
-      <span className={SOURCE_KEY_CLASS}>流转规则</span>
+      <span className={SOURCE_KEY_CLASS}>{t('distillPage.flowRules.title')}</span>
       <span className={SOURCE_VALUE_CLASS}>
         <EditableSourceField>
           <div className={FLOW_RULE_EDITOR_CLASS}>
             <div className={FLOW_RULE_HEAD_CLASS}>
-              <span>从 {nodeDisplayNameById(nodes, sourceNodeId)} 出发</span>
+              <span>{t('distillPage.flowRules.fromNode', { name: nodeDisplayNameById(nodes, sourceNodeId) })}</span>
               <UIButton variant="outline" size="sm" className={PILL_OUTLINE_BUTTON_CLASS} onClick={onAdd}>
                 <PlusOutlined />
-                新增规则
+                {t('distillPage.flowRules.add')}
               </UIButton>
             </div>
             {orderedEdges.length === 0 ? (
-              <div className={FLOW_RULE_EMPTY_CLASS}>{terminal ? '当前节点是终止节点，默认流程结束。' : '还没有后续节点，请新增流转规则。'}</div>
+              <div className={FLOW_RULE_EMPTY_CLASS}>{terminal ? t('distillPage.flowRules.emptyTerminal') : t('distillPage.flowRules.empty')}</div>
             ) : (
               <div className={FLOW_RULE_LIST_CLASS}>
                 {orderedEdges.map(({ edge, index }) => (
                   <div className={FLOW_RULE_ITEM_CLASS} key={`${String(edge.next_node_id)}_${index}`}>
                     <label className={cn(FLOW_RULE_FIELD_CLASS, FLOW_RULE_FIELD_TARGET_CLASS)}>
-                      <span>目标 Node</span>
+                      <span>{t('distillPage.flowRules.target')}</span>
                       <SourceSelect
                         className={FLOW_RULE_TARGET_CLASS}
                         value={String(edge.next_node_id || '') || undefined}
                         options={nodeOptions}
-                        placeholder="选择目标 Node"
+                        placeholder={t('distillPage.flowRules.targetPlaceholder')}
                         onChange={(value) => onUpdate(index, { next_node_id: value })}
                       />
                     </label>
                     <label className={cn(FLOW_RULE_FIELD_CLASS, FLOW_RULE_FIELD_LABEL_CLASS)}>
-                      <span>规则名称</span>
+                      <span>{t('distillPage.flowRules.label')}</span>
                       <SourceInput
                         className={FLOW_RULE_LABEL_INPUT_CLASS}
                         value={String(edge.label || '')}
-                        placeholder="例如：信息完整后继续"
+                        placeholder={t('distillPage.flowRules.labelPlaceholder')}
                         onChange={(event) => onUpdate(index, { label: event.target.value })}
                       />
                     </label>
                     <div className={cn(FLOW_RULE_FIELD_CLASS, FLOW_RULE_FIELD_CONDITION_CLASS)}>
-                      <span>进入条件</span>
+                      <span>{t('distillPage.flowRules.condition')}</span>
                       <div className={FLOW_RULE_CONDITION_CONTROLS_CLASS}>
                         <SourceSelect
                           className={CONDITION_PRESET_CLASS}
                           value={conditionPresetValue(String(edge.condition || ''))}
-                          options={CONDITION_PRESET_OPTIONS}
+                          options={conditionPresetOptions()}
                           onChange={(nextValue) => {
                             if (nextValue === '__custom__') {
                               onUpdate(index, { condition: conditionNaturalText(String(edge.condition || '')) });
@@ -6893,7 +7471,7 @@ function EditableFlowRulesLine({
                         <AutoGrowTextarea
                           className={FLOW_RULE_CONDITION_INPUT_CLASS}
                           value={conditionNaturalText(String(edge.condition || ''))}
-                          placeholder="用一句话描述，例如：报文已获取后进入"
+                          placeholder={t('distillPage.flowRules.conditionPlaceholder')}
                           minRows={1}
                           onChange={(event) => onUpdate(index, { condition: event.target.value })}
                         />
@@ -6901,7 +7479,7 @@ function EditableFlowRulesLine({
                       <em>{flowRuleConditionText(String(edge.condition || ''))}</em>
                     </div>
                     <label className={cn(FLOW_RULE_FIELD_CLASS, FLOW_RULE_FIELD_PRIORITY_CLASS)}>
-                      <span>优先级</span>
+                      <span>{t('distillPage.flowRules.priority')}</span>
                       <SourceNumberInput
                         className={FLOW_RULE_PRIORITY_CLASS}
                         min={0}
@@ -7047,7 +7625,7 @@ function ActionChip({
   editable?: boolean;
 }) {
   const toolName = toolNameFromAction(action);
-  const description = toolName ? toolDescriptions[toolName] || '当前工具配置中暂无描述' : '';
+  const description = toolName ? toolDescriptions[toolName] || currentDistillTranslator().t('distillPage.tool.noDescription') : '';
   const status = toolName ? toolStatuses[toolName] || 'incomplete' : '';
   const variant = className.includes('removed')
     ? 'removed'
@@ -7156,13 +7734,13 @@ function actionsFromDiffText(value: string): string[] {
 }
 
 function parseInitialSkillPrompt(text: string): { title: string; raw_content: string } {
-  return { title: '新SOP', raw_content: text.trim() };
+  return { title: defaultDistillSkillTitle(), raw_content: text.trim() };
 }
 
 function createStreamingDraftSeed(payload: { title: string; raw_content: string }): SkillCard {
   return {
     skill_id: `skill_${slugSegment(payload.title) || 'preview'}`,
-    name: payload.title || '新SOP',
+    name: payload.title || defaultDistillSkillTitle(),
     version: '1.0.0',
     business_domain: '',
     description: payload.raw_content.slice(0, 120),
@@ -7222,7 +7800,7 @@ function parseCompleteStreamSkill(streamText: string): SkillCard | null {
     if (!isRecord(draft)) return null;
     return {
       skill_id: stringValue(draft.skill_id, 'skill_preview'),
-      name: stringValue(draft.name, '新SOP'),
+      name: stringValue(draft.name, defaultDistillSkillTitle()),
       version: stringValue(draft.version, '1.0.0'),
       business_domain: stringValue(draft.business_domain, ''),
       description: stringValue(draft.description, ''),
@@ -7297,6 +7875,7 @@ function parseNodeFragment(fragment: string, index: number): Record<string, unkn
   const condition = extractJsonStringField(fragment, 'condition') || '';
   const subSopId = extractJsonStringField(fragment, 'sub_sop_id') || '';
   const assigneeUserId = extractJsonStringField(fragment, 'assignee_user_id') || '';
+  const assigneeNotifyChannel = extractJsonStringField(fragment, 'assignee_notify_channel') || '';
   const expectedUserInfo = extractJsonStringArrayField(fragment, 'expected_user_info') || [];
   const allowedActions = extractJsonStringArrayField(fragment, 'allowed_actions') || [];
   const generalSkillIds = extractJsonStringArrayField(fragment, 'general_skill_ids') || [];
@@ -7320,7 +7899,7 @@ function parseNodeFragment(fragment: string, index: number): Record<string, unkn
   return {
     node_id: nodeId || `node_${index + 1}`,
     type,
-    name: name || nodeId || `节点 ${index + 1}`,
+    name: name || nodeId || indexedNodeLabel(index),
     instruction,
     optional: false,
     condition,
@@ -7339,6 +7918,7 @@ function parseNodeFragment(fragment: string, index: number): Record<string, unkn
     retry_policy: {},
     metadata: {},
     assignee_user_id: assigneeUserId || null,
+    assignee_notify_channel: assigneeNotifyChannel || null,
   };
 }
 
@@ -7346,6 +7926,7 @@ function normalizeNodePreview(node: Record<string, unknown>, index = 0): Record<
   const nodeId = stringValue(node.node_id, `node_${index + 1}`);
   const capabilityRefs = nodeCapabilityRefs(node);
   const assigneeUserId = stringValue(node.assignee_user_id, '');
+  const assigneeNotifyChannel = stringValue(node.assignee_notify_channel, '');
   return {
     node_id: nodeId,
     type: stringValue(node.type, 'collect_info'),
@@ -7361,6 +7942,7 @@ function normalizeNodePreview(node: Record<string, unknown>, index = 0): Record<
     metadata: isRecord(node.metadata) ? node.metadata : {},
     sub_sop_id: stringValue(node.sub_sop_id, ''),
     assignee_user_id: assigneeUserId || null,
+    assignee_notify_channel: assigneeNotifyChannel || null,
   };
 }
 
@@ -7561,6 +8143,28 @@ function asStringList(value: unknown): string[] {
   return [];
 }
 
+export function applyNodeTypeChange(
+  node: Record<string, unknown>,
+  nextType: string,
+): Record<string, unknown> {
+  const type = String(nextType || 'collect_info');
+  node.type = type;
+  // 类型切换离开 handoff 时清理转人工专属配置:动作与处理人只属于 handoff 节点
+  if (type !== 'handoff') {
+    node.allowed_actions = asStringList(node.allowed_actions)
+      .filter((action) => action !== 'handoff_human');
+    node.assignee_user_id = null;
+    node.assignee_notify_channel = null;
+  }
+  return node;
+}
+
+export function filterActionOptionsForNodeType(options: SelectOption[], type: string): SelectOption[] {
+  // 转人工动作只允许出现在 handoff 节点上
+  if (String(type || '') === 'handoff') return options;
+  return options.filter((option) => option.value !== 'handoff_human');
+}
+
 function hasSelectedText(): boolean {
   return Boolean(window.getSelection()?.toString().trim());
 }
@@ -7577,18 +8181,19 @@ async function fileToBase64(file: File): Promise<string> {
 }
 
 function filenameTitle(filename: string): string {
-  return filename.replace(/\.[^.]+$/, '').trim() || '新SOP';
+  return filename.replace(/\.[^.]+$/, '').trim() || defaultDistillSkillTitle();
 }
 
-const uploadContentMarker = '上传文档内容：';
+const uploadContentMarker = currentDistillTranslator().t('distillPage.upload.contentMarker');
 
 function buildOutgoingText(input: string, attachments: UploadAttachment[]): string {
+  const { t } = currentDistillTranslator();
   const text = input.trim();
   const attachmentText = attachments
     .filter((item) => item.status === 'ready' && item.text?.trim())
-    .map((item) => `文件：${item.name}\n${item.text?.trim() || ''}`)
+    .map((item) => t('distillPage.upload.fileBlock', { name: item.name, text: item.text?.trim() || '' }))
     .join('\n\n');
-  return [text, attachmentText ? `上传文档内容：\n${attachmentText}` : ''].filter(Boolean).join('\n\n');
+  return [text, attachmentText ? `${t('distillPage.upload.contentMarker')}\n${attachmentText}` : ''].filter(Boolean).join('\n\n');
 }
 
 function visibleChatContent(item: ChatItem): string {
@@ -7657,6 +8262,7 @@ function PencilGlyph() {
 }
 
 function normalizeToolSuggestions(value: unknown): ToolSuggestionItem[] {
+  const { t } = currentDistillTranslator();
   if (!Array.isArray(value)) return [];
   return value
     .filter((item): item is Record<string, unknown> => isRecord(item))
@@ -7664,7 +8270,7 @@ function normalizeToolSuggestions(value: unknown): ToolSuggestionItem[] {
       name: String(item.name || '').trim(),
       display_name: typeof item.display_name === 'string' ? item.display_name : undefined,
       description: typeof item.description === 'string' ? item.description : undefined,
-      bucket: typeof item.bucket === 'string' && item.bucket.trim() ? item.bucket.trim() : '技能自发现工具',
+      bucket: typeof item.bucket === 'string' && item.bucket.trim() ? item.bucket.trim() : t('distillPage.tool.defaultBucket'),
       tool_type: item.tool_type === 'mcp' ? 'mcp' : item.tool_type === 'a2a' ? 'a2a' : 'http',
       method: typeof item.method === 'string' ? item.method : 'POST',
       url: typeof item.url === 'string' ? item.url : '',
@@ -7699,30 +8305,33 @@ function toolSuggestionResolution(suggestion: ToolSuggestionItem): NonNullable<T
 }
 
 function toolSuggestionTitle(suggestion: ToolSuggestionItem): string {
+  const { t } = currentDistillTranslator();
   const label = suggestion.display_name || suggestion.name;
   if (toolSuggestionResolution(suggestion) === 'existing') {
-    return `已匹配工具：${suggestion.matched_tool_display_name || label}`;
+    return t('distillPage.tool.matchedTitle', { name: suggestion.matched_tool_display_name || label });
   }
-  return `建议新增工具：${label}`;
+  return t('distillPage.tool.suggestedTitle', { name: label });
 }
 
 function toolSuggestionResolutionLabel(suggestion: ToolSuggestionItem): string {
+  const { t } = currentDistillTranslator();
   const status = toolSuggestionResolution(suggestion);
-  if (status === 'existing') return '已匹配现有工具';
-  if (status === 'incomplete') return '工具信息不足';
-  return '可新增候选';
+  if (status === 'existing') return t('distillPage.tool.resolution.existing');
+  if (status === 'incomplete') return t('distillPage.tool.resolution.incomplete');
+  return t('distillPage.tool.resolution.newCandidate');
 }
 
 function toolSuggestionStatusText(suggestion: ToolSuggestionItem): string {
-  if (suggestion.status === 'accepted') return '已确认';
-  if (suggestion.status === 'created') return '已新增';
-  if (suggestion.status === 'rejected') return '已拒绝';
-  if (suggestion.probeStatus === 'probing') return '测试中';
-  if (suggestion.probe_result?.success) return '测试通过';
-  if (suggestion.probe_result && !suggestion.probe_result.success) return '测试失败';
-  if (toolSuggestionResolution(suggestion) === 'existing') return '已存在';
-  if (toolSuggestionResolution(suggestion) === 'incomplete') return '信息不足';
-  return '待新增';
+  const { t } = currentDistillTranslator();
+  if (suggestion.status === 'accepted') return t('distillPage.tool.status.accepted');
+  if (suggestion.status === 'created') return t('distillPage.tool.status.created');
+  if (suggestion.status === 'rejected') return t('distillPage.tool.status.rejected');
+  if (suggestion.probeStatus === 'probing') return t('distillPage.tool.status.probing');
+  if (suggestion.probe_result?.success) return t('distillPage.tool.status.probeSucceeded');
+  if (suggestion.probe_result && !suggestion.probe_result.success) return t('distillPage.tool.status.probeFailed');
+  if (toolSuggestionResolution(suggestion) === 'existing') return t('distillPage.tool.status.existing');
+  if (toolSuggestionResolution(suggestion) === 'incomplete') return t('distillPage.tool.status.insufficient');
+  return t('distillPage.tool.status.pendingCreate');
 }
 
 function toolSuggestionStatusClass(suggestion: ToolSuggestionItem): ToolStatusBadgeVariant {
@@ -7763,6 +8372,7 @@ function compactWarningItems(
 }
 
 function readDistillCache(key: string): DistillCacheSnapshot | null {
+  const { t } = currentDistillTranslator();
   try {
     const raw = window.sessionStorage.getItem(key);
     if (!raw) return null;
@@ -7771,7 +8381,7 @@ function readDistillCache(key: string): DistillCacheSnapshot | null {
       draft: parsed.draft || null,
       loadedSkill: parsed.loadedSkill || null,
       lastSavedDraft: parsed.lastSavedDraft || null,
-      messages: Array.isArray(parsed.messages) ? parsed.messages : DEFAULT_DISTILL_MESSAGES,
+      messages: Array.isArray(parsed.messages) ? parsed.messages : defaultDistillMessages(),
       input: typeof parsed.input === 'string' ? parsed.input : '',
       selectedPaths: normalizeInitialSelectedPaths(
         Array.isArray(parsed.selectedPaths) ? parsed.selectedPaths.map(String) : DEFAULT_TARGET_PATHS,
@@ -7785,7 +8395,7 @@ function readDistillCache(key: string): DistillCacheSnapshot | null {
       attachments: Array.isArray(parsed.attachments)
         ? parsed.attachments.filter((item): item is UploadAttachment => isRecord(item)).map((item) => ({
             id: String(item.id || `file_${Date.now()}_${Math.random().toString(16).slice(2)}`),
-            name: String(item.name || '未命名文件'),
+            name: String(item.name || t('distillPage.upload.unnamedFile')),
             status: item.status === 'error' ? 'error' : 'ready',
             text: typeof item.text === 'string' ? item.text : undefined,
             error: typeof item.error === 'string' ? item.error : undefined,
@@ -8291,15 +8901,15 @@ function buildToolStatusMap(tools: ToolRead[], messages: ChatItem[]): ToolStatus
 }
 
 function toolPayloadFromSuggestion(suggestion: ToolSuggestionItem, skillId?: string): Record<string, unknown> {
+  const { t } = currentDistillTranslator();
   const outputSchema = suggestion.probe_result?.success && suggestion.probe_result.inferred_output_schema
     ? suggestion.probe_result.inferred_output_schema
     : suggestion.output_schema || {};
   return {
-    tenant_id: TENANT_ID,
     name: suggestion.name,
     display_name: suggestion.display_name || suggestion.name,
     description: suggestion.description || suggestion.reason || '',
-    bucket: suggestion.bucket || '技能自发现工具',
+    bucket: suggestion.bucket || t('distillPage.tool.defaultBucket'),
     tool_type: suggestion.tool_type || 'http',
     method: suggestion.method || 'POST',
     url: suggestion.url || `/api/mock/${suggestion.name.replace(/\./g, '/')}`,
@@ -8314,17 +8924,20 @@ function toolPayloadFromSuggestion(suggestion: ToolSuggestionItem, skillId?: str
   };
 }
 
-function toolReadFromSuggestion(suggestion: ToolSuggestionItem, skillId?: string): ToolRead {
+function toolReadFromSuggestion(
+  suggestion: ToolSuggestionItem,
+  skillId?: string,
+): Omit<ToolRead, 'tenant_id'> {
+  const { t } = currentDistillTranslator();
   const outputSchema = suggestion.probe_result?.success && suggestion.probe_result.inferred_output_schema
     ? suggestion.probe_result.inferred_output_schema
     : suggestion.output_schema || {};
   return {
     id: suggestion.name,
-    tenant_id: TENANT_ID,
     name: suggestion.name,
     display_name: suggestion.display_name || suggestion.name,
     description: suggestion.description || suggestion.reason || '',
-    bucket: suggestion.bucket || '技能自发现工具',
+    bucket: suggestion.bucket || t('distillPage.tool.defaultBucket'),
     tool_type: suggestion.tool_type || 'http',
     method: suggestion.method || 'POST',
     url: suggestion.url || `/api/mock/${suggestion.name.replace(/\./g, '/')}`,
@@ -8349,29 +8962,30 @@ function upsertToolRead(current: ToolRead[], nextTool: ToolRead): ToolRead[] {
 }
 
 function fieldLabel(field: string): string {
+  const { t } = currentDistillTranslator();
   const labels: Record<string, string> = {
-    skill_id: '技能 ID',
-    name: '名称',
-    version: '版本',
-    business_domain: '业务域',
-    description: '描述',
-    capability_scope: '使用范围',
-    step_timeout_seconds: '单步运行上限（秒）',
-    trigger_intents: '触发意图',
-    user_utterance_examples: '示例话术',
-    goal: '目标',
-    required_info: '必填信息',
-    response_rules: '回复规则',
-    step_id: '节点 ID',
-    type: '节点类型',
-    condition: '条件',
-    instruction: '节点说明',
-    expected_user_info: '期望字段',
-    allowed_actions: '允许动作',
-    general_skill_ids: 'SOP 技能',
-    tool_ids: 'SOP 工具',
-    knowledge_base_ids: 'SOP 知识库',
-    sub_sop_id: '调用子 SOP',
+    skill_id: t('distillPage.field.skillId'),
+    name: t('distillPage.field.name'),
+    version: t('distillPage.field.version'),
+    business_domain: t('distillPage.field.businessDomain'),
+    description: t('distillPage.field.description'),
+    capability_scope: t('distillPage.field.capabilityScope'),
+    step_timeout_seconds: t('distillPage.field.stepTimeoutSeconds'),
+    trigger_intents: t('distillPage.field.triggerIntents'),
+    user_utterance_examples: t('distillPage.field.userUtteranceExamples'),
+    goal: t('distillPage.field.goal'),
+    required_info: t('distillPage.field.requiredInfo'),
+    response_rules: t('distillPage.field.responseRules'),
+    step_id: t('distillPage.field.stepId'),
+    type: t('distillPage.field.type'),
+    condition: t('distillPage.field.condition'),
+    instruction: t('distillPage.field.instruction'),
+    expected_user_info: t('distillPage.field.expectedUserInfo'),
+    allowed_actions: t('distillPage.field.allowedActions'),
+    general_skill_ids: t('distillPage.field.generalSkillIds'),
+    tool_ids: t('distillPage.field.toolIds'),
+    knowledge_base_ids: t('distillPage.field.knowledgeBaseIds'),
+    sub_sop_id: t('distillPage.field.subSopId'),
   };
   return labels[field] || field;
 }
@@ -8381,9 +8995,10 @@ function toolNameFromAction(action: string): string {
 }
 
 function actionLabel(action: string): string {
+  const { t } = currentDistillTranslator();
   const toolName = toolNameFromAction(action);
-  if (toolName) return `调用工具：${toolName}`;
-  return BASE_ACTION_OPTIONS.find((item) => item.value === action)?.label || action;
+  if (toolName) return t('distillPage.action.callTool', { name: toolName });
+  return baseActionOptions().find((item) => item.value === action)?.label || action;
 }
 
 function buildActionOptions(
@@ -8391,19 +9006,20 @@ function buildActionOptions(
   toolStatuses: ToolStatusMap,
   steps: Array<Record<string, unknown>>,
 ): SelectOption[] {
+  const { t } = currentDistillTranslator();
   const toolNames = Array.from(new Set([
     ...Object.keys(toolDescriptions),
     ...Object.keys(toolStatuses),
   ])).filter(Boolean).sort((a, b) => a.localeCompare(b));
   const toolOptions = toolNames.map((toolName) => ({
     value: `call_tool:${toolName}`,
-    label: `调用工具：${toolName}`,
+    label: t('distillPage.action.callTool', { name: toolName }),
   }));
   const currentActionOptions = steps
     .flatMap((step) => asStringList(step.allowed_actions))
     .filter(Boolean)
     .map((action) => ({ value: action, label: actionLabel(action) }));
-  return mergeSelectOptions(BASE_ACTION_OPTIONS, toolOptions, currentActionOptions);
+  return mergeSelectOptions(baseActionOptions(), toolOptions, currentActionOptions);
 }
 
 function mergeSelectOptions(...groups: SelectOption[][]): SelectOption[] {
@@ -8420,34 +9036,36 @@ function mergeSelectOptions(...groups: SelectOption[][]): SelectOption[] {
 function conditionPresetValue(value: string): string {
   const trimmed = value.trim();
   if (!trimmed || trimmed === 'always' || trimmed === 'true') return '__always__';
-  if (CONDITION_PRESET_OPTIONS.some((option) => option.value === trimmed)) return trimmed;
-  const naturalMatch = Object.entries(CONDITION_PRESET_TEXT).find(([, text]) => text === trimmed);
+  if (conditionPresetOptions().some((option) => option.value === trimmed)) return trimmed;
+  const naturalMatch = Object.entries(conditionPresetText()).find(([, text]) => text === trimmed);
   if (naturalMatch) return naturalMatch[0];
   return '__custom__';
 }
 
 function conditionFromPreset(value: string): string {
   if (value === '__always__') return '';
-  return CONDITION_PRESET_TEXT[value] || '';
+  return conditionPresetText()[value] || '';
 }
 
 function conditionNaturalText(value: string): string {
   const trimmed = value.trim();
   if (!trimmed || trimmed === 'always' || trimmed === 'true') return '';
-  if (CONDITION_PRESET_TEXT[trimmed]) return CONDITION_PRESET_TEXT[trimmed];
-  const presetMatch = Object.entries(CONDITION_PRESET_TEXT).find(([, text]) => text === trimmed);
+  if (conditionPresetText()[trimmed]) return conditionPresetText()[trimmed];
+  const presetMatch = Object.entries(conditionPresetText()).find(([, text]) => text === trimmed);
   if (presetMatch) return presetMatch[1];
   return trimmed;
 }
 
 function conditionReadableText(value: string): string {
+  const { t } = currentDistillTranslator();
   const natural = conditionNaturalText(value);
-  return natural ? `模型理解：${natural}。` : '模型理解：没有额外限制，流程可以从这里继续。';
+  return natural ? t('distillPage.condition.readableWithValue', { value: natural }) : t('distillPage.condition.readableDefault');
 }
 
 function flowRuleConditionText(value: string): string {
+  const { t } = currentDistillTranslator();
   const natural = conditionNaturalText(value);
-  return natural ? `进入条件：${natural}。` : '进入条件：总是进入。';
+  return natural ? t('distillPage.condition.enterWithValue', { value: natural }) : t('distillPage.condition.enterDefault');
 }
 
 function diffTargetLabel(path: string, skill: SkillCard | null): string {
@@ -8456,14 +9074,15 @@ function diffTargetLabel(path: string, skill: SkillCard | null): string {
 }
 
 function targetLabel(paths: string[], skill: SkillCard): string {
+  const { t } = currentDistillTranslator();
   const labels = paths.map((path) => {
-    if (path === 'basic') return '基础信息';
-    if (path === 'graph') return '流程连线';
+    if (path === 'basic') return t('distillPage.target.basic');
+    if (path === 'graph') return t('distillPage.target.graph');
     const stepIndex = stepIndexFromPath(path);
     if (stepIndex !== null) {
       const index = stepIndex;
       const step = index >= 0 ? skillGraphSteps(skill)[index] : null;
-      return step ? `节点 ${index + 1}：${step.name || step.step_id || path}` : path;
+      return step ? t('distillPage.target.node', { index: index + 1, name: String(step.name || step.step_id || path) }) : path;
     }
     return path;
   });

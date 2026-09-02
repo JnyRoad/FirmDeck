@@ -1,9 +1,12 @@
 // @vitest-environment jsdom
 
-import { cleanup, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, render as rtlRender, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import type { ReactElement } from 'react';
+import { AppIntlProvider } from '@/i18n';
+import type { AppLocale } from '@/i18n/locales';
 import type { HarnessWorkspaceArtifact } from '@/types';
 
 import HarnessArtifactDownloads from './HarnessArtifactDownloads';
@@ -19,6 +22,10 @@ vi.mock('@/api/client', () => ({
 }));
 
 vi.mock('@/components/ui/app-toast', () => ({
+  createToastNotifier: () => ({
+    error: mocks.notifyError,
+    success: mocks.notifySuccess,
+  }),
   notify: {
     error: mocks.notifyError,
     success: mocks.notifySuccess,
@@ -48,6 +55,22 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+/** 为 artifact 行为测试提供显式语义 i18n runtime，避免依赖 legacy observer。 */
+function render(ui: ReactElement, locale: AppLocale = 'zh-CN') {
+  return rtlRender(<AppIntlProvider initialLocale={locale}>{ui}</AppIntlProvider>);
+}
+
+/** 使用与产品契约相同的 Intl 单位格式，生成 artifact 大小的行为期望。 */
+function expectedKilobyteSize(locale: AppLocale): string {
+  return new Intl.NumberFormat(locale, {
+    style: 'unit',
+    unit: 'kilobyte',
+    unitDisplay: 'short',
+    minimumFractionDigits: 1,
+    maximumFractionDigits: 1,
+  }).format(2);
+}
+
 describe('Harness artifact downloads', () => {
   it('downloads through the authenticated blob API with scoped identifiers', async () => {
     const user = userEvent.setup();
@@ -61,7 +84,10 @@ describe('Harness artifact downloads', () => {
     );
 
     expect(screen.getByText('Q2 财务报告.txt')).toBeTruthy();
-    expect(screen.getByText(/最终交付版 · 2\.0 KB$/)).toBeTruthy();
+    expect(screen.getByText((_, element) => (
+      element?.getAttribute('data-i18n-raw-kind') === 'content'
+      && element.textContent === `最终交付版 · ${expectedKilobyteSize('zh-CN')}`
+    ))).toBeTruthy();
     await user.click(screen.getByRole('button', { name: /Q2 财务报告\.txt$/ }));
 
     await waitFor(() => {
@@ -74,7 +100,10 @@ describe('Harness artifact downloads', () => {
     expect(HTMLAnchorElement.prototype.click).toHaveBeenCalled();
     expect(window.URL.revokeObjectURL).toHaveBeenCalledWith('blob:artifact');
     expect(mocks.notifySuccess).toHaveBeenCalledWith(
-      expect.stringContaining('Q2 财务报告.txt'),
+      {
+        id: 'chat.artifacts.downloaded',
+        values: { filename: 'Q2 财务报告.txt' },
+      },
     );
   });
 
@@ -138,8 +167,31 @@ describe('Harness artifact downloads', () => {
     await user.click(screen.getByRole('button', { name: /Q2 财务报告\.txt$/ }));
 
     await waitFor(() => {
-      expect(mocks.notifyError).toHaveBeenCalledWith('Artifact not found');
+      expect(mocks.notifyError).toHaveBeenCalledWith({ id: 'chat.artifacts.downloadFailed' });
     });
     expect(window.URL.createObjectURL).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['zh-CN', '生成文件', '下载文件 Q2 财务报告.txt'],
+    ['en-US', 'Generated files', 'Download file Q2 财务报告.txt'],
+  ] as const)('localizes artifact chrome in %s while preserving raw metadata', (locale, heading, downloadLabel) => {
+    render(
+      <HarnessArtifactDownloads
+        artifacts={[artifact]}
+        tenantId="tenant demo"
+        sessionId="session demo"
+      />,
+      locale,
+    );
+
+    expect(screen.getByLabelText(heading)).toBeTruthy();
+    expect(screen.getByText(heading)).toBeTruthy();
+    expect(screen.getByRole('button', { name: downloadLabel })).toBeTruthy();
+    expect(screen.getByText('Q2 财务报告.txt')).toBeTruthy();
+    expect(screen.getByText((_, element) => (
+      element?.getAttribute('data-i18n-raw-kind') === 'content'
+      && element.textContent === `最终交付版 · ${expectedKilobyteSize(locale)}`
+    ))).toBeTruthy();
   });
 });

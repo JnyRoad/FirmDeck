@@ -69,6 +69,8 @@ def upsert_concepts(
     knowledge_base_id: str,
     knowledge_base_version_id: str | None,
     concepts: list[dict[str, Any]],
+    *,
+    commit: bool = True,
 ) -> list[KnowledgeConcept]:
     rows: list[KnowledgeConcept] = []
     for item in concepts:
@@ -125,9 +127,12 @@ def upsert_concepts(
         )
         db.add(row)
         rows.append(row)
-    db.commit()
-    for row in rows:
-        db.refresh(row)
+    if commit:
+        db.commit()
+        for row in rows:
+            db.refresh(row)
+    else:
+        db.flush()
     return rows
 
 

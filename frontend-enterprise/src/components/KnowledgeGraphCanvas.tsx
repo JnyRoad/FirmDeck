@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { PointerEvent as ReactPointerEvent } from 'react';
+import { useAppIntl } from '@/i18n/useAppIntl';
+import type { MessageId } from '@/i18n/types';
 import type { KnowledgeConceptRead } from '@/types';
 
 const CANVAS_WIDTH = 1000;
@@ -37,15 +39,18 @@ type ViewTransform = {
   ty: number;
 };
 
-const TYPE_STYLES: Record<string, { color: string; label: string }> = {
-  'Source Document': { color: '#1a71ff', label: '原始资料' },
-  'Source Section': { color: '#0ea5e9', label: '资料页' },
-  Topic: { color: '#22c55e', label: '主题' },
-  Playbook: { color: '#a855f7', label: '流程知识' },
-  'Business Rule': { color: '#f59e0b', label: '业务规则' },
-  'Query Analysis': { color: '#d946ef', label: '查询分析' },
+const TYPE_STYLES: Record<string, { color: string; labelId: MessageId }> = {
+  'Source Document': { color: '#1a71ff', labelId: 'knowledgeGraphCanvas.type.sourceDocument' },
+  'Source Section': { color: '#0ea5e9', labelId: 'knowledgeGraphCanvas.type.sourceSection' },
+  Topic: { color: '#22c55e', labelId: 'knowledgeGraphCanvas.type.topic' },
+  Playbook: { color: '#a855f7', labelId: 'knowledgeGraphCanvas.type.playbook' },
+  'Business Rule': { color: '#f59e0b', labelId: 'knowledgeGraphCanvas.type.businessRule' },
+  'Query Analysis': { color: '#d946ef', labelId: 'knowledgeGraphCanvas.type.queryAnalysis' },
 };
-const FALLBACK_TYPE_STYLE = { color: '#94a3b8', label: '概念' };
+const FALLBACK_TYPE_STYLE = {
+  color: '#94a3b8',
+  labelId: 'knowledgeGraphCanvas.type.concept' as const,
+};
 const TYPE_ORDER = Object.keys(TYPE_STYLES);
 
 function clamp(value: number, min: number, max: number) {
@@ -139,14 +144,15 @@ function buildGraph(concepts: KnowledgeConceptRead[]): GraphData {
   return { nodes, edges };
 }
 
-function compareNodeIndices(nodes: GraphNode[]) {
+/** 按节点类型与当前 locale 生成稳定的布局排序器。 */
+function compareNodeIndices(nodes: GraphNode[], locale: string) {
   return (left: number, right: number) => {
     const leftRank = TYPE_ORDER.indexOf(nodes[left].concept.concept_type);
     const rightRank = TYPE_ORDER.indexOf(nodes[right].concept.concept_type);
     const leftOrder = leftRank === -1 ? TYPE_ORDER.length : leftRank;
     const rightOrder = rightRank === -1 ? TYPE_ORDER.length : rightRank;
     if (leftOrder !== rightOrder) return leftOrder - rightOrder;
-    return nodes[left].label.localeCompare(nodes[right].label, 'zh-CN');
+    return nodes[left].label.localeCompare(nodes[right].label, locale);
   };
 }
 
@@ -154,7 +160,7 @@ function compareNodeIndices(nodes: GraphNode[]) {
 // neighbors on the first ring, remaining connected nodes on a second ring, and
 // orphan nodes in rows below. Positions are computed once; interactions never
 // re-run the layout, so dragging a node can never move any other node.
-function layoutGraph(graph: GraphData) {
+function layoutGraph(graph: GraphData, locale: string) {
   const { nodes, edges } = graph;
   if (nodes.length === 0) return;
 
@@ -177,7 +183,7 @@ function layoutGraph(graph: GraphData) {
     }
   });
 
-  const byType = compareNodeIndices(nodes);
+  const byType = compareNodeIndices(nodes, locale);
   const ring1 = [...neighbors[center]].sort(byType);
   const assigned = new Set<number>([center, ...ring1]);
   const rest = nodes.map((_, index) => index).filter((index) => !assigned.has(index));
@@ -258,11 +264,12 @@ export default function KnowledgeGraphCanvas({
   onSelectConcept: (concept: KnowledgeConceptRead) => void;
   height?: number;
 }) {
+  const { locale, t } = useAppIntl();
   const graph = useMemo(() => {
     const data = buildGraph(concepts);
-    layoutGraph(data);
+    layoutGraph(data, locale);
     return data;
-  }, [concepts]);
+  }, [concepts, locale]);
   const fitView = useMemo(() => computeFitView(graph, height), [graph, height]);
   const svgRef = useRef<SVGSVGElement | null>(null);
   const viewRef = useRef<ViewTransform>(fitView);
@@ -442,7 +449,7 @@ export default function KnowledgeGraphCanvas({
   }, [graph]);
 
   if (graph.nodes.length === 0) {
-    return <div className="knowledge-graph-empty">暂无知识图谱数据</div>;
+    return <div className="knowledge-graph-empty">{t('knowledgeGraphCanvas.empty')}</div>;
   }
 
   return (
@@ -453,7 +460,7 @@ export default function KnowledgeGraphCanvas({
         style={{ height }}
         className={isPanning ? 'is-panning' : undefined}
         role="img"
-        aria-label="知识图谱画布"
+        aria-label={t('knowledgeGraphCanvas.canvasAria')}
         onPointerDown={handleBackgroundPointerDown}
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerEnd}
@@ -569,6 +576,7 @@ export default function KnowledgeGraphCanvas({
                     x={dotX + 10}
                     y={0}
                     dominantBaseline="central"
+                    data-i18n-raw-kind="content"
                   >
                     {node.label}
                   </text>
@@ -582,19 +590,29 @@ export default function KnowledgeGraphCanvas({
         {legendItems.map((item) => (
           <span key={item.type}>
             <i style={{ background: item.color }} />
-            {item.label}
+            {t(item.labelId)}
           </span>
         ))}
       </div>
       <div className="knowledge-graph-zoom-controls">
-        <button type="button" className="knowledge-graph-zoom-btn" aria-label="放大" onClick={() => zoomBy(1.25)}>
+        <button
+          type="button"
+          className="knowledge-graph-zoom-btn"
+          aria-label={t('knowledgeGraphCanvas.zoomIn')}
+          onClick={() => zoomBy(1.25)}
+        >
           +
         </button>
-        <button type="button" className="knowledge-graph-zoom-btn" aria-label="缩小" onClick={() => zoomBy(1 / 1.25)}>
+        <button
+          type="button"
+          className="knowledge-graph-zoom-btn"
+          aria-label={t('knowledgeGraphCanvas.zoomOut')}
+          onClick={() => zoomBy(1 / 1.25)}
+        >
           −
         </button>
         <button type="button" className="knowledge-graph-zoom-btn is-wide" onClick={resetView}>
-          复位
+          {t('knowledgeGraphCanvas.reset')}
         </button>
       </div>
     </div>

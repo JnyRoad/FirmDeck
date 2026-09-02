@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from time import sleep
 from typing import Any, Iterator
 
 from app import paths
 from app.db.models import ModelConfig
+from app.i18n.language_context import LanguageContext
+from app.i18n.raw_source import RawSourceKind, RawSourceMarker
 from app.llm import LLMClient, LLMError
+from app.llm.prompts.language import language_prompt_contract, resolve_prompt_language_context
 from app.skills.llm_limits import skill_model_config
 from app.skills.nesting import validate_sop_nesting
-from app.skills.skill_reflection import reflect_skill_response, reflect_skill_response_stream
-from app.skills.skill_schema import SkillCard, SkillRewriteRequest, SkillRewriteResponse
 from app.skills.skill_distiller import (
     _compact_warnings,
     _normalize_tool_suggestions,
@@ -19,11 +21,24 @@ from app.skills.skill_distiller import (
     _tool_action_names_from_suggestions,
     _tool_resolution_warnings,
 )
+from app.skills.skill_reflection import (
+    ExecutionFence,
+    fenced_provider_call,
+    reflect_skill_response,
+    reflect_skill_response_stream,
+    skill_status_event,
+)
+from app.skills.skill_schema import (
+    SkillCard,
+    SkillRewriteRequest,
+    SkillRewriteResponse,
+    resolve_skill_language_context,
+)
 from app.skills.step_ids import skill_card_with_unique_step_ids
-
 
 PROMPT_PATH = paths.resource_dir() / "app" / "llm" / "prompts" / "skill_editor_prompt.md"
 STREAM_INTERVAL_SECONDS = 0.035
+logger = logging.getLogger(__name__)
 BASIC_FIELDS = {
     "name",
     "version",
@@ -57,11 +72,50 @@ NODE_FIELDS = {
 GRAPH_FIELDS = {"edges", "start_node_id", "terminal_node_ids"}
 
 
+def _skill_language_contract(language_context: LanguageContext | None) -> dict[str, object]:
+    """Describe rewrite prose locale and exact source values that must remain unchanged."""
+    return language_prompt_contract(
+        language_context,
+        [
+            RawSourceMarker(json_pointer="/current_skill", kind=RawSourceKind.BUSINESS_RECORD),
+            RawSourceMarker(json_pointer="/instruction", kind=RawSourceKind.USER_INPUT),
+            RawSourceMarker(json_pointer="/target_path", kind=RawSourceKind.IDENTIFIER),
+            RawSourceMarker(json_pointer="/target_paths", kind=RawSourceKind.IDENTIFIER),
+            RawSourceMarker(json_pointer="/target_label", kind=RawSourceKind.USER_INPUT),
+            RawSourceMarker(json_pointer="/conversation", kind=RawSourceKind.HISTORY),
+            RawSourceMarker(json_pointer="/available_tools", kind=RawSourceKind.BUSINESS_RECORD),
+            RawSourceMarker(json_pointer="/available_sops", kind=RawSourceKind.BUSINESS_RECORD),
+        ],
+    )
+
+
+def _localized_skill_text(
+    language_context: LanguageContext | None,
+    *,
+    zh_cn: str,
+    en_us: str,
+) -> str:
+    """Select a deterministic rewrite message without translating source Skill data."""
+    context = resolve_prompt_language_context(language_context)
+    return en_us if context.agent_reply_locale.value == "en-US" else zh_cn
+
+
 class SkillEditor:
-    def rewrite(self, request: SkillRewriteRequest, model_config: ModelConfig) -> SkillRewriteResponse:
+    def rewrite(
+        self,
+        request: SkillRewriteRequest,
+        model_config: ModelConfig,
+        *,
+        execution_fence: ExecutionFence | None = None,
+    ) -> SkillRewriteResponse:
+        """Rewrite a Skill Card synchronously under one immutable request language snapshot."""
+        request = self._with_language_context(request)
         client = LLMClient(skill_model_config(model_config))
         payload = self._payload(request)
-        raw = client.generate_json(PROMPT_PATH.read_text(encoding="utf-8"), payload)
+        raw = fenced_provider_call(
+            lambda: client.generate_json(PROMPT_PATH.read_text(encoding="utf-8"), payload),
+            execution_fence,
+        )
         response = self._normalize_response(raw, request)
         return reflect_skill_response(
             client=client,
@@ -72,46 +126,111 @@ class SkillEditor:
             current_warnings=response.warnings,
             tool_suggestions=response.tool_suggestions,
             normalize_response=lambda review_raw: self._normalize_response(review_raw, request),
+            language_context=request.language_context,
+            execution_fence=execution_fence,
         )
 
     def stream_text(
-        self, request: SkillRewriteRequest, model_config: ModelConfig
+        self,
+        request: SkillRewriteRequest,
+        model_config: ModelConfig,
+        *,
+        execution_fence: ExecutionFence | None = None,
     ) -> Iterator[dict[str, object]]:
+        """Yield rewrite progress and approved raw output with locale-bound status metadata."""
+        request = self._with_language_context(request)
         chunks: list[str] = []
         prompt = PROMPT_PATH.read_text(encoding="utf-8")
         payload = self._payload(request)
         client = LLMClient(skill_model_config(model_config))
         try:
-            yield {"event": "status", "data": {"text": "模型正在分析改写范围"}}
-            for chunk in client.generate_text_stream(prompt, payload):
-                chunks.append(chunk)
-            yield {"event": "status", "data": {"text": "正在校验局部改写结果"}}
-            response = self._response_from_text("".join(chunks), request)
-        except (LLMError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            yield skill_status_event(
+                _localized_skill_text(
+                    request.language_context,
+                    zh_cn="模型正在分析改写范围",
+                    en_us="Analyzing the rewrite scope",
+                ),
+                request.language_context,
+            )
+            if execution_fence is not None:
+                execution_fence()
             try:
-                yield {"event": "status", "data": {"text": "模型输出需要修复，正在重试一次"}}
-                repair_text = client.generate_text(
-                    prompt,
-                    {
-                        **payload,
-                        "previous_output": "".join(chunks),
-                        "previous_error": str(exc),
-                        "repair_instruction": (
-                            "请基于 current_skill、instruction 和 target_paths 修复上一次输出。"
-                            "只输出合法 JSON，可以使用 patches 做局部修改，或返回完整 draft_skill。"
-                        ),
-                    },
+                for chunk in client.generate_text_stream(prompt, payload):
+                    chunks.append(chunk)
+            finally:
+                if execution_fence is not None:
+                    execution_fence()
+            yield skill_status_event(
+                _localized_skill_text(
+                    request.language_context,
+                    zh_cn="正在校验局部改写结果",
+                    en_us="Validating the partial rewrite",
+                ),
+                request.language_context,
+            )
+            response = self._response_from_text("".join(chunks), request)
+        except (LLMError, json.JSONDecodeError, TypeError, ValueError):
+            logger.exception("skill rewrite first attempt failed")
+            try:
+                yield skill_status_event(
+                    _localized_skill_text(
+                        request.language_context,
+                        zh_cn="模型输出需要修复，正在重试一次",
+                        en_us="The model output needs repair; retrying once",
+                    ),
+                    request.language_context,
+                )
+                repair_payload = {
+                    **payload,
+                    "previous_output": "".join(chunks),
+                    # Keep the repair prompt deterministic; the raw provider/parser cause
+                    # remains available only in the private exception log above.
+                    "previous_error_code": "SKILL_REWRITE_OUTPUT_INVALID",
+                    "repair_instruction": (
+                        "请基于 current_skill、instruction 和 target_paths 修复上一次输出。"
+                        "只输出合法 JSON，可以使用 patches 做局部修改，或返回完整 draft_skill。"
+                    ),
+                }
+                repair_text = fenced_provider_call(
+                    lambda: client.generate_text(prompt, repair_payload),
+                    execution_fence,
                 )
                 response = self._response_from_text(repair_text, request)
-            except (LLMError, json.JSONDecodeError, TypeError, ValueError) as repair_exc:
-                yield {"event": "status", "data": {"text": "模型改写失败，正在保留原版本"}}
+            except (LLMError, json.JSONDecodeError, TypeError, ValueError):
+                logger.exception("skill rewrite repair failed")
+                yield skill_status_event(
+                    _localized_skill_text(
+                        request.language_context,
+                        zh_cn="模型改写失败，正在保留原版本",
+                        en_us="Rewrite failed; preserving the current version",
+                    ),
+                    request.language_context,
+                )
                 response = SkillRewriteResponse(
                     draft_skill=request.current_skill,
-                    assistant_message="改写失败，已保留当前技能内容。",
+                    assistant_message=_localized_skill_text(
+                        request.language_context,
+                        zh_cn="改写失败，已保留当前技能内容。",
+                        en_us="Rewrite failed; the current Skill content was preserved.",
+                    ),
                     changed_paths=[],
-                    warnings=[f"模型未能完成局部改写：{repair_exc}"],
+                    warnings=[
+                        _localized_skill_text(
+                            request.language_context,
+                            zh_cn="模型未能完成局部改写。",
+                            en_us="The model could not complete the partial rewrite.",
+                        )
+                    ],
+                    language_context=request.language_context,
                 )
-        yield {"event": "status", "data": {"text": "正在校验改写范围与工具接入"}}
+        yield skill_status_event(
+            _localized_skill_text(
+                request.language_context,
+                zh_cn="正在校验改写范围与工具接入",
+                en_us="Validating rewrite scope and tool integration",
+            ),
+            request.language_context,
+        )
         response = yield from reflect_skill_response_stream(
             client=client,
             source_kind="rewrite",
@@ -121,12 +240,28 @@ class SkillEditor:
             current_warnings=response.warnings,
             tool_suggestions=response.tool_suggestions,
             normalize_response=lambda review_raw: self._normalize_response(review_raw, request),
+            language_context=request.language_context,
+            execution_fence=execution_fence,
         )
-        yield {"event": "status", "data": {"text": "正在整理校验后的改写结果"}}
+        yield skill_status_event(
+            _localized_skill_text(
+                request.language_context,
+                zh_cn="正在整理校验后的改写结果",
+                en_us="Organizing the validated rewrite",
+            ),
+            request.language_context,
+        )
         for chunk in _chunk_text(response.assistant_message):
             yield {"event": "message_chunk", "data": {"content": chunk}}
             sleep(STREAM_INTERVAL_SECONDS)
         yield {"event": "complete", "data": response.model_dump(mode="json")}
+
+    def _with_language_context(self, request: SkillRewriteRequest) -> SkillRewriteRequest:
+        """Attach an immutable request snapshot before any rewrite model call or stream event."""
+        context = resolve_skill_language_context(request)
+        if request.language_context == context:
+            return request
+        return request.model_copy(update={"language_context": context})
 
     def _response_from_text(self, text: str, request: SkillRewriteRequest) -> SkillRewriteResponse:
         raw = json.loads(_extract_json(text))
@@ -135,7 +270,8 @@ class SkillEditor:
         return self._normalize_response(raw, request)
 
     def _payload(self, request: SkillRewriteRequest) -> dict[str, Any]:
-        return {
+        """Build the rewrite payload with semantic locale and raw-source contracts."""
+        payload = {
             "current_skill": request.current_skill.model_dump(mode="json"),
             "instruction": request.instruction,
             "target_path": request.target_path,
@@ -162,10 +298,14 @@ class SkillEditor:
                 if isinstance(item, dict)
             ],
         }
+        payload.update(_skill_language_contract(request.language_context))
+        return payload
 
     def _normalize_response(
         self, raw: dict[str, Any], request: SkillRewriteRequest
     ) -> SkillRewriteResponse:
+        """Normalize rewrite output while preserving source-owned values and locale snapshot."""
+        request = self._with_language_context(request)
         target_paths = _target_paths(request)
         patched = _skill_from_patches(raw, request, target_paths)
         draft = (
@@ -199,7 +339,13 @@ class SkillEditor:
             merged.model_dump(mode="json"),
             request.available_sops,
         )
-        assistant_message = str(raw.get("assistant_message") or "已完成选中部分的改写。").strip()
+        assistant_message = str(raw.get("assistant_message") or "").strip()
+        if not assistant_message:
+            assistant_message = _localized_skill_text(
+                request.language_context,
+                zh_cn="已完成选中部分的改写。",
+                en_us="The selected Skill content was rewritten.",
+            )
         warnings = [str(item) for item in raw.get("warnings", []) if str(item).strip()]
         warnings.extend(warning for warning in id_warnings if warning not in warnings)
         for tool_name in missing_tool_names:
@@ -231,6 +377,7 @@ class SkillEditor:
             changed_paths=changed_paths,
             warnings=warnings,
             tool_suggestions=tool_suggestions,
+            language_context=request.language_context,
         )
 
 

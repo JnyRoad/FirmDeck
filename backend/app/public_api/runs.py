@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import mimetypes
 import re
-from typing import Any
 import threading
+from collections.abc import Iterator
+from typing import Any
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, Header, Query, Request, Response
@@ -11,38 +13,69 @@ from fastapi.responses import StreamingResponse
 from sqlmodel import Session, select
 from starlette.background import BackgroundTask
 
+from app.contracts.error_registry import ERROR_REGISTRY, ErrorVisibility
+from app.contracts.projections import (
+    project_public_error_payload,
+    project_public_result_payload,
+)
 from app.core import AgentLoop
 from app.core.cancellation import cancel_chat_turn
-from app.core.harness_session_cleanup import harness_task_workspace_path
+from app.core.harness_session_cleanup import (
+    HarnessWorkspaceArtifactConflictError,
+    open_harness_task_artifact,
+)
 from app.db import engine, get_session
 from app.db.models import (
+    AgentEvent,
     APIClient,
     APICredential,
     APIJob,
-    AgentEvent,
+    APIJobEvent,
+    ChatSession,
     HarnessInvocationRecord,
     HarnessTaskFrameRecord,
     HarnessTurnRecord,
     Message,
 )
-from app.harness import HarnessArtifactAccessError, normalize_harness_artifact_path, open_harness_artifact
+from app.harness import HarnessArtifactAccessError, normalize_harness_artifact_path
+from app.i18n.language_context import (
+    LanguageContext,
+    LanguageContextInputs,
+    ReplyLocaleConflict,
+    resolve_compatible_language_context,
+    resolve_language_context,
+)
+from app.public_api import jobs as public_jobs
 from app.public_api.auth import PublicPrincipal, enforce_agent_access, require_scopes
 from app.public_api.errors import PublicAPIError
 from app.public_api.idempotency import replay_idempotent_response, store_idempotent_response
 from app.public_api.jobs import (
+    _project_source_event_data,
+    _require_job_execution_fence,
+    _require_job_lifecycle,
     create_job,
     ensure_not_cancelled,
     job_read,
+    mark_side_effect_started,
     register_job_handler,
     update_job,
 )
-from app.public_api.jobs import stream_job_events
 from app.public_api.schemas import AgentRunCreate, PublicSessionCreate
-from app.public_api.sessions import create_public_session_row, ensure_public_agent, owned_public_session
+from app.public_api.sessions import (
+    create_public_session_row,
+    ensure_public_agent,
+    owned_public_session,
+)
+from app.security.tenant import (
+    TenantExecutionKind,
+    TenantLifecycleDenied,
+    require_active_tenant,
+    require_matching_admission_version,
+)
 from app.session.session_schema import ChatAttachmentRead, ChatTurnRequest, ChatTurnResponse
 
-
 router = APIRouter(tags=["runs"])
+_DEFAULT_PUBLIC_RUN_ENGINE = engine
 
 _TRACE_EVENT_MAP = {
     "stream_status": "run.status",
@@ -86,6 +119,89 @@ _SENSITIVE_KEYS = {
 }
 
 
+def _public_run_stream_engine():
+    """Use the stream/job engine seam while honoring direct runs-module test overrides."""
+    if public_jobs.engine is not _DEFAULT_PUBLIC_RUN_ENGINE:
+        return public_jobs.engine
+    return engine
+
+
+def _public_run_stream_lifecycle_active(
+    tenant_id: str,
+    admission_version: int,
+    correlation_id: str,
+) -> bool:
+    """Recheck the authoritative tenant state before a public run stream emits one chunk."""
+    try:
+        with Session(_public_run_stream_engine()) as lifecycle_db:
+            decision = require_active_tenant(
+                lifecycle_db,
+                tenant_id,
+                TenantExecutionKind.JOB_CLAIM,
+                correlation_id,
+            )
+            require_matching_admission_version(decision, admission_version)
+    except Exception:  # noqa: BLE001 - lifecycle reads fail closed for any backend failure.
+        return False
+    return True
+
+
+def _require_public_run_stream_lifecycle(
+    tenant_id: str,
+    admission_version: int | None,
+    correlation_id: str,
+) -> None:
+    """Reject a public run stream before headers or durable stream work are exposed."""
+    try:
+        with Session(_public_run_stream_engine()) as lifecycle_db:
+            decision = require_active_tenant(
+                lifecycle_db,
+                tenant_id,
+                TenantExecutionKind.JOB_CLAIM,
+                correlation_id,
+            )
+            if admission_version is not None:
+                require_matching_admission_version(decision, admission_version)
+    except TenantLifecycleDenied as exc:
+        if exc.code == "TENANT_SUSPENDED":
+            raise PublicAPIError(403, "TENANT_SUSPENDED", "The tenant is suspended.") from None
+        raise PublicAPIError(
+            503,
+            "TENANT_LIFECYCLE_CHECK_FAILED",
+            "The tenant lifecycle is unavailable.",
+        ) from None
+    except Exception:  # noqa: BLE001 - project every lifecycle backend failure to one safe code.
+        raise PublicAPIError(
+            503,
+            "TENANT_LIFECYCLE_CHECK_FAILED",
+            "The tenant lifecycle is unavailable.",
+        ) from None
+
+
+def _require_public_run_replay_lifecycle(db: Session, tenant_id: str) -> None:
+    """Recheck a run's tenant immediately before returning an idempotent replay."""
+    # Authentication and replay lookup may have opened a read transaction.  The replay
+    # decision must use a fresh authoritative snapshot so a concurrent suspension wins.
+    db.rollback()
+    try:
+        require_active_tenant(
+            db,
+            tenant_id,
+            TenantExecutionKind.JOB_CLAIM,
+            "public-run-replay",
+        )
+    except TenantLifecycleDenied as exc:
+        if exc.code == "TENANT_SUSPENDED":
+            raise PublicAPIError(403, "TENANT_SUSPENDED", "The tenant is suspended.") from None
+        raise PublicAPIError(
+            503,
+            "TENANT_LIFECYCLE_CHECK_FAILED",
+            "The tenant lifecycle is unavailable.",
+        ) from None
+    finally:
+        db.rollback()
+
+
 def _redact(value: Any) -> Any:
     if isinstance(value, dict):
         return {
@@ -98,6 +214,64 @@ def _redact(value: Any) -> Any:
     if isinstance(value, str) and len(value) > 8000:
         return value[:8000] + "…"
     return value
+
+
+def _job_event_context(job: APIJob) -> tuple[str | None, str | None]:
+    """Read request/trace linkage from the immutable public job snapshot."""
+    correlation = dict((job.request_json or {}).get("_event_context") or {})
+    request_id = correlation.get("request_id")
+    trace_id = correlation.get("trace_id")
+    return (
+        request_id if isinstance(request_id, str) and request_id else None,
+        trace_id if isinstance(trace_id, str) and trace_id else None,
+    )
+
+
+def _project_run_error(value: object, job: APIJob) -> dict[str, Any]:
+    """Project one persisted run error and retain only canonical linkage fields."""
+    if value is None or value == {}:
+        return {}
+    request_id, trace_id = _job_event_context(job)
+    return project_public_error_payload(
+        value,
+        ERROR_REGISTRY,
+        source="public-api-run-result",
+        request_id=request_id,
+        trace_id=trace_id,
+    )
+
+
+def _project_run_result(value: object, job: APIJob) -> dict[str, Any]:
+    """Project known nested run errors while retaining raw successful business output."""
+    request_id, trace_id = _job_event_context(job)
+    return project_public_result_payload(
+        value,
+        ERROR_REGISTRY,
+        source="public-api-run-result",
+        request_id=request_id,
+        trace_id=trace_id,
+    )
+
+
+def _project_relay_failure(payload: dict[str, Any], job: APIJob) -> dict[str, Any]:
+    """Map one AgentLoop failure code to the exact public run.failed parameter contract."""
+    request_id, trace_id = _job_event_context(job)
+    candidate: dict[str, Any] = {}
+    for field_name in ("code", "params"):
+        if field_name in payload:
+            candidate[field_name] = payload[field_name]
+    descriptor = project_public_error_payload(
+        candidate,
+        ERROR_REGISTRY,
+        source="public-api-run-event-relay",
+        request_id=request_id,
+        trace_id=trace_id,
+    )
+    return {
+        "job_id": job.id,
+        "error_code": descriptor["code"],
+        "retryable": descriptor["retryable"],
+    }
 
 
 def _job_actor(db: Session, job: APIJob):
@@ -150,10 +324,46 @@ def _latest_artifacts(
     return artifacts[-100:]
 
 
+def _artifacts_for_run(db: Session, job: APIJob) -> list[dict[str, Any]]:
+    """Return only published artifacts correlated with one public API job's client turn."""
+
+    if not job.session_id:
+        return []
+    turn = db.exec(
+        select(HarnessTurnRecord).where(
+            HarnessTurnRecord.tenant_id == job.tenant_id,
+            HarnessTurnRecord.session_id == job.session_id,
+            HarnessTurnRecord.client_turn_id == job.id,
+        )
+    ).first()
+    return _latest_artifacts(
+        db,
+        job.tenant_id,
+        job.session_id,
+        job.id,
+        turn.user_message_id if turn is not None else None,
+    )
+
+
 @register_job_handler("run")
 def execute_run(db: Session, job: APIJob) -> dict[str, Any]:
+    """Execute one public run and persist only safe nested error projections."""
     credential, actor = _job_actor(db, job)
     payload = dict(job.request_json or {})
+    # Establish the first durable boundary before mutating the job snapshot or
+    # creating a public session. The rollback intentionally precedes all local
+    # preparation so it cannot discard the session/language fields persisted
+    # below in the progress update.
+    _require_job_execution_fence(db, job)
+    _require_job_lifecycle(db, job)
+    db.rollback()
+    language_context = resolve_compatible_language_context(
+        snapshot=job.language_context_json,
+        legacy_ui_locale=None,
+        legacy_agent_reply_locale=None,
+    )
+    if job.language_context_json is None:
+        job.language_context_json = language_context.model_dump(mode="json")
     session_id = str(payload.get("session_id") or "").strip() or None
     stateless = payload.get("session_mode") == "stateless"
     if not session_id:
@@ -177,6 +387,18 @@ def execute_run(db: Session, job: APIJob) -> dict[str, Any]:
             ),
         )
         session_id = session.id
+    session = db.get(ChatSession, session_id)
+    if session is None:
+        raise RuntimeError("public run session is unavailable")
+    if (
+        session.agent_reply_locale is not None
+        and session.agent_reply_locale != language_context.agent_reply_locale.value
+    ):
+        raise RuntimeError("public run session reply locale conflicts with durable snapshot")
+    if session.agent_reply_locale is None:
+        session.agent_reply_locale = language_context.agent_reply_locale.value
+        session.agent_reply_locale_source = language_context.agent_reply_locale_source.value
+        db.add(session)
     job.session_id = session_id
     db.add(job)
     update_job(
@@ -197,6 +419,9 @@ def execute_run(db: Session, job: APIJob) -> dict[str, Any]:
         message=str(payload.get("input") or ""),
         attachments=attachments,
         channel="public_api",
+        ui_locale=language_context.ui_locale,
+        agent_reply_locale=language_context.agent_reply_locale,
+        language_context=language_context,
     )
     seen_event_ids: set[str] = set()
     worker_done = threading.Event()
@@ -213,19 +438,36 @@ def execute_run(db: Session, job: APIJob) -> dict[str, Any]:
                         worker_result["response"] = ChatTurnResponse.model_validate(data)
                 if "response" not in worker_result:
                     raise RuntimeError("Harness stream ended without a complete response")
-        except Exception as exc:  # noqa: BLE001 - re-raised at persistent job boundary.
+        except Exception as exc:
             worker_result["error"] = exc
         finally:
             worker_done.set()
 
     thread = threading.Thread(target=execute_harness, name=f"public-run-{job.id}", daemon=True)
+    # Local session/request preparation above may be lengthy.  Re-evaluate the
+    # authoritative lifecycle immediately before handing control to AgentLoop.
+    _require_job_execution_fence(db, job)
+    _require_job_lifecycle(db, job)
+    db.rollback()
+    # AgentLoop owns the provider/tool boundary for a public run.  Record the
+    # boundary before handing control to the worker thread so a later worker
+    # exception is treated as an uncertain remote outcome.
+    mark_side_effect_started(db)
     thread.start()
     while not worker_done.is_set():
+        # The poller owns a separate Session from the worker.  Close any read
+        # transaction opened by the cancellation/lifecycle/event checks before
+        # waiting on a provider-backed worker, and again after the wait, so the
+        # main connection never pins a stale SQLite snapshot across that wait.
         ensure_not_cancelled(db, job)
         _relay_agent_events(db, job, session_id, seen_event_ids)
+        db.rollback()
         worker_done.wait(0.1)
+        db.rollback()
     thread.join(timeout=1)
+    db.rollback()
     _relay_agent_events(db, job, session_id, seen_event_ids)
+    db.rollback()
     if "error" in worker_result:
         raise worker_result["error"]
     result = ChatTurnResponse.model_validate(worker_result.get("response"))
@@ -275,6 +517,7 @@ def execute_run(db: Session, job: APIJob) -> dict[str, Any]:
         None,
     )
     assistant_metadata = dict(assistant.metadata_json or {}) if assistant else {}
+    request_id, trace_id = _job_event_context(job)
     return {
         "run_id": job.id,
         "agent_id": job.agent_id,
@@ -288,7 +531,10 @@ def execute_run(db: Session, job: APIJob) -> dict[str, Any]:
                 "name": invocation.tool_name,
                 "status": invocation.status,
                 "arguments": _redact(dict(invocation.arguments_json or {})),
-                "result": _redact(dict(invocation.result_json or {})),
+                "result": _project_run_result(
+                    dict(invocation.result_json or {}),
+                    job,
+                ),
             }
             for invocation in invocations
         ],
@@ -299,8 +545,14 @@ def execute_run(db: Session, job: APIJob) -> dict[str, Any]:
                 "status": frame.status,
                 "sop_id": frame.skill_id,
                 "step_id": frame.step_id,
-                "result": _redact(dict(frame.result_json or {})),
-                "error": _redact(dict(frame.error_json or {})),
+                "result": project_public_result_payload(
+                    dict(frame.result_json or {}),
+                    ERROR_REGISTRY,
+                    source="public-api-run-task-result",
+                    request_id=request_id,
+                    trace_id=trace_id,
+                ),
+                "error": _project_run_error(frame.error_json, job),
             }
             for frame in frames
         ],
@@ -322,6 +574,7 @@ def _relay_agent_events(
     session_id: str,
     seen_event_ids: set[str],
 ) -> None:
+    """Relay durable AgentEvents after redaction and canonical error projection."""
     rows = db.exec(
         select(AgentEvent)
         .where(
@@ -353,7 +606,14 @@ def _relay_agent_events(
             continue
         public_type = _TRACE_EVENT_MAP.get(event.event_type)
         if public_type:
-            event_data = _redact(payload)
+            # Workflow: failure relays consume only structured error fields; all
+            # other trace events retain the existing source/raw projection path.
+            if public_type == "run.failed":
+                event_data = _project_relay_failure(payload, job)
+            else:
+                event_data = _project_source_event_data(
+                    _project_run_result(_redact(payload), job)
+                )
             if public_type == "run.output.completed":
                 assistants = db.exec(
                     select(Message)
@@ -379,12 +639,54 @@ def _relay_agent_events(
                 )
                 if citations:
                     event_data["citations"] = _redact(citations)
+            # Relaying an AgentEvent is an independent durable public side effect;
+            # a provider-backed run may have crossed a lifecycle transition since
+            # the previous poll, so repeat admission immediately before writing it.
+            _require_job_execution_fence(db, job)
+            _require_job_lifecycle(db, job)
+            db.rollback()
             update_job(
                 db,
                 job,
                 event_type=public_type,
                 event_data=event_data,
             )
+
+
+def _resolve_run_language_context(
+    principal: PublicPrincipal,
+    body: AgentRunCreate,
+    session: ChatSession | None,
+) -> LanguageContext:
+    """Resolve one public run snapshot before the durable job is created."""
+    try:
+        return resolve_language_context(
+            LanguageContextInputs(
+                explicit_ui_locale=body.ui_locale,
+                explicit_agent_reply_locale=body.agent_reply_locale,
+                session_agent_reply_locale=(
+                    session.agent_reply_locale if session is not None else None
+                ),
+                user_ui_locale=principal.actor_user.ui_locale,
+                user_agent_reply_locale=principal.actor_user.agent_reply_locale,
+            )
+        )
+    except ReplyLocaleConflict as exc:
+        # Workflow: bind only a registered conflict code to the public API error;
+        # a malformed locale conflict fails closed while retaining no raw prose.
+        entry = ERROR_REGISTRY.get(exc.code)
+        safe_params = exc.params
+        safe_status_code = 409
+        if entry is None or entry.visibility is not ErrorVisibility.PUBLIC:
+            entry = ERROR_REGISTRY.require("INTERNAL_ERROR")
+            safe_params = {}
+            safe_status_code = 500
+        raise PublicAPIError(
+            safe_status_code,
+            entry.code,
+            "The requested reply locale conflicts with the session snapshot.",
+            params=safe_params,
+        ) from exc
 
 
 @router.post("/agents/{agent_id}/runs", response_model=dict, status_code=202)
@@ -398,18 +700,24 @@ def create_run_route(
 ) -> dict:
     enforce_agent_access(principal, agent_id)
     ensure_public_agent(db, principal, agent_id)
+    session = None
     if body.session_id:
-        owned_public_session(db, principal, agent_id, body.session_id)
+        session, _ = owned_public_session(db, principal, agent_id, body.session_id)
     replay = replay_idempotent_response(db, principal, request, body.model_dump(mode="json"))
     if replay:
+        _require_public_run_replay_lifecycle(db, principal.tenant_id)
         response.status_code = replay[0]
         return replay[1]
+    language_context = _resolve_run_language_context(principal, body, session)
     job = create_job(
         db,
         principal,
         kind="run",
         request_payload=body.model_dump(mode="json"),
         agent_id=agent_id,
+        language_context=language_context,
+        request_id=str(getattr(request.state, "request_id", "")) or None,
+        trace_id=request.headers.get("X-Trace-ID"),
     )
     payload = job_read(job).model_dump(mode="json")
     store_idempotent_response(
@@ -433,22 +741,28 @@ def create_run_stream_route(
     db: Session = Depends(get_session),
 ) -> StreamingResponse:
     """Create a durable run and stream its public events in the same request."""
+    _require_public_run_stream_lifecycle(principal.tenant_id, None, "public-run-create")
     enforce_agent_access(principal, agent_id)
     ensure_public_agent(db, principal, agent_id)
+    session = None
     if body.session_id:
-        owned_public_session(db, principal, agent_id, body.session_id)
+        session, _ = owned_public_session(db, principal, agent_id, body.session_id)
     request_payload = body.model_dump(mode="json")
     replay = replay_idempotent_response(db, principal, request, request_payload)
     if replay:
         run_id = str(replay[1].get("id") or "")
         job = _owned_run(db, principal, run_id)
     else:
+        language_context = _resolve_run_language_context(principal, body, session)
         job = create_job(
             db,
             principal,
             kind="run",
             request_payload=request_payload,
             agent_id=agent_id,
+            language_context=language_context,
+            request_id=str(getattr(request.state, "request_id", "")) or None,
+            trace_id=request.headers.get("X-Trace-ID"),
         )
         payload = job_read(job).model_dump(mode="json")
         store_idempotent_response(
@@ -460,7 +774,7 @@ def create_run_stream_route(
             status_code=202,
             resource_id=job.id,
         )
-    stream = stream_job_events(job.id, request, 0, None, principal, db)
+    stream = _public_run_event_stream(job, request, 0, None, principal)
     stream.headers["X-Run-ID"] = job.id
     stream.headers["Cache-Control"] = "no-cache, no-transform"
     stream.headers["X-Accel-Buffering"] = "no"
@@ -474,6 +788,92 @@ def _owned_run(db: Session, principal: PublicPrincipal, run_id: str) -> APIJob:
     if principal.agent_id and row.agent_id != principal.agent_id:
         raise PublicAPIError(404, "RUN_NOT_FOUND", "Run not found.")
     return row
+
+
+def _public_run_event_stream(
+    run: APIJob,
+    request: Request,
+    after: int,
+    last_event_id: str | None,
+    principal: PublicPrincipal,
+) -> StreamingResponse:
+    """Stream one run with a lifecycle checkpoint before every public SSE chunk."""
+    del request, principal
+    if last_event_id and last_event_id.isdigit():
+        after = max(after, int(last_event_id))
+    correlation_id = f"public-run-stream:{run.id}"
+    _require_public_run_stream_lifecycle(
+        run.tenant_id,
+        run.tenant_lifecycle_version,
+        correlation_id,
+    )
+
+    def events() -> Iterator[str]:
+        cursor = max(0, after)
+        idle_ticks = 0
+        while True:
+            if not _public_run_stream_lifecycle_active(
+                run.tenant_id,
+                run.tenant_lifecycle_version,
+                correlation_id,
+            ):
+                return
+            with Session(_public_run_stream_engine()) as event_db:
+                current = event_db.get(APIJob, run.id)
+                if not current or current.tenant_id != run.tenant_id:
+                    return
+                rows = event_db.exec(
+                    select(APIJobEvent).where(
+                        APIJobEvent.job_id == run.id,
+                        APIJobEvent.sequence > cursor,
+                        APIJobEvent.public == True,
+                    ).order_by(APIJobEvent.sequence)
+                ).all()
+                chunks = [
+                    (
+                        item.sequence,
+                        (
+                            f"id: {item.sequence}\nevent: {item.event_type}\ndata: "
+                            f"{json.dumps(item.data_json or {}, ensure_ascii=False)}\n\n"
+                        ),
+                    )
+                    for item in rows
+                ]
+                terminal = current.status in {"succeeded", "failed", "cancelled"}
+            # The database Session is closed before any chunk is gated or yielded.
+            for sequence, chunk in chunks:
+                if not _public_run_stream_lifecycle_active(
+                    run.tenant_id,
+                    run.tenant_lifecycle_version,
+                    correlation_id,
+                ):
+                    return
+                cursor = sequence
+                yield chunk
+            if terminal and not chunks:
+                return
+            idle_ticks += 1
+            if idle_ticks % 100 == 0:
+                if not _public_run_stream_lifecycle_active(
+                    run.tenant_id,
+                    run.tenant_lifecycle_version,
+                    correlation_id,
+                ):
+                    return
+                yield ": keepalive\n\n"
+            # Keep the existing public-job polling hook so tests and deployments retain one
+            # bounded cadence while the lifecycle check above remains authoritative.
+            public_jobs.sleep(0.15)
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 @router.get("/runs/{run_id}", response_model=dict)
@@ -491,10 +891,11 @@ def get_run_result(
     principal: PublicPrincipal = Depends(require_scopes("runs:read")),
     db: Session = Depends(get_session),
 ) -> dict:
+    """Return a successful run result with legacy nested errors projected fail-closed."""
     row = _owned_run(db, principal, run_id)
     if row.status != "succeeded":
         raise PublicAPIError(409, "RUN_NOT_SUCCEEDED", "The run has not succeeded.")
-    return dict(row.result_json or {})
+    return _project_run_result(row.result_json, row)
 
 
 @router.get("/runs/{run_id}/events")
@@ -506,8 +907,8 @@ def stream_run_events(
     principal: PublicPrincipal = Depends(require_scopes("runs:read")),
     db: Session = Depends(get_session),
 ) -> StreamingResponse:
-    _owned_run(db, principal, run_id)
-    return stream_job_events(run_id, request, after, last_event_id, principal, db)
+    row = _owned_run(db, principal, run_id)
+    return _public_run_event_stream(row, request, after, last_event_id, principal)
 
 
 @router.post("/runs/{run_id}:cancel", response_model=dict)
@@ -536,7 +937,7 @@ def list_run_artifacts(
     row = _owned_run(db, principal, run_id)
     if not row.session_id:
         return {"data": []}
-    return {"data": _latest_artifacts(db, row.tenant_id, row.session_id)}
+    return {"data": _artifacts_for_run(db, row)}
 
 
 @router.get("/runs/{run_id}/artifacts/{task_frame_id}")
@@ -547,6 +948,8 @@ def download_run_artifact(
     principal: PublicPrincipal = Depends(require_scopes("runs:read")),
     db: Session = Depends(get_session),
 ) -> StreamingResponse:
+    """Download one run-scoped artifact after bounded-root and publication-integrity validation."""
+
     row = _owned_run(db, principal, run_id)
     if not row.session_id:
         raise PublicAPIError(404, "ARTIFACT_NOT_FOUND", "Artifact not found.")
@@ -557,7 +960,7 @@ def download_run_artifact(
     artifact = next(
         (
             item
-            for item in _latest_artifacts(db, row.tenant_id, row.session_id)
+            for item in _artifacts_for_run(db, row)
             if item.get("type") == "workspace_file"
             and str(item.get("task_frame_id") or "") == task_frame_id
             and item.get("path") == normalized
@@ -566,17 +969,35 @@ def download_run_artifact(
     )
     if not artifact:
         raise PublicAPIError(404, "ARTIFACT_NOT_FOUND", "Artifact not found.")
+    opened = None
     try:
-        opened = open_harness_artifact(
-            harness_task_workspace_path(
-                tenant_id=row.tenant_id,
-                session_id=row.session_id,
-                task_frame_id=task_frame_id,
-                db=db,
-            ),
-            normalized,
+        opened, _workspace_root = open_harness_task_artifact(
+            tenant_id=row.tenant_id,
+            session_id=row.session_id,
+            task_frame_id=task_frame_id,
+            path=normalized,
+            db=db,
         )
+        digest = opened.sha256()
+        expected_digest = str(artifact.get("sha256") or "").strip().lower()
+        expected_size = artifact.get("size")
+        if (
+            (expected_digest and expected_digest != digest.lower())
+            or (isinstance(expected_size, int) and expected_size != opened.size)
+        ):
+            opened.close()
+            raise PublicAPIError(409, "ARTIFACT_CHANGED", "Artifact has changed.")
+    except HarnessWorkspaceArtifactConflictError as exc:
+        if opened is not None:
+            opened.close()
+        raise PublicAPIError(
+            409,
+            "ARTIFACT_LOCATION_CONFLICT",
+            "Artifact location is ambiguous.",
+        ) from exc
     except (HarnessArtifactAccessError, OSError) as exc:
+        if opened is not None:
+            opened.close()
         raise PublicAPIError(404, "ARTIFACT_NOT_FOUND", "Artifact not found.") from exc
     filename = _safe_artifact_download_name(
         str(artifact.get("display_name") or opened.filename)

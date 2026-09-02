@@ -3,15 +3,26 @@
 import { afterEach, describe, expect, it } from 'vitest';
 
 import {
-  ENTERPRISE_AGENT_STORAGE_KEY,
+  clearSharedAgentScope,
   isTeamScope,
+  persistSharedAgentScope,
   readEmployeeScope,
+  sessionFilterStorageKey,
   teamIdFromScope,
   toTeamScope,
 } from './agent-scope-storage';
 
+function safely<T>(operation: () => T): T | undefined {
+  try {
+    return operation();
+  } catch {
+    return undefined;
+  }
+}
+
 afterEach(() => {
   window.localStorage.clear();
+  window.sessionStorage.clear();
 });
 
 describe('team agent-scope helpers', () => {
@@ -36,17 +47,64 @@ describe('team agent-scope helpers', () => {
     expect(teamIdFromScope(null)).toBe('');
   });
 
-  it('reads team scopes as an empty employee scope', () => {
-    window.localStorage.setItem(ENTERPRISE_AGENT_STORAGE_KEY, 'team:team-1');
-    expect(readEmployeeScope()).toBe('');
+  it('keeps selected employee scope isolated for tenant and user replacement', () => {
+    persistSharedAgentScope('agent-a', 'tenant-a', 'user-a');
+
+    expect(readEmployeeScope('tenant-a', 'user-a')).toBe('agent-a');
+    expect(readEmployeeScope('tenant-b', 'user-a')).toBe('');
+    expect(readEmployeeScope('tenant-a', 'user-b')).toBe('');
+
+    persistSharedAgentScope('agent-b', 'tenant-b', 'user-a');
+    expect(readEmployeeScope('tenant-a', 'user-a')).toBe('agent-a');
+    expect(readEmployeeScope('tenant-b', 'user-a')).toBe('agent-b');
   });
 
-  it('reads employee scopes as-is', () => {
-    window.localStorage.setItem(ENTERPRISE_AGENT_STORAGE_KEY, 'agent-1');
-    expect(readEmployeeScope()).toBe('agent-1');
+  it('keeps selected team scope in the same tenant/user namespace without leaking it', () => {
+    persistSharedAgentScope(toTeamScope('team-a'), 'tenant-a', 'user-a');
+    const tenantAKeys = Array.from(
+      { length: window.localStorage.length },
+      (_value, index) => window.localStorage.key(index),
+    );
+
+    expect(tenantAKeys).toHaveLength(1);
+    expect(window.localStorage.getItem(tenantAKeys[0]!)).toBe('team:team-a');
+    expect(readEmployeeScope('tenant-a', 'user-a')).toBe('');
+
+    persistSharedAgentScope(toTeamScope('team-b'), 'tenant-b', 'user-a');
+    const values = Array.from(
+      { length: window.localStorage.length },
+      (_value, index) => window.localStorage.getItem(window.localStorage.key(index)!),
+    );
+    expect(values).toEqual(expect.arrayContaining(['team:team-a', 'team:team-b']));
+    expect(readEmployeeScope('tenant-b', 'user-a')).toBe('');
   });
 
-  it('reads an empty storage slot as an empty employee scope', () => {
-    expect(readEmployeeScope()).toBe('');
+  it('does not adopt the legacy unscoped selected-agent slot for a verified identity', () => {
+    window.localStorage.setItem('ultrarag_enterprise_agent_scope', 'legacy-agent');
+
+    expect(readEmployeeScope('tenant-a', 'user-a')).toBe('');
+    clearSharedAgentScope('tenant-a', 'user-a');
+    expect(window.localStorage.getItem('ultrarag_enterprise_agent_scope')).toBe('legacy-agent');
+  });
+
+  it('namespaces the session filter independently for tenant and user', () => {
+    const tenantAUserA = sessionFilterStorageKey('tenant-a', 'user-a');
+    const tenantBUserA = sessionFilterStorageKey('tenant-b', 'user-a');
+    const tenantAUserB = sessionFilterStorageKey('tenant-a', 'user-b');
+
+    expect(tenantAUserA).not.toBe(tenantBUserA);
+    expect(tenantAUserA).not.toBe(tenantAUserB);
+    expect(tenantAUserA).not.toBe('skill_agent_session_filter:user-a');
+
+    window.localStorage.setItem(tenantAUserA, 'agent-a');
+    expect(window.localStorage.getItem(tenantBUserA)).toBeNull();
+    expect(window.localStorage.getItem(tenantAUserB)).toBeNull();
+  });
+
+  it('does not create a usable namespace for missing tenant or user identity', () => {
+    expect(typeof safely(() => sessionFilterStorageKey('', 'user-a'))).not.toBe('string');
+    expect(typeof safely(() => sessionFilterStorageKey('tenant-a', ''))).not.toBe('string');
+    expect(safely(() => readEmployeeScope('', 'user-a')) || '').toBe('');
+    expect(safely(() => readEmployeeScope('tenant-a', '')) || '').toBe('');
   });
 });

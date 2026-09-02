@@ -1,12 +1,39 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
+
+from app.capability_scope import CapabilityScope
+from app.i18n.raw_source import RawSourceMarker
 
 TeamRole = Literal["leader", "member"]
 ReviewVerdict = Literal["approve", "rework", "escalate"]
+KnowledgePermission = Literal["reader", "editor", "publisher"]
+NonEmptyText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+
+
+class TeamSharedKnowledgeCreate(BaseModel):
+    name: NonEmptyText
+    description: str | None = None
+    capability_scope: CapabilityScope = "general"
+
+
+class TeamKnowledgeSelection(BaseModel):
+    existing_knowledge_base_id: str | None = None
+    create_shared: TeamSharedKnowledgeCreate | None = None
+    is_default: bool = False
+
+    @model_validator(mode="after")
+    def validate_exactly_one_source(self) -> TeamKnowledgeSelection:
+        """每个团队知识库选择必须且只能引用现有共享库或声明新建共享库。"""
+        source_count = int(bool(self.existing_knowledge_base_id)) + int(
+            self.create_shared is not None
+        )
+        if source_count != 1:
+            raise ValueError("exactly one knowledge-base source is required")
+        return self
 
 
 class TeamCreateRequest(BaseModel):
@@ -14,6 +41,14 @@ class TeamCreateRequest(BaseModel):
     name: str
     description: str | None = None
     config: dict[str, Any] = Field(default_factory=dict)
+    knowledge_bases: list[TeamKnowledgeSelection] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_one_default_knowledge_base(self) -> TeamCreateRequest:
+        """一次团队创建最多设置一个默认共享知识库。"""
+        if sum(int(item.is_default) for item in self.knowledge_bases) > 1:
+            raise ValueError("only one default knowledge base is allowed")
+        return self
 
 
 class TeamUpdateRequest(BaseModel):
@@ -52,9 +87,67 @@ class TeamRead(BaseModel):
     name: str
     description: str | None = None
     owner_user_id: str
+    default_knowledge_base_id: str | None = None
     config: dict[str, Any] = Field(default_factory=dict)
     status: str
     members: list[TeamMemberRead] = Field(default_factory=list)
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class TeamKnowledgeBindRequest(TeamKnowledgeSelection):
+    tenant_id: str
+
+
+class TeamKnowledgeBindingUpdateRequest(BaseModel):
+    tenant_id: str
+    expected_revision: int = Field(ge=1)
+    is_default: bool
+
+
+class TeamKnowledgeUnbindRequest(BaseModel):
+    tenant_id: str
+    expected_revision: int = Field(ge=1)
+
+
+class TeamKnowledgeGrantInput(BaseModel):
+    agent_id: NonEmptyText
+    permission: KnowledgePermission | None
+
+
+class TeamKnowledgeGrantsUpdateRequest(BaseModel):
+    tenant_id: str
+    expected_revision: int = Field(ge=1)
+    grants: list[TeamKnowledgeGrantInput]
+
+    @model_validator(mode="after")
+    def validate_unique_agents(self) -> TeamKnowledgeGrantsUpdateRequest:
+        """一次原子授权更新中，每名员工只能出现一次。"""
+        agent_ids = [grant.agent_id for grant in self.grants]
+        if len(set(agent_ids)) != len(agent_ids):
+            raise ValueError("grant agent_id values must be unique")
+        return self
+
+
+class TeamKnowledgeGrantRead(BaseModel):
+    agent_id: str
+    permission: KnowledgePermission
+    status: str
+
+
+class TeamKnowledgeBindingRead(BaseModel):
+    id: str
+    team_id: str
+    knowledge_base_id: str
+    knowledge_base_name: str
+    status: str
+    revision: int
+    is_default: bool
+    published_version_id: str | None = None
+    published_version: str | None = None
+    grants: list[TeamKnowledgeGrantRead] = Field(default_factory=list)
     created_at: datetime
     updated_at: datetime
 
@@ -93,6 +186,8 @@ class TeamTaskRead(BaseModel):
     id: str
     team_id: str
     tenant_id: str
+    team_run_id: str | None = None
+    source_turn_id: str | None = None
     parent_task_id: str | None = None
     title: str
     description: str | None = None
@@ -195,9 +290,19 @@ class TeamBlackboardEntryRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class TeamBlackboardSkipRead(BaseModel):
+    """Expose a locale-independent blackboard skip reason and raw source excerpt."""
+
+    event_code: str
+    params: dict[str, Any] = Field(default_factory=dict)
+    reason: dict[str, Any] = Field(default_factory=dict)
+    raw: dict[str, Any] = Field(default_factory=dict)
+    raw_source_markers: list[RawSourceMarker] = Field(default_factory=list)
+
+
 class TeamBlackboardWriteResponse(BaseModel):
     entries: list[TeamBlackboardEntryRead] = Field(default_factory=list)
-    skipped: list[str] = Field(default_factory=list)
+    skipped: list[TeamBlackboardSkipRead] = Field(default_factory=list)
 
 
 class TeamEventRead(BaseModel):
@@ -233,6 +338,7 @@ class TeamThreadRead(BaseModel):
 
 class TeamBlackboardPromoteRequest(BaseModel):
     tenant_id: str
+    knowledge_base_id: str | None = None
 
 
 class TeamBlackboardPromoteResponse(BaseModel):

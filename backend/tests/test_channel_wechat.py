@@ -34,6 +34,18 @@ def _test_engine():
     return engine
 
 
+def _threaded_test_engine(tmp_path, name: str):
+    engine = create_engine(
+        f"sqlite:///{tmp_path / name}",
+        connect_args={"check_same_thread": False, "timeout": 30.0},
+    )
+    with engine.connect() as connection:
+        connection.exec_driver_sql("PRAGMA journal_mode=WAL")
+        connection.exec_driver_sql("PRAGMA busy_timeout=30000")
+    SQLModel.metadata.create_all(engine)
+    return engine
+
+
 def _client(handler) -> WeChatClient:
     return WeChatClient(BASE_URL, "bot_token_x", transport=httpx.MockTransport(handler))
 
@@ -684,8 +696,8 @@ class _ScriptedPollClient:
         return dict(self.tail)
 
 
-def test_first_minus_14_enters_recovery_without_expired() -> None:
-    engine = _test_engine()
+def test_first_minus_14_enters_recovery_without_expired(tmp_path) -> None:
+    engine = _threaded_test_engine(tmp_path, "wechat-first-recovery.db")
     binding_id = _seed_poll_binding(engine)
     client = _ScriptedPollClient([], {"ret": -14, "errcode": -14})
     manager = WeChatPollManager(
@@ -721,8 +733,8 @@ def test_first_minus_14_enters_recovery_without_expired() -> None:
         assert db.get(ChannelBinding, binding_id).status == "active"
 
 
-def test_recovery_success_clears_state_and_resumes_polling() -> None:
-    engine = _test_engine()
+def test_recovery_success_clears_state_and_resumes_polling(tmp_path) -> None:
+    engine = _threaded_test_engine(tmp_path, "wechat-recovery-success.db")
     binding_id = _seed_poll_binding(engine)
     client = _ScriptedPollClient(
         [{"ret": -14, "errcode": -14}],
@@ -774,8 +786,8 @@ def test_repeated_minus_14_marks_expired_at_cap() -> None:
     assert client.calls == 5
 
 
-def test_reconcile_does_not_restart_recovering_binding() -> None:
-    engine = _test_engine()
+def test_reconcile_does_not_restart_recovering_binding(tmp_path) -> None:
+    engine = _threaded_test_engine(tmp_path, "wechat-reconcile-recovery.db")
     binding_id = _seed_poll_binding(engine)
     client = _ScriptedPollClient([], {"ret": -14, "errcode": -14})
     manager = WeChatPollManager(
@@ -884,8 +896,8 @@ def test_for_binding_clamps_stored_illegal_baseurl() -> None:
     assert client.base_url == "https://szilinkai.weixin.qq.com"
 
 
-def test_reconfigure_stop_aborts_inflight_poll_and_restarts() -> None:
-    engine = _test_engine()
+def test_reconfigure_stop_aborts_inflight_poll_and_restarts(tmp_path) -> None:
+    engine = _threaded_test_engine(tmp_path, "wechat-reconfigure-stop.db")
     binding_id = _seed_poll_binding(engine)
 
     class BlockingPollClient:
@@ -935,8 +947,8 @@ def test_reconfigure_stop_aborts_inflight_poll_and_restarts() -> None:
     assert manager.wait_binding_stopped(binding_id, timeout_seconds=5.0)
 
 
-def test_timeout_then_reconcile_restores_old_wechat_config_once() -> None:
-    engine = _test_engine()
+def test_timeout_then_reconcile_restores_old_wechat_config_once(tmp_path) -> None:
+    engine = _threaded_test_engine(tmp_path, "wechat-timeout-reconcile.db")
     binding_id = _seed_poll_binding(engine)
 
     class ControlledPollClient:

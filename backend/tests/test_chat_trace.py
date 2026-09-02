@@ -3,19 +3,27 @@ from datetime import datetime, timedelta
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
+import app.core.cancellation as cancellation_module
 from app.api.chat import (
+    _TRACE_EVENT_CODES,
     _build_turn_traces,
+    _event_trace_lines,
     _events_after_cursor,
-    _format_scheduled_task_schedule,
     _harness_event_trace_line,
     _message_turn_ids_from_events,
+    _normalized_session_event_payload,
     _persist_chat_turn_cancelled,
     _persist_chat_turn_interrupted,
     _relay_event_payload,
+    _resolve_step_label,
+    _scheduled_task_draft_reply,
+    _trace_event_descriptor,
     list_chat_session_spans,
     message_read,
 )
-import app.core.cancellation as cancellation_module
+from app.channels.feishu_trace import _SinkEvent
+from app.contracts.event_registry import EVENT_REGISTRY
+from app.contracts.events import EventVisibility, SystemEvent
 from app.core.cancellation import is_chat_turn_cancelled
 from app.db.models import (
     AgentEvent,
@@ -26,6 +34,7 @@ from app.db.models import (
     Tenant,
     User,
 )
+from app.i18n.language_context import LanguageContext, LocaleResolutionSource, SupportedLocale
 from app.observability.event_log import EventLog
 
 
@@ -47,13 +56,15 @@ def test_task_frame_finished_keeps_switched_sop_name_while_awaiting_user() -> No
         )
     )
 
-    assert line == {
-        "id": "harness_frame_task_purchase",
-        "kind": "skill",
-        "text": "等待用户补充 购买商品流程",
-        "detail": "状态 awaiting_user · 步骤 collect_user_name · 执行 1 个动作",
-        "state": "running",
-    }
+    assert line["id"] == "harness_frame_task_purchase"
+    assert line["kind"] == "skill"
+    assert line["text"] == ""
+    assert line["event_type"] == "task_frame_finished"
+    assert line["event_code"] == "run.task.frame.finished"
+    assert line["params"] == {}
+    assert line["event_data"]["skill_name"] == "购买商品流程"
+    assert line["state"] == "running"
+    assert "detail" not in line
 
 
 def test_event_log_binds_all_execution_events_to_current_turn() -> None:
@@ -74,6 +85,50 @@ def test_event_log_binds_all_execution_events_to_current_turn() -> None:
             "user_message_id": "msg_user",
             "client_turn_id": "client_turn",
         }
+
+
+def test_event_log_binds_language_context_to_execution_events() -> None:
+    """Persist the immutable UI/reply locale snapshot on every bound stream event."""
+    with _test_db() as db:
+        events = EventLog(db)
+        context = LanguageContext(
+            ui_locale=SupportedLocale.EN_US,
+            agent_reply_locale=SupportedLocale.ZH_CN,
+            ui_locale_source=LocaleResolutionSource.EXPLICIT_REQUEST,
+            agent_reply_locale_source=LocaleResolutionSource.SESSION_SNAPSHOT,
+        )
+        events.bind_turn("msg_user", "client_turn", language_context=context)
+
+        event = events.record(
+            "tenant_demo",
+            "session_test",
+            "stream_status",
+            {"phase": "planning", "text": "正在规划本轮任务"},
+        )
+
+        assert event.payload_json["language_context"] == context.model_dump(mode="json")
+        assert event.payload_json["turn_id"] == "msg_user"
+
+
+def test_harness_recovery_event_projects_its_canonical_code_and_params() -> None:
+    """Keep recovery visible after replay without restoring the legacy localized reply."""
+    event = AgentEvent(
+        tenant_id="tenant_demo",
+        session_id="session_recovery",
+        event_type="harness_execution_recovered",
+        payload_json={
+            "schema_version": 2,
+            "event_code": "harness.execution.recovered",
+            "params": {"error_code": "INTERNAL_ERROR"},
+        },
+    )
+
+    lines = _event_trace_lines(event, {})
+
+    assert len(lines) == 1
+    assert lines[0]["event_code"] == "harness.execution.recovered"
+    assert lines[0]["params"] == {"error_code": "INTERNAL_ERROR"}
+    assert lines[0]["text"] == ""
 
 
 def test_session_spans_endpoint_returns_internal_spans_without_relaying_them() -> None:
@@ -137,6 +192,116 @@ def test_session_spans_endpoint_returns_internal_spans_without_relaying_them() -
     assert [event.event_type for event in relayed] == ["router_decision_created"]
 
 
+def test_session_spans_endpoint_sanitizes_failed_span_error_payload() -> None:
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    SQLModel.metadata.create_all(engine)
+    context = LanguageContext(
+        ui_locale=SupportedLocale.EN_US,
+        agent_reply_locale=SupportedLocale.ZH_CN,
+        ui_locale_source=LocaleResolutionSource.EXPLICIT_REQUEST,
+        agent_reply_locale_source=LocaleResolutionSource.SESSION_SNAPSHOT,
+    ).model_dump(mode="json")
+    with Session(engine) as db:
+        db.add(Tenant(id="tenant_demo", name="Demo"))
+        user = User(
+            id="user_demo",
+            tenant_id="tenant_demo",
+            username="demo",
+            password_hash="hashed",
+        )
+        db.add(user)
+        db.add(
+            ChatSession(
+                id="session_test",
+                tenant_id="tenant_demo",
+                user_id=user.id,
+            )
+        )
+        db.add(
+            AgentEvent(
+                id="evt_span_failed",
+                tenant_id="tenant_demo",
+                session_id="session_test",
+                event_type="llm_call_failed",
+                payload_json={
+                    "span_id": "span_failed",
+                    "operation": "router.scene",
+                    "duration_ms": 12.5,
+                    "error": "secret token=/private/router.sock",
+                    "error_type": "RuntimeError",
+                    "language_context": context,
+                },
+            )
+        )
+        db.commit()
+
+        spans = list_chat_session_spans(
+            "session_test",
+            tenant_id="tenant_demo",
+            current_user=user,
+            db=db,
+        )
+
+    assert len(spans) == 1
+    assert spans[0]["operation"] == "router.scene"
+    assert spans[0]["error"] == {
+        "code": "INTERNAL_ERROR",
+        "params": {},
+        "retryable": False,
+        "request_id": None,
+        "trace_id": None,
+    }
+    assert spans[0]["language_context"] == context
+    assert "secret token" not in str(spans[0])
+    assert "error_type" not in spans[0]
+
+
+def test_relay_event_payload_sanitizes_legacy_auto_route_error() -> None:
+    context = LanguageContext(
+        ui_locale=SupportedLocale.ZH_CN,
+        agent_reply_locale=SupportedLocale.EN_US,
+        ui_locale_source=LocaleResolutionSource.EXPLICIT_REQUEST,
+        agent_reply_locale_source=LocaleResolutionSource.EXPLICIT_REQUEST,
+    ).model_dump(mode="json")
+    row = AgentEvent(
+        id="evt_route_failed",
+        tenant_id="tenant_demo",
+        session_id="session_test",
+        event_type="auto_route_decision",
+        payload_json={
+            "current_agent_id": "agent_xz",
+            "agent_id": "agent_xz",
+            "switched": False,
+            "confidence": 0.0,
+            "threshold": 0.75,
+            "reason": "",
+            "error": "Expecting value: secret classifier body",
+            "language_context": context,
+        },
+    )
+
+    normalized = _normalized_session_event_payload(row)
+    event_name, relayed = _relay_event_payload(row)
+
+    assert event_name == "auto_route_decision"
+    assert normalized["error"] == {
+        "code": "INTERNAL_ERROR",
+        "params": {},
+        "retryable": False,
+        "request_id": None,
+        "trace_id": None,
+    }
+    assert relayed["error"] == normalized["error"]
+    assert normalized["language_context"] == context
+    assert relayed["language_context"] == context
+    assert "secret classifier body" not in str(normalized)
+    assert "Expecting value" not in str(relayed)
+
+
 def test_turn_trace_uses_router_skill_hint_when_events_have_turn_id() -> None:
     started_at = datetime(2026, 6, 5, 6, 35, 4)
     messages = [
@@ -193,14 +358,13 @@ def test_turn_trace_uses_router_skill_hint_when_events_have_turn_id() -> None:
 
     traces = _build_turn_traces(messages, events, {"skill_purchase_001": "购买商品流程"})
 
-    skill_lines = [
-        line
-        for line in traces[0]["lines"]
-        if line["kind"] == "skill" and "购买商品流程" in line["text"]
-    ]
+    skill_lines = [line for line in traces[0]["lines"] if line["kind"] == "skill"]
     assert skill_lines
-    assert skill_lines[0]["text"] == "推进SOP 购买商品流程"
-    assert skill_lines[0]["detail"] == "step end"
+    assert skill_lines[0]["text"] == ""
+    assert skill_lines[0]["event_type"] == "skill_step_changed"
+    assert skill_lines[0]["event_code"] == "run.sop.state"
+    assert skill_lines[0]["event_data"]["to_step_id"] == "end"
+    assert "detail" not in skill_lines[0]
     router_line = next(line for line in traces[0]["lines"] if line["id"] == "decision_router")
     assert router_line["icon"] == "judge"
     assert skill_lines[0]["icon"] == "advance"
@@ -259,10 +423,14 @@ def test_turn_trace_recovers_persisted_skill_state_for_current_turn() -> None:
 
     skill_lines = [line for line in traces[0]["lines"] if line["kind"] == "skill"]
     assert skill_lines[0]["id"] == "skill_state_skill_purchase_001_active_collect_user_name"
-    assert skill_lines[0]["text"] == "选择SOP 购买商品流程"
-    assert skill_lines[0]["detail"] == "当前步骤 collect_user_name"
+    assert skill_lines[0]["text"] == ""
+    assert skill_lines[0]["event_type"] == "skill_state"
+    assert skill_lines[0]["event_code"] == "run.sop.state"
+    assert skill_lines[0]["event_data"]["current_skill"]["name"] == "购买商品流程"
+    assert "detail" not in skill_lines[0]
     assert skill_lines[1]["id"] == "skill_state_skill_weather_001_pending_collect_city"
-    assert skill_lines[1]["text"] == "等待SOP 天气查询流程"
+    assert skill_lines[1]["text"] == ""
+    assert skill_lines[1]["event_code"] == "run.sop.state"
 
 
 def test_turn_trace_merges_skill_started_with_matching_state_snapshot() -> None:
@@ -324,16 +492,16 @@ def test_turn_trace_merges_skill_started_with_matching_state_snapshot() -> None:
     )
 
     skill_lines = [line for line in traces[0]["lines"] if line["kind"] == "skill"]
-    assert skill_lines == [
-        {
-            "id": "skill_state_skill_expense_quota_query_active_node_collect_info",
-            "kind": "skill",
-            "text": "选择SOP 报销额度查询",
-            "detail": "当前步骤 node_collect_info",
-            "state": "running",
-            "icon": "advance",
-        }
-    ]
+    assert len(skill_lines) == 1
+    assert skill_lines[0]["id"] == "skill_state_skill_expense_quota_query_active_node_collect_info"
+    assert skill_lines[0]["kind"] == "skill"
+    assert skill_lines[0]["text"] == ""
+    assert skill_lines[0]["event_type"] == "skill_state"
+    assert skill_lines[0]["event_code"] == "run.sop.state"
+    assert skill_lines[0]["params"] == {}
+    assert skill_lines[0]["state"] == "running"
+    assert skill_lines[0]["icon"] == "advance"
+    assert "detail" not in skill_lines[0]
 
 
 def test_turn_trace_uses_live_stream_ids_for_persisted_status_events() -> None:
@@ -450,17 +618,17 @@ def test_turn_trace_merges_knowledge_lifecycle_events_for_same_query() -> None:
     traces = _build_turn_traces(messages, events, {})
 
     knowledge_lines = [line for line in traces[0]["lines"] if line["kind"] == "knowledge"]
-    assert knowledge_lines == [
-        {
-            "id": f"knowledge_lookup_{query}",
-            "kind": "knowledge",
-            "phase": "result",
-            "text": "读取业务资料",
-            "detail": "命中 Wiki 1 个",
-            "state": "completed",
-            "icon": "advance",
-        }
-    ]
+    assert len(knowledge_lines) == 1
+    assert knowledge_lines[0]["id"] == f"knowledge_lookup_{query}"
+    assert knowledge_lines[0]["kind"] == "knowledge"
+    assert knowledge_lines[0]["text"] == ""
+    assert knowledge_lines[0]["event_type"] == "knowledge_result"
+    assert knowledge_lines[0]["event_code"] == "public.run.citation"
+    assert knowledge_lines[0]["params"] == {}
+    assert knowledge_lines[0]["event_data"]["selected_concepts"] == [{"id": "concept_1"}]
+    assert knowledge_lines[0]["state"] == "completed"
+    assert knowledge_lines[0]["icon"] == "advance"
+    assert "detail" not in knowledge_lines[0]
 
 
 def test_turn_trace_merges_created_and_relayed_reflection_decisions() -> None:
@@ -503,7 +671,11 @@ def test_turn_trace_merges_created_and_relayed_reflection_decisions() -> None:
 
     reflection_lines = [line for line in traces[0]["lines"] if line["id"] == "reflection"]
     assert len(reflection_lines) == 1
-    assert reflection_lines[0]["text"] == "反思通过"
+    assert reflection_lines[0]["text"] == ""
+    assert reflection_lines[0]["event_type"] == "reflection_decision"
+    assert reflection_lines[0]["event_code"] == "run.sop.state"
+    assert reflection_lines[0]["params"] == {}
+    assert "detail" not in reflection_lines[0]
 
 
 def test_turn_trace_ignores_noop_skill_step_change() -> None:
@@ -692,7 +864,10 @@ def test_turn_trace_keeps_running_routing_status_for_refresh() -> None:
     assert traces[0]["completed_at"] is None
     assert any(
         line["id"] == "decision_router"
-        and line["text"] == "判断意图"
+        and line["text"] == ""
+        and line["event_type"] == "stream_status"
+        and line["event_code"] == "public.run.status"
+        and line["params"] == {}
         and line["state"] == "running"
         and line["icon"] == "judge"
         for line in traces[0]["lines"]
@@ -700,6 +875,7 @@ def test_turn_trace_keeps_running_routing_status_for_refresh() -> None:
 
 
 def test_turn_trace_marks_model_and_intermediate_errors_failed() -> None:
+    """Project raw legacy failures to stable trace codes without provider prose."""
     started_at = datetime(2026, 7, 9, 12, 0, 0)
     messages = [
         Message(
@@ -764,20 +940,56 @@ def test_turn_trace_marks_model_and_intermediate_errors_failed() -> None:
     lines = traces[0]["lines"]
 
     assert traces[0]["completed_at"] == events[-1].created_at.isoformat()
-    assert any(
-        line["text"] == "模型调用失败"
-        and line["state"] == "failed"
-        and line["icon"] == "loading"
-        and "upstream timeout" in line["detail"]
-        for line in lines
+    skill_error = next(line for line in lines if line["event_type"] == "general_skill_trace")
+    assert skill_error["event_code"] == "run.skill.trace"
+    assert skill_error["state"] == "failed"
+    assert skill_error["text"] == ""
+    terminal_error = next(line for line in lines if line["event_type"] == "error_occurred")
+    assert terminal_error["event_code"] == "public.run.failed"
+    assert terminal_error["params"]["error_code"] == "MODEL_UPSTREAM_ERROR"
+    assert terminal_error["state"] == "failed"
+    assert terminal_error["text"] == ""
+    assert all("detail" not in line for line in lines)
+    assert "upstream timeout" not in str(lines)
+    assert "invalid json" not in str(lines)
+
+
+def test_failed_trace_and_tool_events_drop_nested_provider_diagnostics() -> None:
+    """Keep nested failure payloads safe on the same replay and SSE projection path."""
+    raw_secret = "provider secret=do-not-publish traceback=/private/runtime.sock"
+    skill_event = AgentEvent(
+        tenant_id="tenant_demo",
+        session_id="session_error",
+        event_type="general_skill_trace",
+        payload_json={
+            "phase": "reflection_failed",
+            "message": raw_secret,
+            "review": {"reason": raw_secret},
+            "structured_result": {"error": raw_secret},
+            "data": {"traceback": raw_secret},
+        },
     )
-    assert any(
-        line["text"] == "模型生成 runner 失败"
-        and line["state"] == "failed"
-        and line["icon"] == "generated"
-        and "invalid json" in line["detail"]
-        for line in lines
+    tool_event = AgentEvent(
+        tenant_id="tenant_demo",
+        session_id="session_error",
+        event_type="tool_call_finished",
+        payload_json={
+            "success": False,
+            "content": {"message": raw_secret},
+            "result": {"stderr": raw_secret},
+            "data": {"traceback": raw_secret},
+        },
     )
+
+    skill_name, skill_payload = _relay_event_payload(skill_event)
+    tool_name, tool_payload = _relay_event_payload(tool_event)
+
+    assert skill_name == "general_skill_trace"
+    assert tool_name == "tool_call_finished"
+    assert raw_secret not in str(skill_payload)
+    assert raw_secret not in str(tool_payload)
+    assert skill_payload["error"]["code"] == "INTERNAL_ERROR"
+    assert tool_payload["error"]["code"] == "TOOL_UPSTREAM_ERROR"
 
 
 def test_turn_trace_cancel_event_closes_running_status_for_refresh() -> None:
@@ -822,7 +1034,9 @@ def test_turn_trace_cancel_event_closes_running_status_for_refresh() -> None:
     assert all(line["state"] != "running" for line in traces[0]["lines"])
     assert any(
         line["id"] == "generation_stopped"
-        and line["text"] == "用户已停止生成"
+        and line["text"] == ""
+        and line["event_code"] == "public.run.cancelled"
+        and line["params"]["job_id"]
         and line["state"] == "completed"
         for line in traces[0]["lines"]
     )
@@ -918,17 +1132,38 @@ def test_scheduled_task_draft_trace_restores_config_stages_for_refresh() -> None
         "scheduled_task_draft",
     ]
     assert all(line["state"] == "completed" for line in traces[0]["lines"])
-    assert traces[0]["lines"][1]["detail"] == "计划：每天 16:50"
-    assert "提醒我喝咖啡" in traces[0]["lines"][2]["detail"]
+    assert [line["event_code"] for line in traces[0]["lines"]] == [
+        "chat.scheduled.intent",
+        "chat.scheduled.plan",
+        "chat.scheduled.draft",
+    ]
+    assert all(line["params"] == {} for line in traces[0]["lines"])
+    assert all(line["text"] == "" and "detail" not in line for line in traces[0]["lines"])
+    assert all(line["event_type"] == "stream_status" or line["event_type"] == "scheduled_task_draft_created" for line in traces[0]["lines"])
+    assert traces[0]["lines"][1]["event_data"] == {
+        "title": "提醒我喝咖啡",
+        "schedule_type": "daily",
+        "schedule": {"time": "16:50"},
+    }
 
 
-def test_scheduled_task_schedule_formatter_preserves_fallbacks() -> None:
-    assert (
-        _format_scheduled_task_schedule("weekly", {"time": "18:30", "weekdays": ["1", "x", 6, 7, -1]})
-        == "每周 周二、周日 18:30"
+def test_scheduled_task_draft_reply_uses_agent_reply_locale() -> None:
+    zh_context = LanguageContext(
+        ui_locale=SupportedLocale.EN_US,
+        agent_reply_locale=SupportedLocale.ZH_CN,
+        ui_locale_source=LocaleResolutionSource.EXPLICIT_REQUEST,
+        agent_reply_locale_source=LocaleResolutionSource.EXPLICIT_REQUEST,
     )
-    assert _format_scheduled_task_schedule("monthly", {"day_of_month": 21}) == "每月 21 号 09:00"
-    assert _format_scheduled_task_schedule("unknown", {"time": "08:15"}) == "每天 08:15"
+    en_context = zh_context.model_copy(
+        update={"agent_reply_locale": SupportedLocale.EN_US}
+    )
+
+    assert _scheduled_task_draft_reply(zh_context) == (
+        "定时任务草案已准备好。确认下方卡片后才会创建并启用。"
+    )
+    assert _scheduled_task_draft_reply(en_context) == (
+        "The scheduled task draft is ready. Confirm the card below to create and enable it."
+    )
 
 
 def test_cancel_endpoint_persists_terminal_trace_for_client_turn_id() -> None:
@@ -1006,7 +1241,9 @@ def test_cancel_endpoint_persists_terminal_trace_for_client_turn_id() -> None:
     assert all(line["state"] != "running" for line in traces[0]["lines"])
     assert any(
         line["id"] == "generation_stopped"
-        and line["text"] == "用户已停止生成"
+        and line["text"] == ""
+        and line["event_code"] == "public.run.cancelled"
+        and line["params"]["job_id"]
         and line["state"] == "completed"
         for line in traces[0]["lines"]
     )
@@ -1108,6 +1345,7 @@ def test_process_local_cancel_markers_are_bounded(monkeypatch) -> None:
 
 
 def test_stream_interrupted_persists_terminal_trace_and_message() -> None:
+    """Persist only a stable interruption code while keeping traceback details private."""
     db = _test_db()
     started_at = datetime(2026, 7, 4, 9, 7, 0)
     session_row = ChatSession(id="session_interrupted", tenant_id="tenant_demo", user_id="user_demo")
@@ -1151,7 +1389,18 @@ def test_stream_interrupted_persists_terminal_trace_and_message() -> None:
     )
     db.commit()
 
-    assert _persist_chat_turn_interrupted(db, "tenant_demo", session_row, "turn_interrupted", "GeneratorExit")
+    raw_reason = "provider token=do-not-publish traceback=/private/runtime.sock"
+    assert _persist_chat_turn_interrupted(
+        db,
+        "tenant_demo",
+        session_row,
+        "turn_interrupted",
+        raw_reason,
+        error_details={
+            "error_type": "RuntimeError",
+            "error_traceback": "Traceback: provider token=do-not-publish",
+        },
+    )
     db.commit()
     assert not _persist_chat_turn_interrupted(db, "tenant_demo", session_row, "turn_interrupted", "GeneratorExit")
 
@@ -1164,6 +1413,11 @@ def test_stream_interrupted_persists_terminal_trace_and_message() -> None:
     assert len(interrupted_events) == 1
     assert interrupted_events[0].payload_json["turn_id"] == "msg_user"
     assert interrupted_events[0].payload_json["client_turn_id"] == "turn_interrupted"
+    assert interrupted_events[0].payload_json["code"] == "INTERNAL_ERROR"
+    assert interrupted_events[0].payload_json["message"] == "INTERNAL_ERROR"
+    assert "reason" not in interrupted_events[0].payload_json
+    assert "error_details" not in interrupted_events[0].payload_json
+    assert "do-not-publish" not in str(interrupted_events[0].payload_json)
 
     messages = db.exec(
         select(Message)
@@ -1173,16 +1427,114 @@ def test_stream_interrupted_persists_terminal_trace_and_message() -> None:
     assistant_messages = [message for message in messages if message.role == "assistant"]
     assert len(assistant_messages) == 1
     assert assistant_messages[0].metadata_json["status"] == "interrupted"
+    assert assistant_messages[0].content == "本次响应中断，请重试发送。"
 
     traces = _build_turn_traces(messages, events, {})
     assert traces[0]["completed_at"] == interrupted_events[0].created_at.isoformat()
     assert all(line["state"] != "running" for line in traces[0]["lines"])
     assert any(
         line["id"] == "generation_interrupted"
-        and line["text"] == "响应生成中断"
+        and line["text"] == ""
+        and line["event_code"] == "public.run.failed"
+        and line["params"]["error_code"] == "INTERNAL_ERROR"
         and line["state"] == "failed"
         for line in traces[0]["lines"]
     )
+
+
+def test_stream_interrupted_preserves_language_context_snapshot() -> None:
+    """Carry the turn locale snapshot into interruption events and fallback messages."""
+    db = _test_db()
+    session = ChatSession(id="session_interrupted_locale", tenant_id="tenant_demo")
+    user_message = Message(
+        id="msg_interrupted_locale",
+        tenant_id="tenant_demo",
+        session_id=session.id,
+        role="user",
+        content="hello",
+    )
+    context = LanguageContext(
+        ui_locale=SupportedLocale.EN_US,
+        agent_reply_locale=SupportedLocale.ZH_CN,
+        ui_locale_source=LocaleResolutionSource.EXPLICIT_REQUEST,
+        agent_reply_locale_source=LocaleResolutionSource.SESSION_SNAPSHOT,
+    )
+    db.add(session)
+    db.add(user_message)
+    db.flush()
+
+    assert _persist_chat_turn_interrupted(
+        db,
+        "tenant_demo",
+        session,
+        user_message.id,
+        "worker stopped",
+        language_context=context,
+    )
+
+    interrupted = db.exec(
+        select(AgentEvent).where(
+            AgentEvent.session_id == session.id,
+            AgentEvent.event_type == "stream_interrupted",
+        )
+    ).one()
+    assistant = db.exec(
+        select(Message).where(
+            Message.session_id == session.id,
+            Message.role == "assistant",
+        )
+    ).one()
+    expected = context.model_dump(mode="json")
+    assert interrupted.payload_json["language_context"] == expected
+    assert assistant.metadata_json["language_context"] == expected
+    assert assistant.content == "本次响应中断，请重试发送。"
+
+
+def test_stream_cancelled_preserves_language_context_snapshot() -> None:
+    """Carry the immutable locale snapshot through cancellation fallback persistence."""
+    db = _test_db()
+    session = ChatSession(id="session_cancelled_locale", tenant_id="tenant_demo")
+    user_message = Message(
+        id="msg_cancelled_locale",
+        tenant_id="tenant_demo",
+        session_id=session.id,
+        role="user",
+        content="hello",
+    )
+    context = LanguageContext(
+        ui_locale=SupportedLocale.ZH_CN,
+        agent_reply_locale=SupportedLocale.EN_US,
+        ui_locale_source=LocaleResolutionSource.EXPLICIT_REQUEST,
+        agent_reply_locale_source=LocaleResolutionSource.EXPLICIT_REQUEST,
+    )
+    db.add(session)
+    db.add(user_message)
+    db.flush()
+
+    assert _persist_chat_turn_cancelled(
+        db,
+        "tenant_demo",
+        session,
+        user_message.id,
+        language_context=context,
+    )
+
+    cancelled = db.exec(
+        select(AgentEvent).where(
+            AgentEvent.session_id == session.id,
+            AgentEvent.event_type == "stream_cancelled",
+        )
+    ).one()
+    assistant = db.exec(
+        select(Message).where(
+            Message.session_id == session.id,
+            Message.role == "assistant",
+        )
+    ).one()
+    expected = context.model_dump(mode="json")
+    assert cancelled.payload_json["language_context"] == expected
+    assert assistant.metadata_json["language_context"] == expected
+    assert assistant.content == "Generation stopped."
 
 
 def test_relay_event_payload_maps_persisted_router_and_status_events() -> None:
@@ -1454,10 +1806,15 @@ def test_turn_trace_restores_stream_tool_and_skill_events_with_turn_id() -> None
 
     traces = _build_turn_traces(messages, events, {})
 
-    texts = [line["text"] for line in traces[0]["lines"]]
-    assert "正在根据 SKILL.md 生成 runner" in texts
-    assert "调用工具 weather" in texts
-    assert "重新分析执行动作" in texts
+    assert all(line["text"] == "" for line in traces[0]["lines"])
+    skill_line = next(line for line in traces[0]["lines"] if line["event_type"] == "general_skill_trace")
+    assert skill_line["event_code"] == "run.skill.trace"
+    assert skill_line["event_data"]["message"] == "正在根据 SKILL.md 生成 runner"
+    tool_line = next(line for line in traces[0]["lines"] if line["event_type"] == "tool_result")
+    assert tool_line["event_code"] == "run.tool.completed"
+    assert "maomao-weather" in tool_line["output"]
+    loop_line = next(line for line in traces[0]["lines"] if line["event_type"] == "agent_loop_completed")
+    assert loop_line["event_code"] == "run.loop.completed"
 
 
 def test_turn_trace_uses_message_id_for_repeated_user_text() -> None:
@@ -1543,7 +1900,12 @@ def test_turn_trace_uses_message_id_for_repeated_user_text() -> None:
 
     assert [trace["turn_id"] for trace in traces] == ["msg_user_first", "msg_user_second"]
     assert traces[1]["user_message_id"] == "msg_user_second"
-    assert any(line["text"] == "判断意图 问候" and line["detail"] == "第二轮问候" for line in traces[1]["lines"])
+    router_line = next(line for line in traces[1]["lines"] if line["id"] == "decision_router")
+    assert router_line["text"] == ""
+    assert router_line["event_type"] == "router_decision_created"
+    assert router_line["event_code"] == "public.run.intent"
+    assert router_line["params"] == {"decision": "answer_only"}
+    assert router_line["event_data"]["reason"] == "第二轮问候"
 
 
 def test_turn_trace_keeps_late_trace_events_after_assistant_event() -> None:
@@ -1619,11 +1981,14 @@ def test_turn_trace_keeps_late_trace_events_after_assistant_event() -> None:
 
     assert len(traces) == 1
     assert traces[0]["completed_at"] == (started_at + timedelta(seconds=2)).isoformat()
-    assert any(
-        line["text"] == "判断意图 问候" and line["detail"] == "晚到的意图明细也要保留"
-        for line in traces[0]["lines"]
-    )
-    assert any(line["text"] == "完成步骤判断" and line["detail"] == "直接回复问候" for line in traces[0]["lines"])
+    router_line = next(line for line in traces[0]["lines"] if line["id"] == "decision_router")
+    assert router_line["text"] == ""
+    assert router_line["event_code"] == "public.run.intent"
+    assert router_line["event_data"]["reason"] == "晚到的意图明细也要保留"
+    step_line = next(line for line in traces[0]["lines"] if line["id"] == "decision_step_result")
+    assert step_line["text"] == ""
+    assert step_line["event_code"] == "run.sop.step"
+    assert step_line["event_data"]["reply"] == "直接回复问候"
     assert all(line["state"] != "running" for line in traces[0]["lines"])
 
 
@@ -1731,12 +2096,11 @@ def test_turn_trace_does_not_merge_interleaved_repeated_turns() -> None:
     assert [trace["turn_id"] for trace in traces] == ["msg_user_first", "msg_user_second"]
     assert traces[0]["completed_at"] == (started_at + timedelta(seconds=12)).isoformat()
     assert traces[1]["completed_at"] == (started_at + timedelta(seconds=14)).isoformat()
-    first_details = [line.get("detail") for line in traces[0]["lines"]]
-    second_details = [line.get("detail") for line in traces[1]["lines"]]
-    assert "第一轮问候" in first_details
-    assert "第二轮问候" not in first_details
-    assert "第二轮问候" in second_details
-    assert "第一轮问候" not in second_details
+    first_router = next(line for line in traces[0]["lines"] if line["id"] == "decision_router")
+    second_router = next(line for line in traces[1]["lines"] if line["id"] == "decision_router")
+    assert first_router["event_data"]["reason"] == "第一轮问候"
+    assert second_router["event_data"]["reason"] == "第二轮问候"
+    assert first_router["text"] == second_router["text"] == ""
 
 
 def test_turn_trace_without_message_id_does_not_bind_user_messages() -> None:
@@ -2022,7 +2386,9 @@ def test_turn_trace_restores_harness_task_and_general_skill_execution() -> None:
     lines = traces[0]["lines"]
     assert any(
         line["id"] == "harness_frame_task-weather"
-        and line["text"] == "任务执行完成"
+        and line["text"] == ""
+        and line["event_type"] == "task_frame_finished"
+        and line["event_code"] == "run.task.frame.finished"
         and line["state"] == "completed"
         for line in lines
     )
@@ -2031,14 +2397,392 @@ def test_turn_trace_restores_harness_task_and_general_skill_execution() -> None:
         for line in lines
         if line["id"] == "harness_action_task-weather_1"
     )
-    assert tool_line["text"] == "能力调用完成 general_skill.weather"
+    assert tool_line["text"] == ""
+    assert tool_line["event_type"] == "harness_tool_completed"
+    assert tool_line["event_code"] == "run.capability.completed"
+    assert tool_line["params"] == {}
     assert '"temperature": 29' in tool_line["output"]
     plan_line = next(line for line in lines if line.get("code"))
     assert plan_line["language"] == "bash"
     assert plan_line["code"] == "python3 scripts/weather.py"
-    assert any(line["text"] == "Bash runner 执行完成" for line in lines)
-    assert any(line["text"] == "通用技能运行完成" for line in lines)
-    assert any(line["text"] == "整理任务结果" for line in lines)
+    assert any(
+        line["event_type"] == "general_skill_trace"
+        and line["text"] == ""
+        and line["code"] == "python3 scripts/weather.py"
+        for line in lines
+    )
+    assert any(
+        line["event_type"] == "general_skill_run_finished"
+        and line["text"] == ""
+        for line in lines
+    )
+    assert any(
+        line["event_type"] == "harness_action_created"
+        and line["text"] == ""
+        for line in lines
+    )
+
+
+def test_event_trace_lines_exposes_structured_fields_for_channel_card() -> None:
+    step_names = {
+        "skill_refund": {
+            "collect_order_info": "收集订单信息",
+            "reply_final_result": "反馈最终结果",
+        }
+    }
+    skill_names = {
+        "skill_refund": "售后退款流程",
+        "skill_exchange": "售后换货流程",
+    }
+
+    started = _event_trace_lines(
+        _SinkEvent(
+            "task_frame_started",
+            {"task_frame_id": "f1", "kind": "sop", "step_id": "reply_final_result"},
+        ),
+        skill_names,
+        "skill_refund",
+        step_names,
+    )
+    assert started[0]["text"] == ""
+    assert started[0]["event_type"] == "task_frame_started"
+    assert started[0]["event_code"] == "run.task.frame.started"
+    assert started[0]["params"] == {}
+    assert started[0]["event_data"]["step_id"] == "reply_final_result"
+    assert "detail" not in started[0]
+
+    finished = _event_trace_lines(
+        _SinkEvent(
+            "task_frame_finished",
+            {"task_frame_id": "f1", "status": "handoff", "action_count": 3},
+        ),
+        skill_names,
+        "skill_refund",
+        step_names,
+    )
+    assert finished[0]["text"] == ""
+    assert finished[0]["event_type"] == "task_frame_finished"
+    assert finished[0]["event_code"] == "run.task.frame.finished"
+    assert finished[0]["params"] == {}
+    assert finished[0]["event_data"]["status"] == "handoff"
+    assert finished[0]["event_data"]["action_count"] == 3
+    assert "detail" not in finished[0]
+    assert finished[0]["state"] == "completed"
+
+    state = _event_trace_lines(
+        _SinkEvent(
+            "skill_state",
+            {
+                "runtimeDecision": "continue_active",
+                "currentSkills": [
+                    {
+                        "skillId": "skill_refund",
+                        "name": "售后退款流程",
+                        "stepId": "collect_order_info",
+                        "state": "active",
+                    }
+                ],
+            },
+        ),
+        skill_names,
+        "skill_refund",
+        step_names,
+    )
+    assert state[0]["text"] == ""
+    assert state[0]["event_type"] == "skill_state"
+    assert state[0]["event_code"] == "run.sop.state"
+    assert state[0]["event_data"]["current_skill"]["name"] == "售后退款流程"
+    assert "detail" not in state[0]
+
+    result = _event_trace_lines(
+        _SinkEvent("step_result", {"next_step_id": "reply_final_result"}),
+        skill_names,
+        "skill_refund",
+        step_names,
+    )
+    assert result[0]["text"] == ""
+    assert result[0]["event_code"] == "run.sop.step"
+    assert result[0]["event_data"]["next_step_id"] == "reply_final_result"
+    assert "detail" not in result[0]
+
+    skill_started = _event_trace_lines(
+        _SinkEvent(
+            "skill_started",
+            {
+                "from_skill_id": "skill_exchange",
+                "to_skill_id": "skill_refund",
+                "to_step_id": "collect_order_info",
+            },
+        ),
+        skill_names,
+        None,
+        step_names,
+    )
+    assert skill_started[0]["text"] == ""
+    assert skill_started[0]["event_type"] == "skill_started"
+    assert skill_started[0]["event_code"] == "run.sop.state"
+    assert skill_started[0]["event_data"]["to_skill_id"] == "skill_refund"
+    assert "detail" not in skill_started[0]
+
+    reflection = _event_trace_lines(
+        _SinkEvent(
+            "reflection_decision",
+            {"needs_retry": False, "target_step_id": "reply_final_result"},
+        ),
+        skill_names,
+        "skill_refund",
+        step_names,
+    )
+    assert reflection[0]["text"] == ""
+    assert reflection[0]["event_code"] == "run.sop.state"
+    assert reflection[0]["event_data"]["target_step_id"] == "reply_final_result"
+    assert "detail" not in reflection[0]
+
+    tool_action = _event_trace_lines(
+        _SinkEvent(
+            "harness_action_created",
+            {"task_frame_id": "f1", "iteration": 1, "action": "tool", "tool_name": "hr.balance_query"},
+        ),
+        skill_names,
+        "skill_refund",
+        step_names,
+        {"hr.balance_query": "假期考勤查询"},
+    )
+    assert tool_action[0]["text"] == ""
+    assert tool_action[0]["event_code"] == "run.action.started"
+    assert tool_action[0]["params"] == {"job_id": "f1"}
+    assert tool_action[0]["event_data"]["tool_name"] == "hr.balance_query"
+
+    tool_completed = _event_trace_lines(
+        _SinkEvent(
+            "harness_tool_completed",
+            {"task_frame_id": "f1", "iteration": 1, "tool_name": "hr.balance_query", "success": True},
+        ),
+        skill_names,
+        "skill_refund",
+        step_names,
+        {"hr.balance_query": "假期考勤查询"},
+    )
+    assert tool_completed[0]["text"] == ""
+    assert tool_completed[0]["event_code"] == "run.capability.completed"
+    assert tool_completed[0]["event_data"]["tool_name"] == "hr.balance_query"
+
+    reserved_tool = _event_trace_lines(
+        _SinkEvent(
+            "harness_tool_completed",
+            {"task_frame_id": "f1", "iteration": 2, "tool_name": "capability_describe", "success": True},
+        ),
+        skill_names,
+        "skill_refund",
+        step_names,
+        {"hr.balance_query": "假期考勤查询"},
+    )
+    assert reserved_tool[0]["text"] == ""
+    assert reserved_tool[0]["event_code"] == "run.capability.completed"
+    assert reserved_tool[0]["event_data"]["tool_name"] == "capability_describe"
+
+    skill_completed = _event_trace_lines(
+        _SinkEvent(
+            "skill_completed",
+            {"skill_id": "skill_refund", "reason": "step_completed"},
+        ),
+        skill_names,
+        "skill_refund",
+        step_names,
+        {"hr.balance_query": "假期考勤查询"},
+    )
+    assert skill_completed[0]["text"] == ""
+    assert skill_completed[0]["event_code"] == "run.skill.completed"
+    assert skill_completed[0]["event_data"]["reason"] == "step_completed"
+    assert "detail" not in skill_completed[0]
+
+
+def test_event_trace_lines_keeps_raw_tool_names_without_tool_names() -> None:
+    tool_completed = _event_trace_lines(
+        _SinkEvent(
+            "harness_tool_completed",
+            {"task_frame_id": "f1", "iteration": 1, "tool_name": "hr.balance_query", "success": True},
+        ),
+        {},
+    )
+    assert tool_completed[0]["text"] == ""
+    assert tool_completed[0]["event_code"] == "run.capability.completed"
+    assert tool_completed[0]["event_data"]["tool_name"] == "hr.balance_query"
+
+    skill_completed = _event_trace_lines(
+        _SinkEvent(
+            "skill_completed",
+            {"skill_id": "skill_refund", "reason": "step_completed"},
+        ),
+        {},
+    )
+    assert skill_completed[0]["text"] == ""
+    assert skill_completed[0]["event_code"] == "run.skill.completed"
+    assert skill_completed[0]["event_data"]["reason"] == "step_completed"
+    assert "detail" not in skill_completed[0]
+
+
+def test_event_trace_lines_keeps_technical_detail_without_step_names() -> None:
+    started = _event_trace_lines(
+        _SinkEvent(
+            "task_frame_started",
+            {"task_frame_id": "f1", "kind": "sop", "step_id": "collect_order_info"},
+        ),
+        {},
+    )
+    assert started[0]["text"] == ""
+    assert started[0]["event_code"] == "run.task.frame.started"
+    assert started[0]["event_data"]["step_id"] == "collect_order_info"
+    assert "detail" not in started[0]
+
+    finished = _event_trace_lines(
+        _SinkEvent("task_frame_finished", {"task_frame_id": "f1", "status": "handoff"}),
+        {},
+    )
+    assert finished[0]["text"] == ""
+    assert finished[0]["event_code"] == "run.task.frame.finished"
+    assert finished[0]["event_data"]["status"] == "handoff"
+    assert "detail" not in finished[0]
+
+
+def test_resolve_step_label_uses_names_then_fallbacks() -> None:
+    step_names = {
+        "skill_refund": {"collect_order_info": "收集订单信息"},
+        "skill_exchange": {"collect_order_info": "收集换货订单信息"},
+    }
+    assert _resolve_step_label("collect_order_info", step_names, "skill_refund") == "收集订单信息"
+    assert _resolve_step_label("collect_order_info", step_names, "skill_exchange") == "收集换货订单信息"
+    assert _resolve_step_label("collect_order_info", step_names) == "收集订单信息"
+    assert _resolve_step_label("collect_order_info", {}) == "collect_order_info"
+    assert _resolve_step_label("handoff_to_repair_specialist", {}) == "handoff_to_repair_specialist"
+    assert _resolve_step_label("reply_final_result", {}) == "reply_final_result"
+    assert _resolve_step_label("end", {}) == "end"
+    assert _resolve_step_label("some_random_id", {}) == "some_random_id"
+    assert _resolve_step_label("collect_order_info", None) == "collect_order_info"
+
+
+def test_harness_trace_line_uses_canonical_descriptor_and_raw_event_data() -> None:
+    """Persist only canonical headline metadata while retaining raw task-frame values."""
+    line = _harness_event_trace_line(
+        AgentEvent(
+            id="event-frame-started",
+            tenant_id="tenant_demo",
+            session_id="session_test",
+            event_type="task_frame_started",
+            payload_json={
+                "task_frame_id": "frame-1",
+                "kind": "sop",
+                "skill_name": "流程原名",
+                "step_id": "collect_order_info",
+            },
+        )
+    )
+
+    assert line is not None
+    assert line["event_code"] == "run.task.frame.started"
+    assert line["params"] == {}
+    assert line["event_type"] == "task_frame_started"
+    assert line["event_data"]["skill_name"] == "流程原名"
+    assert line["text"] == ""
+    assert "detail" not in line
+    assert "outputTitle" not in line
+
+
+def test_trace_event_code_map_matches_registry_and_exact_params() -> None:
+    """Ensure every chat trace descriptor is present in the generated event contract shape."""
+    language_context = LanguageContext(
+        ui_locale=SupportedLocale.EN_US,
+        agent_reply_locale=SupportedLocale.EN_US,
+        ui_locale_source=LocaleResolutionSource.EXPLICIT_REQUEST,
+        agent_reply_locale_source=LocaleResolutionSource.EXPLICIT_REQUEST,
+    )
+    payload = {
+        "phase": "routing",
+        "job_id": "job-1",
+        "task_frame_id": "frame-1",
+        "decision": "answer_only",
+        "code": "LLM_ERROR",
+        "success": True,
+    }
+
+    for event_type, expected_code in _TRACE_EVENT_CODES.items():
+        event_code, params = _trace_event_descriptor(event_type, payload, "event-1")
+        assert event_code == expected_code
+        entry = EVENT_REGISTRY.require(expected_code)
+        assert set(params) == set(entry.params_schema)
+        EVENT_REGISTRY.validate(
+            SystemEvent(
+                event_code=event_code,
+                params=params,
+                tenant_id="tenant-demo",
+                aggregate_type="chat_turn",
+                aggregate_id="turn-1",
+                visibility=EventVisibility.PUBLIC,
+                language_context=language_context,
+            )
+        )
+
+    failed_code, failed_params = _trace_event_descriptor(
+        "stream_status",
+        {**payload, "phase": "error"},
+        "event-1",
+    )
+    assert failed_code == "public.run.failed"
+    assert failed_params == {
+        "job_id": "job-1",
+        "error_code": "MODEL_UPSTREAM_ERROR",
+        "retryable": False,
+    }
+
+
+def test_tool_trace_line_keeps_success_raw_output_without_backend_labels() -> None:
+    """Keep provider/tool success content available in raw fields without rendering product prose."""
+    line = _event_trace_lines(
+        _SinkEvent(
+            "harness_tool_completed",
+            {
+                "task_frame_id": "frame-1",
+                "iteration": 1,
+                "tool_name": "vendor.lookup",
+                "success": True,
+                "result": {"provider_message": "原始供应商回文"},
+            },
+        ),
+        {},
+    )[0]
+
+    assert line["event_code"] == "run.capability.completed"
+    assert line["params"] == {}
+    assert line["event_data"]["result"]["provider_message"] == "原始供应商回文"
+    assert "原始供应商回文" in line["output"]
+    assert line["text"] == ""
+    assert "detail" not in line
+    assert "outputTitle" not in line
+
+
+def test_scheduled_trace_line_exposes_event_type_with_canonical_fields() -> None:
+    """Make scheduled replay lines consistent with structured trace consumers."""
+    lines = _event_trace_lines(
+        _SinkEvent(
+            "stream_status",
+            {
+                "phase": "scheduled_task_intent",
+                "code": "chat.scheduled.intent",
+                "params": {},
+                "title": "原始任务标题",
+                "schedule_type": "daily",
+                "schedule": {"time": "16:50"},
+            },
+        ),
+        {},
+    )
+
+    assert lines[0]["event_type"] == "stream_status"
+    assert lines[0]["event_code"] == "chat.scheduled.intent"
+    assert lines[0]["params"] == {}
+    assert lines[0]["event_data"]["title"] == "原始任务标题"
+    assert lines[0]["text"] == ""
+    assert "detail" not in lines[0]
 
 
 def _test_db() -> Session:

@@ -7,13 +7,13 @@ from fastapi import APIRouter, Depends, Header, Request, Response
 from pydantic import ValidationError
 from sqlmodel import Session, select
 
-from app.api import skills as internal_skills
 from app.agents.branching import visible_skill_rows
+from app.api import skills as internal_skills
 from app.db import get_session
 from app.db.models import (
+    AgentResourceBinding,
     APIJob,
     APISOPDraft,
-    AgentResourceBinding,
     GeneralSkill,
     KnowledgeBase,
     Skill,
@@ -23,7 +23,17 @@ from app.db.models import (
 from app.public_api.auth import PublicPrincipal, enforce_agent_access, require_scopes
 from app.public_api.errors import PublicAPIError
 from app.public_api.idempotency import replay_idempotent_response, store_idempotent_response
-from app.public_api.jobs import create_job, job_read, register_job_handler, update_job
+from app.public_api.jobs import (
+    _EXECUTION_FENCE_INFO_KEY,
+    _commit_job_owned_write,
+    _require_job_execution_fence,
+    _require_job_lifecycle,
+    create_job,
+    job_read,
+    mark_side_effect_started,
+    register_job_handler,
+    update_job,
+)
 from app.public_api.json_patch import JSONPatchError, apply_json_patch
 from app.public_api.schemas import (
     SOPGenerateRequest,
@@ -34,6 +44,7 @@ from app.public_api.schemas import (
 from app.public_api.sessions import ensure_public_agent
 from app.public_api.utils import etag_for
 from app.skills import SkillDistiller, SkillEditor
+from app.skills.nesting import SopNestingError, validate_sop_nesting
 from app.skills.skill_schema import (
     SkillCard,
     SkillCreateRequest,
@@ -42,10 +53,46 @@ from app.skills.skill_schema import (
     SkillUpdateRequest,
     skill_card_from_persisted,
 )
-from app.skills.nesting import SopNestingError, validate_sop_nesting
-
 
 router = APIRouter(tags=["sops"])
+
+
+def _skill_execution_fence(db: Session, job: APIJob):
+    """Build a fail-closed fence for every Skill provider stage in one public job."""
+
+    def check() -> None:
+        _require_job_execution_fence(db, job)
+        _require_job_lifecycle(db, job)
+        # Lifecycle/owner reads are deliberately completed before the provider call.
+        db.rollback()
+
+    return check
+
+
+def _safe_validation_errors(errors: list[dict[str, Any]] | None) -> list[dict[str, str]]:
+    """Project validation findings to stable path/code pairs without carrying natural-language detail."""
+    safe_errors: list[dict[str, str]] = []
+    for error in errors or []:
+        raw_path = error.get("path", error.get("loc", []))
+        if isinstance(raw_path, str):
+            path = raw_path
+        elif isinstance(raw_path, list | tuple):
+            path = "/".join(str(item) for item in raw_path)
+        else:
+            path = ""
+        code = str(error.get("code") or error.get("type") or "validation_error")
+        safe_errors.append({"path": path, "code": code})
+    return safe_errors
+
+
+def _project_validation_payload(row: APISOPDraft) -> dict[str, Any]:
+    """Return the public-safe validation snapshot stored on a SOP draft."""
+    validation = dict(row.validation_json or {})
+    return {
+        "valid": bool(validation.get("valid")),
+        "errors": _safe_validation_errors(validation.get("errors") if isinstance(validation, dict) else []),
+        "warnings": list(validation.get("warnings") or row.warnings_json or []),
+    }
 
 
 def _draft_etag(content: dict[str, Any]) -> str:
@@ -53,6 +100,7 @@ def _draft_etag(content: dict[str, Any]) -> str:
 
 
 def _draft_payload(row: APISOPDraft) -> dict[str, Any]:
+    """Serialize one SOP draft while sanitizing any persisted validation diagnostics."""
     return {
         "id": row.id,
         "agent_id": row.agent_id,
@@ -63,7 +111,7 @@ def _draft_payload(row: APISOPDraft) -> dict[str, Any]:
         "status": row.status,
         "source": row.source,
         "warnings": list(row.warnings_json or []),
-        "validation": dict(row.validation_json or {}),
+        "validation": _project_validation_payload(row),
         "etag": row.etag,
         "created_at": row.created_at.isoformat() + "Z",
         "updated_at": row.updated_at.isoformat() + "Z",
@@ -96,6 +144,7 @@ def _new_draft(
     source: str,
     warnings: list[str] | None = None,
     base_version: str | None = None,
+    commit: bool = True,
 ) -> APISOPDraft:
     card = SkillCard.model_validate(content)
     normalized = card.model_dump(mode="json")
@@ -115,8 +164,20 @@ def _new_draft(
         created_by_credential_id=credential_id,
     )
     db.add(row)
-    db.commit()
-    db.refresh(row)
+    if commit:
+        db.commit()
+        db.refresh(row)
+    else:
+        db.flush()
+    return row
+
+
+def _persist_job_draft(db: Session, job: APIJob, **draft_kwargs: Any) -> APISOPDraft:
+    """Persist one generated draft under the claimed worker's final CAS fence."""
+    worker_fenced = db.info.get(_EXECUTION_FENCE_INFO_KEY) is not None
+    row = _new_draft(db, commit=not worker_fenced, **draft_kwargs)
+    if worker_fenced:
+        _commit_job_owned_write(db, job)
     return row
 
 
@@ -192,6 +253,7 @@ def _validate_capability_refs(db: Session, row: APISOPDraft, card: SkillCard) ->
 
 
 def validate_draft(db: Session, row: APISOPDraft) -> dict[str, Any]:
+    """Validate one draft and persist only stable machine-readable findings at the public boundary."""
     try:
         card = skill_card_from_persisted(row.content_json)
         field_errors: list[dict[str, str]] = _validate_capability_refs(db, row, card)
@@ -219,11 +281,14 @@ def validate_draft(db: Session, row: APISOPDraft) -> dict[str, Any]:
             {
                 "path": "/".join(str(item) for item in error.get("loc") or []),
                 "code": str(error.get("type") or "INVALID_SOP"),
-                "detail": str(error.get("msg") or "Invalid SOP"),
             }
             for error in exc.errors()
         ]
-    result = {"valid": not field_errors, "errors": field_errors, "warnings": row.warnings_json or []}
+    result = {
+        "valid": not field_errors,
+        "errors": _safe_validation_errors(field_errors),
+        "warnings": row.warnings_json or [],
+    }
     row.validation_json = result
     row.updated_at = utc_now()
     db.add(row)
@@ -323,18 +388,41 @@ def generate_sop(
 @register_job_handler("sop.generate")
 def execute_sop_generate(db: Session, job: APIJob) -> dict[str, Any]:
     payload = dict(job.request_json or {})
+    _require_job_execution_fence(db, job)
+    _require_job_lifecycle(db, job)
+    db.rollback()
     update_job(db, job, stage="learning", progress=0.15, event_type="sop.generate.learning")
     request = SkillDistillRequest(
         tenant_id=job.tenant_id,
+        agent_id=str(job.agent_id),
         title=str(payload["title"]),
         raw_content=str(payload["raw_content"]),
         business_domain=payload.get("business_domain"),
         model_config_id=payload.get("model_config_id"),
     )
     model = internal_skills._get_request_model(db, job.tenant_id, request.model_config_id)
-    result = SkillDistiller().distill(internal_skills._with_available_tools(db, request), model)
-    row = _new_draft(
+    available_request = internal_skills._with_available_tools(db, request)
+    # SkillDistiller dispatches to the configured LLM provider; local request
+    # preparation above must remain distinguishable from a provider outcome.
+    _require_job_execution_fence(db, job)
+    _require_job_lifecycle(db, job)
+    db.rollback()
+    mark_side_effect_started(db)
+    result = SkillDistiller().distill(
+        available_request,
+        model,
+        execution_fence=_skill_execution_fence(db, job),
+    )
+    # Persisting the generated draft is a second durable boundary.  The provider
+    # may have taken long enough for the tenant to be suspended, so admit the
+    # write from a fresh lifecycle read transaction instead of reusing the
+    # pre-provider decision.
+    _require_job_execution_fence(db, job)
+    _require_job_lifecycle(db, job)
+    db.rollback()
+    row = _persist_job_draft(
         db,
+        job,
         tenant_id=job.tenant_id,
         agent_id=str(job.agent_id),
         credential_id=job.credential_id,
@@ -388,6 +476,9 @@ def rewrite_sop(
 @register_job_handler("sop.rewrite")
 def execute_sop_rewrite(db: Session, job: APIJob) -> dict[str, Any]:
     payload = dict(job.request_json or {})
+    _require_job_execution_fence(db, job)
+    _require_job_lifecycle(db, job)
+    db.rollback()
     update_job(db, job, stage="rewriting", progress=0.15, event_type="sop.rewrite.rewriting")
     request = SkillRewriteRequest(
         tenant_id=job.tenant_id,
@@ -398,12 +489,25 @@ def execute_sop_rewrite(db: Session, job: APIJob) -> dict[str, Any]:
         model_config_id=payload.get("model_config_id"),
     )
     model = internal_skills._get_request_model(db, job.tenant_id, request.model_config_id)
+    available_request = internal_skills._with_available_context_for_rewrite(db, request)
+    # SkillEditor likewise crosses the external model boundary here.
+    _require_job_execution_fence(db, job)
+    _require_job_lifecycle(db, job)
+    db.rollback()
+    mark_side_effect_started(db)
     result = SkillEditor().rewrite(
-        internal_skills._with_available_context_for_rewrite(db, request),
+        available_request,
         model,
+        execution_fence=_skill_execution_fence(db, job),
     )
-    row = _new_draft(
+    # A rewritten draft is persisted after the provider returns; repeat the
+    # lifecycle admission immediately before this independent durable write.
+    _require_job_execution_fence(db, job)
+    _require_job_lifecycle(db, job)
+    db.rollback()
+    row = _persist_job_draft(
         db,
+        job,
         tenant_id=job.tenant_id,
         agent_id=str(job.agent_id),
         credential_id=job.credential_id,

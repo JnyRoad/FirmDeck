@@ -1,6 +1,9 @@
 import { UnderlineTabs, type UnderlineTabItem } from '@/components/ui';
 import { notify } from '@/components/ui/app-toast';
+import { useAppIntl } from '@/i18n/useAppIntl';
+import { RawContent } from '@/i18n/RawContent';
 import { cn } from '@/lib/utils';
+import { apiErrorMessage } from '@/lib/apiErrorMessages';
 
 import IconPlus from '../assets/icons/plus.svg?react';
 import IconSearch from '../assets/icons/search.svg?react';
@@ -8,8 +11,9 @@ import IconSearch from '../assets/icons/search.svg?react';
 import { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 
-import { api, TENANT_ID } from '../api/client';
+import { createTenantClient } from '../api/tenant-client';
 import { type EnterpriseAuthUser } from '../auth';
+import { useTenantSession } from '../contexts/TenantSessionContext';
 
 import AppHeader from '../components/AppHeader';
 import { ConfirmDialog } from '../components/ConfirmDialog';
@@ -24,10 +28,13 @@ import {
   employeeDisplayNameWithCreator,
   employeeProfile,
 } from '../employee';
-import { emitAgentScopeChange, isTeamScope, persistSharedAgentScope, readEmployeeScope } from '../lib/agent-scope-storage';
+import { clearSharedAgentScope, emitAgentScopeChange, isTeamScope, persistSharedAgentScope, readEmployeeScope } from '../lib/agent-scope-storage';
 import type { AgentProfileRead } from '../types';
 
-const ENTERPRISE_AGENT_STORAGE_KEY = 'ultrarag_enterprise_agent_scope';
+/** 按 locale 生成统计卡片的次级计数字符串，不把数字硬编码到固定语言片段里。 */
+function onlineSummary(count: number, translate: ReturnType<typeof useAppIntl>['t']): string {
+  return translate('agentsPage.summary.onlineCount', { count });
+}
 
 export default function AgentsPage({
   currentUser,
@@ -40,6 +47,9 @@ export default function AgentsPage({
   onCreateAgent?: () => void;
   onLogout?: () => void;
 }) {
+  const { t } = useAppIntl();
+  const tenantContext = useTenantSession();
+  const tenantApi = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
   const [agents, setAgents] = useState<AgentProfileRead[]>([]);
   const [loading, setLoading] = useState(false);
   const [avatarAgent, setAvatarAgent] = useState<AgentProfileRead | null>(null);
@@ -50,35 +60,64 @@ export default function AgentsPage({
   const [selectingAgentId, setSelectingAgentId] = useState<string | null>(null);
   const [searchTerm, setSearchTerm] = useState('');
   const [employeeFilter, setEmployeeFilter] = useState<'all' | 'online' | 'offline' | 'pending'>('all');
-  const [selectedAgentId, setSelectedAgentId] = useState<string | null>(
-    () => readEmployeeScope() || null,
-  );
+  const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
   const navigate = useNavigate();
 
   async function load() {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     setLoading(true);
     try {
-      const rows = await api.get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${TENANT_ID}`);
+      const rows = await tenantApi.get<AgentProfileRead[]>('/api/enterprise/agents');
+      if (!context.isCurrentGeneration(generation)) return;
       setAgents(rows);
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '加载员工失败');
+      if (!context.isCurrentGeneration(generation)) return;
+      const message = apiErrorMessage(error, 'common.error.generic', { t });
+      notify.error(message === t('common.error.generic')
+        ? t('agentsPage.toast.loadFailed')
+        : message);
     } finally {
-      setLoading(false);
+      if (context.isCurrentGeneration(generation)) setLoading(false);
     }
   }
 
   useEffect(() => {
     void load();
-  }, []);
+  }, [tenantApi]);
+
+  // Do not keep tenant-A employees or open editors visible during the
+  // provider's verification gap when the tenant session is replaced.
+  useEffect(() => {
+    if (tenantContext) return;
+    setAgents([]);
+    setSelectedAgentId(null);
+    setAvatarAgent(null);
+    setProfileAgent(null);
+    setApiKeyAgent(null);
+    setDeleteTarget(null);
+    setLoading(false);
+  }, [tenantContext]);
 
   useEffect(() => {
+    if (!tenantContext) {
+      setSelectedAgentId(null);
+      return undefined;
+    }
+    const context = tenantContext;
+    setSelectedAgentId(readEmployeeScope(context.tenantId, context.userId) || null);
     const handler = (event: Event) => {
       const next = (event as CustomEvent<{ agentId?: string }>).detail?.agentId || '';
-      setSelectedAgentId(next && !isTeamScope(next) ? next : readEmployeeScope() || null);
+      setSelectedAgentId(
+        next && !isTeamScope(next)
+          ? next
+          : readEmployeeScope(context.tenantId, context.userId) || null,
+      );
     };
     window.addEventListener('ultrarag-enterprise-agent-scope-change', handler);
     return () => window.removeEventListener('ultrarag-enterprise-agent-scope-change', handler);
-  }, []);
+  }, [tenantContext]);
 
   const employees = useMemo(
     () => agents.filter((item) => !item.is_overall && canManageEmployeeAgent(item, currentUser)),
@@ -113,24 +152,33 @@ export default function AgentsPage({
 
   async function selectEmployee(row: AgentProfileRead) {
     if (selectingAgentId) return;
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     setSelectingAgentId(row.id);
     try {
       let selectedRow = row;
       if (!canSelectCurrentEmployeeAgent(row, currentUser, { activeOnly: true })) {
-        selectedRow = await api.post<AgentProfileRead>(
-          `/api/chat/agents/${encodeURIComponent(row.id)}/use?tenant_id=${TENANT_ID}`,
+        selectedRow = await tenantApi.post<AgentProfileRead>(
+          `/api/chat/agents/${encodeURIComponent(row.id)}/use`,
           {},
         );
+        if (!context.isCurrentGeneration(generation)) return;
         updateAgentInList(selectedRow);
       }
+      if (!context.isCurrentGeneration(generation)) return;
       setSelectedAgentId(selectedRow.id);
-      persistSharedAgentScope(selectedRow.id, currentUser?.id);
+      persistSharedAgentScope(selectedRow.id, context.tenantId, context.userId);
       emitAgentScopeChange(selectedRow.id);
       navigate('/enterprise/dashboard');
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '加载员工失败');
+      if (!context.isCurrentGeneration(generation)) return;
+      const message = apiErrorMessage(error, 'common.error.generic', { t });
+      notify.error(message === t('common.error.generic')
+        ? t('agentsPage.toast.loadFailed')
+        : message);
     } finally {
-      setSelectingAgentId(null);
+      if (context.isCurrentGeneration(generation)) setSelectingAgentId(null);
     }
   }
 
@@ -139,21 +187,31 @@ export default function AgentsPage({
   }
 
   async function updateStatus(row: AgentProfileRead, status: 'active' | 'archived') {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     try {
-      await api.put<AgentProfileRead>(`/api/enterprise/agents/${row.id}`, {
-        tenant_id: TENANT_ID,
+      await tenantApi.put<AgentProfileRead>(`/api/enterprise/agents/${row.id}`, {
         status,
         metadata: row.metadata || {},
       });
-      notify.success(status === 'active' ? '员工已上线' : '员工已下线');
+      if (!context.isCurrentGeneration(generation)) return;
+      notify.successText(status === 'active' ? t('agentsPage.toast.published') : t('agentsPage.toast.archived'));
       await load();
       window.dispatchEvent(new Event('ultrarag-enterprise-agent-scope-refresh'));
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '更新员工状态失败');
+      if (!context.isCurrentGeneration(generation)) return;
+      const message = apiErrorMessage(error, 'common.error.generic', { t });
+      notify.error(message === t('common.error.generic')
+        ? t('agentsPage.toast.updateStatusFailed')
+        : message);
     }
   }
 
   async function updateGalleryState(row: AgentProfileRead, published: boolean) {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     try {
       const metadata = {
         ...(row.metadata || {}),
@@ -161,43 +219,59 @@ export default function AgentsPage({
         gallery_published_at: published ? new Date().toISOString() : undefined,
         gallery_published_by: published ? currentUser?.username : undefined,
       };
-      await api.put<AgentProfileRead>(`/api/enterprise/agents/${row.id}`, {
-        tenant_id: TENANT_ID,
+      await tenantApi.put<AgentProfileRead>(`/api/enterprise/agents/${row.id}`, {
         metadata,
       });
-      notify.success(published ? '已发布到广场' : '已从广场下架');
+      if (!context.isCurrentGeneration(generation)) return;
+      notify.successText(
+        published
+          ? t('agentsPage.toast.marketplacePublished')
+          : t('agentsPage.toast.marketplaceUnpublished'),
+      );
       await load();
       window.dispatchEvent(new Event('ultrarag-enterprise-agent-scope-refresh'));
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '更新广场状态失败');
+      if (!context.isCurrentGeneration(generation)) return;
+      const message = apiErrorMessage(error, 'common.error.generic', { t });
+      notify.error(message === t('common.error.generic')
+        ? t('agentsPage.toast.updateMarketplaceFailed')
+        : message);
     }
   }
 
   async function confirmDelete() {
     const row = deleteTarget;
     if (!row) return;
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     setDeleting(true);
     try {
-      await api.delete(`/api/enterprise/agents/${row.id}?tenant_id=${TENANT_ID}`);
-      if (readEmployeeScope() === row.id) {
+      await tenantApi.delete(`/api/enterprise/agents/${row.id}`);
+      if (!context.isCurrentGeneration(generation)) return;
+      if (readEmployeeScope(context.tenantId, context.userId) === row.id) {
         const nextAgent = employees.find((item) => item.id !== row.id && item.status === 'active')
           || employees.find((item) => item.id !== row.id);
         if (nextAgent) {
-          window.localStorage.setItem(ENTERPRISE_AGENT_STORAGE_KEY, nextAgent.id);
+          persistSharedAgentScope(nextAgent.id, context.tenantId, context.userId);
           window.dispatchEvent(new CustomEvent('ultrarag-enterprise-agent-scope-change', { detail: { agentId: nextAgent.id } }));
         } else {
-          window.localStorage.removeItem(ENTERPRISE_AGENT_STORAGE_KEY);
+          clearSharedAgentScope(context.tenantId, context.userId);
           window.dispatchEvent(new CustomEvent('ultrarag-enterprise-agent-scope-change', { detail: { agentId: '' } }));
         }
       }
-      notify.success('员工已删除');
+      notify.successText(t('agentsPage.toast.deleted'));
       setDeleteTarget(null);
       await load();
       window.dispatchEvent(new Event('ultrarag-enterprise-agent-scope-refresh'));
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '删除员工失败');
+      if (!context.isCurrentGeneration(generation)) return;
+      const message = apiErrorMessage(error, 'common.error.generic', { t });
+      notify.error(message === t('common.error.generic')
+        ? t('agentsPage.toast.deleteFailed')
+        : message);
     } finally {
-      setDeleting(false);
+      if (context.isCurrentGeneration(generation)) setDeleting(false);
     }
   }
 
@@ -206,21 +280,21 @@ export default function AgentsPage({
   }
 
   const employeeTabs: UnderlineTabItem<typeof employeeFilter>[] = [
-    { value: 'all', label: '全部员工' },
-    { value: 'online', label: '在线员工' },
-    { value: 'offline', label: '下线员工' },
+    { value: 'all', label: t('agentsPage.tabs.all') },
+    { value: 'online', label: t('agentsPage.tabs.online') },
+    { value: 'offline', label: t('agentsPage.tabs.offline') },
   ];
 
   const summaryCardClass =
     'flex h-[100px] flex-1 basis-[220px] items-center gap-[16px] rounded-[20px] bg-[#f6f6f6] px-[32px] py-[20px] text-left transition-shadow';
   const summaryStats: { key: typeof employeeFilter; value: number; label: string; sub: string }[] = [
-    { key: 'all', value: employees.length, label: '员工总数', sub: `${onlineEmployees.length}位在线` },
-    { key: 'offline', value: offlineEmployees.length, label: '下线员工', sub: '0位在线' },
+    { key: 'all', value: employees.length, label: t('agentsPage.stats.totalEmployees'), sub: onlineSummary(onlineEmployees.length, t) },
+    { key: 'offline', value: offlineEmployees.length, label: t('agentsPage.tabs.offline'), sub: onlineSummary(0, t) },
     {
       key: 'pending',
       value: pendingEmployees.length,
-      label: '待审批',
-      sub: `${pendingEmployees.filter((item) => item.status === 'active').length}位在线`,
+      label: t('agentsPage.tabs.pending'),
+      sub: onlineSummary(pendingEmployees.filter((item) => item.status === 'active').length, t),
     },
   ];
 
@@ -239,8 +313,8 @@ export default function AgentsPage({
               data-bwignore="true"
               value={searchTerm}
               onChange={(event) => setSearchTerm(event.target.value)}
-              placeholder="搜索"
-              aria-label="搜索员工"
+              placeholder={t('agentsPage.search.placeholder')}
+              aria-label={t('agentsPage.search.label')}
               className="min-w-0 flex-1 border-0 bg-transparent text-[14px] text-[#18181A] outline-none placeholder:text-[#757F9C]"
             />
           </div>
@@ -248,7 +322,7 @@ export default function AgentsPage({
       />
 
 
-      <div className="flex flex-wrap items-stretch gap-[20px] my-[36px]" aria-label="数字员工统计">
+      <div className="flex flex-wrap items-stretch gap-[20px] my-[36px]" aria-label={t('agentsPage.stats.ariaLabel')}>
         {summaryStats.map((stat) => (
           <button
             key={stat.key}
@@ -271,18 +345,19 @@ export default function AgentsPage({
             <IconPlus className="size-[38px]" />
           </span>
           <span className="flex min-w-0 flex-col gap-[4px]">
-            <span className="whitespace-nowrap text-[14px] text-[#464C5E]">创建新员工</span>
-            <span className="whitespace-nowrap text-[12px] text-[#757F9C]">几步搭好你的数字员工</span>
+            <span className="whitespace-nowrap text-[14px] text-[#464C5E]">{t('agentsPage.actions.create')}</span>
+            <span className="whitespace-nowrap text-[12px] text-[#757F9C]">{t('agentsPage.actions.createHint')}</span>
           </span>
         </button>
       </div>
 
       <UnderlineTabs
-        className="mb-[16px]"
-        aria-label="数字员工分类"
+        className="mb-[16px] w-full max-w-[520px]"
+        aria-label={t('agentsPage.tabs.ariaLabel')}
         value={employeeFilter}
         onChange={setEmployeeFilter}
         items={employeeTabs}
+        tabClassName="min-w-max flex-1 px-[12px]"
       />
 
       <div className="grid auto-rows-[minmax(262px,auto)] grid-cols-1 content-start gap-[32px] sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4 max-[900px]:gap-[18px]">
@@ -304,7 +379,10 @@ export default function AgentsPage({
           />
         ))}
         {!filteredEmployees.length && (
-          <AgentsEmptyState />
+          <AgentsEmptyState
+            title={t('agentsPage.empty.title')}
+            description={t('agentsPage.empty.description')}
+          />
         )}
       </div>
       <EmployeeAvatarEditor
@@ -331,15 +409,21 @@ export default function AgentsPage({
           if (!open) setDeleteTarget(null);
         }}
         loading={deleting}
-        title={`删除员工「${deleteTarget ? employeeDisplayName(deleteTarget) : ''}」？`}
-        description="删除后该员工的所有配置将一并移除，操作不可撤销。"
+        title={deleteTarget ? (
+          <>
+            {t('agentsPage.dialog.delete.titlePrefix')}
+            <RawContent value={employeeDisplayName(deleteTarget)} />
+            {t('agentsPage.dialog.delete.titleSuffix')}
+          </>
+        ) : ''}
+        description={t('agentsPage.dialog.delete.description')}
         onConfirm={() => void confirmDelete()}
       />
     </div>
   );
 }
 
-function AgentsEmptyState() {
+function AgentsEmptyState({ title, description }: { title: string; description: string }) {
   return (
     <div className="flex h-[262px] w-full items-center justify-center rounded-[20px] border border-dashed border-[#e4e9f2] bg-[#fbfcfe] px-[24px] text-center">
       <div className="flex max-w-[210px] flex-col items-center">
@@ -347,10 +431,10 @@ function AgentsEmptyState() {
           <IconSearch className="size-[16px] shrink-0" />
         </span>
         <p className="mt-[12px] text-[14px] font-medium leading-[20px] text-[#7f879a]">
-          没有匹配的数字员工
+          {title}
         </p>
         <p className="mt-[4px] text-[11px] leading-[17px] text-[#a7adbb]">
-          调整筛选条件，或换个关键词再试试
+          {description}
         </p>
       </div>
     </div>

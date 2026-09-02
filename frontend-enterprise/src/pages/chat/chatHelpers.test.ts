@@ -1,21 +1,60 @@
-import { describe, expect, it } from 'vitest';
+// @vitest-environment jsdom
+
+import { afterEach, describe, expect, it } from 'vitest';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 
+import { AppIntlProvider, createAppTranslator } from '@/i18n';
 import type { ChatMessage } from '@/types';
 
 import {
   STREAM_TERMINAL_EVENTS,
   MarkdownMessage,
+  attachmentTypeLabel,
   canRateMessage,
+  draftConversationKey,
+  formatDraftSchedule,
   harnessEventTraceLine,
   harnessWorkspaceArtifacts,
+  isDraftConversationKey,
   knowledgeCitations,
+  loadSessionReadTimes,
   messageAttachments,
+  modelStorageKey,
+  persistSessionReadTimes,
   renderInlineMarkdown,
+  routerDecisionTraceLine,
   scheduledDraftForMessage,
+  sessionReadStorageKey,
   shouldDeferPersistedEventToLiveStream,
+  streamErrorTraceLine,
+  stripTrailingCitationSummary,
+  traceSummary,
 } from './chatHelpers';
+
+function safely<T>(operation: () => T): T | undefined {
+  try {
+    return operation();
+  } catch {
+    return undefined;
+  }
+}
+
+const { t: translate } = createAppTranslator('zh-CN');
+const { t: translateEnglish } = createAppTranslator('en-US');
+
+/** 在显式语义 i18n Provider 中渲染 Markdown，确保图片宿主 ARIA 使用当前 locale。 */
+function renderLocalizedMarkdown(content: string, preserveLineBreaks = true): string {
+  return renderToStaticMarkup(
+    createElement(
+      AppIntlProvider,
+      {
+        initialLocale: 'zh-CN',
+        children: createElement(MarkdownMessage, { content, preserveLineBreaks }),
+      },
+    ),
+  );
+}
 
 function message(patch: Partial<ChatMessage> = {}): ChatMessage {
   return {
@@ -28,11 +67,42 @@ function message(patch: Partial<ChatMessage> = {}): ChatMessage {
   };
 }
 
+afterEach(() => {
+  window.localStorage.clear();
+  window.sessionStorage.clear();
+});
+
 describe('chat history consumer contract', () => {
+  it('keeps inline citations but removes duplicate trailing citation summaries', () => {
+    const content = [
+      '请假制度按员工手册执行[1]，办公用品按行政手册执行[5]。',
+      '',
+      '## 参考来源',
+      '',
+      '- [1] 人事-员工手册与假期政策：事假',
+      '- [5] 行政-行政服务手册：办公用品申领',
+      '',
+      '参考来源：[1] [5]',
+    ].join('\n');
+
+    expect(stripTrailingCitationSummary(content)).toBe(
+      '请假制度按员工手册执行[1]，办公用品按行政手册执行[5]。',
+    );
+  });
+
+  it('removes a trailing citation-label footer without changing the answer', () => {
+    expect(stripTrailingCitationSummary('正文保留[1]。\n\n参考资料：[1] [2]')).toBe(
+      '正文保留[1]。',
+    );
+  });
+
+  it('preserves ordinary prose that mentions a source', () => {
+    const content = '参考来源：员工手册，具体以最新制度为准。';
+    expect(stripTrailingCitationSummary(content)).toBe(content);
+  });
+
   it('continues top-level process numbering across blank lines and bullet details', () => {
-    const rendered = renderToStaticMarkup(
-      createElement(MarkdownMessage, {
-        content: [
+    const rendered = renderLocalizedMarkdown([
           '## 用印审批流程指引',
           '',
           '1. **申请入口**：登录审批系统',
@@ -47,9 +117,7 @@ describe('chat history consumer contract', () => {
           '- 直属上级审批',
           '',
           '1. **用印办理**：前往办公室盖章',
-        ].join('\n'),
-      }),
-    );
+        ].join('\n'));
 
     expect(rendered.match(/<ol(?: start="\d+")?>/g)).toEqual([
       '<ol>',
@@ -60,11 +128,7 @@ describe('chat history consumer contract', () => {
   });
 
   it('restarts an ordered list after regular paragraph content', () => {
-    const rendered = renderToStaticMarkup(
-      createElement(MarkdownMessage, {
-        content: ['1. 第一组', '', '这是新的正文段落。', '', '1. 第二组'].join('\n'),
-      }),
-    );
+    const rendered = renderLocalizedMarkdown(['1. 第一组', '', '这是新的正文段落。', '', '1. 第二组'].join('\n'));
 
     expect(rendered.match(/<ol(?: start="\d+")?>/g)).toEqual(['<ol>', '<ol>']);
   });
@@ -125,15 +189,11 @@ describe('chat history consumer contract', () => {
   });
 
   it('renders safe Markdown images and keeps unsafe image targets as text', () => {
-    const rendered = renderToStaticMarkup(
-      createElement(MarkdownMessage, {
-        content: [
+    const rendered = renderLocalizedMarkdown([
           '![趋势图](https://images.example.com/chart.png)',
           '',
           '![危险图片](javascript:alert(1))',
-        ].join('\n'),
-      }),
-    );
+        ].join('\n'));
 
     expect(rendered).toContain('src="https://images.example.com/chart.png"');
     expect(rendered).toContain('alt="趋势图"');
@@ -144,7 +204,7 @@ describe('chat history consumer contract', () => {
     expect(rendered).not.toContain('src="javascript:');
   });
 
-  it('keeps only inline citations, deduplicates content, and orders labels', () => {
+  it('prefers inline citations, deduplicates content, and falls back to source metadata', () => {
     const item = message({
       metadata: {
         knowledge_citations: [
@@ -160,7 +220,11 @@ describe('chat history consumer contract', () => {
       expect.objectContaining({ id: 'citation-duplicate', label: '[1]' }),
       expect.objectContaining({ id: 'citation-2', label: '[2]' }),
     ]);
-    expect(knowledgeCitations(item, 'No inline citation markers')).toEqual([]);
+    expect(knowledgeCitations(item, 'No inline citation markers')).toEqual([
+      expect.objectContaining({ id: 'citation-duplicate', label: '[1]' }),
+      expect.objectContaining({ id: 'citation-2', label: '[2]' }),
+      expect.objectContaining({ id: 'citation-unused', label: '[3]' }),
+    ]);
   });
 
   it('keeps separately cited chunks even when their display titles match', () => {
@@ -270,6 +334,53 @@ describe('chat history consumer contract', () => {
     ]);
   });
 
+  /** 验证 trace、附件和排程摘要使用当前 locale，同时保留工具名等 raw 业务值。 */
+  it('localizes helper chrome without translating raw values', () => {
+    const rawToolName = '工具-中文-raw';
+    const rawIntent = '采购流程';
+    const rawToolLine = harnessEventTraceLine('harness_action_created', {
+      task_frame_id: 'task-locale',
+      action: 'tool',
+      tool_name: rawToolName,
+    }, translateEnglish);
+    const zhRouter = routerDecisionTraceLine({ user_intent: rawIntent }, translate);
+    const enRouter = routerDecisionTraceLine({ user_intent: rawIntent }, translateEnglish);
+    const zhError = streamErrorTraceLine({ code: 'PROVIDER_FAILURE' }, 'error', translate);
+    const enError = streamErrorTraceLine({ code: 'PROVIDER_FAILURE' }, 'error', translateEnglish);
+    const attachment = {
+      id: 'attachment-locale',
+      filename: '原始文件.txt',
+      content_type: 'text/plain',
+      size: 2048,
+      kind: 'text' as const,
+      text: 'raw body',
+    };
+    const draft = {
+      should_create: true,
+      tenant_id: 'tenant-demo',
+      agent_id: 'agent-demo',
+      title: 'raw schedule title',
+      prompt: 'raw schedule prompt',
+      schedule_type: 'weekly' as const,
+      schedule: { weekdays: [0, 2], time: '09:30' },
+      timezone: 'Asia/Shanghai',
+      confidence: 1,
+    };
+
+    expect(zhRouter.text).toContain(rawIntent);
+    expect(enRouter.text).toContain(rawIntent);
+    expect(zhRouter.text).not.toBe(enRouter.text);
+    expect(zhError.text).not.toBe(enError.text);
+    expect(zhError.detail).toContain('PROVIDER_FAILURE');
+    expect(attachmentTypeLabel(attachment, 'zh-CN', translate)).toContain('文本');
+    expect(attachmentTypeLabel(attachment, 'en-US', translateEnglish)).toContain('Text');
+    expect(formatDraftSchedule(draft, 'zh-CN', translate, 'Asia/Shanghai')).toContain('09:30');
+    expect(formatDraftSchedule(draft, 'en-US', translateEnglish, 'Asia/Shanghai')).toContain('09:30');
+    expect(formatDraftSchedule(draft, 'zh-CN', translate, 'Asia/Shanghai'))
+      .not.toBe(formatDraftSchedule(draft, 'en-US', translateEnglish, 'Asia/Shanghai'));
+    expect(rawToolLine?.text).toContain(rawToolName);
+  });
+
   it('replays persisted assistant and terminal events even when an old live stream owns the turn', () => {
     expect(shouldDeferPersistedEventToLiveStream('stream_delta', true)).toBe(true);
     expect(shouldDeferPersistedEventToLiveStream('assistant_message_created', true)).toBe(false);
@@ -282,13 +393,13 @@ describe('chat history consumer contract', () => {
     const started = harnessEventTraceLine('task_frame_started', {
       task_frame_id: 'task-weather',
       kind: 'conversation',
-    });
+    }, translate);
     const action = harnessEventTraceLine('harness_action_created', {
       task_frame_id: 'task-weather',
       iteration: 1,
       action: 'tool',
       tool_name: 'general_skill.weather',
-    });
+    }, translate);
     const completed = harnessEventTraceLine('harness_tool_completed', {
       task_frame_id: 'task-weather',
       iteration: 1,
@@ -298,7 +409,7 @@ describe('chat history consumer contract', () => {
         success: true,
         data: { structured_result: { temperature: 29 } },
       },
-    });
+    }, translate);
     const appView = harnessEventTraceLine('harness_mcp_app_view', {
       task_frame_id: 'task-weather',
       tool_name: 'weather.card',
@@ -309,12 +420,12 @@ describe('chat history consumer contract', () => {
         visibility: ['model', 'app'],
         mime_type: 'text/html;profile=mcp-app',
       },
-    });
+    }, translate);
     const finished = harnessEventTraceLine('task_frame_finished', {
       task_frame_id: 'task-weather',
       status: 'completed',
       action_count: 2,
-    });
+    }, translate);
 
     expect(started).toMatchObject({
       id: 'harness_frame_task-weather',
@@ -328,7 +439,7 @@ describe('chat history consumer contract', () => {
     });
     expect(completed).toMatchObject({
       id: 'harness_action_task-weather_1',
-      text: '能力调用完成 general_skill.weather',
+      text: '能力调用完成：general_skill.weather',
       state: 'completed',
       outputLanguage: 'json',
       outputTitle: '查看能力结果',
@@ -354,7 +465,7 @@ describe('chat history consumer contract', () => {
       skill_id: 'skill_purchase_001',
       skill_name: '购买商品流程',
       step_id: 'collect_user_name',
-    });
+    }, translate);
     const finished = harnessEventTraceLine('task_frame_finished', {
       task_frame_id: 'task-purchase',
       kind: 'sop',
@@ -363,19 +474,83 @@ describe('chat history consumer contract', () => {
       step_id: 'collect_user_name',
       status: 'awaiting_user',
       action_count: 1,
-    });
+    }, translate);
 
     expect(started).toMatchObject({
       id: 'harness_frame_task-purchase',
-      text: '开始SOP 购买商品流程',
+      text: '开始 SOP 购买商品流程',
       state: 'running',
     });
     expect(finished).toMatchObject({
       id: 'harness_frame_task-purchase',
       kind: 'skill',
-      text: '等待用户补充 购买商品流程',
-      detail: '状态 awaiting_user · 步骤 collect_user_name · 执行 1 个动作',
+      text: '等待用户补充：购买商品流程',
+      detail: '状态：awaiting_user · 步骤 collect_user_name · 已执行 1 个动作',
       state: 'running',
     });
+  });
+});
+
+describe('tenant/user chat preference namespace', () => {
+  it('keeps read markers isolated for tenant and tenant-local user', () => {
+    const tenantAUserA = sessionReadStorageKey('tenant-a', 'user-a');
+    const tenantBUserA = sessionReadStorageKey('tenant-b', 'user-a');
+    const tenantAUserB = sessionReadStorageKey('tenant-a', 'user-b');
+    const readTimes = { 'session-a': '2026-08-31T09:00:00.000Z' };
+
+    expect(tenantAUserA).not.toBe(tenantBUserA);
+    expect(tenantAUserA).not.toBe(tenantAUserB);
+    persistSessionReadTimes('tenant-a', 'user-a', readTimes);
+
+    expect(loadSessionReadTimes('tenant-a', 'user-a')).toEqual(readTimes);
+    expect(loadSessionReadTimes('tenant-b', 'user-a')).toEqual({});
+    expect(loadSessionReadTimes('tenant-a', 'user-b')).toEqual({});
+  });
+
+  it('does not adopt an unscoped legacy read-marker key', () => {
+    window.localStorage.setItem(
+      'skill_agent_session_read_at:user-a',
+      JSON.stringify({ 'legacy-session': '2026-08-31T09:00:00.000Z' }),
+    );
+
+    expect(loadSessionReadTimes('tenant-a', 'user-a')).toEqual({});
+  });
+
+  it('isolates draft/cache and model preference keys across tenant and user', () => {
+    const draftA = draftConversationKey('tenant-a', 'user-a', 'agent-a');
+    const draftTenantB = draftConversationKey('tenant-b', 'user-a', 'agent-a');
+    const draftUserB = draftConversationKey('tenant-a', 'user-b', 'agent-a');
+    const modelA = modelStorageKey('tenant-a', 'user-a');
+    const modelTenantB = modelStorageKey('tenant-b', 'user-a');
+    const modelUserB = modelStorageKey('tenant-a', 'user-b');
+
+    expect(isDraftConversationKey(draftA)).toBe(true);
+    expect(draftA).not.toBe(draftTenantB);
+    expect(draftA).not.toBe(draftUserB);
+    expect(modelA).not.toBe(modelTenantB);
+    expect(modelA).not.toBe(modelUserB);
+
+    window.localStorage.setItem(modelA, 'model-a');
+    expect(window.localStorage.getItem(modelTenantB)).toBeNull();
+    expect(window.localStorage.getItem(modelUserB)).toBeNull();
+  });
+
+  it('preserves raw agent identity in draft keys without locale transformation', () => {
+    const rawAgentId = 'Agent-İ-中文';
+    const rawKey = draftConversationKey('tenant-a', 'user-a', rawAgentId);
+    const foldedKey = draftConversationKey(
+      'tenant-a',
+      'user-a',
+      rawAgentId.toLocaleLowerCase('tr-TR'),
+    );
+
+    expect(rawKey).not.toBe(foldedKey);
+  });
+
+  it('does not create a usable preference namespace for missing identity', () => {
+    expect(typeof safely(() => sessionReadStorageKey('', 'user-a'))).not.toBe('string');
+    expect(typeof safely(() => sessionReadStorageKey('tenant-a', ''))).not.toBe('string');
+    expect(safely(() => loadSessionReadTimes('', 'user-a')) || {}).toEqual({});
+    expect(safely(() => loadSessionReadTimes('tenant-a', '')) || {}).toEqual({});
   });
 });

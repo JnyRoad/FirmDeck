@@ -1,8 +1,9 @@
 import type { ReactNode } from 'react';
 
+import { useAppIntl, type MessageId } from '@/i18n';
 import { cn } from '@/lib/utils';
 
-import { BADGE_TONE_CLASS, RUN_STATUS_BADGE, TASK_STATUS_BADGE, type BadgeTone } from './shared';
+import { BADGE_TONE_CLASS, runStatusBadge, taskStatusBadge, type BadgeTone } from './shared';
 
 export function StatusBadge({ tone, children }: { tone: BadgeTone; children: ReactNode }) {
   return (
@@ -18,11 +19,14 @@ export function StatusBadge({ tone, children }: { tone: BadgeTone; children: Rea
 }
 
 export function TaskStatusBadge({ status }: { status: string }) {
-  const { tone, text } = TASK_STATUS_BADGE[status] || TASK_STATUS_BADGE.archived;
+  const { locale, t } = useAppIntl();
+  const { tone, text } = taskStatusBadge(status, { locale, t });
   return <StatusBadge tone={tone}>{text}</StatusBadge>;
 }
 
+/** Render a run outcome while localizing the product fallback for unknown statuses. */
 export function TaskRunResultBadge({ status }: { status: string }) {
-  const preset = RUN_STATUS_BADGE[status] || { tone: 'gray' as BadgeTone, text: status || '暂无' };
+  const { locale, t } = useAppIntl();
+  const preset = runStatusBadge(status, { locale, t });
   return <StatusBadge tone={preset.tone}>{preset.text}</StatusBadge>;
 }

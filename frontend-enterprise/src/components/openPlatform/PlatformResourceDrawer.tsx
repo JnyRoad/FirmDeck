@@ -29,6 +29,27 @@ export type PlatformResourceDrawerProps = {
   onNext?: () => void;
   onDelete?: () => void;
   onUse: () => void;
+  copy?: Partial<PlatformResourceDrawerCopy>;
+};
+
+export type PlatformResourceDrawerCopy = {
+  previousLabel: string;
+  nextLabel: string;
+  closeLabel: string;
+  platformLabel: string;
+  categoryLabel: string;
+  descriptionLabel: string;
+  deleteAction: string;
+};
+
+const DEFAULT_PLATFORM_RESOURCE_DRAWER_COPY: PlatformResourceDrawerCopy = {
+  previousLabel: '上一项',
+  nextLabel: '下一项',
+  closeLabel: '关闭',
+  platformLabel: '分类',
+  categoryLabel: '分类',
+  descriptionLabel: '说明',
+  deleteAction: '删除',
 };
 
 const DRAWER_SHEET_CLASS = cn(
@@ -90,8 +111,10 @@ export default function PlatformResourceDrawer({
   onNext,
   onDelete,
   onUse,
+  copy,
 }: PlatformResourceDrawerProps) {
   const accentStyles = platformResourceAccentStyles[accent];
+  const ui = { ...DEFAULT_PLATFORM_RESOURCE_DRAWER_COPY, ...copy };
 
   return (
     <Sheet open={open} onOpenChange={(next) => { if (!next) onClose(); }}>
@@ -102,12 +125,12 @@ export default function PlatformResourceDrawer({
               <span className="text-[12px] font-medium capitalize text-[#464c5e]">
                 {platformTitle}
               </span>
-              <NavChevron direction="prev" disabled={!hasPrev} onClick={onPrev} label="上一项" />
-              <NavChevron direction="next" disabled={!hasNext} onClick={onNext} label="下一项" />
+              <NavChevron direction="prev" disabled={!hasPrev} onClick={onPrev} label={ui.previousLabel} />
+              <NavChevron direction="next" disabled={!hasNext} onClick={onNext} label={ui.nextLabel} />
             </div>
             <button
               type="button"
-              aria-label="关闭"
+              aria-label={ui.closeLabel}
               onClick={onClose}
               className="grid size-[14px] place-items-center text-[#757f9c] transition-colors hover:text-[#18181a]"
             >
@@ -141,13 +164,13 @@ export default function PlatformResourceDrawer({
 
           <div className="grid grid-cols-2 gap-[10px]">
             <div className="flex min-h-[60px] flex-col justify-center gap-[4px] rounded-[14px] border-[0.5px] border-[#e3e7f1] px-[16px] py-[8px]">
-              <span className="text-[10px] leading-[13px] text-[#464c5e]">分类</span>
+              <span className="text-[10px] leading-[13px] text-[#464c5e]">{ui.platformLabel}</span>
               <strong className="truncate text-[12px] leading-[16px] font-medium text-[#18181a]">
                 {platformTitle}
               </strong>
             </div>
             <div className="flex min-h-[60px] flex-col justify-center gap-[4px] rounded-[14px] border-[0.5px] border-[#e3e7f1] px-[16px] py-[8px]">
-              <span className="text-[10px] leading-[13px] text-[#464c5e]">分类</span>
+              <span className="text-[10px] leading-[13px] text-[#464c5e]">{ui.categoryLabel}</span>
               <strong className={cn('truncate text-[12px] leading-[16px] font-medium', accentStyles.meta)}>
                 {categoryMeta}
               </strong>
@@ -155,7 +178,7 @@ export default function PlatformResourceDrawer({
           </div>
 
           <div className="flex min-h-0 flex-1 flex-col gap-[8px]">
-            <span className="text-[12px] capitalize text-[#464c5e]">说明</span>
+            <span className="text-[12px] capitalize text-[#464c5e]">{ui.descriptionLabel}</span>
             <p className="text-[12px] leading-[20px] text-[#757f9c]">
               {detailText}
             </p>
@@ -173,7 +196,7 @@ export default function PlatformResourceDrawer({
               className="inline-flex h-[34px] w-[80px] items-center justify-center gap-[4px] rounded-[10px] border-[0.5px] border-[#d20b0b] bg-white text-[12px] text-[#d20b0b] transition-colors hover:bg-[#fce7e7] disabled:cursor-not-allowed disabled:opacity-50"
             >
               <IconTrash className="size-[14px]" />
-              删除
+              {ui.deleteAction}
             </button>
           )}
           <button

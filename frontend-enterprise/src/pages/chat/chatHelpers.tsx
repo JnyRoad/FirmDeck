@@ -3,7 +3,13 @@ import { useState, type ReactNode } from 'react';
 import CodeBlock from '@/components/CodeBlock';
 import { ApiError } from '@/api/client';
 import type { StreamEvent } from '@/api/client';
-import { formatClientDateTime } from '@/lib/timezone';
+import { createFormatters } from '@/i18n/formatters';
+import type { MessageValues } from '@/i18n/imperative';
+import type { AppLocale } from '@/i18n/locales';
+import type { MessageId } from '@/i18n/types';
+import { useAppIntl } from '@/i18n/useAppIntl';
+import { tenantUserStorageKey } from '@/lib/tenant-storage';
+import { getClientTimeZone, parseBackendDateTime } from '@/lib/timezone';
 import type {
   ChatAttachmentRead,
   ChatMessage,
@@ -33,14 +39,8 @@ import type {
   TraceTool,
   TurnTrace,
 } from './chatTypes';
-export {
-  SELECTED_AGENT_STORAGE_KEY,
-  SESSION_FILTER_STORAGE_PREFIX,
-  sessionFilterStorageKey,
-} from '@/lib/agent-scope-storage';
+export { sessionFilterStorageKey } from '@/lib/agent-scope-storage';
 
-export const MODEL_CONFIG_STORAGE_PREFIX = 'skill_agent_selected_model_config';
-export const SESSION_READ_STORAGE_PREFIX = 'skill_agent_session_read_at';
 export const SIDEBAR_COLLAPSED_STORAGE_KEY = 'skill_agent_sidebar_collapsed';
 export const RUNNING_EVENT_RECOVERY_WINDOW_MS = 600 * 1000;
 export const CHAT_STREAM_IDLE_TIMEOUT_MS = 600 * 1000;
@@ -49,22 +49,35 @@ export const CHAT_STREAM_HEARTBEAT_GRACE_MS = 20 * 1000;
 export const CHAT_TRACE_RECOVERY_WINDOW_MS = 10 * 60 * 1000;
 export const STREAM_TERMINAL_EVENTS = new Set(['complete', 'done', 'stream_end', 'stream_cancelled', 'stream_interrupted', 'error', 'error_occurred']);
 export const HIDDEN_GENERAL_SKILL_TRACE_PHASES = new Set(['replying']);
+/** 旧协议停止状态 marker；仅用于精确识别历史系统消息，不作为展示文案或翻译源。 */
+export const LEGACY_STOPPED_GENERATION_MARKER = '已停止生成';
 const DRAFT_SCHEDULE_TYPES = new Set<DraftScheduleType>(['once', 'daily', 'weekly', 'monthly']);
-const DRAFT_SCHEDULE_TYPE_LABELS: Record<DraftScheduleType, string> = {
-  once: '一次性',
-  daily: '每天',
-  weekly: '每周',
-  monthly: '每月',
-};
-const DRAFT_WEEKDAY_LABELS = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'];
 
-export function sessionReadStorageKey(userId: string): string {
-  return `${SESSION_READ_STORAGE_PREFIX}:${userId || 'anonymous'}`;
+export type ChatTranslate = (id: MessageId, values?: MessageValues) => string;
+
+const DRAFT_WEEKDAY_MESSAGE_IDS = [
+  'chat.draft.weekday.monday',
+  'chat.draft.weekday.tuesday',
+  'chat.draft.weekday.wednesday',
+  'chat.draft.weekday.thursday',
+  'chat.draft.weekday.friday',
+  'chat.draft.weekday.saturday',
+  'chat.draft.weekday.sunday',
+] as const satisfies readonly MessageId[];
+
+/** Generate a read-marker key only from verified tenant and user identity. */
+export function sessionReadStorageKey(tenantId: string, userId: string): string {
+  return tenantUserStorageKey(tenantId, userId, 'session-read');
 }
 
-export function loadSessionReadTimes(userId: string): Record<string, string> {
+/**
+ * 读取租户/用户的会话已读标记；显式身份缺失、旧键或损坏 JSON 都只返回空集合。
+ * 函数只读浏览器存储，不会把旧无租户键迁入新命名空间。
+ */
+export function loadSessionReadTimes(tenantId: string, userId: string): Record<string, string> {
   try {
-    const raw = window.localStorage.getItem(sessionReadStorageKey(userId));
+    const key = sessionReadStorageKey(tenantId, userId);
+    const raw = window.localStorage.getItem(key);
     if (!raw) return {};
     const parsed = JSON.parse(raw) as Record<string, string>;
     return parsed && typeof parsed === 'object' ? parsed : {};
@@ -73,8 +86,17 @@ export function loadSessionReadTimes(userId: string): Record<string, string> {
   }
 }
 
-export function persistSessionReadTimes(userId: string, values: Record<string, string>): void {
-  window.localStorage.setItem(sessionReadStorageKey(userId), JSON.stringify(values));
+/**
+ * 写入租户/用户的会话已读标记；显式身份非法时在生成键阶段失败，不写入旧无租户位置。
+ * 浏览器存储异常会继续抛出，调用方不得把失败当成成功。
+ */
+export function persistSessionReadTimes(
+  tenantId: string,
+  userId: string,
+  values: Record<string, string>,
+): void {
+  const key = sessionReadStorageKey(tenantId, userId);
+  window.localStorage.setItem(key, JSON.stringify(values));
 }
 
 export function isScheduledSession(session: ChatSession): boolean {
@@ -95,8 +117,12 @@ export function sessionHasUnreadReply(
   return Number.isFinite(updatedAt) && (!Number.isFinite(readAt) || updatedAt > readAt + 1000);
 }
 
-export function draftConversationKey(agentId: string): string {
-  return `draft:${agentId}`;
+export function draftConversationKey(
+  tenantId: string,
+  userId: string,
+  agentId: string,
+): string {
+  return `draft:${tenantUserStorageKey(tenantId, userId, agentId)}`;
 }
 
 export function isDraftConversationKey(id: string): boolean {
@@ -107,17 +133,28 @@ export function isMissingChatSessionError(error: unknown): boolean {
   return error instanceof ApiError && error.status === 404;
 }
 
-export function modelStorageKey(tenantId: string): string {
-  return `${MODEL_CONFIG_STORAGE_PREFIX}:${tenantId}`;
+/** Generate a model preference key only from verified tenant and user identity. */
+export function modelStorageKey(tenantId: string, userId: string): string {
+  return tenantUserStorageKey(tenantId, userId, 'model-config');
 }
 
-export function modelDisplayName(model: { name?: string; model?: string }): string {
-  return (model.name || model.model || '模型').trim();
+/** 返回模型业务名称；无名称时使用当前界面的稳定默认标签。 */
+export function modelDisplayName(
+  model: { name?: string; model?: string },
+  translate: ChatTranslate,
+): string {
+  return (model.name || model.model || translate('chat.composer.default')).trim();
 }
 
-export function modelDetailText(model: { name?: string; model?: string; provider?: string; is_default?: boolean }): string {
+/** 返回模型技术标识和默认状态；模型值保持原样，产品标签按当前语言输出。 */
+export function modelDetailText(
+  model: { name?: string; model?: string; provider?: string; is_default?: boolean },
+  translate: ChatTranslate,
+): string {
   const detail = model.model && model.model !== model.name ? model.model : model.provider || '';
-  return model.is_default ? `${detail} · 默认` : detail;
+  return model.is_default
+    ? [detail, translate('chat.composer.default')].filter(Boolean).join(' · ')
+    : detail;
 }
 
 export function normalizeMessageText(value?: string): string {
@@ -186,6 +223,7 @@ function renderBareLinks(text: string, keyPrefix: string): ReactNode[] {
 
 export type MarkdownRenderOptions = {
   renderInternalLink?: (link: { label: string; href: string; key: string }) => ReactNode;
+  translate?: ChatTranslate;
 };
 
 function safeExternalHttpUrl(value: string): string | null {
@@ -198,7 +236,16 @@ function safeExternalHttpUrl(value: string): string | null {
   }
 }
 
-function ExternalMarkdownImage({ alt, src }: { alt: string; src: string }) {
+/** 渲染用户或 Agent 原文中的安全图片；alt 原文保持不变，宿主链接 ARIA 由语义消息生成。 */
+function ExternalMarkdownImage({
+  alt,
+  src,
+  translate,
+}: {
+  alt: string;
+  src: string;
+  translate?: ChatTranslate;
+}) {
   const [failed, setFailed] = useState(false);
 
   if (failed) {
@@ -211,7 +258,9 @@ function ExternalMarkdownImage({ alt, src }: { alt: string; src: string }) {
       href={src}
       target="_blank"
       rel="noreferrer"
-      aria-label={`查看图片：${alt}`}
+      {...(translate
+        ? { 'aria-label': translate('chat.markdown.viewImage', { alt }) }
+        : {})}
     >
       <img
         className={CHAT_MARKDOWN_IMAGE_CLASS}
@@ -250,11 +299,11 @@ export function renderInlineMarkdown(
     } else {
       const image = token.match(/^!\[([^\]]*)\]\(((?:[^()\n]|\([^()\n]*\))+)\)$/);
       if (image) {
-        const alt = image[1].trim() || '图片';
+        const alt = image[1].trim();
         const src = safeExternalHttpUrl(image[2].trim());
         if (src) {
           nodes.push(
-            <ExternalMarkdownImage key={key} src={src} alt={alt} />,
+            <ExternalMarkdownImage key={key} src={src} alt={alt} translate={options.translate} />,
           );
         } else {
           nodes.push(<span key={key}>{alt}</span>);
@@ -594,14 +643,23 @@ export function renderMarkdownBlocks(
   return blocks;
 }
 
+/** 渲染 raw Markdown 内容；仅图片宿主 ARIA 使用显式注入的产品翻译，不翻译正文或链接值。 */
 export function MarkdownMessage({
   content,
   preserveLineBreaks = true,
+  translate,
 }: {
   content: string;
   preserveLineBreaks?: boolean;
+  translate?: ChatTranslate;
 }) {
-  return <div className={CHAT_MARKDOWN_CLASS}>{renderMarkdownBlocks(content, preserveLineBreaks)}</div>;
+  const { t } = useAppIntl();
+  const activeTranslate = translate || t;
+  return (
+    <div className={CHAT_MARKDOWN_CLASS}>
+      {renderMarkdownBlocks(content, preserveLineBreaks, { translate: activeTranslate })}
+    </div>
+  );
 }
 
 export function traceSummaryIconName(_summary: { state: TraceLine['state'] }): CotTraceIconName {
@@ -1075,14 +1133,14 @@ export function computeMergedMessages(slot: SessionSlot, activeTurnId?: string |
     .map((item) => item.messageItem);
 }
 
-function publicStreamPhase(data: Record<string, unknown>): string {
+/** 将流式状态码映射为当前语言的产品状态；服务端自带自然语言不直接进入产品 chrome。 */
+function publicStreamPhase(data: Record<string, unknown>, translate: ChatTranslate): string {
   const phase = typeof data.phase === 'string' ? data.phase : '';
-  const text = typeof data.text === 'string' ? data.text : '';
-  if (phase === 'error') return text || '请求失败';
-  if (phase === 'preparing') return text || '正在整理上下文';
-  if (phase === 'scheduled_task_draft') return text || '生成定时任务草案';
-  if (isKnowledgeTracePhase(phase)) return text || knowledgeTraceText(data);
-  return '正在思考';
+  if (phase === 'error') return translate('chat.trace.statusError');
+  if (phase === 'preparing') return translate('chat.trace.preparing');
+  if (phase === 'scheduled_task_draft') return translate('chat.trace.scheduledDraft');
+  if (isKnowledgeTracePhase(phase)) return knowledgeTraceText(data, translate);
+  return translate('chat.trace.thinking');
 }
 
 export { publicStreamPhase };
@@ -1151,14 +1209,10 @@ export function isKnowledgeTracePhase(phase: string): boolean {
   return KNOWLEDGE_TRACE_PHASES.has(phase);
 }
 
-export function knowledgeTraceText(data: Record<string, unknown>): string {
-  const raw = typeof data.message === 'string'
-    ? data.message
-    : typeof data.text === 'string'
-      ? data.text
-      : '';
-  if (!raw) return '检索知识库';
-  return raw;
+/** 返回知识检索产品状态；服务端自然语言留在协议数据中，不直接覆盖本地化 chrome。 */
+export function knowledgeTraceText(data: Record<string, unknown>, translate: ChatTranslate): string {
+  void data;
+  return translate('chat.trace.readKnowledge');
 }
 
 export function knowledgeTraceLineId(data: Record<string, unknown>): string {
@@ -1171,26 +1225,42 @@ export function knowledgeTraceLineId(data: Record<string, unknown>): string {
   return query ? `knowledge_lookup_${query}` : 'knowledge_lookup';
 }
 
-export function knowledgeTraceDetail(data: Record<string, unknown>): string | undefined {
+/** 生成知识检索明细；查询值保持原样，计数标签使用当前 locale 的 ICU 消息。 */
+export function knowledgeTraceDetail(
+  data: Record<string, unknown>,
+  translate: ChatTranslate,
+): string | undefined {
   const query = isPlainRecord(data.query) && typeof data.query.query === 'string' ? data.query.query : '';
   const parts = [
-    query ? `查询：${query}` : '',
-    typeof data.selected_count === 'number' ? `命中知识图谱 ${data.selected_count} 个` : '',
-    typeof data.candidate_count === 'number' ? `候选 ${data.candidate_count} 个` : '',
-    typeof data.chunk_count === 'number' ? `读取 ${data.chunk_count} 个片段` : '',
-    typeof data.evidence_count === 'number' ? `整理 ${data.evidence_count} 条证据` : '',
+    query ? translate('chat.trace.query', { query }) : '',
+    typeof data.selected_count === 'number'
+      ? translate('chat.trace.knowledgeGraphMatches', { count: data.selected_count })
+      : '',
+    typeof data.candidate_count === 'number'
+      ? translate('chat.trace.candidateCount', { count: data.candidate_count })
+      : '',
+    typeof data.chunk_count === 'number'
+      ? translate('chat.trace.chunkCount', { count: data.chunk_count })
+      : '',
+    typeof data.evidence_count === 'number'
+      ? translate('chat.trace.evidenceCount', { count: data.evidence_count })
+      : '',
   ].filter(Boolean);
   return parts.length ? parts.join(' · ') : undefined;
 }
 
-export function knowledgeResultTraceDetail(data: Record<string, unknown>): string | undefined {
+/** 生成知识结果明细；数组长度按当前语言格式化，检索结果自身不被翻译。 */
+export function knowledgeResultTraceDetail(
+  data: Record<string, unknown>,
+  translate: ChatTranslate,
+): string | undefined {
   const concepts = Array.isArray(data.selected_concepts) ? data.selected_concepts.length : 0;
   const chunks = Array.isArray(data.chunks) ? data.chunks.length : 0;
   const evidence = Array.isArray(data.evidence_pack) ? data.evidence_pack.length : 0;
   const parts = [
-    concepts ? `命中知识图谱 ${concepts} 个` : '',
-    chunks ? `读取 ${chunks} 个片段` : '',
-    evidence ? `生成 ${evidence} 条引用候选` : '',
+    concepts ? translate('chat.trace.knowledgeGraphMatches', { count: concepts }) : '',
+    chunks ? translate('chat.trace.chunkCount', { count: chunks }) : '',
+    evidence ? translate('chat.trace.evidenceCount', { count: evidence }) : '',
   ].filter(Boolean);
   return parts.length ? parts.join(' · ') : undefined;
 }
@@ -1208,22 +1278,27 @@ export function normalizeTraceSkill(value: unknown): TraceSkill | null {
   };
 }
 
-export function streamSkillLabel(data: Record<string, unknown>, skill: TraceSkill): string {
-  if (skill.state === 'suspended') return '挂起SOP';
-  if (skill.state === 'pending') return '等待SOP';
+/** 将 SOP 生命周期枚举转换为当前语言的产品标签，技能名称仍保持 raw。 */
+export function streamSkillLabel(
+  data: Record<string, unknown>,
+  skill: TraceSkill,
+  translate: ChatTranslate,
+): string {
+  if (skill.state === 'suspended') return translate('chat.trace.skillSuspended');
+  if (skill.state === 'pending') return translate('chat.trace.skillPending');
   const decision = typeof data.runtimeDecision === 'string' ? data.runtimeDecision : '';
   const fromSkillId = typeof data.fromSkillId === 'string' ? data.fromSkillId : '';
   const toSkillId = typeof data.toSkillId === 'string' ? data.toSkillId : '';
-  if (decision === 'start_skill' || decision === 'start_new_task') return '选择SOP';
-  if (decision === 'suspend_current_and_start_new_skill') return '切换SOP';
+  if (decision === 'start_skill' || decision === 'start_new_task') return translate('chat.trace.skillSelected');
+  if (decision === 'suspend_current_and_start_new_skill') return translate('chat.trace.skillSwitched');
   if (
     (decision === 'answer_related_question_then_resume' || decision === 'answer_chitchat_then_resume')
     && fromSkillId
     && toSkillId
     && fromSkillId !== toSkillId
-  ) return '切换SOP';
-  if (decision === 'exit_current_skill') return '恢复SOP';
-  return '推进SOP';
+  ) return translate('chat.trace.skillSwitched');
+  if (decision === 'exit_current_skill') return translate('chat.trace.skillResumed');
+  return translate('chat.trace.skillAdvanced');
 }
 
 export function normalizeTraceTool(value: unknown): TraceTool | null {
@@ -1248,36 +1323,54 @@ function shortTraceValue(value: unknown): string {
   return '';
 }
 
-export function toolTraceDetail(tool: TraceTool): string | undefined {
+/** 生成工具 trace 明细；工具名、来源和 provider 字段属于 raw 诊断值，仅状态标签本地化。 */
+export function toolTraceDetail(tool: TraceTool, translate: ChatTranslate): string | undefined {
   const content = tool.content && typeof tool.content === 'object' ? tool.content as Record<string, unknown> : null;
   const data = content?.data && typeof content.data === 'object' ? content.data as Record<string, unknown> : null;
   const parts = [
     tool.rawToolName && tool.rawToolName !== tool.toolName ? tool.rawToolName : '',
     shortTraceValue(data?.source),
-    data?.found === false ? '未命中' : data?.found === true ? '已命中' : '',
+    data?.found === false ? translate('chat.trace.notFound') : data?.found === true ? translate('chat.trace.found') : '',
     shortTraceValue(data?.miss_reason),
     shortTraceValue(data?.recommendation),
   ].filter(Boolean);
   return parts.length > 0 ? parts.join(' · ') : undefined;
 }
 
-export function reflectionTraceDetail(data: Record<string, unknown>): string | undefined {
+/** 生成反思诊断明细；工具、SOP 和步骤 ID 属于 raw 诊断值，产品标签按当前语言输出。 */
+export function reflectionTraceDetail(
+  data: Record<string, unknown>,
+  translate: ChatTranslate,
+): string | undefined {
   const parts = [
     typeof data.reason === 'string' ? data.reason : '',
-    typeof data.target_tool_name === 'string' ? `工具 ${data.target_tool_name}` : '',
-    typeof data.target_skill_id === 'string' ? `SOP ${data.target_skill_id}` : '',
-    typeof data.target_step_id === 'string' ? `步骤 ${data.target_step_id}` : '',
+    typeof data.target_tool_name === 'string'
+      ? translate('chat.trace.targetTool', { toolName: data.target_tool_name })
+      : '',
+    typeof data.target_skill_id === 'string'
+      ? translate('chat.trace.targetSop', { skillId: data.target_skill_id })
+      : '',
+    typeof data.target_step_id === 'string'
+      ? translate('chat.trace.targetStep', { stepId: data.target_step_id })
+      : '',
   ].filter(Boolean);
   return parts.length > 0 ? parts.join(' · ') : undefined;
 }
 
-function streamErrorText(data: Record<string, unknown>, eventName: string): string {
+/** 将错误事件代码映射为稳定产品文案；错误代码和类型作为 raw 参数保留诊断能力。 */
+function streamErrorText(
+  data: Record<string, unknown>,
+  eventName: string,
+  translate: ChatTranslate,
+): string {
   const code = typeof data.code === 'string' ? data.code.trim() : '';
-  if (code === 'LLM_ERROR') return '模型调用失败';
-  if (eventName === 'stream_interrupted') return '响应生成中断';
-  if (code) return `执行失败 ${code}`;
+  if (code === 'LLM_ERROR') return translate('chat.trace.modelCallFailed');
+  if (eventName === 'stream_interrupted') return translate('chat.trace.generationInterrupted');
+  if (code) return translate('chat.trace.executionFailedCode', { code });
   const errorType = typeof data.error_type === 'string' ? data.error_type.trim() : '';
-  return errorType ? `执行失败 ${errorType}` : '执行失败';
+  return errorType
+    ? translate('chat.trace.executionFailedType', { errorType })
+    : translate('chat.trace.executionFailed');
 }
 
 function streamErrorDetail(data: Record<string, unknown>): string | undefined {
@@ -1292,40 +1385,53 @@ function streamErrorDetail(data: Record<string, unknown>): string | undefined {
   return deduped.length > 0 ? deduped.join(' · ').slice(0, 2000) : undefined;
 }
 
-export function streamErrorTraceLine(data: Record<string, unknown>, eventName: string): TraceLine {
+/** 创建失败 trace 行；用户可见前缀本地化，服务端错误详情保持原始诊断值。 */
+export function streamErrorTraceLine(
+  data: Record<string, unknown>,
+  eventName: string,
+  translate: ChatTranslate,
+): TraceLine {
   const code = typeof data.code === 'string' ? data.code.trim() : '';
   const errorType = typeof data.error_type === 'string' ? data.error_type.trim() : '';
   const key = code || errorType || eventName || 'error';
   return {
     id: eventName === 'stream_interrupted' ? 'generation_interrupted' : `error_${key}`,
     kind: 'decision',
-    text: streamErrorText(data, eventName),
+    text: streamErrorText(data, eventName, translate),
     detail: streamErrorDetail(data),
     state: 'failed',
     icon: 'loading',
   };
 }
 
-export function routerDecisionTraceLine(data: Record<string, unknown>): TraceLine {
+/** 创建路由决策 trace 行；intent、decision、reason 和 ID 都是业务/诊断 raw 值。 */
+export function routerDecisionTraceLine(data: Record<string, unknown>, translate: ChatTranslate): TraceLine {
   const intent = typeof data.user_intent === 'string' ? data.user_intent.trim() : '';
   const decision = typeof data.decision === 'string' ? data.decision.trim() : '';
   const skillId = typeof data.target_skill_id === 'string' ? data.target_skill_id.trim() : '';
   const stepId = typeof data.target_step_id === 'string' ? data.target_step_id.trim() : '';
   const reason = typeof data.reason === 'string' ? data.reason.trim() : '';
-  const detail = [reason, skillId ? `目标SOP ${skillId}` : '', stepId ? `目标节点 ${stepId}` : '']
+  const detail = [
+    reason,
+    skillId ? translate('chat.trace.targetSop', { skillId }) : '',
+    stepId ? translate('chat.trace.targetStep', { stepId }) : '',
+  ]
     .filter(Boolean)
     .join(' · ');
   return {
     id: 'decision_router',
     kind: 'decision',
-    text: intent ? `判断意图 ${intent}` : decision ? `判断意图 ${decision}` : '判断意图',
+    text: intent || decision
+      ? translate('chat.trace.intentWithValue', { intent: intent || decision })
+      : translate('chat.trace.decideIntent'),
     detail: detail || undefined,
     state: 'completed',
     icon: 'judge',
   };
 }
 
-export function stepResultTraceLine(data: Record<string, unknown>): TraceLine {
+/** 创建步骤结果 trace 行；步骤、查询和回复值保持 raw，仅产品动作标签本地化。 */
+export function stepResultTraceLine(data: Record<string, unknown>, translate: ChatTranslate): TraceLine {
   const toolCall = isPlainRecord(data.tool_call) ? data.tool_call : undefined;
   const knowledgeQuery = isPlainRecord(data.knowledge_query) ? data.knowledge_query : undefined;
   const nextStepId = typeof data.next_step_id === 'string' ? data.next_step_id.trim() : '';
@@ -1333,8 +1439,8 @@ export function stepResultTraceLine(data: Record<string, unknown>): TraceLine {
   const toolName = typeof toolCall?.name === 'string' ? toolCall.name.trim() : '';
   const knowledgeQueryText = typeof knowledgeQuery?.query === 'string' ? knowledgeQuery.query.trim() : '';
   const detail = [
-    nextStepId ? `下一节点 ${nextStepId}` : '',
-    knowledgeQueryText ? `查询：${knowledgeQueryText}` : '',
+    nextStepId ? translate('chat.trace.nextStepId', { stepId: nextStepId }) : '',
+    knowledgeQueryText ? translate('chat.trace.query', { query: knowledgeQueryText }) : '',
     !toolName && !knowledgeQueryText && reply ? reply.slice(0, 80) : '',
   ].filter(Boolean).join(' · ');
 
@@ -1342,7 +1448,7 @@ export function stepResultTraceLine(data: Record<string, unknown>): TraceLine {
     return {
       id: `decision_step_tool_${toolName}`,
       kind: 'decision',
-      text: `决定调用工具 ${toolName}`,
+      text: translate('chat.trace.decideTool', { toolName }),
       detail: detail || undefined,
       state: 'running',
       icon: 'tool',
@@ -1352,7 +1458,7 @@ export function stepResultTraceLine(data: Record<string, unknown>): TraceLine {
     return {
       id: 'decision_step_knowledge',
       kind: 'decision',
-      text: '决定查询知识库',
+      text: translate('chat.trace.decideKnowledge'),
       detail: detail || undefined,
       state: 'running',
       icon: 'advance',
@@ -1361,7 +1467,7 @@ export function stepResultTraceLine(data: Record<string, unknown>): TraceLine {
   return {
     id: 'decision_step_result',
     kind: 'decision',
-    text: nextStepId ? '决定下一步' : '完成步骤判断',
+    text: nextStepId ? translate('chat.trace.decideNextStep') : translate('chat.trace.stepDecisionComplete'),
     detail: detail || undefined,
     state: 'completed',
     icon: 'advance',
@@ -1446,9 +1552,11 @@ function tracePayloadLanguage(value: string): string {
 }
 
 
+/** 将 Harness 生命周期事件转换为 locale-aware trace；动作、名称、状态和错误详情保持 raw。 */
 export function harnessEventTraceLine(
   eventName: string,
   data: Record<string, unknown>,
+  translate: ChatTranslate,
 ): TraceLine | null {
   const frameId = typeof data.task_frame_id === 'string' && data.task_frame_id.trim()
     ? data.task_frame_id.trim()
@@ -1467,15 +1575,19 @@ export function harnessEventTraceLine(
     return {
       id: `harness_frame_${frameId}`,
       kind: kind === 'sop' ? 'skill' : 'decision',
-      text: kind === 'sop' && skillName ? `开始SOP ${skillName}` : '开始执行任务',
+      text: kind === 'sop' && skillName
+        ? translate('chat.trace.sopFrameStart', { skillName })
+        : translate('chat.trace.taskFrameStart'),
       detail: [
-        kind === 'sop' ? 'SOP TaskFrame' : '对话 TaskFrame',
-        stepId ? `步骤 ${stepId}` : '',
+        kind === 'sop'
+          ? translate('chat.trace.taskFrameSop')
+          : translate('chat.trace.taskFrameConversation'),
+        stepId ? translate('chat.trace.taskFrameStep', { stepId }) : '',
         typeof data.step_timeout_seconds === 'number'
-          ? `单步上限 ${data.step_timeout_seconds} 秒`
+          ? translate('chat.trace.taskFrameStepLimit', { seconds: data.step_timeout_seconds })
           : '',
         typeof data.harness_max_actions === 'number'
-          ? `Harness 最多 ${data.harness_max_actions} 轮`
+          ? translate('chat.trace.taskFrameActionLimit', { count: data.harness_max_actions })
           : '',
       ]
         .filter(Boolean)
@@ -1490,10 +1602,10 @@ export function harnessEventTraceLine(
     return {
       id: `harness_timeout_${frameId}`,
       kind: 'skill',
-      text: 'SOP 单步运行超时',
+      text: translate('chat.trace.sopStepTimeout'),
       detail: [
-        timeoutSeconds === undefined ? '' : `上限 ${timeoutSeconds} 秒`,
-        actionCount === undefined ? '' : `已执行 ${actionCount} 个动作`,
+        timeoutSeconds === undefined ? '' : translate('chat.trace.taskFrameTimeoutLimit', { seconds: timeoutSeconds }),
+        actionCount === undefined ? '' : translate('chat.trace.taskFrameActionsExecuted', { count: actionCount }),
       ].filter(Boolean).join(' · '),
       state: 'failed',
       icon: 'loading',
@@ -1510,19 +1622,19 @@ export function harnessEventTraceLine(
     const actionCount = typeof data.action_count === 'number' ? data.action_count : undefined;
     const text = kind === 'sop' && skillName
       ? (failed
-        ? `SOP执行失败 ${skillName}`
+        ? translate('chat.trace.sopFailed', { skillName })
         : (status === 'awaiting_user'
-          ? `等待用户补充 ${skillName}`
-          : `SOP任务执行完成 ${skillName}`))
-      : (failed ? '任务执行失败' : '任务执行完成');
+          ? translate('chat.trace.sopAwaitingUser', { skillName })
+          : translate('chat.trace.sopCompleted', { skillName })))
+      : (failed ? translate('chat.trace.taskFailed') : translate('chat.trace.taskCompleted'));
     return {
       id: `harness_frame_${frameId}`,
       kind: kind === 'sop' ? 'skill' : 'decision',
       text,
       detail: [
-        `状态 ${status}`,
-        stepId ? `步骤 ${stepId}` : '',
-        actionCount === undefined ? '' : `执行 ${actionCount} 个动作`,
+        translate('chat.trace.taskFrameStatus', { status }),
+        stepId ? translate('chat.trace.taskFrameStep', { stepId }) : '',
+        actionCount === undefined ? '' : translate('chat.trace.taskFrameActionsExecuted', { count: actionCount }),
       ]
         .filter(Boolean)
         .join(' · '),
@@ -1536,8 +1648,10 @@ export function harnessEventTraceLine(
       return {
         id: `harness_action_${frameId}_${iteration || 'current'}`,
         kind: 'tool',
-        text: toolName ? `调用能力 ${toolName}` : '调用能力',
-        detail: iteration ? `第 ${iteration} 个动作` : undefined,
+        text: toolName
+          ? translate('chat.trace.invokeCapability', { toolName })
+          : translate('chat.trace.invokeCapabilityGeneric'),
+        detail: iteration ? translate('chat.trace.taskFrameAction', { iteration }) : undefined,
         state: 'running',
         icon: 'tool',
       };
@@ -1546,8 +1660,8 @@ export function harnessEventTraceLine(
       return {
         id: `harness_finish_${frameId}_${iteration || 'current'}`,
         kind: 'decision',
-        text: '整理任务结果',
-        detail: iteration ? `第 ${iteration} 个动作` : undefined,
+        text: translate('chat.trace.organizeTaskResult'),
+        detail: iteration ? translate('chat.trace.taskFrameAction', { iteration }) : undefined,
         state: 'completed',
         icon: 'advance',
       };
@@ -1563,8 +1677,10 @@ export function harnessEventTraceLine(
     return {
       id: `harness_mcp_app_${frameId}_${appToolName || 'view'}`,
       kind: 'tool',
-      text: appToolName ? `展示 MCP App ${appToolName}` : '展示 MCP App',
-      detail: '隔离视图；加载失败时保留文本结果',
+      text: appToolName
+        ? translate('chat.trace.showMcpApp', { toolName: appToolName })
+        : translate('chat.trace.showMcpAppGeneric'),
+      detail: translate('chat.trace.mcpAppDetail'),
       mcpApp,
       state: 'completed',
       icon: 'tool',
@@ -1586,12 +1702,12 @@ export function harnessEventTraceLine(
       id: `harness_action_${frameId}_${iteration || 'current'}`,
       kind: 'tool',
       text: toolName
-        ? `${success ? '能力调用完成' : '能力调用失败'} ${toolName}`
-        : success ? '能力调用完成' : '能力调用失败',
+        ? translate(success ? 'chat.trace.capabilityCompleted' : 'chat.trace.capabilityFailed', { toolName })
+        : translate(success ? 'chat.trace.capabilityCompletedGeneric' : 'chat.trace.capabilityFailedGeneric'),
       detail,
       output: output || undefined,
       outputLanguage: output ? tracePayloadLanguage(output) : undefined,
-      outputTitle: output ? '查看能力结果' : undefined,
+      outputTitle: output ? translate('chat.trace.viewCapabilityResult') : undefined,
       collapsible: Boolean(output),
       mcpApp,
       state: success ? 'completed' : 'failed',
@@ -1620,18 +1736,24 @@ export function generalSkillTraceDetail(data: Record<string, unknown>, phase: st
   return detail?.trim() || undefined;
 }
 
-export function generalSkillTraceOutput(data: Record<string, unknown>, phase: string, accumulatedText?: string): {
+/** 提取通用技能输出并本地化折叠标题；代码、stdout、stderr 与结构化结果保持 raw。 */
+export function generalSkillTraceOutput(
+  data: Record<string, unknown>,
+  phase: string,
+  accumulatedText: string | undefined,
+  translate: ChatTranslate,
+): {
   output?: string;
   language?: string;
   title?: string;
 } {
   if (phase === 'stdout_chunk') {
     const output = formatTracePayload(accumulatedText || data.stdout_preview || data.text);
-    return output ? { output, language: tracePayloadLanguage(output), title: '查看运行输出' } : {};
+    return output ? { output, language: tracePayloadLanguage(output), title: translate('chat.trace.viewRunOutput') } : {};
   }
   if (phase === 'stderr_chunk') {
     const output = formatTracePayload(accumulatedText || data.stderr_preview || data.text);
-    return output ? { output, language: tracePayloadLanguage(output), title: '查看错误输出' } : {};
+    return output ? { output, language: tracePayloadLanguage(output), title: translate('chat.trace.viewErrorOutput') } : {};
   }
   if (phase === 'code_finished' || phase === 'code_timeout') {
     const result: Record<string, unknown> = {};
@@ -1642,7 +1764,15 @@ export function generalSkillTraceOutput(data: Record<string, unknown>, phase: st
     const output = Object.keys(result).length > 0
       ? formatTracePayload(result)
       : formatTracePayload(data.stdout_preview || data.stderr_preview || data.text);
-    return output ? { output, language: tracePayloadLanguage(output), title: phase === 'code_timeout' ? '查看超时结果' : '查看执行结果' } : {};
+    return output
+      ? {
+        output,
+        language: tracePayloadLanguage(output),
+        title: phase === 'code_timeout'
+          ? translate('chat.trace.viewTimeoutResult')
+          : translate('chat.trace.viewExecutionResult'),
+      }
+      : {};
   }
   if (phase.startsWith('reflection_')) {
     const result: Record<string, unknown> = {};
@@ -1651,7 +1781,7 @@ export function generalSkillTraceOutput(data: Record<string, unknown>, phase: st
     if (typeof data.stdout_preview === 'string' && data.stdout_preview.trim()) result.stdout = data.stdout_preview;
     if (typeof data.stderr_preview === 'string' && data.stderr_preview.trim()) result.stderr = data.stderr_preview;
     const output = Object.keys(result).length > 0 ? formatTracePayload(result) : '';
-    return output ? { output, language: tracePayloadLanguage(output), title: '查看校验详情' } : {};
+    return output ? { output, language: tracePayloadLanguage(output), title: translate('chat.trace.viewValidationDetails') } : {};
   }
   return {};
 }
@@ -1665,20 +1795,25 @@ export function traceLineAllowed(line: TraceLine, config: UIConfigRead): boolean
   return true;
 }
 
-export function traceSummary(trace: TurnTrace, lines: TraceLine[]): { text: string; state: TraceLine['state'] } {
+/** 生成执行记录摘要；摘要标签本地化，trace 行的业务/诊断值不被改写。 */
+export function traceSummary(
+  trace: TurnTrace,
+  lines: TraceLine[],
+  translate: ChatTranslate,
+): { text: string; state: TraceLine['state'] } {
   if (trace.completedAt) {
     if (lines.some((line) => line.state === 'failed')) {
-      return { text: '执行遇到问题', state: 'failed' };
+      return { text: translate('chat.trace.executionProblem'), state: 'failed' };
     }
-    return { text: '执行记录', state: 'completed' };
+    return { text: translate('chat.trace.executionRecord'), state: 'completed' };
   }
   if (lines.some((line) => line.state === 'running')) {
-    return { text: '执行记录', state: 'running' };
+    return { text: translate('chat.trace.executionRecord'), state: 'running' };
   }
   if (lines.some((line) => line.state === 'failed')) {
-    return { text: '执行遇到问题', state: 'failed' };
+    return { text: translate('chat.trace.executionProblem'), state: 'failed' };
   }
-  return { text: '执行记录', state: 'completed' };
+  return { text: translate('chat.trace.executionRecord'), state: 'completed' };
 }
 
 export function traceDetails(lines: TraceLine[]): TraceLine[] {
@@ -1704,7 +1839,25 @@ export function canRateMessage(item: ChatMessage): boolean {
 }
 
 export function stripTrailingCitationSummary(content: string): string {
-  return content;
+  const citationHeading = '(?:参考来源|参考资料|引用来源|资料来源)';
+  const labelFooter = new RegExp(
+    `(?:^|\\n)\\s*${citationHeading}\\s*[:：]\\s*(?:\\[\\d+\\]\\s*)+\\s*$`,
+    'u',
+  );
+  const citationSection = new RegExp(
+    `(?:^|\\n)\\s{0,3}(?:#{1,6}\\s*)?${citationHeading}\\s*[:：]?\\s*`
+      + `(?:\\n\\s*(?:[-*+]\\s+|\\d+[.)]\\s+)?\\[\\d+\\][^\\n]*)+\\s*$`,
+    'u',
+  );
+
+  let stripped = content.trimEnd();
+  let previous = '';
+  while (stripped !== previous) {
+    previous = stripped;
+    stripped = stripped.replace(labelFooter, '').trimEnd();
+    stripped = stripped.replace(citationSection, '').trimEnd();
+  }
+  return stripped;
 }
 
 function citationLabelsInContent(content: string): Set<number> {
@@ -1735,13 +1888,12 @@ export function knowledgeCitations(item: ChatMessage, content: string): Knowledg
   const citations = item.metadata?.knowledge_citations;
   if (!Array.isArray(citations)) return [];
   const usedLabels = citationLabelsInContent(content);
-  if (usedLabels.size === 0) return [];
   const seen = new Set<string>();
   const result: KnowledgeCitation[] = [];
   citations.forEach((citation, index) => {
     if (!citation || !citation.id) return;
     const labelNumber = citationLabelNumber(citation, index + 1);
-    if (!usedLabels.has(labelNumber)) return;
+    if (usedLabels.size > 0 && !usedLabels.has(labelNumber)) return;
     // A document can contribute multiple cited chunks with the same display
     // title. Prefer durable source identifiers so those cards are not merged.
     // Historical citations without source identifiers retain title-based
@@ -1781,17 +1933,19 @@ export function isScheduledTaskPrompt(item: ChatMessage): boolean {
   return item.role === 'user' && item.metadata?.interaction_mode === 'scheduled_task';
 }
 
-export function citationKindLabel(citation: KnowledgeCitation): string {
-  if (citation.kind === 'concept') return '知识图谱';
-  if (citation.kind === 'okf') return '知识图谱引用';
-  return '引用来源';
+/** 将引用类型枚举映射为当前语言标签；引用标题和来源本身保持 raw。 */
+export function citationKindLabel(citation: KnowledgeCitation, translate: ChatTranslate): string {
+  if (citation.kind === 'concept' || citation.kind === 'okf') return translate('chat.dialog.knowledgeGraph');
+  return translate('chat.dialog.citationExcerpt');
 }
 
+/** 提取引用业务标题；缺失值交给调用组件显示本地化 fallback。 */
 export function citationDisplayTitle(citation: KnowledgeCitation): string {
-  const raw = citation.title || citation.section_path || citation.source_path || citation.concept_id || '知识引用';
-  return raw.trim() || '知识引用';
+  const raw = citation.title || citation.section_path || citation.source_path || citation.concept_id || '';
+  return raw.trim();
 }
 
+/** 提取引用来源路径原文，不把路径当作需要翻译的产品文案。 */
 export function citationSourceLabel(citation: KnowledgeCitation): string {
   const raw = citation.source_path || '';
   if (!raw) return '';
@@ -2126,52 +2280,110 @@ function isChatAttachment(value: unknown): value is ChatAttachmentRead {
   return typeof item.id === 'string' && typeof item.filename === 'string';
 }
 
-export function attachmentTypeLabel(attachment: ChatAttachmentRead): string {
-  const size = formatAttachmentSize(attachment.size);
+/** 生成附件类型与大小摘要；类型标签本地化，文件名和错误详情由组件保持 raw。 */
+export function attachmentTypeLabel(
+  attachment: ChatAttachmentRead,
+  locale: AppLocale,
+  translate: ChatTranslate,
+): string {
+  const size = formatAttachmentSize(attachment.size, locale);
   const type = attachment.kind === 'pdf'
-    ? 'PDF'
+    ? translate('chat.attachment.pdf')
     : attachment.kind === 'image'
-      ? '图片'
+      ? translate('chat.attachment.image')
       : attachment.kind === 'text'
-        ? '文本'
-        : '文件';
+        ? translate('chat.attachment.text')
+        : translate('chat.attachment.file');
   return `${type}${size ? ` · ${size}` : ''}`;
 }
 
-function formatAttachmentSize(size: number): string {
+/** 使用当前 locale 的 Intl 单位格式化附件大小，避免固定英文或中文地区参数。 */
+function formatAttachmentSize(size: number, locale: AppLocale): string {
   if (!Number.isFinite(size) || size <= 0) return '';
-  if (size < 1024) return `${size} B`;
-  if (size < 1024 * 1024) return `${(size / 1024).toFixed(size < 10 * 1024 ? 1 : 0)} KB`;
-  return `${(size / 1024 / 1024).toFixed(1)} MB`;
+  if (size < 1024) {
+    return new Intl.NumberFormat(locale, {
+      style: 'unit',
+      unit: 'byte',
+      unitDisplay: 'short',
+      maximumFractionDigits: 0,
+    }).format(size);
+  }
+  if (size < 1024 * 1024) {
+    return new Intl.NumberFormat(locale, {
+      style: 'unit',
+      unit: 'kilobyte',
+      unitDisplay: 'short',
+      maximumFractionDigits: size < 10 * 1024 ? 1 : 0,
+    }).format(size / 1024);
+  }
+  return new Intl.NumberFormat(locale, {
+    style: 'unit',
+    unit: 'megabyte',
+    unitDisplay: 'short',
+    maximumFractionDigits: 1,
+  }).format(size / 1024 / 1024);
 }
 
 // ---------------------------------------------------------------------------
 // Scheduled task draft schedule helpers
 // ---------------------------------------------------------------------------
-export function formatDraftSchedule(draft: ScheduledTaskDraftRead): string {
+/** 将排程结构格式化为当前语言摘要；时间按显式 locale/timezone 输出，输入字段保持 raw。 */
+export function formatDraftSchedule(
+  draft: ScheduledTaskDraftRead,
+  locale: AppLocale,
+  translate: ChatTranslate,
+  timeZone = getClientTimeZone(),
+): string {
+  const formatters = createFormatters(locale);
   const schedule = draft.schedule || {};
   const scheduleType = normalizeDraftScheduleType(draft.schedule_type);
   if (scheduleType === 'weekly') {
     const weekdays = Array.isArray(schedule.weekdays)
-      ? schedule.weekdays.map((item) => DRAFT_WEEKDAY_LABELS[Number(item)]).filter(Boolean).join('、')
-      : '周一';
-    return `每周 ${weekdays} ${schedule.time || '09:00'}`;
+      ? schedule.weekdays
+        .map((item) => DRAFT_WEEKDAY_MESSAGE_IDS[Number(item)])
+        .filter((id) => Boolean(id))
+        .map((id) => translate(id))
+      : [translate('chat.draft.weekday.monday')];
+    return translate('chat.draft.weeklySchedule', {
+      weekdays: formatters.formatList(weekdays, { type: 'conjunction' }),
+      time: String(schedule.time || translate('chat.draft.pendingTime')),
+    });
   }
   if (scheduleType === 'monthly') {
-    return `每月 ${schedule.day_of_month || 1} 号 ${schedule.time || '09:00'}`;
+    return translate('chat.draft.monthlySchedule', {
+      day: String(schedule.day_of_month || 1),
+      time: String(schedule.time || translate('chat.draft.pendingTime')),
+    });
   }
   if (scheduleType === 'once') {
     const value = String(schedule.run_at || '');
-    const formatted = formatClientDateTime(value, '');
-    return formatted
-      ? `一次性 ${formatted}`
-      : '一次性';
+    if (!value) return translate('chat.draft.once');
+    const parsed = parseBackendDateTime(value);
+    const formatted = Number.isNaN(parsed.getTime())
+      ? value
+      : formatters.formatDate(parsed, { dateStyle: 'medium', timeStyle: 'short', timeZone });
+    return translate('chat.draft.onceSchedule', { runAt: formatted });
   }
-  return `每天 ${schedule.time || '09:00'}`;
+  return translate('chat.draft.dailySchedule', {
+    time: String(schedule.time || translate('chat.draft.pendingTime')),
+  });
 }
 
-export function scheduleTypeLabel(type: ScheduledTaskDraftRead['schedule_type']): string {
-  return DRAFT_SCHEDULE_TYPE_LABELS[normalizeDraftScheduleType(type)];
+/** 将排程类型协议枚举映射为语义消息，不把枚举值直接当用户文案。 */
+export function scheduleTypeLabel(
+  type: ScheduledTaskDraftRead['schedule_type'],
+  translate: ChatTranslate,
+): string {
+  switch (normalizeDraftScheduleType(type)) {
+    case 'once':
+      return translate('chat.draft.once');
+    case 'weekly':
+      return translate('chat.draft.weekly');
+    case 'monthly':
+      return translate('chat.draft.monthly');
+    default:
+      return translate('chat.draft.daily');
+  }
 }
 
 export function scheduleEditValue(draft: ScheduledTaskDraftRead): string {

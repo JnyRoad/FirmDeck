@@ -1,18 +1,75 @@
 from __future__ import annotations
 
-from typing import Any, Literal, Optional
+from datetime import datetime
+from typing import Annotated, Any, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
+from typing_extensions import TypedDict
 
 from app.capability_scope import CapabilityScope
+
+KnowledgeBaseMode = Literal["dedicated", "shared"]
+KnowledgePublicationState = Literal["draft", "released", "rejected"]
+NonEmptyText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+
+
+class KnowledgeErrorDescriptor(TypedDict):
+    """持久化知识任务对外暴露的稳定错误字段，不包含异常原文。"""
+
+    code: str
+    params: dict[str, Any]
+    retryable: bool
+    request_id: str | None
+    trace_id: str | None
+
+
+class KnowledgeStageDescriptor(TypedDict):
+    """知识入库阶段的稳定代码和具名参数，显示文案由客户端语言决定。"""
+
+    code: str
+    params: dict[str, Any]
+
+
+class KnowledgeIngestStep(TypedDict):
+    """知识入库进度条使用的机器阶段数据，不携带已翻译标签。"""
+
+    key: str
+    code: str
+    params: dict[str, Any]
+    progress: float
+    status: Literal["pending", "running", "done"]
+
+
+class KnowledgeTraceItem(TypedDict, total=False):
+    """检索诊断步骤的稳定代码、参数和受控统计字段。"""
+
+    phase: str
+    code: str
+    params: dict[str, Any]
+    candidate_count: int
+    selected_count: int
+    section_count: int
+    chunk_count: int
+    evidence_count: int
+    mode: str
+    selected_document_ids: list[str]
 
 
 class KnowledgeBaseCreateRequest(BaseModel):
     tenant_id: str
     name: str
     description: Optional[str] = None
+    mode: KnowledgeBaseMode = "dedicated"
+    agent_id: str | None = None
     capability_scope: CapabilityScope = "general"
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_shared_has_no_employee_owner(self) -> KnowledgeBaseCreateRequest:
+        """共享知识库属于团队绑定关系，不能同时声明员工私有所有者。"""
+        if self.mode == "shared" and self.agent_id:
+            raise ValueError("shared knowledge base cannot declare agent_id")
+        return self
 
 
 class KnowledgeBaseUpdateRequest(BaseModel):
@@ -36,6 +93,11 @@ class KnowledgeBaseRead(BaseModel):
     name: str
     description: Optional[str] = None
     status: str
+    mode: KnowledgeBaseMode = "dedicated"
+    published_version_id: str | None = None
+    published_version: str | None = None
+    bound_team_count: int = 0
+    management_context: dict[str, Any] = Field(default_factory=dict)
     capability_scope: CapabilityScope
     version: Optional[str] = None
     branch_sync_state: Optional[str] = None
@@ -51,9 +113,127 @@ class KnowledgeBaseRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class KnowledgeBaseVersionRead(BaseModel):
+    id: str
+    tenant_id: str
+    knowledge_base_id: str
+    version: str
+    name: str
+    description: str | None = None
+    status: str
+    publication_state: KnowledgePublicationState
+    parent_version_id: str | None = None
+    source_team_id: str | None = None
+    created_by_agent_id: str | None = None
+    created_by_user_id: str | None = None
+    change_reason: str | None = None
+    published_at: datetime | None = None
+    is_published_head: bool = False
+    capability_scope: CapabilityScope = "general"
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class KnowledgeBaseAuditEventRead(BaseModel):
+    id: str
+    knowledge_base_id: str
+    team_id: str | None = None
+    team_name: str | None = None
+    knowledge_base_version_id: str | None = None
+    knowledge_base_version: str | None = None
+    actor_type: str
+    actor_id: str
+    actor_name: str
+    action: str
+    reason: str | None = None
+    details: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
+
+
+class KnowledgeBaseAuditPageRead(BaseModel):
+    items: list[KnowledgeBaseAuditEventRead] = Field(default_factory=list)
+    total: int
+    offset: int
+    limit: int
+    has_more: bool
+
+
+class SharedKnowledgeTeamRead(BaseModel):
+    """一个当前用户可管理且已绑定共享知识库的活动团队。"""
+
+    id: str
+    name: str
+
+
+class SharedKnowledgeDraftCreateRequest(BaseModel):
+    tenant_id: str
+    team_id: str
+    change_reason: NonEmptyText
+    expected_published_version_id: str | None = None
+
+
+class SharedKnowledgePublishRequest(BaseModel):
+    tenant_id: str
+    team_id: str
+    expected_published_version_id: NonEmptyText
+    change_reason: NonEmptyText
+    idempotency_key: str | None = None
+
+
+class SharedKnowledgeRejectRequest(BaseModel):
+    tenant_id: str
+    team_id: str
+    change_reason: NonEmptyText
+    idempotency_key: str | None = None
+
+
+class SharedKnowledgeRollbackRequest(BaseModel):
+    tenant_id: str
+    team_id: str
+    target_version_id: NonEmptyText
+    expected_published_version_id: NonEmptyText
+    change_reason: NonEmptyText
+    idempotency_key: str | None = None
+
+
+class KnowledgeBaseConvertToSharedRequest(BaseModel):
+    tenant_id: str
+    agent_id: NonEmptyText
+    source_version_id: str | None = None
+    name: NonEmptyText
+    description: str | None = None
+    change_reason: NonEmptyText
+    team_bindings: list[str] = Field(default_factory=list)
+    default_for_team_id: str | None = None
+
+    @model_validator(mode="after")
+    def validate_initial_team_bindings(self) -> KnowledgeBaseConvertToSharedRequest:
+        """初始绑定不得重复，且默认团队必须属于同一批绑定。"""
+        if len(set(self.team_bindings)) != len(self.team_bindings):
+            raise ValueError("team_bindings must be unique")
+        if self.default_for_team_id and self.default_for_team_id not in self.team_bindings:
+            raise ValueError("default_for_team_id must be included in team_bindings")
+        return self
+
+
+class KnowledgeBaseConversionRead(BaseModel):
+    source_knowledge_base_id: str
+    source_version_id: str
+    new_knowledge_base: KnowledgeBaseRead
+    released_version: KnowledgeBaseVersionRead
+    binding_ids: list[str] = Field(default_factory=list)
+    default_for_team_id: str | None = None
+    source_archived: bool
+    audit_event_id: str
+
+
 class KnowledgeDocumentUploadRequest(BaseModel):
     tenant_id: str
     knowledge_base_id: Optional[str] = None
+    knowledge_base_version_id: str | None = None
     filename: str
     content_base64: str
     title: Optional[str] = None
@@ -64,13 +244,14 @@ class KnowledgeDocumentUploadRequest(BaseModel):
 class KnowledgeIngestJobRead(BaseModel):
     id: str
     tenant_id: str
+    tenant_lifecycle_version: int = 1
     knowledge_base_id: str
     document_id: Optional[str] = None
     filename: str
     status: str
     stage: str
     progress: float
-    error: Optional[str] = None
+    error: KnowledgeErrorDescriptor | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     created_at: str
     started_at: Optional[str] = None
@@ -84,7 +265,7 @@ class KnowledgeDocumentRead(BaseModel):
     id: str
     tenant_id: str
     knowledge_base_id: str
-    knowledge_base_version_id: Optional[str] = None
+    knowledge_base_version_id: str | None = None
     filename: str
     file_type: str
     title: Optional[str] = None
@@ -92,7 +273,7 @@ class KnowledgeDocumentRead(BaseModel):
     bucket_count: int
     chunk_count: int
     metadata: dict[str, Any] = Field(default_factory=dict)
-    error: Optional[str] = None
+    error: KnowledgeErrorDescriptor | None = None
     created_at: str
     updated_at: str
 
@@ -189,6 +370,7 @@ class KnowledgeConceptUpdateRequest(BaseModel):
 class KnowledgeOkfImportRequest(BaseModel):
     tenant_id: str
     knowledge_base_id: Optional[str] = None
+    knowledge_base_version_id: str | None = None
     filename: str
     content_base64: str
     agent_id: Optional[str] = None
@@ -217,8 +399,8 @@ class KnowledgeSearchRequest(BaseModel):
 class KnowledgeSearchResponse(BaseModel):
     selected_buckets: list[KnowledgeBucketRead] = Field(default_factory=list)
     chunks: list[KnowledgeChunkRead] = Field(default_factory=list)
-    trace: list[dict[str, Any]] = Field(default_factory=list)
-    route_trace: list[dict[str, Any]] = Field(default_factory=list)
+    trace: list[KnowledgeTraceItem] = Field(default_factory=list)
+    route_trace: list[KnowledgeTraceItem] = Field(default_factory=list)
     selected_documents: list[dict[str, Any]] = Field(default_factory=list)
     selected_concepts: list[dict[str, Any]] = Field(default_factory=list)
     expanded_sections: list[dict[str, Any]] = Field(default_factory=list)

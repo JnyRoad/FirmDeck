@@ -1,5 +1,6 @@
-# Domain Docs
+# 领域文档
 
-Use a single-context documentation layout. Before exploring code, read `CONTEXT.md` at the repository root and relevant decisions under `docs/adr/` when those files exist. If they do not exist, continue silently.
+使用单一上下文文档布局。探索代码前，读取仓库根目录的 `CONTEXT.md`，并在这些文件存在时读取
+`docs/adr/` 下的相关决策；若不存在，静默继续。
 
-Use terminology defined in `CONTEXT.md`. If work contradicts an ADR, state the conflict explicitly instead of silently overriding the decision.
+使用 `CONTEXT.md` 定义的术语。若工作内容与 ADR 冲突，明确说明冲突，而不是静默覆盖该决策。

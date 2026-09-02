@@ -134,6 +134,8 @@ class PublicSessionUpdate(BaseModel):
 
 class AgentRunCreate(BaseModel):
     input: str = Field(min_length=1)
+    ui_locale: str | None = None
+    agent_reply_locale: str | None = None
     session_id: str | None = None
     session_mode: Literal["stateful", "stateless"] = "stateful"
     external_session_id: str | None = None

@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import pytest
 from sqlalchemy.pool import StaticPool
-from sqlmodel import Session, SQLModel, create_engine
+from sqlmodel import Session, SQLModel, create_engine, select
 
 from app.core.harness_turn_store import (
     HarnessTurnConflict,
     HarnessTurnStore,
+    _request_digest,
 )
 from app.core.harness_v2_engine import _with_recoverable_first_session
-from app.db.models import ChatSession
+from app.db.models import ChatSession, HarnessTurnRecord, Tenant
+from app.i18n.language_context import SupportedLocale
 from app.session.session_schema import (
     ChatTurnRequest,
     ChatTurnResponse,
@@ -165,3 +168,180 @@ def test_first_turn_retry_without_returned_session_id_replays_original() -> None
 
         assert retry.replay == expected
         assert retry.replay.session_id == recovered_request.session_id
+
+
+def test_turn_claim_binds_independent_locales_and_replays_the_snapshot() -> None:
+    """Resolve locale choices before claiming a receipt and replay the exact completed snapshot."""
+    engine = _engine()
+    with Session(engine) as db:
+        session = ChatSession(id="session-1", tenant_id="tenant-demo")
+        db.add(session)
+        db.commit()
+        request = _request().model_copy(
+            update={"ui_locale": "en-US", "agent_reply_locale": "zh-CN"}
+        )
+        store = HarnessTurnStore(db)
+
+        claim = store.claim(session, request)
+
+        assert claim.record is not None
+        assert request.ui_locale is SupportedLocale.EN_US
+        assert request.agent_reply_locale is SupportedLocale.ZH_CN
+        assert request.language_context is not None
+        assert request.language_context.ui_locale is SupportedLocale.EN_US
+        assert request.language_context.agent_reply_locale is SupportedLocale.ZH_CN
+        assert session.agent_reply_locale == "zh-CN"
+        assert session.agent_reply_locale_source == "explicit_request"
+        assert claim.record.language_context_json == request.language_context.model_dump(mode="json")
+
+        expected = ChatTurnResponse(
+            reply="done",
+            session_id=session.id,
+            ui_locale=SupportedLocale.EN_US,
+            agent_reply_locale=SupportedLocale.ZH_CN,
+            language_context=request.language_context,
+            session_state=SessionPublic(
+                session_id=session.id,
+                tenant_id=session.tenant_id,
+            ),
+        )
+        store.complete(claim.record, expected)
+
+        replay = store.claim(session, request)
+
+        assert replay.replay == expected
+        assert replay.replay is not None
+        assert replay.replay.language_context == request.language_context
+
+
+def test_same_client_turn_id_with_different_locale_is_rejected_and_digest_changes() -> None:
+    """Treat locale changes as a distinct request and reject them under one client turn ID."""
+    engine = _engine()
+    with Session(engine) as db:
+        session = ChatSession(id="session-1", tenant_id="tenant-demo")
+        db.add(session)
+        db.commit()
+        store = HarnessTurnStore(db)
+        first = _request().model_copy(
+            update={"ui_locale": "en-US", "agent_reply_locale": "zh-CN"}
+        )
+        second = _request().model_copy(
+            update={"ui_locale": "zh-CN", "agent_reply_locale": "en-US"}
+        )
+
+        store.claim(session, first)
+
+        assert _request_digest(first) != _request_digest(second)
+        try:
+            store.claim(session, second)
+        except HarnessTurnConflict as exc:
+            assert "不能用于不同" in str(exc)
+        else:  # pragma: no cover - defensive assertion
+            raise AssertionError("locale mutation reused the existing client turn")
+
+
+def test_completed_replay_prefers_durable_snapshot_over_new_session_preference() -> None:
+    """Replay the original turn snapshot even after a later session preference change."""
+    engine = _engine()
+    with Session(engine) as db:
+        session = ChatSession(id="session-1", tenant_id="tenant-demo")
+        db.add(session)
+        db.commit()
+        store = HarnessTurnStore(db)
+        first = _request().model_copy(
+            update={"ui_locale": "en-US", "agent_reply_locale": "zh-CN"}
+        )
+        claim = store.claim(session, first)
+        assert claim.record is not None
+        expected = ChatTurnResponse(
+            reply="done",
+            session_id=session.id,
+            session_state=SessionPublic(
+                session_id=session.id,
+                tenant_id=session.tenant_id,
+            ),
+        )
+        store.complete(claim.record, expected)
+
+        session.agent_reply_locale = SupportedLocale.EN_US.value
+        session.agent_reply_locale_source = "explicit_request"
+        db.add(session)
+        db.commit()
+
+        retry = _request().model_copy(update={"client_turn_id": first.client_turn_id})
+        replay = store.claim(session, retry)
+
+        assert replay.replay == expected
+        assert replay.replay is not None
+        assert replay.replay.ui_locale is SupportedLocale.EN_US
+        assert replay.replay.agent_reply_locale is SupportedLocale.ZH_CN
+
+
+def test_legacy_turn_request_remains_usable_without_explicit_locale_fields() -> None:
+    """Keep old callers valid while assigning the deterministic compatibility language snapshot."""
+    engine = _engine()
+    with Session(engine) as db:
+        session = ChatSession(id="session-1", tenant_id="tenant-demo")
+        db.add(session)
+        db.commit()
+
+        claim = HarnessTurnStore(db).claim(session, _request())
+
+        assert claim.record is not None
+        assert claim.record.language_context_json == {
+            "version": 1,
+            "ui_locale": "zh-CN",
+            "agent_reply_locale": "zh-CN",
+            "ui_locale_source": "legacy_default",
+            "agent_reply_locale_source": "legacy_default",
+        }
+
+
+def test_turn_receipt_claim_binds_the_authoritative_tenant_lifecycle_version() -> None:
+    """A durable turn receipt must retain the active tenant version used at admission."""
+    engine = _engine()
+    with Session(engine) as db:
+        db.add(
+            Tenant(
+                id="tenant-demo",
+                name="Demo",
+                status="active",
+                lifecycle_version=7,
+            )
+        )
+        session = ChatSession(id="session-1", tenant_id="tenant-demo")
+        db.add(session)
+        db.commit()
+
+        claim = HarnessTurnStore(db).claim(session, _request()).record
+
+        assert claim is not None
+        assert claim.tenant_lifecycle_version == 7
+
+
+def test_suspended_tenant_cannot_create_a_new_turn_receipt() -> None:
+    """Suspension must deny turn admission before a receipt or session mutation is committed."""
+    engine = _engine()
+    with Session(engine) as db:
+        db.add(
+            Tenant(
+                id="tenant-demo",
+                name="Demo",
+                status="suspended",
+                lifecycle_version=8,
+            )
+        )
+        session = ChatSession(id="session-1", tenant_id="tenant-demo")
+        db.add(session)
+        db.commit()
+
+        with pytest.raises(Exception) as denied:
+            HarnessTurnStore(db).claim(session, _request())
+
+        assert getattr(denied.value, "code", None) == "TENANT_SUSPENDED"
+        assert db.exec(
+            select(HarnessTurnRecord).where(
+                HarnessTurnRecord.session_id == session.id,
+                HarnessTurnRecord.client_turn_id == "turn-client-1",
+            )
+        ).all() == []

@@ -1,0 +1,136 @@
+{
+  "task": "T091",
+  "owner": "backend/harness-capability-invoker",
+  "catalogs": ["en-US", "zh-CN"],
+  "status": "pending-catalog-unlock",
+  "entries": [
+    {
+      "code": "TOOL_NOT_AVAILABLE",
+      "message_key": "errors.tool.notAvailable",
+      "params": {},
+      "status": 404,
+      "retryable": false,
+      "source": "backend/app/core/harness_capability_invoker.py"
+    },
+    {
+      "code": "CAPABILITY_NOT_ACTIVATED",
+      "message_key": "errors.capability.notActivated",
+      "params": {},
+      "status": 409,
+      "retryable": false,
+      "source": "backend/app/core/harness_capability_invoker.py"
+    },
+    {
+      "code": "CAPABILITY_AUTHORIZATION_REVOKED",
+      "message_key": "errors.capability.authorizationRevoked",
+      "params": {},
+      "status": 403,
+      "retryable": false,
+      "source": "backend/app/core/harness_capability_invoker.py"
+    },
+    {
+      "code": "UNSUPPORTED_CAPABILITY",
+      "message_key": "errors.capability.unsupported",
+      "params": {},
+      "status": 400,
+      "retryable": false,
+      "source": "backend/app/core/harness_capability_invoker.py"
+    },
+    {
+      "code": "HARNESS_TOOL_ERROR",
+      "message_key": "errors.harness.toolError",
+      "params": {},
+      "status": 500,
+      "retryable": false,
+      "source": "backend/app/core/harness_capability_invoker.py"
+    },
+    {
+      "code": "TOOL_CALL_OUTCOME_UNKNOWN",
+      "message_key": "errors.tool.callOutcomeUnknown",
+      "params": {},
+      "status": 409,
+      "retryable": false,
+      "source": "backend/app/core/harness_capability_invoker.py"
+    },
+    {
+      "code": "UNSUPPORTED_INTERNAL_CAPABILITY",
+      "message_key": "errors.capability.unsupportedInternal",
+      "params": {},
+      "status": 400,
+      "retryable": false,
+      "source": "backend/app/core/harness_capability_invoker.py"
+    },
+    {
+      "code": "INVALID_ARGUMENTS",
+      "message_key": "errors.common.invalidArguments",
+      "params": {},
+      "status": 422,
+      "retryable": false,
+      "source": "backend/app/core/harness_capability_invoker.py"
+    },
+    {
+      "code": "PUBLISHED_DELIVERABLE_NOT_FOUND",
+      "message_key": "errors.harness.publishedDeliverableNotFound",
+      "params": {},
+      "status": 404,
+      "retryable": false,
+      "source": "backend/app/core/harness_capability_invoker.py"
+    },
+    {
+      "code": "PUBLISHED_DELIVERABLE_CHANGED",
+      "message_key": "errors.harness.publishedDeliverableChanged",
+      "params": {},
+      "status": 409,
+      "retryable": false,
+      "source": "backend/app/core/harness_capability_invoker.py"
+    },
+    {
+      "code": "PUBLISHED_DELIVERABLE_LOCATION_CONFLICT",
+      "message_key": "errors.harness.publishedDeliverableLocationConflict",
+      "params": {},
+      "status": 409,
+      "retryable": false,
+      "source": "backend/app/core/harness_capability_invoker.py"
+    },
+    {
+      "code": "CAPABILITY_NOT_AVAILABLE",
+      "message_key": "errors.capability.notAvailable",
+      "params": {},
+      "status": 404,
+      "retryable": false,
+      "source": "backend/app/core/harness_capability_invoker.py"
+    },
+    {
+      "code": "SKILL_NOT_AVAILABLE",
+      "message_key": "errors.skill.notAvailable",
+      "params": {},
+      "status": 404,
+      "retryable": false,
+      "source": "backend/app/core/harness_capability_invoker.py"
+    },
+    {
+      "code": "CAPABILITY_SNAPSHOT_CHANGED",
+      "message_key": "errors.capability.snapshotChanged",
+      "params": {},
+      "status": 409,
+      "retryable": false,
+      "source": "backend/app/core/harness_capability_invoker.py"
+    },
+    {
+      "code": "KNOWLEDGE_NOT_AVAILABLE",
+      "message_key": "errors.knowledge.notAvailable",
+      "params": {},
+      "status": 403,
+      "retryable": false,
+      "source": "backend/app/core/harness_capability_invoker.py"
+    },
+    {
+      "code": "TOOL_RESULT_PERSIST_FAILED",
+      "message_key": "errors.harness.toolResultPersistFailed",
+      "params": {},
+      "status": 500,
+      "retryable": false,
+      "source": "backend/app/core/harness_capability_invoker.py"
+    }
+  ]
+}

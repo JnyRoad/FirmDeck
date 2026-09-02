@@ -1,6 +1,7 @@
 import { ChevronLeftIcon, ChevronRightIcon } from 'lucide-react';
 
 import { cn } from '@/lib/utils';
+import { useAppIntl } from '@/i18n/useAppIntl';
 
 import { Pagination, PaginationContent, PaginationItem } from './ui';
 
@@ -57,6 +58,7 @@ export function Paginator({
   className,
   'aria-label': ariaLabel,
 }: PaginatorProps) {
+  const { t } = useAppIntl();
   if (pageCount < 1) return null;
   const range = getPaginationRange(page, pageCount, siblingCount);
   const label = (value: number) => (padZero ? String(value).padStart(2, '0') : String(value));
@@ -65,7 +67,10 @@ export function Paginator({
     if (next !== page) onChange(next);
   };
   return (
-    <Pagination aria-label={ariaLabel} className={cn('mt-[16px]', className)}>
+    <Pagination
+      aria-label={ariaLabel || t('common.pagination.label')}
+      className={cn('mt-[16px]', className)}
+    >
       <PaginationContent className="gap-[16px]">
         <PaginationItem>
           <button
@@ -73,7 +78,7 @@ export function Paginator({
             className={ARROW_CLASS}
             disabled={page <= 1}
             onClick={() => goTo(page - 1)}
-            aria-label="上一页"
+            aria-label={t('common.pagination.previous')}
           >
             <ChevronLeftIcon className="size-[14px]" />
           </button>
@@ -112,7 +117,7 @@ export function Paginator({
             className={ARROW_CLASS}
             disabled={page >= pageCount}
             onClick={() => goTo(page + 1)}
-            aria-label="下一页"
+            aria-label={t('common.pagination.next')}
           >
             <ChevronRightIcon className="size-[14px]" />
           </button>

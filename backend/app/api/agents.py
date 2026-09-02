@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import ExitStack
+from copy import deepcopy
 from datetime import UTC, datetime
 from time import sleep
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -8,24 +10,6 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlmodel import Session, select
 
-from app.agents.schema import (
-    AgentModelsUpdateRequest,
-    AgentAPICredentialCreateRequest,
-    AgentAPICredentialCreated,
-    AgentAPICredentialRead,
-    AgentProfileCreateRequest,
-    AgentProfileRead,
-    AgentProfileUpdateRequest,
-    AgentResourceBindingInput,
-    AgentResourceImportRequest,
-    AgentResourceBindingRead,
-    AgentResourcesUpdateRequest,
-    AgentScopeRead,
-    AgentSkillRollbackRequest,
-    AgentWorkRecordEventRead,
-    AgentWorkRecordRead,
-    AgentWorkRecordReplyStatsRead,
-)
 from app.agents.branching import (
     agent_private_metadata,
     branch_versions,
@@ -41,19 +25,51 @@ from app.agents.branching import (
     sync_branch_from_overall,
     visible_skill_rows,
 )
+from app.agents.schema import (
+    AgentAPICredentialCreated,
+    AgentAPICredentialCreateRequest,
+    AgentAPICredentialRead,
+    AgentAPICredentialReveal,
+    AgentModelsUpdateRequest,
+    AgentProfileCreateRequest,
+    AgentProfileRead,
+    AgentProfileUpdateRequest,
+    AgentResourceBindingInput,
+    AgentResourceBindingRead,
+    AgentResourceImportRequest,
+    AgentResourcesUpdateRequest,
+    AgentScopeRead,
+    AgentSkillRollbackRequest,
+    AgentWorkRecordEventRead,
+    AgentWorkRecordRead,
+    AgentWorkRecordReplyStatsRead,
+)
+from app.channels import binding_lifecycle_lock
+from app.channels.service_account_operations import (
+    ensure_channel_binding_has_no_blocking_account_operation,
+)
+from app.channels.service_routing_locks import (
+    agent_routing_lifecycle_locks,
+    claim_channel_binding_revision,
+)
+from app.contracts.domain_http import domain_http_error
+from app.contracts.http import build_http_exception
 from app.db import get_session
 from app.db.models import (
-    APIClient,
-    APICredential,
-    AgentModelBinding,
     AgentKnowledgeBranch,
+    AgentModelBinding,
     AgentProfile,
     AgentResourceBinding,
     AgentSkillBranch,
     AgentSkillBranchVersion,
     AgentUsage,
+    APIClient,
+    APICredential,
+    ChannelBinding,
+    ChannelBindingAgent,
     ChatSession,
     GeneralSkill,
+    HumanHandoffRequest,
     KnowledgeBase,
     KnowledgeBucket,
     KnowledgeChunk,
@@ -62,9 +78,10 @@ from app.db.models import (
     ModelConfig,
     ScheduledTask,
     Skill,
+    TeamMember,
     Tool,
-    utc_now,
     User,
+    utc_now,
 )
 from app.public_api.auth import generate_api_key
 from app.public_api.credential_profiles import (
@@ -73,9 +90,14 @@ from app.public_api.credential_profiles import (
     scopes_for_agent_access,
 )
 from app.security.auth import get_current_user
+from app.security.encryption import decrypt_recoverable_api_key, encrypt_secret
 from app.security.permissions import agent_owned_by_user as _agent_owned_by_user
 from app.security.permissions import is_admin_user as _is_admin_user
 from app.security.tenant import ensure_tenant
+from app.session.cleanup import (
+    purge_chat_session_records,
+    remove_chat_session_workspace,
+)
 
 IMPORT_LOCK_RETRY_ATTEMPTS = 2
 IMPORT_LOCK_RETRY_DELAY_SECONDS = 0.5
@@ -85,6 +107,25 @@ chat_router = APIRouter(prefix="/api/chat/agents", tags=["chat:agents"])
 scope_router = APIRouter(prefix="/api/enterprise/agent-scope", tags=["enterprise:agent-scope"])
 
 STAFFDECK_AGENT_API_CLIENT_NAME = "StaffDeck 员工 API 密钥"
+
+
+def _agent_error(
+    code: str,
+    status_code: int,
+    *,
+    params: dict[str, object] | None = None,
+    retryable: bool | None = None,
+    cause: BaseException | None = None,
+) -> HTTPException:
+    """Return a canonical agent API error; exception text remains private diagnostics."""
+    return domain_http_error(
+        code,
+        source="agents.api",
+        status_code=status_code,
+        params=params,
+        retryable=retryable,
+        cause=cause,
+    )
 
 
 @scope_router.get("", response_model=AgentScopeRead)
@@ -133,17 +174,17 @@ def create_agent(
     user = current_user
     _ensure_request_tenant(request.tenant_id, user)
     if request.is_overall and not _is_admin_user(user):
-        raise HTTPException(status_code=403, detail="Only administrator can create overall agent")
+        raise _agent_error("AGENT_OVERALL_CREATE_FORBIDDEN", 403)
     name = str(request.name or "").strip()
     if not name:
-        raise HTTPException(status_code=400, detail="Agent name cannot be empty")
+        raise _agent_error("AGENT_NAME_REQUIRED", 400)
     existing = db.exec(
         select(AgentProfile).where(
             AgentProfile.tenant_id == request.tenant_id, AgentProfile.name == name
         )
     ).first()
     if existing:
-        raise HTTPException(status_code=409, detail="Agent name already exists")
+        raise _agent_error("AGENT_NAME_CONFLICT", 409)
     row = AgentProfile(
         tenant_id=request.tenant_id,
         name=name,
@@ -223,11 +264,14 @@ def create_agent_api_credential(
     db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ) -> AgentAPICredentialCreated:
+    """创建员工密钥并保存仅供受授权复制操作使用的加密副本。"""
+    # 先确认当前用户对目标员工有管理权限。
     agent = _get_agent(db, request.tenant_id, agent_id)
     _ensure_can_manage_agent(agent, current_user)
     if agent.is_overall:
-        raise HTTPException(status_code=400, detail="Open gallery cannot own an employee API key")
+        raise _agent_error("AGENT_OPEN_GALLERY_CREDENTIAL_FORBIDDEN", 400)
     client = _ensure_staffdeck_agent_api_client(db, request.tenant_id, current_user)
+    # 再同时持久化认证摘要与不可出现在列表响应中的加密副本。
     token, prefix, digest = generate_api_key()
     row = APICredential(
         tenant_id=request.tenant_id,
@@ -236,6 +280,7 @@ def create_agent_api_credential(
         name=request.name.strip(),
         key_prefix=prefix,
         key_digest=digest,
+        encrypted_key=encrypt_secret(token),
         scopes_json=scopes_for_agent_access(request.access),
         expires_at=request.expires_at,
     )
@@ -259,12 +304,16 @@ def rotate_agent_api_credential(
     db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ) -> AgentAPICredentialCreated:
+    """轮换员工密钥并以新值替换认证摘要和加密副本。"""
+    # 先校验管理权限并将凭据限制到员工所在租户。
     agent = _get_agent(db, tenant_id, agent_id)
     _ensure_can_manage_agent(agent, current_user)
     row = _get_agent_api_credential(db, tenant_id, agent_id, credential_id)
+    # 再用同一个新值更新验证摘要和受保护的复制副本。
     token, prefix, digest = generate_api_key()
     row.key_prefix = prefix
     row.key_digest = digest
+    row.encrypted_key = encrypt_secret(token)
     row.status = "active"
     row.revoked_at = None
     row.updated_at = utc_now()
@@ -278,6 +327,33 @@ def rotate_agent_api_credential(
 
 
 @enterprise_router.post(
+    "/{agent_id}/api-credentials/{credential_id}/reveal",
+    response_model=AgentAPICredentialReveal,
+)
+def reveal_agent_api_credential(
+    agent_id: str,
+    credential_id: str,
+    tenant_id: str = Query(...),
+    db: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+) -> AgentAPICredentialReveal:
+    """为获授权管理者读取一把可用员工密钥的完整值，不向列表接口扩散明文。"""
+    # 先沿用员工管理权限和租户范围检查。
+    agent = _get_agent(db, tenant_id, agent_id)
+    _ensure_can_manage_agent(agent, current_user)
+    row = _get_agent_api_credential(db, tenant_id, agent_id, credential_id)
+    # 仅启用中的凭据允许读取，禁用后的值不能被重新复制。
+    if row.status != "active":
+        raise _agent_error("AGENT_CREDENTIAL_INACTIVE", 409)
+    # 历史凭据没有加密副本，或 APP_SECRET 已变更时，提示轮换而不返回部分值。
+    try:
+        api_key = decrypt_recoverable_api_key(row.encrypted_key)
+    except ValueError as exc:
+        raise _agent_error("AGENT_CREDENTIAL_RECOVERY_REQUIRED", 409, cause=exc) from exc
+    return AgentAPICredentialReveal(api_key=api_key)
+
+
+@enterprise_router.post(
     "/{agent_id}/api-credentials/{credential_id}/revoke",
     response_model=AgentAPICredentialRead,
 )
@@ -288,16 +364,36 @@ def revoke_agent_api_credential(
     db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ) -> AgentAPICredentialRead:
+    """禁用员工密钥并清除不再需要的加密复制副本。"""
+    # 先沿用员工管理权限与租户范围校验。
     agent = _get_agent(db, tenant_id, agent_id)
     _ensure_can_manage_agent(agent, current_user)
     row = _get_agent_api_credential(db, tenant_id, agent_id, credential_id)
+    # 禁用后不允许再次复制，因此立即减少数据库中可恢复明文的留存。
     row.status = "revoked"
+    row.encrypted_key = None
     row.revoked_at = utc_now()
     row.updated_at = utc_now()
     db.add(row)
     db.commit()
     db.refresh(row)
     return _agent_api_credential_read(row)
+
+
+@enterprise_router.delete("/{agent_id}/api-credentials/{credential_id}", status_code=204)
+def delete_agent_api_credential(
+    agent_id: str,
+    credential_id: str,
+    tenant_id: str = Query(...),
+    db: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+) -> None:
+    """永久删除当前用户有管理权的员工 API 密钥。"""
+    agent = _get_agent(db, tenant_id, agent_id)
+    _ensure_can_manage_agent(agent, current_user)
+    row = _get_agent_api_credential(db, tenant_id, agent_id, credential_id)
+    db.delete(row)
+    db.commit()
 
 
 @enterprise_router.get("/{agent_id}/work-record", response_model=AgentWorkRecordRead)
@@ -313,7 +409,7 @@ def get_agent_work_record(
     try:
         local_timezone = ZoneInfo(timezone)
     except (ZoneInfoNotFoundError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail="Invalid timezone") from exc
+        raise _agent_error("AGENT_TIMEZONE_INVALID", 400, cause=exc) from exc
 
     now = utc_now()
     reply_rows = db.exec(
@@ -373,7 +469,7 @@ def update_agent(
     if request.name is not None:
         name = request.name.strip()
         if not name:
-            raise HTTPException(status_code=400, detail="Agent name cannot be empty")
+            raise _agent_error("AGENT_NAME_REQUIRED", 400)
         conflict = db.exec(
             select(AgentProfile).where(
                 AgentProfile.tenant_id == request.tenant_id,
@@ -382,7 +478,7 @@ def update_agent(
             )
         ).first()
         if conflict:
-            raise HTTPException(status_code=409, detail="Agent name already exists")
+            raise _agent_error("AGENT_NAME_CONFLICT", 409)
         row.name = name
     if request.description is not None:
         row.description = request.description
@@ -414,7 +510,7 @@ def unpublish_agent_from_gallery(
     _ensure_admin_user(tenant_id, current_user)
     row = _get_agent(db, tenant_id, agent_id)
     if row.is_overall:
-        raise HTTPException(status_code=400, detail="Overall agent cannot be unpublished")
+        raise _agent_error("AGENT_OVERALL_UNPUBLISH_FORBIDDEN", 400)
 
     metadata = dict(row.metadata_json or {})
     if metadata.get("published_to_gallery") is not True:
@@ -434,6 +530,21 @@ def unpublish_agent_from_gallery(
     return agent_read(row, _bindings_by_agent(db, tenant_id).get(row.id, []))
 
 
+def _affected_channel_binding_ids(db: Session, agent_id: str) -> tuple[str, ...]:
+    """返回员工挂载或默认指针涉及的全部 binding ID，并按 ID 确定性排序。
+
+    该函数只读当前事务，覆盖有挂载行和仅保留 `ChannelBinding.agent_id` 的存量 binding；数据库
+    查询失败直接向调用方传播，不产生持久化副作用。
+    """
+    mounted_ids = db.exec(
+        select(ChannelBindingAgent.binding_id).where(ChannelBindingAgent.agent_id == agent_id)
+    ).all()
+    default_ids = db.exec(
+        select(ChannelBinding.id).where(ChannelBinding.agent_id == agent_id)
+    ).all()
+    return tuple(sorted({*mounted_ids, *default_ids}))
+
+
 @enterprise_router.delete("/{agent_id}")
 def delete_agent(
     agent_id: str,
@@ -441,17 +552,145 @@ def delete_agent(
     db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ) -> dict[str, str]:
+    """原子删除员工及关联记录，并在渠道 binding 锁内安全改写挂载路由。
+
+    输入员工必须属于当前租户且可由调用者管理。该函数会提交数据库删除并清理会话工作区；
+    affected binding 集变化或任一微信客服账号 operation 未决时，以无敏感参数的稳定 409 拒绝，
+    不产生任何部分写入。
+    """
+    # 先完成员工权限校验并只读快照全部 affected binding ID，任何删除尚未开始。
     row = _get_agent(db, tenant_id, agent_id)
     _ensure_can_manage_agent(row, current_user)
     if row.is_overall:
-        raise HTTPException(status_code=400, detail="Overall agent cannot be deleted")
-    bindings = db.exec(
-        select(AgentResourceBinding).where(AgentResourceBinding.agent_id == row.id)
-    ).all()
-    for binding in bindings:
-        db.delete(binding)
-    db.delete(row)
-    db.commit()
+        raise _agent_error("AGENT_OVERALL_DELETE_FORBIDDEN", 400)
+    affected_binding_ids = _affected_channel_binding_ids(db, row.id)
+    db.rollback()
+
+    workspace_cleanups: list[tuple[str, str, tuple[str, ...]]] = []
+    # 全局锁序第一层：按 binding ID 取得全部生命周期锁，避免多 binding 删除形成锁环。
+    with ExitStack() as binding_locks:
+        for binding_id in affected_binding_ids:
+            binding_locks.enter_context(binding_lifecycle_lock(binding_id))
+
+        # 全局锁序第二层：取得目标 agent lock 后，所有重验、guard 与写入持续到 commit。
+        with agent_routing_lifecycle_locks([agent_id]):
+            # 锁内重新校验员工和 affected 集；新增未锁 binding 时整次请求 fail-closed。
+            row = _get_agent(db, tenant_id, agent_id)
+            _ensure_can_manage_agent(row, current_user)
+            if row.is_overall:
+                raise _agent_error("AGENT_OVERALL_DELETE_FORBIDDEN", 400)
+            channel_mounts = db.exec(
+                select(ChannelBindingAgent).where(ChannelBindingAgent.agent_id == row.id)
+            ).all()
+            locked_binding_ids = _affected_channel_binding_ids(db, row.id)
+            if set(locked_binding_ids) - set(affected_binding_ids):
+                db.rollback()
+                raise build_http_exception("CHANNEL_CONFLICT", status_code=409)
+            # The set may safely shrink while waiting: every still-affected binding is locked.
+            affected_binding_ids = locked_binding_ids
+            affected_bindings = {
+                binding_id: binding
+                for binding_id in affected_binding_ids
+                if (binding := db.get(ChannelBinding, binding_id)) is not None
+            }
+            if len(affected_bindings) != len(affected_binding_ids):
+                db.rollback()
+                raise build_http_exception("CHANNEL_CONFLICT", status_code=409)
+            expected_revisions = {
+                binding_id: binding.config_revision
+                for binding_id, binding in affected_bindings.items()
+            }
+
+            # 所有 guard 必须在首个数据库写入前完成，任一未决 operation 都是零部分提交。
+            for binding_id in affected_binding_ids:
+                binding = affected_bindings.get(binding_id)
+                if binding is not None:
+                    ensure_channel_binding_has_no_blocking_account_operation(db, binding)
+
+            # guard 全部通过后才删除员工资源与渠道挂载。
+            bindings = db.exec(
+                select(AgentResourceBinding).where(AgentResourceBinding.agent_id == row.id)
+            ).all()
+            for binding in bindings:
+                db.delete(binding)
+            for mount in channel_mounts:
+                db.delete(mount)
+            db.flush()
+
+            # 每个变化 binding 只推进一次 revision；默认被删时提升剩余首个挂载。
+            for binding_id in affected_binding_ids:
+                channel_binding = affected_bindings.get(binding_id)
+                if channel_binding is None:
+                    continue
+                remaining = db.exec(
+                    select(ChannelBindingAgent)
+                    .where(ChannelBindingAgent.binding_id == binding_id)
+                    .order_by(ChannelBindingAgent.sort_order, ChannelBindingAgent.created_at)
+                ).first()
+                if channel_binding.agent_id == row.id and remaining:
+                    remaining.is_default = True
+                    channel_binding.agent_id = remaining.agent_id
+                    db.add(remaining)
+                channel_binding.updated_at = utc_now()
+                db.add(channel_binding)
+
+            # 会话级联清理：员工删除后不允许默认 persona 静默接管历史会话。
+            sessions = db.exec(
+                select(ChatSession).where(
+                    ChatSession.tenant_id == tenant_id,
+                    ChatSession.agent_id == row.id,
+                )
+            ).all()
+            for session in sessions:
+                cleanup = purge_chat_session_records(db, session)
+                workspace_cleanups.append((session.tenant_id, session.id, cleanup.workspace_roots))
+
+            # 团队、任务与待处理转接同步终结，随后在全部路由锁内提交。
+            memberships = db.exec(select(TeamMember).where(TeamMember.agent_id == row.id)).all()
+            for membership in memberships:
+                db.delete(membership)
+            scheduled_tasks = db.exec(
+                select(ScheduledTask).where(
+                    ScheduledTask.tenant_id == tenant_id,
+                    ScheduledTask.agent_id == row.id,
+                    ScheduledTask.status == "active",
+                )
+            ).all()
+            for task in scheduled_tasks:
+                task.status = "paused"
+                task.next_run_at = None
+                task.updated_at = utc_now()
+                db.add(task)
+            pending_handoffs = db.exec(
+                select(HumanHandoffRequest).where(
+                    HumanHandoffRequest.tenant_id == tenant_id,
+                    HumanHandoffRequest.agent_id == row.id,
+                    HumanHandoffRequest.status == "pending",
+                )
+            ).all()
+            for handoff in pending_handoffs:
+                handoff.status = "cancelled"
+                handoff.updated_at = utc_now()
+                db.add(handoff)
+            db.delete(row)
+            for binding_id, channel_binding in affected_bindings.items():
+                if not claim_channel_binding_revision(
+                    db,
+                    channel_binding,
+                    expected_revisions[binding_id],
+                ):
+                    db.rollback()
+                    raise build_http_exception("CHANNEL_CONFLICT", status_code=409)
+            db.commit()
+
+    # 数据库提交并释放全部 binding 锁后，再清理每个已删除会话的工作区。
+    for session_tenant_id, session_id, workspace_roots in workspace_cleanups:
+        remove_chat_session_workspace(
+            tenant_id=session_tenant_id,
+            session_id=session_id,
+            db=db,
+            workspace_roots=workspace_roots,
+        )
     return {"status": "deleted"}
 
 
@@ -483,7 +722,7 @@ def update_agent_resources(
     agent = _get_agent(db, request.tenant_id, agent_id)
     _ensure_can_manage_agent(agent, current_user)
     if agent.is_overall:
-        raise HTTPException(status_code=400, detail="Overall agent uses the global resource pool")
+        raise _agent_error("AGENT_GLOBAL_RESOURCE_POOL", 400)
     existing = db.exec(
         select(AgentResourceBinding).where(
             AgentResourceBinding.tenant_id == request.tenant_id,
@@ -533,7 +772,7 @@ def import_agent_resources(
             if not _is_database_locked_error(exc) or attempt >= IMPORT_LOCK_RETRY_ATTEMPTS - 1:
                 raise
             sleep(IMPORT_LOCK_RETRY_DELAY_SECONDS * (attempt + 1))
-    raise HTTPException(status_code=503, detail="Resource import is temporarily busy")
+    raise _agent_error("AGENT_RESOURCE_IMPORT_BUSY", 503, retryable=True)
 
 
 def _import_agent_resources_once(
@@ -548,10 +787,10 @@ def _import_agent_resources_once(
     _ensure_can_import_to_agent(target_agent, user)
     _ensure_can_copy_from_agent(source_agent, user)
     if source_agent.id == target_agent.id:
-        raise HTTPException(status_code=400, detail="Source and target agent cannot be the same")
+        raise _agent_error("AGENT_RESOURCE_SOURCE_TARGET_SAME", 400)
     resource_ids = _dedupe_ids(request.resource_ids)
     if not resource_ids:
-        raise HTTPException(status_code=400, detail="No resources selected")
+        raise _agent_error("AGENT_RESOURCES_REQUIRED", 400)
     imported: list[dict[str, object]] = []
     missing: list[dict[str, str]] = []
     for identifier in resource_ids:
@@ -581,7 +820,7 @@ def _import_agent_resources_once(
                 db, request.tenant_id, source_agent, request.resource_type, resolved
             )
         else:
-            _upsert_imported_resource_binding(
+            resolved = _upsert_imported_resource_binding(
                 db,
                 request.tenant_id,
                 source_agent,
@@ -633,12 +872,10 @@ def sync_agent_skill_from_overall(
     agent = _get_agent(db, tenant_id, agent_id)
     _ensure_can_manage_agent(agent, current_user)
     if agent.is_overall:
-        raise HTTPException(status_code=400, detail="Overall agent is already the trunk")
+        raise _agent_error("AGENT_OVERALL_TRUNK", 400)
     skill = _get_global_skill(db, tenant_id, skill_id)
     if skill.status != "published":
-        raise HTTPException(
-            status_code=400, detail="Disabled SOP cannot be learned from the open gallery"
-        )
+        raise _agent_error("AGENT_SKILL_NOT_PUBLISHED", 400)
     branch = sync_branch_from_overall(db, tenant_id, agent_id, skill)
     db.commit()
     return {"status": "synced", "skill_id": skill_id, "head_version": branch.head_version}
@@ -655,9 +892,7 @@ def promote_agent_skill_to_overall(
     _ensure_admin_user(tenant_id, current_user)
     agent = _get_agent(db, tenant_id, agent_id)
     if agent.is_overall:
-        raise HTTPException(
-            status_code=400, detail="Overall agent does not have a branch to promote"
-        )
+        raise _agent_error("AGENT_OVERALL_BRANCH_UNAVAILABLE", 400)
     branch = db.exec(
         select(AgentSkillBranch).where(
             AgentSkillBranch.tenant_id == tenant_id,
@@ -666,7 +901,7 @@ def promote_agent_skill_to_overall(
         )
     ).first()
     if not branch:
-        raise HTTPException(status_code=404, detail="Branch not found")
+        raise _agent_error("AGENT_SKILL_BRANCH_NOT_FOUND", 404)
     skill = promote_branch_to_overall(db, tenant_id, branch)
     db.commit()
     return {"status": "promoted", "skill_id": skill_id, "version": skill.version}
@@ -683,9 +918,7 @@ def rollback_agent_skill(
     agent = _get_agent(db, request.tenant_id, agent_id)
     _ensure_can_manage_agent(agent, current_user)
     if agent.is_overall:
-        raise HTTPException(
-            status_code=400, detail="Use the global skill rollback endpoint for overall agent"
-        )
+        raise _agent_error("AGENT_GLOBAL_SKILL_ROLLBACK_REQUIRED", 400)
     branch = rollback_branch(db, request.tenant_id, agent_id, skill_id, request.version)
     db.commit()
     return {"status": "rolled_back", "skill_id": skill_id, "head_version": branch.head_version}
@@ -762,7 +995,7 @@ def list_chat_agents(
     db: Session = Depends(get_session),
 ) -> list[AgentProfileRead]:
     if tenant_id != current_user.tenant_id:
-        raise HTTPException(status_code=403, detail="Tenant mismatch")
+        raise _agent_error("TENANT_MISMATCH", 403)
     ensure_tenant(db, tenant_id)
     rows = db.exec(
         select(AgentProfile)
@@ -790,7 +1023,7 @@ def use_chat_agent(
     db: Session = Depends(get_session),
 ) -> AgentProfileRead:
     if tenant_id != current_user.tenant_id:
-        raise HTTPException(status_code=403, detail="Tenant mismatch")
+        raise _agent_error("TENANT_MISMATCH", 403)
     ensure_tenant(db, tenant_id)
     row = _get_agent(db, tenant_id, agent_id)
     if (
@@ -798,7 +1031,7 @@ def use_chat_agent(
         or row.status != "active"
         or not _chat_agent_visible_to_user(row, current_user)
     ):
-        raise HTTPException(status_code=403, detail="Cannot access this agent")
+        raise _agent_error("AGENT_ACCESS_FORBIDDEN", 403)
     _mark_agent_used(db, tenant_id, current_user, row.id)
     bindings = _bindings_by_agent(db, tenant_id)
     return agent_read(row, bindings.get(row.id, []), True)
@@ -991,7 +1224,7 @@ def _is_database_locked_error(exc: OperationalError) -> bool:
 
 def _ensure_request_tenant(tenant_id: str, user: User) -> None:
     if user.tenant_id != tenant_id:
-        raise HTTPException(status_code=403, detail="Tenant mismatch")
+        raise _agent_error("TENANT_MISMATCH", 403)
 
 
 def _ensure_staffdeck_agent_api_client(
@@ -1035,7 +1268,7 @@ def _get_agent_api_credential(
 ) -> APICredential:
     row = db.get(APICredential, credential_id)
     if not row or row.tenant_id != tenant_id or row.agent_id != agent_id:
-        raise HTTPException(status_code=404, detail="Employee API credential not found")
+        raise _agent_error("AGENT_CREDENTIAL_NOT_FOUND", 404)
     return row
 
 
@@ -1046,6 +1279,7 @@ def _agent_api_credential_read(row: APICredential) -> AgentAPICredentialRead:
         name=row.name,
         access=agent_access_for_scopes(list(row.scopes_json or [])),
         key_prefix=f"{row.key_prefix}…",
+        can_reveal=row.status == "active" and bool(row.encrypted_key),
         scopes=list(row.scopes_json or []),
         status=row.status,
         expires_at=row.expires_at,
@@ -1135,14 +1369,14 @@ def _chat_agent_selectable_to_user(row: AgentProfile, user: User, used_agent_ids
 def _ensure_can_access_agent(row: AgentProfile, user: User) -> None:
     _ensure_request_tenant(row.tenant_id, user)
     if not _agent_visible_to_user(row, user):
-        raise HTTPException(status_code=403, detail="Cannot access this agent")
+        raise _agent_error("AGENT_ACCESS_FORBIDDEN", 403)
 
 
 def _ensure_can_copy_from_agent(row: AgentProfile, user: User) -> None:
     _ensure_request_tenant(row.tenant_id, user)
     if row.is_overall or _agent_visible_to_user(row, user):
         return
-    raise HTTPException(status_code=403, detail="Cannot copy resources from this agent")
+    raise _agent_error("AGENT_RESOURCE_COPY_FORBIDDEN", 403)
 
 
 def _ensure_can_manage_agent(row: AgentProfile, user: User) -> None:
@@ -1150,12 +1384,10 @@ def _ensure_can_manage_agent(row: AgentProfile, user: User) -> None:
     if _is_admin_user(user):
         return
     if row.is_overall:
-        raise HTTPException(status_code=403, detail="Only administrator can manage overall agent")
+        raise _agent_error("AGENT_OVERALL_MANAGE_FORBIDDEN", 403)
     if _agent_owned_by_user(row, user):
         return
-    raise HTTPException(
-        status_code=403, detail="Only the creator or administrator can manage this staff"
-    )
+    raise _agent_error("AGENT_MANAGE_FORBIDDEN", 403)
 
 
 def _ensure_can_import_to_agent(row: AgentProfile, user: User) -> None:
@@ -1168,9 +1400,7 @@ def _ensure_can_import_to_agent(row: AgentProfile, user: User) -> None:
 def _ensure_admin_user(tenant_id: str, user: User) -> None:
     _ensure_request_tenant(tenant_id, user)
     if not _is_admin_user(user):
-        raise HTTPException(
-            status_code=403, detail="Only administrator can update the open gallery"
-        )
+        raise _agent_error("AGENT_GALLERY_UPDATE_FORBIDDEN", 403)
 
 
 def _metadata_with_creator(metadata: dict[str, object], user: User) -> dict[str, object]:
@@ -1253,13 +1483,30 @@ def _copy_resource_binding(
 ) -> None:
     if binding.status != "active":
         return
+    resource_id = binding.resource_id
+    metadata = dict(binding.metadata_json or {})
+    if binding.resource_type == "general_skill":
+        general_skill = db.get(GeneralSkill, binding.resource_id)
+        if (
+            general_skill is not None
+            and general_skill.tenant_id == tenant_id
+            and not is_open_gallery_resource(db, tenant_id, "general_skill", general_skill)
+        ):
+            copied_skill = _copy_private_general_skill(
+                db,
+                tenant_id,
+                general_skill,
+                target_agent_id,
+            )
+            resource_id = copied_skill.id
+            metadata = agent_private_metadata(target_agent_id, metadata)
     copied_binding = AgentResourceBinding(
         tenant_id=tenant_id,
         agent_id=target_agent_id,
         resource_type=binding.resource_type,
-        resource_id=binding.resource_id,
+        resource_id=resource_id,
         status=binding.status,
-        metadata_json=dict(binding.metadata_json or {}),
+        metadata_json=metadata,
     )
     db.add(copied_binding)
     if binding.resource_type == "skill":
@@ -1396,7 +1643,13 @@ def _upsert_imported_resource_binding(
     resource_type: str,
     resolved: AgentResource,
     source_binding: AgentResourceBinding | None,
-) -> None:
+) -> AgentResource:
+    if (
+        resource_type == "general_skill"
+        and isinstance(resolved, GeneralSkill)
+        and not is_open_gallery_resource(db, tenant_id, resource_type, resolved)
+    ):
+        resolved = _copy_private_general_skill(db, tenant_id, resolved, target_agent.id)
     status = source_binding.status if source_binding else "active"
     metadata = agent_private_metadata(
         target_agent.id,
@@ -1430,6 +1683,67 @@ def _upsert_imported_resource_binding(
         _copy_or_update_skill_branch(db, tenant_id, source_agent.id, target_agent.id, resolved)
     elif resource_type == "knowledge_base" and isinstance(resolved, KnowledgeBase):
         _copy_or_update_knowledge_branch(db, tenant_id, source_agent.id, target_agent.id, resolved)
+    return resolved
+
+
+def _copy_private_general_skill(
+    db: Session,
+    tenant_id: str,
+    source: GeneralSkill,
+    target_agent_id: str,
+) -> GeneralSkill:
+    existing_bindings = db.exec(
+        select(AgentResourceBinding).where(
+            AgentResourceBinding.tenant_id == tenant_id,
+            AgentResourceBinding.agent_id == target_agent_id,
+            AgentResourceBinding.resource_type == "general_skill",
+            AgentResourceBinding.status != "deleted",
+        )
+    ).all()
+    for existing_binding in existing_bindings:
+        existing = db.get(GeneralSkill, existing_binding.resource_id)
+        metadata = (
+            existing.metadata_json
+            if existing is not None and isinstance(existing.metadata_json, dict)
+            else {}
+        )
+        if metadata.get("copied_from_general_skill_id") == source.id:
+            return existing
+
+    metadata = agent_private_metadata(target_agent_id, deepcopy(source.metadata_json or {}))
+    metadata["copied_from_general_skill_id"] = source.id
+    metadata["copied_from_general_skill_slug"] = source.slug
+    copied = GeneralSkill(
+        tenant_id=tenant_id,
+        slug=_unique_general_skill_slug(db, tenant_id, f"{source.slug}-copy"),
+        name=source.name,
+        description=source.description,
+        homepage=source.homepage,
+        skill_markdown=source.skill_markdown,
+        skill_files_json=deepcopy(source.skill_files_json or []),
+        metadata_json=metadata,
+        status=source.status,
+        capability_scope=source.capability_scope,
+        permissions_json=deepcopy(source.permissions_json or {}),
+        runtime_config_json=deepcopy(source.runtime_config_json or {}),
+    )
+    db.add(copied)
+    db.flush()
+    return copied
+
+
+def _unique_general_skill_slug(db: Session, tenant_id: str, base_slug: str) -> str:
+    candidate = base_slug
+    suffix = 2
+    while db.exec(
+        select(GeneralSkill).where(
+            GeneralSkill.tenant_id == tenant_id,
+            GeneralSkill.slug == candidate,
+        )
+    ).first():
+        candidate = f"{base_slug}-{suffix}"
+        suffix += 1
+    return candidate
 
 
 def _copy_or_update_skill_branch(
@@ -1698,7 +2012,7 @@ def _get_agent(db: Session, tenant_id: str, agent_id: str) -> AgentProfile:
     ensure_tenant(db, tenant_id)
     row = db.get(AgentProfile, agent_id)
     if not row or row.tenant_id != tenant_id:
-        raise HTTPException(status_code=404, detail="Agent not found")
+        raise _agent_error("AGENT_NOT_FOUND", 404)
     return row
 
 
@@ -1830,9 +2144,7 @@ def _ensure_resource_exists(db: Session, tenant_id: str, item: AgentResourceBind
     }[item.resource_type]
     row = db.get(model, item.resource_id)
     if not row or row.tenant_id != tenant_id:
-        raise HTTPException(
-            status_code=404, detail=f"Resource not found: {item.resource_type}:{item.resource_id}"
-        )
+        raise _agent_error("AGENT_RESOURCE_NOT_FOUND", 404)
 
 
 def _get_global_skill(db: Session, tenant_id: str, skill_id: str) -> Skill:
@@ -1840,7 +2152,7 @@ def _get_global_skill(db: Session, tenant_id: str, skill_id: str) -> Skill:
         select(Skill).where(Skill.tenant_id == tenant_id, Skill.skill_id == skill_id)
     ).first()
     if not row:
-        raise HTTPException(status_code=404, detail="Skill not found")
+        raise _agent_error("SKILL_NOT_FOUND", 404)
     return row
 
 

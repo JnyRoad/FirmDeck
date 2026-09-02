@@ -1,0 +1,6 @@
+{
+  "fixture.action.save": "Save",
+  "fixture.message.greeting": "Hello, <strong>{name}</strong>",
+  "fixture.panel.aria": "Localized fixture panel",
+  "fixture.panel.title": "Internationalization fixture"
+}

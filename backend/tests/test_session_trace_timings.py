@@ -161,13 +161,41 @@ def test_enterprise_trace_timings_include_each_step_and_model_time() -> None:
     ]
     assert [line["model_duration_ms"] for line in harness_model_lines] == [900, 800]
     assert [line["model_call_count"] for line in harness_model_lines] == [1, 1]
-    assert [line["text"] for line in harness_model_lines] == [
-        "第 1 轮决定调用能力",
-        "第 2 轮决定完成任务",
+    assert [line["event_code"] for line in harness_model_lines] == [
+        "trace.harness.model.decision",
+        "trace.harness.model.decision",
     ]
+    assert [line["params"] for line in harness_model_lines] == [
+        {
+            "iteration": "1",
+            "decision": "tool",
+            "call_index": 1,
+            "call_count": 1,
+            "json_attempt": 1,
+            "json_max_attempts": 1,
+            "request_attempt": 1,
+            "request_max_attempts": 1,
+        },
+        {
+            "iteration": "2",
+            "decision": "finish",
+            "call_index": 1,
+            "call_count": 1,
+            "json_attempt": 1,
+            "json_max_attempts": 1,
+            "request_attempt": 1,
+            "request_max_attempts": 1,
+        },
+    ]
+    assert all(line["text"] == "" for line in harness_model_lines)
+    assert all("detail" not in line for line in harness_model_lines)
     assert all(line["depth"] == 1 for line in harness_model_lines)
     assert lines["response_generation"]["duration_ms"] == 1800
     assert lines["response_generation"]["model_duration_ms"] == 1800
+    assert lines["response_generation"]["event_code"] == "trace.response.generation"
+    assert lines["response_generation"]["params"] == {"model_call_count": 1}
+    assert lines["response_generation"]["text"] == ""
+    assert "detail" not in lines["response_generation"]
 
 
 def test_enterprise_trace_timings_merge_overlapping_model_spans() -> None:

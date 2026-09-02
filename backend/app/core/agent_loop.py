@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Iterator
+from datetime import timedelta
 from time import sleep
 from typing import Any, Literal
 
@@ -14,12 +16,18 @@ from app.agents.branching import (
 from app.channels.service_outbox import stage_channel_delivery
 from app.core.agent_identity_prompt import AgentIdentityPrompt
 from app.core.cancellation import clear_chat_turn_cancelled
-from app.core.conversation_context import build_conversation_context
+from app.core.conversation_context import (
+    ConversationContextSettings,
+    build_conversation_context,
+)
 from app.core.conversation_projection import ConversationProjection
 from app.core.graph_rules import GraphRules
-from app.core.harness_agent import HarnessExecutionCancelled
+from app.core.harness_agent import HarnessExecutionCancelled, HarnessExecutionFenced
 from app.core.harness_session_lock import HarnessSessionBusy
-from app.core.harness_turn_store import HarnessTurnConflict
+from app.core.harness_turn_store import (
+    HarnessTurnConflict,
+    _prepare_turn_language_context,
+)
 from app.core.harness_v2_engine import (
     HarnessV2Engine,
     _with_recoverable_first_session,
@@ -30,6 +38,7 @@ from app.core.response_generator import (
     ResponseGenerator,
     format_runtime_failure_reply,
     model_failure_suggestion,
+    public_error_code,
 )
 from app.core.skill_runtime import SkillRuntime
 from app.core.slash_commands import SlashCommandError
@@ -37,6 +46,7 @@ from app.core.turn_finalizer import TurnFinalizer
 from app.db.models import (
     AgentProfile,
     ChannelBinding,
+    ChannelDelivery,
     ChatSession,
     HarnessTurnRecord,
     HumanHandoffRequest,
@@ -45,9 +55,18 @@ from app.db.models import (
     PersonaConfig,
     Skill,
     UIConfig,
+    User,
     new_id,
     utc_now,
 )
+from app.i18n.language_context import (
+    LanguageContext,
+    LanguageContextInputs,
+    ReplyLocaleConflict,
+    resolve_compatible_language_context,
+    resolve_language_context,
+)
+from app.i18n.raw_source import RawSourceKind, RawSourceMarker
 from app.knowledge.citations import (
     compact_knowledge_citation_labels,
     restore_truncated_atomic_references,
@@ -56,11 +75,22 @@ from app.llm import LLMClient, LLMError
 from app.llm.model_config_resolver import (
     resolve_model_config_for_runtime,
 )
+from app.llm.prompts.language import (
+    language_prompt_contract,
+    localized_cancelled_reply,
+    localized_compat_text,
+)
 from app.llm.stage_protocol import stage_payload, unified_system_prompt
 from app.memory.jobs import enqueue_memory_capture
 from app.memory.service import MemoryService
 from app.observability import EventLog
+from app.observability.product_events import record_product_event
 from app.observability.spans import llm_operation
+from app.security.tenant import (
+    TenantExecutionKind,
+    TenantLifecycleDenied,
+    require_active_tenant,
+)
 from app.session.helpers import public_session
 from app.session.message_visibility import visible_message_content, visible_message_rows
 from app.session.origin import PILOTDECK_GROUP_CHAT_CHANNEL
@@ -68,16 +98,37 @@ from app.session.session_schema import (
     ChatTurnRequest,
     ChatTurnResponse,
     RouterDecision,
+    SessionPublic,
     StepAgentResult,
 )
 from app.tools.tool_schema import ToolResult
+
+logger = logging.getLogger(__name__)
+
+_STREAM_FALLBACK_GRACE_SECONDS = 120
 
 STREAM_CHUNK_INTERVAL_SECONDS = 0.045
 MAX_TOOL_ACTIONS_PER_TURN = 32
 MAX_TOOL_ACTIONS_PER_TURN_LIMIT = 100
 GRAPH_PENDING_STEPS_SLOT = "_graph_pending_steps"
-CANCELLED_ASSISTANT_REPLY = "已停止生成"
 ExecutionFinalizeState = Literal["continued", "completed", "handoff"]
+
+
+def _legacy_event_recorder(events: Any) -> Callable[..., Any]:
+    """Return the named compatibility writer, with a narrow old-sink fallback.
+
+    Production :class:`EventLog` instances expose ``record_legacy_event``.  A small
+    number of integration tests and embedding callers still provide the historical
+    ``record``-only sink, so retain that exact compatibility shape without making it
+    the normal producer API.
+    """
+    adapter = getattr(events, "record_legacy_event", None)
+    if callable(adapter):
+        return adapter
+    fallback = getattr(events, "record", None)
+    if callable(fallback):
+        return fallback
+    raise TypeError("event sink does not implement the legacy event contract")
 
 
 def _knowledge_scope_ids(
@@ -140,62 +191,449 @@ class AgentLoop:
         db: Session,
         *,
         event_sink: Callable[[str, dict[str, Any]], None] | None = None,
+        stream_sink: Any | None = None,
     ) -> None:
+        """Initialize the turn runtime with optional progress and answer streaming."""
         self.db = db
         self.events = EventLog(db, event_sink=event_sink)
+        self.stream_sink = stream_sink
+        self.stream_delivery_succeeded = False
+        self.stream_delivery_pending = False
+        self.stream_delivery_id: str | None = None
         self.runtime = SkillRuntime()
         self.response_generator = ResponseGenerator()
         self.memory = MemoryService(db)
+        self._language_context: LanguageContext | None = None
+
+    def _abort_stream_sink(self) -> None:
+        """Retire an unfinished channel stream without exposing provider failures."""
+        self.stream_delivery_pending = False
+        if self.stream_sink is None:
+            return
+        abort = getattr(self.stream_sink, "abort", None)
+        if not callable(abort):
+            return
+        try:
+            abort()
+        except Exception:
+            logger.exception("stream sink abort failed")
+
+    def _prepare_stream_delivery(self, reply: str, streamed_reply: str) -> None:
+        """Freeze the persisted answer in the sink without publishing a terminal frame."""
+        self.stream_delivery_succeeded = False
+        self.stream_delivery_pending = False
+        if self.stream_sink is None:
+            return
+        try:
+            replace_answer = getattr(self.stream_sink, "replace_answer", None)
+            if callable(replace_answer):
+                replace_answer(reply)
+                self.stream_delivery_pending = True
+            elif streamed_reply == reply:
+                self.stream_delivery_pending = True
+        except Exception:
+            logger.exception("stream sink answer preparation failed")
+        if not self.stream_delivery_pending:
+            abort = getattr(self.stream_sink, "abort", None)
+            if callable(abort):
+                try:
+                    abort()
+                except Exception:
+                    logger.exception("stream sink abort failed")
+
+    def _complete_stream_delivery(self) -> None:
+        """Publish the terminal frame only after the answer and fallback commit durably."""
+        if self.stream_sink is None:
+            return
+        succeeded = False
+        if self.stream_delivery_pending:
+            try:
+                succeeded = bool(self.stream_sink.finish())
+            except Exception:
+                logger.exception("stream sink finalization failed")
+            if not succeeded:
+                abort = getattr(self.stream_sink, "abort", None)
+                if callable(abort):
+                    try:
+                        abort()
+                    except Exception:
+                        logger.exception("stream sink abort failed")
+        self.stream_delivery_succeeded = succeeded
+        self.stream_delivery_pending = False
+        try:
+            self._settle_stream_delivery(succeeded=succeeded)
+        except Exception:
+            logger.exception("stream fallback settlement failed")
+            self.db.rollback()
+            try:
+                self._settle_stream_delivery(succeeded=succeeded)
+            except Exception:
+                logger.exception("stream fallback settlement retry failed")
+                self.db.rollback()
+
+    def _settle_stream_delivery(self, *, succeeded: bool) -> None:
+        """Retire or release the durable fallback after the stream terminal attempt."""
+        delivery_id = self.stream_delivery_id
+        if not delivery_id:
+            return
+        delivery = self.db.get(ChannelDelivery, delivery_id)
+        if delivery is None or delivery.status != "pending":
+            self.stream_delivery_id = None
+            return
+        delivery.updated_at = utc_now()
+        if succeeded:
+            delivery.status = "delivered"
+            delivery.next_attempt_at = None
+            delivery.last_error = None
+            delivery.delivered_at = delivery.updated_at
+        else:
+            delivery.next_attempt_at = delivery.updated_at
+            delivery.last_error = "stream_delivery_failed"
+            delivery.delivered_at = None
+        self.db.add(delivery)
+        self.db.commit()
+        self.stream_delivery_id = None
+
+    def _record_legacy_event(
+        self,
+        tenant_id: str,
+        session_id: str,
+        event_type: str,
+        payload: dict[str, Any],
+        *,
+        raw_fields: set[str] | frozenset[str] | None = None,
+    ) -> Any:
+        """Route producer events through the named compatibility adapter.
+
+        The fallback is limited to record-only test/embedding sinks; production
+        ``EventLog`` instances always take ``record_legacy_event`` and therefore
+        retain its allowlist, validation, and usage telemetry.
+        """
+        recorder = _legacy_event_recorder(self.events)
+        if raw_fields is None:
+            return recorder(tenant_id, session_id, event_type, payload)
+        return recorder(
+            tenant_id,
+            session_id,
+            event_type,
+            payload,
+            raw_fields=raw_fields,
+        )
+
+    def _prepare_request_language_context(self, request: ChatTurnRequest) -> LanguageContext:
+        """Resolve one request's UI/reply locales before Harness creates or claims execution state."""
+        # Workflow: a caller-provided internal snapshot is already immutable; otherwise resolve
+        # against the recovered session and user preferences before the engine starts streaming.
+        session_request = _with_recoverable_first_session(request)
+        session = (
+            self.db.get(ChatSession, session_request.session_id)
+            if session_request.session_id
+            else None
+        )
+        if session is not None:
+            existing = None
+            client_turn_id = str(request.client_turn_id or "").strip()
+            if client_turn_id:
+                existing = self.db.exec(
+                    select(HarnessTurnRecord).where(
+                        HarnessTurnRecord.tenant_id == session.tenant_id,
+                        HarnessTurnRecord.session_id == session.id,
+                        HarnessTurnRecord.client_turn_id == client_turn_id,
+                    )
+                ).first()
+            context = _prepare_turn_language_context(
+                self.db,
+                session,
+                request,
+                existing=existing,
+            )
+        elif request.language_context is not None:
+            context = request.language_context
+        else:
+            user = self.db.get(User, request.user_id) if request.user_id else None
+            try:
+                context = resolve_language_context(
+                    LanguageContextInputs(
+                        explicit_ui_locale=request.ui_locale,
+                        explicit_agent_reply_locale=request.agent_reply_locale,
+                        user_ui_locale=user.ui_locale if user else None,
+                        user_agent_reply_locale=user.agent_reply_locale if user else None,
+                    )
+                )
+            except ReplyLocaleConflict as exc:
+                raise HarnessTurnConflict(
+                    "同一个 client_turn_id 不能用于不同的 Harness 请求或语言快照。",
+                    code=exc.code,
+                    params=exc.params,
+                ) from exc
+            request.language_context = context
+            request.ui_locale = context.ui_locale
+            request.agent_reply_locale = context.agent_reply_locale
+        self._language_context = context
+        self.events.bind_turn("", language_context=context)
+        return context
+
+    def _response_with_language_context(self, response: ChatTurnResponse) -> ChatTurnResponse:
+        """Add the active immutable locale snapshot to a response without changing its reply."""
+        if not isinstance(response, ChatTurnResponse):
+            return response
+        context = self._language_context or response.language_context
+        if context is None:
+            return response
+        updates: dict[str, object] = {}
+        if response.ui_locale is None:
+            updates["ui_locale"] = context.ui_locale
+        if response.agent_reply_locale is None:
+            updates["agent_reply_locale"] = context.agent_reply_locale
+        if response.language_context is None:
+            updates["language_context"] = context
+        if not updates:
+            return response
+        return response.model_copy(
+            update=updates
+        )
 
     def _turn_payload(self, payload: dict[str, Any], user_message_id: str | None) -> dict[str, Any]:
+        """Attach turn correlation and the immutable language snapshot to stream payloads."""
         data = dict(payload)
         if user_message_id:
             data.setdefault("user_message_id", user_message_id)
             data.setdefault("turn_id", user_message_id)
+        if self._language_context is not None:
+            data.setdefault(
+                "language_context", self._language_context.model_dump(mode="json")
+            )
         return data
 
-    def handle_turn(self, request: ChatTurnRequest) -> ChatTurnResponse:
+    def _public_runtime_error_detail(self, code: str) -> str:
+        """Return one safe runtime detail for public replies without exposing raw exceptions."""
+        del code
+        return localized_compat_text(
+            self._language_context,
+            zh_cn="本次操作未完成。",
+            en_us="The operation could not be completed.",
+        )
+
+    def _public_turn_rejection_detail(self, code: str) -> str:
+        """Return one safe rejection detail for public busy, replay, and locale-conflict replies."""
+        if code == "INTERNAL_ERROR":
+            return localized_compat_text(
+                self._language_context,
+                zh_cn="本次请求未完成。",
+                en_us="This request could not be completed.",
+            )
+        if code == "AGENT_REPLY_LOCALE_CONFLICT":
+            return localized_compat_text(
+                self._language_context,
+                zh_cn="该会话已绑定回复语言，当前请求不能改写该语言快照。",
+                en_us="This session already has a bound reply locale and cannot be changed by this request.",
+            )
+        return localized_compat_text(
+            self._language_context,
+            zh_cn="该请求当前不能完成。",
+            en_us="This request could not be completed.",
+        )
+
+    def _public_turn_rejection_suggestion(self, code: str) -> str:
+        """Return the safe operator guidance for one rejected Harness turn."""
+        if code == "AGENT_REPLY_LOCALE_CONFLICT":
+            return localized_compat_text(
+                self._language_context,
+                zh_cn="请保持会话已绑定的回复语言，或新建会话后重试。",
+                en_us="Keep the session's bound reply locale, or start a new session and retry.",
+            )
+        return localized_compat_text(
+            self._language_context,
+            zh_cn="请稍后重试，或为新请求使用新的 client_turn_id。",
+            en_us="Please retry later, or use a new client_turn_id for a new request.",
+        )
+
+    def _public_turn_rejection_payload(
+        self,
+        code: str,
+        safe_params: dict[str, object] | None,
+        client_turn_id: str | None,
+    ) -> dict[str, object]:
+        """Project a rejected Harness turn as stable code plus safe params without raw causes."""
+        payload: dict[str, object] = {
+            "code": code,
+            "message": code,
+            "client_turn_id": client_turn_id,
+        }
+        if isinstance(safe_params, dict) and safe_params:
+            payload["params"] = dict(safe_params)
+        return payload
+
+    def handle_turn(
+        self,
+        request: ChatTurnRequest,
+        *,
+        wake_admission_check: Callable[[], None] | None = None,
+    ) -> ChatTurnResponse:
+        """Execute one turn after binding its locale snapshot and preserve compatible error paths."""
         engine = HarnessV2Engine(self)
         chat_session: ChatSession | None = None
         user_message_id: str | None = None
         step_result = StepAgentResult(action="reply")
+        runtime_error_code: str | None = None
         try:
-            return engine.run(request)
-        except (HarnessTurnConflict, HarnessSessionBusy) as exc:
+            if callable(wake_admission_check):
+                wake_admission_check()
+            self._prepare_request_language_context(request)
+            if callable(wake_admission_check):
+                response = engine.run(
+                    request,
+                    wake_admission_check=wake_admission_check,
+                )
+            else:
+                response = engine.run(request)
+            return self._response_with_language_context(response)
+        except HarnessExecutionFenced:
+            # A team wake whose heartbeat/claim was lost must not continue into
+            # normal error finalization. Close only the durable Harness attempt;
+            # the wake executor will fence all team-visible writes itself.
             chat_session = engine.session
             self.db.rollback()
-            chat_session = chat_session or self._get_or_create_session(request)
-            error_code = (
-                "HARNESS_SESSION_BUSY"
-                if isinstance(exc, HarnessSessionBusy)
-                else "HARNESS_TURN_CONFLICT"
-            )
-            self.events.record(
-                request.tenant_id,
-                chat_session.id,
-                "turn_rejected",
-                {
-                    "code": error_code,
-                    "message": str(exc),
-                    "client_turn_id": request.client_turn_id,
-                },
-            )
-            self.db.commit()
-            return ChatTurnResponse(
+            # Never project the caught exception text into a typed/public response.
+            # The enclosing wake executor retains the precise private reason and
+            # terminalizes it; AgentLoop exposes only the stable fenced contract.
+            code = "TEAM_WAKE_CLAIM_LOST"
+            if chat_session is not None:
+                engine.mark_lifecycle_denied(code)
+                self.db.refresh(chat_session)
+                return self._response_with_language_context(ChatTurnResponse(
+                    reply=code,
+                    session_id=chat_session.id,
+                    runtime_error_code=code,
+                    step_result=step_result,
+                    session_state=public_session(chat_session),
+                ))
+            return self._response_with_language_context(ChatTurnResponse(
+                reply=code,
+                session_id=(
+                    _with_recoverable_first_session(request).session_id
+                    or "session_unbound"
+                ),
+                runtime_error_code=code,
+                step_result=step_result,
+                session_state=SessionPublic(
+                    session_id=(
+                        _with_recoverable_first_session(request).session_id
+                        or "session_unbound"
+                    ),
+                    tenant_id=request.tenant_id,
+                    user_id=request.user_id,
+                    agent_id=request.agent_id,
+                    status="active",
+                ),
+            ))
+        except TenantLifecycleDenied as exc:
+            # Lifecycle admission is a terminal fence, not a transient runtime
+            # failure.  Close any durable attempt and return without entering a
+            # model/AgentLoop retry path or appending a misleading assistant reply.
+            chat_session = engine.session
+            self.db.rollback()
+            if chat_session is None:
+                session_id = (
+                    _with_recoverable_first_session(request).session_id
+                    or "session_unbound"
+                )
+                error_code = public_error_code(exc.code)
+                return self._response_with_language_context(ChatTurnResponse(
+                    reply=format_runtime_failure_reply(
+                        localized_compat_text(
+                            self._language_context,
+                            zh_cn="当前租户暂不可执行该请求",
+                            en_us="This tenant cannot execute the request right now",
+                        ),
+                        error_code,
+                        error_code,
+                        localized_compat_text(
+                            self._language_context,
+                            zh_cn="请联系系统管理员恢复租户后重试。",
+                            en_us="Ask a system administrator to reactivate the tenant, then retry.",
+                        ),
+                        self._language_context,
+                    ),
+                    session_id=session_id,
+                    runtime_error_code=error_code,
+                    step_result=step_result,
+                    session_state=SessionPublic(
+                        session_id=session_id,
+                        tenant_id=request.tenant_id,
+                        user_id=request.user_id,
+                        agent_id=request.agent_id,
+                        status="active",
+                    ),
+                ))
+            engine.mark_lifecycle_denied(exc.code)
+            self.db.refresh(chat_session)
+            error_code = public_error_code(exc.code)
+            return self._response_with_language_context(ChatTurnResponse(
                 reply=format_runtime_failure_reply(
-                    "Harness 并发或重复请求已阻止",
-                    exc,
+                    localized_compat_text(
+                        self._language_context,
+                        zh_cn="当前租户暂不可执行该请求",
+                        en_us="This tenant cannot execute the request right now",
+                    ),
                     error_code,
-                    "请等待原请求完成，或为新请求使用新的 client_turn_id。",
+                    error_code,
+                    localized_compat_text(
+                        self._language_context,
+                        zh_cn="请联系系统管理员恢复租户后重试。",
+                        en_us="Ask a system administrator to reactivate the tenant, then retry.",
+                    ),
+                    self._language_context,
                 ),
                 session_id=chat_session.id,
                 runtime_error_code=error_code,
                 step_result=step_result,
                 session_state=public_session(chat_session),
+            ))
+        except (HarnessTurnConflict, HarnessSessionBusy) as exc:
+            chat_session = engine.session
+            self._abort_stream_sink()
+            self.db.rollback()
+            chat_session = chat_session or self._get_or_create_session(request)
+            raw_error_code = (
+                "HARNESS_SESSION_BUSY"
+                if isinstance(exc, HarnessSessionBusy)
+                else getattr(exc, "code", "HARNESS_TURN_CONFLICT")
             )
+            error_code = public_error_code(raw_error_code)
+            safe_params = getattr(exc, "params", None)
+            self._record_legacy_event(
+                request.tenant_id,
+                chat_session.id,
+                "turn_rejected",
+                self._public_turn_rejection_payload(
+                    error_code,
+                    safe_params if isinstance(safe_params, dict) else None,
+                    request.client_turn_id,
+                ),
+            )
+            self.db.commit()
+            return self._response_with_language_context(ChatTurnResponse(
+                reply=format_runtime_failure_reply(
+                    localized_compat_text(
+                        self._language_context,
+                        zh_cn="Harness 并发或重复请求已阻止",
+                        en_us="The Harness request was rejected",
+                    ),
+                    self._public_turn_rejection_detail(error_code),
+                    error_code,
+                    self._public_turn_rejection_suggestion(error_code),
+                    self._language_context,
+                ),
+                session_id=chat_session.id,
+                runtime_error_code=error_code,
+                step_result=step_result,
+                session_state=public_session(chat_session),
+            ))
         except HarnessExecutionCancelled:
             chat_session = engine.session
             user_message_id = engine.user_message_id
+            self._abort_stream_sink()
             engine.mark_cancelled()
             chat_session = chat_session or self._get_or_create_session(request)
             if user_message_id:
@@ -209,47 +647,76 @@ class AgentLoop:
             for turn_id in (user_message_id, request.client_turn_id):
                 if turn_id:
                     clear_chat_turn_cancelled(chat_session.id, turn_id)
-            return ChatTurnResponse(
-                reply=CANCELLED_ASSISTANT_REPLY,
+            return self._response_with_language_context(ChatTurnResponse(
+                reply=localized_cancelled_reply(self._language_context),
                 session_id=chat_session.id,
                 step_result=step_result,
                 session_state=public_session(chat_session),
-            )
+            ))
         except (AgentLoopPreconditionError, SlashCommandError) as exc:
             chat_session = engine.session
-            engine.mark_interrupted(exc.code, exc.message)
+            safe_code = public_error_code(exc.code)
+            engine.mark_interrupted(safe_code, safe_code)
             chat_session = chat_session or self._get_or_create_session(request)
-            return self._finish_with_error(chat_session, exc.code, exc.message)
+            return self._finish_with_error(chat_session, safe_code, safe_code)
         except LLMError as exc:
             chat_session = engine.session
             user_message_id = engine.user_message_id
-            engine.mark_interrupted("LLM_ERROR", str(exc))
+            self._abort_stream_sink()
+            runtime_error_code = public_error_code(
+                getattr(exc, "code", None),
+                fallback="MODEL_UPSTREAM_ERROR",
+            )
+            logger.exception(
+                "agent loop model failure",
+                extra={"tenant_id": request.tenant_id, "client_turn_id": request.client_turn_id},
+            )
+            engine.mark_interrupted(runtime_error_code, runtime_error_code)
             chat_session = chat_session or self._get_or_create_session(request)
-            self.events.record(
+            self._record_legacy_event(
                 request.tenant_id,
                 chat_session.id,
                 "error_occurred",
-                {"code": "LLM_ERROR", "message": str(exc)},
+                {"code": runtime_error_code, "message": runtime_error_code},
             )
             reply = format_runtime_failure_reply(
-                "模型调用失败", exc, "LLM_ERROR", model_failure_suggestion(exc)
+                "模型调用失败",
+                self._public_runtime_error_detail(runtime_error_code),
+                runtime_error_code,
+                model_failure_suggestion(self._language_context),
+                self._language_context,
             )
-        except Exception as exc:
+        except Exception:
             chat_session = engine.session
             user_message_id = engine.user_message_id
-            engine.mark_interrupted("HARNESS_V2_ERROR", str(exc))
+            self._abort_stream_sink()
+            runtime_error_code = "INTERNAL_ERROR"
+            logger.exception(
+                "agent loop runtime failure",
+                extra={"tenant_id": request.tenant_id, "client_turn_id": request.client_turn_id},
+            )
+            engine.mark_interrupted(runtime_error_code, runtime_error_code)
             chat_session = chat_session or self._get_or_create_session(request)
-            self.events.record(
+            self._record_legacy_event(
                 request.tenant_id,
                 chat_session.id,
                 "error_occurred",
-                {"code": "HARNESS_V2_ERROR", "message": str(exc)},
+                {"code": runtime_error_code, "message": runtime_error_code},
             )
             reply = format_runtime_failure_reply(
-                "Harness v2 执行出错",
-                exc,
-                "HARNESS_V2_ERROR",
-                "请查看执行记录或服务日志定位具体原因。",
+                localized_compat_text(
+                    self._language_context,
+                    zh_cn="Harness v2 执行出错",
+                    en_us="The Harness run failed",
+                ),
+                self._public_runtime_error_detail(runtime_error_code),
+                runtime_error_code,
+                localized_compat_text(
+                    self._language_context,
+                    zh_cn="请稍后重试，或联系管理员查看执行记录。",
+                    en_us="Please retry later or ask an administrator to inspect the run record.",
+                ),
+                self._language_context,
             )
         finally:
             terminal_record = getattr(engine, "turn_record", None)
@@ -279,18 +746,80 @@ class AgentLoop:
         )
         self.db.commit()
         self.db.refresh(chat_session)
-        return ChatTurnResponse(
+        return self._response_with_language_context(ChatTurnResponse(
             reply=reply,
             session_id=chat_session.id,
+            runtime_error_code=runtime_error_code,
             step_result=step_result,
             session_state=public_session(chat_session),
+        ))
+
+    def handle_turn_stream(
+        self,
+        request: ChatTurnRequest,
+        *,
+        wake_admission_check: Callable[[], None] | None = None,
+    ) -> Iterator[dict[str, object]]:
+        yield from self._handle_turn_stream_v2(
+            request,
+            wake_admission_check=wake_admission_check,
         )
 
-    def handle_turn_stream(self, request: ChatTurnRequest) -> Iterator[dict[str, object]]:
-        yield from self._handle_turn_stream_v2(request)
-
-    def _handle_turn_stream_v2(self, request: ChatTurnRequest) -> Iterator[dict[str, object]]:
+    def _handle_turn_stream_v2(
+        self,
+        request: ChatTurnRequest,
+        *,
+        wake_admission_check: Callable[[], None] | None = None,
+    ) -> Iterator[dict[str, object]]:
+        """Resolve turn language before streaming and project an early wake fence safely."""
         session_request = _with_recoverable_first_session(request)
+        try:
+            if callable(wake_admission_check):
+                wake_admission_check()
+        except HarnessExecutionFenced:
+            # A wake can be fenced before a session exists, so project the same
+            # stable stream error without entering normal turn finalization.
+            yield {
+                "event": "error",
+                "data": {
+                    "kind": "error",
+                    "sessionId": session_request.session_id or "session_unbound",
+                    "code": "TEAM_WAKE_CLAIM_LOST",
+                    "message": "TEAM_WAKE_CLAIM_LOST",
+                    "client_turn_id": request.client_turn_id,
+                    "execution_engine": "harness_v2",
+                },
+            }
+            return
+        self._prepare_request_language_context(request)
+        try:
+            require_active_tenant(
+                self.db,
+                request.tenant_id,
+                TenantExecutionKind.JOB_CLAIM,
+                (
+                    str(request.client_turn_id or "").strip()
+                    or session_request.session_id
+                    or "harness-stream"
+                ),
+            )
+        except TenantLifecycleDenied as exc:
+            # Keep denied streams side-effect free: no session_created event,
+            # user message, receipt, or worker session is persisted.
+            error_code = public_error_code(exc.code)
+            session_id = session_request.session_id or "session_unbound"
+            yield {
+                "event": "error",
+                "data": {
+                    "kind": "error",
+                    "sessionId": session_id,
+                    "code": error_code,
+                    "message": error_code,
+                    "client_turn_id": request.client_turn_id,
+                    "execution_engine": "harness_v2",
+                },
+            }
+            return
         existing_session = (
             self.db.get(ChatSession, session_request.session_id)
             if session_request.session_id
@@ -299,6 +828,7 @@ class AgentLoop:
         chat_session = get_or_create_harness_session(
             self,
             session_request,
+            admission_check=wake_admission_check,
         )
         created_session = existing_session is None
         scoped_request = request.model_copy(update={"session_id": chat_session.id})
@@ -329,11 +859,18 @@ class AgentLoop:
         yield self._stream_status(
             chat_session,
             "planning",
-            "正在规划本轮任务",
             {"execution_engine": "harness_v2"},
             user_message_id=initial_turn_id,
         )
-        response = self.handle_turn(scoped_request)
+        if callable(wake_admission_check):
+            response = self.handle_turn(
+                scoped_request,
+                wake_admission_check=wake_admission_check,
+            )
+        else:
+            # Keep lightweight embedding/test overrides that implement the
+            # historical one-argument hook compatible when no wake token exists.
+            response = self.handle_turn(scoped_request)
         chat_session = self.db.get(ChatSession, response.session_id)
         if chat_session is None:
             return
@@ -367,14 +904,15 @@ class AgentLoop:
                 .order_by(Message.created_at.desc())
             ).first()
         user_message_id = user_message.id if user_message else None
-        if response.reply == CANCELLED_ASSISTANT_REPLY:
+        cancelled_reply = localized_cancelled_reply(self._language_context)
+        if response.reply == cancelled_reply:
             yield self._stream_event(
                 "stream_cancelled",
                 chat_session,
                 self._turn_payload(
                     {
                         "phase": "cancelled",
-                        "text": CANCELLED_ASSISTANT_REPLY,
+                        "text": cancelled_reply,
                         "client_turn_id": request.client_turn_id,
                         "execution_engine": "harness_v2",
                     },
@@ -390,7 +928,7 @@ class AgentLoop:
                 self._turn_payload(
                     {
                         "code": response.runtime_error_code,
-                        "message": response.reply,
+                        "message": response.runtime_error_code,
                         "client_turn_id": request.client_turn_id,
                         "execution_engine": "harness_v2",
                     },
@@ -435,15 +973,15 @@ class AgentLoop:
         self,
         chat_session: ChatSession,
         phase: str,
-        text: str,
         extra: dict[str, object] | None = None,
         user_message_id: str | None = None,
     ) -> dict[str, object]:
-        payload: dict[str, object] = {"phase": phase, "text": text, **(extra or {})}
+        """Emit locale-independent status metadata for frontend-owned product chrome."""
+        payload: dict[str, object] = {"phase": phase, **(extra or {})}
         if user_message_id:
             payload = self._turn_payload(payload, user_message_id)
             if phase != "received":
-                self.events.record(
+                self._record_legacy_event(
                     chat_session.tenant_id, chat_session.id, "stream_status", payload
                 )
                 self.db.commit()
@@ -459,6 +997,12 @@ class AgentLoop:
         chat_session: ChatSession,
         payload: dict[str, object],
     ) -> dict[str, object]:
+        """Persist and relay a stream event with its immutable language snapshot."""
+        payload = dict(payload)
+        if self._language_context is not None:
+            payload.setdefault(
+                "language_context", self._language_context.model_dump(mode="json")
+            )
         persisted_stream_events = {
             "agent_loop_completed",
             "agent_loop_continued",
@@ -476,7 +1020,7 @@ class AgentLoop:
         if kind in persisted_stream_events and (
             payload.get("turn_id") or payload.get("user_message_id")
         ):
-            self.events.record(chat_session.tenant_id, chat_session.id, kind, payload)
+            self._record_legacy_event(chat_session.tenant_id, chat_session.id, kind, payload)
             self.db.commit()
         data = {
             "kind": kind,
@@ -684,7 +1228,7 @@ class AgentLoop:
         before_skill = chat_session.active_skill_id
         before_step = chat_session.active_step_id
         self.runtime.complete_current_skill(chat_session)
-        self.events.record(
+        self._record_legacy_event(
             tenant_id,
             chat_session.id,
             "skill_completed",
@@ -716,7 +1260,7 @@ class AgentLoop:
             current_step_allows_handoff=self._current_step_allows_human_handoff,
             route_to_handoff_node=self._maybe_route_to_handoff_node,
             create_handoff=self._create_human_handoff_request,
-            record_event=self.events.record,
+            record_event=_legacy_event_recorder(self.events),
             should_complete=self._should_complete_skill,
             complete_skill=self._complete_active_skill,
         )
@@ -730,7 +1274,9 @@ class AgentLoop:
     ) -> HumanHandoffRequest:
         # SOP 节点指定的处理人:从当前 step 的 assignee_user_id 字段读取
         # (handoff 类型节点或 allowed_actions 含 handoff_human 的节点可配置)。
+        # assignee_notify_channel 指定投递渠道:None=默认;"web"=仅网页端;绑定渠道=按渠道转接。
         step_assignee_user_id: str | None = None
+        step_notify_channel: str | None = None
         current_step = (
             self._current_skill_step(active_skill, chat_session.active_step_id)
             if active_skill
@@ -740,9 +1286,12 @@ class AgentLoop:
             step_assignee_user_id = (
                 str(current_step.get("assignee_user_id") or "").strip() or None
             )
+            step_notify_channel = (
+                str(current_step.get("assignee_notify_channel") or "").strip() or None
+            )
         # 当前渠道默认处理人:从会话所属 binding 的 config_json 读取。
-        binding_default_assignee_user_id = self._binding_default_handoff_assignee(
-            tenant_id, chat_session
+        binding_default_assignee_user_id, binding_default_notify_channel = (
+            self._binding_default_handoff_assignee(tenant_id, chat_session)
         )
         handoff = HumanHandoffService(self.db, self.events).create(
             tenant_id,
@@ -754,51 +1303,97 @@ class AgentLoop:
             pending_question=self._human_handoff_pending_question,
             step_assignee_user_id=step_assignee_user_id,
             binding_default_assignee_user_id=binding_default_assignee_user_id,
+            step_notify_channel=step_notify_channel,
+            binding_default_notify_channel=binding_default_notify_channel,
+            language_context=getattr(self, "_language_context", None),
         )
-        # 给 assignee 发飞书私聊通知(经会话所属 binding 投递)。失败仅记日志,
-        # 不影响 handoff 主流程(网页收件箱仍可兜底)。
-        self._maybe_notify_handoff_assignee_on_feishu(tenant_id, chat_session, handoff)
+        # 给 assignee 发渠道私聊通知。失败仅记日志,不影响 handoff 主流程
+        # (网页收件箱仍可兜底)。
+        self._maybe_notify_handoff_assignee(tenant_id, chat_session, handoff)
         return handoff
 
     def _binding_default_handoff_assignee(
         self,
         tenant_id: str,
         chat_session: ChatSession,
-    ) -> str | None:
-        """会话所属渠道绑定配置的默认人工处理人。
+    ) -> tuple[str | None, str | None]:
+        """会话所属渠道绑定配置的默认人工处理人及其通知渠道。
 
         从 ChatSession.channel_binding_id 反查 binding(而非 agent 挂载列表取首个),
-        读取 config_json.default_handoff_assignee_user_id。无 binding 或未配置返回 None。
+        读取 config_json.default_handoff_assignee_user_id 与
+        default_handoff_assignee_channel。无 binding 或未配置返回 (None, None)。
         """
         if not chat_session.channel_binding_id:
-            return None
+            return None, None
         binding = self.db.get(ChannelBinding, chat_session.channel_binding_id)
         if not binding or binding.tenant_id != tenant_id:
-            return None
+            return None, None
         config = binding.config_json if isinstance(binding.config_json, dict) else {}
         value = str(config.get("default_handoff_assignee_user_id") or "").strip()
-        return value or None
+        if not value:
+            return None, None
+        channel = str(config.get("default_handoff_assignee_channel") or "").strip()
+        return value, (channel or None)
 
-    def _maybe_notify_handoff_assignee_on_feishu(
+    def _maybe_notify_handoff_assignee(
         self,
         tenant_id: str,
         chat_session: ChatSession,
         handoff: HumanHandoffRequest,
     ) -> None:
-        from app.channels.service_outbox import notify_handoff_assignee
+        """按通知渠道偏好解析投递 binding,给 assignee 登记渠道私聊通知。
 
-        # 通知用 binding 必须是会话所属 binding(用户消息进来的那个),
-        # 而非从 agent 挂载列表取首个 active 飞书绑定。
-        if not chat_session.channel_binding_id:
+        绑定解析规则:
+        - 偏好为具体渠道(如 feishu)时:优先会话所属 binding(渠道匹配且 active);
+          会话无 binding 或渠道不匹配时,在租户内找该渠道的任一 active 员工绑定。
+        - 偏好为 None(默认)时:用会话所属 binding(渠道支持私聊通知即可达)。
+        - 偏好为 "web" 时:仅网页收件箱,直接返回。
+
+        无可用 binding(含日志说明)或 assignee 在该 binding scope 无非群聊身份时,
+        由 notify_handoff_assignee 内部跳过,网页收件箱兜底。
+        """
+        from app.channels.service_outbox import (
+            HANDOFF_NOTIFY_CHANNELS,
+            notify_handoff_assignee,
+            resolve_handoff_notify_binding,
+        )
+
+        metadata = handoff.metadata_json if isinstance(handoff.metadata_json, dict) else {}
+        notify_channel = str(metadata.get("assignee_notify_channel") or "").strip()
+        if notify_channel == "web":
             return
-        binding = self.db.get(ChannelBinding, chat_session.channel_binding_id)
-        if (
-            not binding
-            or binding.tenant_id != tenant_id
-            or binding.channel != "feishu"
-            or binding.status != "active"
-        ):
-            return
+        binding: ChannelBinding | None = None
+        if notify_channel:
+            # 指定渠道:优先会话所属 binding,渠道不匹配时回退租户内该渠道任一 binding。
+            if chat_session.channel_binding_id:
+                session_binding = self.db.get(ChannelBinding, chat_session.channel_binding_id)
+                if (
+                    session_binding
+                    and session_binding.tenant_id == tenant_id
+                    and session_binding.channel == notify_channel
+                    and session_binding.status == "active"
+                ):
+                    binding = session_binding
+            binding = binding or resolve_handoff_notify_binding(self.db, tenant_id, notify_channel)
+            if binding is None:
+                logger.warning(
+                    "handoff 通知跳过:租户无可用的 %s 绑定 handoff=%s", notify_channel, handoff.id
+                )
+                return
+        else:
+            # 默认投递:用会话所属 binding,渠道支持私聊通知即可达。
+            if not chat_session.channel_binding_id:
+                return
+            session_binding = self.db.get(ChannelBinding, chat_session.channel_binding_id)
+            if (
+                not session_binding
+                or session_binding.tenant_id != tenant_id
+                or session_binding.status != "active"
+            ):
+                return
+            if session_binding.channel not in HANDOFF_NOTIFY_CHANNELS:
+                return
+            binding = session_binding
         notify_handoff_assignee(
             self.db,
             binding,
@@ -821,7 +1416,7 @@ class AgentLoop:
                 **(chat_session.slots_json or {}),
                 **step_result.slot_updates,
             }
-            self.events.record(
+            self._record_legacy_event(
                 tenant_id,
                 chat_session.id,
                 "slot_updated",
@@ -835,7 +1430,7 @@ class AgentLoop:
         if active_skill_matches and step_result.next_step_id:
             next_step_id = str(step_result.next_step_id).strip()
             if not self._skill_has_step(active_skill, next_step_id):
-                self.events.record(
+                self._record_legacy_event(
                     tenant_id,
                     chat_session.id,
                     "step_agent_result_repaired",
@@ -902,14 +1497,13 @@ class AgentLoop:
             self._change_active_step(tenant_id, chat_session, str(step_result.next_step_id).strip())
             return
 
-        if active_skill_matches and step_result.is_step_completed:
-            if self._activate_next_pending_graph_step(
-                tenant_id,
-                chat_session,
-                active_skill,
-                reason="graph_pending_step",
-            ):
-                step_result.next_step_id = chat_session.active_step_id
+        if active_skill_matches and step_result.is_step_completed and self._activate_next_pending_graph_step(
+            tenant_id,
+            chat_session,
+            active_skill,
+            reason="graph_pending_step",
+        ):
+            step_result.next_step_id = chat_session.active_step_id
 
     def _sync_awaiting_input_from_step_result(
         self,
@@ -987,7 +1581,7 @@ class AgentLoop:
         }
         if reason:
             payload["reason"] = reason
-        self.events.record(tenant_id, chat_session.id, "skill_step_changed", payload)
+        self._record_legacy_event(tenant_id, chat_session.id, "skill_step_changed", payload)
 
     def _graph_pending_steps(self, chat_session: ChatSession) -> list[str]:
         value = (chat_session.slots_json or {}).get(GRAPH_PENDING_STEPS_SLOT)
@@ -1006,7 +1600,7 @@ class AgentLoop:
         else:
             slots.pop(GRAPH_PENDING_STEPS_SLOT, None)
         chat_session.slots_json = slots
-        self.events.record(
+        self._record_legacy_event(
             tenant_id,
             chat_session.id,
             "graph_pending_steps_updated",
@@ -1097,6 +1691,7 @@ class AgentLoop:
         )
 
     def _get_or_create_session(self, request: ChatTurnRequest) -> ChatSession:
+        """Load or create a session and seed its reply locale from the active turn snapshot."""
         session_id = request.session_id or new_id("session")
         chat_session = self.db.get(ChatSession, session_id)
         if not chat_session:
@@ -1110,11 +1705,26 @@ class AgentLoop:
                     if request.channel in {PILOTDECK_GROUP_CHAT_CHANNEL, "skill_test"}
                     else None
                 ),
+                agent_reply_locale=(
+                    self._language_context.agent_reply_locale.value
+                    if self._language_context is not None
+                    else None
+                ),
+                agent_reply_locale_source=(
+                    self._language_context.agent_reply_locale_source.value
+                    if self._language_context is not None
+                    else None
+                ),
             )
             self.db.add(chat_session)
             self.db.flush()
         elif not chat_session.agent_id and request.agent_id:
             chat_session.agent_id = request.agent_id
+        if chat_session.agent_reply_locale is None and self._language_context is not None:
+            chat_session.agent_reply_locale = self._language_context.agent_reply_locale.value
+            chat_session.agent_reply_locale_source = (
+                self._language_context.agent_reply_locale_source.value
+            )
         return chat_session
 
     def _current_skill_step(
@@ -1172,6 +1782,49 @@ class AgentLoop:
         row = self.db.get(UIConfig, tenant_id)
         value = row.agent_loop_max_actions if row else MAX_TOOL_ACTIONS_PER_TURN
         return max(1, min(int(value), MAX_TOOL_ACTIONS_PER_TURN_LIMIT))
+
+    def _get_conversation_context_settings(
+        self,
+        tenant_id: str,
+    ) -> ConversationContextSettings:
+        if not hasattr(self.db, "get"):
+            return ConversationContextSettings()
+        row = self.db.get(UIConfig, tenant_id)
+        if row is None:
+            return ConversationContextSettings()
+        return ConversationContextSettings(
+            token_budget=getattr(row, "context_token_budget", 32_000),
+            compaction_trigger_ratio=getattr(
+                row,
+                "context_compaction_trigger_ratio",
+                0.70,
+            ),
+            recent_round_limit=getattr(row, "context_recent_round_limit", 6),
+            long_summary_token_budget=getattr(
+                row,
+                "context_long_summary_token_budget",
+                4_000,
+            ),
+            medium_summary_token_budget=getattr(
+                row,
+                "context_medium_summary_token_budget",
+                4_000,
+            ),
+            allowed_roles=frozenset(
+                getattr(row, "context_allowed_roles", None)
+                or {"user", "assistant"}
+            ),
+            long_summary_prefix=getattr(
+                row,
+                "context_long_summary_prefix",
+                "历史的信息可以被总结为：",
+            ),
+            medium_summary_prefix=getattr(
+                row,
+                "context_medium_summary_prefix",
+                "近期的历史信息总结为：",
+            ),
+        ).normalized()
 
     def _list_published_skills(self, tenant_id: str, agent_id: str | None = None) -> list[Skill]:
         return visible_published_skills(self.db, tenant_id, agent_id)
@@ -1278,7 +1931,7 @@ class AgentLoop:
         if changed:
             chat_session.updated_at = utc_now()
             if hasattr(self, "events"):
-                self.events.record(
+                self._record_legacy_event(
                     tenant_id,
                     chat_session.id,
                     "skill_state_pruned",
@@ -1315,6 +1968,7 @@ class AgentLoop:
                 )
                 for row in visible_rows
             ],
+            settings=self._get_conversation_context_settings(chat_session.tenant_id),
             context_state=chat_session.context_state_json,
             summary_builder=self._context_summary_builder(model_config) if model_config else None,
         )
@@ -1325,20 +1979,39 @@ class AgentLoop:
         return context
 
     def _context_summary_builder(self, model_config: ModelConfig) -> Callable[[str, str, int], str]:
+        """Build a context compactor that uses the active immutable reply-locale snapshot."""
+
         def summarize(label: str, source: str, token_budget: int) -> str:
+            """Summarize raw conversation history into locale-bound prose for future turns."""
+            del label
+            language_contract = language_prompt_contract(
+                getattr(self, "_language_context", None),
+                [
+                    RawSourceMarker(
+                        json_pointer="/history_to_compress",
+                        kind=RawSourceKind.HISTORY,
+                    )
+                ],
+            )
             payload = stage_payload(
                 phase="Context Compression",
-                user_message=f"请压缩{label}",
+                user_message="Compress conversation history",
                 conversation_context={},
                 memory_context=None,
                 instructions=(
-                    "把输入的历史对话压缩成一段可供后续对话继续使用的中文事实摘要。"
-                    "保留用户身份与偏好、已确认事实、未完成任务、关键约束、工具或知识结论；"
-                    "删除寒暄、重复内容、内部 ID、时间戳和推理过程，不新增原文没有的信息。"
+                    "Compress the provided conversation history into a concise factual summary "
+                    "for future turns. Preserve source-owned history facts when quoting; retain "
+                    "identity, preferences, confirmed facts, unfinished tasks, key constraints, "
+                    "and tool or knowledge conclusions. Remove greetings, repetition, internal "
+                    "IDs, timestamps, and reasoning. Do not invent information."
                 ),
                 stage_data={"history_to_compress": source},
-                output_contract=(f"只输出一段纯文本摘要，控制在约 {token_budget} tokens 以内。"),
+                output_contract=(
+                    f"Return only one plain-text summary of approximately {token_budget} tokens "
+                    "or fewer."
+                ),
             )
+            payload.update(language_contract)
             with llm_operation("context.compact"):
                 return (
                     LLMClient(model_config).generate_text(unified_system_prompt(), payload).strip()
@@ -1355,8 +2028,11 @@ class AgentLoop:
         chat_session: ChatSession,
         source_message: str | None = None,
     ) -> dict[str, Any]:
+        """Project assistant metadata with the active immutable locale snapshot."""
         return ConversationProjection.assistant_message_metadata(
-            step_result, citation_deduper=self._dedupe_knowledge_citations
+            step_result,
+            citation_deduper=self._dedupe_knowledge_citations,
+            language_context=self._language_context,
         )
 
     def _dedupe_knowledge_citations(self, citations: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1387,6 +2063,7 @@ class AgentLoop:
         user_message_id: str,
         client_turn_id: str | None = None,
     ) -> Message | None:
+        """Persist one cancellation reply while retaining the turn's language snapshot."""
         if not user_message_id:
             return None
         user_message = self.db.get(Message, user_message_id)
@@ -1423,7 +2100,13 @@ class AgentLoop:
 
         chat_session.updated_at = utc_now()
         chat_session.status = "active"
-        chat_session.summary = f"最近回复：{CANCELLED_ASSISTANT_REPLY}"
+        cancelled_reply = localized_cancelled_reply(self._language_context)
+        summary_prefix = localized_compat_text(
+            self._language_context,
+            zh_cn="最近回复：",
+            en_us="Latest reply: ",
+        )
+        chat_session.summary = f"{summary_prefix}{cancelled_reply}"
         user_visibility = str(
             (user_message.metadata_json or {}).get("message_visibility") or "visible"
         )
@@ -1435,14 +2118,16 @@ class AgentLoop:
         }
         if user_visibility != "visible":
             cancelled_metadata["message_visibility"] = user_visibility
+        if self._language_context is not None:
+            cancelled_metadata["language_context"] = self._language_context.model_dump(mode="json")
         assistant_message = self._append_message(
             tenant_id,
             chat_session.id,
             "assistant",
-            CANCELLED_ASSISTANT_REPLY,
+            cancelled_reply,
             metadata=cancelled_metadata,
         )
-        self.events.record(
+        self._record_legacy_event(
             tenant_id,
             chat_session.id,
             "assistant_message_created",
@@ -1452,11 +2137,16 @@ class AgentLoop:
                 "user_message_id": user_message_id,
                 "turn_id": user_message_id,
                 "client_turn_id": normalized_client_turn_id or None,
-                "reply": CANCELLED_ASSISTANT_REPLY,
+                "reply": cancelled_reply,
                 "status": "cancelled",
+                **(
+                    {"language_context": self._language_context.model_dump(mode="json")}
+                    if self._language_context is not None
+                    else {}
+                ),
             },
         )
-        self.events.record(
+        self._record_legacy_event(
             tenant_id,
             chat_session.id,
             "session_state_changed",
@@ -1483,15 +2173,40 @@ class AgentLoop:
                 tool_result,
                 model_config.id,
             )
-        except Exception as exc:
-            self.events.record(
-                request.tenant_id,
-                chat_session.id,
-                "memory_error",
-                {"message": str(exc)},
+        except Exception:
+            logger.exception(
+                "memory capture enqueue failed",
+                extra={"tenant_id": request.tenant_id, "session_id": chat_session.id},
             )
+            language_context = self._language_context or resolve_compatible_language_context(
+                snapshot=request.language_context,
+                legacy_ui_locale=(request.ui_locale.value if request.ui_locale else None),
+                legacy_agent_reply_locale=(
+                    request.agent_reply_locale.value if request.agent_reply_locale else None
+                ),
+            )
+            try:
+                record_product_event(
+                    self.events,
+                    event_code="memory.capture.failed",
+                    tenant_id=request.tenant_id,
+                    aggregate_type="chat_session",
+                    aggregate_id=chat_session.id,
+                    params={
+                        "reason_code": "MEMORY_CAPTURE_ENQUEUE_FAILED",
+                        "missing_session": False,
+                        "missing_model_config": False,
+                    },
+                    language_context=language_context,
+                    client_turn_id=request.client_turn_id,
+                )
+            except Exception:
+                logger.exception(
+                    "memory capture failure event recording failed",
+                    extra={"tenant_id": request.tenant_id, "session_id": chat_session.id},
+                )
             return []
-        self.events.record(
+        self._record_legacy_event(
             request.tenant_id,
             chat_session.id,
             "async_job_enqueued",
@@ -1503,26 +2218,38 @@ class AgentLoop:
     def _finish_with_error(
         self, chat_session: ChatSession, code: str, message: str
     ) -> ChatTurnResponse:
+        """Finalize a configuration error while preserving the active language snapshot."""
+        self._abort_stream_sink()
         reply = format_runtime_failure_reply(
-            "系统配置错误",
+            localized_compat_text(
+                self._language_context,
+                zh_cn="系统配置错误",
+                en_us="System configuration error",
+            ),
             message,
             code,
-            "请在管理端补齐配置后重试。",
+            localized_compat_text(
+                self._language_context,
+                zh_cn="请在管理端补齐配置后重试。",
+                en_us="Complete the required configuration in the admin console and retry.",
+            ),
+            self._language_context,
         )
-        self.events.record(
+        self._record_legacy_event(
             chat_session.tenant_id,
             chat_session.id,
             "error_occurred",
-            {"code": code, "message": message},
+            {"code": code, "message": code},
         )
         reply = self._finalize_turn(chat_session, chat_session.tenant_id, reply)
         self.db.commit()
         self.db.refresh(chat_session)
-        return ChatTurnResponse(
+        return self._response_with_language_context(ChatTurnResponse(
             reply=reply,
             session_id=chat_session.id,
+            runtime_error_code=code,
             session_state=public_session(chat_session),
-        )
+        ))
 
     def _finalize_turn(
         self,
@@ -1534,6 +2261,7 @@ class AgentLoop:
         user_message_id: str | None = None,
         assistant_metadata_override: dict[str, Any] | None = None,
     ) -> str:
+        """Persist the assistant reply, delivery stage, trace event, and language snapshot."""
         chat_session.updated_at = utc_now()
         if chat_session.status != "handoff":
             chat_session.status = "active"
@@ -1557,7 +2285,12 @@ class AgentLoop:
             fallback_title = self._fallback_session_title_from_message(source_message)
             if fallback_title:
                 chat_session.title = fallback_title
-        chat_session.summary = f"最近回复：{reply[:120]}"
+        summary_prefix = localized_compat_text(
+            self._language_context,
+            zh_cn="最近回复：",
+            en_us="Latest reply: ",
+        )
+        chat_session.summary = f"{summary_prefix}{reply[:120]}"
         assistant_metadata = dict(metadata or {})
         if user_message_id:
             assistant_metadata.setdefault("user_message_id", user_message_id)
@@ -1569,7 +2302,24 @@ class AgentLoop:
             reply,
             metadata=assistant_metadata,
         )
-        stage_channel_delivery(self.db, chat_session, assistant_message)
+        if not self.stream_delivery_succeeded:
+            not_before = (
+                utc_now() + timedelta(seconds=_STREAM_FALLBACK_GRACE_SECONDS)
+                if self.stream_delivery_pending
+                else None
+            )
+            delivery = stage_channel_delivery(
+                self.db,
+                chat_session,
+                assistant_message,
+                not_before=not_before,
+            )
+            if (
+                self.stream_delivery_pending
+                and delivery is not None
+                and delivery.status == "pending"
+            ):
+                self.stream_delivery_id = delivery.id
         event_payload: dict[str, Any] = {
             "message_id": assistant_message.id,
             "assistant_message_id": assistant_message.id,
@@ -1582,13 +2332,15 @@ class AgentLoop:
             event_payload["knowledge_citations"] = assistant_metadata["knowledge_citations"]
         if assistant_metadata.get("message_visibility"):
             event_payload["message_visibility"] = assistant_metadata["message_visibility"]
-        self.events.record(
+        if assistant_metadata.get("language_context"):
+            event_payload["language_context"] = assistant_metadata["language_context"]
+        self._record_legacy_event(
             tenant_id,
             chat_session.id,
             "assistant_message_created",
             event_payload,
         )
-        self.events.record(
+        self._record_legacy_event(
             tenant_id,
             chat_session.id,
             "session_state_changed",

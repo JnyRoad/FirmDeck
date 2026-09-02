@@ -14,7 +14,19 @@ from app.db.models import (
     User,
     utc_now,
 )
+from app.i18n.language_context import LanguageContext, resolve_compatible_language_context
 from app.session.session_schema import StepAgentResult
+
+
+def _legacy_event_recorder(events: Any) -> Callable[..., Any]:
+    """Return the named compatibility writer, retaining an exact old-sink fallback."""
+    adapter = getattr(events, "record_legacy_event", None)
+    if callable(adapter):
+        return adapter
+    fallback = getattr(events, "record", None)
+    if callable(fallback):
+        return fallback
+    raise TypeError("event sink does not implement the legacy event contract")
 
 
 class HumanHandoffService:
@@ -34,7 +46,18 @@ class HumanHandoffService:
         pending_question: Callable[[dict[str, Any] | None, StepAgentResult], str],
         step_assignee_user_id: str | None = None,
         binding_default_assignee_user_id: str | None = None,
+        step_notify_channel: str | None = None,
+        binding_default_notify_channel: str | None = None,
+        language_context: LanguageContext | dict | None = None,
     ) -> HumanHandoffRequest:
+        """Create a handoff bound to the source turn's immutable language context."""
+        context = resolve_compatible_language_context(
+            snapshot=language_context,
+            legacy_ui_locale=None,
+            legacy_agent_reply_locale=chat_session.agent_reply_locale,
+        )
+        current_step = current_step_resolver()
+        pending_question_text = pending_question(current_step, step_result)
         existing = self.db.exec(
             select(HumanHandoffRequest)
             .where(HumanHandoffRequest.tenant_id == tenant_id)
@@ -42,6 +65,26 @@ class HumanHandoffService:
             .where(HumanHandoffRequest.status == "pending")
         ).first()
         if existing:
+            # Preserve the latest durable step metadata when concurrent execution
+            # observes the same pending request; this keeps resume context current.
+            existing.metadata_json = {
+                **dict(existing.metadata_json or {}),
+                "step": current_step or {},
+                "step_reply": step_result.reply,
+                "step_handoff": step_result.handoff,
+            }
+            existing.updated_at = utc_now()
+            if language_context is not None:
+                existing_context = resolve_compatible_language_context(
+                    snapshot=existing.language_context_json,
+                    legacy_ui_locale=None,
+                    legacy_agent_reply_locale=chat_session.agent_reply_locale,
+                )
+                if existing_context != context:
+                    raise RuntimeError("人工转接语言快照冲突")
+                if existing.language_context_json is None:
+                    existing.language_context_json = context.model_dump(mode="json")
+                    self.db.add(existing)
             chat_session.status = "handoff"
             chat_session.awaiting_input_json = {
                 "type": "human_handoff",
@@ -51,19 +94,27 @@ class HumanHandoffService:
             chat_session.updated_at = utc_now()
             return existing
 
-        current_step = current_step_resolver()
-        pending_question_text = pending_question(current_step, step_result)
         # Assignee 优先级:SOP 节点指定 → 当前渠道默认处理人 → 数字员工负责人 → 租户管理员。
         # 不再从知识库 Contact 概念推断 assignee(知识内容变化会导致处理人不稳定,
         # 且缺少权限/审计入口)。
-        configured_assignee = next(
+        # 通知渠道随命中的配置走:None=默认投递;"web"=仅网页端;绑定渠道=按该渠道转接。
+        configured = next(
             (
-                user_id
-                for user_id in (step_assignee_user_id, binding_default_assignee_user_id)
+                (user_id, notify_channel)
+                for user_id, notify_channel in (
+                    (step_assignee_user_id, step_notify_channel),
+                    (binding_default_assignee_user_id, binding_default_notify_channel),
+                )
                 if self._is_internal_assignee(tenant_id, user_id)
             ),
             None,
         )
+        if configured:
+            configured_assignee = configured[0]
+            assignee_notify_channel = str(configured[1] or "").strip() or None
+        else:
+            configured_assignee = None
+            assignee_notify_channel = None
         assignee_user_id = configured_assignee or assignee_resolver(
             tenant_id, chat_session.agent_id, chat_session.user_id
         )
@@ -82,12 +133,21 @@ class HumanHandoffService:
                 "active_step_id": chat_session.active_step_id,
                 "slots": chat_session.slots_json or {},
                 "pending_tasks": chat_session.pending_tasks_json or [],
+                # Resume runs use an internal channel marker. Keep the original
+                # external route so group handoffs return to the same chat.
+                "channel": chat_session.channel,
+                "channel_binding_id": chat_session.channel_binding_id,
+                "channel_account_key": chat_session.channel_account_key,
+                "external_conv_id": chat_session.external_conv_id,
+                "channel_target": dict(chat_session.channel_target_json or {}),
             },
             metadata_json={
                 "step": current_step or {},
                 "step_reply": step_result.reply,
                 "step_handoff": step_result.handoff,
+                "assignee_notify_channel": assignee_notify_channel,
             },
+            language_context_json=context.model_dump(mode="json"),
         )
         self.db.add(handoff)
         chat_session.status = "handoff"
@@ -97,7 +157,7 @@ class HumanHandoffService:
             "pending_question": handoff.pending_question,
         }
         chat_session.updated_at = utc_now()
-        self.events.record(
+        _legacy_event_recorder(self.events)(
             tenant_id,
             chat_session.id,
             "human_handoff_requested",
@@ -108,6 +168,7 @@ class HumanHandoffService:
                 "trigger_skill_id": handoff.trigger_skill_id,
                 "trigger_step_id": handoff.trigger_step_id,
                 "pending_question": handoff.pending_question,
+                "language_context": context.model_dump(mode="json"),
             },
         )
         return handoff

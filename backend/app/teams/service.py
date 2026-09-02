@@ -2,23 +2,47 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any
+from collections.abc import Mapping, Sequence
+from typing import Any, Literal
 
 from fastapi import HTTPException
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
+from app.contracts.domain_http import domain_http_error
+from app.contracts.error_registry import ERROR_REGISTRY, ErrorContractViolation, ErrorVisibility
+from app.contracts.errors import ErrorDescriptor
 from app.db.models import (
     AgentProfile,
+    ChatSession,
+    KnowledgeBase,
+    KnowledgeBaseVersion,
     Team,
     TeamBlackboardEntry,
+    TeamKnowledgeBaseBinding,
+    TeamKnowledgeBaseGrant,
     TeamMember,
+    TeamRun,
     TeamTask,
     TeamTaskBid,
     TeamTaskEvent,
     TeamWakeEvent,
     utc_now,
 )
+from app.i18n.raw_source import RawSourceKind, RawSourceMarker
+from app.knowledge.audit import KnowledgeAuditService
+from app.knowledge.errors import (
+    KNOWLEDGE_BINDING_REVISION_CONFLICT,
+    KNOWLEDGE_CONTEXT_MISMATCH,
+    KNOWLEDGE_DEFAULT_NOT_CONFIGURED,
+    KNOWLEDGE_MODE_INVALID,
+    knowledge_error,
+)
+from app.session.cleanup import (
+    purge_chat_session_records,
+    remove_chat_session_workspace,
+)
+from app.teams.schema import TeamKnowledgeSelection
 
 TEAM_MEMBER_ROLES = {"leader", "member"}
 
@@ -48,6 +72,86 @@ TASK_TRANSITIONS: dict[str, set[str]] = {
 VERDICT_TARGET_STATUS = {"approve": "done", "rework": "rework", "escalate": "escalated"}
 
 _JSON_BLOCK_RE = re.compile(r"```json\s*\n?(.*?)```", re.DOTALL)
+
+
+def _team_error(
+    code: str,
+    status_code: int,
+    *,
+    params: dict[str, object] | None = None,
+    retryable: bool | None = None,
+    cause: BaseException | None = None,
+) -> HTTPException:
+    """Return a canonical team error without exposing member or database details."""
+    return domain_http_error(
+        code,
+        source="teams.service",
+        status_code=status_code,
+        params=params,
+        retryable=retryable,
+        cause=cause,
+    )
+
+
+def _project_team_error(candidate: object) -> dict[str, object]:
+    """Convert persisted team failure metadata to a public-safe descriptor."""
+    code = "INTERNAL_ERROR"
+    params: dict[str, Any] = {}
+    retryable = False
+    request_id: str | None = None
+    trace_id: str | None = None
+    if isinstance(candidate, Mapping):
+        raw_code = candidate.get("code")
+        entry = ERROR_REGISTRY.get(raw_code) if isinstance(raw_code, str) else None
+        if entry is not None and entry.visibility is ErrorVisibility.PUBLIC:
+            code = entry.code
+            raw_params = candidate.get("params")
+            params = dict(raw_params) if isinstance(raw_params, Mapping) else {}
+            raw_retryable = candidate.get("retryable", entry.retryable_default)
+            retryable = raw_retryable if isinstance(raw_retryable, bool) else entry.retryable_default
+            request_id = candidate.get("request_id") if isinstance(candidate.get("request_id"), str) else None
+            trace_id = candidate.get("trace_id") if isinstance(candidate.get("trace_id"), str) else None
+    entry = ERROR_REGISTRY.get(code)
+    if entry is None or entry.visibility is not ErrorVisibility.PUBLIC:
+        return ErrorDescriptor(code="INTERNAL_ERROR", params={}, retryable=False).model_dump(mode="json")
+    descriptor = ErrorDescriptor(
+        code=entry.code,
+        params=params,
+        retryable=retryable,
+        request_id=request_id,
+        trace_id=trace_id,
+    )
+    try:
+        ERROR_REGISTRY.validate(descriptor)
+    except (ErrorContractViolation, TypeError, ValueError):
+        descriptor = ErrorDescriptor(code="INTERNAL_ERROR", params={}, retryable=False)
+    return descriptor.model_dump(mode="json")
+
+
+def _sanitize_team_payload(candidate: object) -> dict[str, Any]:
+    """Persist raw business values unchanged while replacing nested error objects."""
+    if not isinstance(candidate, Mapping):
+        return {}
+    result: dict[str, Any] = {}
+    for key, value in candidate.items():
+        if key in {"error", "error_json", "failure"}:
+            # Existing wakeup producers already persist a code-only string.  Keep that
+            # exact compatibility value until their typed event migration lands; prose
+            # or structured-but-invalid errors still fail closed to INTERNAL_ERROR.
+            if isinstance(value, str) and re.fullmatch(r"[A-Z][A-Z0-9_.-]{2,127}", value):
+                result[str(key)] = value
+            else:
+                result[str(key)] = _project_team_error(value)
+        elif isinstance(value, Mapping):
+            result[str(key)] = _sanitize_team_payload(value)
+        elif isinstance(value, list):
+            result[str(key)] = [
+                _sanitize_team_payload(item) if isinstance(item, Mapping) else item
+                for item in value
+            ]
+        else:
+            result[str(key)] = value
+    return result
 
 
 class TeamTaskTransitionError(ValueError):
@@ -322,7 +426,7 @@ def parse_blackboard_suggestions(reply: str) -> list[dict[str, Any]]:
 def get_team(db: Session, tenant_id: str, team_id: str) -> Team:
     team = db.get(Team, team_id)
     if team is None or team.tenant_id != tenant_id:
-        raise HTTPException(status_code=404, detail="Team not found")
+        raise _team_error("TEAM_NOT_FOUND", 404)
     return team
 
 
@@ -344,15 +448,17 @@ def create_team(
     description: str | None,
     owner_user_id: str,
     config: dict[str, Any] | None = None,
+    knowledge_bases: Sequence[TeamKnowledgeSelection] | None = None,
 ) -> Team:
+    """原子创建团队及其初始共享知识库、绑定和默认写入目标。"""
     name = name.strip()
     if not name:
-        raise HTTPException(status_code=400, detail="Team name cannot be empty")
+        raise _team_error("TEAM_NAME_REQUIRED", 400)
     existing = db.exec(
         select(Team).where(Team.tenant_id == tenant_id, Team.name == name)
     ).first()
     if existing:
-        raise HTTPException(status_code=409, detail="Team name already exists")
+        raise _team_error("TEAM_NAME_CONFLICT", 409)
     team = Team(
         tenant_id=tenant_id,
         name=name,
@@ -363,17 +469,533 @@ def create_team(
     )
     db.add(team)
     try:
+        db.flush()
+        for selection in knowledge_bases or ():
+            _bind_team_knowledge_base(
+                db,
+                team=team,
+                selection=selection,
+                actor_user_id=owner_user_id,
+            )
         db.commit()
     except IntegrityError as exc:
         db.rollback()
-        raise HTTPException(status_code=409, detail="Team name already exists") from exc
+        raise _team_error("TEAM_NAME_CONFLICT", 409, cause=exc) from exc
+    except Exception:
+        db.rollback()
+        raise
     db.refresh(team)
     return team
 
 
+def _create_initial_shared_knowledge_base(
+    db: Session,
+    *,
+    team: Team,
+    selection: TeamKnowledgeSelection,
+    actor_user_id: str,
+) -> KnowledgeBase:
+    """在当前事务内创建一个带空白初始正式版本的共享知识库。"""
+    payload = selection.create_shared
+    if payload is None:
+        raise knowledge_error(KNOWLEDGE_MODE_INVALID)
+    existing = db.exec(
+        select(KnowledgeBase).where(
+            KnowledgeBase.tenant_id == team.tenant_id,
+            KnowledgeBase.name == payload.name,
+        )
+    ).first()
+    if existing is not None:
+        raise knowledge_error(
+            KNOWLEDGE_MODE_INVALID,
+            message="同一租户中已存在同名知识库。",
+        )
+
+    now = utc_now()
+    knowledge_base = KnowledgeBase(
+        tenant_id=team.tenant_id,
+        name=payload.name,
+        description=payload.description,
+        mode="shared",
+        capability_scope=payload.capability_scope,
+        status="active",
+        updated_at=now,
+    )
+    db.add(knowledge_base)
+    db.flush()
+    version = KnowledgeBaseVersion(
+        tenant_id=team.tenant_id,
+        knowledge_base_id=knowledge_base.id,
+        version="1.0.0",
+        name=payload.name,
+        description=payload.description,
+        publication_state="released",
+        status="active",
+        created_by_user_id=actor_user_id,
+        change_reason="创建共享知识库",
+        published_at=now,
+        capability_scope=payload.capability_scope,
+    )
+    db.add(version)
+    db.flush()
+    knowledge_base.published_version_id = version.id
+    db.add(knowledge_base)
+    KnowledgeAuditService(db).append_event(
+        tenant_id=team.tenant_id,
+        knowledge_base_id=knowledge_base.id,
+        team_id=team.id,
+        knowledge_base_version_id=version.id,
+        actor_type="user",
+        actor_id=actor_user_id,
+        action="shared_created",
+        reason="创建团队时新建共享知识库",
+        details={"published_version_id": version.id},
+    )
+    return knowledge_base
+
+
+def _require_bindable_shared_base(
+    db: Session,
+    *,
+    team: Team,
+    knowledge_base_id: str,
+) -> KnowledgeBase:
+    """校验目标是同租户启用且已有正式版本的共享知识库。"""
+    knowledge_base = db.get(KnowledgeBase, knowledge_base_id)
+    if knowledge_base is None or knowledge_base.tenant_id != team.tenant_id:
+        raise knowledge_error(KNOWLEDGE_CONTEXT_MISMATCH)
+    if (
+        knowledge_base.mode != "shared"
+        or knowledge_base.status != "active"
+        or not knowledge_base.published_version_id
+    ):
+        raise knowledge_error(KNOWLEDGE_MODE_INVALID)
+    version = db.get(KnowledgeBaseVersion, knowledge_base.published_version_id)
+    if (
+        version is None
+        or version.tenant_id != team.tenant_id
+        or version.knowledge_base_id != knowledge_base.id
+        or version.publication_state != "released"
+    ):
+        raise knowledge_error(KNOWLEDGE_MODE_INVALID)
+    return knowledge_base
+
+
+def _bind_team_knowledge_base(
+    db: Session,
+    *,
+    team: Team,
+    selection: TeamKnowledgeSelection,
+    actor_user_id: str,
+) -> TeamKnowledgeBaseBinding:
+    """在调用方事务内创建或恢复团队绑定，并可同时设为默认目标。"""
+    knowledge_base = (
+        _require_bindable_shared_base(
+            db,
+            team=team,
+            knowledge_base_id=str(selection.existing_knowledge_base_id),
+        )
+        if selection.existing_knowledge_base_id
+        else _create_initial_shared_knowledge_base(
+            db,
+            team=team,
+            selection=selection,
+            actor_user_id=actor_user_id,
+        )
+    )
+    binding = db.exec(
+        select(TeamKnowledgeBaseBinding).where(
+            TeamKnowledgeBaseBinding.tenant_id == team.tenant_id,
+            TeamKnowledgeBaseBinding.team_id == team.id,
+            TeamKnowledgeBaseBinding.knowledge_base_id == knowledge_base.id,
+        )
+    ).first()
+    if binding is not None and binding.status == "active":
+        raise knowledge_error(
+            KNOWLEDGE_MODE_INVALID,
+            message="该共享知识库已绑定到当前团队。",
+        )
+    now = utc_now()
+    if binding is None:
+        binding = TeamKnowledgeBaseBinding(
+            tenant_id=team.tenant_id,
+            team_id=team.id,
+            knowledge_base_id=knowledge_base.id,
+            created_by_user_id=actor_user_id,
+            status="active",
+            revision=1,
+        )
+    else:
+        binding.status = "active"
+        binding.revision += 1
+        binding.updated_at = now
+        binding.created_by_user_id = actor_user_id
+    db.add(binding)
+    if selection.is_default:
+        previous_default = team.default_knowledge_base_id
+        team.default_knowledge_base_id = knowledge_base.id
+        team.updated_at = now
+        db.add(team)
+        KnowledgeAuditService(db).append_event(
+            tenant_id=team.tenant_id,
+            knowledge_base_id=knowledge_base.id,
+            team_id=team.id,
+            knowledge_base_version_id=knowledge_base.published_version_id,
+            actor_type="user",
+            actor_id=actor_user_id,
+            action="default_changed",
+            details={
+                "previous_knowledge_base_id": previous_default,
+                "new_knowledge_base_id": knowledge_base.id,
+            },
+        )
+    KnowledgeAuditService(db).append_event(
+        tenant_id=team.tenant_id,
+        knowledge_base_id=knowledge_base.id,
+        team_id=team.id,
+        knowledge_base_version_id=knowledge_base.published_version_id,
+        actor_type="user",
+        actor_id=actor_user_id,
+        action="binding_created",
+        details={"binding_id": binding.id, "revision": binding.revision},
+    )
+    return binding
+
+
+def bind_team_knowledge_base(
+    db: Session,
+    *,
+    team: Team,
+    selection: TeamKnowledgeSelection,
+    actor_user_id: str,
+) -> TeamKnowledgeBaseBinding:
+    """原子新增或恢复一个团队共享知识库绑定。"""
+    try:
+        binding = _bind_team_knowledge_base(
+            db,
+            team=team,
+            selection=selection,
+            actor_user_id=actor_user_id,
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    db.refresh(binding)
+    db.refresh(team)
+    return binding
+
+
+def list_team_knowledge_bindings(
+    db: Session,
+    team: Team,
+) -> list[TeamKnowledgeBaseBinding]:
+    """列出团队的全部绑定历史，包含已撤销记录，供管理界面审计。"""
+    return list(
+        db.exec(
+            select(TeamKnowledgeBaseBinding)
+            .where(
+                TeamKnowledgeBaseBinding.tenant_id == team.tenant_id,
+                TeamKnowledgeBaseBinding.team_id == team.id,
+            )
+            .order_by(TeamKnowledgeBaseBinding.created_at)
+        ).all()
+    )
+
+
+def _require_binding_revision(
+    db: Session,
+    *,
+    team: Team,
+    knowledge_base_id: str,
+    expected_revision: int,
+) -> TeamKnowledgeBaseBinding:
+    """返回有效绑定，并以乐观锁修订号阻止并发覆盖。"""
+    binding = db.exec(
+        select(TeamKnowledgeBaseBinding).where(
+            TeamKnowledgeBaseBinding.tenant_id == team.tenant_id,
+            TeamKnowledgeBaseBinding.team_id == team.id,
+            TeamKnowledgeBaseBinding.knowledge_base_id == knowledge_base_id,
+            TeamKnowledgeBaseBinding.status == "active",
+        )
+    ).first()
+    if binding is None:
+        raise knowledge_error(KNOWLEDGE_CONTEXT_MISMATCH)
+    if binding.revision != expected_revision:
+        raise knowledge_error(
+            KNOWLEDGE_BINDING_REVISION_CONFLICT,
+            details={"current_revision": binding.revision},
+        )
+    return binding
+
+
+def set_team_default_knowledge_base(
+    db: Session,
+    *,
+    team: Team,
+    knowledge_base_id: str,
+    is_default: bool,
+    expected_revision: int,
+    actor_user_id: str,
+) -> TeamKnowledgeBaseBinding:
+    """以修订号保护地设置或清除该团队唯一的默认写入知识库。"""
+    binding = _require_binding_revision(
+        db,
+        team=team,
+        knowledge_base_id=knowledge_base_id,
+        expected_revision=expected_revision,
+    )
+    previous_default = team.default_knowledge_base_id
+    next_default = knowledge_base_id if is_default else None
+    if not is_default and previous_default != knowledge_base_id:
+        return binding
+    if previous_default == next_default:
+        return binding
+    now = utc_now()
+    previous_binding = None
+    if previous_default and previous_default != knowledge_base_id:
+        previous_binding = db.exec(
+            select(TeamKnowledgeBaseBinding).where(
+                TeamKnowledgeBaseBinding.team_id == team.id,
+                TeamKnowledgeBaseBinding.knowledge_base_id == previous_default,
+                TeamKnowledgeBaseBinding.status == "active",
+            )
+        ).first()
+    binding.revision += 1
+    binding.updated_at = now
+    db.add(binding)
+    if previous_binding is not None:
+        previous_binding.revision += 1
+        previous_binding.updated_at = now
+        db.add(previous_binding)
+    team.default_knowledge_base_id = next_default
+    team.updated_at = now
+    db.add(team)
+    KnowledgeAuditService(db).append_event(
+        tenant_id=team.tenant_id,
+        knowledge_base_id=knowledge_base_id,
+        team_id=team.id,
+        knowledge_base_version_id=None,
+        actor_type="user",
+        actor_id=actor_user_id,
+        action="default_changed",
+        details={
+            "previous_knowledge_base_id": previous_default,
+            "new_knowledge_base_id": next_default,
+            "revision": binding.revision,
+        },
+    )
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    db.refresh(binding)
+    db.refresh(team)
+    return binding
+
+
+def replace_team_knowledge_grants(
+    db: Session,
+    *,
+    team: Team,
+    knowledge_base_id: str,
+    expected_revision: int,
+    grants: Mapping[str, Literal["reader", "editor", "publisher"] | None],
+    actor_user_id: str,
+) -> TeamKnowledgeBaseBinding:
+    """原子替换一个绑定的完整成员权限矩阵并递增绑定修订号。"""
+    binding = _require_binding_revision(
+        db,
+        team=team,
+        knowledge_base_id=knowledge_base_id,
+        expected_revision=expected_revision,
+    )
+    valid_permissions = {"reader", "editor", "publisher"}
+    member_ids = {member.agent_id for member in list_team_members(db, team.id)}
+    for agent_id, permission in grants.items():
+        if agent_id not in member_ids:
+            raise knowledge_error(KNOWLEDGE_CONTEXT_MISMATCH)
+        if permission is not None and permission not in valid_permissions:
+            raise knowledge_error(KNOWLEDGE_MODE_INVALID)
+
+    existing_rows = db.exec(
+        select(TeamKnowledgeBaseGrant).where(
+            TeamKnowledgeBaseGrant.tenant_id == team.tenant_id,
+            TeamKnowledgeBaseGrant.team_id == team.id,
+            TeamKnowledgeBaseGrant.knowledge_base_id == knowledge_base_id,
+        )
+    ).all()
+    existing_by_agent = {row.agent_id: row for row in existing_rows}
+    audit = KnowledgeAuditService(db)
+    now = utc_now()
+    changed = False
+    all_agent_ids = set(existing_by_agent) | set(grants)
+    for agent_id in sorted(all_agent_ids):
+        desired = grants.get(agent_id)
+        row = existing_by_agent.get(agent_id)
+        if desired is None:
+            if row is None or row.status != "active":
+                continue
+            previous_permission = row.permission
+            row.status = "revoked"
+            row.updated_at = now
+            db.add(row)
+            changed = True
+            audit.append_event(
+                tenant_id=team.tenant_id,
+                knowledge_base_id=knowledge_base_id,
+                team_id=team.id,
+                knowledge_base_version_id=None,
+                actor_type="user",
+                actor_id=actor_user_id,
+                action="grant_revoked",
+                details={
+                    "agent_id": agent_id,
+                    "previous_permission": previous_permission,
+                },
+            )
+            continue
+        if row is None:
+            row = TeamKnowledgeBaseGrant(
+                tenant_id=team.tenant_id,
+                team_id=team.id,
+                knowledge_base_id=knowledge_base_id,
+                agent_id=agent_id,
+                permission=desired,
+                status="active",
+                created_by_user_id=actor_user_id,
+            )
+            db.add(row)
+            changed = True
+            action = "grant_created"
+            previous_permission = None
+        elif row.permission != desired or row.status != "active":
+            previous_permission = row.permission if row.status == "active" else None
+            row.permission = desired
+            row.status = "active"
+            row.created_by_user_id = actor_user_id
+            row.updated_at = now
+            db.add(row)
+            changed = True
+            action = "grant_changed"
+        else:
+            continue
+        audit.append_event(
+            tenant_id=team.tenant_id,
+            knowledge_base_id=knowledge_base_id,
+            team_id=team.id,
+            knowledge_base_version_id=None,
+            actor_type="user",
+            actor_id=actor_user_id,
+            action=action,
+            details={
+                "agent_id": agent_id,
+                "previous_permission": previous_permission,
+                "new_permission": desired,
+            },
+        )
+    if changed:
+        binding.revision += 1
+        binding.updated_at = now
+        db.add(binding)
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    db.refresh(binding)
+    return binding
+
+
+def unbind_team_knowledge_base(
+    db: Session,
+    *,
+    team: Team,
+    knowledge_base_id: str,
+    expected_revision: int,
+    actor_user_id: str,
+) -> TeamKnowledgeBaseBinding:
+    """撤销团队绑定及其全部授权，并在同一事务中清空对应默认目标。"""
+    binding = _require_binding_revision(
+        db,
+        team=team,
+        knowledge_base_id=knowledge_base_id,
+        expected_revision=expected_revision,
+    )
+    now = utc_now()
+    audit = KnowledgeAuditService(db)
+    grants = db.exec(
+        select(TeamKnowledgeBaseGrant).where(
+            TeamKnowledgeBaseGrant.tenant_id == team.tenant_id,
+            TeamKnowledgeBaseGrant.team_id == team.id,
+            TeamKnowledgeBaseGrant.knowledge_base_id == knowledge_base_id,
+            TeamKnowledgeBaseGrant.status == "active",
+        )
+    ).all()
+    for grant in grants:
+        grant.status = "revoked"
+        grant.updated_at = now
+        db.add(grant)
+        audit.append_event(
+            tenant_id=team.tenant_id,
+            knowledge_base_id=knowledge_base_id,
+            team_id=team.id,
+            knowledge_base_version_id=None,
+            actor_type="user",
+            actor_id=actor_user_id,
+            action="grant_revoked",
+            details={
+                "agent_id": grant.agent_id,
+                "previous_permission": grant.permission,
+            },
+        )
+    previous_default = team.default_knowledge_base_id
+    if previous_default == knowledge_base_id:
+        team.default_knowledge_base_id = None
+        team.updated_at = now
+        db.add(team)
+        audit.append_event(
+            tenant_id=team.tenant_id,
+            knowledge_base_id=knowledge_base_id,
+            team_id=team.id,
+            knowledge_base_version_id=None,
+            actor_type="user",
+            actor_id=actor_user_id,
+            action="default_changed",
+            details={
+                "previous_knowledge_base_id": knowledge_base_id,
+                "new_knowledge_base_id": None,
+            },
+        )
+    binding.status = "revoked"
+    binding.revision += 1
+    binding.updated_at = now
+    db.add(binding)
+    audit.append_event(
+        tenant_id=team.tenant_id,
+        knowledge_base_id=knowledge_base_id,
+        team_id=team.id,
+        knowledge_base_version_id=None,
+        actor_type="user",
+        actor_id=actor_user_id,
+        action="binding_revoked",
+        details={"binding_id": binding.id, "revision": binding.revision},
+    )
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    db.refresh(binding)
+    db.refresh(team)
+    return binding
+
+
 def delete_team(db: Session, team: Team) -> None:
-    """删除团队并级联清理成员/任务/竞标/审计/唤醒事件/黑板。"""
+    """删除团队并级联清理成员/运行/任务/竞标/审计/唤醒事件/黑板/团队会话。"""
     members = list_team_members(db, team.id)
+    runs = list(db.exec(select(TeamRun).where(TeamRun.team_id == team.id)).all())
     tasks = list(db.exec(select(TeamTask).where(TeamTask.team_id == team.id)).all())
     bids = list(db.exec(select(TeamTaskBid).where(TeamTaskBid.team_id == team.id)).all())
     events = list(db.exec(select(TeamTaskEvent).where(TeamTaskEvent.team_id == team.id)).all())
@@ -381,24 +1003,39 @@ def delete_team(db: Session, team: Team) -> None:
     entries = list(
         db.exec(select(TeamBlackboardEntry).where(TeamBlackboardEntry.team_id == team.id)).all()
     )
-    for row in [*members, *tasks, *bids, *events, *wakes, *entries]:
+    sessions = list(
+        db.exec(select(ChatSession).where(ChatSession.team_id == team.id)).all()
+    )
+    workspace_cleanups = []
+    for row in [*members, *runs, *tasks, *bids, *events, *wakes, *entries]:
         db.delete(row)
+    for session in sessions:
+        cleanup = purge_chat_session_records(db, session)
+        workspace_cleanups.append((session.tenant_id, session.id, cleanup.workspace_roots))
     db.delete(team)
     db.commit()
+    for tenant_id, session_id, workspace_roots in workspace_cleanups:
+        remove_chat_session_workspace(
+            tenant_id=tenant_id,
+            session_id=session_id,
+            db=db,
+            workspace_roots=workspace_roots,
+        )
 
 
 def _ensure_team_agent(db: Session, team: Team, agent_id: str) -> AgentProfile:
     agent = db.get(AgentProfile, agent_id)
     if agent is None or agent.tenant_id != team.tenant_id:
-        raise HTTPException(status_code=404, detail="Agent not found in this tenant")
+        raise _team_error("TEAM_AGENT_NOT_FOUND", 404)
     if agent.status != "active":
-        raise HTTPException(status_code=400, detail="Agent is not active")
+        raise _team_error("TEAM_AGENT_INACTIVE", 400)
     return agent
 
 
 def add_member(db: Session, team: Team, *, agent_id: str, role: str = "member") -> TeamMember:
     if role not in TEAM_MEMBER_ROLES:
-        raise HTTPException(status_code=400, detail=f"Invalid team member role: {role}")
+        safe_role = role if role in {"leader", "member"} else "unknown"
+        raise _team_error("TEAM_MEMBER_ROLE_INVALID", 400, params={"role": safe_role})
     _ensure_team_agent(db, team, agent_id)
     existing = db.exec(
         select(TeamMember).where(
@@ -406,14 +1043,14 @@ def add_member(db: Session, team: Team, *, agent_id: str, role: str = "member") 
         )
     ).first()
     if existing:
-        raise HTTPException(status_code=409, detail="Agent is already a team member")
+        raise _team_error("TEAM_MEMBER_DUPLICATE", 409)
     member = TeamMember(team_id=team.id, agent_id=agent_id, role="member")
     db.add(member)
     try:
         db.commit()
     except IntegrityError as exc:
         db.rollback()
-        raise HTTPException(status_code=409, detail="Agent is already a team member") from exc
+        raise _team_error("TEAM_MEMBER_DUPLICATE", 409, cause=exc) from exc
     db.refresh(member)
     if role == "leader":
         # 一个团队至多一名 TL:新 leader 上任即换任
@@ -422,16 +1059,97 @@ def add_member(db: Session, team: Team, *, agent_id: str, role: str = "member") 
     return member
 
 
-def remove_member(db: Session, team: Team, agent_id: str) -> None:
+def remove_member(
+    db: Session,
+    team: Team,
+    agent_id: str,
+    *,
+    actor_user_id: str | None = None,
+) -> None:
+    """移除成员并仅撤销其在当前团队的授权，保留其他团队权限。"""
     member = db.exec(
         select(TeamMember).where(
             TeamMember.team_id == team.id, TeamMember.agent_id == agent_id
         )
     ).first()
     if member is None:
-        raise HTTPException(status_code=404, detail="Team member not found")
+        raise _team_error("TEAM_MEMBER_NOT_FOUND", 404)
+    now = utc_now()
+    grants = db.exec(
+        select(TeamKnowledgeBaseGrant).where(
+            TeamKnowledgeBaseGrant.tenant_id == team.tenant_id,
+            TeamKnowledgeBaseGrant.team_id == team.id,
+            TeamKnowledgeBaseGrant.agent_id == agent_id,
+            TeamKnowledgeBaseGrant.status == "active",
+        )
+    ).all()
+    changed_base_ids: set[str] = set()
+    audit = KnowledgeAuditService(db)
+    for grant in grants:
+        grant.status = "revoked"
+        grant.updated_at = now
+        db.add(grant)
+        changed_base_ids.add(grant.knowledge_base_id)
+        audit.append_event(
+            tenant_id=team.tenant_id,
+            knowledge_base_id=grant.knowledge_base_id,
+            team_id=team.id,
+            knowledge_base_version_id=None,
+            actor_type="user" if actor_user_id else "system",
+            actor_id=actor_user_id or "system",
+            action="grant_revoked",
+            reason="员工已从团队移除",
+            details={
+                "agent_id": agent_id,
+                "previous_permission": grant.permission,
+            },
+        )
+    for knowledge_base_id in changed_base_ids:
+        binding = db.exec(
+            select(TeamKnowledgeBaseBinding).where(
+                TeamKnowledgeBaseBinding.tenant_id == team.tenant_id,
+                TeamKnowledgeBaseBinding.team_id == team.id,
+                TeamKnowledgeBaseBinding.knowledge_base_id == knowledge_base_id,
+                TeamKnowledgeBaseBinding.status == "active",
+            )
+        ).first()
+        if binding is not None:
+            binding.revision += 1
+            binding.updated_at = now
+            db.add(binding)
     db.delete(member)
-    db.commit()
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+
+def resolve_team_knowledge_write_base(
+    db: Session,
+    *,
+    team: Team,
+    knowledge_base_id: str | None,
+) -> KnowledgeBase:
+    """只从显式目标或团队默认目标解析已绑定共享库，绝不回退到租户默认库。"""
+    target_id = str(knowledge_base_id or team.default_knowledge_base_id or "").strip()
+    if not target_id:
+        raise knowledge_error(KNOWLEDGE_DEFAULT_NOT_CONFIGURED)
+    binding = db.exec(
+        select(TeamKnowledgeBaseBinding).where(
+            TeamKnowledgeBaseBinding.tenant_id == team.tenant_id,
+            TeamKnowledgeBaseBinding.team_id == team.id,
+            TeamKnowledgeBaseBinding.knowledge_base_id == target_id,
+            TeamKnowledgeBaseBinding.status == "active",
+        )
+    ).first()
+    if binding is None:
+        raise knowledge_error(KNOWLEDGE_CONTEXT_MISMATCH)
+    return _require_bindable_shared_base(
+        db,
+        team=team,
+        knowledge_base_id=target_id,
+    )
 
 
 def set_leader(db: Session, team: Team, agent_id: str) -> TeamMember:
@@ -442,7 +1160,7 @@ def set_leader(db: Session, team: Team, agent_id: str) -> TeamMember:
         )
     ).first()
     if member is None:
-        raise HTTPException(status_code=404, detail="Agent is not a team member")
+        raise _team_error("TEAM_AGENT_NOT_MEMBER", 404)
     current = get_team_leader(db, team.id)
     if current and current.agent_id != agent_id:
         current.role = "member"
@@ -464,13 +1182,14 @@ def record_task_event(
     event_type: str,
     payload: dict[str, Any] | None = None,
 ) -> TeamTaskEvent:
+    """Persist a team audit event with canonical nested errors and raw success fields intact."""
     event = TeamTaskEvent(
         task_id=task_id,
         team_id=team_id,
         actor_type=actor_type,
         actor_id=actor_id,
         event_type=event_type,
-        payload_json=dict(payload or {}),
+        payload_json=_sanitize_team_payload(payload or {}),
     )
     db.add(event)
     return event
@@ -489,7 +1208,14 @@ def apply_task_transition(
     """按状态机迁移任务状态并写审计;非法流转抛 TeamTaskTransitionError。"""
     if new_status not in TASK_STATUSES:
         raise TeamTaskTransitionError(f"未知任务状态: {new_status}")
-    if new_status != task.status and new_status not in TASK_TRANSITIONS.get(task.status, set()):
+    planner_run_completed = bool(
+        task.team_run_id and task.status == "in_progress" and new_status == "done"
+    )
+    if (
+        new_status != task.status
+        and new_status not in TASK_TRANSITIONS.get(task.status, set())
+        and not planner_run_completed
+    ):
         raise TeamTaskTransitionError(f"任务不允许从 {task.status} 流转到 {new_status}")
     previous = task.status
     task.status = new_status
@@ -553,6 +1279,72 @@ BLACKBOARD_SOURCE_TYPES = {"member", "leader", "human"}
 BLACKBOARD_STATUSES = {"active", "archived"}
 BLACKBOARD_INJECTION_LIMIT = 10
 
+# TeamTaskEvent is a legacy audit table, but its public reason fields now carry
+# the same locale-independent shape as SystemEvent.  The canonical registry
+# entries are kept here as a narrow producer contract until the event registry
+# migration is complete; callers must not add free-form params to these events.
+TEAM_EVENT_PARAM_SCHEMAS: dict[str, dict[str, str]] = {
+    "team.blackboard.entry.skipped": {"reason_code": "string"},
+    "team.task.bid.failed": {"reason_code": "string", "round": "integer"},
+    "team.task.review.failed": {"reason_code": "string"},
+    "team.task.escalated": {"reason_code": "string"},
+}
+
+
+def team_reason_payload(
+    event_code: str,
+    *,
+    reason_code: str,
+    params: Mapping[str, object] | None = None,
+    raw: Mapping[str, object] | None = None,
+) -> dict[str, Any]:
+    """Build a typed team reason envelope while marking business excerpts as raw source.
+
+    ``event_code`` and the exact primitive ``params`` are the machine contract.
+    ``raw`` is deliberately outside ``params`` so task names, bid/report text,
+    and bounded business excerpts never become localization arguments.
+    """
+    schema = TEAM_EVENT_PARAM_SCHEMAS.get(event_code)
+    if schema is None:
+        raise ValueError(f"unregistered team event code: {event_code}")
+    event_params: dict[str, object] = {"reason_code": reason_code, **dict(params or {})}
+    if set(event_params) != set(schema):
+        raise ValueError(f"{event_code} params do not match the team event contract")
+    for name, kind in schema.items():
+        value = event_params[name]
+        valid = (
+            isinstance(value, str)
+            if kind == "string"
+            else isinstance(value, int) and not isinstance(value, bool)
+        )
+        if not valid:
+            raise TypeError(f"{event_code} param {name} must be {kind}")
+    payload: dict[str, Any] = {
+        "event_code": event_code,
+        "params": event_params,
+        "reason": {"code": reason_code, "params": dict(params or {})},
+    }
+    if raw:
+        payload["raw"] = dict(raw)
+        payload["raw_source_markers"] = [
+            RawSourceMarker(
+                json_pointer=f"/raw/{key.replace('~', '~0').replace('/', '~1')}",
+                kind=RawSourceKind.BUSINESS_RECORD,
+            ).model_dump(mode="json")
+            for key in raw
+        ]
+    return payload
+
+
+def blackboard_skip_reason(reason_code: str, content: str = "") -> dict[str, Any]:
+    """Return one blackboard skip envelope with a bounded, verbatim source excerpt."""
+    excerpt = str(content or "")[:50]
+    return team_reason_payload(
+        "team.blackboard.entry.skipped",
+        reason_code=reason_code,
+        raw={"content_excerpt": excerpt} if excerpt else None,
+    )
+
 
 def normalize_blackboard_content(content: Any) -> str:
     """黑板内容规范化:压缩全部空白,供去重/合并比较。"""
@@ -581,12 +1373,12 @@ def write_blackboard_entries(
     source_type: str,
     source_agent_id: str | None = None,
     source_task_id: str | None = None,
-) -> tuple[list[TeamBlackboardEntry], list[str]]:
+) -> tuple[list[TeamBlackboardEntry], list[dict[str, Any]]]:
     """轻量黑板写入流水线:规范化 -> 去重合并 -> 结构化写入(带引用)。
 
     黑板是活文档:与同团队既有 active 条目完全相同或为其子串时不新增;
     新内容是既有条目超集时合并更新既有条目(content/tags/citation/updated_at)。
-    调用方负责 commit。返回 (写入/更新的条目列表, 跳过原因列表)。
+    调用方负责 commit。返回 (写入/更新的条目列表, 结构化跳过原因列表)。
     """
     if source_type not in BLACKBOARD_SOURCE_TYPES:
         raise ValueError(f"未知黑板来源类型: {source_type}")
@@ -606,28 +1398,30 @@ def write_blackboard_entries(
     )
     existing_by_norm = {normalize_blackboard_content(row.content): row for row in existing_rows}
     written: list[TeamBlackboardEntry] = []
-    skipped: list[str] = []
+    skipped: list[dict[str, Any]] = []
     seen_in_batch: set[str] = set()
     for raw in entries:
         if not isinstance(raw, dict):
-            skipped.append("条目结构非法,已跳过")
+            skipped.append(blackboard_skip_reason("invalid_shape", str(raw)))
             continue
+        source_content = str(raw.get("content") or "")
+        source_excerpt = source_content[:50]
         content = normalize_blackboard_content(raw.get("content"))
         if not content:
-            skipped.append("内容为空,已跳过")
+            skipped.append(blackboard_skip_reason("empty_content"))
             continue
         if content in seen_in_batch:
-            skipped.append(f"与本批次内其他条目重复: {content[:50]}")
+            skipped.append(blackboard_skip_reason("duplicate_batch", source_excerpt))
             continue
         seen_in_batch.add(content)
         tags = normalize_blackboard_tags(raw.get("tags"))
         if content in existing_by_norm:
-            skipped.append(f"与黑板既有条目重复: {content[:50]}")
+            skipped.append(blackboard_skip_reason("duplicate_existing", source_excerpt))
             continue
         # 子串关系:新内容是既有条目的子串 -> 跳过;既有条目是新内容的子串 -> 合并更新
         is_substring = any(content in norm for norm in existing_by_norm)
         if is_substring:
-            skipped.append(f"黑板已有更完整条目: {content[:50]}")
+            skipped.append(blackboard_skip_reason("covered_by_existing", source_excerpt))
             continue
         superseded: TeamBlackboardEntry | None = None
         superseded_norm = ""

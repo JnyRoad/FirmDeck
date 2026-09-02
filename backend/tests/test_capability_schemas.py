@@ -106,3 +106,23 @@ def test_python_provider_error_has_one_wire_error_code_mapping() -> None:
         request_id="req-1",
     ).to_payload()
     assert not list(validator.iter_errors(payload))
+
+
+def test_provider_v1_marks_message_deprecated_and_carries_canonical_trace_fields() -> None:
+    """Keep the v1 message compatibility field explicit while adding safe params and trace linkage."""
+    schema = load_schema("provider.error.v1.json")
+    validator = Draft202012Validator(schema)
+    payload = {
+        "error_code": "KNOWLEDGE_TIMEOUT",
+        "message": "legacy provider diagnostic",
+        "retryable": True,
+        "request_id": "req-1",
+        "trace_id": "trace-1",
+        "params": {"provider_id": "knowledge-primary"},
+        "provider_id": "knowledge-primary",
+        "extensions": {},
+        "deprecated_fields": ["message"],
+    }
+
+    assert schema["properties"]["message"]["deprecated"] is True
+    assert not list(validator.iter_errors(payload))

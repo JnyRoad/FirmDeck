@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import {
   Clock,
@@ -30,12 +30,20 @@ import {
   type UnderlineTabItem,
 } from '@/components/ui';
 import { notify } from '@/components/ui/app-toast';
+import { RawContent, RawIdentifier } from '@/i18n/RawContent';
+import type { MessageValues } from '@/i18n/imperative';
+import type { MessageId } from '@/i18n/types';
+import { useAppIntl } from '@/i18n/useAppIntl';
+import { apiErrorMessage } from '@/lib/apiErrorMessages';
+import { backendEventMessage } from '@/lib/backendEventMessages';
 import { cn } from '@/lib/utils';
 import { SELECT_TRIGGER_CLASS, formatDateTime } from '@/lib/enterprise-ui';
 import { isTeamScope, readEmployeeScope } from '@/lib/agent-scope-storage';
+import { tenantUserStorageKey } from '@/lib/tenant-storage';
 import { MarkdownMessage } from '../chat/chatHelpers';
 
-import { api, TENANT_ID } from '../../api/client';
+import { createTenantClient } from '../../api/tenant-client';
+import { useTenantSession } from '../../contexts/TenantSessionContext';
 import IconCalendar from '../../assets/icons/profile-calendar.svg?react';
 import { employeeDisplayNameWithCreator } from '../../employee';
 import { useClientPagination } from '../../hooks/useClientPagination';
@@ -62,6 +70,63 @@ import { employeeDashboardMetrics } from './employeeDashboardMetrics';
 
 const FEEDBACK_PAGE_SIZE = 10;
 const ALL_CONVERSATION_USERS = '__all_conversation_users__';
+const CONVERSATION_LOG_FILTER_FEATURE = 'conversation-log-filter';
+
+const CONVERSATION_LOG_FILTERS = new Set<ConversationLogFilter>([
+  'all',
+  'up',
+  'down',
+  'unrated',
+  'ability',
+  'tool',
+  'knowledge',
+  'sop',
+]);
+
+type StoredConversationLogFilter = {
+  filter: ConversationLogFilter;
+  userId: string;
+};
+
+/** Generate the tenant/user namespace for conversation-log view preferences. */
+function conversationLogFilterStorageKey(tenantId: string, userId: string): string {
+  return tenantUserStorageKey(tenantId, userId, CONVERSATION_LOG_FILTER_FEATURE);
+}
+
+/** Read only the validated conversation-log filter for one tenant/user pair. */
+function readConversationLogFilter(tenantId: string, userId: string): StoredConversationLogFilter | null {
+  try {
+    const raw = window.localStorage.getItem(conversationLogFilterStorageKey(tenantId, userId));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    if (
+      !parsed
+      || typeof parsed !== 'object'
+      || typeof parsed.userId !== 'string'
+      || typeof parsed.filter !== 'string'
+      || !CONVERSATION_LOG_FILTERS.has(parsed.filter as ConversationLogFilter)
+    ) return null;
+    return { filter: parsed.filter as ConversationLogFilter, userId: parsed.userId };
+  } catch {
+    return null;
+  }
+}
+
+/** Persist the filter selection in the verified tenant/user namespace only. */
+function persistConversationLogFilter(
+  tenantId: string,
+  userId: string,
+  value: StoredConversationLogFilter,
+): void {
+  try {
+    window.localStorage.setItem(
+      conversationLogFilterStorageKey(tenantId, userId),
+      JSON.stringify(value),
+    );
+  } catch {
+    // A blocked or full browser store must not affect server-backed log views.
+  }
+}
 
 type ConversationDetail = {
   session: Record<string, unknown>;
@@ -72,23 +137,279 @@ type ConversationDetail = {
   toolInvocations: NonNullable<EnterpriseSessionDetailRead['tool_invocations']>;
 };
 
-const FILTER_TABS: UnderlineTabItem<ConversationLogFilter>[] = [
-  { label: '全部', value: 'all' },
-  { label: '好评', value: 'up' },
-  { label: '差评', value: 'down' },
-  { label: '未评价', value: 'unrated' },
-  { label: '能力不足', value: 'ability' },
-  { label: '工具问题', value: 'tool' },
-  { label: '知识缺失', value: 'knowledge' },
-  { label: 'SOP 问题', value: 'sop' },
-];
+const FILTER_TAB_DEFINITIONS = [
+  { labelId: 'dashboard.conversationLogs.filter.all', value: 'all' },
+  { labelId: 'dashboard.conversationLogs.filter.up', value: 'up' },
+  { labelId: 'dashboard.conversationLogs.filter.down', value: 'down' },
+  { labelId: 'dashboard.conversationLogs.filter.unrated', value: 'unrated' },
+  { labelId: 'dashboard.conversationLogs.filter.ability', value: 'ability' },
+  { labelId: 'dashboard.conversationLogs.filter.tool', value: 'tool' },
+  { labelId: 'dashboard.conversationLogs.filter.knowledge', value: 'knowledge' },
+  { labelId: 'dashboard.conversationLogs.filter.sop', value: 'sop' },
+] as const satisfies ReadonlyArray<{ labelId: MessageId; value: ConversationLogFilter }>;
+
+type FeedbackBucketId =
+  | 'model_issue'
+  | 'skill_issue'
+  | 'skill_instruction_issue'
+  | 'sop_trigger_issue'
+  | 'sop_slot_issue'
+  | 'sop_transition_issue'
+  | 'sop_capability_issue'
+  | 'knowledge_gap'
+  | 'tool_or_system_issue'
+  | 'tool_or_runtime_issue'
+  | 'user_random_or_unclear'
+  | 'positive_or_resolved'
+  | 'needs_model_analysis'
+  | 'unknown';
+
+const FEEDBACK_BUCKET_IDS = {
+  model_issue: 'dashboard.conversationLogs.bucket.modelIssue',
+  skill_issue: 'dashboard.conversationLogs.bucket.skillIssue',
+  skill_instruction_issue: 'dashboard.conversationLogs.bucket.skillInstructionIssue',
+  sop_trigger_issue: 'dashboard.conversationLogs.bucket.sopTriggerIssue',
+  sop_slot_issue: 'dashboard.conversationLogs.bucket.sopSlotIssue',
+  sop_transition_issue: 'dashboard.conversationLogs.bucket.sopTransitionIssue',
+  sop_capability_issue: 'dashboard.conversationLogs.bucket.sopCapabilityIssue',
+  knowledge_gap: 'dashboard.conversationLogs.bucket.knowledgeGap',
+  tool_or_system_issue: 'dashboard.conversationLogs.bucket.toolOrSystemIssue',
+  tool_or_runtime_issue: 'dashboard.conversationLogs.bucket.toolOrRuntimeIssue',
+  user_random_or_unclear: 'dashboard.conversationLogs.bucket.userRandomOrUnclear',
+  positive_or_resolved: 'dashboard.conversationLogs.bucket.positiveOrResolved',
+  needs_model_analysis: 'dashboard.conversationLogs.bucket.needsModelAnalysis',
+  unknown: 'dashboard.conversationLogs.bucket.unknown',
+} as const satisfies Record<FeedbackBucketId, string>;
+
+type AnalysisStatusId = 'pending' | 'analyzed' | 'failed' | 'needs_model' | 'unknown';
+
+const ANALYSIS_STATUS_IDS = {
+  pending: 'dashboard.conversationLogs.analysis.pending',
+  analyzed: 'dashboard.conversationLogs.analysis.completed',
+  failed: 'dashboard.conversationLogs.analysis.failed',
+  needs_model: 'dashboard.conversationLogs.analysis.needsModel',
+  unknown: 'dashboard.conversationLogs.analysis.unknown',
+} as const satisfies Record<AnalysisStatusId, string>;
+
+const FAILED_ATTEMPTS_MESSAGE_ID = 'dashboard.conversationLogs.analysis.failedAttempts';
+const SUMMARY_COUNT_MESSAGE_ID = 'dashboard.conversationLogs.summary.count';
+
+export type FeedbackMessageValues = Record<string, number>;
+
+export type FeedbackMessageId =
+  | (typeof FEEDBACK_BUCKET_IDS)[FeedbackBucketId]
+  | (typeof ANALYSIS_STATUS_IDS)[AnalysisStatusId]
+  | typeof FAILED_ATTEMPTS_MESSAGE_ID
+  | typeof SUMMARY_COUNT_MESSAGE_ID;
+
+export type FeedbackMessageDescriptor = {
+  id: FeedbackMessageId;
+  values?: FeedbackMessageValues;
+};
+
+export type FeedbackTranslate = (id: FeedbackMessageId, values?: FeedbackMessageValues) => string;
 
 const MOBILE_CARD_CLASS =
   'min-w-0 rounded-[8px] border border-[#eceef1] bg-white p-[14px]';
 
+/** 将未知异常折叠为安全语义消息；普通 Error.message 不进入最终 UI。 */
+function conversationLogErrorMessage(
+  error: unknown,
+  fallbackId: MessageId,
+  translate: (id: MessageId, values?: MessageValues) => string,
+): string {
+  const generic = translate('common.error.generic');
+  const message = apiErrorMessage(error, fallbackId, { t: translate });
+  return message === generic ? translate(fallbackId) : message;
+}
+
+/** Narrow unknown backend values to a record before reading typed projection fields. */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** Accept only finite positive integer parameters that are safe for ICU number formatting. */
+function positiveInteger(value: unknown): number | null {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : null;
+}
+
+/** Return whether a backend bucket is one of the registered stable identifiers. */
+function isFeedbackBucketId(value: unknown): value is FeedbackBucketId {
+  return typeof value === 'string' && Object.prototype.hasOwnProperty.call(FEEDBACK_BUCKET_IDS, value);
+}
+
+/** Project a backend bucket identifier to a semantic message descriptor; malformed values fail closed. */
+export function feedbackBucketDescriptor(bucket: unknown): FeedbackMessageDescriptor {
+  return { id: isFeedbackBucketId(bucket) ? FEEDBACK_BUCKET_IDS[bucket] : FEEDBACK_BUCKET_IDS.unknown };
+}
+
+/** Render a stable bucket descriptor through the active UI locale without exposing backend labels. */
+export function feedbackBucketLabel(bucket: unknown, translate: FeedbackTranslate): string {
+  const descriptor = feedbackBucketDescriptor(bucket);
+  return translate(descriptor.id, descriptor.values);
+}
+
+/** Return whether a backend analysis status is one of the registered stable identifiers. */
+function isAnalysisStatusId(value: unknown): value is AnalysisStatusId {
+  return typeof value === 'string' && Object.prototype.hasOwnProperty.call(ANALYSIS_STATUS_IDS, value);
+}
+
+/** Project a stable analysis status and its bounded params to a semantic message descriptor. */
+export function feedbackAnalysisStatusDescriptor(
+  status: unknown,
+  params: unknown,
+): FeedbackMessageDescriptor {
+  const normalizedStatus: AnalysisStatusId = isAnalysisStatusId(status) ? status : 'unknown';
+  if (normalizedStatus === 'failed' && isRecord(params)) {
+    const attempts = positiveInteger(params.attempts);
+    if (attempts !== null) return { id: FAILED_ATTEMPTS_MESSAGE_ID, values: { attempts } };
+  }
+  return { id: ANALYSIS_STATUS_IDS[normalizedStatus] };
+}
+
+/** Render a stable analysis status through the active UI locale and ignore malformed status params. */
+export function analysisStatusLabel(
+  status: unknown,
+  params: unknown,
+  translate: FeedbackTranslate,
+): string {
+  const descriptor = feedbackAnalysisStatusDescriptor(status, params);
+  return translate(descriptor.id, descriptor.values);
+}
+
+/** Project the backend aggregate descriptor while keeping model-authored detail outside i18n. */
+export function feedbackSummaryDescriptor(value: unknown): {
+  bucket: FeedbackMessageDescriptor;
+  count: FeedbackMessageDescriptor;
+  detail: string | null;
+} | null {
+  if (!isRecord(value) || !isRecord(value.params)) return null;
+  const count = positiveInteger(value.params.count);
+  if (count === null) return null;
+  if (value.detail !== undefined && value.detail !== null && typeof value.detail !== 'string') return null;
+  return {
+    bucket: feedbackBucketDescriptor(value.bucket),
+    count: { id: SUMMARY_COUNT_MESSAGE_ID, values: { count } },
+    detail: typeof value.detail === 'string' ? value.detail : null,
+  };
+}
+
+/** Project one aggregate bucket count using canonical params, with a numeric legacy reader fallback. */
+export function feedbackBucketCountDescriptor(value: unknown): {
+  bucket: FeedbackMessageDescriptor;
+  count: FeedbackMessageDescriptor;
+} | null {
+  if (!isRecord(value)) return null;
+  const params = isRecord(value.params) ? value.params : null;
+  const count = positiveInteger(params?.count ?? value.count);
+  if (count === null) return null;
+  return {
+    bucket: feedbackBucketDescriptor(value.bucket),
+    count: { id: SUMMARY_COUNT_MESSAGE_ID, values: { count } },
+  };
+}
+
+/** Read only the status params field from the versioned analysis payload. */
+function feedbackStatusParams(value: FeedbackAnalysisRead | undefined): unknown {
+  return value ? Reflect.get(value, 'status_params') : undefined;
+}
+
+/** Serialize one model-owned evidence value without translating or silently stringifying failures. */
+function rawFeedbackContent(value: unknown): string | null {
+  if (typeof value === 'string') return value;
+  if (value === null || value === undefined) return null;
+  try {
+    const serialized = JSON.stringify(value);
+    return typeof serialized === 'string' ? serialized : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Read the versioned evidence list and retain only values that can cross a RawContent boundary. */
+export function feedbackEvidenceContent(value: unknown): string[] {
+  const evidence = value ? Reflect.get(value, 'evidence') : undefined;
+  if (!Array.isArray(evidence)) return [];
+  return evidence
+    .map(rawFeedbackContent)
+    .filter((item): item is string => item !== null && item.length > 0);
+}
+
+/** 按当前界面语言格式化百分比指标，避免把数值和单位手工拼接进 UI。 */
+function formatMetricPercent(value: number, locale: string): string {
+  return new Intl.NumberFormat(locale, {
+    style: 'percent',
+    maximumFractionDigits: 0,
+  }).format(value / 100);
+}
+
 export default function ConversationLogsTab() {
+  const { locale, t } = useAppIntl();
+  const tenantContext = useTenantSession();
+  const tenantClient = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
+  const tenantId = tenantContext?.tenantId || '';
+  const userId = tenantContext?.userId || '';
+  const tenantScopeKey = tenantContext
+    ? `${tenantId}:${userId}:${tenantContext.generation}`
+    : '';
+  const scopeKeyRef = useRef('');
+  const agentIdRef = useRef('');
+  const lastAgentIdRef = useRef('');
+  const scopeRevisionRef = useRef(0);
+  const actionControllersRef = useRef(new Set<AbortController>());
+  const previousAgentIdRef = useRef<string | null>(null);
+  const [scopeReady, setScopeReady] = useState(false);
+  const loadControllerRef = useRef<AbortController | null>(null);
+  const feedbackTranslate: FeedbackTranslate = (id, values) => {
+    switch (id) {
+      case 'dashboard.conversationLogs.bucket.modelIssue':
+        return t('dashboard.conversationLogs.bucket.modelIssue', values);
+      case 'dashboard.conversationLogs.bucket.skillIssue':
+        return t('dashboard.conversationLogs.bucket.skillIssue', values);
+      case 'dashboard.conversationLogs.bucket.skillInstructionIssue':
+        return t('dashboard.conversationLogs.bucket.skillInstructionIssue', values);
+      case 'dashboard.conversationLogs.bucket.sopTriggerIssue':
+        return t('dashboard.conversationLogs.bucket.sopTriggerIssue', values);
+      case 'dashboard.conversationLogs.bucket.sopSlotIssue':
+        return t('dashboard.conversationLogs.bucket.sopSlotIssue', values);
+      case 'dashboard.conversationLogs.bucket.sopTransitionIssue':
+        return t('dashboard.conversationLogs.bucket.sopTransitionIssue', values);
+      case 'dashboard.conversationLogs.bucket.sopCapabilityIssue':
+        return t('dashboard.conversationLogs.bucket.sopCapabilityIssue', values);
+      case 'dashboard.conversationLogs.bucket.knowledgeGap':
+        return t('dashboard.conversationLogs.bucket.knowledgeGap', values);
+      case 'dashboard.conversationLogs.bucket.toolOrSystemIssue':
+        return t('dashboard.conversationLogs.bucket.toolOrSystemIssue', values);
+      case 'dashboard.conversationLogs.bucket.toolOrRuntimeIssue':
+        return t('dashboard.conversationLogs.bucket.toolOrRuntimeIssue', values);
+      case 'dashboard.conversationLogs.bucket.userRandomOrUnclear':
+        return t('dashboard.conversationLogs.bucket.userRandomOrUnclear', values);
+      case 'dashboard.conversationLogs.bucket.positiveOrResolved':
+        return t('dashboard.conversationLogs.bucket.positiveOrResolved', values);
+      case 'dashboard.conversationLogs.bucket.needsModelAnalysis':
+        return t('dashboard.conversationLogs.bucket.needsModelAnalysis', values);
+      case 'dashboard.conversationLogs.bucket.unknown':
+        return t('dashboard.conversationLogs.bucket.unknown', values);
+      case 'dashboard.conversationLogs.analysis.pending':
+        return t('dashboard.conversationLogs.analysis.pending', values);
+      case 'dashboard.conversationLogs.analysis.completed':
+        return t('dashboard.conversationLogs.analysis.completed', values);
+      case 'dashboard.conversationLogs.analysis.failed':
+        return t('dashboard.conversationLogs.analysis.failed', values);
+      case 'dashboard.conversationLogs.analysis.failedAttempts':
+        return t('dashboard.conversationLogs.analysis.failedAttempts', values);
+      case 'dashboard.conversationLogs.analysis.needsModel':
+        return t('dashboard.conversationLogs.analysis.needsModel', values);
+      case 'dashboard.conversationLogs.analysis.unknown':
+        return t('dashboard.conversationLogs.analysis.unknown', values);
+      case 'dashboard.conversationLogs.summary.count':
+        return t('dashboard.conversationLogs.summary.count', values);
+      default:
+        return t('dashboard.conversationLogs.analysis.unknown');
+    }
+  };
   const [searchParams] = useSearchParams();
-  const [scopedAgentId, setScopedAgentId] = useState(readEmployeeScope);
+  const [scopedAgentId, setScopedAgentId] = useState('');
   const agentId = searchParams.get('agent_id') || scopedAgentId;
   const [sessions, setSessions] = useState<EnterpriseChatSessionRead[]>([]);
   const [downRows, setDownRows] = useState<FeedbackSessionRead[]>([]);
@@ -103,27 +424,121 @@ export default function ConversationLogsTab() {
   const [reanalyzingId, setReanalyzingId] = useState<string | null>(null);
   const [selectedSessionIds, setSelectedSessionIds] = useState<Set<string>>(() => new Set());
   const [exportingKey, setExportingKey] = useState('');
+  // Keep the latest effective employee visible to in-flight callbacks before passive effects run.
+  agentIdRef.current = agentId;
+
+  /** Abort detail, feedback, and export actions when the employee scope changes or the view unmounts. */
+  function cancelActionControllers() {
+    actionControllersRef.current.forEach((controller) => controller.abort());
+    actionControllersRef.current.clear();
+  }
+
+  /** Advance the scope revision synchronously so no action can publish into a replaced employee view. */
+  function updateAgentScope(nextAgentId: string) {
+    agentIdRef.current = nextAgentId;
+    lastAgentIdRef.current = nextAgentId;
+    scopeRevisionRef.current += 1;
+    cancelActionControllers();
+    setSessions([]);
+    setDownRows([]);
+    setUpRows([]);
+    setSummary(null);
+    setExportingKey('');
+    setDetailLoading(false);
+    setReanalyzingId(null);
+    setDetail(null);
+    setSelectedSessionIds(new Set());
+    setScopedAgentId(nextAgentId);
+  }
+
+  useEffect(() => {
+    if (lastAgentIdRef.current === agentId) return;
+    lastAgentIdRef.current = agentId;
+    scopeRevisionRef.current += 1;
+    cancelActionControllers();
+    setSessions([]);
+    setDownRows([]);
+    setUpRows([]);
+    setSummary(null);
+    setExportingKey('');
+    setDetailLoading(false);
+    setReanalyzingId(null);
+    setDetail(null);
+    setSelectedSessionIds(new Set());
+  }, [agentId]);
+
+  useEffect(() => () => cancelActionControllers(), [tenantContext?.generation]);
+  const filterTabs = useMemo<UnderlineTabItem<ConversationLogFilter>[]>(
+    () => FILTER_TAB_DEFINITIONS.map((item) => ({ value: item.value, label: t(item.labelId) })),
+    [t],
+  );
+
+  useEffect(() => {
+    if (!tenantContext || !tenantId || !userId) {
+      scopeKeyRef.current = '';
+      agentIdRef.current = '';
+      lastAgentIdRef.current = '';
+      scopeRevisionRef.current += 1;
+      cancelActionControllers();
+      previousAgentIdRef.current = null;
+      setScopeReady(false);
+      setScopedAgentId('');
+      setFilter('all');
+      setConversationUserId(ALL_CONVERSATION_USERS);
+      return;
+    }
+    scopeKeyRef.current = tenantScopeKey;
+    const nextAgentId = readEmployeeScope(tenantId, userId);
+    agentIdRef.current = nextAgentId;
+    lastAgentIdRef.current = nextAgentId;
+    scopeRevisionRef.current += 1;
+    cancelActionControllers();
+    setScopedAgentId(nextAgentId);
+    const stored = readConversationLogFilter(tenantId, userId);
+    setFilter(stored?.filter || 'all');
+    setConversationUserId(stored?.userId || ALL_CONVERSATION_USERS);
+    setScopeReady(true);
+  }, [tenantContext, tenantId, tenantScopeKey, userId]);
 
   useEffect(() => {
     const onScopeChange = (event: Event) => {
       const next = (event as CustomEvent<{ agentId?: string }>).detail?.agentId || '';
-      setScopedAgentId(next && !isTeamScope(next) ? next : readEmployeeScope());
+      if (!tenantContext || !tenantId || !userId || scopeKeyRef.current !== tenantScopeKey) return;
+      updateAgentScope(next && !isTeamScope(next) ? next : readEmployeeScope(tenantId, userId));
     };
     window.addEventListener('ultrarag-enterprise-agent-scope-change', onScopeChange);
     return () => window.removeEventListener('ultrarag-enterprise-agent-scope-change', onScopeChange);
-  }, []);
+  }, [tenantContext, tenantId, tenantScopeKey, userId]);
 
-  const load = async () => {
+  const load = useCallback(async () => {
+    if (!tenantContext || !tenantId || !userId || !scopeReady || scopeKeyRef.current !== tenantScopeKey) return;
+    loadControllerRef.current?.abort();
+    const requestController = new AbortController();
+    loadControllerRef.current = requestController;
+    const generation = tenantContext.generation;
+    const capturedAgentId = agentId;
+    const capturedScopeRevision = scopeRevisionRef.current;
+    const isCurrent = () => (
+      !requestController.signal.aborted
+      && tenantContext.isCurrentGeneration(generation)
+      && scopeKeyRef.current === tenantScopeKey
+      && agentIdRef.current === capturedAgentId
+      && scopeRevisionRef.current === capturedScopeRevision
+    );
     setLoading(true);
     const agentQuery = agentId ? `&agent_id=${encodeURIComponent(agentId)}` : '';
     // Load each source independently so one failing endpoint doesn't blank the whole tab.
     const [sessionResult, downResult, upResult, summaryResult, agentResult] = await Promise.allSettled([
-      api.get<EnterpriseChatSessionRead[]>(`/api/enterprise/sessions?tenant_id=${TENANT_ID}${agentQuery}`),
-      api.get<FeedbackSessionRead[]>(`/api/enterprise/feedback/sessions?tenant_id=${TENANT_ID}&rating=down${agentQuery}`),
-      api.get<FeedbackSessionRead[]>(`/api/enterprise/feedback/sessions?tenant_id=${TENANT_ID}&rating=up${agentQuery}`),
-      api.get<FeedbackSummaryRead>(`/api/enterprise/feedback/summary?tenant_id=${TENANT_ID}${agentQuery}`),
-      api.get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${TENANT_ID}`),
+      tenantClient.get<EnterpriseChatSessionRead[]>(
+        `/api/enterprise/sessions${agentId ? `?agent_id=${encodeURIComponent(agentId)}` : ''}`,
+        { signal: requestController.signal },
+      ),
+      tenantClient.get<FeedbackSessionRead[]>(`/api/enterprise/feedback/sessions?rating=down${agentQuery}`, { signal: requestController.signal }),
+      tenantClient.get<FeedbackSessionRead[]>(`/api/enterprise/feedback/sessions?rating=up${agentQuery}`, { signal: requestController.signal }),
+      tenantClient.get<FeedbackSummaryRead>(`/api/enterprise/feedback/summary${agentId ? `?agent_id=${encodeURIComponent(agentId)}` : ''}`, { signal: requestController.signal }),
+      tenantClient.get<AgentProfileRead[]>('/api/enterprise/agents', { signal: requestController.signal }),
     ]);
+    if (!isCurrent()) return;
     if (sessionResult.status === 'fulfilled') setSessions(sessionResult.value);
     if (downResult.status === 'fulfilled') setDownRows(downResult.value);
     if (upResult.status === 'fulfilled') setUpRows(upResult.value);
@@ -133,19 +548,65 @@ export default function ConversationLogsTab() {
       (item): item is PromiseRejectedResult => item.status === 'rejected',
     );
     if (failure) {
-      notify.error(failure.reason instanceof Error ? failure.reason.message : '部分对话日志数据加载失败');
+      notify.error(conversationLogErrorMessage(failure.reason, 'dashboard.conversationLogs.error.partialLoad', t));
     }
-    setLoading(false);
-  };
+    if (loadControllerRef.current === requestController) {
+      loadControllerRef.current = null;
+      setLoading(false);
+    }
+  }, [agentId, scopeReady, t, tenantClient, tenantContext, tenantId, tenantScopeKey, userId]);
 
   useEffect(() => {
     void load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [agentId]);
+    return () => {
+      loadControllerRef.current?.abort();
+    };
+  }, [load]);
 
   useEffect(() => {
+    if (!tenantContext || !tenantId || !userId || !scopeReady || scopeKeyRef.current !== tenantScopeKey) {
+      previousAgentIdRef.current = null;
+      return;
+    }
+    // The first scoped render has already hydrated the persisted user filter;
+    // only a later employee-scope change should clear an incompatible user.
+    if (previousAgentIdRef.current === null) {
+      previousAgentIdRef.current = agentId;
+      return;
+    }
+    if (previousAgentIdRef.current === agentId) return;
+    previousAgentIdRef.current = agentId;
     setConversationUserId(ALL_CONVERSATION_USERS);
-  }, [agentId]);
+  }, [agentId, scopeReady, tenantContext, tenantId, tenantScopeKey, userId]);
+
+  useEffect(() => {
+    if (!tenantContext || !tenantId || !userId || !scopeReady || scopeKeyRef.current !== tenantScopeKey) return;
+    persistConversationLogFilter(tenantId, userId, {
+      filter,
+      userId: conversationUserId,
+    });
+  }, [conversationUserId, filter, scopeReady, tenantContext, tenantId, tenantScopeKey, userId]);
+
+  /** Create a request fence that rejects late results after tenant or view replacement. */
+  const beginRequestFence = () => {
+    if (!tenantContext || !tenantId || !userId || !scopeReady || scopeKeyRef.current !== tenantScopeKey) return null;
+    const requestController = new AbortController();
+    actionControllersRef.current.add(requestController);
+    const generation = tenantContext.generation;
+    const capturedAgentId = agentId;
+    const capturedScopeRevision = scopeRevisionRef.current;
+    return {
+      signal: requestController.signal,
+      isCurrent: () => (
+        !requestController.signal.aborted
+        && tenantContext.isCurrentGeneration(generation)
+        && scopeKeyRef.current === tenantScopeKey
+        && agentIdRef.current === capturedAgentId
+        && scopeRevisionRef.current === capturedScopeRevision
+      ),
+      release: () => actionControllersRef.current.delete(requestController),
+    };
+  };
 
   const rows = useMemo<ConversationLogRow[]>(() => {
     const downBySession = new Map(downRows.map((item) => [item.session_id, item]));
@@ -159,11 +620,12 @@ export default function ConversationLogsTab() {
       }));
   }, [agentId, downRows, sessions, upRows]);
   const dashboardMetrics = employeeDashboardMetrics(rows, summary);
+  const aggregateSummary = feedbackSummaryDescriptor(summary?.summary);
 
   const agentsById = useMemo(() => new Map(agents.map((agent) => [agent.id, agent])), [agents]);
 
   const agentLabelFromId = (rowAgentId?: string | null): string => {
-    if (!rowAgentId) return '-';
+    if (!rowAgentId) return t('dashboard.conversationLogs.placeholder.empty');
     const agent = agentsById.get(rowAgentId);
     return agent ? employeeDisplayNameWithCreator(agent) : rowAgentId;
   };
@@ -240,48 +702,70 @@ export default function ConversationLogsTab() {
   };
 
   const exportSingleSession = async (row: ConversationLogRow) => {
+    const fence = beginRequestFence();
+    if (!fence) return;
     setExportingKey(row.id);
     try {
-      const blob = await api.blob(
-        `/api/enterprise/sessions/${encodeURIComponent(row.id)}/export?tenant_id=${TENANT_ID}`,
+      const blob = await tenantClient.blob(
+        `/api/enterprise/sessions/${encodeURIComponent(row.id)}/export`,
+        { signal: fence.signal },
       );
+      if (!fence.isCurrent()) return;
       downloadBlob(blob, `staffdeck-conversation-log-${safeFilenamePart(row.id)}.json`);
-      notify.success('对话日志 JSON 已导出');
+      notify.successText(t('dashboard.conversationLogs.toast.exportSingleSuccess'));
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '导出对话日志失败');
+      if (fence.isCurrent()) {
+        notify.error(conversationLogErrorMessage(error, 'dashboard.conversationLogs.error.exportSingle', t));
+      }
     } finally {
-      setExportingKey('');
+      if (fence.isCurrent()) setExportingKey('');
+      fence.release();
     }
   };
 
   const exportBatch = async () => {
+    const fence = beginRequestFence();
+    if (!fence) return;
     const sessionIds = batchRows.map((row) => row.id);
-    if (sessionIds.length === 0) return;
+    if (sessionIds.length === 0) {
+      fence.release();
+      return;
+    }
     if (sessionIds.length > 500) {
-      notify.error('单次最多导出 500 条对话日志，请缩小筛选范围后重试');
+      notify.error(t('dashboard.conversationLogs.error.exportBatchLimit', { count: 500 }));
+      fence.release();
       return;
     }
     setExportingKey('batch');
     try {
-      const blob = await api.postBlob(
-        `/api/enterprise/sessions/export?tenant_id=${TENANT_ID}`,
+      const blob = await tenantClient.postBlob(
+        '/api/enterprise/sessions/export',
         { session_ids: sessionIds },
+        { signal: fence.signal },
       );
+      if (!fence.isCurrent()) return;
       downloadBlob(blob, `staffdeck-conversation-logs-${filenameTimestamp()}.json`);
-      notify.success(`已导出 ${sessionIds.length} 条对话日志`);
+      notify.successText(t('dashboard.conversationLogs.toast.exportBatchSuccess', { count: sessionIds.length }));
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '批量导出对话日志失败');
+      if (fence.isCurrent()) {
+        notify.error(conversationLogErrorMessage(error, 'dashboard.conversationLogs.error.exportBatch', t));
+      }
     } finally {
-      setExportingKey('');
+      if (fence.isCurrent()) setExportingKey('');
+      fence.release();
     }
   };
 
   const openDetail = async (row: ConversationLogRow) => {
+    const fence = beginRequestFence();
+    if (!fence) return;
     setDetailLoading(true);
     try {
-      const sessionDetail = await api.get<EnterpriseSessionDetailRead>(
-        `/api/enterprise/sessions/${row.id}?tenant_id=${TENANT_ID}`,
+      const sessionDetail = await tenantClient.get<EnterpriseSessionDetailRead>(
+        `/api/enterprise/sessions/${row.id}`,
+        { signal: fence.signal },
       );
+      if (!fence.isCurrent()) return;
       setDetail({
         session: sessionDetail.session,
         messages: sessionDetail.messages,
@@ -291,9 +775,12 @@ export default function ConversationLogsTab() {
         toolInvocations: sessionDetail.tool_invocations || [],
       });
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '加载对话详情失败');
+      if (fence.isCurrent()) {
+        notify.error(conversationLogErrorMessage(error, 'dashboard.conversationLogs.error.loadDetail', t));
+      }
     } finally {
-      setDetailLoading(false);
+      if (fence.isCurrent()) setDetailLoading(false);
+      fence.release();
     }
   };
 
@@ -305,16 +792,27 @@ export default function ConversationLogsTab() {
   };
 
   const reanalyzeFeedback = async (feedbackId: string) => {
+    const fence = beginRequestFence();
+    if (!fence) return;
     setReanalyzingId(feedbackId);
     try {
-      await api.post(`/api/enterprise/feedback/${feedbackId}/reanalyze?tenant_id=${TENANT_ID}`);
-      notify.success('已重新提交后台分析');
+      await tenantClient.post(
+        `/api/enterprise/feedback/${feedbackId}/reanalyze`,
+        undefined,
+        { signal: fence.signal },
+      );
+      if (!fence.isCurrent()) return;
+      notify.successText(t('dashboard.conversationLogs.toast.reanalyzeSuccess'));
       await reloadCurrentDetail();
+      if (!fence.isCurrent()) return;
       await load();
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '重新分析失败');
+      if (fence.isCurrent()) {
+        notify.error(conversationLogErrorMessage(error, 'dashboard.conversationLogs.error.reanalyze', t));
+      }
     } finally {
-      setReanalyzingId(null);
+      if (fence.isCurrent()) setReanalyzingId(null);
+      fence.release();
     }
   };
 
@@ -323,7 +821,7 @@ export default function ConversationLogsTab() {
       key: 'selection',
       title: (
         <Checkbox
-          aria-label="选择当前页对话日志"
+          aria-label={t('dashboard.conversationLogs.aria.selectPage')}
           checked={allPageRowsSelected ? true : somePageRowsSelected ? 'indeterminate' : false}
           onCheckedChange={(checked) => togglePageSelection(checked === true)}
         />
@@ -332,7 +830,7 @@ export default function ConversationLogsTab() {
       align: 'center',
       render: (row) => (
         <Checkbox
-          aria-label={`选择对话日志 ${row.title || row.id}`}
+          aria-label={t('dashboard.conversationLogs.aria.selectRow', { session: row.title || row.id })}
           checked={selectedSessionIds.has(row.id)}
           onCheckedChange={(checked) => toggleSessionSelection(row.id, checked === true)}
         />
@@ -340,81 +838,89 @@ export default function ConversationLogsTab() {
     },
     {
       key: 'title',
-      title: '对话任务',
+      title: t('dashboard.conversationLogs.table.title'),
       width: 200,
       className: 'whitespace-normal text-[#18181a]',
       render: (row) => (
         <span className="line-clamp-1 wrap-break-word">
-          {row.title || row.summary || row.last_agent_question || row.id}
+          <RawContent value={row.title || row.summary || row.last_agent_question || row.id} />
         </span>
       ),
     },
     {
       key: 'agent',
-      title: '数字员工',
+      title: t('dashboard.conversationLogs.table.agent'),
       width: 180,
-      render: (row) => <span className="block truncate" title={agentLabel(row)}>{agentLabel(row)}</span>,
+      render: (row) => (
+        <span className="block truncate" title={agentLabel(row)}>
+          <RawContent value={agentLabel(row)} />
+        </span>
+      ),
     },
     {
       key: 'source',
-      title: '来源/用户',
+      title: t('dashboard.conversationLogs.table.source'),
       width: 140,
       render: (row) => (
         <div className="flex min-w-0 flex-col items-start gap-[4px]">
-          <ChannelBadge channel={row.channel} />
+          <ChannelBadge channel={row.channel} t={t} />
           <span className="max-w-full truncate text-[11px] text-[#a0a6b8]">
-            {row.session_display_name || row.session_username || '-'}
+            {(row.session_display_name || row.session_username)
+              ? <RawContent value={row.session_display_name || row.session_username || ''} />
+              : t('dashboard.conversationLogs.placeholder.empty')}
           </span>
         </div>
       ),
     },
     {
       key: 'status',
-      title: '状态',
+      title: t('dashboard.conversationLogs.table.status'),
       width: 120,
       render: (row) => (
         <div className="flex flex-wrap gap-[4px]">
-          {row.downFeedback && <StatusBadge tone="red">差评</StatusBadge>}
-          {row.upFeedback && <StatusBadge tone="green">好评</StatusBadge>}
-          {!row.upFeedback && !row.downFeedback && <StatusBadge tone="blue">未评价</StatusBadge>}
+          {row.downFeedback && <StatusBadge tone="red">{t('dashboard.conversationLogs.status.down')}</StatusBadge>}
+          {row.upFeedback && <StatusBadge tone="green">{t('dashboard.conversationLogs.status.up')}</StatusBadge>}
+          {!row.upFeedback && !row.downFeedback && <StatusBadge tone="blue">{t('dashboard.conversationLogs.status.unrated')}</StatusBadge>}
         </div>
       ),
     },
     {
       key: 'attribution',
-      title: '问题归因',
+      title: t('dashboard.conversationLogs.table.attribution'),
       width: 130,
       render: (row) => (
         <span>
           {row.downFeedback
-            ? row.downFeedback.primary_bucket_label || row.downFeedback.primary_bucket || '待分析'
-            : '暂无缺口'}
+            ? feedbackBucketLabel(row.downFeedback.primary_bucket, feedbackTranslate)
+            : t('dashboard.conversationLogs.bucket.none')}
         </span>
       ),
     },
     {
       key: 'latest',
-      title: '最近内容',
+      title: t('dashboard.conversationLogs.table.latest'),
       className: 'whitespace-normal',
       render: (row) => (
         <span className="line-clamp-1 wrap-break-word">
-          {row.downFeedback?.latest_message ||
+          <RawContent value={
+            row.downFeedback?.latest_message ||
             row.upFeedback?.latest_message ||
             row.summary ||
             row.last_agent_question ||
-            '-'}
+            t('dashboard.conversationLogs.placeholder.empty')
+          } />
         </span>
       ),
     },
     {
       key: 'updated',
-      title: '时间',
+      title: t('dashboard.conversationLogs.table.updatedAt'),
       width: 170,
       render: (row) => formatDateTime(row.updated_at),
     },
     {
       key: 'actions',
-      title: '操作',
+      title: t('dashboard.conversationLogs.table.actions'),
       width: 150,
       render: (row) => (
         <div className="flex items-center gap-[12px]">
@@ -437,7 +943,7 @@ export default function ConversationLogsTab() {
             onClick={() => void openDetail(row)}
             className="h-auto p-0 text-[12px] font-normal text-[#1a71ff] hover:text-[#4a8dff] hover:no-underline disabled:text-[#c0c6d4]"
           >
-            查看
+            {t('dashboard.conversationLogs.actions.view')}
           </UIButton>
         </div>
       ),
@@ -449,34 +955,40 @@ export default function ConversationLogsTab() {
       <div className="flex min-w-0 items-start justify-between gap-[10px]">
         <div className="flex min-w-0 items-start gap-[8px]">
           <Checkbox
-            aria-label={`选择对话日志 ${row.title || row.id}`}
+            aria-label={t('dashboard.conversationLogs.aria.selectRow', { session: row.title || row.id })}
             checked={selectedSessionIds.has(row.id)}
             onCheckedChange={(checked) => toggleSessionSelection(row.id, checked === true)}
           />
           <strong className="min-w-0 wrap-break-word text-[14px] font-semibold text-[#18181a]">
-            {row.title || row.summary || row.last_agent_question || row.id}
+            <RawContent value={row.title || row.summary || row.last_agent_question || row.id} />
           </strong>
         </div>
         <div className="flex shrink-0 flex-wrap justify-end gap-[4px]">
-          {row.downFeedback && <StatusBadge tone="red">差评</StatusBadge>}
-          {row.upFeedback && <StatusBadge tone="green">好评</StatusBadge>}
-          {!row.upFeedback && !row.downFeedback && <StatusBadge tone="blue">未评价</StatusBadge>}
+          {row.downFeedback && <StatusBadge tone="red">{t('dashboard.conversationLogs.status.down')}</StatusBadge>}
+          {row.upFeedback && <StatusBadge tone="green">{t('dashboard.conversationLogs.status.up')}</StatusBadge>}
+          {!row.upFeedback && !row.downFeedback && <StatusBadge tone="blue">{t('dashboard.conversationLogs.status.unrated')}</StatusBadge>}
         </div>
       </div>
       <p className="mt-[8px] line-clamp-2 text-[12px] leading-[1.55] text-[#858b9c]">
-        {row.downFeedback?.latest_message ||
+        <RawContent value={
+          row.downFeedback?.latest_message ||
           row.upFeedback?.latest_message ||
           row.summary ||
           row.last_agent_question ||
-          '-'}
+          t('dashboard.conversationLogs.placeholder.empty')
+        } />
       </p>
       <div className="mt-[10px] flex items-center justify-between gap-[10px] text-[12px] text-[#858b9c]">
-        <span className="truncate" title={agentLabel(row)}>{agentLabel(row)}</span>
+        <span className="truncate" title={agentLabel(row)}><RawContent value={agentLabel(row)} /></span>
         <span className="shrink-0">{formatDateTime(row.updated_at)}</span>
       </div>
       <div className="mt-[8px] flex items-center gap-[8px] text-[12px] text-[#858b9c]">
-        <ChannelBadge channel={row.channel} />
-        <span className="truncate">{row.session_display_name || row.session_username || '-'}</span>
+        <ChannelBadge channel={row.channel} t={t} />
+        <span className="truncate">
+          {(row.session_display_name || row.session_username)
+            ? <RawContent value={row.session_display_name || row.session_username || ''} />
+            : t('dashboard.conversationLogs.placeholder.empty')}
+        </span>
       </div>
       <div className="mt-[10px] flex justify-end gap-[12px]">
         <UIButton
@@ -498,7 +1010,7 @@ export default function ConversationLogsTab() {
           onClick={() => void openDetail(row)}
           className="h-auto p-0 text-[12px] font-normal text-[#1a71ff] hover:text-[#4a8dff] hover:no-underline disabled:text-[#c0c6d4]"
         >
-          查看
+          {t('dashboard.conversationLogs.actions.view')}
         </UIButton>
       </div>
     </article>
@@ -512,30 +1024,42 @@ export default function ConversationLogsTab() {
       >
         <div className="flex items-center gap-[6px] px-[12px] text-[#757f9c]">
           <IconCalendar className="size-[14px] shrink-0" />
-          <span className="text-[14px] font-normal leading-none">对话记录</span>
+          <span className="text-[14px] font-normal leading-none">{t('dashboard.conversationLogs.title')}</span>
         </div>
 
-        <div className="flex flex-wrap items-stretch gap-[20px]" aria-label="对话反馈统计">
-          <StatCard value={rows.length} label="对话" />
-          <StatCard value={summary?.total_feedback ?? 0} label="反馈" />
-          <StatCard value={`${dashboardMetrics.positiveRate}%`} label="好评率" tone="green" />
-          <StatCard value={`${dashboardMetrics.negativeRate}%`} label="差评率" tone="red" />
+        <div className="flex flex-wrap items-stretch gap-[20px]" aria-label={t('dashboard.conversationLogs.metrics.ariaLabel')}>
+          <StatCard value={rows.length} label={t('dashboard.conversationLogs.metrics.conversations')} />
+          <StatCard value={summary?.total_feedback ?? 0} label={t('dashboard.conversationLogs.metrics.feedback')} />
+          <StatCard value={formatMetricPercent(dashboardMetrics.positiveRate, locale)} label={t('dashboard.conversationLogs.metrics.positiveRate')} tone="green" />
+          <StatCard value={formatMetricPercent(dashboardMetrics.negativeRate, locale)} label={t('dashboard.conversationLogs.metrics.negativeRate')} tone="red" />
         </div>
 
-        {summary && (summary.summary || summary.bucket_counts.length > 0) && (
+        {summary && (aggregateSummary || summary.bucket_counts.length > 0) && (
           <div className="flex flex-col gap-[12px] rounded-[14px] border border-[#eef0f4] bg-[#fafbfc] px-[20px] py-[16px]">
-            {summary.summary && (
+            {aggregateSummary && (
               <p className="wrap-break-word text-[13px] leading-[1.7] text-[#464c5e]">
-                {summary.summary}
+                <span>{feedbackTranslate(aggregateSummary.bucket.id)}</span>{' '}
+                <span>{feedbackTranslate(aggregateSummary.count.id, aggregateSummary.count.values)}</span>
+                {aggregateSummary.detail && (
+                  <>
+                    <span>{' · '}</span>
+                    <RawContent value={aggregateSummary.detail} />
+                  </>
+                )}
               </p>
             )}
             {summary.bucket_counts.length > 0 && (
               <div className="flex flex-wrap gap-[6px]">
-                {summary.bucket_counts.map((item) => (
-                  <StatusBadge key={item.bucket} tone={bucketTone(item.bucket)}>
-                    {item.label} {item.count}
-                  </StatusBadge>
-                ))}
+                {summary.bucket_counts.map((item) => {
+                  const projection = feedbackBucketCountDescriptor(item);
+                  if (!projection) return null;
+                  return (
+                    <StatusBadge key={item.bucket} tone={bucketTone(item.bucket)}>
+                      {feedbackTranslate(projection.bucket.id)}{' '}
+                      {feedbackTranslate(projection.count.id, projection.count.values)}
+                    </StatusBadge>
+                  );
+                })}
               </div>
             )}
           </div>
@@ -544,21 +1068,21 @@ export default function ConversationLogsTab() {
         <div className="flex flex-col gap-[12px] min-[1100px]:flex-row min-[1100px]:items-center min-[1100px]:justify-between">
           <div className="min-w-0 overflow-x-auto">
             <UnderlineTabs
-              aria-label="对话日志筛选"
+              aria-label={t('dashboard.conversationLogs.filter.ariaLabel')}
               variant="line"
               value={filter}
               onChange={setFilter}
-              items={FILTER_TABS}
+              items={filterTabs}
             />
           </div>
           <div className="flex shrink-0 items-center gap-[8px] max-[1099px]:w-full max-[520px]:flex-col">
             <label className="flex h-[34px] w-[280px] shrink-0 items-center overflow-hidden rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white transition-colors focus-within:border-[#18181a] max-[1099px]:flex-1 max-[520px]:w-full">
               <span className="flex h-full w-[72px] shrink-0 items-center justify-center border-r-[0.5px] border-[#e3e7f1] bg-[#f6f6f6] text-[12px] text-[#858b9c]">
-                对话用户
+                {t('dashboard.conversationLogs.userFilter.label')}
               </span>
               <UISelect value={conversationUserId} onValueChange={setConversationUserId}>
                 <SelectTrigger
-                  aria-label="筛选对话用户"
+                  aria-label={t('dashboard.conversationLogs.userFilter.ariaLabel')}
                   className={cn(
                     SELECT_TRIGGER_CLASS,
                     'h-full min-w-0 flex-1 rounded-none border-0 px-[12px] shadow-none focus-visible:border-0',
@@ -568,11 +1092,11 @@ export default function ConversationLogsTab() {
                 </SelectTrigger>
                 <SelectContent>
                   <SelectItem value={ALL_CONVERSATION_USERS}>
-                    全部用户（{logFilterRows.length}）
+                    {t('dashboard.conversationLogs.userFilter.allUsers', { count: logFilterRows.length })}
                   </SelectItem>
                   {conversationUserOptions.map((option) => (
                     <SelectItem key={option.userId} value={option.userId}>
-                      {option.label}（{option.count}）
+                      <RawContent value={option.label} /> ({option.count})
                     </SelectItem>
                   ))}
                 </SelectContent>
@@ -590,8 +1114,8 @@ export default function ConversationLogsTab() {
                 <Download className="size-[14px]" />
               )}
               {selectedSessionIds.size
-                ? `导出已选（${batchRows.length}）`
-                : `导出筛选结果（${batchRows.length}）`}
+                ? t('dashboard.conversationLogs.actions.exportSelected', { count: batchRows.length })
+                : t('dashboard.conversationLogs.actions.exportFiltered', { count: batchRows.length })}
             </UIButton>
           </div>
         </div>
@@ -600,24 +1124,24 @@ export default function ConversationLogsTab() {
           {filteredRows.length ? (
             pagination.pagedItems.map(renderMobileCard)
           ) : (
-            <div className="py-[40px] text-center text-[13px] text-[#858b9c]">暂无对话日志</div>
+            <div className="py-[40px] text-center text-[13px] text-[#858b9c]">{t('dashboard.conversationLogs.empty')}</div>
           )}
         </div>
 
         <div className="hidden md:block">
           <DataTable
-            aria-label="对话日志"
+            aria-label={t('dashboard.conversationLogs.table.ariaLabel')}
             columns={columns}
             data={pagination.pagedItems}
             rowKey={(row) => row.id}
             loading={loading}
-            emptyText="暂无对话日志"
+            emptyText={t('dashboard.conversationLogs.empty')}
           />
         </div>
 
         {filteredRows.length > 0 && (
           <Paginator
-            aria-label="对话日志分页"
+            aria-label={t('dashboard.conversationLogs.pagination.ariaLabel')}
             className="mt-0 mb-[6px]"
             page={pagination.page}
             pageCount={pagination.pageCount}
@@ -632,6 +1156,9 @@ export default function ConversationLogsTab() {
         onClose={() => setDetail(null)}
         onReanalyze={reanalyzeFeedback}
         reanalyzingId={reanalyzingId}
+        locale={locale}
+        t={t}
+        feedbackTranslate={feedbackTranslate}
       />
     </>
   );
@@ -643,12 +1170,18 @@ function FeedbackDetailDialog({
   onClose,
   onReanalyze,
   reanalyzingId,
+  locale,
+  t,
+  feedbackTranslate,
 }: {
   detail: ConversationDetail | null;
   agentLabelFromId: (agentId?: string | null) => string;
   onClose: () => void;
   onReanalyze: (feedbackId: string) => void;
   reanalyzingId: string | null;
+  locale: 'zh-CN' | 'en-US';
+  t: (id: MessageId, values?: MessageValues) => string;
+  feedbackTranslate: FeedbackTranslate;
 }) {
   return (
     <Dialog open={Boolean(detail)} onOpenChange={(open) => !open && onClose()}>
@@ -659,26 +1192,34 @@ function FeedbackDetailDialog({
         <div className="flex items-center gap-[6px] px-[12px] text-[#757f9c]">
           <Clock className="size-[14px] shrink-0" />
           <DialogTitle className="text-[14px] font-normal leading-none text-[#757f9c]">
-            对话日志详情
+            {t('dashboard.conversationLogs.detail.title')}
           </DialogTitle>
         </div>
 
         {detail && (
           <div className="flex min-h-0 flex-1 flex-col gap-[16px] overflow-y-auto px-[12px]">
             <div className="grid grid-cols-2 gap-[10px] max-[520px]:grid-cols-1">
-              <DetailField label="任务 ID">
-                {String(detail.session.session_id || detail.session.id || '-')}
+              <DetailField label={t('dashboard.conversationLogs.detail.sessionId')}>
+                <RawIdentifier value={String(detail.session.session_id || detail.session.id || t('dashboard.conversationLogs.placeholder.empty'))} />
               </DetailField>
-              <DetailField label="数字员工">{agentLabelFromId(String(detail.session.agent_id || ''))}</DetailField>
-              <DetailField label="用户">{displayUser(detail.session)}</DetailField>
-              <DetailField label="状态">{String(detail.session.status || '-')}</DetailField>
-              <DetailField label="反馈" className="col-span-2 max-[520px]:col-span-1">
+              <DetailField label={t('dashboard.conversationLogs.detail.agent')}>
+                <RawContent value={agentLabelFromId(String(detail.session.agent_id || ''))} />
+              </DetailField>
+              <DetailField label={t('dashboard.conversationLogs.detail.user')}>
+                <RawContent value={displayUser(detail.session, t)} />
+              </DetailField>
+              <DetailField label={t('dashboard.conversationLogs.detail.status')}>
+                {detail.session.status
+                  ? <RawIdentifier value={String(detail.session.status)} />
+                  : t('dashboard.conversationLogs.placeholder.empty')}
+              </DetailField>
+              <DetailField label={t('dashboard.conversationLogs.detail.feedback')} className="col-span-2 max-[520px]:col-span-1">
                 <div className="flex flex-wrap gap-[6px]">
                   <StatusBadge tone="green">
-                    好评 {detail.feedback.filter((item) => item.rating === 'up').length}
+                    {t('dashboard.conversationLogs.status.up')} {detail.feedback.filter((item) => item.rating === 'up').length}
                   </StatusBadge>
                   <StatusBadge tone="red">
-                    差评 {detail.feedback.filter((item) => item.rating === 'down').length}
+                    {t('dashboard.conversationLogs.status.down')} {detail.feedback.filter((item) => item.rating === 'down').length}
                   </StatusBadge>
                   {detail.feedback
                     .filter((item) => item.rating === 'down')
@@ -689,7 +1230,7 @@ function FeedbackDetailDialog({
                         key={`${analysis?.bucket || 'unknown'}_${index}`}
                         tone={bucketTone(analysis?.bucket)}
                       >
-                        {analysis?.bucket_label || analysis?.bucket || '待分析'}
+                        {feedbackBucketLabel(analysis?.bucket, feedbackTranslate)}
                       </StatusBadge>
                     ))}
                 </div>
@@ -702,33 +1243,36 @@ function FeedbackDetailDialog({
                   key={item.id}
                   item={item}
                   trace={trace}
-                  userLabel={displayUser(detail.session)}
+                  userLabel={displayUser(detail.session, t)}
                   onReanalyze={onReanalyze}
                   reanalyzing={Boolean(item.feedback_id && item.feedback_id === reanalyzingId)}
+                  locale={locale}
+                  t={t}
+                  feedbackTranslate={feedbackTranslate}
                 />
               ))}
               {detail.messages.length === 0 && detail.traces.length > 0
                 ? detail.traces.map((trace) => (
                     <div key={trace.turn_id} className="feedback-message-row assistant">
                       <div className="feedback-message-bubble trace-only">
-                        <FeedbackTraceBlock trace={trace} />
+                        <FeedbackTraceBlock trace={trace} locale={locale} t={t} />
                       </div>
                     </div>
                   ))
                 : null}
             </div>
 
-            <ModelCallLogSection events={detail.events} />
+            <ModelCallLogSection events={detail.events} t={t} />
 
             <section className="rounded-[14px] border border-[#e3e7f1] bg-[#fafbfc] p-[14px]">
               <div className="flex flex-wrap items-center justify-between gap-[8px]">
                 <div>
-                  <strong className="text-[13px] font-semibold text-[#18181a]">工具调用与原始日志 JSON</strong>
+                  <strong className="text-[13px] font-semibold text-[#18181a]">{t('dashboard.conversationLogs.tools.title')}</strong>
                   <p className="m-0 mt-[3px] text-[11px] text-[#858b9c]">
-                    包含工具参数、返回结果、Trace、事件和消息，敏感字段使用服务端审计副本。
+                    {t('dashboard.conversationLogs.tools.description')}
                   </p>
                 </div>
-                <StatusBadge tone="blue">{detail.toolInvocations.length} 次工具调用</StatusBadge>
+                <StatusBadge tone="blue">{t('dashboard.conversationLogs.tools.count', { count: detail.toolInvocations.length })}</StatusBadge>
               </div>
 
               {detail.toolInvocations.length > 0 && (
@@ -736,7 +1280,7 @@ function FeedbackDetailDialog({
                   {detail.toolInvocations.map((invocation) => (
                     <details key={invocation.id} className="rounded-[10px] border border-[#e6e9ef] bg-white px-[12px] py-[9px]">
                       <summary className="cursor-pointer text-[12px] font-medium text-[#464c5e]">
-                        {invocation.tool_name} · {invocation.status} · {formatDateTime(invocation.started_at)}
+                        <RawIdentifier value={invocation.tool_name} /> · <RawIdentifier value={invocation.status} /> · {formatDateTime(invocation.started_at)}
                       </summary>
                       <pre className="mt-[10px] max-h-[360px] overflow-auto rounded-[8px] bg-[#18181a] p-[12px] text-[11px] leading-[1.55] text-[#d8e2f0]">
                         {JSON.stringify(invocation, null, 2)}
@@ -747,7 +1291,7 @@ function FeedbackDetailDialog({
               )}
 
               <details className="mt-[10px] rounded-[10px] border border-[#e6e9ef] bg-white px-[12px] py-[9px]">
-                <summary className="cursor-pointer text-[12px] font-medium text-[#464c5e]">查看完整会话日志 JSON</summary>
+                <summary className="cursor-pointer text-[12px] font-medium text-[#464c5e]">{t('dashboard.conversationLogs.tools.fullJson')}</summary>
                 <pre className="mt-[10px] max-h-[520px] overflow-auto rounded-[8px] bg-[#18181a] p-[12px] text-[11px] leading-[1.55] text-[#d8e2f0]">
                   {JSON.stringify({
                     session: detail.session,
@@ -775,7 +1319,13 @@ type ModelCallLog = {
   terminal?: SessionEvent;
 };
 
-function ModelCallLogSection({ events }: { events: SessionEvent[] }) {
+function ModelCallLogSection({
+  events,
+  t,
+}: {
+  events: SessionEvent[];
+  t: (id: MessageId, values?: MessageValues) => string;
+}) {
   const calls = modelCallLogs(events);
   if (calls.length === 0) return null;
 
@@ -783,12 +1333,12 @@ function ModelCallLogSection({ events }: { events: SessionEvent[] }) {
     <section className="rounded-[14px] border border-[#dce6f7] bg-[#f7faff] p-[14px]">
       <div className="flex flex-wrap items-center justify-between gap-[8px]">
         <div>
-          <strong className="text-[13px] font-semibold text-[#18181a]">模型输入与输出</strong>
+          <strong className="text-[13px] font-semibold text-[#18181a]">{t('dashboard.conversationLogs.modelLogs.title')}</strong>
           <p className="m-0 mt-[3px] text-[11px] text-[#75809a]">
-            这里是模型调用级审计日志，不是用户可见回复。保留实际协议输入、reasoning、工具调用参数和原始响应；密钥及内嵌图片数据已脱敏。
+            {t('dashboard.conversationLogs.modelLogs.description')}
           </p>
         </div>
-        <StatusBadge tone="blue">{calls.length} 次模型调用</StatusBadge>
+        <StatusBadge tone="blue">{t('dashboard.conversationLogs.modelLogs.count', { count: calls.length })}</StatusBadge>
       </div>
 
       <div className="mt-[12px] grid gap-[8px]">
@@ -801,7 +1351,7 @@ function ModelCallLogSection({ events }: { events: SessionEvent[] }) {
           const responseMessage = output.response_message && typeof output.response_message === 'object'
             ? output.response_message as Record<string, unknown>
             : {};
-          const modelName = String(input.model_name || input.model || '未记录模型');
+          const modelName = String(input.model_name || input.model || t('dashboard.conversationLogs.modelLogs.noModel'));
           const operation = String(input.operation || 'llm.request');
           return (
             <details
@@ -809,9 +1359,19 @@ function ModelCallLogSection({ events }: { events: SessionEvent[] }) {
               className="rounded-[10px] border border-[#dfe6f1] bg-white px-[12px] py-[9px]"
             >
               <summary className="flex cursor-pointer list-none flex-wrap items-center gap-[6px] text-[12px] font-medium text-[#464c5e]">
-                <span>第 {index + 1} 次 · {operation} · {modelName}</span>
+                <span>
+                  {t('dashboard.conversationLogs.modelLogs.summary', {
+                    index: index + 1,
+                    operation,
+                    modelName,
+                  })}
+                </span>
                 <StatusBadge tone={failed ? 'red' : running ? 'orange' : 'green'}>
-                  {failed ? '失败' : running ? '执行中' : '完成'}
+                  {failed
+                    ? t('dashboard.conversationLogs.modelLogs.status.failed')
+                    : running
+                      ? t('dashboard.conversationLogs.modelLogs.status.running')
+                      : t('dashboard.conversationLogs.modelLogs.status.completed')}
                 </StatusBadge>
                 <span className="ml-auto text-[11px] font-normal text-[#8a91a2]">
                   {formatDateTime(call.started?.created_at || call.terminal?.created_at || '')}
@@ -819,7 +1379,7 @@ function ModelCallLogSection({ events }: { events: SessionEvent[] }) {
               </summary>
               <div className="mt-[10px] grid gap-[10px] lg:grid-cols-2">
                 <ModelExchangePayload
-                  title="模型完整 Input"
+                  title={t('dashboard.conversationLogs.modelLogs.input')}
                   value={{
                     provider_request: input.request_payload || {
                       messages: input.request_messages || [],
@@ -830,7 +1390,9 @@ function ModelCallLogSection({ events }: { events: SessionEvent[] }) {
                   }}
                 />
                 <ModelExchangePayload
-                  title={failed ? '模型错误与部分原始 Output' : '模型完整原始 Output'}
+                  title={failed
+                    ? t('dashboard.conversationLogs.modelLogs.failedOutput')
+                    : t('dashboard.conversationLogs.modelLogs.output')}
                   value={
                     failed
                       ? {
@@ -899,57 +1461,86 @@ function FeedbackMessage({
   userLabel,
   onReanalyze,
   reanalyzing,
+  locale,
+  t,
+  feedbackTranslate,
 }: {
   item: FeedbackMessageRead;
   trace?: TurnTraceRead;
   userLabel: string;
   onReanalyze: (feedbackId: string) => void;
   reanalyzing: boolean;
+  locale: 'zh-CN' | 'en-US';
+  t: (id: MessageId, values?: MessageValues) => string;
+  feedbackTranslate: FeedbackTranslate;
 }) {
   const isUser = item.role === 'user';
   const isAssistant = item.role === 'assistant';
   const analysisFailed = item.feedback_analysis?.status === 'failed';
+  const evidence = feedbackEvidenceContent(item.feedback_analysis);
   return (
     <div className={`feedback-message-row ${isUser ? 'user' : 'assistant'}`}>
       <div className="feedback-message-bubble">
         <div className="feedback-message-meta">
-          <span>{isUser ? userLabel : isAssistant ? '员工' : item.role}</span>
+          <span>
+            {isUser
+              ? <RawContent value={userLabel} />
+              : isAssistant
+                ? t('dashboard.conversationLogs.role.employee')
+                : <RawIdentifier value={item.role} />}
+          </span>
           <span>{formatDateTime(item.created_at)}</span>
-          {item.feedback_rating === 'down' && <StatusBadge tone="red">差评</StatusBadge>}
-          {item.feedback_rating === 'up' && <StatusBadge tone="green">好评</StatusBadge>}
+          {item.feedback_rating === 'down' && <StatusBadge tone="red">{t('dashboard.conversationLogs.status.down')}</StatusBadge>}
+          {item.feedback_rating === 'up' && <StatusBadge tone="green">{t('dashboard.conversationLogs.status.up')}</StatusBadge>}
           {item.feedback_analysis &&
             (analysisFailed ? (
-              <StatusBadge tone="red">分析失败</StatusBadge>
+              <StatusBadge tone="red">{t('dashboard.conversationLogs.analysis.failed')}</StatusBadge>
             ) : (
               <StatusBadge tone={bucketTone(item.feedback_analysis.bucket)}>
-                {item.feedback_analysis.bucket_label || item.feedback_analysis.bucket || '待分析'}
+                {feedbackBucketLabel(item.feedback_analysis.bucket, feedbackTranslate)}
               </StatusBadge>
             ))}
         </div>
-        {trace && <FeedbackTraceBlock trace={trace} />}
+        {trace && <FeedbackTraceBlock trace={trace} locale={locale} t={t} />}
         <div className="feedback-message-content">
           <MarkdownMessage content={item.content} />
         </div>
         {item.feedback_analysis && item.feedback_rating === 'down' && (
           <div className="feedback-analysis-box">
             <div>
-              <strong>状态：</strong>
-              {analysisStatusLabel(item.feedback_analysis.status)}
+              <strong>{t('dashboard.conversationLogs.analysis.statusLabel')}</strong>
+              {analysisStatusLabel(
+                item.feedback_analysis.status,
+                feedbackStatusParams(item.feedback_analysis),
+                feedbackTranslate,
+              )}
               {item.feedback_analysis.status !== 'failed' &&
                 typeof item.feedback_analysis.confidence === 'number' && (
-                  <span> · 置信度 {(item.feedback_analysis.confidence * 100).toFixed(0)}%</span>
+                  <span> · {t('dashboard.conversationLogs.analysis.confidence', { value: Number((item.feedback_analysis.confidence * 100).toFixed(0)) })}</span>
                 )}
             </div>
             {item.feedback_analysis.summary && (
               <div>
-                <strong>改进项：</strong>
-                {item.feedback_analysis.summary}
+                <strong>{t('dashboard.conversationLogs.analysis.summaryLabel')}</strong>
+                <RawContent value={item.feedback_analysis.summary} />
               </div>
             )}
             {item.feedback_analysis.reason && (
               <div>
-                <strong>原因：</strong>
-                {item.feedback_analysis.reason}
+                <strong>{t('dashboard.conversationLogs.analysis.reasonLabel')}</strong>
+                <RawContent value={item.feedback_analysis.reason} />
+              </div>
+            )}
+            {evidence.length > 0 && (
+              <div>
+                <strong>{t('dashboard.conversationLogs.analysis.evidenceLabel')}</strong>
+                <ul>
+                  {evidence.map((value, index) => (
+                    <li key={`${item.id}-evidence-${index}`}>
+                      <RawContent value={value} />
+                    </li>
+                  ))}
+                </ul>
               </div>
             )}
             {item.feedback_analysis.status === 'failed' && item.feedback_id && (
@@ -960,7 +1551,7 @@ function FeedbackMessage({
                 className="mt-[8px] h-[30px] gap-[4px] rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[14px] text-[12px] font-normal text-[#757f9c] hover:border-[#cbd3e6] hover:text-[#18181a]"
               >
                 <RefreshCw className={cn('size-3.5', reanalyzing && 'animate-spin')} />
-                重新分析
+                {t('dashboard.conversationLogs.actions.reanalyze')}
               </UIButton>
             )}
           </div>
@@ -994,24 +1585,38 @@ function conversationItems(
   });
 }
 
-function FeedbackTraceBlock({ trace }: { trace: TurnTraceRead }) {
+function FeedbackTraceBlock({
+  trace,
+  locale,
+  t,
+}: {
+  trace: TurnTraceRead;
+  locale: 'zh-CN' | 'en-US';
+  t: (id: MessageId, values?: MessageValues) => string;
+}) {
   const lines = traceDetails(trace.lines);
   if (lines.length === 0) return null;
   return (
     <div className="feedback-trace-block">
       <div className="feedback-trace-header">
         <Workflow className="size-[14px]" />
-        <span>执行记录</span>
+        <span>{t('dashboard.conversationLogs.trace.title')}</span>
         <span className="feedback-trace-overall-timing">
           {timingText(
             trace.duration_ms,
             trace.model_duration_ms,
             trace.model_call_count,
             trace.model_names,
+            locale,
+            t,
             true,
           )}
         </span>
-        <span className="feedback-trace-status">{trace.completed_at ? '已完成' : '执行中'}</span>
+        <span className="feedback-trace-status">
+          {trace.completed_at
+            ? t('dashboard.conversationLogs.trace.status.completed')
+            : t('dashboard.conversationLogs.trace.status.running')}
+        </span>
       </div>
       <div className="feedback-trace-lines">
         {lines.map((line) => (
@@ -1023,7 +1628,9 @@ function FeedbackTraceBlock({ trace }: { trace: TurnTraceRead }) {
             <span className="feedback-trace-icon">{traceLineIcon(line.kind)}</span>
             <span className="feedback-trace-content">
               <span className="feedback-trace-title-row">
-                <span className="feedback-trace-text">{line.text}</span>
+                <span className="feedback-trace-text">
+                  {traceLineText(line, t)}
+                </span>
                 {(typeof line.duration_ms === 'number' || typeof line.model_duration_ms === 'number') && (
                   <span className="feedback-trace-timing">
                     {timingText(
@@ -1031,20 +1638,22 @@ function FeedbackTraceBlock({ trace }: { trace: TurnTraceRead }) {
                       line.model_duration_ms,
                       line.model_call_count,
                       line.model_names,
+                      locale,
+                      t,
                     )}
                   </span>
                 )}
               </span>
-              {line.detail && <span className="feedback-trace-detail">{line.detail}</span>}
+              {line.detail && <span className="feedback-trace-detail"><RawContent value={line.detail} /></span>}
               {line.code && (
                 <details className="feedback-trace-code">
-                  <summary>查看代码</summary>
+                  <summary>{t('dashboard.conversationLogs.trace.viewCode')}</summary>
                   <pre>{line.code}</pre>
                 </details>
               )}
               {line.output && (
                 <details className="feedback-trace-code">
-                  <summary>{line.outputTitle || '查看输出'}</summary>
+                  <summary>{line.outputTitle ? <RawContent value={line.outputTitle} /> : t('dashboard.conversationLogs.trace.viewOutput')}</summary>
                   <pre>{line.output}</pre>
                 </details>
               )}
@@ -1056,11 +1665,20 @@ function FeedbackTraceBlock({ trace }: { trace: TurnTraceRead }) {
   );
 }
 
+/** trace 行优先使用 canonical event_code/params，缺失时才显式落到 raw 文本。 */
+function traceLineText(
+  line: TraceLineRead,
+  translate: (id: MessageId, values?: MessageValues) => string,
+): string | JSX.Element {
+  if (line.event_code) {
+    return backendEventMessage(line.event_code, line.params || {}, translate, 'dashboard.conversationLogs.trace.fallback');
+  }
+  return <RawContent value={line.text} />;
+}
+
 function traceDetails(lines: TraceLineRead[]): TraceLineRead[] {
-  const hiddenPlaceholders = new Set(['正在思考', '已完成思考', '正在执行', '执行记录']);
   return lines.filter((line) => {
     if (line.kind === 'thinking' && line.state !== 'failed') return false;
-    if (hiddenPlaceholders.has(line.text) && !line.detail && !line.code && !line.output) return false;
     return true;
   });
 }
@@ -1072,34 +1690,53 @@ function traceLineIcon(kind: TraceLineRead['kind']) {
   return <Workflow className="size-[13px]" />;
 }
 
-function displayUser(session: Record<string, unknown>): string {
+/** 读取会话中的可见用户名称；未知时使用安全占位语义文本。 */
+function displayUser(
+  session: Record<string, unknown>,
+  translate: (id: MessageId, values?: MessageValues) => string,
+): string {
   return String(
     session.session_display_name ||
       session.display_name ||
       session.session_username ||
       session.username ||
-      '未知用户',
+      translate('dashboard.conversationLogs.user.unknown'),
   );
 }
 
+/** 将 trace 与模型耗时格式化为当前 locale 的简洁摘要。 */
 function timingText(
   durationMs?: number | null,
   modelDurationMs?: number | null,
   modelCallCount?: number | null,
   modelNames?: string[] | null,
+  locale?: 'zh-CN' | 'en-US',
+  translate?: (id: MessageId, values?: MessageValues) => string,
   showMissingModel = false,
 ): string {
   const parts: string[] = [];
-  if (typeof durationMs === 'number') parts.push(`总 ${formatDuration(durationMs)}`);
-  const names = Array.from(new Set((modelNames || []).filter(Boolean)));
-  if (names.length > 0) {
-    parts.push(names.length <= 2 ? names.join('、') : `${names.slice(0, 2).join('、')} 等 ${names.length} 个模型`);
+  if (typeof durationMs === 'number' && translate) {
+    parts.push(translate('dashboard.conversationLogs.timing.total', { value: formatDuration(durationMs) }));
   }
-  if (typeof modelDurationMs === 'number') parts.push(`模型耗时 ${formatDuration(modelDurationMs)}`);
-  if (typeof modelCallCount === 'number' && modelCallCount > 0) {
-    parts.push(`${modelCallCount} 次调用`);
-  } else if (showMissingModel && typeof durationMs === 'number' && modelDurationMs == null) {
-    parts.push('模型调用未记录');
+  const names = Array.from(new Set((modelNames || []).filter(Boolean)));
+  if (names.length > 0 && translate && locale) {
+    const listText = new Intl.ListFormat(locale, {
+      style: 'short',
+      type: 'conjunction',
+    }).format(names.slice(0, 2));
+    parts.push(
+      names.length <= 2
+        ? listText
+        : translate('dashboard.conversationLogs.timing.modelList', { names: listText, count: names.length }),
+    );
+  }
+  if (typeof modelDurationMs === 'number' && translate) {
+    parts.push(translate('dashboard.conversationLogs.timing.modelDuration', { value: formatDuration(modelDurationMs) }));
+  }
+  if (typeof modelCallCount === 'number' && modelCallCount > 0 && translate) {
+    parts.push(translate('dashboard.conversationLogs.timing.modelCalls', { count: modelCallCount }));
+  } else if (showMissingModel && typeof durationMs === 'number' && modelDurationMs == null && translate) {
+    parts.push(translate('dashboard.conversationLogs.timing.noModelCalls'));
   }
   return parts.join(' · ');
 }
@@ -1111,10 +1748,16 @@ function formatDuration(durationMs: number): string {
   return `${(durationMs / 1000).toFixed(1)}s`;
 }
 
-function ChannelBadge({ channel }: { channel?: string | null }) {
-  if (channel === 'wechat') return <StatusBadge tone="green">微信</StatusBadge>;
-  if (channel) return <StatusBadge tone="blue">{channel}</StatusBadge>;
-  return <StatusBadge tone="gray">网页</StatusBadge>;
+function ChannelBadge({
+  channel,
+  t,
+}: {
+  channel?: string | null;
+  t: (id: MessageId, values?: MessageValues) => string;
+}) {
+  if (channel === 'wechat') return <StatusBadge tone="green">{t('dashboard.conversationLogs.channel.wechat')}</StatusBadge>;
+  if (channel) return <StatusBadge tone="blue"><RawIdentifier value={channel} /></StatusBadge>;
+  return <StatusBadge tone="gray">{t('dashboard.conversationLogs.channel.web')}</StatusBadge>;
 }
 
 function bucketTone(bucket?: string): BadgeTone {
@@ -1126,14 +1769,7 @@ function bucketTone(bucket?: string): BadgeTone {
   return 'gray';
 }
 
-function analysisStatusLabel(status?: string): string {
-  if (status === 'pending') return '等待分析';
-  if (status === 'analyzed') return '已完成';
-  if (status === 'failed') return '分析失败';
-  if (status === 'needs_model') return '未配置模型';
-  return status || '未知';
-}
-
+/** 反馈分析状态优先使用语义标签，未知状态保留稳定标识。 */
 function downloadBlob(blob: Blob, filename: string): void {
   const objectUrl = window.URL.createObjectURL(blob);
   const link = document.createElement('a');

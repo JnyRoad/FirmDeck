@@ -1,14 +1,81 @@
 // @vitest-environment jsdom
 
-import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
+import fs from 'node:fs';
+import path from 'node:path';
+
+import type { ComponentProps, ReactElement, ReactNode } from 'react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
+import { MemoryRouter, Route, Routes, useLocation, useNavigate } from 'react-router-dom';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 
-import { I18nProvider } from '@/i18n';
-import type { AgentProfileRead, TeamBlackboardEntryRead, TeamEventRead, TeamRead, TeamTaskBidRead, TeamTaskRead } from '@/types';
+import { AppIntlProvider, createAppTranslator, I18nProvider, type AppLocale } from '@/i18n';
+import type {
+  AgentProfileRead,
+  TeamBlackboardEntryRead,
+  TeamEventRead,
+  TeamKnowledgeBindingRead,
+  TeamRead,
+  TeamTaskBidRead,
+  TeamTaskRead,
+} from '@/types';
 
-import TeamDetailPage from './TeamDetailPage';
+const tenantContextMock = vi.hoisted(() => {
+  const controller = new AbortController();
+  return {
+    context: {
+      session: {
+        token: 'tenant-demo-token',
+        scope: 'tenant' as const,
+        tenant: { id: 'tenant_demo', slug: 'tenant-demo', display_name: 'Tenant Demo' },
+        user: {
+          id: 'user-1',
+          tenant_id: 'tenant_demo',
+          username: 'demo',
+          display_name: 'Demo',
+          role: 'admin' as const,
+          must_change_password: false,
+          avatar_url: null,
+        },
+      },
+      tenantId: 'tenant_demo',
+      tenantSlug: 'tenant-demo',
+      userId: 'user-1',
+      generation: 1,
+      signal: controller.signal,
+      isCurrentGeneration: (generation: number) => generation === 1,
+    },
+  };
+});
+
+vi.mock('../contexts/TenantSessionContext', () => ({
+  useTenantSession: () => tenantContextMock.context,
+}));
+
+import TeamDetailPage, { teamEventLabel } from './TeamDetailPage';
+
+const sonnerSpies = vi.hoisted(() => ({
+  custom: vi.fn(),
+}));
+
+vi.mock('sonner', () => ({
+  toast: sonnerSpies,
+}));
+
+vi.mock('@/components/LanguageSwitcher', () => ({
+  /** Keep unrelated shell migration out of the team-detail locale contract. */
+  default: () => null,
+}));
+
+vi.mock('@/components/ui/input', () => ({
+  /** Preserve native input semantics without the legacy arbitrary-prop observer. */
+  Input: (props: ComponentProps<'input'>) => <input {...props} />,
+}));
+
+vi.mock('@/components/ui/textarea', () => ({
+  /** Preserve native textarea semantics without the legacy arbitrary-prop observer. */
+  Textarea: (props: ComponentProps<'textarea'>) => <textarea {...props} />,
+}));
 
 const team: TeamRead = {
   id: 'team-1',
@@ -38,6 +105,38 @@ const team: TeamRead = {
   ],
   created_at: '2026-08-01T00:00:00Z',
   updated_at: '2026-08-01T00:00:00Z',
+};
+
+const knowledgeBindings: TeamKnowledgeBindingRead[] = [
+  {
+    id: 'teamkb-1',
+    team_id: 'team-1',
+    knowledge_base_id: 'kb-shared-1',
+    knowledge_base_name: '共享制度库',
+    status: 'active',
+    revision: 4,
+    is_default: false,
+    published_version_id: 'kbver-shared-1',
+    published_version: '1.0.0',
+    grants: [{ agent_id: 'agent-1', permission: 'reader', status: 'active' }],
+    created_at: '2026-08-01T00:00:00Z',
+    updated_at: '2026-08-01T00:00:00Z',
+  },
+];
+
+const crowdedTeam: TeamRead = {
+  ...team,
+  members: [
+    team.members[0],
+    ...Array.from({ length: 9 }, (_, index) => ({
+      id: `member-crowded-${index + 1}`,
+      team_id: 'team-1',
+      agent_id: `agent-crowded-${index + 1}`,
+      role: 'member' as const,
+      agent_name: index === 0 ? '产品经理' : `成员${index + 2}`,
+      created_at: '2026-08-01T00:00:00Z',
+    })),
+  ],
 };
 
 function makeTask(overrides: Partial<TeamTaskRead>): TeamTaskRead {
@@ -106,12 +205,50 @@ const agents: AgentProfileRead[] = [
   },
 ];
 
+const teamLog = {
+  schema_version: 'staffdeck.team-log.v1',
+  exported_at: '2026-08-03T00:00:00Z',
+  team: { id: 'team-1', name: '增长团队' },
+  summary: {
+    task_count: 3,
+    wake_event_count: 2,
+    blackboard_entry_count: 1,
+    session_count: 1,
+  },
+  tasks: [],
+  wake_events: [],
+  blackboard_entries: [],
+  sessions: [
+    {
+      session: { id: 'session-log-1', title: '成员调研', agent_id: 'agent-2', status: 'completed' },
+      messages: [
+        { id: 'message-log-1', role: 'user', content: '调研用户反馈' },
+        { id: 'message-log-2', role: 'assistant', content: '已完成用户反馈调研' },
+      ],
+      traces: [],
+      events: [{ id: 'event-log-1', event_type: 'model_exchange_completed' }],
+      tool_invocations: [{ id: 'tool-log-1', tool_name: 'knowledge_search', status: 'completed' }],
+    },
+  ],
+};
+
 function jsonResponse(body: unknown): Response {
   return {
     ok: true,
     status: 200,
     statusText: 'OK',
     text: async () => JSON.stringify(body ?? {}),
+    blob: async () => new Blob([JSON.stringify(body ?? {})], { type: 'application/json' }),
+  } as Response;
+}
+
+function errorResponse(status: number, body: unknown): Response {
+  /** Build a failed fetch response for stable API error-code rendering tests. */
+  return {
+    ok: false,
+    status,
+    statusText: 'Conflict',
+    text: async () => JSON.stringify(body),
   } as Response;
 }
 
@@ -141,10 +278,56 @@ function stubDetailFetch(overrides?: {
   taskList?: TeamTaskRead[];
   onTlSession?: () => { session_id: string };
   taskDetails?: Record<string, TeamTaskRead>;
+  knowledgeRows?: TeamKnowledgeBindingRead[];
+  conflictOnGrantSave?: boolean;
+  onGrantSave?: (
+    knowledgeBaseId: string,
+    init: RequestInit,
+  ) => Promise<Response>;
 }) {
   let boardRows = [...(overrides?.entries ?? [])];
+  let teamKnowledgeRows = [...(overrides?.knowledgeRows ?? [])];
   const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
+    if (url.includes('/knowledge-bases')) {
+      const method = (init?.method || 'GET').toUpperCase();
+      if (method === 'PUT' && url.includes('/grants')) {
+        const knowledgeBaseId = url.split('/knowledge-bases/')[1]?.split('/')[0] || '';
+        if (overrides?.onGrantSave) return overrides.onGrantSave(knowledgeBaseId, init || {});
+        if (overrides?.conflictOnGrantSave) {
+          return errorResponse(409, {
+            detail: {
+              code: 'KNOWLEDGE_BINDING_REVISION_CONFLICT',
+              message: '配置已变化',
+            },
+          });
+        }
+        const body = JSON.parse(String(init?.body)) as {
+          grants: Array<{ agent_id: string; permission: 'reader' | 'editor' | 'publisher' | null }>;
+        };
+        teamKnowledgeRows = teamKnowledgeRows.map((row) => (
+          url.includes(row.knowledge_base_id)
+            ? {
+              ...row,
+              revision: row.revision + 1,
+              grants: body.grants
+                .filter((grant) => grant.permission)
+                .map((grant) => ({ ...grant, permission: grant.permission!, status: 'active' })),
+            }
+            : row
+        ));
+        return jsonResponse(teamKnowledgeRows[0]);
+      }
+      if (method === 'PUT') {
+        teamKnowledgeRows = teamKnowledgeRows.map((row) => ({
+          ...row,
+          revision: row.revision + 1,
+          is_default: url.includes(row.knowledge_base_id),
+        }));
+        return jsonResponse(teamKnowledgeRows[0]);
+      }
+      return jsonResponse(teamKnowledgeRows);
+    }
     if (url.includes('/blackboard')) {
       const method = (init?.method || 'GET').toUpperCase();
       if (url.includes('/archive')) {
@@ -176,6 +359,7 @@ function stubDetailFetch(overrides?: {
     if (url.includes('/tl/session')) {
       return jsonResponse(overrides?.onTlSession?.() ?? { session_id: 'session-1' });
     }
+    if (url.includes('/export')) return jsonResponse(teamLog);
     if (url.includes('/award-override')) {
       return jsonResponse(makeTask({ status: 'pending', assignee_agent_id: 'agent-1' }));
     }
@@ -239,6 +423,12 @@ function LocationEcho() {
   return <div data-testid="location">{`${location.pathname}${location.search}`}</div>;
 }
 
+/** 为路由回归测试提供一个可点击的导航入口，模拟同一页面内的深链切换。 */
+function RouteChangeButton({ label, to }: { label: string; to: string }) {
+  const navigate = useNavigate();
+  return <button type="button" onClick={() => navigate(to)}>{label}</button>;
+}
+
 function renderDetail(initialEntry = '/enterprise/teams/team-1') {
   return render(
     <I18nProvider>
@@ -250,6 +440,146 @@ function renderDetail(initialEntry = '/enterprise/teams/team-1') {
         </Routes>
       </MemoryRouter>
     </I18nProvider>,
+  );
+}
+
+/** 挂载带路由切换控件的团队详情，覆盖参数和查询串在同一组件实例内变化。 */
+function renderDetailWithRouteChange(
+  initialEntry: string,
+  target: string,
+  label: string,
+) {
+  return render(
+    <I18nProvider>
+      <MemoryRouter initialEntries={[initialEntry]}>
+        <RouteChangeButton label={label} to={target} />
+        <Routes>
+          <Route path="/enterprise/teams/:teamId" element={<TeamDetailPage />} />
+        </Routes>
+      </MemoryRouter>
+    </I18nProvider>,
+  );
+}
+
+type RouteMutationFetchOptions = {
+  pendingPath: string;
+  pendingMethod?: string;
+  entriesByTeam?: Record<string, TeamBlackboardEntryRead[]>;
+  knowledgeRowsByTeam?: Record<string, TeamKnowledgeBindingRead[]>;
+  taskListByTeam?: Record<string, TeamTaskRead[]>;
+  taskDetails?: Record<string, TeamTaskRead>;
+};
+
+/** Create a deferred fetch response so a route can change while an action is in flight. */
+function deferredResponse() {
+  let resolve!: (response: Response) => void;
+  const promise = new Promise<Response>((nextResolve) => {
+    resolve = nextResolve;
+  });
+  return { promise, resolve };
+}
+
+/** Stub every TeamDetail read while leaving one selected route mutation pending. */
+function stubRouteMutationFetch(options: RouteMutationFetchOptions) {
+  const pending = deferredResponse();
+  const pendingMethod = (options.pendingMethod || 'POST').toUpperCase();
+  const teamById: Record<string, TeamRead> = {
+    'team-a': { ...team, id: 'team-a', name: '团队 A' },
+    'team-b': { ...team, id: 'team-b', name: '团队 B' },
+  };
+  const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = new URL(String(input), window.location.origin);
+    const requestPath = url.pathname;
+    const method = String(init?.method || 'GET').toUpperCase();
+    const teamMatch = requestPath.match(/\/teams\/([^/]+)/);
+    const routeTeamId = teamMatch?.[1] || 'team-a';
+
+    if (requestPath === options.pendingPath && method === pendingMethod) {
+      return pending.promise;
+    }
+    if (method === 'GET' && requestPath.match(/\/teams\/[^/]+$/)) {
+      return jsonResponse(teamById[routeTeamId] || teamById['team-a']);
+    }
+    if (method === 'GET' && requestPath.match(/\/teams\/[^/]+\/tasks\/[^/]+$/)) {
+      const taskId = requestPath.split('/').pop() || '';
+      return jsonResponse(options.taskDetails?.[taskId] || makeTask({ id: taskId }));
+    }
+    if (method === 'GET' && requestPath.endsWith('/tasks')) {
+      return jsonResponse(options.taskListByTeam?.[routeTeamId] || tasks);
+    }
+    if (method === 'GET' && requestPath.match(/\/teams\/[^/]+\/blackboard$/)) {
+      return jsonResponse(options.entriesByTeam?.[routeTeamId] || []);
+    }
+    if (method === 'GET' && requestPath.match(/\/teams\/[^/]+\/events$/)) {
+      return jsonResponse([]);
+    }
+    if (method === 'GET' && requestPath.match(/\/teams\/[^/]+\/knowledge-bases$/)) {
+      return jsonResponse(options.knowledgeRowsByTeam?.[routeTeamId] || []);
+    }
+    if (method === 'GET' && requestPath === '/api/enterprise/knowledge-bases') {
+      return jsonResponse([]);
+    }
+    if (method === 'GET' && requestPath === '/api/enterprise/agents') {
+      return jsonResponse(agents);
+    }
+    if (method === 'GET' && requestPath.endsWith('/export')) {
+      return jsonResponse(teamLog);
+    }
+    if (method === 'POST' && requestPath.endsWith('/tl/session')) {
+      return jsonResponse({ session_id: 'session-1' });
+    }
+    if (method === 'PUT' && requestPath.includes('/knowledge-bases/')) {
+      const rows = options.knowledgeRowsByTeam?.[routeTeamId] || knowledgeBindings;
+      return jsonResponse(rows[0] || knowledgeBindings[0]);
+    }
+    if (method === 'POST' && requestPath.includes('/award-override')) {
+      return jsonResponse(makeTask({ status: 'pending', assignee_agent_id: 'agent-1' }));
+    }
+    if (method === 'POST' && requestPath.includes('/override')) {
+      return jsonResponse(makeTask({ status: 'done' }));
+    }
+    if (method === 'POST' && requestPath.endsWith('/tasks')) {
+      return jsonResponse(makeTask({ id: 'task-created', title: '创建后的任务' }));
+    }
+    if (method === 'POST' && requestPath.includes('/blackboard')) {
+      return jsonResponse(makeEntry({ id: 'entry-created', content: '创建后的黑板条目' }));
+    }
+    if (method === 'POST' || method === 'PUT' || method === 'DELETE') {
+      return jsonResponse({});
+    }
+    return jsonResponse({});
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  return { fetchMock, pending };
+}
+
+function countRequest(
+  fetchMock: ReturnType<typeof vi.fn>,
+  requestPath: string,
+  method = 'GET',
+): number {
+  return fetchMock.mock.calls.filter(([input, init]) => {
+    const url = new URL(String(input), window.location.origin);
+    return url.pathname === requestPath
+      && String(init?.method || 'GET').toUpperCase() === method.toUpperCase();
+  }).length;
+}
+
+/** Render team detail with the semantic provider as the only locale source. */
+function renderDetailWithAppLocale(
+  locale: AppLocale,
+  initialEntry = '/enterprise/teams/team-1',
+) {
+  return render(
+    <AppIntlProvider locale={locale}>
+      <MemoryRouter initialEntries={[initialEntry]}>
+        <Routes>
+          <Route path="/enterprise/teams/:teamId" element={<TeamDetailPage />} />
+          <Route path="/enterprise/teams/:teamId/chat" element={<LocationEcho />} />
+          <Route path="/workspace/chat/:sessionId" element={<LocationEcho />} />
+        </Routes>
+      </MemoryRouter>
+    </AppIntlProvider>,
   );
 }
 
@@ -267,6 +597,212 @@ beforeAll(() => {
 });
 
 describe('TeamDetailPage', () => {
+  it('requires one route action fence across every mutating TeamDetail pathway', () => {
+    const source = fs.readFileSync(path.resolve(__dirname, 'TeamDetailPage.tsx'), 'utf8');
+    const actionNames = [
+      'addMember',
+      'removeMember',
+      'promoteLeader',
+      'createTask',
+      'startTeamChat',
+      'openTeamLog',
+      'addBoardEntry',
+      'togglePinEntry',
+      'saveEditEntry',
+      'archiveBoardEntry',
+      'promoteBoardEntry',
+      'saveKnowledgeGrants',
+      'setDefaultKnowledgeBase',
+      'removeKnowledgeBase',
+      'bindExistingKnowledgeBase',
+      'createAndBindSharedKnowledgeBase',
+      'saveTeamConfig',
+      'awardOverride',
+      'overrideTask',
+    ];
+
+    actionNames.forEach((actionName) => {
+      const start = source.indexOf(`async function ${actionName}`);
+      const next = source.indexOf('\n  async function', start + 1);
+      const block = source.slice(start, next === -1 ? source.length : next);
+      expect(block, `${actionName} must capture route identity`).toMatch(/beginTeamActionFence\(\)/);
+      expect(block, `${actionName} must pass its abort signal`).toMatch(/signal: fence\.signal/);
+      expect(block, `${actionName} must fence every post-request side effect`).toMatch(/fence\.isCurrent\(\)/);
+    });
+
+    expect(source).toMatch(/actionControllersRef/);
+    expect(source).toMatch(/cancelRouteActionControllers/);
+    expect(source).toMatch(/routeAbortControllerRef/);
+  });
+
+  it('projects canonical team event params and never renders legacy payload prose', () => {
+    const english = createAppTranslator('en-US');
+    const chinese = createAppTranslator('zh-CN');
+    const payload = {
+      event_code: 'team.run.progress.completed',
+      params: { total_tasks: 2 },
+      text: 'backend-rendered text must stay hidden',
+    };
+
+    expect(teamEventLabel('task_escalated', payload, english.t)).toBe(
+      'Received all 2 member replies. The team summary is complete.',
+    );
+    expect(teamEventLabel('task_escalated', payload, chinese.t)).toBe(
+      '已收到全部 2 项成员回复，团队汇总已完成。',
+    );
+    expect(teamEventLabel('task_escalated', payload, english.t)).not.toContain('backend-rendered');
+  });
+
+  it('falls back to the legacy event code label only when canonical metadata is unavailable', () => {
+    const english = createAppTranslator('en-US');
+    expect(teamEventLabel('task_escalated', { event_code: 'team.unknown.event', params: {} }, english.t)).toBe(
+      'Task escalated',
+    );
+    expect(teamEventLabel('unknown_event', { text: 'backend text' }, english.t)).toBe('unknown_event');
+  });
+
+  it('explains the group-read union, private isolation, and shared-only team writes', async () => {
+    stubDetailFetch({ knowledgeRows: knowledgeBindings });
+    renderDetail();
+
+    const section = await screen.findByLabelText('团队知识库');
+    expect(within(section).getByText(
+      '团队群聊会读取当前执行员工自己的专用知识库，以及这里绑定并授予该员工的共享知识库；不会读取其他员工的专用知识库。员工私聊只读取自己的专用知识库，不读取团队共享知识库。团队默认写入目标仍只能是共享知识库。',
+    )).toBeTruthy();
+  });
+
+  it('renders and saves the per-member shared knowledge permission matrix', async () => {
+    const user = userEvent.setup();
+    const fetchMock = stubDetailFetch({ knowledgeRows: knowledgeBindings });
+    renderDetail();
+
+    const section = await screen.findByLabelText('团队知识库');
+    expect(within(section).getByText('共享制度库')).toBeTruthy();
+    await user.selectOptions(
+      within(section).getByLabelText('小艾 在 共享制度库 的权限'),
+      'publisher',
+    );
+    await user.click(within(section).getByRole('button', { name: '保存 共享制度库 权限' }));
+
+    await waitFor(() => {
+      const call = fetchMock.mock.calls.find(([input, init]) => (
+        String(input).includes('/knowledge-bases/kb-shared-1/grants')
+        && init?.method === 'PUT'
+      ));
+      const body = JSON.parse(String(call?.[1]?.body)) as Record<string, unknown>;
+      expect(body.expected_revision).toBe(4);
+      expect(body.grants).toEqual([
+        { agent_id: 'agent-1', permission: 'publisher' },
+        { agent_id: 'agent-2', permission: null },
+      ]);
+    });
+  });
+
+  it('sets the default shared knowledge base with its displayed revision', async () => {
+    const user = userEvent.setup();
+    const fetchMock = stubDetailFetch({ knowledgeRows: knowledgeBindings });
+    renderDetail();
+
+    const section = await screen.findByLabelText('团队知识库');
+    await user.click(within(section).getByRole('button', { name: '设为默认 共享制度库' }));
+
+    await waitFor(() => {
+      const call = fetchMock.mock.calls.find(([input, init]) => (
+        String(input).includes('/knowledge-bases/kb-shared-1')
+        && init?.method === 'PUT'
+      ));
+      expect(JSON.parse(String(call?.[1]?.body))).toEqual({
+        tenant_id: 'tenant_demo',
+        expected_revision: 4,
+        is_default: true,
+      });
+    });
+  });
+
+  it('shows a safe reload instruction on permission revision conflict', async () => {
+    const user = userEvent.setup();
+    sonnerSpies.custom.mockClear();
+    stubDetailFetch({ knowledgeRows: knowledgeBindings, conflictOnGrantSave: true });
+    renderDetail();
+
+    const section = await screen.findByLabelText('团队知识库');
+    await user.click(within(section).getByRole('button', { name: '保存 共享制度库 权限' }));
+
+    await waitFor(() => {
+      const renderer =
+        sonnerSpies.custom.mock.calls[sonnerSpies.custom.mock.calls.length - 1]?.[0];
+      expect(typeof renderer).toBe('function');
+      const { container } = render((renderer as () => ReactNode)() as ReactElement);
+      expect(container.textContent).toContain('权限配置已被其他管理员更新，请刷新后重新确认。');
+    });
+  });
+
+  it('keeps each knowledge binding busy until its own overlapping save completes', async () => {
+    const user = userEvent.setup();
+    const secondBinding: TeamKnowledgeBindingRead = {
+      ...knowledgeBindings[0],
+      id: 'teamkb-2',
+      knowledge_base_id: 'kb-shared-2',
+      knowledge_base_name: '共享选题库',
+    };
+    let resolveFirst!: (response: Response) => void;
+    let resolveSecond!: (response: Response) => void;
+    const first = new Promise<Response>((resolve) => { resolveFirst = resolve; });
+    const second = new Promise<Response>((resolve) => { resolveSecond = resolve; });
+    stubDetailFetch({
+      knowledgeRows: [...knowledgeBindings, secondBinding],
+      onGrantSave: (knowledgeBaseId) => (
+        knowledgeBaseId === 'kb-shared-1' ? first : second
+      ),
+    });
+    renderDetail();
+
+    const section = await screen.findByLabelText('团队知识库');
+    const firstButton = within(section).getByRole('button', { name: '保存 共享制度库 权限' });
+    const secondButton = within(section).getByRole('button', { name: '保存 共享选题库 权限' });
+    await user.click(firstButton);
+    await user.click(secondButton);
+    expect((firstButton as HTMLButtonElement).disabled).toBe(true);
+    expect((secondButton as HTMLButtonElement).disabled).toBe(true);
+
+    resolveFirst(jsonResponse({ ...knowledgeBindings[0], revision: 5 }));
+    await waitFor(() => expect((firstButton as HTMLButtonElement).disabled).toBe(false));
+    expect((secondButton as HTMLButtonElement).disabled).toBe(true);
+
+    resolveSecond(jsonResponse({ ...secondBinding, revision: 5 }));
+    await waitFor(() => expect((secondButton as HTMLButtonElement).disabled).toBe(false));
+  });
+
+  it('opens the complete team execution log online and keeps JSON download available', async () => {
+    const user = userEvent.setup();
+    const fetchMock = stubDetailFetch();
+    const createObjectURL = vi.fn(() => 'blob:team-log');
+    const revokeObjectURL = vi.fn();
+    const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined);
+    Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: createObjectURL });
+    Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: revokeObjectURL });
+    renderDetail();
+
+    await user.click(await screen.findByRole('button', { name: '查看完整日志' }));
+
+    const dialog = await screen.findByRole('dialog');
+    expect(within(dialog).getByText('团队完整日志')).toBeTruthy();
+    expect(within(dialog).getByText('成员调研')).toBeTruthy();
+    expect(within(dialog).getByText('任务数')).toBeTruthy();
+    await user.click(within(dialog).getByText('成员调研'));
+    expect(await within(dialog).findByText('已完成用户反馈调研')).toBeTruthy();
+    await user.click(within(dialog).getByRole('button', { name: '下载 JSON' }));
+
+    await waitFor(() => {
+      expect(fetchMock.mock.calls.some(([input]) =>
+        String(input).includes('/api/enterprise/teams/team-1/export?tenant_id=tenant_demo'),
+      )).toBe(true);
+      expect(createObjectURL).toHaveBeenCalledTimes(1);
+      expect(click).toHaveBeenCalledTimes(1);
+      expect(revokeObjectURL).toHaveBeenCalledWith('blob:team-log');
+    });
+  });
+
   it('renders members and groups kanban tasks by status', async () => {
     stubDetailFetch();
     renderDetail();
@@ -287,6 +823,32 @@ describe('TeamDetailPage', () => {
     expect(within(pendingColumn).getByText('未分配')).toBeTruthy();
     const progressColumn = within(board).getByText('进行中').closest('div')?.parentElement as HTMLElement;
     expect(within(progressColumn).getByText('投放分析')).toBeTruthy();
+  });
+
+  it('starts an overflowed member list from the left and shows a horizontal scroll hint', async () => {
+    vi.spyOn(Element.prototype, 'scrollWidth', 'get').mockReturnValue(1000);
+    vi.spyOn(Element.prototype, 'clientWidth', 'get').mockReturnValue(500);
+    stubDetailFetch({ teamOverride: crowdedTeam });
+    renderDetail();
+
+    const memberList = await screen.findByRole('region', { name: '团队成员列表' });
+    const memberSection = screen.getByRole('region', { name: '成员管理' });
+    await waitFor(() => {
+      expect(within(memberSection).getByText('横向滑动查看更多成员')).toBeTruthy();
+    });
+    expect(memberList.scrollLeft).toBe(0);
+    expect(memberList.firstElementChild?.className).toContain('w-max');
+    expect(memberList.firstElementChild?.className).toContain('min-w-full');
+    expect(memberSection.querySelector('[data-scroll-edge="right"]')).toBeTruthy();
+    expect(within(memberSection).getByText('产品经理')).toBeTruthy();
+    expect(within(memberSection).getAllByText('成员', { exact: true })).toHaveLength(9);
+
+    memberList.scrollLeft = 500;
+    fireEvent.scroll(memberList);
+    await waitFor(() => {
+      expect(memberSection.querySelector('[data-scroll-edge="left"]')).toBeTruthy();
+      expect(memberSection.querySelector('[data-scroll-edge="right"]')).toBeFalsy();
+    });
   });
 
   it('submits an override verdict from the task detail dialog', async () => {
@@ -358,7 +920,9 @@ describe('TeamDetailPage', () => {
     expect(within(board).getByText('okr')).toBeTruthy();
     expect(within(board).getByText((content) => content.startsWith('项目领导'))).toBeTruthy();
     expect(within(board).getByText((content) => content.startsWith('小北'))).toBeTruthy();
-    expect(within(board).getByText(/关联任务：写周报/)).toBeTruthy();
+    expect(within(board).getByText((_, element) => (
+      element?.textContent === '关联任务：写周报'
+    ))).toBeTruthy();
     expect(within(board).getAllByText('置顶').length).toBeGreaterThan(0);
   });
 
@@ -588,6 +1152,254 @@ describe('TeamDetailPage', () => {
     expect(within(dialog).getByText('submitted')).toBeTruthy();
   });
 
+  it('does not let a previous team response replace the newly routed team', async () => {
+    const user = userEvent.setup();
+    const teamA = { ...team, id: 'team-a', name: '团队 A' };
+    const teamB = { ...team, id: 'team-b', name: '团队 B' };
+    let resolveTeamA!: (response: Response) => void;
+    const pendingTeamA = new Promise<Response>((resolve) => {
+      resolveTeamA = resolve;
+    });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith('/api/enterprise/teams/team-a?tenant_id=tenant_demo')) return pendingTeamA;
+      if (url.endsWith('/api/enterprise/teams/team-b?tenant_id=tenant_demo')) return jsonResponse(teamB);
+      if (url.includes('/api/enterprise/teams/') && url.includes('/tasks/')) return jsonResponse([]);
+      if (url.includes('/api/enterprise/teams/') && url.includes('/tasks?')) return jsonResponse([]);
+      if (url.includes('/api/enterprise/teams/') && url.includes('/blackboard')) return jsonResponse([]);
+      if (url.includes('/api/enterprise/teams/') && url.includes('/events')) return jsonResponse([]);
+      if (url.includes('/api/enterprise/teams/') && url.includes('/knowledge-bases')) return jsonResponse([]);
+      if (url.endsWith('/api/enterprise/knowledge-bases?tenant_id=tenant_demo')) return jsonResponse([]);
+      if (url.endsWith('/api/enterprise/agents?tenant_id=tenant_demo')) return jsonResponse([]);
+      return jsonResponse({});
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    renderDetailWithRouteChange('/enterprise/teams/team-a', '/enterprise/teams/team-b', '切换 B');
+    await waitFor(() => expect(fetchMock.mock.calls.some(([input]) => (
+      String(input).includes('/api/enterprise/teams/team-a')
+      && !String(input).includes('/tasks')
+      && !String(input).includes('/blackboard')
+      && !String(input).includes('/events')
+      && !String(input).includes('/knowledge-bases')
+    ))).toBe(true));
+    fireEvent.click(screen.getByText('切换 B'));
+    expect(await screen.findByText('团队 B')).toBeTruthy();
+
+    await act(async () => {
+      resolveTeamA(jsonResponse(teamA));
+      await Promise.resolve();
+    });
+    expect(screen.queryByText('团队 A')).toBeNull();
+  });
+
+  it('clears the active task when the task query parameter is removed', async () => {
+    stubDetailFetch();
+    renderDetailWithRouteChange(
+      '/enterprise/teams/team-1?task=task-1',
+      '/enterprise/teams/team-1',
+      '移除任务查询',
+    );
+
+    expect(await screen.findByRole('dialog')).toBeTruthy();
+    fireEvent.click(screen.getByText('移除任务查询'));
+
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+  });
+
+  it('does not reload team A after an add-member action completes on team B', async () => {
+    const user = userEvent.setup();
+    const { fetchMock, pending } = stubRouteMutationFetch({
+      pendingPath: '/api/enterprise/teams/team-a/members',
+    });
+    renderDetailWithRouteChange('/enterprise/teams/team-a', '/enterprise/teams/team-b', '切换 B');
+
+    await screen.findByText('团队 A', { exact: true });
+    const members = screen.getByRole('region', { name: '成员管理' });
+    await user.click(within(members).getByRole('combobox', { name: '选择员工' }));
+    await user.click(await screen.findByRole('option', { name: '小丙' }));
+    await user.click(within(members).getByRole('button', { name: '添加成员' }));
+    await waitFor(() => expect(countRequest(
+      fetchMock,
+      '/api/enterprise/teams/team-a/members',
+      'POST',
+    )).toBe(1));
+    const teamReadsBeforeRouteChange = countRequest(fetchMock, '/api/enterprise/teams/team-a');
+
+    fireEvent.click(screen.getByText('切换 B'));
+    await screen.findByText('团队 B', { exact: true });
+
+    await act(async () => {
+      pending.resolve(jsonResponse({}));
+      await pending.promise;
+    });
+    await waitFor(() => expect(countRequest(
+      fetchMock,
+      '/api/enterprise/teams/team-a',
+    )).toBe(teamReadsBeforeRouteChange));
+    expect(countRequest(fetchMock, '/api/enterprise/teams/team-b/members', 'POST')).toBe(0);
+  });
+
+  it('does not reload team A tasks after a create-task action completes on team B', async () => {
+    const user = userEvent.setup();
+    const { fetchMock, pending } = stubRouteMutationFetch({
+      pendingPath: '/api/enterprise/teams/team-a/tasks',
+      taskListByTeam: {
+        'team-a': [makeTask({ id: 'a-task', title: 'A task list' })],
+        'team-b': [makeTask({ id: 'b-task', title: 'B task list' })],
+      },
+    });
+    renderDetailWithRouteChange('/enterprise/teams/team-a', '/enterprise/teams/team-b', '切换 B');
+
+    const board = screen.getByRole('region', { name: '任务看板' });
+    await screen.findByText('团队 A', { exact: true });
+    await user.click(within(board).getByRole('button', { name: '新建任务' }));
+    const dialog = await screen.findByRole('dialog');
+    await user.type(within(dialog).getByLabelText('任务标题'), 'A pending task');
+    await user.click(within(dialog).getByRole('button', { name: '创建' }));
+    await waitFor(() => expect(countRequest(
+      fetchMock,
+      '/api/enterprise/teams/team-a/tasks',
+      'POST',
+    )).toBe(1));
+    const taskReadsBeforeRouteChange = countRequest(
+      fetchMock,
+      '/api/enterprise/teams/team-a/tasks',
+    );
+
+    fireEvent.click(screen.getByText('切换 B'));
+    await screen.findByText('团队 B', { exact: true });
+    await screen.findByText('B task list', { exact: true });
+
+    await act(async () => {
+      pending.resolve(jsonResponse(makeTask({ id: 'a-created', title: 'A pending task' })));
+      await pending.promise;
+    });
+    await waitFor(() => expect(countRequest(
+      fetchMock,
+      '/api/enterprise/teams/team-a/tasks',
+    )).toBe(taskReadsBeforeRouteChange));
+    expect(screen.queryByText('A task list', { exact: true })).toBeNull();
+    expect(countRequest(fetchMock, '/api/enterprise/teams/team-b/tasks', 'POST')).toBe(0);
+  });
+
+  it('does not publish a stale blackboard mutation after routing from team A to team B', async () => {
+    const user = userEvent.setup();
+    const { fetchMock, pending } = stubRouteMutationFetch({
+      pendingPath: '/api/enterprise/teams/team-a/blackboard',
+      entriesByTeam: {
+        'team-a': [makeEntry({ id: 'a-entry', content: 'A board refresh' })],
+        'team-b': [makeEntry({ id: 'b-entry', content: 'B board refresh' })],
+      },
+    });
+    renderDetailWithRouteChange('/enterprise/teams/team-a', '/enterprise/teams/team-b', '切换 B');
+
+    const board = screen.getByRole('region', { name: '团队黑板' });
+    await within(board).findByText('A board refresh', { exact: true });
+    await user.type(within(board).getByLabelText('输入黑板内容'), 'A pending board');
+    await user.click(within(board).getByRole('button', { name: '添加' }));
+    await waitFor(() => expect(countRequest(
+      fetchMock,
+      '/api/enterprise/teams/team-a/blackboard',
+      'POST',
+    )).toBe(1));
+    const boardReadsBeforeRouteChange = countRequest(
+      fetchMock,
+      '/api/enterprise/teams/team-a/blackboard',
+    );
+
+    fireEvent.click(screen.getByText('切换 B'));
+    await screen.findByText('团队 B', { exact: true });
+    await within(screen.getByRole('region', { name: '团队黑板' })).findByText('B board refresh', { exact: true });
+
+    await act(async () => {
+      pending.resolve(jsonResponse(makeEntry({ id: 'a-created', content: 'A pending board' })));
+      await pending.promise;
+    });
+    await waitFor(() => expect(countRequest(
+      fetchMock,
+      '/api/enterprise/teams/team-a/blackboard',
+    )).toBe(boardReadsBeforeRouteChange));
+    expect(screen.queryByText('A board refresh', { exact: true })).toBeNull();
+    expect(countRequest(fetchMock, '/api/enterprise/teams/team-b/blackboard', 'POST')).toBe(0);
+  });
+
+  it('does not publish a stale knowledge permission save after routing from team A to team B', async () => {
+    const user = userEvent.setup();
+    // Keep the binding id stable to prove the stale response cannot mutate the
+    // same rendered row after the team route changes.
+    const knowledgeA = { ...knowledgeBindings[0], id: 'teamkb-shared', knowledge_base_name: 'A binding' };
+    const knowledgeB = { ...knowledgeBindings[0], id: 'teamkb-shared', knowledge_base_name: 'B binding' };
+    const { fetchMock, pending } = stubRouteMutationFetch({
+      pendingPath: '/api/enterprise/teams/team-a/knowledge-bases/kb-shared-1/grants',
+      pendingMethod: 'PUT',
+      knowledgeRowsByTeam: {
+        'team-a': [knowledgeA],
+        'team-b': [knowledgeB],
+      },
+    });
+    renderDetailWithRouteChange('/enterprise/teams/team-a', '/enterprise/teams/team-b', '切换 B');
+
+    const knowledge = await screen.findByRole('region', { name: '团队知识库' });
+    await within(knowledge).findByText('A binding', { exact: true });
+    await user.click(within(knowledge).getByRole('button', { name: '保存 A binding 权限' }));
+    await waitFor(() => expect(countRequest(
+      fetchMock,
+      '/api/enterprise/teams/team-a/knowledge-bases/kb-shared-1/grants',
+      'PUT',
+    )).toBe(1));
+
+    fireEvent.click(screen.getByText('切换 B'));
+    const teamBKnowledge = await screen.findByRole('region', { name: '团队知识库' });
+    await within(teamBKnowledge).findByText('B binding', { exact: true });
+
+    await act(async () => {
+      pending.resolve(jsonResponse({ ...knowledgeA, knowledge_base_name: 'A stale binding' }));
+      await pending.promise;
+    });
+    await waitFor(() => expect(within(
+      screen.getByRole('region', { name: '团队知识库' }),
+    ).queryByText('A stale binding', { exact: true })).toBeNull());
+    expect(within(screen.getByRole('region', { name: '团队知识库' })).getByText('B binding', { exact: true })).toBeTruthy();
+  });
+
+  it('does not reload team A after a task override completes on team B', async () => {
+    const user = userEvent.setup();
+    const { fetchMock, pending } = stubRouteMutationFetch({
+      pendingPath: '/api/enterprise/teams/team-a/tasks/task-1/override',
+      taskListByTeam: {
+        'team-a': [
+          makeTask({ id: 'task-1', title: '写周报', status: 'review' }),
+          makeTask({ id: 'a-stale', title: 'A stale task', status: 'pending' }),
+        ],
+        'team-b': [makeTask({ id: 'b-task', title: 'B task', status: 'pending' })],
+      },
+    });
+    renderDetailWithRouteChange('/enterprise/teams/team-a', '/enterprise/teams/team-b', '切换 B');
+
+    const board = screen.getByRole('region', { name: '任务看板' });
+    await within(board).findByText('写周报', { exact: true });
+    await user.click(within(board).getByText('写周报', { exact: true }));
+    const dialog = await screen.findByRole('dialog');
+    await user.click(within(dialog).getByRole('button', { name: '通过' }));
+    await waitFor(() => expect(countRequest(
+      fetchMock,
+      '/api/enterprise/teams/team-a/tasks/task-1/override',
+      'POST',
+    )).toBe(1));
+
+    fireEvent.click(screen.getByText('切换 B'));
+    const teamBBoard = await screen.findByRole('region', { name: '任务看板' });
+    await within(teamBBoard).findByText('B task', { exact: true });
+
+    await act(async () => {
+      pending.resolve(jsonResponse(makeTask({ id: 'task-1', title: '写周报', status: 'done' })));
+      await pending.promise;
+    });
+    await waitFor(() => expect(screen.queryByText('A stale task', { exact: true })).toBeNull());
+    expect(within(screen.getByRole('region', { name: '任务看板' })).getByText('B task', { exact: true })).toBeTruthy();
+  });
+
   it('saves team settings via PUT with the merged config', async () => {
     const user = userEvent.setup();
     const fetchMock = stubDetailFetch({
@@ -596,7 +1408,8 @@ describe('TeamDetailPage', () => {
     renderDetail();
 
     const settings = await screen.findByLabelText('团队设置');
-    expect((within(settings).getByLabelText('成员并发上限') as HTMLInputElement).value).toBe('2');
+    const concurrencyInput = within(settings).getByLabelText('成员并发上限') as HTMLInputElement;
+    await waitFor(() => expect(concurrencyInput.value).toBe('2'));
     const timeoutInput = within(settings).getByLabelText('任务超时分钟') as HTMLInputElement;
     expect(timeoutInput.value).toBe('30');
     expect((within(settings).getByLabelText('竞标反驳轮数') as HTMLInputElement).value).toBe('1');
@@ -718,6 +1531,32 @@ describe('TeamDetailPage', () => {
     expect(await within(dialog).findByText('周报已完成')).toBeTruthy();
   });
 
+  it('renders canonical team event params in the activity timeline', async () => {
+    stubDetailFetch({
+      events: [
+        {
+          id: 'canonical-event-1',
+          task_id: 'task-1',
+          task_title: '写周报',
+          actor_type: 'system',
+          actor_id: null,
+          event_type: 'task_escalated',
+          payload: {
+            event_code: 'team.run.progress.completed',
+            params: { total_tasks: 2 },
+            text: 'legacy backend prose must not render',
+          },
+          created_at: new Date().toISOString(),
+        },
+      ],
+    });
+    renderDetailWithAppLocale('en-US');
+
+    const activity = await screen.findByLabelText('Team activity');
+    expect(within(activity).getByText('Received all 2 member replies. The team summary is complete.')).toBeTruthy();
+    expect(within(activity).queryByText('legacy backend prose must not render')).toBeNull();
+  });
+
   it('renders the review verdict as a prominent banner with the comment quote', async () => {
     const user = userEvent.setup();
     stubDetailFetch({
@@ -737,7 +1576,7 @@ describe('TeamDetailPage', () => {
     const verdict = await within(dialog).findByLabelText('验收结论');
     expect(within(verdict).getByText('退回重做')).toBeTruthy();
     const quote = within(verdict).getByText('数据不完整，请补充来源');
-    expect(quote.tagName).toBe('BLOCKQUOTE');
+    expect(quote.closest('blockquote')?.tagName).toBe('BLOCKQUOTE');
   });
 
   it('renders an approve banner and hides the section when there is no verdict', async () => {
@@ -755,7 +1594,7 @@ describe('TeamDetailPage', () => {
     let dialog = await screen.findByRole('dialog');
     const verdict = await within(dialog).findByLabelText('验收结论');
     expect(within(verdict).getByText('验收通过')).toBeTruthy();
-    await user.click(within(dialog).getByRole('button', { name: 'Close' }));
+    await user.click(within(dialog).getByRole('button', { name: '关闭' }));
     await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
 
     await user.click(within(board).getByText('投放分析'));
@@ -810,5 +1649,121 @@ describe('TeamDetailPage', () => {
     const removeButton = within(members).getByRole('button', { name: '移除成员 小北' });
     expect(promoteButton.className).toContain('whitespace-nowrap');
     expect(removeButton.className).toContain('whitespace-nowrap');
+  });
+});
+
+describe('TeamDetailPage semantic locale boundary', () => {
+  it.each([
+    {
+      locale: 'zh-CN',
+      memberSection: '成员管理',
+      activeStatus: '正常',
+      leaderRole: '项目领导',
+      memberRole: '成员',
+      promote: '设为项目领导',
+      removeAria: '移除成员 小北',
+      memberListAria: '团队成员列表',
+      knowledgeSection: '团队知识库',
+      permissionAria: '小艾 在 共享制度库 的权限',
+      noAccess: '无权限',
+      reader: '可读取',
+      editor: '可编辑',
+      publisher: '可发布',
+      taskBoard: '任务看板',
+      reviewStatus: '待验收',
+    },
+    {
+      locale: 'en-US',
+      memberSection: 'Member management',
+      activeStatus: 'Active',
+      leaderRole: 'Project lead',
+      memberRole: 'Member',
+      promote: 'Set as project lead',
+      removeAria: 'Remove member 小北',
+      memberListAria: 'Team member list',
+      knowledgeSection: 'Team knowledge bases',
+      permissionAria: 'Permissions for 小艾 in 共享制度库',
+      noAccess: 'No access',
+      reader: 'Read',
+      editor: 'Edit',
+      publisher: 'Publish',
+      taskBoard: 'Task board',
+      reviewStatus: 'In review',
+    },
+  ] as const)(
+    'localizes roles, permissions, statuses and ARIA in $locale while names stay raw',
+    async ({
+      locale,
+      memberSection,
+      activeStatus,
+      leaderRole,
+      memberRole,
+      promote,
+      removeAria,
+      memberListAria,
+      knowledgeSection,
+      permissionAria,
+      noAccess,
+      reader,
+      editor,
+      publisher,
+      taskBoard,
+      reviewStatus,
+    }) => {
+      stubDetailFetch({ knowledgeRows: knowledgeBindings });
+      renderDetailWithAppLocale(locale);
+
+      expect(await screen.findByText('增长团队')).toBeTruthy();
+      expect(screen.getByText('负责增长实验')).toBeTruthy();
+      const members = screen.getByLabelText(memberSection);
+      expect(within(members).getByText(activeStatus)).toBeTruthy();
+      expect(within(members).getByText(leaderRole)).toBeTruthy();
+      expect(within(members).getByText(memberRole)).toBeTruthy();
+      expect(within(members).getByRole('button', { name: promote })).toBeTruthy();
+      expect(within(members).getByRole('button', { name: removeAria })).toBeTruthy();
+      expect(within(members).getByRole('region', { name: memberListAria })).toBeTruthy();
+      expect(within(members).getByText('小艾')).toBeTruthy();
+      expect(within(members).getByText('小北')).toBeTruthy();
+
+      const knowledge = screen.getByLabelText(knowledgeSection);
+      const permission = within(knowledge).getByLabelText(permissionAria);
+      expect(within(permission).getByRole('option', { name: noAccess })).toBeTruthy();
+      expect(within(permission).getByRole('option', { name: reader })).toBeTruthy();
+      expect(within(permission).getByRole('option', { name: editor })).toBeTruthy();
+      expect(within(permission).getByRole('option', { name: publisher })).toBeTruthy();
+      expect(within(knowledge).getByText('共享制度库')).toBeTruthy();
+
+      const board = screen.getByLabelText(taskBoard);
+      expect(within(board).getByText(reviewStatus)).toBeTruthy();
+      expect(within(board).getByText('写周报')).toBeTruthy();
+    },
+  );
+
+  it('localizes empty collaboration states without altering the team record', async () => {
+    stubDetailFetch({ taskList: [], events: [], teamOverride: { ...team, members: [] } });
+    renderDetailWithAppLocale('en-US');
+
+    expect(await screen.findByText('增长团队')).toBeTruthy();
+    expect(screen.getByLabelText('Member management')).toBeTruthy();
+    expect(screen.getByText('No members')).toBeTruthy();
+    expect(screen.getAllByText('No tasks').length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText('No team activity')).toBeTruthy();
+    expect(screen.getByText('No blackboard entries')).toBeTruthy();
+  });
+
+  it('localizes native archive confirmation while keeping entry content raw', async () => {
+    const user = userEvent.setup();
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false);
+    stubDetailFetch({ entries: [makeEntry({ id: 'entry-1', content: 'stale note' })] });
+    renderDetailWithAppLocale('en-US');
+
+    const board = await screen.findByLabelText('Team blackboard');
+    expect(within(board).getByText('stale note')).toBeTruthy();
+    await user.click(within(board).getByRole('button', { name: 'Archive' }));
+
+    expect(confirm).toHaveBeenCalledWith(
+      'Archive this blackboard entry? Archived entries are no longer shown.',
+    );
+    expect(within(board).getByText('stale note')).toBeTruthy();
   });
 });

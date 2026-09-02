@@ -3,13 +3,13 @@ from types import SimpleNamespace
 import pytest
 
 from app.llm.client import LLMClient, LLMError, _thinking_mode_for_model
-from app.llm.protocol_drivers import ChatCompletionsDriver, ProtocolCallError
 from app.llm.output_policy import (
     operation_empty_response_retries,
     operation_output_tokens,
 )
-from app.llm.stage_protocol import TURN_STAGE_MESSAGES_KEY, stage_payload
+from app.llm.protocol_drivers import ChatCompletionsDriver, CodexAppServerDriver, ProtocolCallError
 from app.llm.schemas import ModelConfigCreateRequest
+from app.llm.stage_protocol import TURN_STAGE_MESSAGES_KEY, stage_payload
 from app.observability.spans import bind_span_sink, llm_operation
 
 
@@ -38,6 +38,104 @@ class _FakeOpenAIClient:
     def __init__(self) -> None:
         self.responses = _ForbiddenResponses()
         self.chat = _FakeChat()
+
+
+def test_llm_client_uses_codex_runtime_driver_without_decrypting_an_api_key(monkeypatch) -> None:
+    """订阅模型只保存本机 runtime 会话工厂，构造客户端时不会读取或解密 API Key。"""
+    session = object()
+
+    class _SubscriptionService:
+        """提供可观察的 runtime 会话工厂，不提供遗留 OpenAI client 适配器。"""
+
+        def create_session(self) -> object:
+            """返回供协议驱动在真实请求时创建的短生命周期 runtime 会话。"""
+            return session
+
+    config = SimpleNamespace(
+        api_protocol="codex_app_server",
+        api_key_encrypted="must-not-be-read",
+        base_url="",
+        model="gpt-5.1-codex",
+        temperature=0.2,
+        max_output_tokens=128,
+        protocol_options={},
+        legacy_extra_body={},
+    )
+    monkeypatch.setattr(
+        "app.llm.client.decrypt_secret",
+        lambda _value: (_ for _ in ()).throw(AssertionError("subscription must not decrypt API keys")),
+    )
+    monkeypatch.setattr(
+        "app.llm.client.get_codex_subscription_service",
+        lambda: _SubscriptionService(),
+    )
+    monkeypatch.setattr(
+        "app.llm.client.get_settings",
+        lambda: SimpleNamespace(model_api_timeout_seconds=30.0),
+    )
+
+    client = LLMClient(config)
+
+    assert client.client is None
+    assert isinstance(client.driver, CodexAppServerDriver)
+    assert client.driver.session_factory() is session
+
+
+def test_llm_client_keeps_api_key_sdk_and_subscription_runtime_branches_separate(
+    monkeypatch,
+) -> None:
+    """API Key 模型继续使用官方 OpenAI SDK，订阅模型只使用本机 Codex runtime 驱动。"""
+    api_client = _FakeOpenAIClient()
+    runtime_session = object()
+
+    class _SubscriptionService:
+        """提供订阅 runtime 会话工厂，防止测试意外走 API Key SDK 分支。"""
+
+        def create_session(self) -> object:
+            """返回订阅驱动在请求时需要的短生命周期会话。"""
+            return runtime_session
+
+    monkeypatch.setattr("app.llm.client.decrypt_secret", lambda _value: "platform-api-key")
+    monkeypatch.setattr("app.llm.client.OpenAI", lambda **_kwargs: api_client)
+    monkeypatch.setattr(
+        "app.llm.client.get_codex_subscription_service",
+        lambda: _SubscriptionService(),
+    )
+    monkeypatch.setattr(
+        "app.llm.client.get_settings",
+        lambda: SimpleNamespace(model_api_timeout_seconds=30.0),
+    )
+
+    api_key_client = LLMClient(
+        SimpleNamespace(
+            api_protocol="openai_chat_completions",
+            api_key_encrypted="encrypted-api-key",
+            base_url="https://api.openai.com/v1",
+            model="gpt-5",
+            temperature=0.2,
+            max_output_tokens=128,
+            protocol_options={},
+            legacy_extra_body={},
+        )
+    )
+    subscription_client = LLMClient(
+        SimpleNamespace(
+            api_protocol="codex_app_server",
+            api_key_encrypted="",
+            base_url="",
+            model="gpt-5.1-codex",
+            temperature=0.2,
+            max_output_tokens=128,
+            protocol_options={},
+            legacy_extra_body={},
+        )
+    )
+
+    assert isinstance(api_key_client.driver, ChatCompletionsDriver)
+    assert api_key_client.client is api_client
+    assert isinstance(subscription_client.driver, CodexAppServerDriver)
+    assert subscription_client.client is None
+    assert subscription_client.driver.session_factory() is runtime_session
 
 
 def test_llm_client_uses_600_second_timeout(monkeypatch):
@@ -111,6 +209,38 @@ def test_llm_client_preserves_custom_openai_base_url(monkeypatch) -> None:
     LLMClient(config)
 
     assert captured["base_url"] == "https://custom-relay.example/llm"
+
+
+def test_llm_client_sets_outbound_user_agent_for_chat_completions(monkeypatch) -> None:
+    from app.llm.client import _OUTBOUND_USER_AGENT
+
+    captured = {}
+    monkeypatch.setattr("app.llm.client.decrypt_secret", lambda _value: "api-key")
+    monkeypatch.setattr(
+        "app.llm.client.OpenAI",
+        lambda **kwargs: captured.update(kwargs) or _FakeOpenAIClient(),
+    )
+    monkeypatch.setattr(
+        "app.llm.client.get_settings",
+        lambda: type("Settings", (), {"model_api_timeout_seconds": 30.0})(),
+    )
+    config = type(
+        "ModelConfig",
+        (),
+        {
+            "api_key_encrypted": "encrypted",
+            "base_url": "https://gateway.example.test/v1",
+            "model": "demo-model",
+            "temperature": 0.2,
+            "max_output_tokens": 128,
+            "extra_body_json": {},
+        },
+    )()
+
+    LLMClient(config)
+
+    assert captured["default_headers"]["User-Agent"] == _OUTBOUND_USER_AGENT
+    assert not any(key.startswith("X-Stainless") for key in captured["default_headers"])
 
 
 def test_model_config_create_defaults_to_8192_output_tokens():
@@ -512,6 +642,39 @@ def test_generate_text_records_each_empty_response_retry():
     assert [item["retry_count"] for item in finished] == [0, 1, 2]
 
 
+def test_generate_text_failed_span_uses_canonical_error_without_provider_exception_text() -> None:
+    client = object.__new__(LLMClient)
+    client.client = _FakeOpenAIClient()
+    client.driver = ChatCompletionsDriver(client.client)
+    client.model = "demo-model"
+    client.base_url = "https://example.test/v1"
+    client.temperature = 0.2
+    client.max_output_tokens = 256
+    events: list[tuple[str, dict]] = []
+
+    def fail_create(**kwargs):  # noqa: ANN003
+        client.client.chat.completions.calls.append(kwargs)
+        raise RuntimeError("provider timeout secret=/private/provider.sock")
+
+    client.client.chat.completions.create = fail_create
+
+    with bind_span_sink(lambda event_type, payload: events.append((event_type, payload))):
+        with pytest.raises(LLMError):
+            client.generate_text("system prompt", {"hello": "world"})
+
+    failed = next(payload for event_type, payload in events if event_type == "llm_call_failed")
+    assert failed["error"] == {
+        "code": "INTERNAL_ERROR",
+        "params": {},
+        "retryable": False,
+        "request_id": None,
+        "trace_id": None,
+    }
+    assert failed["response_text"] == ""
+    assert "provider timeout" not in str(failed)
+    assert "secret=/private/provider.sock" not in str(failed)
+
+
 def test_generate_text_empty_response_reports_provider_diagnostics():
     client = object.__new__(LLMClient)
     client.client = _FakeOpenAIClient()
@@ -675,6 +838,54 @@ def test_generate_text_stream_records_ttft_and_output_volume():
     assert finished["response_chunks"][1]["choices"][0]["delta"]["tool_calls"][0][
         "function"
     ]["arguments"] == raw_arguments
+
+
+def test_generate_text_stream_failed_span_keeps_partial_output_but_sanitizes_error() -> None:
+    client = object.__new__(LLMClient)
+    client.client = _FakeOpenAIClient()
+    client.driver = ChatCompletionsDriver(client.client)
+    client.model = "demo-model"
+    client.base_url = "https://example.test/v1"
+    client.temperature = 0.2
+    client.max_output_tokens = 256
+    events: list[tuple[str, dict]] = []
+
+    def chunk(content, finish_reason=None, *, reasoning=None):  # noqa: ANN001
+        delta = type(
+            "Delta",
+            (),
+            {
+                "content": content,
+                "reasoning_content": reasoning,
+                "tool_calls": [],
+            },
+        )()
+        choice = type("Choice", (), {"delta": delta, "finish_reason": finish_reason})()
+        return type("Chunk", (), {"id": "chunk_demo", "choices": [choice]})()
+
+    def failing_stream():
+        yield chunk("你", reasoning="先输出一半。")
+        raise RuntimeError("stream aborted secret=/private/stream.sock")
+
+    client.client.chat.completions.create = lambda **_kwargs: failing_stream()
+
+    with bind_span_sink(lambda event_type, payload: events.append((event_type, payload))):
+        with pytest.raises(LLMError):
+            list(client.generate_text_stream("system", {"hello": "world"}))
+
+    failed = next(payload for event_type, payload in events if event_type == "llm_call_failed")
+    assert failed["error"] == {
+        "code": "INTERNAL_ERROR",
+        "params": {},
+        "retryable": False,
+        "request_id": None,
+        "trace_id": None,
+    }
+    assert failed["partial_response_text"] == "你"
+    assert failed["partial_reasoning_content"] == "先输出一半。"
+    assert failed["stream_chunks"] == 1
+    assert "stream aborted" not in str(failed)
+    assert "secret=/private/stream.sock" not in str(failed)
 
 
 def test_generate_text_projects_conversation_context_messages():
@@ -1335,6 +1546,48 @@ def test_generate_json_allows_multiple_repair_attempts(monkeypatch):
     assert payloads[1]["_json_repair"]["attempt"] == 1
     assert payloads[2]["_json_repair"]["attempt"] == 2
     assert "parser_error" in payloads[2]["_json_repair"]
+
+
+def test_generate_json_sequence_accepts_consecutive_objects_without_retry(monkeypatch):
+    client = object.__new__(LLMClient)
+    payloads = []
+
+    def fake_generate_text(_system_prompt, payload, response_format=None):  # noqa: ANN001, ARG001
+        payloads.append(payload)
+        return (
+            '{"action":"tool","tool_name":"skill.first","arguments":{}}\n'
+            '{"action":"tool","tool_name":"skill.second","arguments":{}}'
+        )
+
+    monkeypatch.setattr(client, "generate_text", fake_generate_text)
+
+    assert client.generate_json_sequence("prompt", {}) == [
+        {"action": "tool", "tool_name": "skill.first", "arguments": {}},
+        {"action": "tool", "tool_name": "skill.second", "arguments": {}},
+    ]
+    assert len(payloads) == 1
+    assert "_json_repair" not in payloads[0]
+
+
+def test_generate_json_keeps_consecutive_object_recovery_opt_in(monkeypatch):
+    client = object.__new__(LLMClient)
+    payloads = []
+    calls = iter(
+        [
+            '{"decision":"answer_only"}{"decision":"start_new_task"}',
+            '{"decision":"answer_only"}',
+        ]
+    )
+
+    def fake_generate_text(_system_prompt, payload, response_format=None):  # noqa: ANN001, ARG001
+        payloads.append(payload)
+        return next(calls)
+
+    monkeypatch.setattr(client, "generate_text", fake_generate_text)
+
+    assert client.generate_json("prompt", {}) == {"decision": "answer_only"}
+    assert len(payloads) == 2
+    assert payloads[1]["_json_repair"]["attempt"] == 1
 
 
 # --- Reasoning-model length-truncation token escalation regression tests ---

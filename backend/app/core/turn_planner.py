@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from copy import deepcopy
 from typing import Any
 
@@ -12,9 +13,13 @@ from app.core.context_projection import (
     compact_pending_tasks,
 )
 from app.core.graph_rules import GraphRules
+from app.core.harness_agent import HarnessExecutionFenced
 from app.core.task_frame_store import MAX_TASK_FRAMES_PER_TURN
 from app.db.models import ChatSession, ModelConfig, Skill, new_id
+from app.i18n.language_context import LanguageContext
+from app.i18n.raw_source import RawSourceKind, RawSourceMarker
 from app.llm import LLMClient, LLMError
+from app.llm.prompts.language import language_prompt_contract
 from app.llm.stage_protocol import (
     TURN_PLANNER_OUTPUT_SCHEMA,
     stage_payload,
@@ -26,10 +31,10 @@ from app.session.session_schema import (
     PlannedTaskFrame,
     RouterDecision,
     TaskUpdate,
+    TeamPlannerContext,
     TurnPlan,
 )
 from app.session.slot_policy import strip_router_generated_message_slots
-
 
 PROMPT_PATH = (
     paths.resource_dir() / "app" / "llm" / "prompts" / "turn_planner_prompt.md"
@@ -49,7 +54,13 @@ class TurnPlanner:
         conversation_context: dict[str, object] | None = None,
         memory_context: list[dict[str, object]] | None = None,
         task_frame_state: list[dict[str, Any]] | None = None,
+        interaction_mode: str = "normal",
+        team_context: TeamPlannerContext | None = None,
+        language_context: LanguageContext | None = None,
+        admission_check: Callable[[], None] | None = None,
     ) -> TurnPlan:
+        """Plan task frames while keeping source text raw and generated fields in reply locale."""
+        # Workflow: construct one bounded planner payload with immutable language and raw markers.
         payload = stage_payload(
             phase="TurnPlanner",
             user_message=message,
@@ -57,6 +68,35 @@ class TurnPlanner:
             memory_context=memory_context,
             instructions=PROMPT_PATH.read_text(encoding="utf-8"),
             stage_data={
+                **language_prompt_contract(
+                    language_context,
+                    [
+                        RawSourceMarker(
+                            json_pointer="/user_message",
+                            kind=RawSourceKind.USER_INPUT,
+                        ),
+                        RawSourceMarker(
+                            json_pointer="/conversation_context",
+                            kind=RawSourceKind.HISTORY,
+                        ),
+                        RawSourceMarker(
+                            json_pointer="/_agent_stage/memory",
+                            kind=RawSourceKind.HISTORY,
+                        ),
+                        RawSourceMarker(
+                            json_pointer="/current_session",
+                            kind=RawSourceKind.BUSINESS_RECORD,
+                        ),
+                        RawSourceMarker(
+                            json_pointer="/available_sops",
+                            kind=RawSourceKind.BUSINESS_RECORD,
+                        ),
+                        RawSourceMarker(
+                            json_pointer="/team_context",
+                            kind=RawSourceKind.IDENTIFIER,
+                        ),
+                    ],
+                ),
                 "current_session": _session_payload(
                     session,
                     task_frame_state=task_frame_state,
@@ -66,18 +106,26 @@ class TurnPlanner:
                 # make the prompt boundary explicit so the planner cannot
                 # confuse runtime capabilities with SOP routing candidates.
                 "available_sops": [_sop_payload(skill) for skill in available_skills],
+                "interaction_mode": interaction_mode,
+                "team_context": (
+                    team_context.model_dump(mode="json") if team_context is not None else None
+                ),
             },
             output_contract=TURN_PLANNER_OUTPUT_SCHEMA,
         )
         try:
+            # Workflow: validate the provider output before normalizing it to trusted frames.
             client = LLMClient(model_config)
             with llm_operation("turn_planner.plan"):
                 plan = self._generate_validated_plan(
                     client,
                     unified_system_prompt(),
                     payload,
+                    admission_check=admission_check,
                 )
         except Exception as exc:
+            if isinstance(exc, HarnessExecutionFenced):
+                raise
             if isinstance(exc, LLMError):
                 raise
             raise LLMError(f"Turn Planner returned invalid JSON schema: {exc}") from exc
@@ -87,6 +135,8 @@ class TurnPlanner:
             session,
             available_skills,
             task_frame_state,
+            interaction_mode,
+            team_context,
         )
 
     def _generate_validated_plan(
@@ -94,6 +144,7 @@ class TurnPlanner:
         client: LLMClient,
         system_prompt: str,
         payload: dict[str, Any],
+        admission_check: Callable[[], None] | None = None,
     ) -> TurnPlan:
         base_payload = deepcopy(payload)
         next_payload = payload
@@ -104,7 +155,13 @@ class TurnPlanner:
                 schema_retry_count=attempt,
                 schema_max_attempts=max_attempts,
             ):
-                raw = client.generate_json(system_prompt, next_payload)
+                if callable(admission_check):
+                    admission_check()
+                try:
+                    raw = client.generate_json(system_prompt, next_payload)
+                finally:
+                    if callable(admission_check):
+                        admission_check()
             try:
                 return TurnPlan.model_validate(raw)
             except ValidationError as exc:
@@ -131,6 +188,8 @@ class TurnPlanner:
         session: ChatSession,
         available_skills: list[Skill],
         task_frame_state: list[dict[str, Any]] | None = None,
+        interaction_mode: str = "normal",
+        team_context: TeamPlannerContext | None = None,
     ) -> TurnPlan:
         skills = {skill.skill_id: skill for skill in available_skills}
         known_frames = _known_task_frames(session, task_frame_state)
@@ -333,6 +392,11 @@ class TurnPlanner:
                 if task_id_map.get(task_id, task_id) in valid_ids
                 and task_id_map.get(task_id, task_id) != frame.task_id
             ]
+        frames = _normalize_execution_targets(
+            frames,
+            interaction_mode=interaction_mode,
+            team_context=team_context,
+        )
 
         first = frames[0]
         if plan.decision == "complete_task":
@@ -368,6 +432,65 @@ def _compact_validation_errors(exc: ValidationError) -> list[dict[str, str]]:
             }
         )
     return compact
+
+
+def _normalize_execution_targets(
+    frames: list[PlannedTaskFrame],
+    *,
+    interaction_mode: str,
+    team_context: TeamPlannerContext | None,
+) -> list[PlannedTaskFrame]:
+    """Validate planner-selected assignees without guessing team membership."""
+    leader_id = team_context.leader_agent_id if team_context is not None else ""
+    member_ids = {
+        member.agent_id
+        for member in (team_context.members if team_context is not None else [])
+        if member.agent_id and member.agent_id != leader_id
+    }
+    for frame in frames:
+        assignee_id = str(frame.assignee_agent_id or "").strip()
+        is_valid_remote = (
+            interaction_mode == "team_tl"
+            and team_context is not None
+            and frame.kind == "conversation"
+            and frame.execution_target == "team_member"
+            and assignee_id in member_ids
+        )
+        if is_valid_remote:
+            frame.execution_target = "team_member"
+            frame.assignee_agent_id = assignee_id
+        else:
+            frame.execution_target = "self"
+            frame.assignee_agent_id = None
+            frame.activation_condition = {}
+
+    # A TeamTask can depend only on other TeamTasks published in this batch.
+    # If a model points a remote frame at a leader-local frame, keep it local
+    # rather than creating a permanently blocked task with an unresolvable ID.
+    while True:
+        remote_ids = {
+            frame.task_id
+            for frame in frames
+            if frame.execution_target == "team_member" and frame.task_id
+        }
+        changed = False
+        for frame in frames:
+            if frame.execution_target != "team_member":
+                continue
+            if any(task_id not in remote_ids for task_id in frame.depends_on_task_ids):
+                frame.execution_target = "self"
+                frame.assignee_agent_id = None
+                frame.activation_condition = {}
+                changed = True
+        if not changed:
+            break
+
+    for frame in frames:
+        if frame.execution_target != "team_member" or not frame.depends_on_task_ids:
+            frame.activation_condition = {}
+        elif not frame.activation_condition:
+            frame.activation_condition = {"type": "all_succeeded"}
+    return frames
 
 
 def turn_plan_router_decision(plan: TurnPlan) -> RouterDecision:

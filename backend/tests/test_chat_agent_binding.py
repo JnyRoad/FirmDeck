@@ -5,15 +5,15 @@ from fastapi import HTTPException
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
-from app.api import chat as chat_api
 from app.agents.branching import agent_private_metadata
+from app.api import chat as chat_api
 from app.api.chat import (
     _bind_request_to_session_agent,
     _ensure_chat_agent_available,
     _user_message_metadata,
     create_chat_session,
-    list_slash_commands,
     list_chat_sessions,
+    list_slash_commands,
 )
 from app.core.agent_loop import AgentLoop, AgentLoopPreconditionError
 from app.db.models import (
@@ -33,6 +33,7 @@ from app.db.models import (
     User,
     utc_now,
 )
+from app.i18n.language_context import LanguageContext, LocaleResolutionSource, SupportedLocale
 from app.session.session_schema import ChatSessionCreateRequest, ChatTurnRequest
 
 
@@ -67,6 +68,67 @@ def test_existing_chat_session_cannot_switch_agent() -> None:
 
         assert exc_info.value.status_code == 409
         assert db.get(ChatSession, session.id).agent_id == "agent_a"
+
+
+def test_existing_chat_session_rejects_explicit_reply_locale_mutation() -> None:
+    """Keep the session reply locale authoritative while allowing UI locale independence."""
+    with _test_session() as db:
+        db.add(Tenant(id="tenant_demo", name="Demo"))
+        current_user = User(
+            id="user_demo", tenant_id="tenant_demo", username="demo", password_hash="x"
+        )
+        db.add(current_user)
+        db.add(AgentProfile(id="agent_a", tenant_id="tenant_demo", name="客服 A", is_overall=False))
+        session = ChatSession(
+            id="session_bound",
+            tenant_id="tenant_demo",
+            user_id="user_demo",
+            agent_id="agent_a",
+            agent_reply_locale=SupportedLocale.ZH_CN.value,
+            agent_reply_locale_source="explicit_request",
+        )
+        db.add(session)
+        db.commit()
+
+        request = ChatTurnRequest(
+            tenant_id="tenant_demo",
+            session_id=session.id,
+            user_id="user_demo",
+            agent_id="agent_a",
+            message="hello",
+            ui_locale=SupportedLocale.EN_US,
+            agent_reply_locale=SupportedLocale.EN_US,
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            _bind_request_to_session_agent(db, request, session, current_user)
+
+        assert exc_info.value.status_code == 409
+        assert session.agent_reply_locale == SupportedLocale.ZH_CN.value
+        assert request.ui_locale is SupportedLocale.EN_US
+
+
+def test_user_message_metadata_carries_language_context_snapshot() -> None:
+    """Mirror the immutable locale snapshot into user-message metadata after turn binding."""
+    request = ChatTurnRequest(
+        tenant_id="tenant_demo",
+        session_id="session_demo",
+        user_id="user_demo",
+        agent_id="agent_demo",
+        message="hello",
+        ui_locale=SupportedLocale.EN_US,
+        agent_reply_locale=SupportedLocale.ZH_CN,
+    )
+    request.language_context = LanguageContext(
+        ui_locale=SupportedLocale.EN_US,
+        agent_reply_locale=SupportedLocale.ZH_CN,
+        ui_locale_source=LocaleResolutionSource.EXPLICIT_REQUEST,
+        agent_reply_locale_source=LocaleResolutionSource.EXPLICIT_REQUEST,
+    )
+
+    metadata = _user_message_metadata(request)
+
+    assert metadata["language_context"] == request.language_context.model_dump(mode="json")
 
 
 def test_chat_agent_must_be_active_non_overall_agent() -> None:
@@ -423,6 +485,92 @@ def test_session_title_summary_does_not_override_existing_title(monkeypatch) -> 
     assert row is not None
     assert row.title == "手动标题"
     assert events == []
+
+
+def test_session_title_summary_uses_bound_reply_locale_for_async_prompt(monkeypatch) -> None:
+    """后台标题生成使用会话绑定的回复语言，并保留用户消息原文作为输入。"""
+    engine = _test_engine()
+    monkeypatch.setattr(chat_api, "engine", engine)
+    captured: dict[str, object] = {}
+
+    class _FakeLLMClient:
+        """捕获后台标题请求，避免测试依赖真实模型服务。"""
+
+        def __init__(self, _model_config: object) -> None:
+            """接收已解析模型配置；测试只验证 prompt 和 payload。"""
+
+        def generate_json(self, prompt: str, payload: dict[str, object]) -> dict[str, str]:
+            """记录一次标题请求并返回合法英文标题，模拟模型的结构化响应。"""
+            captured["prompt"] = prompt
+            captured["payload"] = payload
+            return {"title": "Beijing weather"}
+
+    monkeypatch.setattr(chat_api, "LLMClient", _FakeLLMClient)
+    raw_message = "请查询北京今天的天气。"
+    with Session(engine) as db:
+        db.add(
+            ModelConfig(
+                id="model_title",
+                tenant_id="tenant_demo",
+                name="标题模型",
+                model="title-model",
+                is_default=True,
+            )
+        )
+        db.add(
+            ChatSession(
+                id="session_title_en",
+                tenant_id="tenant_demo",
+                user_id="user_demo",
+                agent_reply_locale=SupportedLocale.EN_US.value,
+                agent_reply_locale_source="explicit_request",
+            )
+        )
+        db.add(
+            Message(
+                id="msg_user_title_en",
+                tenant_id="tenant_demo",
+                session_id="session_title_en",
+                role="user",
+                content=raw_message,
+            )
+        )
+        db.commit()
+
+    chat_api._summarize_session_title_once(
+        "tenant_demo",
+        "user_demo",
+        "session_title_en",
+        None,
+        language_context=LanguageContext(
+            ui_locale=SupportedLocale.ZH_CN,
+            agent_reply_locale=SupportedLocale.EN_US,
+            ui_locale_source=LocaleResolutionSource.EXPLICIT_REQUEST,
+            agent_reply_locale_source=LocaleResolutionSource.EXPLICIT_REQUEST,
+        ),
+    )
+
+    assert "en-US" in str(captured["prompt"])
+    assert "中文" not in str(captured["prompt"])
+    payload = captured["payload"]
+    assert isinstance(payload, dict)
+    assert payload["messages"] == [{"role": "user", "content": raw_message}]
+    with Session(engine) as db:
+        event = db.exec(
+            select(AgentEvent).where(
+                AgentEvent.session_id == "session_title_en",
+                AgentEvent.event_type == chat_api.SESSION_TITLE_SUMMARY_EVENT,
+            )
+        ).first()
+    assert event is not None
+    assert event.payload_json["language_context"]["agent_reply_locale"] == "en-US"
+
+
+def test_session_title_prompt_uses_zh_cn_for_missing_locale() -> None:
+    """缺失历史 locale 时使用记录过的 zh-CN 兼容默认，而不是猜测当前界面语言。"""
+    prompt = chat_api._session_title_prompt(None)
+
+    assert "zh-CN" in prompt
 
 
 def test_scheduled_task_chat_turn_marks_user_message_metadata() -> None:

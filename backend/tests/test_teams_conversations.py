@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
@@ -25,8 +26,17 @@ from test_teams_bidding import (
 
 from app.api import chat as chat_api
 from app.api import teams as teams_api
-from app.core import AgentLoop
-from app.db.models import AgentEvent, ChatSession, Message, TeamTask, TeamWakeEvent
+from app.core import AgentLoop, harness_v2_engine
+from app.core.harness_v2_engine import HarnessV2Engine
+from app.db.models import (
+    AgentEvent,
+    AgentProfile,
+    ChatSession,
+    Message,
+    TeamTask,
+    TeamWakeEvent,
+    Tenant,
+)
 from app.session.session_schema import ChatTurnRequest, ChatTurnResponse, SessionPublic
 from app.teams import wakeup
 from app.teams.schema import TeamTLChatRequest
@@ -116,9 +126,9 @@ def test_member_task_and_tl_review_sessions_carry_team_id(monkeypatch: pytest.Mo
         wakeup.execute_wake_event(db, db.get(TeamWakeEvent, review_wake.id))
 
         sessions = db.exec(select(ChatSession).where(ChatSession.team_id == team.id)).all()
-        titles = {item.title for item in sessions}
-        assert f"团队任务:{task.title}" in titles
-        assert f"团队任务验收:{task.title}" in titles
+        session_contracts = {(item.session_kind, item.title) for item in sessions}
+        assert ("team_member_task", task.title) in session_contracts
+        assert ("team_tl_review", task.title) in session_contracts
         db.refresh(task)
         assert task.status == "done"
 
@@ -143,20 +153,22 @@ def test_bid_request_and_award_sessions_carry_team_id(monkeypatch: pytest.Monkey
         for wake in wakes:
             _run_wake(db, wake.id)
         bid_sessions = db.exec(
-            select(ChatSession).where(ChatSession.title.like("团队竞标:%"))
+            select(ChatSession).where(ChatSession.session_kind == "team_member_bid")
         ).all()
         assert len(bid_sessions) == 2
         assert all(item.team_id == team.id for item in bid_sessions)
+        assert all(item.title == task.title for item in bid_sessions)
 
         judge = _pending_wakes(db, "bid_judge")
         assert len(judge) == 1
         assert judge[0].payload_json["mode"] == "award"
         _run_wake(db, judge[0].id)
         award_sessions = db.exec(
-            select(ChatSession).where(ChatSession.title.like("团队竞标裁决:%"))
+            select(ChatSession).where(ChatSession.session_kind == "team_bid_judge")
         ).all()
         assert len(award_sessions) == 1
         assert award_sessions[0].team_id == team.id
+        assert award_sessions[0].title == task.title
 
 
 def test_bid_score_session_carries_team_id(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -181,10 +193,11 @@ def test_bid_score_session_carries_team_id(monkeypatch: pytest.MonkeyPatch) -> N
         assert judge[0].payload_json["mode"] == "score"
         _run_wake(db, judge[0].id)
         score_sessions = db.exec(
-            select(ChatSession).where(ChatSession.title.like("团队竞标打分:%"))
+            select(ChatSession).where(ChatSession.session_kind == "team_bid_score")
         ).all()
         assert len(score_sessions) == 1
         assert score_sessions[0].team_id == team.id
+        assert score_sessions[0].title == task.title
 
 
 # ---------- 团队会话列表端点 ----------
@@ -574,12 +587,148 @@ def test_chat_turn_allows_tenant_member_on_team_session(monkeypatch: pytest.Monk
         assert exc_info.value.status_code == 404
 
 
+def test_team_and_private_sessions_drive_trusted_knowledge_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """团队群聊传入团队范围，员工私聊明确传入空团队范围。"""
+    observed_contexts: list[tuple[str, str | None]] = []
+
+    class RecordingKnowledgeAccessService:
+        """记录 Harness 从服务端会话解析出的知识范围。"""
+
+        def __init__(self, db: Session) -> None:
+            """保留数据库会话，模拟真实访问服务的构造契约。"""
+            self.db = db
+
+        def resolve_projections(
+            self,
+            *,
+            tenant_id: str,
+            agent_id: str,
+            team_id: str | None,
+        ) -> list[SimpleNamespace]:
+            """按收到的可信团队标识返回可辨识的冻结版本。"""
+            assert tenant_id == "tenant_demo"
+            observed_contexts.append((agent_id, team_id))
+            suffix = "shared" if team_id else "private"
+            return [
+                SimpleNamespace(
+                    knowledge_base_id=f"kb_{suffix}",
+                    knowledge_base_version_id=f"version_{suffix}",
+                )
+            ]
+
+    monkeypatch.setattr(
+        harness_v2_engine,
+        "KnowledgeAccessService",
+        RecordingKnowledgeAccessService,
+    )
+
+    with _test_session() as db:
+        team = _seed_team(db)
+        team_id = team.id
+        team_session = _make_session(
+            db,
+            session_id="sess_team_knowledge_scope",
+            team_id=team.id,
+            agent_id="agent_tl",
+            title=f"团队 {team.name} · TL 对话",
+            created_at=datetime(2026, 1, 1, tzinfo=UTC),
+        )
+        private_session = _make_session(
+            db,
+            session_id="sess_private_knowledge_scope",
+            team_id=None,
+            agent_id="agent_tl",
+            title="员工私聊",
+            created_at=datetime(2026, 1, 1, tzinfo=UTC),
+        )
+        db.commit()
+
+        engine = object.__new__(HarnessV2Engine)
+        engine.db = db
+
+        assert engine._freeze_turn_knowledge_versions(
+            "tenant_demo", team_session
+        ) == {"kb_shared": "version_shared"}
+        assert engine._freeze_turn_knowledge_versions(
+            "tenant_demo", private_session
+        ) == {"kb_private": "version_private"}
+
+    assert observed_contexts == [
+        ("agent_tl", team_id),
+        ("agent_tl", None),
+    ]
+
+
+def test_wakeup_turn_rejects_a_session_owned_by_another_team(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """唤醒入口必须核对事件团队与持久化会话团队，不能跨团队复用。"""
+    observed_requests: list[ChatTurnRequest] = []
+
+    def fake_stream(self, request):
+        """记录越权请求；修复后该函数不应被调用。"""
+        observed_requests.append(request)
+        yield {
+            "event": "complete",
+            "data": ChatTurnResponse(
+                reply="不应执行",
+                session_id=str(request.session_id),
+                session_state=SessionPublic(
+                    session_id=str(request.session_id),
+                    tenant_id=request.tenant_id,
+                ),
+            ).model_dump(mode="json"),
+        }
+
+    monkeypatch.setattr(AgentLoop, "handle_turn_stream", fake_stream)
+
+    with _test_session() as db:
+        team_a = _seed_team(db)
+        team_b = create_team(
+            db,
+            tenant_id="tenant_demo",
+            name="共享执行团队B",
+            description=None,
+            owner_user_id="user_admin",
+        )
+        add_member(db, team_b, agent_id="agent_tl", role="leader")
+        session_a = _make_session(
+            db,
+            session_id="sess_wrong_wakeup_team",
+            team_id=team_a.id,
+            agent_id="agent_tl",
+            title=f"团队 {team_a.name} · TL 对话",
+            created_at=datetime(2026, 1, 1, tzinfo=UTC),
+        )
+        db.commit()
+        leader = db.get(AgentProfile, "agent_tl")
+        assert leader is not None
+
+        with pytest.raises(RuntimeError, match="不属于当前团队"):
+            wakeup.run_agent_turn(
+                db,
+                team=team_b,
+                agent=leader,
+                session_id=session_a.id,
+                wake_event_id="wake-cross-team",
+                message="执行团队唤醒",
+                interaction_mode="team_tl",
+            )
+
+    assert observed_requests == []
+
+
 # ---------- 团队会话写入权限与共享 TL 隔离 ----------
 
 
-def test_chat_turn_and_stream_reject_non_tl_team_sessions() -> None:
+def test_chat_turn_and_stream_reject_non_tl_team_sessions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """任务执行/竞标/验收会话仅可查看:人工 /turn、/stream 一律 403,TL 对话不受影响。"""
     with _test_session() as db:
+        monkeypatch.setattr(chat_api, "engine", db.get_bind())
         team = _seed_team(db)
         base = datetime(2026, 1, 1, 12, 0, 0)
         sessions = [
@@ -623,6 +772,38 @@ def test_chat_turn_and_stream_reject_non_tl_team_sessions() -> None:
                     db,
                 )
             assert exc_info.value.status_code == 403
+
+
+def test_chat_stream_initial_lifecycle_gate_uses_fresh_tenant_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cached active Tenant must not admit a stream after another session suspends it."""
+    with _test_session() as stale_db:
+        monkeypatch.setattr(chat_api, "engine", stale_db.get_bind())
+        stale_db.add(Tenant(id="tenant_demo", name="Demo"))
+        stale_db.commit()
+        stale_tenant = stale_db.get(Tenant, "tenant_demo")
+        assert stale_tenant is not None
+        assert stale_tenant.status == "active"
+
+        with Session(stale_db.get_bind()) as control_db:
+            tenant = control_db.get(Tenant, "tenant_demo")
+            assert tenant is not None
+            tenant.status = "suspended"
+            tenant.lifecycle_version += 1
+            control_db.add(tenant)
+            control_db.commit()
+
+        # The request-scoped identity map is intentionally stale here. The admission helper
+        # must create its own Session and observe the authoritative suspended state.
+        assert stale_db.get(Tenant, "tenant_demo") is stale_tenant
+        assert stale_tenant.status == "active"
+        with pytest.raises(HTTPException) as exc_info:
+            chat_api._require_chat_stream_lifecycle(
+                "tenant_demo",
+                "chat-stream:user_member",
+            )
+        assert exc_info.value.status_code == 403
 
 
 def test_tl_chat_rejects_session_from_other_team_with_shared_tl() -> None:

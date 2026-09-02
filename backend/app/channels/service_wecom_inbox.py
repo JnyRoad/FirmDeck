@@ -8,7 +8,11 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlmodel import Session, select
 
 from app.channels.adapters.base import ChannelInbound, ChannelInboundAttachment
-from app.channels.service_durable_inbox import StageDisposition, StageResult
+from app.channels.service_durable_inbox import (
+    StageDisposition,
+    StageResult,
+    channel_ingress_language_context,
+)
 from app.db.models import ChannelBinding, ChannelInboundEvent, new_id
 
 WECOM_ENVELOPE_VERSION = 1
@@ -91,10 +95,50 @@ def stage_wecom_inbound(
                     StageDisposition.SECURITY_DROP,
                     error_code="binding_fence_mismatch",
                 )
+            from app.channels.service_intake import (
+                admit_channel_lifecycle,
+                channel_lifecycle_error_code,
+                finalize_channel_staging_fence,
+            )
+            from app.security.tenant import TenantLifecycleDenied
+
+            try:
+                lifecycle = admit_channel_lifecycle(
+                    db,
+                    tenant_id=binding.tenant_id,
+                    correlation_id=inbound.event_id,
+                )
+            except TenantLifecycleDenied as exc:
+                return StageResult(
+                    StageDisposition.SECURITY_DROP,
+                    error_code=channel_lifecycle_error_code(exc),
+                )
             target = {
                 "to_user_id": inbound.conv_key if inbound.is_group else inbound.from_user_id,
                 "context_token": inbound.context_token,
             }
+            if inbound.is_group:
+                target.update(
+                    {
+                        "reply_to_user_id": inbound.from_user_id,
+                        "is_group": True,
+                        "reply_quote": {
+                            "sender_name": inbound.sender_name or inbound.from_user_id,
+                            "text": inbound.text,
+                        },
+                    }
+                )
+            fence_error = finalize_channel_staging_fence(
+                db,
+                binding,
+                expected_channel="wecom",
+                expected_revision=expected_revision,
+                lifecycle_version=lifecycle.lifecycle_version,
+                correlation_id=inbound.event_id,
+            )
+            if fence_error:
+                db.rollback()
+                return StageResult(StageDisposition.SECURITY_DROP, error_code=fence_error)
             event = ChannelInboundEvent(
                 id=new_id("chevt"),
                 tenant_id=binding.tenant_id,
@@ -105,6 +149,10 @@ def stage_wecom_inbound(
                 config_revision=expected_revision,
                 target_json=target,
                 status="received",
+                tenant_lifecycle_version=lifecycle.lifecycle_version,
+                language_context_json=channel_ingress_language_context(binding).model_dump(
+                    mode="json"
+                ),
             )
             db.add(event)
             try:

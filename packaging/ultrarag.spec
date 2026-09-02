@@ -1,5 +1,6 @@
 # packaging/ultrarag.spec
 # 运行：cd backend && pyinstaller ../packaging/ultrarag.spec --noconfirm
+import json
 import os
 import re
 import sys
@@ -7,6 +8,10 @@ from pathlib import Path
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules, copy_metadata
 
 BACKEND = Path.cwd()                      # 约定在 backend/ 下执行
+sys.path.insert(0, str(BACKEND))
+
+from app.distribution import resolve_build_release_repository, write_distribution_metadata  # noqa: E402
+
 REPO = BACKEND.parent
 DIST = REPO / "frontend-enterprise" / "dist"
 ASSETS = REPO / "packaging" / "assets"
@@ -14,7 +19,16 @@ ICNS = ASSETS / "staffdeck.icns"
 ICO = ASSETS / "staffdeck.ico"
 assert DIST.exists(), "先构建前端：npm --prefix frontend-enterprise run build"
 
-RAW_VERSION = os.environ.get("VERSION", "0.1.0").strip() or "0.1.0"
+DEFAULT_VERSION_FILE = BACKEND / "VERSION"
+PACKAGE_VERSION_FILE = REPO / "frontend-enterprise" / "package.json"
+DEFAULT_VERSION = (
+    DEFAULT_VERSION_FILE.read_text(encoding="utf-8").strip()
+    if DEFAULT_VERSION_FILE.exists()
+    else json.loads(PACKAGE_VERSION_FILE.read_text(encoding="utf-8"))["version"]
+    if PACKAGE_VERSION_FILE.exists()
+    else "0.0.0-dev"
+)
+RAW_VERSION = os.environ.get("VERSION", DEFAULT_VERSION).strip() or DEFAULT_VERSION
 if not re.fullmatch(
     r"[vV]?\d+(?:\.\d+)*(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
     r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?",
@@ -26,6 +40,12 @@ VERSION_FILE = REPO / "packaging" / "build" / "staffdeck-version.txt"
 VERSION_FILE.parent.mkdir(parents=True, exist_ok=True)
 VERSION_FILE.write_text(BUNDLE_VERSION + "\n", encoding="utf-8")
 
+DISTRIBUTION_REPOSITORY = resolve_build_release_repository(REPO)
+DISTRIBUTION_METADATA_FILE = (
+    REPO / "packaging" / "build" / "staffdeck-distribution.json"
+)
+write_distribution_metadata(DISTRIBUTION_METADATA_FILE, DISTRIBUTION_REPOSITORY)
+
 # 平台图标：macOS 用 .icns，Windows 用 .ico，Linux(EXE) 不用
 _exe_icon = None
 if sys.platform == "win32" and ICO.exists():
@@ -34,16 +54,18 @@ if sys.platform == "win32" and ICO.exists():
 datas = [
     (str(DIST), "frontend-enterprise/dist"),
     (str(VERSION_FILE), "."),
+    (str(DISTRIBUTION_METADATA_FILE), "."),
     (str(ASSETS / "staffdeck.png"), "packaging/assets"),
     (str(BACKEND / "app" / "llm" / "prompts"), "app/llm/prompts"),
     (str(BACKEND / "app" / "db" / "seed_fixtures"), "app/db/seed_fixtures"),
     (str(BACKEND / "mock_servers"), "mock_servers"),
-] + collect_data_files("tzdata") + copy_metadata("lark-channel-sdk")
+] + collect_data_files("tzdata") + copy_metadata("lark-channel-sdk") + copy_metadata("mcp")
 
 hiddenimports = (
     collect_submodules("uvicorn")
     + collect_submodules("sqlmodel")
     + collect_submodules("lark_channel")
+    + collect_submodules("mcp")
     + collect_submodules("app")
     + [
         # 顶层单文件模块：uvicorn 用字符串 "single_port_app:app" 运行时动态 import

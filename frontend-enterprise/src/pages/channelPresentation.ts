@@ -16,6 +16,13 @@ const BUILT_IN_CHANNELS: Record<string, ChannelPresentation> = {
     blurb: '扫码接入，微信用户直接与数字员工对话。',
     disconnectDescription: '断开后微信接入将离线，需要重新扫码才能恢复；对话记录保留。确定断开接入吗？',
   },
+  wechat_kf: {
+    name: '微信客服',
+    identifierLabel: '客服账号 ID',
+    userLabel: '微信客服用户',
+    blurb: '配置微信客服回调、账号与咨询链接。',
+    disconnectDescription: '断开后微信客服接入将停止服务，需要重新配置才能恢复；对话记录保留。确定断开接入吗？',
+  },
   wecom: {
     name: '企业微信',
     identifierLabel: '机器人 ID',

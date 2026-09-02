@@ -4,6 +4,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from app.db.models import ChannelBinding, ChatSession, User, new_id, utc_now
+from app.session.session_kinds import SESSION_KIND_TEAM_TL
 
 _CHANNEL_TITLE_LIMIT = 20
 
@@ -32,11 +33,22 @@ def migrate_binding_session_account_key(
 
 def adopt_orphan_channel_sessions(db: Session, binding: ChannelBinding) -> int:
     """仅按稳定外部账号键认领孤儿会话;无法确定归属的 legacy 会话保持孤立。"""
-    from app.channels.service_routing import mounted_agents
+    from app.db.models import ChannelBindingAgent
 
     if not binding.external_account_key:
         return 0
-    agent_ids = [mount.agent_id for mount in mounted_agents(db, binding)]
+    # 认领按挂载表原始行取 agent 集,不过滤已删除员工的孤儿挂载:
+    # 历史会话的 agent 可能已删除,但会话归属仍应迁移到新绑定,
+    # 后续路由由 mounted_agents 的过滤 + 指针重置兜底。
+    # 无挂载行(存量 v1 绑定)回退为 [binding.agent_id],与挂载集语义一致。
+    agent_ids = [
+        row.agent_id
+        for row in db.exec(
+            select(ChannelBindingAgent).where(
+                ChannelBindingAgent.binding_id == binding.id
+            )
+        ).all()
+    ] or [binding.agent_id]
     alive_binding_ids = set(
         db.exec(
             select(ChannelBinding.id).where(ChannelBinding.tenant_id == binding.tenant_id)
@@ -89,8 +101,8 @@ def find_or_create_channel_session(
 ) -> ChatSession:
     """按 (agent_id, channel, external_conv_id) 锚定渠道会话，无则创建。
 
-    团队绑定传 team_id/team_title:创建时落 team_id 并以「团队 X · TL 对话」为题,
-    命中 api/chat 的 TL 会话三条件识别;TL 换帅后按新 agent_id 锚定自然另起会话。
+    团队绑定传 team_id/team_title:创建时落稳定机器类型，team_title 仅保留
+    原始团队名;TL 换帅后按新 agent_id 锚定自然另起会话。
     """
     chat_session = find_channel_session(db, binding, agent_id, external_conv_id)
     if chat_session:
@@ -124,6 +136,7 @@ def find_or_create_channel_session(
         channel_binding_id=binding.id,
         channel_account_key=binding.external_account_key,
         team_id=team_id,
+        session_kind=SESSION_KIND_TEAM_TL if team_id else None,
     )
     db.add(chat_session)
     try:

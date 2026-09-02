@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import importlib
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 
 import pytest
 from fastapi import HTTPException
 from sqlalchemy import text
 from sqlmodel import Session, SQLModel, create_engine, select
 
+import app.api.model_configs as model_configs_module
 from app.api.model_configs import (
     create_model_config,
     delete_model_config,
@@ -113,7 +116,7 @@ def test_failed_verified_create_does_not_leave_disabled_model(tmp_path, monkeypa
 
         assert exc_info.value.status_code == 502
         assert exc_info.value.detail["code"] == "MODEL_CONNECTION_FAILED"
-        assert exc_info.value.detail["message"] == "Connection error"
+        assert "Connection error" not in repr(exc_info.value.detail)
         assert db.exec(select(ModelConfig)).all() == []
 
 
@@ -153,10 +156,11 @@ def test_model_test_returns_structured_provider_diagnostics(tmp_path, monkeypatc
         assert result.success is False
         assert result.message == "MODEL_UPSTREAM_ERROR"
         assert result.error is not None
-        assert result.error.upstream_status == 422
-        assert result.error.provider_code == "invalid_model"
-        assert result.error.provider_message == "model does not exist"
-        assert result.error.upstream_body == '{"error":{"code":"invalid_model"}}'
+        assert result.error.params == {}
+        assert result.error.upstream_status is None
+        assert result.error.provider_code is None
+        assert result.error.provider_message is None
+        assert result.error.upstream_body is None
         assert result.error.request_id == "req_123"
 
 
@@ -199,6 +203,192 @@ def test_openai_responses_model_config_can_be_created(tmp_path) -> None:
         assert created.api_protocol == "openai_responses"
         assert created.protocol_options == {}
         assert created.enabled is False
+
+
+def test_subscription_model_config_can_be_created_without_an_api_key(tmp_path) -> None:
+    with _db(tmp_path) as db:
+        try:
+            created = create_model_config(
+                ModelConfigCreateRequest(
+                    tenant_id="tenant_a",
+                    name="Codex subscription",
+                    auth_mode="chatgpt_subscription",
+                    model="gpt-5.1-codex",
+                ),
+                db=db,
+                current_user=_admin(),
+            )
+        except HTTPException as exc:
+            pytest.fail(f"subscription model should not require an API key: {exc.detail}")
+
+        assert created.auth_mode == "chatgpt_subscription"
+        assert created.api_protocol == "codex_app_server"
+        assert created.api_key_masked == ""
+        stored = db.get(ModelConfig, created.id)
+        assert stored is not None
+        assert stored.api_key_encrypted == ""
+
+
+def test_switching_to_subscription_clears_direct_model_credentials(tmp_path) -> None:
+    with _db(tmp_path) as db:
+        db.add(
+            ModelConfig(
+                id="direct_model",
+                tenant_id="tenant_a",
+                name="Direct model",
+                api_protocol="openai_responses",
+                base_url="https://example.invalid/v1",
+                api_key_encrypted=encrypt_secret("direct-secret"),
+                model="gpt-direct",
+                extra_body_json={"vendor": "value"},
+                protocol_options_json={"openai_responses": {}},
+            )
+        )
+        db.commit()
+
+        updated = update_model_config(
+            "direct_model",
+            ModelConfigUpdateRequest(
+                tenant_id="tenant_a",
+                auth_mode="chatgpt_subscription",
+                model="gpt-5.1-codex",
+            ),
+            db=db,
+            current_user=_admin(),
+        )
+
+        assert updated.auth_mode == "chatgpt_subscription"
+        assert updated.api_protocol == "codex_app_server"
+        assert updated.base_url is None
+        stored = db.get(ModelConfig, "direct_model")
+        assert stored is not None
+        assert stored.api_key_encrypted == ""
+        assert stored.extra_body_json == {}
+        assert stored.protocol_options_json == {}
+
+
+@dataclass
+class _SubscriptionAccount:
+    status: str
+    plan_type: str | None
+    message: str
+
+    def to_dict(self) -> dict[str, str | None]:
+        return {
+            "status": self.status,
+            "plan_type": self.plan_type,
+            "message": self.message,
+        }
+
+
+class _SubscriptionRuntime:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def account_status(self) -> _SubscriptionAccount:
+        self.calls.append("status")
+        return _SubscriptionAccount("connected", "plus", "已连接 ChatGPT 订阅")
+
+    def start_login(self) -> _SubscriptionAccount:
+        self.calls.append("login")
+        return _SubscriptionAccount("pending", None, "请在浏览器中完成 ChatGPT 授权。")
+
+    def cancel_login(self) -> _SubscriptionAccount:
+        self.calls.append("cancel")
+        return _SubscriptionAccount("requires_login", None, "尚未连接 ChatGPT 订阅")
+
+    def logout(self) -> _SubscriptionAccount:
+        self.calls.append("logout")
+        return _SubscriptionAccount("requires_login", None, "尚未连接 ChatGPT 订阅")
+
+
+def test_subscription_account_routes_return_only_safe_status(monkeypatch) -> None:
+    required = (
+        "get_codex_subscription_account",
+        "start_codex_subscription_login",
+        "cancel_codex_subscription_login",
+        "logout_codex_subscription",
+    )
+    if any(not hasattr(model_configs_module, name) for name in required):
+        pytest.fail("model configuration API must expose subscription account controls")
+
+    runtime = _SubscriptionRuntime()
+    monkeypatch.setattr(model_configs_module, "get_codex_subscription_service", lambda: runtime)
+
+    connected = model_configs_module.get_codex_subscription_account("tenant_a", _admin())
+    pending = model_configs_module.start_codex_subscription_login("tenant_a", _admin())
+    cancelled = model_configs_module.cancel_codex_subscription_login("tenant_a", _admin())
+    logged_out = model_configs_module.logout_codex_subscription("tenant_a", _admin())
+
+    assert connected.status == "connected"
+    assert connected.plan_type == "plus"
+    assert pending.status == "pending"
+    assert cancelled.status == "requires_login"
+    assert logged_out.status == "requires_login"
+    assert runtime.calls == ["status", "login", "cancel", "logout"]
+    assert "authUrl" not in str(connected.model_dump())
+    assert "secret" not in str(pending.model_dump())
+
+
+def test_subscription_account_routes_map_runtime_browser_errors_without_upstream_detail(monkeypatch) -> None:
+    subscription_module = importlib.import_module("app.codex_subscription")
+
+    class _UnavailableBrowserRuntime:
+        def start_login(self) -> _SubscriptionAccount:
+            raise subscription_module.CodexSubscriptionError(
+                "MODEL_SUBSCRIPTION_BROWSER_UNAVAILABLE"
+            )
+
+    monkeypatch.setattr(
+        model_configs_module,
+        "get_codex_subscription_service",
+        lambda: _UnavailableBrowserRuntime(),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        model_configs_module.start_codex_subscription_login("tenant_a", _admin())
+
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.detail["code"] == "MODEL_SUBSCRIPTION_BROWSER_UNAVAILABLE"
+    assert "token" not in str(exc_info.value.detail).lower()
+
+
+@pytest.mark.parametrize(
+    ("code", "status_code"),
+    [
+        ("MODEL_SUBSCRIPTION_RUNTIME_UNAVAILABLE", 503),
+        ("MODEL_SUBSCRIPTION_RUNTIME_TIMEOUT", 504),
+        ("MODEL_SUBSCRIPTION_RUNTIME_PROTOCOL_ERROR", 502),
+        ("MODEL_SUBSCRIPTION_RUNTIME_FAILED", 502),
+    ],
+)
+def test_subscription_runtime_errors_use_safe_http_statuses(
+    monkeypatch,
+    code: str,
+    status_code: int,
+) -> None:
+    """运行时启动登录失败时仅返回稳定状态码和安全错误码。"""
+    subscription_module = importlib.import_module("app.codex_subscription")
+
+    class _FailingRuntime:
+        """模拟返回错误码但不泄漏底层进程输出的本机运行时。"""
+
+        def start_login(self) -> _SubscriptionAccount:
+            """抛出本用例指定的安全运行时错误。"""
+            raise subscription_module.CodexSubscriptionError(code)
+
+    monkeypatch.setattr(
+        model_configs_module,
+        "get_codex_subscription_service",
+        lambda: _FailingRuntime(),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        model_configs_module.start_codex_subscription_login("tenant_a", _admin())
+
+    assert exc_info.value.status_code == status_code
+    assert exc_info.value.detail["code"] == code
+    assert "traceback" not in str(exc_info.value.detail).lower()
 
 
 def test_chat_extra_body_is_not_validated_as_protocol_options(tmp_path) -> None:
@@ -249,7 +439,7 @@ def test_non_chat_protocol_rejects_extra_body_with_distinct_error(tmp_path) -> N
                 current_user=_admin(),
             )
 
-        assert exc_info.value.detail == "MODEL_EXTRA_BODY_UNSUPPORTED"
+        assert exc_info.value.detail["code"] == "MODEL_EXTRA_BODY_UNSUPPORTED"
 
 
 def test_model_config_delete_removes_agent_bindings(tmp_path) -> None:
@@ -314,6 +504,42 @@ def test_security_change_invalidates_and_disables_legacy_config(tmp_path) -> Non
         assert updated.is_default is False
         assert updated.trust_status == "unverified"
         assert updated.security_revision == 2
+
+
+def test_update_rejects_endpoint_or_protocol_change_without_a_new_api_key(tmp_path) -> None:
+    with _db(tmp_path) as db:
+        original_secret = encrypt_secret("old-secret")
+        db.add(
+            ModelConfig(
+                id="model_a",
+                tenant_id="tenant_a",
+                name="Chat",
+                api_protocol="openai_chat_completions",
+                base_url="https://old-provider.example/v1",
+                api_key_encrypted=original_secret,
+                model="model-a",
+            )
+        )
+        db.commit()
+
+        with pytest.raises(HTTPException) as exc_info:
+            update_model_config(
+                "model_a",
+                ModelConfigUpdateRequest(
+                    tenant_id="tenant_a",
+                    base_url="https://new-provider.example/v1",
+                ),
+                db=db,
+                current_user=_admin(),
+            )
+
+        assert exc_info.value.status_code == 422
+        assert exc_info.value.detail["code"] == "MODEL_API_KEY_REQUIRED"
+        db.expire_all()
+        stored = db.get(ModelConfig, "model_a")
+        assert stored is not None
+        assert stored.base_url == "https://old-provider.example/v1"
+        assert stored.api_key_encrypted == original_secret
 
 
 def test_failed_verified_update_preserves_existing_model(tmp_path, monkeypatch) -> None:
@@ -412,7 +638,7 @@ def test_unverified_config_cannot_become_default(tmp_path) -> None:
             set_default_model_config("model_a", tenant_id="tenant_a", db=db)
         except HTTPException as exc:
             assert exc.status_code == 409
-            assert exc.detail == "MODEL_CONFIG_VERIFICATION_REQUIRED"
+            assert exc.detail["code"] == "MODEL_CONFIG_VERIFICATION_REQUIRED"
         else:
             raise AssertionError("unverified config unexpectedly became default")
 
@@ -476,7 +702,7 @@ def test_read_returns_only_current_protocol_options(tmp_path) -> None:
     assert model_config_read(row).protocol_options == {"thinking": {"type": "disabled"}}
 
 
-def test_verification_runs_bounded_text_stream_and_json_probes(tmp_path, monkeypatch) -> None:
+def test_verification_runs_one_bounded_connectivity_probe(tmp_path, monkeypatch) -> None:
     calls = []
 
     class FakeClient:
@@ -486,14 +712,6 @@ def test_verification_runs_bounded_text_stream_and_json_probes(tmp_path, monkeyp
         def generate_text(self, _prompt, _payload):  # noqa: ANN001
             calls.append(("text",))
             return "ok"
-
-        def generate_text_stream(self, _prompt, _payload):  # noqa: ANN001
-            calls.append(("stream",))
-            yield "ok"
-
-        def generate_json(self, _prompt, _payload):  # noqa: ANN001
-            calls.append(("json",))
-            return {"ok": True}
 
     monkeypatch.setattr("app.api.model_configs.LLMClient", FakeClient)
     with _db(tmp_path) as db:
@@ -514,15 +732,62 @@ def test_verification_runs_bounded_text_stream_and_json_probes(tmp_path, monkeyp
         result = run_model_config_test("model_a", tenant_id="tenant_a", db=db)
 
         assert result.success is True
-        assert [item.id for item in result.capabilities] == ["text", "stream", "json"]
+        assert [item.id for item in result.capabilities] == ["text"]
         assert calls == [
             ("init", 64, 25.0),
             ("text",),
-            ("init", 64, 25.0),
-            ("stream",),
-            ("init", 64, 35.0),
-            ("json",),
         ]
+
+
+def test_subscription_verification_uses_the_codex_app_server_protocol(tmp_path, monkeypatch) -> None:
+    """订阅模型也只跑一次连通性探针，并保留本机 runtime 协议。"""
+    observed_protocols: list[str] = []
+
+    class FakeClient:
+        """模拟执行成功的 LLM 客户端，并记录每个验证探针收到的协议。"""
+
+        def __init__(self, config) -> None:  # noqa: ANN001
+            """保存配置协议，供断言验证调用链没有改写订阅模型。"""
+            observed_protocols.append(config.api_protocol.value)
+
+        def generate_text(self, _prompt, _payload):  # noqa: ANN001
+            """模拟文本探针的成功响应。"""
+            return "ok"
+
+        def generate_text_stream(self, _prompt, _payload):  # noqa: ANN001
+            """模拟流式探针的成功响应。"""
+            yield "ok"
+
+        def generate_json(self, _prompt, _payload):  # noqa: ANN001
+            """模拟 JSON 探针的成功响应。"""
+            return {"ok": True}
+
+    monkeypatch.setattr("app.api.model_configs.LLMClient", FakeClient)
+    with _db(tmp_path) as db:
+        db.add(
+            ModelConfig(
+                id="subscription_model",
+                tenant_id="tenant_a",
+                name="Subscription",
+                api_key_encrypted="",
+                auth_mode="chatgpt_subscription",
+                api_protocol="codex_app_server",
+                model="gpt-5.1-codex",
+                max_output_tokens=64,
+                trust_status="unverified",
+                enabled=False,
+            )
+        )
+        db.commit()
+
+        result = run_model_config_test(
+            "subscription_model",
+            tenant_id="tenant_a",
+            db=db,
+        )
+
+    assert result.success is True
+    assert observed_protocols == ["codex_app_server"]
 
 
 def test_initial_verification_can_atomically_activate_first_model(tmp_path, monkeypatch) -> None:

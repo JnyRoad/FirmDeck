@@ -6,18 +6,28 @@ from io import BytesIO
 
 import pytest
 from docx import Document
+from fastapi import HTTPException
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from app.agents.branching import ensure_open_gallery_binding
 from app.api.knowledge import (
     confirm_discovery as confirm_discovery_api,
+)
+from app.api.knowledge import (
+    document_read,
+    job_read,
     list_documents,
     search_knowledge,
     update_chunk,
     update_document,
 )
-from app.api.knowledge_bases import knowledge_base_read
+from app.api.knowledge_bases import (
+    _knowledge_http_error,
+    knowledge_base_read,
+    upsert_okf_concept,
+)
+from app.contracts.error_registry import ERROR_REGISTRY, ErrorVisibility
 from app.db.models import (
     AgentProfile,
     KnowledgeBase,
@@ -35,9 +45,16 @@ from app.db.models import (
     User,
     utc_now,
 )
-from app.knowledge.schema import KnowledgeChunkUpdateRequest, KnowledgeDocumentUpdateRequest, KnowledgeSearchRequest, KnowledgeSearchResponse
+from app.knowledge.errors import KNOWLEDGE_MODE_INVALID, KnowledgeError
 from app.knowledge.okf import search_concepts
 from app.knowledge.parser import extract_text
+from app.knowledge.schema import (
+    KnowledgeChunkUpdateRequest,
+    KnowledgeConceptUpdateRequest,
+    KnowledgeDocumentUpdateRequest,
+    KnowledgeSearchRequest,
+    KnowledgeSearchResponse,
+)
 from app.knowledge.service import (
     IngestPayload,
     KnowledgeDiscoveryConflictError,
@@ -170,6 +187,50 @@ def test_knowledge_ingest_creates_document_buckets_and_chunks_without_auto_disco
         assert response.evidence_pack[0]["excerpt"]
         assert response.chunks
         assert db.exec(select(KnowledgeDiscoverySuggestion)).all() == []
+
+
+def test_authorized_search_without_agent_keeps_only_server_authorized_versions() -> None:
+    """无员工身份的内部检索也必须受服务端冻结版本映射约束，不能扩大到整租户。"""
+    with _test_session() as db:
+        db.add(Tenant(id="tenant_demo", name="Demo"))
+        for base_id, version_id in (
+            ("kb_allowed", "kbver_allowed"),
+            ("kb_denied", "kbver_denied"),
+        ):
+            db.add(
+                KnowledgeBase(
+                    id=base_id,
+                    tenant_id="tenant_demo",
+                    name=base_id,
+                    mode="shared",
+                    published_version_id=version_id,
+                )
+            )
+            db.add(
+                KnowledgeBaseVersion(
+                    id=version_id,
+                    tenant_id="tenant_demo",
+                    knowledge_base_id=base_id,
+                    version="1.0.0",
+                    name=base_id,
+                    publication_state="released",
+                )
+            )
+        db.commit()
+
+        request = KnowledgeSearchRequest(
+            tenant_id="tenant_demo",
+            query="制度",
+            knowledge_base_ids=["kb_allowed", "kb_denied"],
+        )
+        scoped = KnowledgeService(db)._authorized_search_request(  # noqa: SLF001
+            request,
+            trusted_team_id=None,
+            authorized_knowledge_versions={"kb_allowed": "kbver_allowed"},
+        )
+
+    assert scoped.knowledge_base_ids == ["kb_allowed"]
+    assert scoped.knowledge_base_version_ids == ["kbver_allowed"]
 
 
 def test_related_chunk_expansion_returns_all_siblings_in_source_order() -> None:
@@ -341,7 +402,7 @@ def test_knowledge_ingest_cancel_queued_job_clears_embedded_content() -> None:
         assert cancelled.status == "cancelled"
         assert cancelled.stage == "cancelled"
         assert cancelled.finished_at is not None
-        assert cancelled.metadata_json["stage_label"] == "已取消"
+        assert cancelled.metadata_json["stage_detail"] == {"code": "cancelled", "params": {}}
         assert "content_base64" not in cancelled.metadata_json
 
 
@@ -476,7 +537,7 @@ def test_knowledge_ingest_stale_cancel_request_finalizes_without_worker() -> Non
         assert finalized.status == "cancelled"
         assert finalized.stage == "cancelled"
         assert finalized.document_id is None
-        assert finalized.metadata_json["stage_label"] == "已取消"
+        assert finalized.metadata_json["stage_detail"] == {"code": "cancelled", "params": {}}
         assert "content_base64" not in finalized.metadata_json
         assert db.get(KnowledgeDocument, document.id) is None
 
@@ -1367,7 +1428,9 @@ def test_confirm_discovery_api_returns_422_for_invalid_skill() -> None:
             confirm_discovery_api(suggestion.id, "tenant_demo", db, user)
 
         assert getattr(exc_info.value, "status_code", None) == 422
-        assert "StaffDeck SkillCard" in str(getattr(exc_info.value, "detail", ""))
+        assert getattr(exc_info.value, "detail", {}).get("code") == (
+            "KNOWLEDGE_DISCOVERY_VALIDATION_FAILED"
+        )
 
 
 def test_confirm_discovery_api_returns_409_for_non_pending_status() -> None:
@@ -1397,7 +1460,9 @@ def test_confirm_discovery_api_returns_409_for_non_pending_status() -> None:
             confirm_discovery_api(suggestion.id, "tenant_demo", db, user)
 
         assert getattr(exc_info.value, "status_code", None) == 409
-        assert "只有待处理建议可以确认" in str(getattr(exc_info.value, "detail", ""))
+        assert getattr(exc_info.value, "detail", {}).get("code") == (
+            "KNOWLEDGE_DISCOVERY_CONFLICT"
+        )
 
 
 def test_confirm_discovery_rejects_noncanonical_skill_graph() -> None:
@@ -1703,6 +1768,175 @@ def test_discovery_only_marks_valid_skill_as_pending(monkeypatch: pytest.MonkeyP
         stored_skill = valid_row.payload_json["draft_skill"]
         assert stored_skill["nodes"][0]["node_id"] == "collect"
         assert stored_skill["nodes"][0]["expected_user_info"] == []
+
+
+def test_legacy_document_and_okf_writes_cannot_mutate_shared_published_snapshot() -> None:
+    """旧管理写入口必须拒绝直接修改共享知识库当前正式版本。"""
+    with _test_session() as db:
+        db.add(Tenant(id="tenant_demo", name="Demo"))
+        user = User(
+            id="user_admin",
+            tenant_id="tenant_demo",
+            username="admin",
+            role="admin",
+            password_hash="test",
+        )
+        version = KnowledgeBaseVersion(
+            id="kbver_shared_release",
+            tenant_id="tenant_demo",
+            knowledge_base_id="kb_shared",
+            version="1.0.0",
+            name="共享制度库",
+            publication_state="released",
+        )
+        base = KnowledgeBase(
+            id="kb_shared",
+            tenant_id="tenant_demo",
+            name="共享制度库",
+            mode="shared",
+            published_version_id=version.id,
+        )
+        document = KnowledgeDocument(
+            id="kdoc_shared_release",
+            tenant_id="tenant_demo",
+            knowledge_base_id=base.id,
+            knowledge_base_version_id=version.id,
+            filename="制度.md",
+            file_type="md",
+            title="正式制度",
+            status="ready",
+        )
+        db.add(base)
+        db.add(version)
+        db.add(document)
+        ensure_open_gallery_binding(
+            db,
+            "tenant_demo",
+            "knowledge_base",
+            base.id,
+            "active",
+        )
+        db.commit()
+
+        with pytest.raises(HTTPException) as document_error:
+            update_document(
+                document.id,
+                KnowledgeDocumentUpdateRequest(
+                    tenant_id="tenant_demo",
+                    title="被直接覆盖",
+                ),
+                db=db,
+                current_user=user,
+                agent_id=None,
+            )
+        assert document_error.value.status_code == 409
+        assert document_error.value.detail["code"] == "KNOWLEDGE_MODE_INVALID"
+
+        with pytest.raises(HTTPException) as concept_error:
+            upsert_okf_concept(
+                base.id,
+                "policy/direct-edit",
+                KnowledgeConceptUpdateRequest(
+                    tenant_id="tenant_demo",
+                    content_md="# 禁止直接编辑\n\n正文",
+                ),
+                agent_id=None,
+                db=db,
+                current_user=user,
+            )
+        assert concept_error.value.status_code == 409
+        assert concept_error.value.detail["code"] == "KNOWLEDGE_MODE_INVALID"
+        assert db.exec(
+            select(KnowledgeConcept).where(
+                KnowledgeConcept.knowledge_base_id == base.id,
+                KnowledgeConcept.concept_id == "policy/direct-edit",
+            )
+        ).first() is None
+        db.refresh(document)
+        assert document.title == "正式制度"
+
+
+def test_enterprise_knowledge_error_projects_safe_canonical_detail() -> None:
+    """Keep raw domain prose private and fail closed for legacy params outside the registry."""
+    raw_cause = "database path=/private/tenant.sqlite password=do-not-publish"
+    error = KnowledgeError(
+        KNOWLEDGE_MODE_INVALID,
+        message=raw_cause,
+        details={"knowledge_base_id": "kb-shared"},
+    )
+    error.request_id = "req-knowledge"
+    error.trace_id = "trace-knowledge"
+
+    http_error = _knowledge_http_error(error)
+
+    assert http_error.detail == {
+        "code": "INTERNAL_ERROR",
+        "params": {},
+        "retryable": False,
+        "request_id": "req-knowledge",
+        "trace_id": "trace-knowledge",
+    }
+    assert raw_cause not in repr(http_error.detail)
+
+
+def test_ingest_failure_persists_safe_job_and_document_errors(monkeypatch) -> None:
+    """Persist a canonical failure payload and keep the seeded raw cause out of reads."""
+    raw_cause = "bucket build failed secret=do-not-publish /private/kb.sqlite"
+
+    def fail_build_buckets(*args, **kwargs):
+        raise RuntimeError(raw_cause)
+
+    monkeypatch.setattr(KnowledgeService, "_build_buckets", fail_build_buckets)
+
+    with _test_session() as db:
+        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.add(KnowledgeBase(id="kb_demo", tenant_id="tenant_demo", name="默认知识库"))
+        db.commit()
+        service = KnowledgeService(db)
+        job = service.create_ingest_job(
+            IngestPayload(
+                tenant_id="tenant_demo",
+                knowledge_base_id="kb_demo",
+                filename="policy.md",
+                content_base64=_b64("# 售后政策\n用户可查询订单。"),
+            )
+        )
+
+        service._run_ingest_job(job.id)
+
+        failed_job = db.get(KnowledgeIngestJob, job.id)
+        assert failed_job is not None
+        assert failed_job.status == "failed"
+        assert failed_job.document_id is not None
+        assert raw_cause not in str(failed_job.error)
+
+        failed_document = db.get(KnowledgeDocument, failed_job.document_id)
+        assert failed_document is not None
+        assert failed_document.status == "failed"
+        assert raw_cause not in str(failed_document.error)
+
+        projected_job = job_read(failed_job)
+        projected_document = document_read(failed_document)
+
+        assert projected_job.error == {
+            "code": "INTERNAL_ERROR",
+            "params": {},
+            "retryable": False,
+            "request_id": None,
+            "trace_id": None,
+        }
+        assert projected_document.error == projected_job.error
+        assert raw_cause not in repr(projected_job.error)
+        assert raw_cause not in repr(projected_document.error)
+
+
+def test_knowledge_error_code_is_registered_for_public_projection() -> None:
+    """Require the enterprise knowledge code to resolve through the canonical registry."""
+    entry = ERROR_REGISTRY.require(KNOWLEDGE_MODE_INVALID)
+
+    assert entry.code == KNOWLEDGE_MODE_INVALID
+    assert entry.visibility is ErrorVisibility.PUBLIC
+    assert entry.message_key.startswith("errors.knowledge.")
 
 
 def _b64(text: str) -> str:

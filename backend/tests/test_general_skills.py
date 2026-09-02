@@ -51,6 +51,11 @@ from app.general_skills.schema import (
     GeneralSkillRunRequest,
     GeneralSkillRunResponse,
 )
+from app.i18n.language_context import (
+    LanguageContext,
+    LocaleResolutionSource,
+    SupportedLocale,
+)
 from app.llm import LLMClient, LLMError
 from app.security.auth import hash_password
 from app.security.encryption import encrypt_secret
@@ -122,6 +127,12 @@ def _system_and_stage_instructions(system_prompt: object, payload: object) -> st
     stage = payload.get("_agent_stage", {}) if isinstance(payload, dict) else {}
     instructions = stage.get("instructions", "") if isinstance(stage, dict) else ""
     return f"{system_prompt}\n{instructions}"
+
+
+def _stage_phase(payload: object) -> str:
+    """Read the stable stage identifier instead of coupling tests to prompt prose."""
+    stage = payload.get("_agent_stage", {}) if isinstance(payload, dict) else {}
+    return str(stage.get("phase") or "") if isinstance(stage, dict) else ""
 
 
 def test_capability_selector_allows_general_skill_and_knowledge_together(monkeypatch) -> None:
@@ -212,6 +223,67 @@ def test_general_skill_reader_does_not_generate_runner_code(monkeypatch) -> None
     assert any(item["phase"] == "read_created" for item in response.execution_trace)
 
 
+def test_general_skill_reader_marks_skill_sources_and_uses_reply_locale(monkeypatch) -> None:
+    """Constrain generated Skill prose while preserving query and package source content."""
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(LLMClient, "__init__", lambda self, model_config: None)
+
+    def fake_generate_json(self, system_prompt, payload):
+        """Capture the real reader payload and return a minimal valid read response."""
+        captured.update(payload)
+        return {
+            "reply": "Skill source README-原文 remains unchanged.",
+            "summary": "Skill overview",
+            "inputs": [],
+            "side_effects": [],
+        }
+
+    monkeypatch.setattr(LLMClient, "generate_json", fake_generate_json)
+    skill = GeneralSkill(
+        tenant_id="tenant_demo",
+        slug="raw-reader",
+        name="README-原文",
+        skill_markdown="# README-原文\nRead /原始/路径.txt exactly.",
+        status="published",
+    )
+    context = LanguageContext(
+        ui_locale=SupportedLocale.ZH_CN,
+        agent_reply_locale=SupportedLocale.EN_US,
+        ui_locale_source=LocaleResolutionSource.EXPLICIT_REQUEST,
+        agent_reply_locale_source=LocaleResolutionSource.USER_PREFERENCE,
+    )
+
+    response = GeneralSkillReader().read(
+        skill,
+        "解释 README-原文",
+        SimpleNamespace(),
+        language_context=context,
+    )
+
+    assert captured["language_context"]["agent_reply_locale"] == "en-US"
+    assert captured["language_directive"]["new_prose_locale"] == "en-US"
+    assert captured["raw_source_markers"] == [
+        {
+            "json_pointer": "/user_message",
+            "kind": "user_input",
+            "policy": "preserve_verbatim",
+        },
+        {
+            "json_pointer": "/conversation_context",
+            "kind": "history",
+            "policy": "preserve_verbatim",
+        },
+        {
+            "json_pointer": "/skill",
+            "kind": "business_record",
+            "policy": "preserve_verbatim",
+        },
+    ]
+    assert captured["skill"]["markdown"] == "# README-原文\nRead /原始/路径.txt exactly."
+    assert response.reply == "Skill source README-原文 remains unchanged."
+    assert response.language_context == context
+
+
 def test_general_skill_reader_returns_structured_failure(monkeypatch) -> None:
     monkeypatch.setattr(LLMClient, "__init__", lambda self, model_config: None)
     monkeypatch.setattr(
@@ -234,8 +306,10 @@ def test_general_skill_reader_returns_structured_failure(monkeypatch) -> None:
         "success": False,
         "operation": "read",
         "error": "skill_read_failed",
-        "message": "model unavailable",
+        "error_code": "GENERAL_SKILL_READ_FAILED",
     }
+    assert response.stderr == ""
+    assert "model unavailable" not in repr(response.model_dump())
     assert any(item["phase"] == "read_failed" for item in response.execution_trace)
 
 
@@ -309,7 +383,8 @@ def test_import_general_skill_uses_user_supplied_metadata() -> None:
             assert False, "expected general skill slug update to fail"
         except HTTPException as exc:
             assert exc.status_code == 400
-            assert exc.detail == "General skill slug cannot be modified"
+            assert exc.detail["code"] == "GENERAL_SKILL_SLUG_IMMUTABLE"
+            assert exc.detail["params"] == {}
 
 
 def test_import_general_skill_without_original_slug_does_not_overwrite_existing() -> None:
@@ -540,6 +615,79 @@ def test_import_general_skill_folder_reads_skill_md_metadata() -> None:
         assert row.metadata["name"] == "中国城市天气"
         assert [file.path for file in row.skill_files] == ["SKILL.md", "data/cities.json"]
         assert row.skill_markdown.startswith("---\nname: 中国城市天气")
+
+
+def test_import_general_skill_rejects_missing_reference_files() -> None:
+    with _test_session() as db:
+        _seed_minimal_tenant(db)
+
+        with pytest.raises(HTTPException) as exc_info:
+            import_general_skill(
+                GeneralSkillImportRequest(
+                    tenant_id="tenant_demo",
+                    name="企业微信日程",
+                    slug="wecom-calendar",
+                    markdown=(
+                        "# 企业微信日程\n\n"
+                        "执行前读取 references/wecomcli-calendar-meeting-room.md。\n"
+                    ),
+                ),
+                db,
+                _admin_user(),
+            )
+
+        assert exc_info.value.status_code == 400
+        assert exc_info.value.detail["code"] == "GENERAL_SKILL_REFERENCED_FILE_MISSING"
+        assert exc_info.value.detail["params"] == {}
+
+
+def test_markdown_only_update_preserves_existing_skill_package_files() -> None:
+    with _test_session() as db:
+        _seed_minimal_tenant(db)
+        created = import_general_skill(
+            GeneralSkillImportRequest(
+                tenant_id="tenant_demo",
+                name="企业微信日程",
+                slug="wecom-calendar",
+                files=[
+                    {
+                        "path": "SKILL.md",
+                        "content": (
+                            "# 企业微信日程\n\n"
+                            "读取 references/wecomcli-calendar-meeting-room.md。\n"
+                        ),
+                    },
+                    {
+                        "path": "references/wecomcli-calendar-meeting-room.md",
+                        "content": "# 会议室日程查询\n",
+                    },
+                ],
+            ),
+            db,
+            _admin_user(),
+        )
+
+        updated = import_general_skill(
+            GeneralSkillImportRequest(
+                tenant_id="tenant_demo",
+                name="企业微信日程",
+                slug=created.slug,
+                original_slug=created.slug,
+                markdown=(
+                    "# 企业微信日程（更新）\n\n"
+                    "读取 references/wecomcli-calendar-meeting-room.md。\n"
+                ),
+            ),
+            db,
+            _admin_user(),
+        )
+
+        assert updated.id == created.id
+        assert [file.path for file in updated.skill_files] == [
+            "SKILL.md",
+            "references/wecomcli-calendar-meeting-room.md",
+        ]
+        assert updated.skill_files[1].content == "# 会议室日程查询\n"
 
 
 def test_import_general_skill_persists_empty_directories_across_updates() -> None:
@@ -871,7 +1019,8 @@ def test_import_clawhub_skill_rejects_plain_html_page(monkeypatch) -> None:
             )
         except HTTPException as error:
             assert error.status_code == 400
-            assert "HTML 页面不会被当作 SKILL.md 导入" in str(error.detail)
+            assert error.detail["code"] == "GENERAL_SKILL_SOURCE_HTML_UNAVAILABLE"
+            assert error.detail["params"] == {}
         else:
             raise AssertionError("plain HTML page must not be imported as SKILL.md")
 
@@ -951,7 +1100,8 @@ def test_general_skill_archive_publish_and_delete_api(monkeypatch) -> None:
             )
         except HTTPException as error:
             assert error.status_code == 400
-            assert "not published" in str(error.detail)
+            assert error.detail["code"] == "GENERAL_SKILL_NOT_PUBLISHED"
+            assert error.detail["params"] == {}
         else:
             raise AssertionError("archived general skill should not run")
 
@@ -1014,11 +1164,13 @@ def test_general_skill_archive_publish_and_delete_api(monkeypatch) -> None:
 
 
 @pytest.mark.anyio
-async def test_general_skill_stream_executes_through_forced_harness_v2(monkeypatch) -> None:
+async def test_general_skill_stream_executes_through_forced_harness_v2(
+    monkeypatch,
+    tmp_path,
+) -> None:
     test_engine = create_engine(
-        "sqlite://",
+        f"sqlite:///{tmp_path / 'general-skill-stream.db'}",
         connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
     )
     SQLModel.metadata.create_all(test_engine)
     captured_requests = []
@@ -1109,10 +1261,73 @@ async def test_general_skill_stream_executes_through_forced_harness_v2(monkeypat
     assert captured_requests[0].message == "/skill weather-harness 北京天气"
     assert captured_requests[0].message_visibility == "internal"
     assert debug_session.id == captured_requests[0].session_id
+    assert debug_session.session_kind == "skill_test"
+    assert debug_session.title == imported.name
     assert '"execution_engine": "harness_v2"' in body
     assert "已加载技能说明" in body
     assert "北京天气晴朗" in body
     assert '"path": "weather.txt"' in body
+
+
+@pytest.mark.anyio
+async def test_general_skill_stream_projects_safe_error_payload(monkeypatch) -> None:
+    """Fail closed when the Harness worker crashes instead of streaming raw exception text."""
+    test_engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    SQLModel.metadata.create_all(test_engine)
+
+    def fail_handle_turn(self, request):
+        raise RuntimeError("provider token=do-not-publish")
+
+    general_skills_module = sys.modules[run_general_skill.__module__]
+    monkeypatch.setattr(general_skills_module, "engine", test_engine)
+    monkeypatch.setattr(general_skills_module.AgentLoop, "handle_turn", fail_handle_turn)
+
+    with Session(test_engine) as db:
+        _seed_minimal_tenant(db)
+        db.add(
+            AgentProfile(
+                id="agent_overall",
+                tenant_id="tenant_demo",
+                name="开放广场",
+                is_overall=True,
+            )
+        )
+        db.commit()
+        imported = import_general_skill(
+            GeneralSkillImportRequest(
+                tenant_id="tenant_demo",
+                name="天气",
+                slug="weather-harness-error",
+                markdown=WEATHER_SKILL_MD,
+                status="published",
+            ),
+            db,
+            _admin_user(),
+        )
+        response = run_general_skill_stream(
+            imported.slug,
+            GeneralSkillRunRequest(
+                tenant_id="tenant_demo",
+                agent_id="agent_overall",
+                user_id="user_demo",
+                query="北京天气",
+            ),
+            db,
+            _admin_user(),
+        )
+        chunks = [chunk async for chunk in response.body_iterator]
+        body = "".join(
+            chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk for chunk in chunks
+        )
+
+    assert "event: error" in body
+    assert '"code": "INTERNAL_ERROR"' in body
+    assert '"retryable": true' in body
+    assert "provider token=do-not-publish" not in body
 
 
 def test_non_overall_agent_delete_hides_general_skill_only_in_branch() -> None:
@@ -1175,8 +1390,8 @@ def test_general_skill_runner_repairs_failed_code(monkeypatch) -> None:
         return None
 
     def fake_generate_json(self, system_prompt, payload):  # noqa: ANN001
-        prompt_text = _system_and_stage_instructions(system_prompt, payload)
-        if "代码修复器" in prompt_text:
+        phase = _stage_phase(payload)
+        if phase == "Step Agent / General Skill Repair":
             calls.append("repair")
             return {
                 "code": (
@@ -1186,13 +1401,13 @@ def test_general_skill_runner_repairs_failed_code(monkeypatch) -> None:
                 ),
                 "rationale": "修复失败输出",
             }
-        if "通用技能执行器" in prompt_text:
+        if phase == "Step Agent / General Skill Plan":
             calls.append("runner")
             return {
                 "code": "import json\nprint(json.dumps({'success': False, 'error': 'first_fail'}, ensure_ascii=False))\n",
                 "rationale": "首次尝试失败",
             }
-        if "通用技能结果回复器" in prompt_text:
+        if phase == "Response Generator / General Skill Reply":
             calls.append("reply")
             assert payload["structured_result"]["success"] is True
             return {"reply": "北京今天晴。"}
@@ -1222,14 +1437,22 @@ def test_general_skill_runner_repairs_failed_code(monkeypatch) -> None:
     events: list[dict] = []
 
     response = GeneralSkillRunner().run(
-        skill, "北京今天天气怎么样", model_config, max_attempts=2, event_sink=events.append
+        skill,
+        "北京今天天气怎么样",
+        model_config,
+        max_attempts=2,
+        event_sink=events.append,
+        sandbox_enabled=False,
     )
 
     assert response.reply == "北京今天晴。"
     assert response.structured_result["success"] is True
     assert calls == ["runner", "repair", "reply"]
     assert any(item["phase"] == "reflection_retrying" for item in response.execution_trace)
-    assert any(item["phase"] == "stdout_chunk" and "first_fail" in item["text"] for item in events)
+    assert any(
+        item["phase"] == "stdout_chunk" and "first_fail" in item["raw_stdout"]
+        for item in events
+    )
 
 
 def test_general_skill_runner_materializes_folder_package(monkeypatch) -> None:
@@ -1239,8 +1462,8 @@ def test_general_skill_runner_materializes_folder_package(monkeypatch) -> None:
         return None
 
     def fake_generate_json(self, system_prompt, payload):  # noqa: ANN001
-        prompt_text = _system_and_stage_instructions(system_prompt, payload)
-        if "通用技能执行器" in prompt_text:
+        phase = _stage_phase(payload)
+        if phase == "Step Agent / General Skill Plan":
             calls.append("runner")
             assert payload["skill"]["package"]["file_count"] == 2
             assert [item["path"] for item in payload["skill"]["package"]["files"]] == [
@@ -1257,7 +1480,7 @@ def test_general_skill_runner_materializes_folder_package(monkeypatch) -> None:
                 ),
                 "rationale": "读取技能目录里的数据文件。",
             }
-        if "通用技能运行结果审查器" in prompt_text:
+        if phase == "Reflection / General Skill Review":
             calls.append("review")
             assert payload["structured_result"]["city"] == "北京"
             return {
@@ -1266,7 +1489,7 @@ def test_general_skill_runner_materializes_folder_package(monkeypatch) -> None:
                 "terminal": False,
                 "reason": "目录文件已读取成功。",
             }
-        if "通用技能结果回复器" in prompt_text:
+        if phase == "Response Generator / General Skill Reply":
             calls.append("reply")
             assert payload["structured_result"]["city"] == "北京"
             return {"reply": "已读取目录技能，城市是北京。"}
@@ -1296,7 +1519,13 @@ def test_general_skill_runner_materializes_folder_package(monkeypatch) -> None:
         enabled=True,
     )
 
-    response = GeneralSkillRunner().run(skill, "查一下目录里的城市", model_config, max_attempts=1)
+    response = GeneralSkillRunner().run(
+        skill,
+        "查一下目录里的城市",
+        model_config,
+        max_attempts=1,
+        sandbox_enabled=False,
+    )
 
     assert response.reply == "已读取目录技能，城市是北京。"
     assert response.structured_result["city"] == "北京"
@@ -1311,8 +1540,8 @@ def test_general_skill_runner_executes_bash_package_command(monkeypatch) -> None
         return None
 
     def fake_generate_json(self, system_prompt, payload):  # noqa: ANN001
-        prompt_text = _system_and_stage_instructions(system_prompt, payload)
-        if "通用技能执行器" in prompt_text:
+        phase = _stage_phase(payload)
+        if phase == "Step Agent / General Skill Plan":
             calls.append("runner")
             assert payload["skill"]["package"]["file_count"] == 2
             assert payload["runtime"]["languages"] == ["bash", "python"]
@@ -1321,7 +1550,7 @@ def test_general_skill_runner_executes_bash_package_command(monkeypatch) -> None
                 "code": 'set -euo pipefail\ncd "$SKILL_WORKSPACE"\nprintf \'%s\\n\' "$ARGUMENTS" | python3 scripts/weather.py\n',
                 "rationale": "技能声明 allowed-tools: Bash，并给出了调用 scripts/weather.py 的命令。",
             }
-        if "通用技能运行结果审查器" in prompt_text:
+        if phase == "Reflection / General Skill Review":
             calls.append("review")
             assert payload["structured_result"]["city"] == "北京"
             return {
@@ -1330,7 +1559,7 @@ def test_general_skill_runner_executes_bash_package_command(monkeypatch) -> None
                 "terminal": False,
                 "reason": "Bash 已调用包内脚本并得到结果。",
             }
-        if "通用技能结果回复器" in prompt_text:
+        if phase == "Response Generator / General Skill Reply":
             calls.append("reply")
             return {"reply": "北京今天晴。"}
         raise AssertionError("unexpected prompt")
@@ -1374,13 +1603,19 @@ def test_general_skill_runner_executes_bash_package_command(monkeypatch) -> None
         enabled=True,
     )
 
-    response = GeneralSkillRunner().run(skill, "北京今天天气怎么样", model_config, max_attempts=1)
+    response = GeneralSkillRunner().run(
+        skill,
+        "北京今天天气怎么样",
+        model_config,
+        max_attempts=1,
+        sandbox_enabled=False,
+    )
 
     assert response.reply == "北京今天晴。"
     assert response.structured_result["city"] == "北京"
     assert calls == ["runner", "review", "reply"]
     plan_events = [item for item in response.execution_trace if item["phase"] == "plan_created"]
-    assert plan_events[0]["runtime"] == "bash"
+    assert plan_events[0]["params"]["runtime"] == "bash"
 
 
 def test_general_skill_runner_has_requests_in_runtime(monkeypatch) -> None:
@@ -1390,8 +1625,8 @@ def test_general_skill_runner_has_requests_in_runtime(monkeypatch) -> None:
         return None
 
     def fake_generate_json(self, system_prompt, payload):  # noqa: ANN001
-        prompt_text = _system_and_stage_instructions(system_prompt, payload)
-        if "通用技能执行器" in prompt_text:
+        phase = _stage_phase(payload)
+        if phase == "Step Agent / General Skill Plan":
             calls.append("runner")
             return {
                 "runtime": "python",
@@ -1407,7 +1642,7 @@ def test_general_skill_runner_has_requests_in_runtime(monkeypatch) -> None:
                 ),
                 "rationale": "验证通用技能运行环境包含 requests。",
             }
-        if "通用技能运行结果审查器" in prompt_text:
+        if phase == "Reflection / General Skill Review":
             calls.append("review")
             assert payload["structured_result"]["requests_available"] is True
             return {
@@ -1416,7 +1651,7 @@ def test_general_skill_runner_has_requests_in_runtime(monkeypatch) -> None:
                 "terminal": False,
                 "reason": "requests 可用。",
             }
-        if "通用技能结果回复器" in prompt_text:
+        if phase == "Response Generator / General Skill Reply":
             calls.append("reply")
             return {"reply": "requests 可用。"}
         raise AssertionError("unexpected prompt")
@@ -1441,7 +1676,13 @@ def test_general_skill_runner_has_requests_in_runtime(monkeypatch) -> None:
         enabled=True,
     )
 
-    response = GeneralSkillRunner().run(skill, "检查 requests", model_config, max_attempts=1)
+    response = GeneralSkillRunner().run(
+        skill,
+        "检查 requests",
+        model_config,
+        max_attempts=1,
+        sandbox_enabled=False,
+    )
 
     assert response.reply == "requests 可用。"
     assert response.structured_result["requests_available"] is True
@@ -1483,8 +1724,8 @@ def test_general_skill_runner_reflects_failed_initial_plan(monkeypatch) -> None:
         return None
 
     def fake_generate_json(self, system_prompt, payload):  # noqa: ANN001
-        prompt_text = _system_and_stage_instructions(system_prompt, payload)
-        if "代码修复器" in prompt_text:
+        phase = _stage_phase(payload)
+        if phase == "Step Agent / General Skill Repair":
             calls.append("repair")
             assert (
                 payload["previous_attempts"][0]["structured_result"]["error"]
@@ -1498,10 +1739,10 @@ def test_general_skill_runner_reflects_failed_initial_plan(monkeypatch) -> None:
                 ),
                 "rationale": "重新输出合法 runner JSON",
             }
-        if "通用技能执行器" in prompt_text:
+        if phase == "Step Agent / General Skill Plan":
             calls.append("runner_failed")
             raise LLMError("Model did not return valid JSON after retry")
-        if "通用技能结果回复器" in prompt_text:
+        if phase == "Response Generator / General Skill Reply":
             calls.append("reply")
             assert payload["structured_result"]["success"] is True
             return {"reply": "廊坊今天多云。"}
@@ -1528,7 +1769,13 @@ def test_general_skill_runner_reflects_failed_initial_plan(monkeypatch) -> None:
         enabled=True,
     )
 
-    response = GeneralSkillRunner().run(skill, "廊坊天气", model_config, max_attempts=2)
+    response = GeneralSkillRunner().run(
+        skill,
+        "廊坊天气",
+        model_config,
+        max_attempts=2,
+        sandbox_enabled=False,
+    )
 
     assert response.reply == "廊坊今天多云。"
     assert response.structured_result["success"] is True
@@ -1544,8 +1791,8 @@ def test_general_skill_runner_stops_on_non_retryable_failure(monkeypatch) -> Non
         return None
 
     def fake_generate_json(self, system_prompt, payload):  # noqa: ANN001
-        prompt_text = _system_and_stage_instructions(system_prompt, payload)
-        if "通用技能执行器" in prompt_text:
+        phase = _stage_phase(payload)
+        if phase == "Step Agent / General Skill Plan":
             calls.append("runner")
             return {
                 "code": (
@@ -1562,10 +1809,10 @@ def test_general_skill_runner_stops_on_non_retryable_failure(monkeypatch) -> Non
                 ),
                 "rationale": "返回不可自动修复的失败",
             }
-        if "代码修复器" in prompt_text:
+        if phase == "Step Agent / General Skill Repair":
             calls.append("repair")
             raise AssertionError("non-retryable failure should not call repair")
-        if "通用技能运行结果审查器" in prompt_text:
+        if phase == "Reflection / General Skill Review":
             calls.append("review")
             return {
                 "result_sufficient": False,
@@ -1573,7 +1820,7 @@ def test_general_skill_runner_stops_on_non_retryable_failure(monkeypatch) -> Non
                 "terminal": False,
                 "reason": "模型错误地建议重试",
             }
-        if "通用技能结果回复器" in prompt_text:
+        if phase == "Response Generator / General Skill Reply":
             calls.append("reply")
             assert payload["structured_result"]["retryable"] is False
             return {"reply": "当前天气源不可用，建议稍后再试。"}
@@ -1600,7 +1847,13 @@ def test_general_skill_runner_stops_on_non_retryable_failure(monkeypatch) -> Non
         enabled=True,
     )
 
-    response = GeneralSkillRunner().run(skill, "北京今天天气怎么样", model_config, max_attempts=10)
+    response = GeneralSkillRunner().run(
+        skill,
+        "北京今天天气怎么样",
+        model_config,
+        max_attempts=10,
+        sandbox_enabled=False,
+    )
 
     assert response.reply == "当前天气源不可用，建议稍后再试。"
     assert calls == ["runner", "review", "reply"]

@@ -260,7 +260,11 @@ def test_start_bidding_without_candidates_escalates() -> None:
         assert task.status == "escalated"
         escalated = _events(db, task.id, "task_escalated")
         assert len(escalated) == 1
-        assert "无候选" in escalated[0].payload_json["reason"]
+        assert escalated[0].payload_json["event_code"] == "team.task.bid.failed"
+        assert escalated[0].payload_json["params"] == {
+            "reason_code": "no_candidates",
+            "round": 1,
+        }
         assert db.exec(select(TeamWakeEvent)).all() == []
 
 
@@ -592,7 +596,11 @@ def test_bidding_no_valid_statements_escalates(monkeypatch: pytest.MonkeyPatch) 
         db.refresh(task)
         assert task.status == "escalated"
         escalated = _events(db, task.id, "task_escalated")
-        assert "无人应标" in escalated[0].payload_json["reason"]
+        assert escalated[0].payload_json["event_code"] == "team.task.bid.failed"
+        assert escalated[0].payload_json["params"] == {
+            "reason_code": "no_valid_bids",
+            "round": 1,
+        }
         assert _pending_wakes(db, "bid_judge") == []
 
 
@@ -653,7 +661,11 @@ def test_bid_judge_invalid_winner_escalates(monkeypatch: pytest.MonkeyPatch) -> 
         db.refresh(task)
         assert task.status == "escalated"
         escalated = _events(db, task.id, "task_escalated")
-        assert "裁决失败" in escalated[0].payload_json["reason"]
+        assert escalated[0].payload_json["event_code"] == "team.task.bid.failed"
+        assert escalated[0].payload_json["params"] == {
+            "reason_code": "award_unparsed",
+            "round": 1,
+        }
         assert task.assignee_agent_id is None
 
 

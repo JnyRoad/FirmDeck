@@ -6,10 +6,17 @@
   "required": ["error_code", "message", "retryable", "request_id"],
   "properties": {
     "error_code": {"type": "string", "minLength": 1},
-    "message": {"type": "string", "minLength": 1},
+    "message": {"type": "string", "minLength": 1, "deprecated": true},
     "retryable": {"type": "boolean"},
     "request_id": {"type": "string", "minLength": 1},
+    "trace_id": {"type": ["string", "null"], "minLength": 1},
+    "params": {"type": "object"},
     "provider_id": {"type": ["string", "null"]},
+    "deprecated_fields": {
+      "type": "array",
+      "items": {"enum": ["message"]},
+      "uniqueItems": true
+    },
     "extensions": {
       "type": "object",
       "patternProperties": {"^(?!core$|staffdeck$)[a-z][a-z0-9_]*$": {"type": "object"}},

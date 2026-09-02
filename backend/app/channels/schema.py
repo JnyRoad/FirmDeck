@@ -1,10 +1,13 @@
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional
 
 from pydantic import BaseModel
 from sqlmodel import Session, select
 
+from app.contracts.error_registry import ERROR_REGISTRY
+from app.contracts.errors import ErrorDescriptor, ErrorOccurrence, InternalErrorContext
+from app.contracts.projections import project_public_error
 from app.db.models import ChannelBinding, ChannelDelivery, Team, User
 
 
@@ -14,6 +17,8 @@ class ChannelBindingCreate(BaseModel):
     agent_id: Optional[str] = None
     team_id: Optional[str] = None
     channel: str = "wechat"
+    # 接入显示名;缺省时后端按「渠道名+YYYYMMDDHHMM」生成默认名
+    name: Optional[str] = None
 
 
 class ChannelBindingAgentRead(BaseModel):
@@ -27,6 +32,17 @@ class ChannelBindingAgentInput(BaseModel):
     is_default: bool = False
 
 
+class WeChatKfAccountRead(BaseModel):
+    """微信客服账号的公开路由状态；不包含 provider 凭据。"""
+
+    open_kfid: str
+    name: str = ""
+    agent_id: str | None = None
+    team_id: str | None = None
+    status: str = "active"
+    sync_cursor: str = ""
+
+
 class ChannelBindingAgentsUpdate(BaseModel):
     # 为 None 时跳过挂载集替换(仅更新开关);为 [] 时报 400 不允许空列表
     agents: Optional[list[ChannelBindingAgentInput]] = None
@@ -35,6 +51,11 @@ class ChannelBindingAgentsUpdate(BaseModel):
     # 渠道默认人工处理人:不传不动;传 None 清空,传 user_id 写入。
     # SOP 节点未指定 assignee 时回退到此值,再回退到数字员工负责人/管理员。
     default_handoff_assignee_user_id: str | None = "unchanged"
+    # 处理人通知渠道:不传不动;None/"web"=网页端收件箱;"feishu" 等绑定渠道=按该渠道转接。
+    # 仅在 default_handoff_assignee_user_id 非 unchanged 时生效。
+    default_handoff_assignee_channel: str | None = "unchanged"
+    # 接入显示名(重命名):不传不动;传非空字符串则更新
+    name: Optional[str] = None
 
 
 class ChannelBindingRead(BaseModel):
@@ -44,6 +65,8 @@ class ChannelBindingRead(BaseModel):
     tenant_id: str
     agent_id: str
     channel: str
+    # 用户可编辑的接入显示名;为空时前端回退展示渠道类型名
+    name: Optional[str] = None
     # 团队绑定:非空表示接入某团队(与员工挂载互斥)
     team_id: Optional[str] = None
     team_name: Optional[str] = None
@@ -53,6 +76,8 @@ class ChannelBindingRead(BaseModel):
     baseurl: Optional[str] = None
     bot_id: Optional[str] = None
     corp_id: Optional[str] = None
+    open_kfid: Optional[str] = None
+    callback_ready: bool = False
     app_id: Optional[str] = None
     client_id: Optional[str] = None
     bot_open_id: Optional[str] = None
@@ -64,10 +89,13 @@ class ChannelBindingRead(BaseModel):
     created_by_user_id: Optional[str] = None
     created_by_name: Optional[str] = None
     agents: list[ChannelBindingAgentRead] = []
+    wechat_kf_accounts: list[WeChatKfAccountRead] = []
     auto_route: bool = True
     # 渠道默认人工处理人(SOP 节点未指定 assignee 时回退到此值)。
     default_handoff_assignee_user_id: Optional[str] = None
     default_handoff_assignee_name: Optional[str] = None
+    # 处理人通知渠道:None=默认投递;"web"=仅网页端;"feishu" 等绑定渠道=按该渠道转接。
+    default_handoff_assignee_channel: Optional[str] = None
     identity_scope_key: Optional[str] = None
     # 当前请求者对该绑定的管理角色:admin/owner/collaborator;无管理关系时为 None
     my_role: Optional[str] = None
@@ -123,6 +151,47 @@ class WeComCredentialsRequest(BaseModel):
     corp_id: str
 
 
+class WeChatKfCredentialsRequest(BaseModel):
+    """微信客服应用凭据写入请求；所有秘密字段仅允许写入。"""
+
+    tenant_id: str
+    corp_id: str
+    secret: str
+    callback_token: str = ""
+    encoding_aes_key: str = ""
+
+
+class WeChatKfCallbackConfigRequest(BaseModel):
+    """微信客服回调凭据预配置请求。"""
+
+    tenant_id: str
+    corp_id: str
+
+
+class WeChatKfAccountCreateRequest(BaseModel):
+    """创建 provider 客服账号并绑定当前路由的请求。"""
+
+    tenant_id: str
+    name: str
+    media_id: str
+
+
+class WeChatKfAccountSelectRequest(BaseModel):
+    """选择既有 provider 客服账号的请求。"""
+
+    tenant_id: str
+    open_kfid: str
+
+
+class WeChatKfAccountUpdateRequest(BaseModel):
+    """更新已绑定 provider 客服账号资料的请求。"""
+
+    tenant_id: str
+    open_kfid: str
+    name: str
+    media_id: str | None = None
+
+
 class FeishuCredentialsRequest(BaseModel):
     tenant_id: str
     app_id: str
@@ -161,6 +230,8 @@ class ChannelDeliveryRead(BaseModel):
     status: str
     attempts: int
     last_error: Optional[str] = None
+    error: dict[str, Any] | None = None
+    language_context: dict[str, Any] | None = None
     delivered_at: Optional[str] = None
     created_at: str
 
@@ -290,12 +361,30 @@ def channel_binding_my_role(
 def channel_binding_read(
     db: Session, binding: ChannelBinding, current_user: Optional[User] = None
 ) -> ChannelBindingRead:
+    """Project one binding into its credential-free, requester-aware public contract."""
     config = dict(binding.config_json or {})
     bound_at = config.get("bound_at")
     team_name: Optional[str] = None
     if binding.team_id:
         team = db.get(Team, binding.team_id)
         team_name = team.name if team else None
+    wechat_kf_accounts: list[WeChatKfAccountRead] = []
+    if binding.channel == "wechat_kf":
+        from app.db.models import WeChatKfAccount
+
+        wechat_kf_accounts = [
+            WeChatKfAccountRead(
+                open_kfid=row.open_kfid,
+                name=row.name,
+                agent_id=binding.agent_id if not binding.team_id else None,
+                team_id=binding.team_id,
+                status=row.status,
+                sync_cursor=row.sync_cursor,
+            )
+            for row in db.exec(
+                select(WeChatKfAccount).where(WeChatKfAccount.binding_id == binding.id)
+            ).all()
+        ]
     identity_scope_key = binding.identity_scope_key
     if not identity_scope_key and binding.channel == "feishu":
         app_id = str(config.get("app_id") or "").strip()
@@ -309,6 +398,7 @@ def channel_binding_read(
         tenant_id=binding.tenant_id,
         agent_id=binding.agent_id,
         channel=binding.channel,
+        name=binding.name,
         team_id=binding.team_id,
         team_name=team_name,
         status=binding.status,
@@ -317,6 +407,8 @@ def channel_binding_read(
         baseurl=config.get("baseurl"),
         bot_id=config.get("bot_id"),
         corp_id=config.get("corp_id"),
+        open_kfid=config.get("open_kfid"),
+        callback_ready=bool(config.get("callback_ready")),
         app_id=config.get("app_id"),
         client_id=config.get("client_id"),
         bot_open_id=config.get("bot_open_id"),
@@ -328,11 +420,17 @@ def channel_binding_read(
         created_by_user_id=binding.created_by_user_id,
         created_by_name=channel_binding_creator_name(db, binding),
         agents=channel_binding_agents_read(db, binding),
+        wechat_kf_accounts=wechat_kf_accounts,
         auto_route=(binding.config_json or {}).get("auto_route") is not False,
         default_handoff_assignee_user_id=(binding.config_json or {}).get(
             "default_handoff_assignee_user_id"
         ),
         default_handoff_assignee_name=_default_handoff_assignee_name(db, binding),
+        default_handoff_assignee_channel=(
+            (binding.config_json or {}).get("default_handoff_assignee_channel")
+            if (binding.config_json or {}).get("default_handoff_assignee_user_id")
+            else None
+        ),
         identity_scope_key=identity_scope_key,
         my_role=channel_binding_my_role(db, binding, current_user),
         created_at=binding.created_at.isoformat(),
@@ -340,7 +438,46 @@ def channel_binding_read(
     )
 
 
+def _channel_delivery_error_code(raw_error: str | None) -> str | None:
+    """Map private delivery failures to the closest registered public channel code."""
+    error = str(raw_error or "").strip()
+    if not error:
+        return None
+    if error in {"渠道绑定不存在或已停用", "binding_missing_or_inactive", "binding_deleted"}:
+        return "CHANNEL_NOT_FOUND"
+    if error in {"渠道会话与绑定账号不一致", "reaction 事件边界无效"}:
+        return "CHANNEL_CONFLICT"
+    if error in {"reaction 渠道无效", "delivery_target_missing"}:
+        return "CHANNEL_BAD_REQUEST"
+    if error == "remote_state_unknown":
+        return "CHANNEL_UPSTREAM_ERROR"
+    return "CHANNEL_UPSTREAM_ERROR"
+
+
+def _channel_delivery_public_error(delivery: ChannelDelivery) -> dict[str, Any] | None:
+    """Project one delivery failure to a safe public descriptor while keeping raw cause private."""
+    code = _channel_delivery_error_code(delivery.last_error)
+    if code is None:
+        return None
+    entry = ERROR_REGISTRY.get(code) or ERROR_REGISTRY.require("INTERNAL_ERROR")
+    occurrence = ErrorOccurrence(
+        descriptor=ErrorDescriptor(
+            code=entry.code,
+            params={},
+            retryable=entry.retryable_default if delivery.status == "pending" else False,
+        ),
+        internal=InternalErrorContext(
+            source="channels.delivery",
+            raw_message=str(delivery.last_error or "")[:500] or None,
+            upstream_code=code,
+        ),
+    )
+    return project_public_error(occurrence, ERROR_REGISTRY)
+
+
 def channel_delivery_read(delivery: ChannelDelivery) -> ChannelDeliveryRead:
+    """Project one delivery row without exposing provider/raw failure text to public APIs."""
+    public_error = _channel_delivery_public_error(delivery)
     return ChannelDeliveryRead(
         id=delivery.id,
         binding_id=delivery.binding_id,
@@ -350,7 +487,9 @@ def channel_delivery_read(delivery: ChannelDelivery) -> ChannelDeliveryRead:
         text=delivery.text,
         status=delivery.status,
         attempts=delivery.attempts,
-        last_error=delivery.last_error,
+        last_error=public_error["code"] if public_error else None,
+        error=public_error,
+        language_context=delivery.language_context_json,
         delivered_at=delivery.delivered_at.isoformat() if delivery.delivered_at else None,
         created_at=delivery.created_at.isoformat(),
     )

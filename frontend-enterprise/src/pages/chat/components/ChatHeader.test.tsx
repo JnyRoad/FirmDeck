@@ -4,6 +4,8 @@ import { cleanup, render, screen } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { I18nProvider } from '@/i18n';
+import { TenantSessionProvider } from '@/contexts/TenantSessionContext';
+import type { EnterpriseAuthSession } from '@/auth';
 import type { ChatSession, TeamRead } from '@/types';
 
 import type { UseChatSession } from '../useChatSession';
@@ -22,12 +24,32 @@ const team: TeamRead = {
   updated_at: '2026-08-01T00:00:00Z',
 };
 
+const tenantSession: EnterpriseAuthSession = {
+  token: 'token-1',
+  scope: 'tenant',
+  tenant: {
+    id: 'tenant_demo',
+    slug: 'demo-lab',
+    display_name: 'Demo Lab',
+  },
+  user: {
+    id: 'user-1',
+    tenant_id: 'tenant_demo',
+    username: 'demo',
+    display_name: 'Demo Operator',
+    role: 'admin',
+    must_change_password: false,
+    avatar_url: null,
+  },
+};
+
 function jsonResponse(body: unknown): Response {
   return {
     ok: true,
     status: 200,
     statusText: 'OK',
     text: async () => JSON.stringify(body ?? {}),
+    json: async () => body ?? {},
   } as Response;
 }
 
@@ -47,9 +69,17 @@ function buildChat(session: Partial<ChatSession>): UseChatSession {
 }
 
 function renderHeader(chat: UseChatSession) {
+  const delegatedFetch = globalThis.fetch;
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => (
+    String(input).includes('/api/auth/me')
+      ? Promise.resolve(jsonResponse(tenantSession.user))
+      : delegatedFetch(input, init)
+  )));
   return render(
     <I18nProvider>
-      <ChatHeader chat={chat} />
+      <TenantSessionProvider session={tenantSession}>
+        <ChatHeader chat={chat} />
+      </TenantSessionProvider>
     </I18nProvider>,
   );
 }

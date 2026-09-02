@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import re
+from contextvars import ContextVar
 from datetime import UTC, datetime
 from typing import Any, Optional
 from uuid import uuid4
 
-from sqlalchemy import JSON, Column, Index, Integer, UniqueConstraint
+from pydantic import model_validator
+from sqlalchemy import JSON, CheckConstraint, Column, Index, Integer, UniqueConstraint, event
 from sqlmodel import Field, SQLModel
 
 
@@ -16,13 +19,91 @@ def new_id(prefix: str) -> str:
     return f"{prefix}_{uuid4().hex[:16]}"
 
 
+def _require_a2a_owner_shape(
+    *,
+    owner_scope: str | None,
+    tenant_id: str | None,
+    system_runtime_key: str | None,
+    tenant_lifecycle_version: int | None,
+    direction: str | None,
+) -> None:
+    """Reject incomplete or mixed A2A ownership before a model can reach persistence."""
+    tenant_owned = (
+        owner_scope == "tenant"
+        and tenant_id is not None
+        and system_runtime_key is None
+        and isinstance(tenant_lifecycle_version, int)
+        and not isinstance(tenant_lifecycle_version, bool)
+        and tenant_lifecycle_version > 0
+    )
+    system_owned = (
+        owner_scope == "system"
+        and tenant_id is None
+        and isinstance(system_runtime_key, str)
+        and bool(system_runtime_key.strip())
+        and len(system_runtime_key) <= 128
+        and tenant_lifecycle_version is None
+    )
+    if not (tenant_owned or system_owned):
+        raise ValueError("A2A task run must use one complete tenant or system owner shape")
+    if direction not in {"client", "server"}:
+        raise ValueError("A2A task run direction must be client or server")
+
+
+_a2a_model_validation_active: ContextVar[bool] = ContextVar(
+    "a2a_model_validation_active",
+    default=False,
+)
+
+
 class Tenant(SQLModel, table=True):
     __tablename__ = "tenants"
+    __table_args__ = (
+        CheckConstraint(
+            "length(slug) BETWEEN 3 AND 63 "
+            "AND slug GLOB '[a-z0-9]*' "
+            "AND slug GLOB '*[a-z0-9]' "
+            "AND slug NOT GLOB '*[^a-z0-9-]*'",
+            name="ck_tenants_slug_shape",
+        ),
+        CheckConstraint("status IN ('active', 'suspended')", name="ck_tenants_status"),
+        CheckConstraint("lifecycle_version > 0", name="ck_tenants_lifecycle_version_positive"),
+    )
 
     id: str = Field(primary_key=True)
+    slug: str = Field(index=True, unique=True, min_length=3, max_length=63)
     name: str
+    status: str = Field(default="active", index=True)
+    lifecycle_version: int = Field(default=1, gt=0)
+    initial_admin_user_id: str | None = Field(default=None, index=True)
+    suspended_at: datetime | None = None
+    suspension_reason: str | None = Field(default=None, max_length=500)
+    reactivated_at: datetime | None = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
+
+    @staticmethod
+    def _legacy_slug_from_id(tenant_id: str) -> str:
+        """Normalize one durable tenant ID into a valid compatibility slug without random suffixes."""
+        if tenant_id == "tenant_demo":
+            return "demo"
+        slug = re.sub(r"[^a-z0-9]+", "-", tenant_id.lower()).strip("-")
+        if len(slug) < 3:
+            slug = f"tenant-{slug or 'unknown'}"
+        return slug[:63].rstrip("-")
+
+
+@event.listens_for(Tenant, "init")
+def _apply_tenant_slug_constructor_compatibility(
+    _target: Tenant,
+    _args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> None:
+    """Fill only omitted legacy slugs and reject an explicit null before SQLModel initializes fields."""
+    if "slug" in kwargs and kwargs["slug"] is None:
+        raise ValueError("Tenant slug cannot be null")
+    if "slug" not in kwargs and isinstance(kwargs.get("id"), str):
+        kwargs["slug"] = Tenant._legacy_slug_from_id(kwargs["id"])
 
 
 class User(SQLModel, table=True):
@@ -30,6 +111,7 @@ class User(SQLModel, table=True):
     __table_args__ = (
         UniqueConstraint("tenant_id", "username", name="uq_user_tenant_username"),
         Index("ix_users_tenant_id_display_name", "tenant_id", "display_name"),
+        CheckConstraint("auth_version > 0", name="ck_users_auth_version_positive"),
     )
 
     id: str = Field(default_factory=lambda: new_id("user"), primary_key=True)
@@ -39,9 +121,136 @@ class User(SQLModel, table=True):
     role: str = Field(default="member", index=True)
     # 账号来源:web=网页端创建;wechat 等=渠道懒建(用户管理列表默认隐藏)
     source: str = Field(default="web", index=True)
+    # 产品界面语言偏好；迁移期间可为空，存量行由启动迁移补齐兼容默认值。
+    ui_locale: Optional[str] = Field(default=None)
+    # Agent 新生成自然语言的语言偏好；与产品界面语言独立保存。
+    agent_reply_locale: Optional[str] = Field(default=None)
     password_hash: str
+    auth_version: int = Field(default=1, gt=0)
+    must_change_password: bool = False
+    password_changed_at: datetime | None = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
+
+
+class SystemAdmin(SQLModel, table=True):
+    """Installation-scoped administrator identity, isolated from every tenant principal."""
+
+    __tablename__ = "system_admins"
+    __table_args__ = (
+        CheckConstraint("status IN ('active', 'disabled')", name="ck_system_admins_status"),
+        CheckConstraint("auth_version > 0", name="ck_system_admins_auth_version_positive"),
+    )
+
+    id: str = Field(default_factory=lambda: new_id("sysadmin"), primary_key=True)
+    username: str = Field(index=True, unique=True, min_length=1, max_length=128)
+    display_name: str | None = Field(default=None, max_length=255)
+    password_hash: str
+    status: str = Field(default="active", index=True)
+    auth_version: int = Field(default=1, gt=0)
+    must_change_password: bool = False
+    password_changed_at: datetime | None = None
+    last_login_at: datetime | None = None
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class InstallationPasswordPolicy(SQLModel, table=True):
+    """Persist one installation-wide password policy for system or default tenant credentials."""
+
+    __tablename__ = "installation_password_policies"
+    __table_args__ = (
+        CheckConstraint(
+            "scope IN ('system', 'tenant_default')",
+            name="ck_installation_password_policies_scope",
+        ),
+        CheckConstraint(
+            "min_length BETWEEN 8 AND 20",
+            name="ck_installation_password_policies_min_length",
+        ),
+        CheckConstraint(
+            "max_length BETWEEN 8 AND 20",
+            name="ck_installation_password_policies_max_length",
+        ),
+        CheckConstraint(
+            "min_length <= max_length",
+            name="ck_installation_password_policies_length_order",
+        ),
+    )
+
+    scope: str = Field(primary_key=True, max_length=32)
+    min_length: int = Field(default=8, ge=8, le=20)
+    max_length: int = Field(default=20, ge=8, le=20)
+    complexity_enabled: bool = False
+    require_uppercase: bool = True
+    require_lowercase: bool = True
+    require_digit: bool = True
+    require_special: bool = True
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class TenantPasswordPolicy(SQLModel, table=True):
+    """Persist one tenant custom policy, or an explicit inheritance choice, without password data."""
+
+    __tablename__ = "tenant_password_policies"
+    __table_args__ = (
+        CheckConstraint(
+            "mode IN ('inherit', 'custom')",
+            name="ck_tenant_password_policies_mode",
+        ),
+        CheckConstraint(
+            "min_length IS NULL OR min_length BETWEEN 8 AND 20",
+            name="ck_tenant_password_policies_min_length",
+        ),
+        CheckConstraint(
+            "max_length IS NULL OR max_length BETWEEN 8 AND 20",
+            name="ck_tenant_password_policies_max_length",
+        ),
+        CheckConstraint(
+            "min_length IS NULL OR max_length IS NULL OR min_length <= max_length",
+            name="ck_tenant_password_policies_length_order",
+        ),
+    )
+
+    tenant_id: str = Field(primary_key=True)
+    mode: str = Field(default="inherit", max_length=16)
+    min_length: int | None = Field(default=None, ge=8, le=20)
+    max_length: int | None = Field(default=None, ge=8, le=20)
+    complexity_enabled: bool | None = None
+    require_uppercase: bool | None = None
+    require_lowercase: bool | None = None
+    require_digit: bool | None = None
+    require_special: bool | None = None
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class SystemControlAudit(SQLModel, table=True):
+    """Append-only control-plane audit evidence without credentials or raw request diagnostics."""
+
+    __tablename__ = "system_control_audits"
+    __table_args__ = (
+        CheckConstraint(
+            "result IN ('succeeded', 'rejected', 'failed')",
+            name="ck_system_control_audits_result",
+        ),
+    )
+
+    id: str = Field(default_factory=lambda: new_id("sysaudit"), primary_key=True)
+    actor_system_admin_id: str | None = Field(default=None, index=True)
+    actor_label: str | None = Field(default=None, max_length=255)
+    action: str = Field(index=True, max_length=64)
+    target_type: str = Field(max_length=64)
+    target_id: str | None = Field(default=None, index=True)
+    result: str = Field(index=True, max_length=16)
+    reason_code: str = Field(max_length=128)
+    operator_reason: str | None = Field(default=None, max_length=500)
+    status_before: str | None = Field(default=None, max_length=16)
+    status_after: str | None = Field(default=None, max_length=16)
+    lifecycle_version: int | None = Field(default=None, gt=0)
+    request_id: str | None = Field(default=None, index=True)
+    trace_id: str | None = Field(default=None, index=True)
+    safe_params_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    created_at: datetime = Field(default_factory=utc_now, index=True)
 
 
 class UserAvatar(SQLModel, table=True):
@@ -78,7 +287,7 @@ class APIClient(SQLModel, table=True):
 
 
 class APICredential(SQLModel, table=True):
-    """Hashed tenant or agent credential. Plaintext is returned exactly once."""
+    """Tenant or agent credential with an authentication digest and optional encrypted recovery copy."""
 
     __tablename__ = "api_credentials"
     __table_args__ = (
@@ -92,6 +301,7 @@ class APICredential(SQLModel, table=True):
     name: str
     key_prefix: str = Field(index=True)
     key_digest: str
+    encrypted_key: Optional[str] = None
     scopes_json: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     status: str = Field(default="active", index=True)
     expires_at: Optional[datetime] = Field(default=None, index=True)
@@ -125,11 +335,24 @@ class APIIdempotencyRecord(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=utc_now)
 
 
+class CodexSubscriptionCredential(SQLModel, table=True):
+    """安装级 ChatGPT 订阅凭据；令牌 JSON 始终以加密形式保存。"""
+
+    __tablename__ = "codex_subscription_credentials"
+
+    id: str = Field(default="default", primary_key=True)
+    credential_encrypted: str
+    access_token_expires_at: datetime
+    plan_type: Optional[str] = None
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
 class APIJob(SQLModel, table=True):
     __tablename__ = "api_jobs"
 
     id: str = Field(default_factory=lambda: new_id("apijob"), primary_key=True)
     tenant_id: str = Field(index=True)
+    tenant_lifecycle_version: int = Field(default=1, index=True, gt=0)
     credential_id: str = Field(index=True)
     agent_id: Optional[str] = Field(default=None, index=True)
     kind: str = Field(index=True)
@@ -139,12 +362,19 @@ class APIJob(SQLModel, table=True):
     request_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     result_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     error_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    terminal_reason: str | None = Field(default=None, index=True, max_length=120)
+    outcome_unknown: bool = False
     cancel_requested: bool = False
     retryable: bool = False
-    execution_owner: Optional[str] = Field(default=None, index=True)
+    execution_owner: str | None = Field(default=None, index=True)
     execution_generation: int = 0
-    lease_expires_at: Optional[datetime] = Field(default=None, index=True)
+    lease_expires_at: datetime | None = Field(default=None, index=True)
     session_id: Optional[str] = Field(default=None, index=True)
+    # Durable public run snapshot; never re-resolve from mutable preferences on retry.
+    language_context_json: Optional[dict[str, Any]] = Field(
+        default=None,
+        sa_column=Column(JSON, nullable=True),
+    )
     created_at: datetime = Field(default_factory=utc_now)
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
@@ -171,10 +401,37 @@ class A2ATaskRun(SQLModel, table=True):
     """Durable state for outbound A2A calls and locally served A2A tasks."""
 
     __tablename__ = "a2a_task_runs"
+    __table_args__ = (
+        CheckConstraint(
+            "owner_scope IS NOT NULL AND owner_scope IN ('tenant', 'system')",
+            name="ck_a2a_task_runs_owner_scope",
+        ),
+        CheckConstraint(
+            "direction IS NOT NULL AND direction IN ('client', 'server')",
+            name="ck_a2a_task_runs_direction",
+        ),
+        CheckConstraint(
+            "(owner_scope = 'tenant' "
+            "AND tenant_id IS NOT NULL "
+            "AND system_runtime_key IS NULL "
+            "AND tenant_lifecycle_version IS NOT NULL "
+            "AND tenant_lifecycle_version > 0) "
+            "OR (owner_scope = 'system' "
+            "AND tenant_id IS NULL "
+            "AND system_runtime_key IS NOT NULL "
+            "AND length(trim(system_runtime_key)) > 0 "
+            "AND length(system_runtime_key) <= 128 "
+            "AND tenant_lifecycle_version IS NULL)",
+            name="ck_a2a_task_runs_owner_shape",
+        ),
+    )
 
     id: str = Field(default_factory=lambda: new_id("a2arun"), primary_key=True)
+    owner_scope: str | None = Field(default=None, index=True, min_length=1, max_length=16)
     direction: str = Field(default="client", index=True)
-    tenant_id: str = Field(index=True)
+    tenant_id: str | None = Field(default=None, index=True)
+    system_runtime_key: str | None = Field(default=None, index=True, max_length=128)
+    tenant_lifecycle_version: int | None = Field(default=None, index=True, gt=0)
     tool_id: Optional[str] = Field(default=None, index=True)
     agent_id: Optional[str] = Field(default=None, index=True)
     session_id: Optional[str] = Field(default=None, index=True)
@@ -192,13 +449,62 @@ class A2ATaskRun(SQLModel, table=True):
     error_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     artifacts_json: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
     agent_card_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    # Local execution snapshot; remote protocol payloads remain unchanged and raw.
+    language_context_json: Optional[dict[str, Any]] = Field(
+        default=None,
+        sa_column=Column(JSON, nullable=True),
+    )
     last_event_id: Optional[str] = Field(default=None, index=True)
     cancel_requested: bool = False
     recovery_attempts: int = 0
+    # Durable worker claim shared by tenant-client recovery and system Codex execution.
+    # Generation prevents a worker whose lease expired from publishing over its successor.
+    worker_owner: str | None = Field(default=None, index=True, max_length=128)
+    worker_generation: int = Field(default=0, ge=0)
+    worker_lease_until: datetime | None = Field(default=None, index=True)
     created_at: datetime = Field(default_factory=utc_now)
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
     updated_at: datetime = Field(default_factory=utc_now)
+
+    @classmethod
+    def model_validate(cls, obj: Any, **kwargs: Any) -> A2ATaskRun:
+        """Let Pydantic create its internal blank model before the shared guard validates parsed fields."""
+        token = _a2a_model_validation_active.set(True)
+        try:
+            return super().model_validate(obj, **kwargs)
+        finally:
+            _a2a_model_validation_active.reset(token)
+
+    @model_validator(mode="after")
+    def validate_owner_shape(self) -> A2ATaskRun:
+        """Apply the same owner contract when callers explicitly use Pydantic model validation."""
+        _require_a2a_owner_shape(
+            owner_scope=self.owner_scope,
+            tenant_id=self.tenant_id,
+            system_runtime_key=self.system_runtime_key,
+            tenant_lifecycle_version=self.tenant_lifecycle_version,
+            direction=self.direction,
+        )
+        return self
+
+
+@event.listens_for(A2ATaskRun, "init")
+def _validate_a2a_task_run_constructor(
+    _target: A2ATaskRun,
+    _args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> None:
+    """Run the shared owner guard for direct table-model construction without disrupting model_validate."""
+    if _a2a_model_validation_active.get() and not kwargs:
+        return
+    _require_a2a_owner_shape(
+        owner_scope=kwargs.get("owner_scope"),
+        tenant_id=kwargs.get("tenant_id"),
+        system_runtime_key=kwargs.get("system_runtime_key"),
+        tenant_lifecycle_version=kwargs.get("tenant_lifecycle_version"),
+        direction=kwargs.get("direction", "client"),
+    )
 
 
 class A2ATaskEvent(SQLModel, table=True):
@@ -208,7 +514,6 @@ class A2ATaskEvent(SQLModel, table=True):
     )
 
     id: str = Field(default_factory=lambda: new_id("a2aevt"), primary_key=True)
-    tenant_id: str = Field(index=True)
     run_id: str = Field(index=True)
     sequence: int = Field(index=True)
     external_event_id: Optional[str] = Field(default=None, index=True)
@@ -240,6 +545,7 @@ class WebhookDelivery(SQLModel, table=True):
 
     id: str = Field(default_factory=lambda: new_id("whdelivery"), primary_key=True)
     tenant_id: str = Field(index=True)
+    tenant_lifecycle_version: int = Field(default=1, index=True, gt=0)
     endpoint_id: str = Field(index=True)
     event_id: str = Field(index=True)
     event_type: str = Field(index=True)
@@ -251,6 +557,8 @@ class WebhookDelivery(SQLModel, table=True):
     next_attempt_at: Optional[datetime] = Field(default=None, index=True)
     last_status_code: Optional[int] = None
     last_error: Optional[str] = None
+    terminal_reason: str | None = Field(default=None, index=True, max_length=120)
+    outcome_unknown: bool = False
     created_at: datetime = Field(default_factory=utc_now)
     delivered_at: Optional[datetime] = None
     updated_at: datetime = Field(default_factory=utc_now)
@@ -420,6 +728,8 @@ class KnowledgeBase(SQLModel, table=True):
     name: str
     description: Optional[str] = None
     status: str = Field(default="active", index=True)
+    mode: str = Field(default="dedicated", index=True)
+    published_version_id: str | None = Field(default=None, index=True)
     capability_scope: str = Field(default="general", index=True)
     metadata_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     created_at: datetime = Field(default_factory=utc_now)
@@ -439,6 +749,13 @@ class KnowledgeBaseVersion(SQLModel, table=True):
     name: str
     description: Optional[str] = None
     status: str = Field(default="active", index=True)
+    parent_version_id: str | None = Field(default=None, index=True)
+    publication_state: str = Field(default="released", index=True)
+    source_team_id: str | None = Field(default=None, index=True)
+    created_by_agent_id: str | None = Field(default=None, index=True)
+    created_by_user_id: str | None = Field(default=None, index=True)
+    change_reason: str | None = None
+    published_at: datetime | None = None
     capability_scope: str = Field(default="general", index=True)
     metadata_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     created_at: datetime = Field(default_factory=utc_now)
@@ -572,11 +889,15 @@ class KnowledgeIngestJob(SQLModel, table=True):
 
     id: str = Field(default_factory=lambda: new_id("kjob"), primary_key=True)
     tenant_id: str = Field(index=True)
+    tenant_lifecycle_version: int = Field(default=1, index=True, gt=0)
     knowledge_base_id: str = Field(index=True)
     knowledge_base_version_id: Optional[str] = Field(default=None, index=True)
     document_id: Optional[str] = Field(default=None, index=True)
     filename: str
     status: str = Field(default="queued", index=True)
+    execution_owner: Optional[str] = Field(default=None, index=True)
+    execution_generation: int = Field(default=0, index=True, ge=0)
+    lease_expires_at: Optional[datetime] = Field(default=None, index=True)
     stage: str = "queued"
     progress: float = 0.0
     error: Optional[str] = None
@@ -594,9 +915,10 @@ class ModelConfig(SQLModel, table=True):
     tenant_id: str = Field(index=True)
     name: str
     provider: str = "openai_compatible"
+    auth_mode: str = Field(default="api_key", index=True)
     api_protocol: str = Field(default="openai_chat_completions", index=True)
     base_url: Optional[str] = None
-    api_key_encrypted: str
+    api_key_encrypted: str = ""
     model: str
     temperature: float = 0.2
     max_output_tokens: int = 8192
@@ -639,6 +961,17 @@ class UIConfig(SQLModel, table=True):
     show_tool_trace: bool = True
     reflection_max_rounds: int = 1
     agent_loop_max_actions: int = 32
+    context_token_budget: int = 32_000
+    context_compaction_trigger_ratio: float = 0.70
+    context_recent_round_limit: int = 6
+    context_long_summary_token_budget: int = 4_000
+    context_medium_summary_token_budget: int = 4_000
+    context_allowed_roles: list[str] = Field(
+        default_factory=lambda: ["user", "assistant"],
+        sa_column=Column(JSON),
+    )
+    context_long_summary_prefix: str = "历史的信息可以被总结为："
+    context_medium_summary_prefix: str = "近期的历史信息总结为："
     sandbox_enabled: bool = False
     sandbox_network_mode: str = Field(default="all")
     sandbox_allowed_domains: list[str] = Field(default_factory=list, sa_column=Column(JSON))
@@ -764,11 +1097,75 @@ class MCPServer(SQLModel, table=True):
         default_factory=dict,
         sa_column=Column(JSON),
     )
+    # OAuth policy is shared, while every token remains in a separate user grant.
+    auth_mode: str = Field(default="none", index=True)
+    oauth_client_id: Optional[str] = None
+    oauth_client_metadata_url: Optional[str] = None
+    oauth_redirect_uri: Optional[str] = None
     # 最近一次发现的原始工具定义（预览/审计用）
     discovered_tools_json: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
     last_synced_at: Optional[datetime] = None
     capability_scope: str = Field(default="general", index=True)
     enabled: bool = True
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class MCPUserOAuthGrant(SQLModel, table=True):
+    """Encrypted personal OAuth state for one tenant, MCP server, and user."""
+
+    __tablename__ = "mcp_user_oauth_grants"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "server_id",
+            "user_id",
+            name="uq_mcp_oauth_grant_owner",
+        ),
+        Index(
+            "ix_mcp_oauth_grants_tenant_user_status",
+            "tenant_id",
+            "user_id",
+            "status",
+        ),
+    )
+
+    id: str = Field(default_factory=lambda: new_id("mcpgrant"), primary_key=True)
+    tenant_id: str = Field(index=True)
+    server_id: str = Field(index=True)
+    user_id: str = Field(index=True)
+    config_fingerprint: str = Field(default="")
+    encrypted_payload: str
+    expires_at: Optional[datetime] = Field(default=None, index=True)
+    status: str = Field(default="authorizing", index=True)
+    version: int = 1
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class MCPOAuthFlow(SQLModel, table=True):
+    """Credential-free audit record for one bounded browser authorization attempt."""
+
+    __tablename__ = "mcp_oauth_flows"
+    __table_args__ = (
+        UniqueConstraint("state_digest", name="uq_mcp_oauth_flow_state_digest"),
+        Index(
+            "ix_mcp_oauth_flows_state_status_expiry",
+            "state_digest",
+            "status",
+            "expires_at",
+        ),
+    )
+
+    id: str = Field(default_factory=lambda: new_id("mcpflow"), primary_key=True)
+    tenant_id: str = Field(index=True)
+    server_id: str = Field(index=True)
+    user_id: str = Field(index=True)
+    state_digest: str = Field(index=True)
+    redirect_uri: str
+    status: str = Field(default="pending", index=True)
+    expires_at: datetime = Field(index=True)
+    error_code: Optional[str] = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 
@@ -813,6 +1210,11 @@ class ChatSession(SQLModel, table=True):
     summary: Optional[str] = None
     last_agent_question: Optional[str] = None
     status: str = "active"
+    # Existing sessions keep one authoritative Agent reply locale across retries and resumes.
+    agent_reply_locale: Optional[str] = Field(default=None)
+    agent_reply_locale_source: Optional[str] = Field(default=None)
+    # Machine-owned classification stays independent from raw, user-visible session titles.
+    session_kind: Optional[str] = Field(default=None, index=True)
     channel: Optional[str] = None
     external_conv_id: Optional[str] = None
     channel_target_json: Optional[dict[str, Any]] = Field(default=None, sa_column=Column(JSON))
@@ -833,6 +1235,8 @@ class ChannelBinding(SQLModel, table=True):
     tenant_id: str = Field(index=True)
     agent_id: str = Field(index=True)
     channel: str = Field(default="wechat", index=True)
+    # 用户可编辑的接入显示名;为空时前端回退展示渠道类型名
+    name: Optional[str] = Field(default=None)
     # 团队绑定:非空表示该渠道接入某团队(与员工挂载互斥),入站消息直路由团队 TL;
     # 存 team_id 不存 leader,换帅自动跟随
     team_id: Optional[str] = Field(default=None, index=True)
@@ -857,6 +1261,59 @@ class ChannelBinding(SQLModel, table=True):
     # 最近一次成功连上渠道的时间(企微断开超时告警的时间基准)
     last_connected_at: Optional[datetime] = None
     created_by_user_id: Optional[str] = Field(default=None, index=True)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class WeChatKfAccount(SQLModel, table=True):
+    """Persist one WeChat客服 account route under a tenant-owned channel binding."""
+
+    __tablename__ = "wechat_kf_accounts"
+    __table_args__ = (
+        UniqueConstraint("binding_id", "open_kfid", name="uq_wechat_kf_account_binding_kfid"),
+        UniqueConstraint("tenant_id", "open_kfid", name="uq_wechat_kf_account_tenant_kfid"),
+    )
+
+    id: str = Field(default_factory=lambda: new_id("wka"), primary_key=True)
+    tenant_id: str = Field(index=True)
+    binding_id: str = Field(index=True)
+    open_kfid: str = Field(index=True)
+    name: str = ""
+    agent_id: str | None = Field(default=None, index=True)
+    team_id: str | None = Field(default=None, index=True)
+    status: str = Field(default="active", index=True)
+    sync_cursor: str = ""
+    last_error: str | None = None
+    last_sync_at: datetime | None = None
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class WeChatKfAccountOperation(SQLModel, table=True):
+    """Persist a recoverable provider/local account-management operation intent."""
+
+    __tablename__ = "wechat_kf_account_operations"
+    __table_args__ = (
+        Index(
+            "ix_wechat_kf_account_operations_binding_status",
+            "binding_id",
+            "status",
+        ),
+    )
+
+    id: str = Field(default_factory=lambda: new_id("wko"), primary_key=True)
+    tenant_id: str = Field(index=True)
+    binding_id: str = Field(index=True)
+    kind: str = Field(index=True)
+    status: str = Field(default="prepared", index=True)
+    open_kfid: str | None = Field(default=None, index=True)
+    desired_name: str = ""
+    desired_media_id: str | None = None
+    binding_revision: int = 0
+    attempts: int = 0
+    last_error_code: str | None = None
+    provider_applied_at: datetime | None = None
+    completed_at: datetime | None = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 
@@ -978,6 +1435,7 @@ class ChannelInboundEvent(SQLModel, table=True):
 
     id: str = Field(default_factory=lambda: new_id("chevt"), primary_key=True)
     tenant_id: str = Field(index=True)
+    tenant_lifecycle_version: int = Field(default=1, index=True, gt=0)
     binding_id: str = Field(index=True)
     channel: str = Field(index=True)
     event_id: str
@@ -1000,6 +1458,11 @@ class ChannelInboundEvent(SQLModel, table=True):
     # 创建/接管该事件的进程启动代次；当前代次仍在运行时禁止按墙钟误接管。
     processor_run_id: Optional[str] = Field(default=None, index=True)
     processor_lease_expires_at: Optional[datetime] = Field(default=None, index=True)
+    # Capture the ingress turn's language choices before asynchronous processing.
+    language_context_json: Optional[dict[str, Any]] = Field(
+        default=None,
+        sa_column=Column(JSON, nullable=True),
+    )
     error: Optional[str] = None
     processed_at: Optional[datetime] = None
     created_at: datetime = Field(default_factory=utc_now)
@@ -1011,6 +1474,7 @@ class ChannelDelivery(SQLModel, table=True):
 
     id: str = Field(default_factory=lambda: new_id("chdlv"), primary_key=True)
     tenant_id: str = Field(index=True)
+    tenant_lifecycle_version: int = Field(default=1, index=True, gt=0)
     binding_id: str = Field(index=True)
     session_id: str = Field(index=True)
     message_id: Optional[str] = Field(default=None, index=True)
@@ -1037,6 +1501,11 @@ class ChannelDelivery(SQLModel, table=True):
     # 第一次真正尝试远端发送的时间，用于飞书 UUID 一小时去重窗口
     first_attempt_at: Optional[datetime] = None
     delivered_at: Optional[datetime] = None
+    # Repeated delivery sends the already-localized text under this exact snapshot.
+    language_context_json: Optional[dict[str, Any]] = Field(
+        default=None,
+        sa_column=Column(JSON, nullable=True),
+    )
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 
@@ -1064,6 +1533,11 @@ class HumanHandoffRequest(SQLModel, table=True):
     # 飞书 handoff_notice 投递成功后回写的飞书 message_id;阶段 4 据此关联处理人回复。
     # 网页触发的 handoff 无此字段(为空),不影响现有网页回复链路。
     notify_message_id: Optional[str] = Field(default=None, index=True)
+    # Handoff/resume keeps the source turn's immutable language choices.
+    language_context_json: Optional[dict[str, Any]] = Field(
+        default=None,
+        sa_column=Column(JSON, nullable=True),
+    )
 
 
 class ScheduledTask(SQLModel, table=True):
@@ -1093,6 +1567,11 @@ class ScheduledTask(SQLModel, table=True):
     lease_until: Optional[datetime] = Field(default=None, index=True)
     source_session_id: Optional[str] = Field(default=None, index=True)
     metadata_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    # Scheduled executions inherit this snapshot instead of current user settings.
+    language_context_json: Optional[dict[str, Any]] = Field(
+        default=None,
+        sa_column=Column(JSON, nullable=True),
+    )
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 
@@ -1105,6 +1584,7 @@ class ScheduledTaskRun(SQLModel, table=True):
 
     id: str = Field(default_factory=lambda: new_id("schedrun"), primary_key=True)
     tenant_id: str = Field(index=True)
+    tenant_lifecycle_version: int = Field(default=1, index=True, gt=0)
     scheduled_task_id: str = Field(index=True)
     agent_id: str = Field(index=True)
     user_id: str = Field(index=True)
@@ -1116,6 +1596,11 @@ class ScheduledTaskRun(SQLModel, table=True):
     result_summary: Optional[str] = None
     error: Optional[str] = None
     trace_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    # Each retry/recovery uses the run snapshot captured at enqueue time.
+    language_context_json: Optional[dict[str, Any]] = Field(
+        default=None,
+        sa_column=Column(JSON, nullable=True),
+    )
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 
@@ -1159,6 +1644,7 @@ class HarnessTaskFrameRecord(SQLModel, table=True):
 
     id: str = Field(default_factory=lambda: new_id("htask"), primary_key=True)
     tenant_id: str = Field(index=True)
+    tenant_lifecycle_version: int = Field(default=1, index=True, gt=0)
     session_id: str = Field(index=True)
     source_turn_id: str = Field(index=True)
     task_id: str = Field(index=True)
@@ -1169,6 +1655,7 @@ class HarnessTaskFrameRecord(SQLModel, table=True):
     sequence: int = 0
     skill_id: Optional[str] = Field(default=None, index=True)
     step_id: Optional[str] = Field(default=None, index=True)
+    workspace_root: Optional[str] = None
     user_intent: Optional[str] = None
     requirements_json: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     slots_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
@@ -1178,6 +1665,11 @@ class HarnessTaskFrameRecord(SQLModel, table=True):
     )
     result_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     error_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    # Durable task-frame snapshot used by recovery and replay.
+    language_context_json: Optional[dict[str, Any]] = Field(
+        default=None,
+        sa_column=Column(JSON, nullable=True),
+    )
     state_version: int = 1
     attempt_no: int = 0
     lease_owner: Optional[str] = Field(default=None, index=True)
@@ -1191,6 +1683,7 @@ class HarnessRunRecord(SQLModel, table=True):
 
     id: str = Field(default_factory=lambda: new_id("hrun"), primary_key=True)
     tenant_id: str = Field(index=True)
+    tenant_lifecycle_version: int = Field(default=1, index=True, gt=0)
     session_id: str = Field(index=True)
     task_frame_record_id: str = Field(index=True)
     agent_loop_id: Optional[str] = Field(default=None, index=True)
@@ -1208,6 +1701,11 @@ class HarnessRunRecord(SQLModel, table=True):
         default_factory=dict, sa_column=Column(JSON)
     )
     result_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    # Durable run snapshot; absence is only valid for pre-migration records.
+    language_context_json: Optional[dict[str, Any]] = Field(
+        default=None,
+        sa_column=Column(JSON, nullable=True),
+    )
     started_at: datetime = Field(default_factory=utc_now)
     finished_at: Optional[datetime] = None
     created_at: datetime = Field(default_factory=utc_now)
@@ -1229,6 +1727,7 @@ class HarnessTurnRecord(SQLModel, table=True):
 
     id: str = Field(default_factory=lambda: new_id("hturn"), primary_key=True)
     tenant_id: str = Field(index=True)
+    tenant_lifecycle_version: int = Field(default=1, index=True, gt=0)
     session_id: str = Field(index=True)
     client_turn_id: str = Field(index=True)
     request_digest: str = Field(index=True)
@@ -1243,6 +1742,11 @@ class HarnessTurnRecord(SQLModel, table=True):
     error_json: dict[str, Any] = Field(
         default_factory=dict,
         sa_column=Column(JSON),
+    )
+    # Exactly-once receipt includes the locale snapshot used to produce its response.
+    language_context_json: Optional[dict[str, Any]] = Field(
+        default=None,
+        sa_column=Column(JSON, nullable=True),
     )
     started_at: datetime = Field(default_factory=utc_now)
     finished_at: Optional[datetime] = None
@@ -1281,6 +1785,7 @@ class HarnessInvocationRecord(SQLModel, table=True):
 
     id: str = Field(default_factory=lambda: new_id("hinvoke"), primary_key=True)
     tenant_id: str = Field(index=True)
+    tenant_lifecycle_version: int = Field(default=1, index=True, gt=0)
     session_id: str = Field(index=True)
     task_id: str = Field(index=True)
     run_id: str = Field(index=True)
@@ -1301,6 +1806,11 @@ class HarnessInvocationRecord(SQLModel, table=True):
         sa_column=Column(JSON),
     )
     approval_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    # Tool execution remains tied to the source turn's language context.
+    language_context_json: Optional[dict[str, Any]] = Field(
+        default=None,
+        sa_column=Column(JSON, nullable=True),
+    )
     started_at: datetime = Field(default_factory=utc_now)
     finished_at: Optional[datetime] = None
     created_at: datetime = Field(default_factory=utc_now)
@@ -1428,6 +1938,7 @@ class Team(SQLModel, table=True):
     name: str
     description: Optional[str] = None
     owner_user_id: str = Field(index=True)
+    default_knowledge_base_id: str | None = Field(default=None, index=True)
     # 预留:并发策略/竞标等团队级配置
     config_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     status: str = Field(default="active", index=True)
@@ -1447,6 +1958,112 @@ class TeamMember(SQLModel, table=True):
     created_at: datetime = Field(default_factory=utc_now)
 
 
+class TeamKnowledgeBaseBinding(SQLModel, table=True):
+    __tablename__ = "team_knowledge_base_bindings"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "team_id",
+            "knowledge_base_id",
+            name="uq_team_knowledge_base_binding",
+        ),
+    )
+
+    id: str = Field(default_factory=lambda: new_id("teamkb"), primary_key=True)
+    tenant_id: str = Field(index=True)
+    team_id: str = Field(index=True)
+    knowledge_base_id: str = Field(index=True)
+    status: str = Field(default="active", index=True)
+    revision: int = Field(default=1, sa_column=Column(Integer, nullable=False))
+    created_by_user_id: str = Field(index=True)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class TeamKnowledgeBaseGrant(SQLModel, table=True):
+    __tablename__ = "team_knowledge_base_grants"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "team_id",
+            "knowledge_base_id",
+            "agent_id",
+            name="uq_team_knowledge_base_grant",
+        ),
+    )
+
+    id: str = Field(default_factory=lambda: new_id("teamkbgrant"), primary_key=True)
+    tenant_id: str = Field(index=True)
+    team_id: str = Field(index=True)
+    knowledge_base_id: str = Field(index=True)
+    agent_id: str = Field(index=True)
+    permission: str = Field(index=True)
+    status: str = Field(default="active", index=True)
+    created_by_user_id: str = Field(index=True)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class KnowledgeBaseAuditEvent(SQLModel, table=True):
+    __tablename__ = "knowledge_base_audit_events"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "actor_id",
+            "action",
+            "idempotency_key",
+            name="uq_knowledge_audit_idempotency",
+        ),
+    )
+
+    id: str = Field(default_factory=lambda: new_id("kbaudit"), primary_key=True)
+    tenant_id: str = Field(index=True)
+    knowledge_base_id: str = Field(index=True)
+    team_id: str | None = Field(default=None, index=True)
+    knowledge_base_version_id: str | None = Field(default=None, index=True)
+    actor_type: str = Field(index=True)
+    actor_id: str = Field(index=True)
+    action: str = Field(index=True)
+    idempotency_key: str | None = Field(default=None, index=True)
+    reason: str | None = None
+    details_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class TeamRun(SQLModel, table=True):
+    """One durable TL plan from delegation through final team synthesis."""
+
+    __tablename__ = "team_runs"
+    __table_args__ = (
+        UniqueConstraint(
+            "tl_session_id",
+            "source_turn_id",
+            name="uq_team_run_tl_session_source_turn",
+        ),
+    )
+
+    id: str = Field(default_factory=lambda: new_id("team_run"), primary_key=True)
+    team_id: str = Field(index=True)
+    tenant_id: str = Field(index=True)
+    tenant_lifecycle_version: int = Field(default=1, index=True, gt=0)
+    tl_session_id: str = Field(index=True)
+    source_turn_id: str = Field(index=True)
+    created_by_user_id: Optional[str] = Field(default=None, index=True)
+    # planning -> running/awaiting_input -> synthesizing -> completed/failed
+    status: str = Field(default="planning", index=True)
+    synthesis_session_id: Optional[str] = Field(default=None, index=True)
+    final_message_id: Optional[str] = Field(default=None, index=True)
+    error: Optional[str] = None
+    # Team synthesis must inherit the initiating turn's immutable snapshot.
+    language_context_json: Optional[dict[str, Any]] = Field(
+        default=None,
+        sa_column=Column(JSON, nullable=True),
+    )
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+    completed_at: Optional[datetime] = None
+
+
 class TeamTask(SQLModel, table=True):
     """团队任务:blocked -> pending -> in_progress -> review -> done/rework/escalated;
 
@@ -1458,6 +2075,9 @@ class TeamTask(SQLModel, table=True):
     id: str = Field(default_factory=lambda: new_id("team_task"), primary_key=True)
     team_id: str = Field(index=True)
     tenant_id: str = Field(index=True)
+    tenant_lifecycle_version: int = Field(default=1, index=True, gt=0)
+    team_run_id: Optional[str] = Field(default=None, index=True)
+    source_turn_id: Optional[str] = Field(default=None, index=True)
     parent_task_id: Optional[str] = Field(default=None, index=True)
     title: str
     description: Optional[str] = None
@@ -1471,6 +2091,11 @@ class TeamTask(SQLModel, table=True):
     activation_condition_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     report_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     review_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    # Delegated member work uses the source TeamRun snapshot.
+    language_context_json: Optional[dict[str, Any]] = Field(
+        default=None,
+        sa_column=Column(JSON, nullable=True),
+    )
     # 乐观锁版本号,人改判/验收并发时防覆盖
     version: int = 0
     created_at: datetime = Field(default_factory=utc_now)
@@ -1501,6 +2126,11 @@ class TeamWakeEvent(SQLModel, table=True):
     id: str = Field(default_factory=lambda: new_id("team_wake"), primary_key=True)
     team_id: str = Field(index=True)
     tenant_id: str = Field(index=True)
+    tenant_lifecycle_version: int = Field(default=1, index=True, gt=0)
+    # 每次认领都绑定唯一 owner 与单调 generation；租约过期接管后，旧 worker 的迟到结果不得落库。
+    worker_owner: str | None = Field(default=None, index=True, max_length=128)
+    worker_generation: int = Field(default=0, ge=0)
+    worker_lease_until: datetime | None = Field(default=None, index=True)
     target_agent_id: str = Field(index=True)
     # trigger_type: task_assigned / task_report / task_rework / tl_message 等
     trigger_type: str = Field(index=True)
@@ -1508,6 +2138,11 @@ class TeamWakeEvent(SQLModel, table=True):
     # status: pending -> claimed -> done / failed
     status: str = Field(default="pending", index=True)
     error: Optional[str] = None
+    # Background wakeups must not resolve language from a later mutable preference.
+    language_context_json: Optional[dict[str, Any]] = Field(
+        default=None,
+        sa_column=Column(JSON, nullable=True),
+    )
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 

@@ -16,8 +16,8 @@ from app.db.models import (
     Tenant,
     User,
 )
-from app.evolution.service import EvolutionService, _json_diff, _risk_for_sop_diff
 from app.evolution.schema import EvolutionAnalyzeRequest
+from app.evolution.service import EvolutionService, _json_diff, _risk_for_sop_diff
 
 
 def _session() -> Session:
@@ -210,7 +210,9 @@ def test_analyze_without_feedback_returns_localizable_error_code() -> None:
             )
 
         assert caught.value.status_code == 404
-        assert caught.value.detail == {
-            "code": "EVOLUTION_FEEDBACK_NOT_FOUND",
-            "message": "未找到可用于改进的 Skill 或 SOP 反馈",
-        }
+        assert caught.value.detail["code"] == "EVOLUTION_FEEDBACK_NOT_FOUND"
+        assert caught.value.detail["params"] == {}
+        assert caught.value.detail["retryable"] is False
+        assert caught.value.detail["status"] == 404
+        assert "message" not in caught.value.detail
+        assert "未找到可用于改进的 Skill 或 SOP 反馈" not in repr(caught.value.detail)

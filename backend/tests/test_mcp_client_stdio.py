@@ -18,6 +18,7 @@ from app.tools.mcp_client import (
     _send_json,
     _StderrCollector,
     _StdioSession,
+    _validate_remote_mcp_url,
     execute_mcp_tool,
     list_mcp_tools,
 )
@@ -44,6 +45,35 @@ class _PagedToolSession(_MCPSession):
 
     def _notify(self, method: str, params: dict[str, object]) -> None:  # type: ignore[override]
         self.requests.append((method, params))
+
+
+def test_remote_mcp_url_rejects_private_and_loopback_targets(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "app.tools.mcp_client.socket.getaddrinfo",
+        lambda *args, **kwargs: [(2, 1, 6, "", ("10.20.30.40", 443))],
+    )
+
+    with pytest.raises(MCPClientError, match="私有网络"):
+        _validate_remote_mcp_url("https://mcp.example.test/rpc")
+    with pytest.raises(MCPClientError, match="私有网络"):
+        _validate_remote_mcp_url("http://127.0.0.1:8080/mcp")
+    with pytest.raises(MCPClientError, match="私有网络"):
+        _validate_remote_mcp_url("http://[::1]/mcp")
+
+
+def test_remote_mcp_url_accepts_only_public_http_endpoints(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "app.tools.mcp_client.socket.getaddrinfo",
+        lambda *args, **kwargs: [(2, 1, 6, "", ("93.184.216.34", 443))],
+    )
+
+    assert _validate_remote_mcp_url("https://mcp.example.test/rpc?tenant=demo") == (
+        "https://mcp.example.test/rpc?tenant=demo"
+    )
+    with pytest.raises(MCPClientError, match="HTTP"):
+        _validate_remote_mcp_url("file:///tmp/mcp.sock")
+    with pytest.raises(MCPClientError, match="凭据"):
+        _validate_remote_mcp_url("https://user:secret@mcp.example.test/rpc")
 
 
 class _WindowsAnonymousPipe(io.StringIO):

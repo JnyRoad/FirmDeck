@@ -221,17 +221,33 @@ class Service:
                 self.start()
 
     def healthy(self) -> bool:
+        """Return whether the configured health URL responds below 500.
+
+        A missing URL is healthy, request failures are unhealthy, and close-time OSError is ignored.
+        """
         if not self.health_url:
             return True
+        response = None
         try:
-            with urllib.request.urlopen(self.health_url, timeout=2) as response:
-                response.read()
-                return 200 <= response.status < 500
+            response = urllib.request.urlopen(self.health_url, timeout=2)
+            return 200 <= response.status < 500
         except Exception:
             return False
+        finally:
+            if response is not None:
+                try:
+                    close = getattr(response, "close", None)
+                    if close:
+                        close()
+                except OSError:
+                    pass
 
 
 def build_services() -> list[Service]:
+    """Build unstarted services for the configured development port mode.
+
+    The returned definitions read module configuration but do not launch processes or write files.
+    """
     backend_python = _backend_python()
     if SINGLE_PORT:
         return [

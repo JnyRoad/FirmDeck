@@ -3,7 +3,7 @@ import tailwindcss from '@tailwindcss/vite';
 import { loadEnv } from 'vite';
 import react from '@vitejs/plugin-react';
 import svgr from 'vite-plugin-svgr';
-import { defineConfig } from 'vitest/config';
+import { configDefaults, defineConfig } from 'vitest/config';
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '');
@@ -16,6 +16,11 @@ export default defineConfig(({ mode }) => {
     },
     base: '/',
     test: {
+      exclude: [
+        ...configDefaults.exclude,
+        'tests/e2e/**',
+        'scripts/i18n/fixtures/**',
+      ],
       setupFiles: ['./src/test/setup.ts'],
       environmentOptions: {
         jsdom: {

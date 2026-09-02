@@ -3,14 +3,14 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Query
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from sqlmodel import Session, select
 
-from app.api.chat import _build_turn_traces, session_read
-from app.session.message_read import message_read
+from app.api.chat import _build_turn_traces, _sanitized_session_event_payload, session_read
+from app.contracts.http import build_http_exception
 from app.core.harness_session_cleanup import stage_harness_session_execution_reset
 from app.db import get_session
 from app.db.models import (
@@ -29,6 +29,7 @@ from app.observability.session_timings import enrich_turn_traces_with_timings
 from app.security.auth import get_current_user
 from app.security.permissions import agent_owned_by_user, is_admin_user
 from app.security.tenant import ensure_tenant
+from app.session.message_read import message_read
 from app.session.message_visibility import visible_message_content, visible_message_rows
 
 router = APIRouter(prefix="/api/enterprise/sessions", tags=["enterprise:sessions"])
@@ -197,6 +198,7 @@ def _build_session_detail_payload(
     invocation_rows: list[HarnessInvocationRecord],
     skill_names: dict[str, str],
 ) -> dict:
+    """Project one enterprise session detail payload without leaking raw event failures."""
     feedback_by_message = {item.message_id: item for item in feedback_rows}
     traces = enrich_turn_traces_with_timings(
         _build_turn_traces(messages, events, skill_names),
@@ -225,7 +227,9 @@ def _build_session_detail_payload(
             {
                 "id": event.id,
                 "event_type": event.event_type,
-                "payload": event.payload_json,
+                "payload": _sanitized_session_event_payload(
+                    event.event_type, event.payload_json or {}
+                ),
                 "created_at": event.created_at.isoformat(),
             }
             for event in events
@@ -331,7 +335,7 @@ def _can_view_all_agent_sessions(
         return False
     agent = db.get(AgentProfile, agent_id)
     if not agent or agent.tenant_id != tenant_id:
-        raise HTTPException(status_code=404, detail="Agent not found")
+        raise build_http_exception("SESSION_AGENT_NOT_FOUND")
     if agent.is_overall:
         # is_overall 员工只有 admin 可看全部，创建者永不匹配
         return False
@@ -347,7 +351,7 @@ def _get_visible_chat_session(
     ensure_tenant(db, tenant_id)
     row = db.get(ChatSession, session_id)
     if not row or row.tenant_id != tenant_id:
-        raise HTTPException(status_code=404, detail="Session not found")
+        raise build_http_exception("SESSION_NOT_FOUND")
     if row.user_id == current_user.id or is_admin_user(current_user):
         return row
     agent = db.get(AgentProfile, row.agent_id) if row.agent_id else None
@@ -358,7 +362,7 @@ def _get_visible_chat_session(
         and agent_owned_by_user(agent, current_user)
     ):
         return row
-    raise HTTPException(status_code=404, detail="Session not found")
+    raise build_http_exception("SESSION_NOT_FOUND")
 
 
 def _session_payloads(db: Session, rows: list[ChatSession]) -> list[dict]:
@@ -385,4 +389,4 @@ def _session_payloads(db: Session, rows: list[ChatSession]) -> list[dict]:
 
 def _ensure_request_tenant(tenant_id: str, current_user: User) -> None:
     if tenant_id != current_user.tenant_id:
-        raise HTTPException(status_code=403, detail="Tenant mismatch")
+        raise build_http_exception("TENANT_MISMATCH")

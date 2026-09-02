@@ -17,6 +17,7 @@ from app.db.models import (
     User,
     utc_now,
 )
+from app.i18n.language_context import LanguageContext, LocaleResolutionSource
 from app.session.session_schema import ChatTurnRequest, RouterDecision, StepAgentResult
 from app.session.slot_policy import strip_router_generated_message_slots
 
@@ -264,6 +265,12 @@ def test_handoff_assignee_uses_requester_when_no_owner_or_admin_exists():
 
 
 def test_handoff_finalize_creates_pending_request_for_declared_step():
+    context = LanguageContext(
+        ui_locale="en-US",
+        agent_reply_locale="zh-CN",
+        ui_locale_source=LocaleResolutionSource.EXPLICIT_REQUEST,
+        agent_reply_locale_source=LocaleResolutionSource.EXPLICIT_REQUEST,
+    )
     loop = AgentLoop.__new__(AgentLoop)
     db = FakeDb(
         exec_results=[
@@ -291,6 +298,7 @@ def test_handoff_finalize_creates_pending_request_for_declared_step():
     )
     loop.db = db
     loop.events = FakeEvents()
+    loop._language_context = context
     loop._should_complete_skill = lambda *_args, **_kwargs: False
     session = _handoff_session()
 
@@ -316,6 +324,7 @@ def test_handoff_finalize_creates_pending_request_for_declared_step():
     assert handoff.trigger_step_id == "manual_review"
     assert handoff.resume_payload_json["slots"] == {"order_id": "A001"}
     assert handoff.pending_question == "需要人工复核订单 A001"
+    assert handoff.language_context_json == context.model_dump(mode="json")
     assert session.awaiting_input_json["handoff_id"] == handoff.id
     assert [record[2] for record in loop.events.records] == ["human_handoff_requested"]
 
@@ -787,6 +796,132 @@ def test_handoff_resume_worker_continues_original_session_once(monkeypatch):
         assert events[0].payload_json["handoff_id"] == "handoff_worker"
 
 
+def test_handoff_resume_worker_prefers_session_user_after_rebind(monkeypatch):
+    """渠道身份重绑后 session.user_id 已迁移,handoff.requester_user_id 是过期快照。
+
+    resume 请求必须以会话属主为准,否则触发 harness 的 session-user 围栏校验
+    (HARNESS_V2_ERROR: Harness session user does not match the request)。
+    """
+    engine = _test_engine()
+    handled_requests: list[ChatTurnRequest] = []
+
+    class FakeAgentLoop:
+        def __init__(self, db: Session) -> None:
+            self.db = db
+
+        def handle_turn(self, request: ChatTurnRequest) -> None:
+            handled_requests.append(request)
+
+    monkeypatch.setattr(chat_api, "engine", engine)
+    monkeypatch.setattr(chat_api, "AgentLoop", FakeAgentLoop)
+    with Session(engine) as db:
+        _admin, user, _other = _seed_handoff_users(db)
+        # 会话属主已被迁移到 admin(重绑后);handoff 快照仍是旧的懒建账号 user。
+        db.add(
+            ChatSession(
+                id="session_rebind",
+                tenant_id="tenant_demo",
+                user_id="admin_user",
+                agent_id="agent_demo",
+                status="active",
+            )
+        )
+        db.add(
+            HumanHandoffRequest(
+                id="handoff_rebind",
+                tenant_id="tenant_demo",
+                session_id="session_rebind",
+                agent_id="agent_demo",
+                requester_user_id=user.id,
+                assignee_user_id="admin_user",
+                trigger_skill_id="manual_skill",
+                trigger_step_id="manual_review",
+                pending_question="请人工确认",
+                status="answered",
+                human_reply="人工答复：继续执行后续流程",
+            )
+        )
+        db.commit()
+
+    chat_api._resume_human_handoff_worker("handoff_rebind")
+
+    assert len(handled_requests) == 1
+    assert handled_requests[0].user_id == "admin_user"
+
+
+def test_handoff_resume_worker_restores_original_wecom_group_target(monkeypatch):
+    """A resumed handoff must return to its original WeCom group target."""
+    engine = _test_engine()
+    session_id = "session_wecom_group_resume"
+    handled_requests: list[ChatTurnRequest] = []
+
+    class FakeAgentLoop:
+        def __init__(self, db: Session) -> None:
+            self.db = db
+
+        def handle_turn(self, request: ChatTurnRequest) -> None:
+            handled_requests.append(request)
+
+    monkeypatch.setattr(chat_api, "engine", engine)
+    monkeypatch.setattr(chat_api, "AgentLoop", FakeAgentLoop)
+    with Session(engine) as db:
+        _admin, user, _other = _seed_handoff_users(db)
+        session = ChatSession(
+            id=session_id,
+            tenant_id="tenant_demo",
+            user_id=user.id,
+            agent_id="agent_demo",
+            channel="web",
+            channel_binding_id=None,
+            channel_account_key=None,
+            external_conv_id="temporary_human_direct_target",
+            channel_target_json={
+                "to_user_id": "admin_user",
+                "context_token": "temporary_human_direct_target",
+            },
+            status="active",
+        )
+        db.add(session)
+        db.add(
+            HumanHandoffRequest(
+                id="handoff_wecom_group_resume",
+                tenant_id="tenant_demo",
+                session_id=session.id,
+                agent_id="agent_demo",
+                requester_user_id=user.id,
+                assignee_user_id="admin_user",
+                status="answered",
+                human_reply="人工回复",
+                resume_payload_json={
+                    "channel": "wecom",
+                    "channel_binding_id": "binding_wecom",
+                    "channel_account_key": "wecom:corp:4:corp:bot:3:bot",
+                    "external_conv_id": "wecom_corp_group_chat_123",
+                    "channel_target": {
+                        "to_user_id": "group_chat_123",
+                        "context_token": "group_chat_123",
+                    },
+                },
+            )
+        )
+        db.commit()
+
+    chat_api._resume_human_handoff_worker("handoff_wecom_group_resume")
+
+    assert len(handled_requests) == 1
+    with Session(engine) as db:
+        restored = db.get(ChatSession, session_id)
+        assert restored is not None
+        assert restored.channel == "wecom"
+        assert restored.channel_binding_id == "binding_wecom"
+        assert restored.channel_account_key == "wecom:corp:4:corp:bot:3:bot"
+        assert restored.external_conv_id == "wecom_corp_group_chat_123"
+        assert restored.channel_target_json == {
+            "to_user_id": "group_chat_123",
+            "context_token": "group_chat_123",
+        }
+
+
 def test_handoff_resume_worker_persists_failed_resume(monkeypatch):
     engine = _test_engine()
 
@@ -833,10 +968,20 @@ def test_handoff_resume_worker_persists_failed_resume(monkeypatch):
         assert handoff.status == "failed"
         assert handoff.metadata_json["resume_started_at"]
         assert handoff.metadata_json["resume_failed_at"]
-        assert "resume failed for session_handoff" in handoff.metadata_json["resume_error"]
+        assert handoff.metadata_json["resume_error"] == {
+            "code": "INTERNAL_ERROR",
+            "params": {},
+            "retryable": False,
+            "request_id": None,
+            "trace_id": None,
+        }
+        assert "resume failed for session_handoff" not in str(handoff.metadata_json)
         events = db.exec(select(AgentEvent).where(AgentEvent.event_type == "human_handoff_resume_failed")).all()
         assert len(events) == 1
         assert events[0].payload_json["handoff_id"] == "handoff_worker_failed"
+        assert events[0].payload_json["error"] == handoff.metadata_json["resume_error"]
+        assert "resume failed for session_handoff" not in str(events[0].payload_json)
+        assert events[0].payload_json["language_context"]["ui_locale"] == "zh-CN"
 
 
 def test_router_generated_message_slots_are_not_persisted():
@@ -851,3 +996,78 @@ def test_router_generated_message_slots_are_not_persisted():
     )
 
     assert cleaned == {"product_id": "A1", "quantity": 1}
+
+
+_HANDOFF_LANGUAGE_MATRIX = (
+    ("zh-CN", "zh-CN"),
+    ("zh-CN", "en-US"),
+    ("en-US", "zh-CN"),
+    ("en-US", "en-US"),
+)
+
+
+@pytest.mark.parametrize(("ui_locale", "agent_reply_locale"), _HANDOFF_LANGUAGE_MATRIX)
+def test_handoff_resume_reuses_bound_snapshot_after_ui_preference_switch(
+    ui_locale: str,
+    agent_reply_locale: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Resume with the source snapshot even when a mutable UI preference changed meanwhile."""
+    context = LanguageContext(
+        ui_locale=ui_locale,
+        agent_reply_locale=agent_reply_locale,
+        ui_locale_source=LocaleResolutionSource.EXPLICIT_REQUEST,
+        agent_reply_locale_source=LocaleResolutionSource.EXPLICIT_REQUEST,
+    )
+    expected_snapshot = context.model_dump(mode="json")
+    raw_human_reply = "人工原始答复：保留 SKU-A/42 与 /kb/C-42.md"
+    handled_requests: list[ChatTurnRequest] = []
+
+    class FakeAgentLoop:
+        def __init__(self, db: Session) -> None:
+            self.db = db
+
+        def handle_turn(self, request: ChatTurnRequest) -> None:
+            """Capture the resumed turn without invoking an actual model."""
+            handled_requests.append(request)
+
+    engine = _test_engine()
+    monkeypatch.setattr(chat_api, "engine", engine)
+    monkeypatch.setattr(chat_api, "AgentLoop", FakeAgentLoop)
+    with Session(engine) as db:
+        _admin, user, _other = _seed_handoff_users(db)
+        user.ui_locale = "en-US" if ui_locale == "zh-CN" else "zh-CN"
+        db.add(user)
+        db.add(
+            ChatSession(
+                id="session_handoff_language",
+                tenant_id="tenant_demo",
+                user_id=user.id,
+                agent_id="agent_demo",
+                status="active",
+            )
+        )
+        db.add(
+            HumanHandoffRequest(
+                id="handoff_language",
+                tenant_id="tenant_demo",
+                session_id="session_handoff_language",
+                agent_id="agent_demo",
+                requester_user_id=user.id,
+                assignee_user_id="admin_user",
+                pending_question="请人工确认",
+                status="answered",
+                human_reply=raw_human_reply,
+                language_context_json=expected_snapshot,
+            )
+        )
+        db.commit()
+
+    chat_api._resume_human_handoff_worker("handoff_language")
+
+    assert len(handled_requests) == 1
+    request = handled_requests[0]
+    assert request.language_context == context
+    assert request.ui_locale.value == ui_locale
+    assert request.agent_reply_locale.value == agent_reply_locale
+    assert request.message == raw_human_reply

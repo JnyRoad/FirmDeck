@@ -6,8 +6,7 @@ import mimetypes
 import re
 import threading
 import time
-import traceback
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from datetime import timedelta
 from urllib.parse import quote
 
@@ -20,23 +19,27 @@ from starlette.background import BackgroundTask
 
 from app.agents.branching import model_for_agent, visible_published_skills
 from app.channels.service_outbox import stage_channel_delivery
+from app.contracts.domain_http import domain_http_error
+from app.contracts.error_registry import ERROR_REGISTRY
+from app.contracts.errors import ErrorDescriptor, ErrorOccurrence, InternalErrorContext, JsonValue
+from app.contracts.projections import project_public_error
 from app.core import AgentLoop
 from app.core.cancellation import cancel_chat_turn, is_chat_turn_cancelled
 from app.core.capability_manifest import CapabilityManifestBuilder
+from app.core.conversation_projection import ConversationProjection
 from app.core.harness_session_cleanup import (
-    harness_task_workspace_path,
-    remove_harness_session_workspace,
-    stage_harness_session_record_deletion,
+    HarnessWorkspaceArtifactConflictError,
+    open_harness_task_artifact,
 )
-from app.core.harness_turn_store import HarnessTurnStore
+from app.core.harness_turn_store import HarnessTurnStore, _prepare_turn_language_context
 from app.core.slash_commands import SlashCommandRead, slash_command_catalog
 from app.db import engine, get_session
 from app.db.models import (
     AgentEvent,
     AgentProfile,
     ChatSession,
-    HarnessTurnRecord,
     HarnessTaskFrameRecord,
+    HarnessTurnRecord,
     HumanHandoffRequest,
     Message,
     MessageFeedback,
@@ -44,17 +47,28 @@ from app.db.models import (
     Skill,
     SkillFeedback,
     Team,
+    Tenant,
     User,
     new_id,
     utc_now,
 )
-from app.feedback import enqueue_feedback_analysis
+from app.feedback.jobs import enqueue_feedback_analysis, resolve_feedback_language_context
 from app.harness import (
     HarnessArtifactAccessError,
     normalize_harness_artifact_path,
-    open_harness_artifact,
+)
+from app.i18n.language_context import (
+    LanguageContext,
+    normalize_locale,
+    resolve_compatible_language_context,
 )
 from app.llm import LLMClient, LLMError
+from app.llm.prompts.language import (
+    language_prompt_contract,
+    localized_cancelled_reply,
+    localized_compat_text,
+    localized_interrupted_reply,
+)
 from app.observability.spans import (
     bind_span_sink,
     llm_operation,
@@ -62,49 +76,65 @@ from app.observability.spans import (
     set_span_sink,
 )
 from app.scheduled_tasks.schema import ScheduledTaskDraftRead
-from app.scheduled_tasks.service import DEFAULT_TASK_TIME, detect_scheduled_task_draft
+from app.scheduled_tasks.service import detect_scheduled_task_draft
 from app.security.auth import get_current_user
 from app.security.permissions import agent_owned_by_user, is_admin_user
-from app.security.tenant import ensure_tenant
+from app.security.tenant import (
+    TenantExecutionKind,
+    TenantLifecycleDecision,
+    TenantLifecycleDenied,
+    ensure_tenant,
+    require_active_tenant,
+    require_matching_admission_version,
+)
 from app.session.attachments import (
     parse_chat_attachment,
     validate_chat_turn_attachments,
 )
+from app.session.cleanup import (
+    purge_chat_session_records,
+    remove_chat_session_workspace,
+)
 from app.session.helpers import public_session
+from app.session.message_read import message_read
 from app.session.message_visibility import (
     internal_message_turn_ids,
     visible_message_content,
     visible_message_rows,
 )
-from app.session.message_read import message_read
 from app.session.origin import pilotdeck_origin_session_ids
+from app.session.session_kinds import is_team_tl_session, team_tl_session_filter
 from app.session.session_schema import (
     ChatAttachmentRead,
     ChatSessionCreateRequest,
-    ChatSessionRead,
     ChatSessionUpdateRequest,
     ChatTurnRequest,
     ChatTurnResponse,
     MessageFeedbackRequest,
     MessageRead,
 )
+from app.session.session_schema import ChatSessionRead as ChatSessionReadSchema
 from app.skills.nesting import discoverable_sops
 from app.teams.service import get_team_leader
 from app.teams.wakeup import build_tl_chat_context, process_tl_reply
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 logger = logging.getLogger(__name__)
-CANCELLED_ASSISTANT_REPLY = "已停止生成"
-INTERRUPTED_ASSISTANT_REPLY = "本次响应中断，请重试发送。"
+
+
+class ChatSessionRead(ChatSessionReadSchema):
+    """Expose the persisted machine session kind to chat clients during the API migration."""
+
+    session_kind: str | None = None
+
+
 STREAM_REPLY_CHUNK_SIZE = 96
 STREAM_RELAY_POLL_SECONDS = 0.08
 STREAM_RELAY_HEARTBEAT_SECONDS = 5.0
 STREAM_RELAY_IDLE_TIMEOUT_SECONDS = 660.0
-STREAM_INTERRUPTED_TRACEBACK_CHAR_LIMIT = 6000
 MAX_CHAT_ATTACHMENT_BYTES = 12 * 1024 * 1024
 MAX_CHAT_ATTACHMENTS = 8
 SESSION_TITLE_SUMMARY_EVENT = "session_title_summarized"
-SCHEDULE_WEEKDAY_LABELS = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
 EVENT_PAYLOAD_META_KEYS = {"id", "event", "type", "event_type", "created_at", "data"}
 STREAM_RELAY_EVENT_ALIASES = {
     "router_decision_created": "router_decision",
@@ -124,6 +154,107 @@ SPAN_EVENT_TYPES = {
     "knowledge_span_finished",
     "knowledge_span_failed",
 }
+_LEGACY_PUBLIC_ERROR_ALIASES = {
+    "LLM_ERROR": "MODEL_UPSTREAM_ERROR",
+    "HARNESS_V2_ERROR": "INTERNAL_ERROR",
+    "SERVICE_RESTARTED": "INTERNAL_ERROR",
+    "HARNESS_EXECUTION_LOST": "INTERNAL_ERROR",
+    "HARNESS_SESSION_BUSY": "INTERNAL_ERROR",
+    "HARNESS_TURN_CONFLICT": "INTERNAL_ERROR",
+}
+
+
+def _chat_stream_lifecycle_active(tenant_id: str, correlation_id: str) -> bool:
+    """Recheck the authoritative tenant state before a chat stream emits work."""
+    try:
+        with Session(engine) as lifecycle_db:
+            require_active_tenant(
+                lifecycle_db,
+                tenant_id,
+                TenantExecutionKind.JOB_CLAIM,
+                correlation_id,
+            )
+    except Exception:  # noqa: BLE001 - lifecycle reads fail closed for any backend failure.
+        return False
+    return True
+
+
+def _require_handoff_resume_lifecycle(
+    db: Session,
+    handoff: HumanHandoffRequest,
+    persisted_lifecycle_version: object | None,
+) -> TenantLifecycleDecision:
+    """Admit one handoff resume only for the active tenant generation that answered it.
+
+    The handoff's optional durable version is retained as a compatibility boundary for rows
+    created before lifecycle fencing.  New channel replies always carry it; when present it
+    must match the current active tenant version, otherwise a fast suspend/reactivate cycle
+    is treated as stale and raises the stable suspension denial.  This function only reads
+    and expires the tenant row; callers decide how to terminalize the handoff on denial.
+    """
+    tenant = db.get(Tenant, handoff.tenant_id)
+    if tenant is not None and tenant not in db.new and tenant not in db.dirty:
+        # The worker keeps one Session across its durable marker and AgentLoop call.  Expire
+        # the cached tenant before every invocation so a concurrent lifecycle commit is seen.
+        db.expire(tenant)
+    decision = require_active_tenant(
+        db,
+        handoff.tenant_id,
+        TenantExecutionKind.CHANNEL_DELIVERY,
+        f"handoff-resume:{handoff.id}",
+    )
+    if persisted_lifecycle_version is None:
+        return decision
+    try:
+        require_matching_admission_version(decision, persisted_lifecycle_version)
+    except TenantLifecycleDenied as exc:
+        # A version mismatch is stale even if the tenant is active again after reactivation.
+        raise TenantLifecycleDenied(
+            "TENANT_SUSPENDED",
+            {
+                "tenant_id": decision.tenant_id,
+                "execution_kind": decision.execution_kind,
+                "correlation_id": decision.correlation_id,
+            },
+        ) from exc
+    return decision
+
+
+def _require_chat_stream_lifecycle(tenant_id: str, correlation_id: str) -> None:
+    """Reject a chat stream before mutating state or exposing its first response event."""
+    try:
+        with Session(engine) as lifecycle_db:
+            require_active_tenant(
+                lifecycle_db,
+                tenant_id,
+                TenantExecutionKind.JOB_CLAIM,
+                correlation_id,
+            )
+    except TenantLifecycleDenied as exc:
+        if exc.code == "TENANT_SUSPENDED":
+            raise _chat_error("TENANT_SUSPENDED", 403) from None
+        raise _chat_error("TENANT_LIFECYCLE_CHECK_FAILED", 503) from None
+    except Exception:  # noqa: BLE001 - project every lifecycle backend failure to one safe code.
+        raise _chat_error("TENANT_LIFECYCLE_CHECK_FAILED", 503) from None
+
+
+def _chat_error(
+    code: str,
+    status_code: int | None = None,
+    *,
+    params: dict[str, object] | None = None,
+    cause: BaseException | None = None,
+) -> HTTPException:
+    """Build a canonical chat-boundary error while keeping raw causes diagnostic-only."""
+    return domain_http_error(
+        code,
+        source="chat.api",
+        status_code=status_code,
+        params=params,
+        cause=cause,
+    )
+
+
 KNOWLEDGE_TRACE_PHASES = {
     "knowledge",
     "okf_route",
@@ -139,17 +270,19 @@ KNOWLEDGE_TRACE_PHASES = {
     "no_documents",
     "no_buckets",
 }
-SESSION_TITLE_PROMPT = """你是任务派发台的会话标题编辑器。
+SESSION_TITLE_PROMPT = """You are StaffDeck's session title editor.
 
-根据首轮用户需求和员工回复，生成一个简短、可读、具体的中文标题。
+Based on the first user request and the employee reply, generate a short, readable,
+specific session title.
 
-要求：
-- 输出 JSON object，格式为 {"title": "..."}。
-- 直接输出标题 JSON，不输出分析、候选标题或解释。
-- 标题 4 到 18 个中文字符优先，最多 24 个字符。
-- 不要使用“新任务”“任务记录”“用户咨询”等空泛标题。
-- 不要包含标点符号、引号、编号、员工名或用户称呼。
-- 如果无法判断，就返回最能概括用户需求的短语。
+Requirements:
+- Output one JSON object in the form {"title": "..."}.
+- Output only the title JSON; do not include analysis, alternatives, or explanations.
+- Write the newly generated title in the Agent reply locale from the language contract.
+- Prefer 4 to 18 characters when natural for that locale, with a maximum of 24 Unicode characters.
+- Avoid generic titles such as "New task", "Task record", or "User inquiry".
+- Do not include punctuation, quotation marks, numbering, employee names, or user salutations.
+- If the intent is unclear, return the shortest phrase that best describes the user request.
 """
 _session_title_summary_jobs: set[str] = set()
 _session_title_summary_jobs_lock = threading.Lock()
@@ -187,6 +320,7 @@ class HumanHandoffReplyRequest(BaseModel):
 def session_read(
     row: ChatSession, *, is_scheduled: bool = False, team_name: str | None = None
 ) -> ChatSessionRead:
+    """Project a session while retaining its authoritative Agent reply locale snapshot."""
     return ChatSessionRead(
         id=row.id,
         tenant_id=row.tenant_id,
@@ -196,17 +330,29 @@ def session_read(
         active_skill_id=row.active_skill_id,
         active_step_id=row.active_step_id,
         status=row.status,
+        agent_reply_locale=row.agent_reply_locale,
+        agent_reply_locale_source=row.agent_reply_locale_source,
         summary=row.summary,
         last_agent_question=row.last_agent_question,
         is_scheduled=is_scheduled,
         team_id=row.team_id,
         team_name=team_name,
+        session_kind=row.session_kind,
         created_at=row.created_at.isoformat(),
         updated_at=row.updated_at.isoformat(),
     )
 
 
 def human_handoff_read(row: HumanHandoffRequest) -> HumanHandoffRead:
+    """Project one handoff row while stripping raw resume failure text from public metadata."""
+    metadata = dict(row.metadata_json or {})
+    if "resume_error" in metadata:
+        metadata["resume_error"] = _project_error_candidate(
+            metadata.get("resume_error"),
+            source="chat.handoff_resume",
+            default_code="INTERNAL_ERROR",
+            retryable=False,
+        )
     return HumanHandoffRead(
         id=row.id,
         tenant_id=row.tenant_id,
@@ -220,7 +366,7 @@ def human_handoff_read(row: HumanHandoffRequest) -> HumanHandoffRead:
         pending_question=row.pending_question,
         status=row.status,
         human_reply=row.human_reply,
-        metadata=row.metadata_json or {},
+        metadata=metadata,
         created_at=row.created_at.isoformat(),
         updated_at=row.updated_at.isoformat(),
         answered_at=row.answered_at.isoformat() if row.answered_at else None,
@@ -228,16 +374,15 @@ def human_handoff_read(row: HumanHandoffRequest) -> HumanHandoffRead:
 
 
 def _user_message_metadata(request: ChatTurnRequest) -> dict[str, object]:
-    metadata: dict[str, object] = {}
-    if request.client_turn_id:
-        metadata["client_turn_id"] = request.client_turn_id
-    if request.interaction_mode == "scheduled_task":
-        metadata["interaction_mode"] = "scheduled_task"
-    if request.model_config_id:
-        metadata["model_config_id"] = request.model_config_id
-    if request.attachments:
-        metadata["attachments"] = [item.model_dump(mode="json") for item in request.attachments]
-    return metadata
+    """Project request metadata consistently with the AgentLoop conversation projection."""
+    return ConversationProjection.user_message_metadata(request)
+
+
+def _language_context_payload(request: ChatTurnRequest) -> dict[str, object]:
+    """Return the serialized immutable locale snapshot for compatibility event envelopes."""
+    if request.language_context is None:
+        return {}
+    return {"language_context": request.language_context.model_dump(mode="json")}
 
 
 def _schedule_session_title_summary(
@@ -245,7 +390,10 @@ def _schedule_session_title_summary(
     user_id: str,
     session_id: str,
     agent_id: str | None,
+    *,
+    language_context: LanguageContext | None = None,
 ) -> None:
+    """Queue one title job with the originating immutable reply-locale snapshot."""
     if not session_id:
         return
     job_key = f"{tenant_id}:{user_id}:{session_id}"
@@ -256,7 +404,13 @@ def _schedule_session_title_summary(
 
     def run() -> None:
         try:
-            _summarize_session_title_once(tenant_id, user_id, session_id, agent_id)
+            _summarize_session_title_once(
+                tenant_id,
+                user_id,
+                session_id,
+                agent_id,
+                language_context=language_context,
+            )
         finally:
             with _session_title_summary_jobs_lock:
                 _session_title_summary_jobs.discard(job_key)
@@ -273,7 +427,11 @@ def _summarize_session_title_once(
     user_id: str,
     session_id: str,
     agent_id: str | None,
+    *,
+    language_context: LanguageContext | None = None,
 ) -> None:
+    """Generate and persist one title using the turn snapshot or the session's bound locale."""
+    resolved_language_context = language_context
     try:
         for attempt in range(8):
             messages: list[Message] = []
@@ -290,6 +448,23 @@ def _summarize_session_title_once(
                 if not session:
                     return
                 if (session.title or "").strip():
+                    return
+                session_language_context = resolve_compatible_language_context(
+                    snapshot=None,
+                    legacy_ui_locale=None,
+                    legacy_agent_reply_locale=session.agent_reply_locale,
+                )
+                if resolved_language_context is None:
+                    resolved_language_context = session_language_context
+                elif (
+                    session.agent_reply_locale
+                    and session_language_context.agent_reply_locale
+                    is not resolved_language_context.agent_reply_locale
+                ):
+                    logger.error(
+                        "session title locale snapshot conflicts with bound session locale",
+                        extra={"tenant_id": tenant_id, "session_id": session_id},
+                    )
                     return
                 existing = db.exec(
                     select(AgentEvent).where(
@@ -349,7 +524,10 @@ def _summarize_session_title_once(
                             )
 
                     with bind_span_sink(persist_title_span), llm_operation("session.title"):
-                        raw = LLMClient(model_config).generate_json(SESSION_TITLE_PROMPT, payload)
+                        raw = LLMClient(model_config).generate_json(
+                            _session_title_prompt(resolved_language_context),
+                            payload,
+                        )
                     title = _normalize_auto_title(str(raw.get("title") or ""))
                     if title:
                         title_source = "first_turn_summary"
@@ -392,6 +570,7 @@ def _summarize_session_title_once(
                             "title": title,
                             "source": title_source,
                             "agent_id": effective_agent_id,
+                            "language_context": resolved_language_context.model_dump(mode="json"),
                         },
                     )
                 )
@@ -427,6 +606,13 @@ def _normalize_auto_title(value: str) -> str:
     return title[:24]
 
 
+def _session_title_prompt(language_context: LanguageContext | None) -> str:
+    """Attach the immutable Agent reply-locale contract to the title-generation prompt."""
+    contract = language_prompt_contract(language_context, ())
+    directive = contract["language_directive"]["instruction"]
+    return f"{SESSION_TITLE_PROMPT}\n\nLanguage contract:\n{directive}"
+
+
 def _fallback_session_title(messages: list[Message]) -> str:
     first_user = next((row.content for row in messages if row.role == "user" and row.content.strip()), "")
     if not first_user:
@@ -435,7 +621,8 @@ def _fallback_session_title(messages: list[Message]) -> str:
 
 
 def _normalized_session_event_payload(row: AgentEvent) -> dict[str, object]:
-    payload = dict(row.payload_json or {})
+    """Normalize one stored session event into the authenticated replay/detail envelope."""
+    payload = _sanitized_session_event_payload(row.event_type, row.payload_json or {})
     event_name = str(payload.get("event") or payload.get("type") or row.event_type)
     data = payload.get("data")
     if not isinstance(data, dict):
@@ -464,9 +651,9 @@ def _apply_handoff_reply(
 ) -> None:
     """把一条 pending handoff 置为 answered 并触发 SOP 恢复。
 
-    供网页 API(reply_human_handoff)与飞书 intake 回复分支复用。
+    供网页 API 与飞书/企微 intake 回复分支复用。
     调用前需已完成权限校验与状态校验;本函数负责落库 + 事件 + 异步恢复。
-    source: "web" 或 "feishu",由调用方显式指定(不再靠 user_id 前缀推断)。
+    source: "web"、"feishu" 或 "wecom",由调用方显式指定(不再靠 user_id 前缀推断)。
     """
     now = utc_now()
     row.status = "answered"
@@ -480,12 +667,34 @@ def _apply_handoff_reply(
     db.add(row)
 
     chat_session = db.get(ChatSession, row.session_id)
+    language_context = resolve_compatible_language_context(
+        snapshot=row.language_context_json,
+        legacy_ui_locale=None,
+        legacy_agent_reply_locale=(
+            chat_session.agent_reply_locale
+            if chat_session and chat_session.tenant_id == row.tenant_id
+            else None
+        ),
+    )
     if chat_session and chat_session.tenant_id == row.tenant_id:
         chat_session.status = "active"
         chat_session.awaiting_input_json = None
-        chat_session.summary = f"最近回复：{reply[:120]}"
+        chat_session.slots_json = {
+            **dict(chat_session.slots_json or {}),
+            "handoff_requested": False,
+            "handoff_completed": True,
+        }
+        summary_prefix = localized_compat_text(
+            language_context,
+            zh_cn="最近回复：",
+            en_us="Latest reply: ",
+        )
+        chat_session.summary = f"{summary_prefix}{reply[:120]}"
         chat_session.updated_at = now
         db.add(chat_session)
+    if row.language_context_json is None:
+        row.language_context_json = language_context.model_dump(mode="json")
+        db.add(row)
     db.add(
         AgentEvent(
             tenant_id=row.tenant_id,
@@ -499,6 +708,7 @@ def _apply_handoff_reply(
                 "answered_by_user_id": answered_by_user_id,
                 "reply_preview": reply[:180],
                 "source": source,
+                "language_context": language_context.model_dump(mode="json"),
             },
             created_at=now,
         )
@@ -514,6 +724,7 @@ def _resume_human_handoff_async(handoff_id: str) -> None:
 
 
 def _resume_human_handoff_worker(handoff_id: str) -> None:
+    """Resume one answered handoff from its persisted locale snapshot and fail closed on errors."""
     try:
         with Session(engine) as db:
             handoff = db.get(HumanHandoffRequest, handoff_id)
@@ -522,6 +733,62 @@ def _resume_human_handoff_worker(handoff_id: str) -> None:
             chat_session = db.get(ChatSession, handoff.session_id)
             if not chat_session or chat_session.tenant_id != handoff.tenant_id:
                 return
+            resume_payload = (
+                dict(handoff.resume_payload_json)
+                if isinstance(handoff.resume_payload_json, dict)
+                else {}
+            )
+            persisted_lifecycle_version = resume_payload.get("tenant_lifecycle_version")
+            lifecycle = _require_handoff_resume_lifecycle(
+                db,
+                handoff,
+                persisted_lifecycle_version,
+            )
+            if persisted_lifecycle_version is None:
+                # Web-created legacy handoffs did not have a durable generation at answer
+                # time. Pin the first admitted generation so fast reactivation cannot replay it.
+                resume_payload["tenant_lifecycle_version"] = lifecycle.lifecycle_version
+                handoff.resume_payload_json = resume_payload
+            if "channel" in resume_payload:
+                chat_session.channel = str(resume_payload.get("channel") or "web").strip()
+            if "channel_binding_id" in resume_payload:
+                chat_session.channel_binding_id = (
+                    str(resume_payload.get("channel_binding_id") or "").strip() or None
+                )
+            if "channel_account_key" in resume_payload:
+                chat_session.channel_account_key = (
+                    str(resume_payload.get("channel_account_key") or "").strip() or None
+                )
+            if "external_conv_id" in resume_payload:
+                chat_session.external_conv_id = (
+                    str(resume_payload.get("external_conv_id") or "").strip() or None
+                )
+            original_target = resume_payload.get("channel_target")
+            if "channel_target" in resume_payload and isinstance(original_target, dict):
+                chat_session.channel_target_json = dict(original_target)
+            elif chat_session.channel_target_json:
+                # Legacy handoffs predate the target snapshot; preserve the
+                # already anchored target, especially a WeCom group chatid.
+                chat_session.channel_target_json = dict(chat_session.channel_target_json)
+            db.add(chat_session)
+            language_context = resolve_compatible_language_context(
+                snapshot=handoff.language_context_json,
+                legacy_ui_locale=None,
+                legacy_agent_reply_locale=chat_session.agent_reply_locale,
+            )
+            if handoff.language_context_json is None:
+                handoff.language_context_json = language_context.model_dump(mode="json")
+            # The handoff snapshot is the execution boundary.  Align the legacy
+            # scalar column before Harness validates the resumed request so a
+            # later user-preference change cannot alter the reply locale.
+            if chat_session.agent_reply_locale != language_context.agent_reply_locale.value:
+                chat_session.agent_reply_locale = language_context.agent_reply_locale.value
+                chat_session.agent_reply_locale_source = (
+                    language_context.agent_reply_locale_source.value
+                )
+                chat_session.updated_at = utc_now()
+                db.add(chat_session)
+            db.add(handoff)
             metadata = dict(handoff.metadata_json or {})
             if metadata.get("resume_started_at"):
                 return
@@ -529,6 +796,11 @@ def _resume_human_handoff_worker(handoff_id: str) -> None:
             metadata["resume_started_at"] = now.isoformat()
             handoff.metadata_json = metadata
             db.add(handoff)
+            language_context = resolve_compatible_language_context(
+                snapshot=handoff.language_context_json,
+                legacy_ui_locale=None,
+                legacy_agent_reply_locale=None,
+            )
             db.add(
                 AgentEvent(
                     tenant_id=handoff.tenant_id,
@@ -539,33 +811,57 @@ def _resume_human_handoff_worker(handoff_id: str) -> None:
                         "agent_id": handoff.agent_id,
                         "trigger_skill_id": handoff.trigger_skill_id,
                         "trigger_step_id": handoff.trigger_step_id,
+                        "language_context": language_context.model_dump(mode="json"),
                     },
                     created_at=now,
                 )
             )
             db.commit()
 
+            # 会话属主是恢复请求的权威 user:渠道身份重绑(懒建账号→web 账号)会迁移
+            # session.user_id,而 handoff.requester_user_id 是创建时的快照,可能已过期;
+            # 优先旧快照会触发 harness 的 session-user 围栏校验失败。
             request = ChatTurnRequest(
                 tenant_id=handoff.tenant_id,
                 session_id=handoff.session_id,
                 agent_id=handoff.agent_id or chat_session.agent_id,
-                user_id=handoff.requester_user_id or chat_session.user_id or "",
+                user_id=chat_session.user_id or handoff.requester_user_id or None,
                 message=handoff.human_reply,
                 channel="human_handoff_resume",
+                ui_locale=language_context.ui_locale,
+                agent_reply_locale=language_context.agent_reply_locale,
+                language_context=language_context,
                 debug=False,
+            )
+            _require_handoff_resume_lifecycle(
+                db,
+                handoff,
+                resume_payload.get("tenant_lifecycle_version"),
             )
             AgentLoop(db).handle_turn(request)
             # resume turn 完成后不再写 resume_finished_at 标记:
             # _inject_handoff_context 已改为用 request.channel == "human_handoff_resume"
             # 判定 resume turn,时序可靠,无需事后标记。
     except Exception as exc:
+        logger.exception("人工转接恢复失败 handoff=%s", handoff_id)
         with Session(engine) as db:
             handoff = db.get(HumanHandoffRequest, handoff_id)
             if not handoff:
                 return
+            language_context = resolve_compatible_language_context(
+                snapshot=handoff.language_context_json,
+                legacy_ui_locale=None,
+                legacy_agent_reply_locale=None,
+            )
+            error_payload = _project_error_candidate(
+                exc,
+                source="chat.handoff_resume",
+                default_code="INTERNAL_ERROR",
+                retryable=False,
+            )
             metadata = dict(handoff.metadata_json or {})
             metadata["resume_failed_at"] = utc_now().isoformat()
-            metadata["resume_error"] = str(exc)[:300]
+            metadata["resume_error"] = error_payload
             handoff.status = "failed"
             handoff.metadata_json = metadata
             handoff.updated_at = utc_now()
@@ -575,7 +871,11 @@ def _resume_human_handoff_worker(handoff_id: str) -> None:
                     tenant_id=handoff.tenant_id,
                     session_id=handoff.session_id,
                     event_type="human_handoff_resume_failed",
-                    payload_json={"handoff_id": handoff.id, "error": str(exc)[:300]},
+                    payload_json={
+                        "handoff_id": handoff.id,
+                        "error": error_payload,
+                        "language_context": language_context.model_dump(mode="json"),
+                    },
                 )
             )
             db.commit()
@@ -586,6 +886,7 @@ def _maybe_handle_scheduled_task_request(
     request: ChatTurnRequest,
     chat_session: ChatSession,
 ) -> tuple[ChatTurnResponse, ScheduledTaskDraftRead] | None:
+    """Persist scheduled-task shortcut messages with the turn's immutable language snapshot."""
     if request.interaction_mode != "scheduled_task" or not request.agent_id:
         return None
     if request.client_turn_id and is_chat_turn_cancelled(
@@ -597,6 +898,7 @@ def _maybe_handle_scheduled_task_request(
         # Cancellation wins over the shortcut. Let the normal Harness path
         # claim and terminalize the logical turn instead of creating a draft.
         return None
+    _prepare_scheduled_draft_language_context(db, request, chat_session)
     draft = detect_scheduled_task_draft(
         db,
         request.tenant_id,
@@ -605,6 +907,7 @@ def _maybe_handle_scheduled_task_request(
         request.message,
         chat_session.id,
         request.client_timezone,
+        language_context=request.language_context,
     )
     if not draft or not draft.should_create:
         return None
@@ -614,7 +917,7 @@ def _maybe_handle_scheduled_task_request(
     if turn_claim.replay is not None:
         return turn_claim.replay, draft
 
-    reply = _scheduled_task_draft_reply(draft)
+    reply = _scheduled_task_draft_reply(request.language_context)
     now = utc_now()
     intent_time = now + timedelta(microseconds=1)
     parse_time = now + timedelta(microseconds=2)
@@ -623,7 +926,12 @@ def _maybe_handle_scheduled_task_request(
     assistant_time = now + timedelta(microseconds=5)
     state_time = now + timedelta(microseconds=6)
     chat_session.updated_at = assistant_time
-    chat_session.summary = f"最近回复：{reply[:120]}"
+    summary_prefix = localized_compat_text(
+        request.language_context,
+        zh_cn="最近回复：",
+        en_us="Latest reply: ",
+    )
+    chat_session.summary = f"{summary_prefix}{reply[:120]}"
     user_message = Message(
         tenant_id=request.tenant_id,
         session_id=chat_session.id,
@@ -642,6 +950,7 @@ def _maybe_handle_scheduled_task_request(
             session_id=chat_session.id,
             event_type="user_message_received",
             payload_json={
+                **_language_context_payload(request),
                 "message_id": user_message.id,
                 "client_turn_id": request.client_turn_id,
                 "message": request.message,
@@ -657,7 +966,8 @@ def _maybe_handle_scheduled_task_request(
         chat_session.id,
         user_message.id,
         "scheduled_task_intent",
-        "识别定时任务需求",
+        "chat.scheduled.intent",
+        language_context=request.language_context,
         created_at=intent_time,
     )
     _add_stream_status_event(
@@ -666,7 +976,8 @@ def _maybe_handle_scheduled_task_request(
         chat_session.id,
         user_message.id,
         "scheduled_task_parse",
-        "解析执行计划",
+        "chat.scheduled.plan",
+        language_context=request.language_context,
         created_at=parse_time,
     )
     _add_stream_status_event(
@@ -675,8 +986,9 @@ def _maybe_handle_scheduled_task_request(
         chat_session.id,
         user_message.id,
         "scheduled_task_draft",
-        "生成定时任务草案",
+        "chat.scheduled.draft",
         extra=draft_payload,
+        language_context=request.language_context,
         created_at=draft_status_time,
     )
     assistant_message = Message(
@@ -685,6 +997,7 @@ def _maybe_handle_scheduled_task_request(
         role="assistant",
         content=reply,
         metadata_json={
+            **_language_context_payload(request),
             "scheduled_task_draft": draft_payload,
             "user_message_id": user_message.id,
             "turn_id": user_message.id,
@@ -698,7 +1011,12 @@ def _maybe_handle_scheduled_task_request(
             tenant_id=request.tenant_id,
             session_id=chat_session.id,
             event_type="scheduled_task_draft_created",
-            payload_json={**draft_payload, "user_message_id": user_message.id, "turn_id": user_message.id},
+            payload_json={
+                **_language_context_payload(request),
+                **draft_payload,
+                "user_message_id": user_message.id,
+                "turn_id": user_message.id,
+            },
             created_at=event_time,
         )
     )
@@ -708,6 +1026,7 @@ def _maybe_handle_scheduled_task_request(
             session_id=chat_session.id,
             event_type="assistant_message_created",
             payload_json={
+                **_language_context_payload(request),
                 "message_id": assistant_message.id,
                 "assistant_message_id": assistant_message.id,
                 "user_message_id": user_message.id,
@@ -724,18 +1043,47 @@ def _maybe_handle_scheduled_task_request(
             tenant_id=request.tenant_id,
             session_id=chat_session.id,
             event_type="session_state_changed",
-            payload_json=state.model_dump(),
+            payload_json={**_language_context_payload(request), **state.model_dump()},
             created_at=state_time,
         )
     )
     response = ChatTurnResponse(
         reply=reply,
         session_id=chat_session.id,
+        ui_locale=request.ui_locale,
+        agent_reply_locale=request.agent_reply_locale,
+        language_context=request.language_context,
         session_state=public_session(chat_session),
     )
     turn_store.complete(turn_claim.record, response)
     db.refresh(chat_session)
     return response, draft
+
+
+def _prepare_scheduled_draft_language_context(
+    db: Session,
+    request: ChatTurnRequest,
+    chat_session: ChatSession,
+) -> None:
+    """Resolve a shortcut turn snapshot before its background draft model call."""
+    if request.language_context is not None:
+        return
+    existing = None
+    client_turn_id = str(request.client_turn_id or "").strip()
+    if client_turn_id:
+        existing = db.exec(
+            select(HarnessTurnRecord).where(
+                HarnessTurnRecord.tenant_id == chat_session.tenant_id,
+                HarnessTurnRecord.session_id == chat_session.id,
+                HarnessTurnRecord.client_turn_id == client_turn_id,
+            )
+        ).first()
+    _prepare_turn_language_context(
+        db,
+        chat_session,
+        request,
+        existing=existing,
+    )
 
 
 def _add_stream_status_event(
@@ -744,18 +1092,24 @@ def _add_stream_status_event(
     session_id: str,
     user_message_id: str,
     phase: str,
-    text: str,
+    event_code: str,
     *,
+    params: dict[str, object] | None = None,
     extra: dict | None = None,
+    language_context: LanguageContext | None = None,
     created_at=None,
 ) -> None:
+    """Persist one structured stream status plus the immutable locale snapshot used for replay."""
     payload = {
         "phase": phase,
-        "text": text,
+        "code": event_code,
+        "params": params or {},
         "user_message_id": user_message_id,
         "turn_id": user_message_id,
         **(extra or {}),
     }
+    if language_context is not None:
+        payload["language_context"] = language_context.model_dump(mode="json")
     db.add(
         AgentEvent(
             tenant_id=tenant_id,
@@ -767,95 +1121,61 @@ def _add_stream_status_event(
     )
 
 
-def _scheduled_task_draft_reply(draft: ScheduledTaskDraftRead) -> str:
-    lines = [
-        "我已按你选择的定时项目整理成自动任务草案。",
-        f"任务：{draft.title}",
-        f"计划：{_format_draft_schedule(draft)}",
-        f"执行内容：{draft.prompt}",
-        "确认下方卡片后才会启用；确认前不会创建自动任务。",
-    ]
-    return "\n".join(lines)
+def _scheduled_task_draft_reply(language_context: LanguageContext | None) -> str:
+    """Return the draft-ready Agent reply in the immutable reply locale; the card owns raw details."""
+    return localized_compat_text(
+        language_context,
+        zh_cn="定时任务草案已准备好。确认下方卡片后才会创建并启用。",
+        en_us="The scheduled task draft is ready. Confirm the card below to create and enable it.",
+    )
 
 
-def _format_draft_schedule(draft: ScheduledTaskDraftRead) -> str:
-    return _format_scheduled_task_schedule(draft.schedule_type, draft.schedule or {})
+def _scheduled_task_trace_data(payload: dict) -> dict[str, object]:
+    """Expose only raw schedule fields needed for frontend-localized trace details."""
+    return {
+        "title": payload.get("title"),
+        "schedule_type": payload.get("schedule_type"),
+        "schedule": payload.get("schedule"),
+    }
 
 
-def _format_once_schedule(schedule: dict) -> str:
-    return f"一次性 {schedule.get('run_at') or '待确认时间'}"
-
-
-def _format_weekly_schedule(schedule: dict) -> str:
-    return f"每周 {_format_weekday_labels(schedule.get('weekdays'))} {schedule.get('time') or DEFAULT_TASK_TIME}"
-
-
-def _format_monthly_schedule(schedule: dict) -> str:
-    return f"每月 {schedule.get('day_of_month') or 1} 号 {schedule.get('time') or DEFAULT_TASK_TIME}"
-
-
-def _format_daily_schedule(schedule: dict) -> str:
-    return f"每天 {schedule.get('time') or DEFAULT_TASK_TIME}"
-
-
-SCHEDULE_TEXT_FORMATTERS: dict[str, Callable[[dict], str]] = {
-    "once": _format_once_schedule,
-    "weekly": _format_weekly_schedule,
-    "monthly": _format_monthly_schedule,
-    "daily": _format_daily_schedule,
-}
-
-
-def _format_scheduled_task_schedule(schedule_type: object, schedule_value: object) -> str:
-    schedule = schedule_value if isinstance(schedule_value, dict) else {}
-    schedule_type_text = str(schedule_type or "daily")
-    formatter = SCHEDULE_TEXT_FORMATTERS.get(schedule_type_text, _format_daily_schedule)
-    return formatter(schedule)
-
-
-def _format_weekday_labels(value: object) -> str:
-    if not isinstance(value, list):
-        return SCHEDULE_WEEKDAY_LABELS[0]
-    labels: list[str] = []
-    for item in value:
-        text = str(item).strip()
-        if not text.isdigit():
-            continue
-        day = int(text)
-        if 0 <= day < len(SCHEDULE_WEEKDAY_LABELS):
-            labels.append(SCHEDULE_WEEKDAY_LABELS[day])
-    return "、".join(labels) or SCHEDULE_WEEKDAY_LABELS[0]
-
-
-def _scheduled_task_trace_detail(payload: dict) -> str | None:
-    title = str(payload.get("title") or "").strip()
-    schedule = _format_scheduled_task_schedule(payload.get("schedule_type"), payload.get("schedule"))
-    detail = " · ".join(part for part in (title, schedule, "等待确认后启用") if part)
-    return detail or None
-
-
-def _scheduled_task_trace_lines(payload: dict, *, state: str = "completed") -> list[dict]:
-    schedule = _format_scheduled_task_schedule(payload.get("schedule_type"), payload.get("schedule"))
+def _scheduled_task_trace_lines(
+    payload: dict,
+    *,
+    state: str = "completed",
+    event_type: str = "scheduled_task_draft_created",
+) -> list[dict]:
+    """Build scheduled-task stages from canonical fields and raw schedule details."""
+    event_data = _scheduled_task_trace_data(payload)
     return [
         {
             "id": "scheduled_task_intent",
             "kind": "decision",
-            "text": "识别定时任务需求",
-            "detail": "用户选择了创建定时任务模式",
+            "text": "",
+            "event_type": event_type,
+            "event_code": "chat.scheduled.intent",
+            "params": {},
+            "event_data": event_data,
             "state": "completed",
         },
         {
             "id": "scheduled_task_parse",
             "kind": "decision",
-            "text": "解析执行计划",
-            "detail": f"计划：{schedule}" if schedule else None,
+            "text": "",
+            "event_type": event_type,
+            "event_code": "chat.scheduled.plan",
+            "params": {},
+            "event_data": event_data,
             "state": "completed",
         },
         {
             "id": "scheduled_task_draft",
             "kind": "decision",
-            "text": "生成定时任务草案",
-            "detail": _scheduled_task_trace_detail(payload),
+            "text": "",
+            "event_type": event_type,
+            "event_code": "chat.scheduled.draft",
+            "params": {},
+            "event_data": event_data,
             "state": state,
         },
     ]
@@ -866,10 +1186,15 @@ def _persist_scheduled_task_draft(
     tenant_id: str,
     session_id: str,
     draft: ScheduledTaskDraftRead,
+    *,
+    language_context: LanguageContext | None = None,
 ) -> None:
+    """Persist a scheduled-task draft and retain the originating turn locale snapshot."""
     if not session_id:
         return
     payload = draft.model_dump(mode="json")
+    if language_context is not None:
+        payload["language_context"] = language_context.model_dump(mode="json")
     latest_assistant = db.exec(
         select(Message)
         .where(Message.tenant_id == tenant_id, Message.session_id == session_id, Message.role == "assistant")
@@ -900,6 +1225,7 @@ def _reply_chunks(reply: str) -> Iterator[str]:
 def _validate_chat_turn_attachments(
     request: ChatTurnRequest,
 ) -> ChatTurnRequest:
+    """Validate attachment metadata while projecting validation failures to a stable chat code."""
     try:
         attachments = validate_chat_turn_attachments(
             request.attachments,
@@ -907,7 +1233,7 @@ def _validate_chat_turn_attachments(
             max_attachment_bytes=MAX_CHAT_ATTACHMENT_BYTES,
         )
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise _chat_error("CHAT_ATTACHMENT_INVALID", 400, cause=exc) from exc
     return request.model_copy(update={"attachments": attachments})
 
 
@@ -945,16 +1271,24 @@ async def upload_chat_attachments(
     _ensure_request_tenant(tenant_id, current_user)
     ensure_tenant(db, tenant_id)
     if not files:
-        raise HTTPException(status_code=400, detail="No files uploaded")
+        raise _chat_error("CHAT_ATTACHMENTS_REQUIRED", 400)
     if len(files) > MAX_CHAT_ATTACHMENTS:
-        raise HTTPException(status_code=400, detail=f"最多一次上传 {MAX_CHAT_ATTACHMENTS} 个文件")
+        raise _chat_error(
+            "CHAT_ATTACHMENT_LIMIT_EXCEEDED",
+            400,
+            params={"max_count": MAX_CHAT_ATTACHMENTS},
+        )
     parsed: list[ChatAttachmentRead] = []
     from app.session.attachment_store import stage_chat_attachment
 
     for file in files:
         data = await file.read()
         if len(data) > MAX_CHAT_ATTACHMENT_BYTES:
-            raise HTTPException(status_code=413, detail=f"{file.filename or '文件'} 超过上传大小限制")
+            raise _chat_error(
+                "CHAT_ATTACHMENT_TOO_LARGE",
+                413,
+                params={"max_bytes": MAX_CHAT_ATTACHMENT_BYTES},
+            )
         attachment = parse_chat_attachment(
             file.filename or "uploaded-file",
             file.content_type,
@@ -978,6 +1312,7 @@ def chat_turn(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_session),
 ) -> ChatTurnResponse:
+    """Execute one authenticated chat turn with an immutable reply-locale snapshot."""
     _ensure_request_tenant(request.tenant_id, current_user)
     request = request.model_copy(
         update={
@@ -997,7 +1332,7 @@ def chat_turn(
         _ensure_chat_agent_available(db, request.tenant_id, request.agent_id, current_user)
     ensure_tenant(db, request.tenant_id)
     if not request.message.strip() and not request.attachments:
-        raise HTTPException(status_code=400, detail="Message cannot be empty")
+        raise _chat_error("CHAT_MESSAGE_REQUIRED", 400)
     original_message = request.message
     if team_tl_team is not None:
         # 团队 TL 会话:注入团队上下文(花名册/未闭环任务/黑板/派任务格式)后再走正常引擎
@@ -1013,10 +1348,22 @@ def chat_turn(
         scheduled_response = _maybe_handle_scheduled_task_request(db, request, chat_session)
         if scheduled_response:
             response, _draft = scheduled_response
-            _schedule_session_title_summary(request.tenant_id, request.user_id, response.session_id, request.agent_id)
+            _schedule_session_title_summary(
+                request.tenant_id,
+                request.user_id,
+                response.session_id,
+                request.agent_id,
+                language_context=response.language_context or request.language_context,
+            )
             return response
     response = AgentLoop(db).handle_turn(request)
-    _schedule_session_title_summary(request.tenant_id, request.user_id, response.session_id, request.agent_id)
+    _schedule_session_title_summary(
+        request.tenant_id,
+        request.user_id,
+        response.session_id,
+        request.agent_id,
+        language_context=response.language_context or request.language_context,
+    )
     if team_tl_team is not None:
         # TL 回复后处理:解析派任务块并创建任务(与 tl_chat 端点同语义);
         # 后处理失败不影响本轮回复
@@ -1030,7 +1377,7 @@ def chat_turn(
                 reply=response.reply or "",
                 client_turn_id=request.client_turn_id,
             )
-        except Exception:
+        except (TypeError, ValueError):
             logger.exception("team TL reply post-processing failed")
     if request.interaction_mode == "scheduled_task" and request.agent_id:
         draft = detect_scheduled_task_draft(
@@ -1041,9 +1388,16 @@ def chat_turn(
             request.message,
             response.session_id,
             request.client_timezone,
+            language_context=request.language_context,
         )
         if draft and draft.should_create:
-            _persist_scheduled_task_draft(db, request.tenant_id, response.session_id, draft)
+            _persist_scheduled_task_draft(
+                db,
+                request.tenant_id,
+                response.session_id,
+                draft,
+                language_context=request.language_context,
+            )
     return response
 
 
@@ -1053,7 +1407,10 @@ def chat_stream(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_session),
 ) -> StreamingResponse:
+    """Stream one authenticated chat turn while sanitizing persisted replay and failure events."""
     _ensure_request_tenant(request.tenant_id, current_user)
+    stream_correlation_id = f"chat-stream:{current_user.id}"
+    _require_chat_stream_lifecycle(request.tenant_id, stream_correlation_id)
     request = request.model_copy(
         update={
             "user_id": current_user.id,
@@ -1073,7 +1430,7 @@ def chat_stream(
     else:
         _ensure_chat_agent_available(db, request.tenant_id, request.agent_id, current_user)
     if not request.message.strip() and not request.attachments:
-        raise HTTPException(status_code=400, detail="Message cannot be empty")
+        raise _chat_error("CHAT_MESSAGE_REQUIRED", 400)
     original_message = request.message
     if team_tl_team_id is not None:
         # 团队 TL 会话:注入团队上下文(花名册/未闭环任务/黑板/派任务格式)后再走正常引擎
@@ -1104,6 +1461,9 @@ def chat_stream(
     def run_stream_worker() -> None:
         span_sink_token = None
         try:
+            if not _chat_stream_lifecycle_active(request.tenant_id, stream_correlation_id):
+                worker_terminal["seen"] = True
+                return
             with Session(engine) as worker_db:
                 span_turn_id = {"value": ""}
 
@@ -1118,6 +1478,9 @@ def chat_stream(
                         event_payload.setdefault("user_message_id", turn_id)
                     if request.client_turn_id:
                         event_payload.setdefault("client_turn_id", request.client_turn_id)
+                    context_payload = _language_context_payload(request)
+                    if context_payload:
+                        event_payload.setdefault("language_context", context_payload["language_context"])
                     _persist_relay_only_event(
                         worker_db,
                         request.tenant_id,
@@ -1135,20 +1498,46 @@ def chat_stream(
                         request.user_id,
                         request.session_id,
                     )
+                    existing_turn = None
+                    client_turn_id = str(request.client_turn_id or "").strip()
+                    if client_turn_id:
+                        existing_turn = worker_db.exec(
+                            select(HarnessTurnRecord).where(
+                                HarnessTurnRecord.tenant_id == chat_session.tenant_id,
+                                HarnessTurnRecord.session_id == chat_session.id,
+                                HarnessTurnRecord.client_turn_id == client_turn_id,
+                            )
+                        ).first()
+                    _prepare_turn_language_context(
+                        worker_db,
+                        chat_session,
+                        request,
+                        existing=existing_turn,
+                    )
                     if request.interaction_mode == "scheduled_task":
                         _persist_relay_only_event(
                             worker_db,
                             request.tenant_id,
                             chat_session.id,
                             "stream_status",
-                            {"phase": "scheduled_task_intent", "text": "识别定时任务需求"},
+                            {
+                                **_language_context_payload(request),
+                                "phase": "scheduled_task_intent",
+                                "code": "chat.scheduled.intent",
+                                "params": {},
+                            },
                         )
                         _persist_relay_only_event(
                             worker_db,
                             request.tenant_id,
                             chat_session.id,
                             "stream_status",
-                            {"phase": "scheduled_task_parse", "text": "解析执行计划"},
+                            {
+                                **_language_context_payload(request),
+                                "phase": "scheduled_task_parse",
+                                "code": "chat.scheduled.plan",
+                                "params": {},
+                            },
                         )
                     scheduled_response = _maybe_handle_scheduled_task_request(worker_db, request, chat_session)
                     if scheduled_response:
@@ -1161,6 +1550,7 @@ def chat_stream(
                             request.client_turn_id or "",
                         )
                         turn_payload = {
+                            **_language_context_payload(request),
                             "turn_id": message_id,
                             "user_message_id": message_id,
                             "client_turn_id": client_turn_id or None,
@@ -1172,7 +1562,8 @@ def chat_stream(
                             "stream_status",
                             {
                                 "phase": "scheduled_task_draft",
-                                "text": "生成定时任务草案",
+                                "code": "chat.scheduled.draft",
+                                "params": {},
                                 **draft.model_dump(mode="json"),
                                 **turn_payload,
                             },
@@ -1212,9 +1603,13 @@ def chat_stream(
                             request.user_id,
                             response.session_id,
                             request.agent_id,
+                            language_context=response.language_context or request.language_context,
                         )
                         return
                 for item in AgentLoop(worker_db).handle_turn_stream(request):
+                    if not _chat_stream_lifecycle_active(request.tenant_id, stream_correlation_id):
+                        worker_terminal["seen"] = True
+                        return
                     event_name = str(item["event"])
                     data = item["data"] if isinstance(item.get("data"), dict) else {}
                     item_session_id = str(data.get("sessionId") or request.session_id or source_session_id["value"] or "")
@@ -1241,6 +1636,7 @@ def chat_stream(
                             request.user_id,
                             event_source_session_id,
                             request.agent_id,
+                            language_context=request.language_context,
                         )
                         continue
                     if item["event"] == "complete":
@@ -1250,6 +1646,7 @@ def chat_stream(
                             request.user_id,
                             event_source_session_id,
                             request.agent_id,
+                            language_context=request.language_context,
                         )
                         if team_tl_team_id is not None:
                             # 团队 TL 会话:complete 后做派任务后处理(与 tl_chat 端点同语义);
@@ -1292,17 +1689,27 @@ def chat_stream(
                             request.message,
                             event_source_session_id or None,
                             request.client_timezone,
+                            language_context=request.language_context,
                         )
                         if draft and draft.should_create:
-                            _persist_scheduled_task_draft(worker_db, request.tenant_id, event_source_session_id, draft)
+                            _persist_scheduled_task_draft(
+                                worker_db,
+                                request.tenant_id,
+                                event_source_session_id,
+                                draft,
+                                language_context=request.language_context,
+                            )
                             _persist_relay_only_event(
                                 worker_db,
                                 request.tenant_id,
                                 event_source_session_id,
                                 "scheduled_task_draft",
-                                draft.model_dump(mode="json"),
+                                {
+                                    **draft.model_dump(mode="json"),
+                                    **_language_context_payload(request),
+                                },
                             )
-        except Exception as exc:
+        except Exception:
             logger.exception("chat stream worker failed")
             session_id = source_session_id["value"] or request.session_id or ""
             if session_id:
@@ -1314,11 +1721,8 @@ def chat_stream(
                             request.tenant_id,
                             chat_session,
                             request.client_turn_id or "",
-                            str(exc) or "stream worker failed",
-                            error_details={
-                                "error_type": exc.__class__.__name__,
-                                "error_traceback": traceback.format_exc()[-STREAM_INTERRUPTED_TRACEBACK_CHAR_LIMIT:],
-                            },
+                            "INTERNAL_ERROR",
+                            language_context=request.language_context,
                         )
                         error_db.commit()
                         worker_terminal["seen"] = True
@@ -1335,11 +1739,8 @@ def chat_stream(
                             request.tenant_id,
                             chat_session,
                             request.client_turn_id or "",
-                            exc.__class__.__name__,
-                            error_details={
-                                "error_type": exc.__class__.__name__,
-                                "error_traceback": traceback.format_exc()[-STREAM_INTERRUPTED_TRACEBACK_CHAR_LIMIT:],
-                            },
+                            "INTERNAL_ERROR",
+                            language_context=request.language_context,
                         )
                         error_db.commit()
                         worker_terminal["seen"] = True
@@ -1360,6 +1761,7 @@ def chat_stream(
                             chat_session,
                             request.client_turn_id or "",
                             "stream worker ended before terminal event",
+                            language_context=request.language_context,
                         )
                         if changed:
                             final_db.commit()
@@ -1376,12 +1778,16 @@ def chat_stream(
         terminal_sent = False
         internal_relay_turn_ids: set[str] = set()
         while True:
+            if not _chat_stream_lifecycle_active(request.tenant_id, stream_correlation_id):
+                return
             session_id = source_session_id["value"]
             emitted = False
             if session_id:
                 with Session(engine) as relay_db:
                     rows = _events_after_cursor(relay_db, request.tenant_id, session_id, initial_cursor)
                 for row in rows:
+                    if not _chat_stream_lifecycle_active(request.tenant_id, stream_correlation_id):
+                        return
                     payload = row.payload_json or {}
                     row_turn_ids = {
                         str(payload.get(key) or "").strip()
@@ -1416,12 +1822,15 @@ def chat_stream(
                                 chat_session,
                                 request.client_turn_id or "",
                                 "stream relay timed out waiting for terminal event",
+                                language_context=request.language_context,
                             )
                             timeout_db.commit()
                     continue
                 return
             now = time.monotonic()
             if now - last_heartbeat_at >= STREAM_RELAY_HEARTBEAT_SECONDS:
+                if not _chat_stream_lifecycle_active(request.tenant_id, stream_correlation_id):
+                    return
                 last_heartbeat_at = now
                 yield _sse(
                     "heartbeat",
@@ -1466,7 +1875,10 @@ def _persist_chat_turn_cancelled(
     chat_session: ChatSession,
     requested_turn_id: str,
     cancelled_by_user_id: str | None = None,
+    *,
+    language_context: LanguageContext | None = None,
 ) -> bool:
+    """Persist a cancellation trace and fallback reply with the immutable turn locale snapshot."""
     requested_turn_id = requested_turn_id.strip()
     if not requested_turn_id:
         return False
@@ -1476,6 +1888,13 @@ def _persist_chat_turn_cancelled(
         .where(AgentEvent.tenant_id == tenant_id, AgentEvent.session_id == chat_session.id)
         .order_by(AgentEvent.created_at)
     ).all()
+    language_context = language_context or _language_context_for_turn(
+        db,
+        tenant_id,
+        chat_session.id,
+        requested_turn_id,
+        events=events,
+    )
     message_id = ""
     client_turn_id = ""
     for event in reversed(events):
@@ -1524,10 +1943,12 @@ def _persist_chat_turn_cancelled(
                 message_id,
                 client_turn_id,
                 event.created_at + timedelta(microseconds=1),
+                language_context=language_context,
             )
         return False
 
     now = utc_now()
+    cancelled_reply = localized_cancelled_reply(language_context)
     receipt_cancelled = _cancel_harness_turn_receipt(
         db,
         tenant_id,
@@ -1549,8 +1970,13 @@ def _persist_chat_turn_cancelled(
                 "user_message_id": message_id,
                 "client_turn_id": client_turn_id or None,
                 "phase": "cancelled",
-                "text": "已停止生成",
+                "text": cancelled_reply,
                 "cancelled_by_user_id": cancelled_by_user_id,
+                **(
+                    {"language_context": language_context.model_dump(mode="json")}
+                    if language_context is not None
+                    else {}
+                ),
             },
             created_at=now,
         )
@@ -1562,6 +1988,7 @@ def _persist_chat_turn_cancelled(
         message_id,
         client_turn_id,
         now + timedelta(microseconds=1),
+        language_context=language_context,
     )
     chat_session.status = "active"
     chat_session.updated_at = now
@@ -1623,6 +2050,97 @@ def _cancel_harness_turn_receipt(
     return getattr(result, "rowcount", 0) == 1
 
 
+def _language_context_for_turn(
+    db: Session,
+    tenant_id: str,
+    session_id: str,
+    requested_turn_id: str,
+    *,
+    events: list[AgentEvent] | None = None,
+) -> LanguageContext | None:
+    """Recover only an explicitly persisted locale snapshot, never infer one from message text."""
+    requested_turn_id = requested_turn_id.strip()
+    if not requested_turn_id:
+        return None
+    event_rows = events
+    if event_rows is None:
+        event_rows = db.exec(
+            select(AgentEvent)
+            .where(
+                AgentEvent.tenant_id == tenant_id,
+                AgentEvent.session_id == session_id,
+            )
+            .order_by(AgentEvent.created_at.desc())
+        ).all()
+    for event in event_rows:
+        payload = event.payload_json or {}
+        event_turn_ids = {
+            str(payload.get(key) or "").strip()
+            for key in ("turn_id", "user_message_id", "message_id", "client_turn_id")
+            if str(payload.get(key) or "").strip()
+        }
+        if requested_turn_id and requested_turn_id not in event_turn_ids:
+            continue
+        raw_context = payload.get("language_context")
+        if isinstance(raw_context, dict):
+            try:
+                return LanguageContext.model_validate(raw_context)
+            except (TypeError, ValueError):
+                continue
+    record = db.exec(
+        select(HarnessTurnRecord).where(
+            HarnessTurnRecord.tenant_id == tenant_id,
+            HarnessTurnRecord.session_id == session_id,
+            or_(
+                HarnessTurnRecord.client_turn_id == requested_turn_id,
+                HarnessTurnRecord.user_message_id == requested_turn_id,
+            ),
+        )
+    ).first()
+    raw_context = record.language_context_json if record is not None else None
+    if not isinstance(raw_context, dict):
+        return None
+    try:
+        return LanguageContext.model_validate(raw_context)
+    except (TypeError, ValueError):
+        pass
+
+    # A legacy/partially committed stream may have the snapshot on its message metadata
+    # before the matching event or receipt is visible; inspect only the exact turn IDs.
+    message_rows = db.exec(
+        select(Message)
+        .where(Message.tenant_id == tenant_id, Message.session_id == session_id)
+        .order_by(Message.created_at.desc())
+    ).all()
+    for message in message_rows:
+        metadata = message.metadata_json or {}
+        metadata_turn_ids = {
+            str(metadata.get(key) or "").strip()
+            for key in ("turn_id", "user_message_id", "client_turn_id")
+            if str(metadata.get(key) or "").strip()
+        }
+        if message.id != requested_turn_id and requested_turn_id not in metadata_turn_ids:
+            continue
+        raw_context = metadata.get("language_context")
+        if isinstance(raw_context, dict):
+            try:
+                return LanguageContext.model_validate(raw_context)
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _safe_interruption_code(reason: object) -> str:
+    """Reduce a worker interruption marker to a registered public code only."""
+    candidate = reason.strip() if isinstance(reason, str) else ""
+    if candidate == "LLM_ERROR":
+        return "MODEL_UPSTREAM_ERROR"
+    entry = ERROR_REGISTRY.get(candidate)
+    if entry is None:
+        return "INTERNAL_ERROR"
+    return entry.code
+
+
 def _ensure_cancelled_assistant_message(
     db: Session,
     tenant_id: str,
@@ -1630,7 +2148,10 @@ def _ensure_cancelled_assistant_message(
     user_message_id: str,
     client_turn_id: str,
     created_at,
+    *,
+    language_context: LanguageContext | None = None,
 ) -> bool:
+    """Create one cancellation assistant message while retaining its turn locale snapshot."""
     user_message = db.get(Message, user_message_id)
     if not user_message or user_message.tenant_id != tenant_id or user_message.session_id != chat_session.id:
         return False
@@ -1655,16 +2176,22 @@ def _ensure_cancelled_assistant_message(
         if turn_ids & row_turn_ids:
             return False
 
+    cancelled_reply = localized_cancelled_reply(language_context)
     assistant_message = Message(
         tenant_id=tenant_id,
         session_id=chat_session.id,
         role="assistant",
-        content=CANCELLED_ASSISTANT_REPLY,
+        content=cancelled_reply,
         metadata_json={
             "turn_id": user_message_id,
             "user_message_id": user_message_id,
             "client_turn_id": client_turn_id or None,
             "status": "cancelled",
+            **(
+                {"language_context": language_context.model_dump(mode="json")}
+                if language_context is not None
+                else {}
+            ),
         },
         created_at=created_at,
     )
@@ -1681,13 +2208,23 @@ def _ensure_cancelled_assistant_message(
                 "user_message_id": user_message_id,
                 "turn_id": user_message_id,
                 "client_turn_id": client_turn_id or None,
-                "reply": CANCELLED_ASSISTANT_REPLY,
+                "reply": cancelled_reply,
                 "status": "cancelled",
+                **(
+                    {"language_context": language_context.model_dump(mode="json")}
+                    if language_context is not None
+                    else {}
+                ),
             },
             created_at=created_at,
         )
     )
-    chat_session.summary = f"最近回复：{CANCELLED_ASSISTANT_REPLY}"
+    summary_prefix = localized_compat_text(
+        language_context,
+        zh_cn="最近回复：",
+        en_us="Latest reply: ",
+    )
+    chat_session.summary = f"{summary_prefix}{cancelled_reply}"
     chat_session.updated_at = created_at
     db.add(chat_session)
     return True
@@ -1700,27 +2237,41 @@ def _persist_chat_turn_interrupted(
     requested_turn_id: str,
     reason: str,
     error_details: dict[str, object] | None = None,
+    *,
+    language_context: LanguageContext | None = None,
 ) -> bool:
+    """Persist interruption trace and fallback reply with the immutable turn locale snapshot."""
+    del error_details
     message_id, client_turn_id = _resolve_turn_ids_from_events(db, tenant_id, chat_session.id, requested_turn_id)
     if not message_id:
         message_id = requested_turn_id.strip()
     if not message_id:
         return False
 
+    language_context = language_context or _language_context_for_turn(
+        db,
+        tenant_id,
+        chat_session.id,
+        requested_turn_id,
+    )
+
     if _turn_has_terminal_event(db, tenant_id, chat_session.id, message_id, client_turn_id):
         return False
 
     now = utc_now()
+    safe_code = _safe_interruption_code(reason)
     payload = {
         "turn_id": message_id,
         "user_message_id": message_id,
         "client_turn_id": client_turn_id or None,
         "phase": "interrupted",
-        "text": "响应生成中断",
-        "reason": reason[:2000],
+        "code": safe_code,
+        "message": safe_code,
+        "text": localized_interrupted_reply(language_context),
+        "retryable": True,
     }
-    if error_details:
-        payload.update(error_details)
+    if language_context is not None:
+        payload["language_context"] = language_context.model_dump(mode="json")
     db.add(
         AgentEvent(
             tenant_id=tenant_id,
@@ -1737,6 +2288,7 @@ def _persist_chat_turn_interrupted(
         message_id,
         client_turn_id,
         now + timedelta(microseconds=1),
+        language_context=language_context,
     )
     chat_session.status = "active"
     chat_session.updated_at = now
@@ -1812,7 +2364,10 @@ def _ensure_interrupted_assistant_message(
     user_message_id: str,
     client_turn_id: str,
     created_at,
+    *,
+    language_context: LanguageContext | None = None,
 ) -> bool:
+    """Create one interrupted assistant message while retaining its turn locale snapshot."""
     user_message = db.get(Message, user_message_id)
     if not user_message or user_message.tenant_id != tenant_id or user_message.session_id != chat_session.id:
         return False
@@ -1837,16 +2392,22 @@ def _ensure_interrupted_assistant_message(
         if turn_ids & row_turn_ids:
             return False
 
+    interrupted_reply = localized_interrupted_reply(language_context)
     assistant_message = Message(
         tenant_id=tenant_id,
         session_id=chat_session.id,
         role="assistant",
-        content=INTERRUPTED_ASSISTANT_REPLY,
+        content=interrupted_reply,
         metadata_json={
             "turn_id": user_message_id,
             "user_message_id": user_message_id,
             "client_turn_id": client_turn_id or None,
             "status": "interrupted",
+            **(
+                {"language_context": language_context.model_dump(mode="json")}
+                if language_context is not None
+                else {}
+            ),
         },
         created_at=created_at,
     )
@@ -1863,13 +2424,23 @@ def _ensure_interrupted_assistant_message(
                 "user_message_id": user_message_id,
                 "turn_id": user_message_id,
                 "client_turn_id": client_turn_id or None,
-                "reply": INTERRUPTED_ASSISTANT_REPLY,
+                "reply": interrupted_reply,
                 "status": "interrupted",
+                **(
+                    {"language_context": language_context.model_dump(mode="json")}
+                    if language_context is not None
+                    else {}
+                ),
             },
             created_at=created_at,
         )
     )
-    chat_session.summary = f"最近回复：{INTERRUPTED_ASSISTANT_REPLY}"
+    summary_prefix = localized_compat_text(
+        language_context,
+        zh_cn="最近回复：",
+        en_us="Latest reply: ",
+    )
+    chat_session.summary = f"{summary_prefix}{interrupted_reply}"
     chat_session.updated_at = created_at
     db.add(chat_session)
     return True
@@ -1894,7 +2465,8 @@ def _persist_relay_only_event(
 
 
 def _relay_event_payload(row: AgentEvent) -> tuple[str, dict[str, object]]:
-    payload = dict(row.payload_json or {})
+    """Build one streaming replay envelope while fail-closing any legacy raw error payloads."""
+    payload = _sanitized_session_event_payload(row.event_type, row.payload_json or {})
     event_name = STREAM_RELAY_EVENT_ALIASES.get(row.event_type, row.event_type)
     data: dict[str, object] = {
         "kind": event_name,
@@ -1904,6 +2476,312 @@ def _relay_event_payload(row: AgentEvent) -> tuple[str, dict[str, object]]:
         **payload,
     }
     return event_name, data
+
+
+def _project_error_candidate(
+    candidate: object,
+    *,
+    source: str,
+    default_code: str,
+    retryable: bool,
+) -> dict[str, JsonValue]:
+    """Project a raw or partially structured error candidate to a safe public descriptor."""
+    code = default_code
+    params: dict[str, JsonValue] = {}
+    request_id: str | None = None
+    trace_id: str | None = None
+    internal_message: str | None = None
+    if isinstance(candidate, BaseException):
+        internal_message = str(candidate)[:500]
+    elif isinstance(candidate, dict):
+        candidate_code = candidate.get("code")
+        candidate_params = candidate.get("params")
+        if isinstance(candidate_code, str) and candidate_code.isupper():
+            code = _LEGACY_PUBLIC_ERROR_ALIASES.get(candidate_code, candidate_code)
+        if isinstance(candidate_params, dict):
+            params = {
+                str(key): value
+                for key, value in candidate_params.items()
+                if isinstance(key, str)
+            }
+        if isinstance(candidate.get("retryable"), bool):
+            retryable = candidate["retryable"]
+        request_value = candidate.get("request_id")
+        trace_value = candidate.get("trace_id")
+        request_id = request_value if isinstance(request_value, str) and request_value else None
+        trace_id = trace_value if isinstance(trace_value, str) and trace_value else None
+        message_value = candidate.get("message") or candidate.get("detail")
+        internal_message = (
+            str(message_value)[:500]
+            if isinstance(message_value, str) and message_value
+            else str(candidate)[:500]
+        )
+    elif candidate is not None:
+        internal_message = str(candidate)[:500]
+    entry = ERROR_REGISTRY.get(code)
+    if entry is None:
+        entry = ERROR_REGISTRY.require("INTERNAL_ERROR")
+        params = {}
+    occurrence = ErrorOccurrence(
+        descriptor=ErrorDescriptor(
+            code=entry.code,
+            params=params,
+            retryable=retryable,
+            request_id=request_id,
+            trace_id=trace_id,
+        ),
+        internal=InternalErrorContext(
+            source=source,
+            raw_message=internal_message,
+        ),
+    )
+    return project_public_error(occurrence, ERROR_REGISTRY)
+
+
+def _language_context_from_payload(payload: dict[str, object]) -> LanguageContext | None:
+    """Read a valid immutable locale snapshot from an event without inferring from prose."""
+    value = payload.get("language_context")
+    if not isinstance(value, dict):
+        return None
+    try:
+        return LanguageContext.model_validate(value)
+    except (TypeError, ValueError):
+        return None
+
+
+_FAILURE_RAW_PAYLOAD_FIELDS = frozenset(
+    {
+        "content",
+        "data",
+        "diagnostic",
+        "detail",
+        "error_details",
+        "error_json",
+        "error_traceback",
+        "error_type",
+        "failure_reason",
+        "last_error",
+        "message",
+        "output",
+        "rationale",
+        "reason",
+        "reply",
+        "reply_fragment",
+        "review",
+        "result",
+        "stderr",
+        "stderr_preview",
+        "stdout",
+        "stdout_preview",
+        "structured_result",
+        "text",
+        "traceback",
+    }
+)
+
+
+def _scrub_failure_payload(
+    value: object,
+    *,
+    source: str,
+    default_code: str,
+    retryable: bool,
+) -> object:
+    """Recursively remove failure prose while retaining only canonical nested error descriptors."""
+    if isinstance(value, dict):
+        scrubbed: dict[str, object] = {}
+        for key, child in value.items():
+            if not isinstance(key, str) or key in _FAILURE_RAW_PAYLOAD_FIELDS:
+                continue
+            if key == "error":
+                scrubbed[key] = _project_error_candidate(
+                    child,
+                    source=source,
+                    default_code=default_code,
+                    retryable=retryable,
+                )
+            else:
+                scrubbed[key] = _scrub_failure_payload(
+                    child,
+                    source=source,
+                    default_code=default_code,
+                    retryable=retryable,
+                )
+        return scrubbed
+    if isinstance(value, list):
+        return [
+            _scrub_failure_payload(
+                item,
+                source=source,
+                default_code=default_code,
+                retryable=retryable,
+            )
+            for item in value
+        ]
+    return value
+
+
+def _sanitized_session_event_payload(
+    event_type: str,
+    payload: dict[str, object],
+) -> dict[str, object]:
+    """Fail closed raw error fields on authenticated session detail, list, and replay paths."""
+    safe_payload = dict(payload)
+    phase = str(safe_payload.get("phase") or "").strip()
+    error_value = safe_payload.get("error")
+    if event_type == "human_handoff_resume_failed":
+        descriptor = _project_error_candidate(
+            error_value,
+            source="chat.handoff_resume",
+            default_code="INTERNAL_ERROR",
+            retryable=False,
+        )
+        safe_payload = _scrub_failure_payload(
+            safe_payload,
+            source="chat.handoff_resume",
+            default_code="INTERNAL_ERROR",
+            retryable=False,
+        )
+        if not isinstance(safe_payload, dict):
+            safe_payload = {}
+        safe_payload["error"] = descriptor
+    elif event_type == "auto_route_decision":
+        if error_value not in (None, ""):
+            descriptor = _project_error_candidate(
+                error_value,
+                source="channel.auto_route",
+                default_code="INTERNAL_ERROR",
+                retryable=False,
+            )
+            safe_payload = _scrub_failure_payload(
+                safe_payload,
+                source="channel.auto_route",
+                default_code="INTERNAL_ERROR",
+                retryable=False,
+            )
+            if not isinstance(safe_payload, dict):
+                safe_payload = {}
+            safe_payload["error"] = descriptor
+    if event_type in {"error_occurred", "stream_interrupted"} or (
+        event_type == "stream_status" and phase == "error"
+    ):
+        descriptor = _project_error_candidate(
+            safe_payload,
+            source=f"chat.{event_type}",
+            default_code="INTERNAL_ERROR",
+            retryable=event_type == "stream_interrupted",
+        )
+        safe_payload = _scrub_failure_payload(
+            safe_payload,
+            source=f"chat.{event_type}",
+            default_code="INTERNAL_ERROR",
+            retryable=event_type == "stream_interrupted",
+        )
+        if not isinstance(safe_payload, dict):
+            safe_payload = {}
+        safe_payload.update(
+            {
+                "code": descriptor["code"],
+                "message": descriptor["code"],
+                "params": descriptor["params"],
+                "retryable": descriptor["retryable"],
+                "error": descriptor,
+            }
+        )
+        for key in (
+            "reason",
+            "detail",
+            "error_details",
+            "error_type",
+            "error_traceback",
+            "traceback",
+            "stderr_preview",
+        ):
+            safe_payload.pop(key, None)
+        if event_type == "stream_interrupted":
+            safe_payload["text"] = localized_interrupted_reply(
+                _language_context_from_payload(safe_payload)
+            )
+    if event_type == "general_skill_trace" and _general_skill_trace_failed(phase):
+        safe_payload = _scrub_failure_payload(
+            safe_payload,
+            source="chat.general_skill_trace",
+            default_code="INTERNAL_ERROR",
+            retryable=False,
+        )
+        if not isinstance(safe_payload, dict):
+            safe_payload = {}
+        safe_message = localized_compat_text(
+            _language_context_from_payload(safe_payload),
+            zh_cn="执行失败",
+            en_us="Execution failed",
+        )
+        safe_payload["message"] = safe_message
+        safe_payload["rationale"] = safe_message
+        safe_payload["text"] = safe_message
+        safe_payload["error"] = _project_error_candidate(
+            payload.get("error") or payload,
+            source="chat.general_skill_trace",
+            default_code="INTERNAL_ERROR",
+            retryable=False,
+        )
+    if event_type in {"tool_result", "tool_call_finished"}:
+        success = safe_payload.get("success")
+        is_error = bool(safe_payload.get("isError")) if success is None else not bool(success)
+        if is_error:
+            descriptor = _project_error_candidate(
+                safe_payload.get("error")
+                or safe_payload.get("content")
+                or safe_payload,
+                source=f"chat.{event_type}",
+                default_code="TOOL_UPSTREAM_ERROR",
+                retryable=True,
+            )
+            scrubbed_payload = _scrub_failure_payload(
+                safe_payload,
+                source=f"chat.{event_type}",
+                default_code="TOOL_UPSTREAM_ERROR",
+                retryable=True,
+            )
+            if isinstance(scrubbed_payload, dict):
+                safe_payload = scrubbed_payload
+            safe_payload["error"] = descriptor
+            if event_type == "tool_result":
+                safe_payload["content"] = {"error": descriptor}
+            else:
+                safe_payload.pop("content", None)
+    data = safe_payload.get("data")
+    if isinstance(data, dict) and "error" in safe_payload:
+        next_data = dict(data)
+        next_data["error"] = safe_payload["error"]
+        safe_payload["data"] = next_data
+    return safe_payload
+
+
+def _sanitized_span_payload(
+    event_type: str,
+    payload: dict[str, object],
+) -> dict[str, object]:
+    """Fail closed legacy span errors while preserving normal timing and language metadata."""
+    safe_payload = dict(payload)
+    if event_type.endswith("_failed"):
+        descriptor = _project_error_candidate(
+            safe_payload.get("error") or safe_payload,
+            source="observability.span",
+            default_code="INTERNAL_ERROR",
+            retryable=False,
+        )
+        scrubbed_payload = _scrub_failure_payload(
+            safe_payload,
+            source="observability.span",
+            default_code="INTERNAL_ERROR",
+            retryable=False,
+        )
+        if isinstance(scrubbed_payload, dict):
+            safe_payload = scrubbed_payload
+        safe_payload["error"] = descriptor
+        safe_payload.pop("error_type", None)
+    return safe_payload
 
 
 def _events_after_cursor(
@@ -1952,6 +2830,7 @@ def create_chat_session(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_session),
 ) -> ChatSessionRead:
+    """Create a session with the user's reply-language preference as its initial authority."""
     _ensure_request_tenant(request.tenant_id, current_user)
     ensure_tenant(db, request.tenant_id)
     _ensure_chat_agent_available(db, request.tenant_id, request.agent_id, current_user)
@@ -1962,6 +2841,10 @@ def create_chat_session(
         user_id=current_user.id,
         agent_id=request.agent_id,
         title=title,
+        agent_reply_locale=current_user.agent_reply_locale,
+        agent_reply_locale_source=(
+            "user_preference" if current_user.agent_reply_locale else None
+        ),
     )
     db.add(row)
     db.commit()
@@ -1993,7 +2876,7 @@ def list_chat_sessions(
                     ),
                     and_(
                         ChatSession.team_id.is_not(None),
-                        ChatSession.title.like("%TL 对话%"),
+                        team_tl_session_filter(),
                     ),
                 ),
             )
@@ -2100,48 +2983,18 @@ def delete_chat_session(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_session),
 ) -> dict[str, str]:
+    """Delete one user's chat session and then remove its captured Harness workspace roots."""
+
     _ensure_request_tenant(tenant_id, current_user)
     row = _get_user_chat_session(db, tenant_id, current_user.id, session_id)
-    messages = db.exec(
-        select(Message).where(Message.tenant_id == tenant_id, Message.session_id == session_id)
-    ).all()
-    events = db.exec(
-        select(AgentEvent).where(AgentEvent.tenant_id == tenant_id, AgentEvent.session_id == session_id)
-    ).all()
-    feedback_rows = db.exec(
-        select(MessageFeedback).where(MessageFeedback.tenant_id == tenant_id, MessageFeedback.session_id == session_id)
-    ).all()
-    skill_feedback_rows = db.exec(
-        select(SkillFeedback).where(SkillFeedback.tenant_id == tenant_id, SkillFeedback.session_id == session_id)
-    ).all()
-    stage_harness_session_record_deletion(
-        db,
+    harness_cleanup = purge_chat_session_records(db, row)
+    db.commit()
+    remove_chat_session_workspace(
         tenant_id=tenant_id,
         session_id=session_id,
+        db=db,
+        workspace_roots=harness_cleanup.workspace_roots,
     )
-    for message in messages:
-        db.delete(message)
-    for event in events:
-        db.delete(event)
-    for feedback in feedback_rows:
-        db.delete(feedback)
-    for feedback in skill_feedback_rows:
-        db.delete(feedback)
-    db.delete(row)
-    db.commit()
-    try:
-        remove_harness_session_workspace(
-            tenant_id=tenant_id,
-            session_id=session_id,
-            db=db,
-        )
-    except OSError:
-        logger.warning(
-            "Failed to remove Harness workspace for tenant=%s session=%s",
-            tenant_id,
-            session_id,
-            exc_info=True,
-        )
     return {"status": "deleted"}
 
 
@@ -2205,7 +3058,7 @@ def download_harness_artifact(
         )
     ).first()
     if frame is None:
-        raise HTTPException(status_code=404, detail="Artifact not found")
+        raise _chat_error("CHAT_ARTIFACT_NOT_FOUND", 404)
     artifact = _published_workspace_artifact(
         db,
         tenant_id=tenant_id,
@@ -2214,18 +3067,16 @@ def download_harness_artifact(
         requested_path=path,
     )
     if artifact is None:
-        raise HTTPException(status_code=404, detail="Artifact not found")
+        raise _chat_error("CHAT_ARTIFACT_NOT_FOUND", 404)
 
     opened = None
     try:
-        opened = open_harness_artifact(
-            harness_task_workspace_path(
-                tenant_id=tenant_id,
-                session_id=session_id,
-                task_frame_id=task_frame_id,
-                db=db,
-            ),
-            path,
+        opened, _workspace_root = open_harness_task_artifact(
+            tenant_id=tenant_id,
+            session_id=session_id,
+            task_frame_id=task_frame_id,
+            path=path,
+            db=db,
         )
         digest = opened.sha256()
         expected_digest = str(artifact.get("sha256") or "").strip().lower()
@@ -2235,11 +3086,15 @@ def download_harness_artifact(
             or (isinstance(expected_size, int) and expected_size != opened.size)
         ):
             opened.close()
-            raise HTTPException(status_code=409, detail="Artifact has changed")
-    except (HarnessArtifactAccessError, OSError):
+            raise _chat_error("CHAT_ARTIFACT_CHANGED", 409)
+    except HarnessWorkspaceArtifactConflictError as exc:
         if opened is not None:
             opened.close()
-        raise HTTPException(status_code=404, detail="Artifact not found") from None
+        raise _chat_error("CHAT_ARTIFACT_LOCATION_CONFLICT", 409, cause=exc) from None
+    except (HarnessArtifactAccessError, OSError) as exc:
+        if opened is not None:
+            opened.close()
+        raise _chat_error("CHAT_ARTIFACT_NOT_FOUND", 404, cause=exc) from None
 
     filename = _safe_artifact_download_name(
         str(artifact.get("display_name") or opened.filename)
@@ -2352,17 +3207,17 @@ def reply_human_handoff(
     _ensure_request_tenant(request.tenant_id, current_user)
     row = db.get(HumanHandoffRequest, handoff_id)
     if not row or row.tenant_id != request.tenant_id:
-        raise HTTPException(status_code=404, detail="Handoff request not found")
+        raise _chat_error("CHAT_HANDOFF_NOT_FOUND", 404)
     if not is_admin_user(current_user) and row.assignee_user_id not in {None, current_user.id}:
-        raise HTTPException(status_code=403, detail="Handoff request not assigned to current user")
+        raise _chat_error("CHAT_HANDOFF_ACCESS_FORBIDDEN", 403)
     reply = request.reply.strip()
     if not reply:
-        raise HTTPException(status_code=400, detail="Reply is required")
+        raise _chat_error("CHAT_HANDOFF_REPLY_REQUIRED", 400)
     if row.status != "pending":
-        raise HTTPException(status_code=409, detail="Handoff request is not pending")
+        raise _chat_error("CHAT_HANDOFF_NOT_PENDING", 409)
     chat_session = db.get(ChatSession, row.session_id)
     if not chat_session or chat_session.tenant_id != request.tenant_id:
-        raise HTTPException(status_code=409, detail="Original handoff session is not available")
+        raise _chat_error("CHAT_HANDOFF_SESSION_UNAVAILABLE", 409)
 
     _apply_handoff_reply(
         db, row, reply, answered_by_user_id=current_user.id, source="web"
@@ -2377,6 +3232,7 @@ def upsert_message_feedback(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_session),
 ) -> dict:
+    """Persist feedback and enqueue analysis with the linked turn locale snapshot."""
     _ensure_request_tenant(request.tenant_id, current_user)
     message_row = _get_feedback_target_message(db, request.tenant_id, current_user.id, message_id)
     existing = db.exec(
@@ -2412,17 +3268,33 @@ def upsert_message_feedback(
         )
     db.add(row)
     _upsert_skill_feedback_for_message(db, request.tenant_id, current_user.id, message_row, request.rating, now)
+    language_context = resolve_feedback_language_context(
+        db,
+        tenant_id=request.tenant_id,
+        session_id=message_row.session_id,
+        message_id=message_row.id,
+    )
     db.add(
         AgentEvent(
             tenant_id=request.tenant_id,
             session_id=message_row.session_id,
             event_type="message_feedback_changed",
-            payload_json={"message_id": message_row.id, "rating": request.rating, "user_id": current_user.id},
+            payload_json={
+                "message_id": message_row.id,
+                "rating": request.rating,
+                "user_id": current_user.id,
+                "language_context": language_context.model_dump(mode="json"),
+            },
         )
     )
     db.commit()
     db.refresh(row)
-    enqueue_feedback_analysis(row.tenant_id, row.id, row.session_id)
+    enqueue_feedback_analysis(
+        row.tenant_id,
+        row.id,
+        row.session_id,
+        language_context=language_context,
+    )
     return {
         "id": row.id,
         "tenant_id": row.tenant_id,
@@ -2510,6 +3382,7 @@ def list_chat_session_spans(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_session),
 ) -> list[dict[str, object]]:
+    """Return persisted span events with canonical public errors and no raw exception text."""
     _ensure_request_tenant(tenant_id, current_user)
     _get_readable_chat_session(db, tenant_id, current_user, session_id)
     rows = db.exec(
@@ -2526,7 +3399,7 @@ def list_chat_session_spans(
             "event_id": row.id,
             "event_type": row.event_type,
             "created_at": row.created_at.isoformat(),
-            **dict(row.payload_json or {}),
+            **_sanitized_span_payload(row.event_type, row.payload_json or {}),
         }
         for row in rows
     ]
@@ -2536,7 +3409,7 @@ def _get_user_chat_session(db: Session, tenant_id: str, user_id: str, session_id
     ensure_tenant(db, tenant_id)
     row = db.get(ChatSession, session_id)
     if not row or row.tenant_id != tenant_id or row.user_id != user_id:
-        raise HTTPException(status_code=404, detail="Session not found")
+        raise _chat_error("CHAT_SESSION_NOT_FOUND", 404)
     return row
 
 
@@ -2544,7 +3417,7 @@ def _get_readable_chat_session(db: Session, tenant_id: str, current_user: User, 
     ensure_tenant(db, tenant_id)
     row = db.get(ChatSession, session_id)
     if not row or row.tenant_id != tenant_id:
-        raise HTTPException(status_code=404, detail="Session not found")
+        raise _chat_error("CHAT_SESSION_NOT_FOUND", 404)
     if row.user_id == current_user.id:
         return row
     if row.team_id:
@@ -2555,7 +3428,7 @@ def _get_readable_chat_session(db: Session, tenant_id: str, current_user: User, 
             return row
     if _user_can_read_handoff_session(db, tenant_id, current_user, session_id):
         return row
-    raise HTTPException(status_code=404, detail="Session not found")
+    raise _chat_error("CHAT_SESSION_NOT_FOUND", 404)
 
 
 def _published_workspace_artifact(
@@ -2633,13 +3506,13 @@ def _ensure_chat_agent_available(
     current_user: User,
 ) -> AgentProfile:
     if not agent_id:
-        raise HTTPException(status_code=400, detail="Agent is required")
+        raise _chat_error("CHAT_AGENT_REQUIRED", 400)
     ensure_tenant(db, tenant_id)
     row = db.get(AgentProfile, agent_id)
     if not row or row.tenant_id != tenant_id or row.status != "active" or row.is_overall:
-        raise HTTPException(status_code=404, detail="Agent not available")
+        raise _chat_error("CHAT_AGENT_UNAVAILABLE", 404)
     if not _chat_agent_visible_to_user(row, current_user):
-        raise HTTPException(status_code=403, detail="Agent not available")
+        raise _chat_error("CHAT_AGENT_ACCESS_FORBIDDEN", 403)
     return row
 
 
@@ -2649,9 +3522,24 @@ def _bind_request_to_session_agent(
     chat_session: ChatSession,
     current_user: User,
 ) -> ChatTurnRequest:
+    """Bind the agent without allowing a request to mutate an existing session reply locale."""
+    if chat_session.agent_reply_locale and request.agent_reply_locale:
+        session_locale = normalize_locale(chat_session.agent_reply_locale)
+        requested_locale = normalize_locale(request.agent_reply_locale)
+        if session_locale is not None and requested_locale is not session_locale:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "AGENT_REPLY_LOCALE_CONFLICT",
+                    "params": {
+                        "requested": requested_locale.value if requested_locale else None,
+                        "session": session_locale.value,
+                    },
+                },
+            )
     if chat_session.agent_id:
         if request.agent_id and request.agent_id != chat_session.agent_id:
-            raise HTTPException(status_code=409, detail="Session is already bound to another agent")
+            raise _chat_error("CHAT_SESSION_AGENT_CONFLICT", 409)
         return request.model_copy(update={"agent_id": chat_session.agent_id})
 
     agent = _ensure_chat_agent_available(db, request.tenant_id, request.agent_id, current_user)
@@ -2666,22 +3554,22 @@ def _ensure_chat_session_available(db: Session, tenant_id: str, user_id: str, se
     ensure_tenant(db, tenant_id)
     row = db.get(ChatSession, session_id)
     if not row or row.tenant_id != tenant_id:
-        raise HTTPException(status_code=404, detail="Session not found")
+        raise _chat_error("CHAT_SESSION_NOT_FOUND", 404)
     # 团队会话(team_id 非空)对本租户成员开放发言(如 TL 工作台聊天室);
     # 普通会话仍仅创建者可见
     if row.user_id != user_id and not row.team_id:
-        raise HTTPException(status_code=404, detail="Session not found")
+        raise _chat_error("CHAT_SESSION_NOT_FOUND", 404)
     return row
 
 
 def _ensure_team_session_human_writable(chat_session: ChatSession) -> None:
     """团队内部会话(任务执行/竞标/验收)仅可查看,不允许人工 /turn、/stream 写入。
 
-    判据与 _team_tl_session_team 一致:只有「TL 对话」标题的团队会话才对人类开放发言,
+    判据与 _team_tl_session_team 一致:只有机器类型为 TL 的团队会话才对人类开放发言,
     其余团队会话由唤醒机制自主驱动,人工写入会污染任务历史并绕过 Agent 权限校验。
     """
-    if chat_session.team_id and "TL 对话" not in (chat_session.title or ""):
-        raise HTTPException(status_code=403, detail="Team execution sessions are read-only")
+    if chat_session.team_id and not is_team_tl_session(chat_session):
+        raise _chat_error("CHAT_TEAM_SESSION_READ_ONLY", 403)
 
 
 def _team_tl_session_team(db: Session, chat_session: ChatSession) -> Team | None:
@@ -2692,8 +3580,8 @@ def _team_tl_session_team(db: Session, chat_session: ChatSession) -> Team | None
     if not chat_session.team_id or not chat_session.agent_id:
         return None
     # 团队会话全量绑定 team_id 后,任务验收/竞标打分等会话同样挂在 TL 名下;
-    # 只有「TL 对话」标题的会话才按人对 TL 聊天处理(与 team-threads 列表同判据)
-    if "TL 对话" not in (chat_session.title or ""):
+    # 只有稳定机器类型为 TL 的会话才按人对 TL 聊天处理。
+    if not is_team_tl_session(chat_session):
         return None
     team = db.get(Team, chat_session.team_id)
     if team is None or team.tenant_id != chat_session.tenant_id or team.status != "active":
@@ -2708,10 +3596,10 @@ def _get_feedback_target_message(db: Session, tenant_id: str, user_id: str, mess
     ensure_tenant(db, tenant_id)
     row = db.get(Message, message_id)
     if not row or row.tenant_id != tenant_id or row.role != "assistant":
-        raise HTTPException(status_code=404, detail="Message not found")
+        raise _chat_error("CHAT_MESSAGE_NOT_FOUND", 404)
     chat_session = db.get(ChatSession, row.session_id)
     if not chat_session or chat_session.tenant_id != tenant_id or chat_session.user_id != user_id:
-        raise HTTPException(status_code=404, detail="Message not found")
+        raise _chat_error("CHAT_MESSAGE_NOT_FOUND", 404)
     return row
 
 
@@ -2946,275 +3834,334 @@ def _fill_skill_context_version(
     return context
 
 
+_TRACE_EVENT_CODES = {
+    "stream_status": "public.run.status",
+    "stream_cancelled": "public.run.cancelled",
+    "stream_interrupted": "public.run.failed",
+    "task_frame_started": "run.task.frame.started",
+    "task_frame_finished": "run.task.frame.finished",
+    "task_frame_completed": "run.task.frame.completed",
+    "task_frame_dependency_waiting": "run.task.frame.waiting",
+    "task_frame_dependencies_released": "run.task.frame.released",
+    "harness_action_created": "run.action.started",
+    "harness_mcp_app_view": "run.capability.completed",
+    "harness_tool_completed": "run.capability.completed",
+    "harness_step_timeout": "run.sop.step.timeout",
+    "harness_execution_recovered": "harness.execution.recovered",
+    "general_skill_selected": "run.skill.trace",
+    "general_skill_intent_checked": "public.run.intent",
+    "general_skill_trace": "run.skill.trace",
+    "general_skill_run_finished": "run.skill.completed",
+    "skill_state": "run.sop.state",
+    "router_decision_created": "public.run.intent",
+    "step_result": "run.sop.step",
+    "skill_started": "run.sop.state",
+    "skill_resumed": "run.sop.state",
+    "skill_step_changed": "run.sop.state",
+    "skill_completed": "run.skill.completed",
+    "tool_call_started": "run.action.started",
+    "tool_result": "run.tool.completed",
+    "tool_call_finished": "run.tool.completed",
+    "knowledge_query_started": "public.run.citation",
+    "knowledge_query_finished": "public.run.citation",
+    "knowledge_result": "public.run.citation",
+    "agent_loop_continued": "run.loop.continued",
+    "agent_loop_completed": "run.loop.completed",
+    "reflection_decision_created": "run.sop.state",
+    "reflection_decision": "run.sop.state",
+    "reflection_skipped": "run.sop.state",
+    "reflection_retry_started": "run.sop.state",
+    "error_occurred": "public.run.failed",
+}
+
+
 def _trace_payload_text(value: object) -> str:
+    """Serialize raw trace output without adding a product-facing label or translation."""
     if value is None or value == "":
         return ""
     if isinstance(value, str):
         try:
             return json.dumps(json.loads(value), ensure_ascii=False, indent=2)
-        except Exception:
+        except (TypeError, ValueError):
             return value
     return json.dumps(value, ensure_ascii=False, indent=2)
 
 
 def _trace_payload_language(value: str) -> str:
+    """Identify raw output format for clients without converting its language or content."""
     if not value.strip():
         return "text"
     try:
         json.loads(value)
         return "json"
-    except Exception:
+    except (TypeError, ValueError):
         return "text"
 
 
-def _general_skill_trace_detail(payload: dict, phase: str) -> str | None:
-    review = payload.get("review") if isinstance(payload.get("review"), dict) else {}
-    if phase.startswith("reflection_"):
-        parts = [
-            str(review.get("reason") or "").strip(),
-            str(review.get("repair_hint") or "").strip(),
-        ]
-        text = " · ".join(part for part in parts if part)
-        return text or None
-    detail = str(payload.get("rationale") or payload.get("text") or "").strip()
-    if _general_skill_trace_failed(phase):
-        error = str(payload.get("error") or payload.get("stderr_preview") or "").strip()
-        if error and error not in detail:
-            detail = f"{detail} · {error}" if detail else error
-    return detail or None
+def _trace_event_data(payload: dict[str, object]) -> dict[str, object]:
+    """Keep raw event values while dropping deprecated backend-rendered text fields."""
+    return {
+        key: value
+        for key, value in payload.items()
+        if key not in {"detail", "outputTitle", "status_text", "text"}
+    }
+
+
+def _trace_event_descriptor(
+    event_type: str,
+    payload: dict[str, object],
+    event_id: str,
+) -> tuple[str | None, dict[str, object]]:
+    """Return a registered trace code and exact primitive params for one event type."""
+    event_code = _TRACE_EVENT_CODES.get(event_type)
+    if event_type == "stream_status" and str(payload.get("phase") or "").strip() == "error":
+        event_code = "public.run.failed"
+    if event_code in {"public.run.cancelled", "run.action.started"}:
+        job_id = str(payload.get("job_id") or payload.get("task_frame_id") or event_id).strip()
+        return event_code, {"job_id": job_id or "chat"}
+    if event_code == "public.run.intent":
+        decision = str(payload.get("decision") or payload.get("user_intent") or "unknown").strip()
+        return event_code, {"decision": decision or "unknown"}
+    if event_code == "public.run.failed":
+        error_code = _LEGACY_PUBLIC_ERROR_ALIASES.get(
+            str(payload.get("code") or payload.get("error_type") or "").strip(),
+            str(payload.get("code") or payload.get("error_type") or "INTERNAL_ERROR").strip(),
+        ) or "INTERNAL_ERROR"
+        job_id = str(payload.get("job_id") or payload.get("task_frame_id") or event_id).strip()
+        return event_code, {
+            "job_id": job_id or "chat",
+            "error_code": error_code,
+            "retryable": bool(payload.get("retryable")),
+        }
+    if event_code == "harness.execution.recovered":
+        raw_params = payload.get("params")
+        params = raw_params if isinstance(raw_params, dict) else {}
+        error_code = str(params.get("error_code") or "INTERNAL_ERROR").strip()
+        return event_code, {"error_code": error_code or "INTERNAL_ERROR"}
+    return event_code, {}
+
+
+def _structured_trace_line(
+    *,
+    line_id: str,
+    kind: str,
+    state: str,
+    event_type: str,
+    event_data: dict[str, object],
+    event_id: str,
+    event_code: str | None = None,
+    params: dict[str, object] | None = None,
+    output: str | None = None,
+    output_language: str | None = None,
+    code: str | None = None,
+    language: str | None = None,
+    mcp_app: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """Build a locale-independent trace projection with an empty legacy text field."""
+    resolved_code, resolved_params = _trace_event_descriptor(event_type, event_data, event_id)
+    line: dict[str, object] = {
+        "id": line_id,
+        "kind": kind,
+        "text": "",
+        "event_type": event_type,
+        "event_data": _trace_event_data(event_data),
+        "state": state,
+    }
+    if event_code or resolved_code:
+        line["event_code"] = event_code or resolved_code
+        line["params"] = params if params is not None else resolved_params
+    if output:
+        line["output"] = output
+        line["outputLanguage"] = output_language or _trace_payload_language(output)
+        line["collapsible"] = True
+    if code:
+        line["code"] = code
+    if language:
+        line["language"] = language
+    if mcp_app is not None:
+        line["mcpApp"] = mcp_app
+    return line
 
 
 def _general_skill_trace_failed(phase: str) -> bool:
+    """Identify failed general-skill phases without projecting their diagnostic prose."""
     return "failed" in phase or phase == "code_timeout" or phase.endswith("_error")
 
 
-def _error_trace_text(payload: dict, *, interrupted: bool = False) -> str:
-    code = str(payload.get("code") or "").strip()
-    if code == "LLM_ERROR":
-        return "模型调用失败"
-    if interrupted:
-        return "响应生成中断"
-    if code:
-        return f"执行失败 {code}"
-    error_type = str(payload.get("error_type") or "").strip()
-    if error_type:
-        return f"执行失败 {error_type}"
-    return "执行失败"
-
-
-def _error_trace_detail(payload: dict) -> str | None:
-    code = str(payload.get("code") or "").strip()
-    error_type = str(payload.get("error_type") or "").strip()
-    message = str(payload.get("message") or payload.get("reason") or payload.get("text") or "").strip()
-    parts = [code, error_type, message]
-    detail = " · ".join(part for part in parts if part)
-    return detail[:2000] if detail else None
-
-
-def _general_skill_trace_output(payload: dict, phase: str) -> dict[str, str]:
-    if phase == "stdout_chunk":
-        output = _trace_payload_text(payload.get("stdout_preview") or payload.get("text"))
+def _general_skill_trace_output(payload: dict[str, object], phase: str) -> dict[str, str]:
+    """Expose successful or technical general-skill output without localized output labels."""
+    if phase in {"stdout_chunk", "stderr_chunk"}:
+        output = _trace_payload_text(payload.get("stdout_preview") or payload.get("stderr_preview") or payload.get("text"))
         return {
             "output": output,
             "outputLanguage": _trace_payload_language(output),
-            "outputTitle": "查看运行输出",
-        } if output else {}
-    if phase == "stderr_chunk":
-        output = _trace_payload_text(payload.get("stderr_preview") or payload.get("text"))
-        return {
-            "output": output,
-            "outputLanguage": _trace_payload_language(output),
-            "outputTitle": "查看错误输出",
         } if output else {}
     if phase in {"code_finished", "code_timeout"}:
         result: dict[str, object] = {}
-        if "return_code" in payload:
-            result["return_code"] = payload.get("return_code")
-        if "structured_result" in payload:
-            result["structured_result"] = payload.get("structured_result")
-        if str(payload.get("stdout_preview") or "").strip():
-            result["stdout"] = payload.get("stdout_preview")
-        if str(payload.get("stderr_preview") or "").strip():
-            result["stderr"] = payload.get("stderr_preview")
-        output = _trace_payload_text(result if result else payload.get("stdout_preview") or payload.get("stderr_preview"))
+        for key in ("return_code", "structured_result"):
+            if key in payload:
+                result[key] = payload.get(key)
+        for key in ("stdout_preview", "stderr_preview"):
+            if str(payload.get(key) or "").strip():
+                result[key.removesuffix("_preview")] = payload.get(key)
+        output = _trace_payload_text(
+            result or payload.get("stdout_preview") or payload.get("stderr_preview")
+        )
         return {
             "output": output,
             "outputLanguage": _trace_payload_language(output),
-            "outputTitle": "查看超时结果" if phase == "code_timeout" else "查看执行结果",
         } if output else {}
     if phase.startswith("reflection_"):
-        result: dict[str, object] = {}
-        if "structured_result" in payload:
-            result["structured_result"] = payload.get("structured_result")
-        if "review" in payload:
-            result["review"] = payload.get("review")
-        if str(payload.get("stdout_preview") or "").strip():
-            result["stdout"] = payload.get("stdout_preview")
-        if str(payload.get("stderr_preview") or "").strip():
-            result["stderr"] = payload.get("stderr_preview")
+        result = {
+            key: payload.get(key)
+            for key in ("structured_result", "review", "stdout_preview", "stderr_preview")
+            if key in payload
+        }
         output = _trace_payload_text(result)
         return {
             "output": output,
             "outputLanguage": _trace_payload_language(output),
-            "outputTitle": "查看校验详情",
         } if result and output else {}
     return {}
 
 
-def _harness_event_trace_line(event: AgentEvent) -> dict | None:
-    payload = event.payload_json or {}
+def _resolve_step_label(
+    step_id: str,
+    step_names: dict[str, dict[str, str]] | None,
+    skill_id: str | None = None,
+) -> str:
+    """Resolve an explicit stored step label, otherwise retain the raw step identifier."""
+    normalized_step_id = str(step_id or "").strip()
+    if not normalized_step_id or step_names is None:
+        return normalized_step_id
+    scoped = step_names.get(skill_id or "") or {}
+    if normalized_step_id in scoped:
+        return scoped[normalized_step_id]
+    for steps in step_names.values():
+        if normalized_step_id in steps:
+            return steps[normalized_step_id]
+    return normalized_step_id
+
+
+def _harness_event_trace_line(
+    event: AgentEvent,
+    skill_hint: str | None = None,
+    step_names: dict[str, dict[str, str]] | None = None,
+    tool_names: dict[str, str] | None = None,
+    payload_override: dict[str, object] | None = None,
+) -> dict | None:
+    """Return one locale-independent Harness trace projection with raw diagnostics."""
+    raw_payload = event.payload_json or {}
+    payload = payload_override if payload_override is not None else _sanitized_session_event_payload(
+        event.event_type, raw_payload
+    )
     event_type = event.event_type
-    frame_id = str(payload.get("task_frame_id") or event.id).strip()
+    event_id = str(event.id or "")
+    frame_id = str(payload.get("task_frame_id") or event_id).strip()
     iteration = str(payload.get("iteration") or "").strip()
-    tool_name = str(payload.get("tool_name") or "").strip()
 
     if event_type == "task_frame_started":
-        kind = str(payload.get("kind") or "conversation").strip()
-        skill_name = str(payload.get("skill_name") or payload.get("skill_id") or "").strip()
-        step_id = str(payload.get("step_id") or "").strip()
-        detail_parts = [
-            "SOP TaskFrame" if kind == "sop" else "对话 TaskFrame",
-            f"步骤 {step_id}" if step_id else "",
-            (
-                f"单步上限 {payload.get('step_timeout_seconds')} 秒"
-                if payload.get("step_timeout_seconds")
-                else ""
-            ),
-            (
-                f"Harness 最多 {payload.get('harness_max_actions')} 轮"
-                if payload.get("harness_max_actions")
-                else ""
-            ),
-        ]
-        return {
-            "id": f"harness_frame_{frame_id}",
-            "kind": "skill" if kind == "sop" else "decision",
-            "text": f"开始SOP {skill_name}" if kind == "sop" and skill_name else "开始执行任务",
-            "detail": " · ".join(part for part in detail_parts if part) or None,
-            "state": "running",
-        }
-    if event_type == "task_frame_finished":
-        kind = str(payload.get("kind") or "conversation").strip()
-        skill_name = str(payload.get("skill_name") or payload.get("skill_id") or "").strip()
-        step_id = str(payload.get("step_id") or "").strip()
+        kind = "skill" if str(payload.get("kind") or "").strip() == "sop" else "decision"
+        return _structured_trace_line(
+            line_id=f"harness_frame_{frame_id}",
+            kind=kind,
+            state="running",
+            event_type=event_type,
+            event_data=payload,
+            event_id=event_id,
+        )
+    if event_type in {
+        "task_frame_finished",
+        "task_frame_completed",
+        "task_frame_dependency_waiting",
+        "task_frame_dependencies_released",
+    }:
         status = str(payload.get("status") or "completed").strip()
-        action_count = payload.get("action_count")
         failed = status in {"failed", "blocked", "cancelled"}
-        detail_parts = [
-            f"状态 {status}",
-            f"步骤 {step_id}" if step_id else "",
-            f"执行 {action_count} 个动作" if isinstance(action_count, int) else "",
-        ]
-        if kind == "sop" and skill_name:
-            if failed:
-                text = f"SOP执行失败 {skill_name}"
-            elif status == "awaiting_user":
-                text = f"等待用户补充 {skill_name}"
-            else:
-                text = f"SOP任务执行完成 {skill_name}"
+        if event_type == "task_frame_dependency_waiting":
+            state = "running"
+        elif event_type in {"task_frame_completed", "task_frame_dependencies_released"}:
+            state = "completed"
         else:
-            text = "任务执行失败" if failed else "任务执行完成"
-        return {
-            "id": f"harness_frame_{frame_id}",
-            "kind": "skill" if kind == "sop" else "decision",
-            "text": text,
-            "detail": " · ".join(part for part in detail_parts if part) or None,
-            "state": "failed" if failed else ("running" if status == "awaiting_user" else "completed"),
-        }
+            state = "failed" if failed else "running" if status == "awaiting_user" else "completed"
+        kind = "skill" if str(payload.get("kind") or "").strip() == "sop" else "decision"
+        return _structured_trace_line(
+            line_id=f"harness_frame_{frame_id}",
+            kind=kind,
+            state=state,
+            event_type=event_type,
+            event_data=payload,
+            event_id=event_id,
+        )
     if event_type == "harness_action_created":
         action = str(payload.get("action") or "").strip()
         if action == "tool":
-            return {
-                "id": f"harness_action_{frame_id}_{iteration or event.id}",
-                "kind": "tool",
-                "text": f"调用能力 {tool_name}" if tool_name else "调用能力",
-                "detail": f"第 {iteration} 个动作" if iteration else None,
-                "state": "running",
-            }
+            return _structured_trace_line(
+                line_id=f"harness_action_{frame_id}_{iteration or event_id}",
+                kind="tool",
+                state="running",
+                event_type=event_type,
+                event_data=payload,
+                event_id=event_id,
+            )
         if action == "finish":
-            return {
-                "id": f"harness_finish_{frame_id}_{iteration or event.id}",
-                "kind": "decision",
-                "text": "整理任务结果",
-                "detail": f"第 {iteration} 个动作" if iteration else None,
-                "state": "completed",
-            }
+            return _structured_trace_line(
+                line_id=f"harness_finish_{frame_id}_{iteration or event_id}",
+                kind="decision",
+                state="completed",
+                event_type=event_type,
+                event_data=payload,
+                event_id=event_id,
+            )
         return None
     if event_type == "harness_mcp_app_view":
         mcp_app = payload.get("mcp_app") if isinstance(payload.get("mcp_app"), dict) else None
         if mcp_app is None:
             return None
-        app_tool_name = str(payload.get("tool_name") or mcp_app.get("tool_name") or "").strip()
-        return {
-            "id": f"harness_mcp_app_{frame_id}_{event.id}",
-            "kind": "tool",
-            "text": f"展示 MCP App {app_tool_name}" if app_tool_name else "展示 MCP App",
-            "detail": "隔离视图；加载失败时保留文本结果",
-            "mcpApp": mcp_app,
-            "state": "completed",
-        }
+        return _structured_trace_line(
+            line_id=f"harness_mcp_app_{frame_id}_{event_id}",
+            kind="tool",
+            state="completed",
+            event_type=event_type,
+            event_data=payload,
+            event_id=event_id,
+            mcp_app=mcp_app,
+        )
     if event_type == "harness_tool_completed":
         success = bool(payload.get("success"))
-        error = payload.get("error") if isinstance(payload.get("error"), dict) else {}
-        error_detail = " · ".join(
-            part
-            for part in (
-                str(error.get("code") or "").strip(),
-                str(error.get("message") or "").strip(),
-            )
-            if part
-        )
         result_payload = payload.get("result")
-        output = _trace_payload_text(result_payload)
+        output = _trace_payload_text(result_payload) if success else ""
         mcp_app = (
             result_payload.get("mcp_app")
             if isinstance(result_payload, dict)
             and isinstance(result_payload.get("mcp_app"), dict)
             else None
         )
-        return {
-            "id": f"harness_action_{frame_id}_{iteration or event.id}",
-            "kind": "tool",
-            "text": (
-                f"能力调用完成 {tool_name}"
-                if success and tool_name
-                else f"能力调用失败 {tool_name}"
-                if tool_name
-                else "能力调用完成"
-                if success
-                else "能力调用失败"
-            ),
-            "detail": error_detail or None,
-            "output": output or None,
-            "outputLanguage": _trace_payload_language(output) if output else None,
-            "outputTitle": "查看能力结果" if output else None,
-            "collapsible": bool(output),
-            "mcpApp": mcp_app,
-            "state": "completed" if success else "failed",
-        }
+        return _structured_trace_line(
+            line_id=f"harness_action_{frame_id}_{iteration or event_id}",
+            kind="tool",
+            state="completed" if success else "failed",
+            event_type=event_type,
+            event_data=payload,
+            event_id=event_id,
+            output=output or None,
+            mcp_app=mcp_app,
+        )
     if event_type == "harness_step_timeout":
-        timeout_seconds = payload.get("timeout_seconds")
-        action_count = payload.get("action_count")
-        return {
-            "id": f"harness_timeout_{frame_id}",
-            "kind": "skill",
-            "text": "SOP 单步运行超时",
-            "detail": " · ".join(
-                part
-                for part in (
-                    f"上限 {timeout_seconds} 秒" if timeout_seconds else "",
-                    f"已执行 {action_count} 个动作" if isinstance(action_count, int) else "",
-                )
-                if part
-            ) or None,
-            "state": "failed",
-        }
+        return _structured_trace_line(
+            line_id=f"harness_timeout_{frame_id}",
+            kind="skill",
+            state="failed",
+            event_type=event_type,
+            event_data=payload,
+            event_id=event_id,
+        )
     return None
 
 
 def _ensure_request_tenant(tenant_id: str, current_user: User) -> None:
     if tenant_id != current_user.tenant_id:
-        raise HTTPException(status_code=403, detail="Tenant mismatch")
+        raise _chat_error("TENANT_MISMATCH", 403)
 
 
 def _chat_agent_visible_to_user(row: AgentProfile, user: User) -> bool:
@@ -3229,7 +4176,7 @@ def _normalize_title(value: str | None) -> str | None:
         return None
     title = value.strip()
     if not title:
-        raise HTTPException(status_code=400, detail="Session title cannot be empty")
+        raise _chat_error("CHAT_SESSION_TITLE_REQUIRED", 400)
     return title[:80]
 
 
@@ -3371,8 +4318,15 @@ def _with_scheduled_draft_message_traces(traces: list[dict], messages: list[Mess
     return next_traces
 
 
-def _event_trace_lines(event: AgentEvent, skill_names: dict[str, str], skill_hint: str | None = None) -> list[dict]:
-    line = _event_trace_line(event, skill_names, skill_hint)
+def _event_trace_lines(
+    event: AgentEvent,
+    skill_names: dict[str, str],
+    skill_hint: str | None = None,
+    step_names: dict[str, dict[str, str]] | None = None,
+    tool_names: dict[str, str] | None = None,
+) -> list[dict]:
+    """Return trace lines with canonical descriptors and a compatibility empty text field."""
+    line = _event_trace_line(event, skill_names, skill_hint, step_names, tool_names)
     if not line:
         return []
     lines = line if isinstance(line, list) else [line]
@@ -3426,173 +4380,96 @@ def _event_trace_icon(event: AgentEvent, line: dict) -> str:
     return "advance"
 
 
-def _event_trace_line(
-    event: AgentEvent, skill_names: dict[str, str], skill_hint: str | None = None
+def _structured_event_trace_line(
+    event: AgentEvent,
+    payload: dict[str, object],
+    skill_names: dict[str, str],
+    skill_hint: str | None = None,
+    step_names: dict[str, dict[str, str]] | None = None,
 ) -> dict | list[dict] | None:
-    payload = event.payload_json or {}
-    if event.event_type in {
-        "task_frame_started",
-        "task_frame_finished",
-        "harness_action_created",
-        "harness_mcp_app_view",
-        "harness_tool_completed",
-        "harness_step_timeout",
-    }:
-        return _harness_event_trace_line(event)
-    if event.event_type == "stream_status":
+    """Build a structured trace line while leaving user and diagnostic values raw."""
+    event_type = event.event_type
+    event_id = str(event.id or "")
+
+    if event_type == "stream_status":
         phase = str(payload.get("phase") or "").strip()
-        text = str(payload.get("text") or "").strip()
-        if phase == "scheduled_task_intent":
+        if phase in {"scheduled_task_intent", "scheduled_task_parse", "scheduled_task_draft"}:
+            index = {
+                "scheduled_task_intent": 0,
+                "scheduled_task_parse": 1,
+                "scheduled_task_draft": 2,
+            }[phase]
             return {
-                "id": "scheduled_task_intent",
-                "kind": "decision",
-                "text": text or "识别定时任务需求",
-                "detail": "用户选择了创建定时任务模式",
-                "state": "running",
+                **_scheduled_task_trace_lines(
+                    payload,
+                    state="running",
+                    event_type=event_type,
+                )[index]
             }
-        if phase == "scheduled_task_parse":
-            return {
-                "id": "scheduled_task_parse",
-                "kind": "decision",
-                "text": text or "解析执行计划",
-                "detail": None,
-                "state": "running",
-            }
-        if phase == "scheduled_task_draft":
-            return {
-                "id": "scheduled_task_draft",
-                "kind": "decision",
-                "text": text or "生成定时任务草案",
-                "detail": _scheduled_task_trace_detail(payload),
-                "state": "running",
-            }
-        if phase == "routing":
-            return {
-                "id": "decision_router",
-                "kind": "decision",
-                "text": "判断意图",
-                "detail": None,
-                "state": "running",
-            }
-        if phase == "error":
-            code = str(payload.get("code") or payload.get("error_type") or "status").strip()
-            return {
-                "id": f"error_{code}",
-                "kind": "decision",
-                "text": _error_trace_text(payload),
-                "detail": _error_trace_detail(payload),
-                "state": "failed",
-            }
-        if phase == "responding":
+        if phase == "responding" or not phase or phase == "received":
             return None
-        if phase == "stepping":
+        if phase == "routing":
+            line_id = "decision_router"
+        elif phase == "error":
+            code = str(payload.get("code") or payload.get("error_type") or "status").strip()
+            line_id = f"error_{code}"
+        elif phase == "stepping":
             repair_reason = str(payload.get("repair_reason") or "main").strip()
-            iteration = payload.get("iteration")
-            iteration_suffix = (
-                f"_{iteration}" if isinstance(iteration, (int, float, str)) else ""
-            )
-            return {
-                "id": f"decision_stepping_{repair_reason}{iteration_suffix}",
-                "kind": "decision",
-                "text": "决定下一步" if repair_reason == "main" else "重新分析",
-                "detail": None,
-                "state": "running",
-            }
-        if phase == "reflecting":
-            return {
-                "id": "reflection",
-                "kind": "decision",
-                "text": "正在反思",
-                "detail": None,
-                "state": "running",
-            }
-        if phase in KNOWLEDGE_TRACE_PHASES:
-            query = payload.get("query") if isinstance(payload.get("query"), dict) else {}
-            detail_parts = [
-                f"查询：{query['query']}" if query.get("query") else "",
-                f"命中知识图谱 {payload['selected_count']} 个"
-                if isinstance(payload.get("selected_count"), int)
-                else "",
-                f"候选 {payload['candidate_count']} 个"
-                if isinstance(payload.get("candidate_count"), int)
-                else "",
-                f"读取 {payload['chunk_count']} 个片段"
-                if isinstance(payload.get("chunk_count"), int)
-                else "",
-                f"整理 {payload['evidence_count']} 条证据"
-                if isinstance(payload.get("evidence_count"), int)
-                else "",
-            ]
-            return {
-                "id": _knowledge_trace_line_id(payload),
-                "kind": "knowledge",
-                "text": text or "检索知识库",
-                "detail": " · ".join(part for part in detail_parts if part) or None,
-                "state": "completed"
-                if phase == "evidence_pack" or phase.startswith("no_") or phase == "okf_only"
-                else "running",
-            }
-        if phase == "tool" and payload.get("tool_name"):
-            tool_name = str(payload["tool_name"])
-            tool_call_id = str(payload.get("tool_call_id") or tool_name)
-            return {
-                "id": f"tool_{tool_call_id}",
-                "kind": "tool",
-                "text": f"正在调用 {tool_name}",
-                "detail": None,
-                "state": "running",
-            }
-        if phase and phase != "received":
-            return {
-                "id": f"decision_status_{phase}",
-                "kind": "decision",
-                "text": text or phase,
-                "detail": None,
-                "state": "running",
-            }
-        return None
-    if event.event_type == "stream_cancelled":
-        return {
-            "id": "generation_stopped",
-            "kind": "decision",
-            "text": "用户已停止生成",
-            "detail": None,
-            "state": "completed",
-        }
-    if event.event_type == "stream_interrupted":
-        return {
-            "id": "generation_interrupted",
-            "kind": "thinking",
-            "text": _error_trace_text(payload, interrupted=True),
-            "detail": _error_trace_detail(payload),
-            "state": "failed",
-        }
-    if event.event_type == "general_skill_selected":
-        skill_name = str(payload.get("skill_name") or payload.get("skill_slug") or "").strip()
-        reason = str(payload.get("reason") or "").strip()
-        return {
-            "id": f"general_skill_selected_{event.id}",
-            "kind": "skill",
-            "text": f"选择通用技能 {skill_name}" if skill_name else "选择通用技能",
-            "detail": reason or None,
-            "state": "completed",
-        }
-    if event.event_type == "general_skill_intent_checked":
-        skill_name = str(payload.get("skill_name") or payload.get("skill_slug") or "").strip()
-        reason = str(payload.get("reason") or "").strip()
-        return {
-            "id": f"general_skill_intent_{event.id}",
-            "kind": "decision",
-            "text": "判断意图" if not skill_name else f"判断意图 {skill_name}",
-            "detail": reason or None,
-            "state": "completed",
-        }
-    if event.event_type == "general_skill_trace":
-        message = str(payload.get("message") or "").strip()
+            iteration = str(payload.get("iteration") or "").strip()
+            suffix = f"_{iteration}" if iteration else ""
+            line_id = f"decision_stepping_{repair_reason}{suffix}"
+        elif phase == "reflecting":
+            line_id = "reflection"
+        elif phase in KNOWLEDGE_TRACE_PHASES:
+            line_id = _knowledge_trace_line_id(payload)
+        elif phase == "tool" and payload.get("tool_name"):
+            tool_call_id = str(payload.get("tool_call_id") or payload.get("tool_name")).strip()
+            line_id = f"tool_{tool_call_id}"
+        else:
+            line_id = f"decision_status_{phase}"
+        kind = "knowledge" if phase in KNOWLEDGE_TRACE_PHASES else "tool" if phase == "tool" else "decision"
+        state = "failed" if phase == "error" else "running"
+        return _structured_trace_line(
+            line_id=line_id,
+            kind=kind,
+            state=state,
+            event_type=event_type,
+            event_data=payload,
+            event_id=event_id,
+        )
+
+    if event_type == "stream_cancelled":
+        return _structured_trace_line(
+            line_id="generation_stopped",
+            kind="decision",
+            state="completed",
+            event_type=event_type,
+            event_data=payload,
+            event_id=event_id,
+        )
+    if event_type == "stream_interrupted":
+        return _structured_trace_line(
+            line_id="generation_interrupted",
+            kind="thinking",
+            state="failed",
+            event_type=event_type,
+            event_data=payload,
+            event_id=event_id,
+        )
+    if event_type in {"general_skill_selected", "general_skill_intent_checked"}:
+        kind = "skill" if event_type == "general_skill_selected" else "decision"
+        return _structured_trace_line(
+            line_id=f"general_skill_{'selected' if kind == 'skill' else 'intent'}_{event_id}",
+            kind=kind,
+            state="completed",
+            event_type=event_type,
+            event_data=payload,
+            event_id=event_id,
+        )
+    if event_type == "general_skill_trace":
         phase = str(payload.get("phase") or "").strip()
         if phase == "replying":
             return None
-        detail = _general_skill_trace_detail(payload, phase)
         output = _general_skill_trace_output(payload, phase)
         code = str(payload.get("code") or "").strip()
         runtime = str(payload.get("runtime") or "").strip().lower()
@@ -3606,208 +4483,141 @@ def _event_trace_line(
             "code_timeout",
             "plan_failed",
         }
-        return {
-            "id": f"general_skill_trace_{event.id}",
-            "kind": "code" if code or phase in code_phases else "decision",
-            "text": message or phase or "执行通用技能",
-            "detail": detail or None,
-            "code": code or None,
-            "language": "bash" if code and runtime == "bash" else "python" if code else None,
-            "state": "failed" if _general_skill_trace_failed(phase) else "completed",
-            "collapsible": bool(code or output.get("output")),
-            **output,
-        }
-    if event.event_type == "general_skill_run_finished":
-        success = bool(payload.get("success"))
-        operation = str(payload.get("operation") or "execute")
-        action = "阅读" if operation == "read" else "运行"
-        return {
-            "id": f"general_skill_finished_{event.id}",
-            "kind": "skill",
-            "text": f"通用技能{action}{'完成' if success else '失败'}",
-            "detail": str(payload.get("skill_slug") or "") or None,
-            "state": "completed" if success else "failed",
-        }
-    if event.event_type == "skill_state":
-        lines = []
-        runtime_decision = str(payload.get("runtimeDecision") or "").strip()
-        from_skill_id = str(payload.get("fromSkillId") or "").strip()
-        to_skill_id = str(payload.get("toSkillId") or "").strip()
+        return _structured_trace_line(
+            line_id=f"general_skill_trace_{event_id}",
+            kind="code" if code or phase in code_phases else "decision",
+            state="failed" if _general_skill_trace_failed(phase) else "completed",
+            event_type=event_type,
+            event_data=payload,
+            event_id=event_id,
+            output=output.get("output"),
+            output_language=output.get("outputLanguage"),
+            code=code or None,
+            language=("bash" if code and runtime == "bash" else "python" if code else None),
+        )
+    if event_type == "general_skill_run_finished":
+        return _structured_trace_line(
+            line_id=f"general_skill_finished_{event_id}",
+            kind="skill",
+            state="completed" if bool(payload.get("success")) else "failed",
+            event_type=event_type,
+            event_data=payload,
+            event_id=event_id,
+        )
+    if event_type == "skill_state":
+        lines: list[dict] = []
         for index, entry in enumerate(payload.get("currentSkills") or []):
             if not isinstance(entry, dict):
                 continue
             skill_id = str(entry.get("skillId") or "").strip()
             if not skill_id:
                 continue
-            name = str(entry.get("name") or skill_id).strip()
             state = str(entry.get("state") or "active").strip()
-            if state == "suspended":
-                label = "挂起SOP"
-            elif state == "pending":
-                label = "等待SOP"
-            elif runtime_decision in {"start_skill", "start_new_task"}:
-                label = "选择SOP"
-            elif runtime_decision == "suspend_current_and_start_new_skill" or (
-                runtime_decision
-                in {"answer_related_question_then_resume", "answer_chitchat_then_resume"}
-                and from_skill_id
-                and to_skill_id
-                and from_skill_id != to_skill_id
-            ):
-                label = "切换SOP"
-            elif runtime_decision == "exit_current_skill":
-                label = "恢复SOP"
-            else:
-                label = "推进SOP"
-            step_id = str(entry.get("stepId") or "").strip()
-            state_key = step_id or str(index)
+            state_key = str(entry.get("stepId") or index)
             lines.append(
-                {
-                    "id": f"skill_state_{skill_id}_{state}_{state_key}",
-                    "kind": "skill",
-                    "text": f"{label} {name}",
-                    "detail": f"当前步骤 {step_id}" if step_id else None,
-                    "state": "completed" if state == "suspended" else "running",
-                }
+                _structured_trace_line(
+                    line_id=f"skill_state_{skill_id}_{state}_{state_key}",
+                    kind="skill",
+                    state="completed" if state == "suspended" else "running",
+                    event_type=event_type,
+                    event_data={**payload, "current_skill": entry},
+                    event_id=event_id,
+                )
             )
         return lines or None
-    if event.event_type == "scheduled_task_draft_created":
-        return _scheduled_task_trace_lines(payload)
-    if event.event_type == "router_decision_created":
-        intent = str(payload.get("user_intent") or "").strip()
-        reason = str(payload.get("reason") or "").strip()
-        return {
-            "id": "decision_router",
-            "kind": "decision",
-            "text": f"判断意图 {intent}" if intent else "完成SOP判断",
-            "detail": reason or None,
-            "state": "completed",
-        }
-    if event.event_type == "step_result":
+    if event_type == "scheduled_task_draft_created":
+        return _scheduled_task_trace_lines(payload, event_type=event_type)
+    if event_type == "router_decision_created":
+        return _structured_trace_line(
+            line_id="decision_router",
+            kind="decision",
+            state="completed",
+            event_type=event_type,
+            event_data=payload,
+            event_id=event_id,
+        )
+    if event_type == "step_result":
         tool_call = payload.get("tool_call") if isinstance(payload.get("tool_call"), dict) else {}
         knowledge_query = payload.get("knowledge_query") if isinstance(payload.get("knowledge_query"), dict) else {}
-        next_step_id = str(payload.get("next_step_id") or "").strip()
-        reply = str(payload.get("reply") or "").strip()
-        raw_tool_name = tool_call.get("name") if isinstance(tool_call, dict) else ""
-        raw_knowledge_query = knowledge_query.get("query") if isinstance(knowledge_query, dict) else ""
-        tool_name = str(raw_tool_name or "").strip()
-        knowledge_query_text = str(raw_knowledge_query or "").strip()
-        detail = " · ".join(
-            part
-            for part in (
-                f"下一节点 {next_step_id}" if next_step_id else "",
-                f"查询：{knowledge_query_text}" if knowledge_query_text else "",
-                reply[:80] if not tool_name and not knowledge_query_text and reply else "",
-            )
-            if part
+        if tool_call.get("name"):
+            line_id = f"decision_step_tool_{tool_call['name']}"
+            state = "running"
+        elif knowledge_query.get("query"):
+            line_id = "decision_step_knowledge"
+            state = "running"
+        else:
+            line_id = "decision_step_result"
+            state = "completed"
+        return _structured_trace_line(
+            line_id=line_id,
+            kind="decision",
+            state=state,
+            event_type=event_type,
+            event_data=payload,
+            event_id=event_id,
         )
-        if tool_name:
-            return {
-                "id": f"decision_step_tool_{tool_name}",
-                "kind": "decision",
-                "text": f"决定调用工具 {tool_name}",
-                "detail": detail or None,
-                "state": "running",
-            }
-        if knowledge_query_text:
-            return {
-                "id": "decision_step_knowledge",
-                "kind": "decision",
-                "text": "决定查询知识库",
-                "detail": detail or None,
-                "state": "running",
-            }
-        return {
-            "id": "decision_step_result",
-            "kind": "decision",
-            "text": "决定下一步" if next_step_id else "完成步骤判断",
-            "detail": detail or None,
-            "state": "completed",
-        }
-    if event.event_type in {"skill_started", "skill_resumed", "skill_step_changed"}:
+    if event_type in {"skill_started", "skill_resumed", "skill_step_changed"}:
         to_skill_id = str(payload.get("to_skill_id") or "")
         from_skill_id = str(payload.get("from_skill_id") or "")
         if (
-            event.event_type == "skill_step_changed"
+            event_type == "skill_step_changed"
             and from_skill_id == to_skill_id
-            and str(payload.get("from_step_id") or "")
-            == str(payload.get("to_step_id") or "")
+            and str(payload.get("from_step_id") or "") == str(payload.get("to_step_id") or "")
         ):
             return None
         skill_id = to_skill_id or from_skill_id or (skill_hint or "")
         if not skill_id:
             return None
-        label = {
-            "skill_started": "选择SOP",
-            "skill_resumed": "恢复SOP",
-            "skill_step_changed": "推进SOP",
-        }[event.event_type]
-        detail_parts = []
-        if from_skill_id and from_skill_id != to_skill_id:
-            detail_parts.append(f"from {skill_names.get(from_skill_id, from_skill_id)}")
-        if payload.get("to_step_id"):
-            detail_parts.append(f"step {payload['to_step_id']}")
         step_id = str(payload.get("to_step_id") or payload.get("from_step_id") or "").strip()
-        state_key = step_id or "0"
-        return {
-            "id": f"skill_state_{skill_id}_active_{state_key}",
-            "kind": "skill",
-            "text": f"{label} {skill_names.get(skill_id, skill_id)}",
-            "detail": " · ".join(detail_parts) or None,
-            "state": "completed",
-        }
-    if event.event_type == "skill_completed":
-        skill_id = str(payload.get("skill_id") or "")
-        return {
-            "id": f"skill_{event.id}",
-            "kind": "skill",
-            "text": f"完成SOP {skill_names.get(skill_id, skill_id)}" if skill_id else "完成SOP",
-            "detail": str(payload.get("reason") or "") or None,
-            "state": "completed",
-        }
-    if event.event_type == "tool_call_started":
-        name = str(payload.get("name") or "")
-        tool_call_id = str(payload.get("tool_call_id") or name or event.id)
+        return _structured_trace_line(
+            line_id=f"skill_state_{skill_id}_active_{step_id or '0'}",
+            kind="skill",
+            state="completed",
+            event_type=event_type,
+            event_data=payload,
+            event_id=event_id,
+        )
+    if event_type == "skill_completed":
+        skill_id = str(payload.get("skill_id") or "").strip()
+        return _structured_trace_line(
+            line_id=f"skill_{event_id}",
+            kind="skill",
+            state="completed",
+            event_type=event_type,
+            event_data=payload,
+            event_id=event_id,
+        )
+    if event_type == "tool_call_started":
+        name = str(payload.get("name") or "").strip()
         if not name:
             return None
-        return {
-            "id": f"tool_{tool_call_id}",
-            "kind": "tool",
-            "text": f"调用工具 {name}",
-            "detail": None,
-            "state": "running",
-        }
-    if event.event_type == "knowledge_query_started":
-        query = payload.get("query") if isinstance(payload.get("query"), dict) else {}
-        text = str(query.get("query") if isinstance(query, dict) else payload.get("text") or "").strip()
-        return {
-            "id": _knowledge_trace_line_id(payload),
-            "kind": "knowledge",
-            "phase": "query",
-            "text": "查询业务资料",
-            "detail": text or None,
-            "state": "running",
-        }
-    if event.event_type in {"knowledge_query_finished", "knowledge_result"}:
-        chunks = payload.get("chunks") if isinstance(payload.get("chunks"), list) else []
-        buckets = payload.get("selected_buckets") if isinstance(payload.get("selected_buckets"), list) else []
-        concepts = payload.get("selected_concepts") if isinstance(payload.get("selected_concepts"), list) else []
-        evidence = payload.get("evidence_pack") if isinstance(payload.get("evidence_pack"), list) else []
-        parts = [
-            f"命中 Wiki {len(concepts)} 个" if concepts else "",
-            f"展开 {len(buckets)} 个知识桶" if buckets else "",
-            f"读取 {len(chunks)} 个片段" if chunks else "",
-            f"生成 {len(evidence)} 条引用候选" if evidence else "",
-        ]
-        return {
-            "id": _knowledge_trace_line_id(payload),
-            "kind": "knowledge",
-            "phase": "result",
-            "text": "读取业务资料",
-            "detail": " · ".join(part for part in parts if part),
-            "state": "completed",
-        }
-    if event.event_type == "tool_result":
+        return _structured_trace_line(
+            line_id=f"tool_{payload.get('tool_call_id') or name or event_id!s}",
+            kind="tool",
+            state="running",
+            event_type=event_type,
+            event_data=payload,
+            event_id=event_id,
+        )
+    if event_type == "knowledge_query_started":
+        return _structured_trace_line(
+            line_id=_knowledge_trace_line_id(payload),
+            kind="knowledge",
+            state="running",
+            event_type=event_type,
+            event_data=payload,
+            event_id=event_id,
+        )
+    if event_type in {"knowledge_query_finished", "knowledge_result"}:
+        return _structured_trace_line(
+            line_id=_knowledge_trace_line_id(payload),
+            kind="knowledge",
+            state="completed",
+            event_type=event_type,
+            event_data=payload,
+            event_id=event_id,
+        )
+    if event_type == "tool_result":
         content = payload.get("content") if isinstance(payload.get("content"), dict) else {}
         raw_name = str(
             payload.get("rawToolName")
@@ -3815,117 +4625,109 @@ def _event_trace_line(
             or content.get("tool_name")
             or ""
         ).strip()
-        display_name = str(payload.get("toolName") or raw_name).strip()
-        tool_call_id = str(payload.get("toolCallId") or raw_name or event.id)
         success = payload.get("success")
         is_error = bool(payload.get("isError")) if success is None else not bool(success)
-        detail_payload = content if isinstance(content, dict) else payload
-        output = _trace_payload_text(detail_payload)
-        return {
-            "id": f"tool_{tool_call_id}",
-            "kind": "tool",
-            "text": f"{'工具调用失败' if is_error else '调用工具'} {display_name}",
-            "detail": _tool_trace_detail(detail_payload),
-            "output": output or None,
-            "outputLanguage": _trace_payload_language(output) if output else None,
-            "outputTitle": "查看工具结果" if output else None,
-            "collapsible": bool(output),
-            "state": "failed" if is_error else "completed",
-        }
-    if event.event_type == "tool_call_finished":
-        name = str(payload.get("tool_name") or "")
-        tool_call_id = str(payload.get("tool_call_id") or name or event.id)
-        success = bool(payload.get("success"))
-        return {
-            "id": f"tool_{tool_call_id}",
-            "kind": "tool",
-            "text": f"{'调用工具' if success else '工具调用失败'} {name}",
-            "detail": _tool_trace_detail(payload),
-            "state": "completed" if success else "failed",
-        }
-    if event.event_type == "agent_loop_continued":
-        iteration = str(payload.get("iteration") or event.id)
-        target_tool = str(payload.get("target_tool_name") or "").strip()
-        return {
-            "id": f"decision_stepping_tool_continuation_{iteration}",
-            "kind": "decision",
-            "text": "重新分析执行动作",
-            "detail": f"决定继续调用工具 {target_tool}" if target_tool else "决定继续调用工具",
-            "state": "completed",
-        }
-    if event.event_type == "agent_loop_completed":
-        iteration = str(payload.get("iteration") or event.id)
-        return {
-            "id": f"decision_stepping_tool_continuation_{iteration}",
-            "kind": "decision",
-            "text": "重新分析执行动作",
-            "detail": "判断无需继续调用工具",
-            "state": "completed",
-        }
-    if event.event_type in {"reflection_decision_created", "reflection_decision"}:
-        needs_retry = bool(payload.get("needs_retry"))
-        return {
-            "id": "reflection",
-            "kind": "decision",
-            "text": "反思后继续尝试" if needs_retry else "反思通过",
-            "detail": _reflection_trace_detail(payload),
-            "state": "completed",
-        }
-    if event.event_type == "reflection_skipped":
-        return {
-            "id": "reflection",
-            "kind": "decision",
-            "text": "反思已关闭",
-            "detail": str(payload.get("reason") or "") or None,
-            "state": "completed",
-        }
-    if event.event_type == "reflection_retry_started":
-        mode = str(payload.get("mode") or "").strip()
-        target_tool = str(payload.get("target_tool_name") or "").strip()
-        target_skill = str(payload.get("target_skill_id") or "").strip()
-        target = target_tool or skill_names.get(target_skill, target_skill)
-        return {
-            "id": "reflection",
-            "kind": "decision",
-            "text": f"重试{ '工具' if mode == 'tool' else 'SOP' } {target}".strip(),
-            "detail": str(payload.get("reason") or "") or None,
-            "state": "completed",
-        }
-    if event.event_type == "error_occurred":
-        code = str(payload.get("code") or payload.get("error_type") or event.id).strip()
-        return {
-            "id": f"error_{code}",
-            "kind": "decision",
-            "text": _error_trace_text(payload),
-            "detail": _error_trace_detail(payload),
-            "state": "failed",
-        }
+        output = _trace_payload_text(content)
+        return _structured_trace_line(
+            line_id=f"tool_{payload.get('toolCallId') or raw_name or event_id!s}",
+            kind="tool",
+            state="failed" if is_error else "completed",
+            event_type=event_type,
+            event_data=payload,
+            event_id=event_id,
+            output=output or None,
+        )
+    if event_type == "tool_call_finished":
+        name = str(payload.get("tool_name") or "").strip()
+        tool_call_id = str(payload.get("tool_call_id") or name or event_id)
+        return _structured_trace_line(
+            line_id=f"tool_{tool_call_id}",
+            kind="tool",
+            state="completed" if bool(payload.get("success")) else "failed",
+            event_type=event_type,
+            event_data=payload,
+            event_id=event_id,
+        )
+    if event_type in {"agent_loop_continued", "agent_loop_completed"}:
+        iteration = str(payload.get("iteration") or event_id)
+        return _structured_trace_line(
+            line_id=f"decision_stepping_tool_continuation_{iteration}",
+            kind="decision",
+            state="completed",
+            event_type=event_type,
+            event_data=payload,
+            event_id=event_id,
+        )
+    if event_type in {
+        "reflection_decision_created",
+        "reflection_decision",
+        "reflection_skipped",
+        "reflection_retry_started",
+    }:
+        return _structured_trace_line(
+            line_id="reflection",
+            kind="decision",
+            state="completed",
+            event_type=event_type,
+            event_data=payload,
+            event_id=event_id,
+        )
+    if event_type == "error_occurred":
+        code = str(payload.get("code") or payload.get("error_type") or event_id).strip()
+        return _structured_trace_line(
+            line_id=f"error_{code}",
+            kind="decision",
+            state="failed",
+            event_type=event_type,
+            event_data=payload,
+            event_id=event_id,
+        )
+    if event_type == "harness_execution_recovered":
+        return _structured_trace_line(
+            line_id=f"harness_recovery_{event_id}",
+            kind="decision",
+            state="failed",
+            event_type=event_type,
+            event_data=payload,
+            event_id=event_id,
+        )
     return None
 
 
-def _tool_trace_detail(payload: dict) -> str | None:
-    data = payload.get("data")
-    data_dict = data if isinstance(data, dict) else {}
-    parts = [
-        "已复用此前成功结果" if payload.get("idempotent_replay") or data_dict.get("idempotent_replay") else "",
-        str(data_dict.get("source") or "").strip(),
-        "未命中" if data_dict.get("found") is False else "已命中" if data_dict.get("found") is True else "",
-        str(data_dict.get("miss_reason") or "").strip(),
-        str(data_dict.get("recommendation") or "").strip(),
-    ]
-    text = " · ".join(part for part in parts if part)
-    return text or None
-
-
-def _reflection_trace_detail(payload: dict) -> str | None:
-    parts = [
-        str(payload.get("reason") or "").strip(),
-        f"工具 {payload['target_tool_name']}" if payload.get("target_tool_name") else "",
-        f"技能 {payload['target_skill_id']}" if payload.get("target_skill_id") else "",
-        f"步骤 {payload['target_step_id']}" if payload.get("target_step_id") else "",
-    ]
-    text = " · ".join(part for part in parts if part)
-    return text or None
+def _event_trace_line(
+    event: AgentEvent,
+    skill_names: dict[str, str],
+    skill_hint: str | None = None,
+    step_names: dict[str, dict[str, str]] | None = None,
+    tool_names: dict[str, str] | None = None,
+) -> dict | list[dict] | None:
+    """Return a structured, locale-independent trace line for a persisted event."""
+    payload = _sanitized_session_event_payload(event.event_type, event.payload_json or {})
+    if event.event_type in {
+        "task_frame_started",
+        "task_frame_finished",
+        "task_frame_completed",
+        "task_frame_dependency_waiting",
+        "task_frame_dependencies_released",
+        "harness_action_created",
+        "harness_mcp_app_view",
+        "harness_tool_completed",
+        "harness_step_timeout",
+    }:
+        return _harness_event_trace_line(
+            event,
+            skill_hint=skill_hint,
+            step_names=step_names,
+            tool_names=tool_names,
+            payload_override=payload,
+        )
+    return _structured_event_trace_line(
+        event,
+        payload,
+        skill_names,
+        skill_hint=skill_hint,
+        step_names=step_names,
+    )
 
 
 def _knowledge_trace_line_id(payload: dict) -> str:
@@ -3945,13 +4747,10 @@ def _upsert_trace_line(lines: list[dict], line: dict) -> None:
 
 
 def _complete_trace_lines(lines: list[dict]) -> None:
+    """Mark trace lines terminal without synthesizing localized product copy."""
     for line in lines:
         if line.get("state") == "running":
             line["state"] = "completed"
-    thinking = next((line for line in lines if line.get("id") == "thinking"), None)
-    if thinking:
-        thinking["text"] = "已完成思考"
-        thinking["state"] = "completed"
 
 
 def _finish_trace_if_needed(trace: dict, fallback_time) -> None:

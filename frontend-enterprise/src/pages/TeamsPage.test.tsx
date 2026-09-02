@@ -1,14 +1,62 @@
 // @vitest-environment jsdom
 
+import type { ComponentProps } from 'react';
 import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { I18nProvider } from '@/i18n';
+import { AppIntlProvider, I18nProvider, type AppLocale } from '@/i18n';
 import type { TeamRead, TeamThreadRead } from '@/types';
 
+const tenantContextMock = vi.hoisted(() => {
+  const controller = new AbortController();
+  return {
+    context: {
+      session: {
+        token: 'tenant-demo-token',
+        scope: 'tenant' as const,
+        tenant: { id: 'tenant_demo', slug: 'tenant-demo', display_name: 'Tenant Demo' },
+        user: {
+          id: 'user-1',
+          tenant_id: 'tenant_demo',
+          username: 'demo',
+          display_name: 'Demo',
+          role: 'admin' as const,
+          must_change_password: false,
+          avatar_url: null,
+        },
+      },
+      tenantId: 'tenant_demo',
+      tenantSlug: 'tenant-demo',
+      userId: 'user-1',
+      generation: 1,
+      signal: controller.signal,
+      isCurrentGeneration: (generation: number) => generation === 1,
+    },
+  };
+});
+
+vi.mock('../contexts/TenantSessionContext', () => ({
+  useTenantSession: () => tenantContextMock.context,
+}));
+
 import TeamsPage from './TeamsPage';
+
+vi.mock('@/components/LanguageSwitcher', () => ({
+  /** Keep unrelated shell migration out of the team-page locale contract. */
+  default: () => null,
+}));
+
+vi.mock('@/components/ui/input', () => ({
+  /** Preserve native input semantics without the legacy arbitrary-prop observer. */
+  Input: (props: ComponentProps<'input'>) => <input {...props} />,
+}));
+
+vi.mock('@/components/ui/textarea', () => ({
+  /** Preserve native textarea semantics without the legacy arbitrary-prop observer. */
+  Textarea: (props: ComponentProps<'textarea'>) => <textarea {...props} />,
+}));
 
 const team: TeamRead = {
   id: 'team-1',
@@ -36,6 +84,20 @@ const team: TeamRead = {
       created_at: '2026-08-01T00:00:00Z',
     },
   ],
+  created_at: '2026-08-01T00:00:00Z',
+  updated_at: '2026-08-01T00:00:00Z',
+};
+
+const sharedKnowledgeBase = {
+  id: 'kb-shared-1',
+  tenant_id: 'tenant_demo',
+  name: '共享制度库',
+  mode: 'shared',
+  status: 'active',
+  version: '1.0.0',
+  document_count: 0,
+  bucket_count: 0,
+  chunk_count: 0,
   created_at: '2026-08-01T00:00:00Z',
   updated_at: '2026-08-01T00:00:00Z',
 };
@@ -70,7 +132,7 @@ describe('TeamsPage', () => {
     expect(await screen.findByText('增长团队')).toBeTruthy();
     expect(screen.getByText('负责增长实验')).toBeTruthy();
     expect(screen.getAllByText('2 名成员').length).toBeGreaterThanOrEqual(1);
-    expect(screen.getByText('项目领导：小艾')).toBeTruthy();
+    expect(screen.getAllByText((_, element) => element?.textContent === '项目领导：小艾').length).toBeGreaterThan(0);
     expect(fetchMock).toHaveBeenCalledWith(
       expect.stringContaining('/api/enterprise/teams?tenant_id='),
       expect.anything(),
@@ -106,6 +168,44 @@ describe('TeamsPage', () => {
       const body = JSON.parse(String(createCall?.[1]?.body)) as Record<string, unknown>;
       expect(body.name).toBe('新团队');
       expect(body.tenant_id).toBeTruthy();
+    });
+  });
+
+  it('creates a team with selected shared knowledge and one default target', async () => {
+    const user = userEvent.setup();
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (init?.method === 'POST') return jsonResponse({ ...team, id: 'team-2' });
+      if (url.includes('/knowledge-bases')) return jsonResponse([sharedKnowledgeBase]);
+      if (url.includes('/team-threads')) return jsonResponse([]);
+      return jsonResponse([team]);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(
+      <I18nProvider>
+        <MemoryRouter>
+          <TeamsPage />
+        </MemoryRouter>
+      </I18nProvider>,
+    );
+
+    await screen.findByText('增长团队');
+    await user.click(screen.getByRole('button', { name: /创建新团队/ }));
+    await user.type(screen.getByLabelText('团队名称'), '知识团队');
+    const knowledgeStep = await screen.findByLabelText('团队知识库配置');
+    await user.click(within(knowledgeStep).getByRole('checkbox', { name: '选择共享制度库' }));
+    await user.click(within(knowledgeStep).getByRole('radio', { name: '设为默认 共享制度库' }));
+    await user.click(screen.getByRole('button', { name: '创建' }));
+
+    await waitFor(() => {
+      const createCall = fetchMock.mock.calls.find(([, init]) => init?.method === 'POST');
+      const body = JSON.parse(String(createCall?.[1]?.body)) as {
+        knowledge_bases?: Array<Record<string, unknown>>;
+      };
+      expect(body.knowledge_bases).toEqual([
+        { existing_knowledge_base_id: 'kb-shared-1', is_default: true },
+      ]);
     });
   });
 
@@ -201,6 +301,21 @@ function renderTeamsWithRoutes() {
   );
 }
 
+/** Render the real teams route against only the semantic locale provider. */
+function renderTeamsWithAppLocale(locale: AppLocale) {
+  return render(
+    <AppIntlProvider locale={locale}>
+      <MemoryRouter initialEntries={['/enterprise/teams']}>
+        <Routes>
+          <Route path="/enterprise/teams" element={<TeamsPage />} />
+          <Route path="/enterprise/teams/:teamId" element={<LocationEcho />} />
+          <Route path="/workspace/chat/:sessionId" element={<LocationEcho />} />
+        </Routes>
+      </MemoryRouter>
+    </AppIntlProvider>,
+  );
+}
+
 function stubThreadsFetch() {
   const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input);
@@ -261,6 +376,92 @@ describe('TeamsPage team activity', () => {
     await user.click(within(activity).getByRole('button', { name: /planning chat/ }));
 
     expect((await screen.findByTestId('location')).textContent).toBe('/workspace/chat/session-1');
+  });
+});
+
+describe('TeamsPage semantic locale boundary', () => {
+  it.each([
+    {
+      locale: 'zh-CN',
+      title: '我的团队',
+      statistics: '团队统计',
+      total: '团队总数',
+      active: '进行中任务',
+      attention: '待处理',
+      memberCount: '2 名成员',
+      leader: '项目领导：小艾',
+      status: '正常',
+      activity: '团队动态',
+      taskStatus: '进行中',
+      chatAria: '开始与团队 增长团队 对话',
+      deleteAria: '删除团队 增长团队',
+    },
+    {
+      locale: 'en-US',
+      title: 'My teams',
+      statistics: 'Team statistics',
+      total: 'Total teams',
+      active: 'Active tasks',
+      attention: 'Needs attention',
+      memberCount: '2 members',
+      leader: 'Project lead: 小艾',
+      status: 'Active',
+      activity: 'Team activity',
+      taskStatus: 'In progress',
+      chatAria: 'Start a conversation with team 增长团队',
+      deleteAria: 'Delete team 增长团队',
+    },
+  ] as const)(
+    'localizes team chrome and ARIA in $locale while records stay raw',
+    async ({
+      locale,
+      title,
+      statistics,
+      total,
+      active,
+      attention,
+      memberCount,
+      leader,
+      status,
+      activity,
+      taskStatus,
+      chatAria,
+      deleteAria,
+    }) => {
+      stubThreadsFetch();
+      renderTeamsWithAppLocale(locale);
+
+      expect(await screen.findByText(title)).toBeTruthy();
+      const summary = screen.getByLabelText(statistics);
+      expect(within(summary).getByText(total)).toBeTruthy();
+      expect(within(summary).getByText(active)).toBeTruthy();
+      expect(within(summary).getByText(attention)).toBeTruthy();
+      expect(screen.getAllByText(memberCount).length).toBeGreaterThanOrEqual(1);
+      expect(screen.getAllByText((_, element) => element?.textContent === leader).length).toBeGreaterThan(0);
+      expect(screen.getByText(status)).toBeTruthy();
+      expect(screen.getByRole('button', { name: chatAria })).toBeTruthy();
+      expect(screen.getByRole('button', { name: deleteAria })).toBeTruthy();
+
+      const activityRegion = screen.getByLabelText(activity);
+      expect(within(activityRegion).getByText(taskStatus)).toBeTruthy();
+      expect(within(activityRegion).getByText('planning chat')).toBeTruthy();
+      expect(within(activityRegion).getAllByText('写周报').length).toBeGreaterThanOrEqual(1);
+      expect(screen.getAllByText('增长团队').length).toBeGreaterThanOrEqual(1);
+      expect(screen.getByText('负责增长实验')).toBeTruthy();
+    },
+  );
+
+  it('localizes destructive confirmation without translating the team name', async () => {
+    const user = userEvent.setup();
+    stubThreadsFetch();
+    renderTeamsWithAppLocale('en-US');
+
+    await user.click(await screen.findByRole('button', { name: 'Delete team 增长团队' }));
+
+    expect(screen.getByText('Delete team “增长团队”?')).toBeTruthy();
+    expect(screen.getByText('The team and its tasks will be removed. This action cannot be undone.')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Cancel' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Delete' })).toBeTruthy();
   });
 });
 

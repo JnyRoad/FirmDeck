@@ -1,0 +1,392 @@
+{
+  "schema_version": 1,
+  "baseline": {
+    "commit": "a22231d00770ba6958f2a2bf1b0d65008bd858c3",
+    "branch": "feat/i18n-governance",
+    "captured_at": "2026-08-30",
+    "supported_interface_locales": [
+      "zh-CN",
+      "en-US"
+    ],
+    "compatibility_default_locale": "zh-CN",
+    "test_only_locales": [
+      "en-XA"
+    ]
+  },
+  "classification": {
+    "OPEN": "Audited candidate that still requires implementation or exact adjudication.",
+    "FIXED": "Verified in source and by the named automated or browser evidence.",
+    "CONFIRMED_RAW": "Verified business, user, Agent, provider, identifier, path, or diagnostic content that must remain verbatim.",
+    "THIRD_PARTY_CONSTRAINED": "Owned by an external runtime or protocol and not safely alterable by StaffDeck.",
+    "UNVERIFIED": "Not exercised against the real runtime, provider, role, platform, or integration."
+  },
+  "scan_scope": {
+    "frontend_product_source": [
+      "frontend-enterprise/index.html",
+      "frontend-enterprise/src/**/*.ts",
+      "frontend-enterprise/src/**/*.tsx"
+    ],
+    "frontend_catalog_and_tools": [
+      "frontend-enterprise/src/i18n/**",
+      "frontend-enterprise/scripts/**",
+      "frontend-enterprise/tests/**"
+    ],
+    "backend_product_source": [
+      "backend/app/**/*.py",
+      "backend/app/llm/prompts/**"
+    ],
+    "backend_tests_and_tools": [
+      "backend/tests/**/*.py",
+      "scripts/**"
+    ],
+    "delivery_and_rules": [
+      ".github/workflows/**",
+      "packaging/**",
+      "docs/agents/**",
+      "CONTEXT.md"
+    ]
+  },
+  "baseline_metrics": {
+    "frontend_non_test_ts_tsx_files_with_han_text": 113,
+    "backend_python_files_with_han_text": 120,
+    "legacy_catalog_parsed_keys": 3640,
+    "legacy_catalog_han_source_keys": 3637,
+    "legacy_catalog_numeric_placeholder_values": 296,
+    "backend_http_exception_text_hits": 505,
+    "frontend_data_i18n_ignore_occurrences": 22,
+    "frontend_locale_formatter_hits": 11,
+    "note": "Metrics are discovery signals, not a count of user-visible defects. The governance checkers classify syntax and sink context before blocking."
+  },
+  "findings": [
+    {
+      "id": "UI-CATALOG-001",
+      "severity": "P1",
+      "status": "FIXED",
+      "boundary": "frontend catalog/runtime",
+      "summary": "The legacy source-key catalog was removed; en-US and zh-CN now use typed semantic IDs, named ICU parameters, exact key parity, and generated en-XA coverage.",
+      "evidence": [
+        "frontend-enterprise/src/i18n/messages/en-US.json",
+        "frontend-enterprise/src/i18n/messages/zh-CN.json",
+        "frontend-enterprise/src/i18n/types.d.ts"
+      ],
+      "target": "BCP 47 catalogs with stable English semantic IDs, named ICU parameters, en-US canonical structure, and exact zh-CN parity.",
+      "verification": [
+        "catalog duplicate/key/parameter/ICU tests",
+        "typed message ID tests"
+      ]
+    },
+    {
+      "id": "UI-RUNTIME-001",
+      "severity": "P1",
+      "status": "FIXED",
+      "boundary": "frontend DOM runtime",
+      "summary": "The global MutationObserver, WeakMaps, numeric placeholders, source-key runtime, and legacy provider were removed; React and controlled imperative sinks localize before display.",
+      "evidence": [
+        "frontend-enterprise/src/i18n/provider.tsx",
+        "frontend-enterprise/src/i18n/imperative.ts",
+        "frontend-enterprise/src/i18n/legacy-removal.test.tsx"
+      ],
+      "target": "React render-time semantic messages plus imperative translation for controlled non-DOM sinks.",
+      "verification": [
+        "legacy characterization test",
+        "observer absence test",
+        "browser mutation regression"
+      ]
+    },
+    {
+      "id": "UI-SINK-001",
+      "severity": "P1",
+      "status": "FIXED",
+      "boundary": "visible and non-DOM UI",
+      "summary": "Repository-wide product sinks now use typed semantic descriptors, including JSX, attributes, toast, native dialog, clipboard, download, title, iframe, postMessage, trace, and accessibility text.",
+      "evidence": [
+        "frontend-enterprise/src/components/ui/app-toast.tsx",
+        "frontend-enterprise/src/lib/clipboard.ts",
+        "frontend-enterprise/src/pages/TeamDetailPage.tsx",
+        "frontend-enterprise/src/pages/dashboard/MemoriesTab.tsx",
+        "frontend-enterprise/src/pages/chat/components/MCPAppView.tsx",
+        "frontend-enterprise/index.html"
+      ],
+      "target": "Typed semantic descriptors at every product-owned sink; external/raw payload fields stay raw.",
+      "verification": [
+        "sink fixture suite",
+        "component locale matrix",
+        "real-browser acceptance"
+      ]
+    },
+    {
+      "id": "UI-RAW-001",
+      "severity": "P1",
+      "status": "FIXED",
+      "boundary": "raw-content exemptions",
+      "summary": "Broad ignore attributes were removed or replaced by narrow RawContent/RawIdentifier boundaries; user, Agent, provider, document, path, identifier, and successful tool content remain verbatim.",
+      "evidence": [
+        "frontend-enterprise/src/components/LanguageSwitcher.tsx",
+        "frontend-enterprise/src/components/AccountApiKeyDialog.tsx",
+        "frontend-enterprise/src/components/EmployeeApiKeyDialog.tsx",
+        "frontend-enterprise/src/components/EmployeeCard.tsx",
+        "frontend-enterprise/src/pages/chat/components/MessageBubble.tsx",
+        "frontend-enterprise/src/pages/chat/components/KnowledgeCitationList.tsx",
+        "frontend-enterprise/src/pages/chat/components/HarnessArtifactDownloads.tsx",
+        "frontend-enterprise/src/pages/chat/components/TeamCollaborationPanel.tsx"
+      ],
+      "target": "Small RawContent wrappers or validated reason-bearing attributes; no file, route, or container-wide ignore.",
+      "verification": [
+        "raw adjacency tests",
+        "ignore reason AST fixtures",
+        "legacy manifest zero-broad-ignore gate"
+      ]
+    },
+    {
+      "id": "UI-FORMAT-001",
+      "severity": "P1",
+      "status": "FIXED",
+      "boundary": "date/number/list/plural/collation",
+      "summary": "Date, time, number, percentage, units, list formatting, pluralization, and collation now use explicit current locale and timezone inputs; fixed-locale and manual-formatting checker diagnostics are zero.",
+      "evidence": [
+        "frontend-enterprise/src/lib/timezone.ts",
+        "frontend-enterprise/src/pages/TeamsPage.tsx",
+        "frontend-enterprise/src/pages/KnowledgePage.tsx",
+        "frontend-enterprise/src/pages/DistillPage.tsx",
+        "frontend-enterprise/src/components/AccountApiKeyDialog.tsx",
+        "frontend-enterprise/src/components/EmployeeApiKeyDialog.tsx",
+        "frontend-enterprise/src/components/knowledge/SharedKnowledgeVersionsDialog.tsx"
+      ],
+      "target": "One locale-aware formatter facade using current locale plus explicit timezone and currency inputs.",
+      "verification": [
+        "locale/timezone/number/plural/list/collation matrix",
+        "fixed-locale AST fixtures"
+      ]
+    },
+    {
+      "id": "BE-SESSION-TITLE-001",
+      "severity": "P1",
+      "status": "FIXED",
+      "boundary": "persistent session titles and team blackboard content",
+      "summary": "User-visible session titles and blackboard bodies no longer carry product-language machine wrappers: stable session_kind stores execution type, titles/body preserve raw business content, and provenance is structured metadata; old title prefixes are accepted only by an exact compatibility boundary.",
+      "evidence": [
+        "backend/app/session/session_kinds.py",
+        "backend/app/db/models.py",
+        "backend/app/db/database.py",
+        "backend/app/api/teams.py",
+        "backend/app/api/chat.py",
+        "backend/app/channels/service_session.py",
+        "backend/app/teams/wakeup.py",
+        "backend/app/scheduled_tasks/service.py",
+        "backend/app/api/general_skills.py",
+        "backend/app/public_api/sessions.py"
+      ],
+      "target": "Stable machine kind fields remain independent from raw/user-visible titles and content; exact legacy parsing is temporary, additive, and removal-tracked.",
+      "verification": [
+        "additive SQLite migration and exact legacy backfill tests",
+        "team/channel/scheduled/general-skill/public-session contract tests",
+        "blackboard raw-content plus structured-provenance tests",
+        "full backend suite"
+      ]
+    },
+    {
+      "id": "BE-ERROR-001",
+      "severity": "P1",
+      "status": "FIXED",
+      "boundary": "backend/public error contract",
+      "summary": "Public errors now project registered code, exact safe params, retryability, and private diagnostics; unknown or malformed errors fail closed without raw exception/provider prose.",
+      "evidence": [
+        "backend/app/public_api/errors.py",
+        "backend/app/capabilities/errors.py",
+        "backend/app/harness/errors.py",
+        "backend/app/knowledge/errors.py",
+        "backend/app/tools/tool_schema.py",
+        "backend/app/tools/tool_executor.py",
+        "backend/app/tools/a2a_client.py",
+        "backend/app/tools/mcp_client.py"
+      ],
+      "target": "Registered code plus safe named params, retryable, request/trace identifiers, and private diagnostic cause; frontend localizes known codes.",
+      "verification": [
+        "registry and serializer tests",
+        "raw exception leakage tests",
+        "frontend known/unknown error tests",
+        "Python boundary fixtures"
+      ]
+    },
+    {
+      "id": "BE-EVENT-001",
+      "severity": "P1",
+      "status": "FIXED",
+      "boundary": "system events and asynchronous progress",
+      "summary": "Product stream, task, team, channel, Harness recovery, public-job, and trace states use registered event_code plus exact params; legacy Harness text/status projections are accepted only by an exact allowlist and bounded compatibility record.",
+      "evidence": [
+        "backend/app/core/agent_loop.py",
+        "backend/app/core/harness_v2_engine.py",
+        "backend/app/core/harness_recovery.py",
+        "backend/app/observability/product_events.py",
+        "backend/app/scheduled_tasks/service.py",
+        "backend/app/teams/wakeup.py",
+        "backend/app/channels/service_intake.py",
+        "backend/app/api/chat.py"
+      ],
+      "target": "Registered versioned product events with safe params and a bounded deprecated text projection.",
+      "verification": [
+        "event registry tests",
+        "SSE/job replay tests",
+        "compatibility telemetry"
+      ]
+    },
+    {
+      "id": "AGENT-LANG-001",
+      "severity": "P0",
+      "status": "FIXED",
+      "boundary": "Agent reply language",
+      "summary": "UI locale and Agent reply locale are independently modeled in an immutable LanguageContext persisted and replayed across web, stream, retry, recovery, handoff, scheduled, team, channel/public, General Skill, Tool, and local A2A paths.",
+      "evidence": [
+        "backend/app/session/session_schema.py",
+        "backend/app/db/models.py",
+        "backend/app/api/chat.py",
+        "backend/app/core/agent_loop.py",
+        "backend/app/core/harness_v2_engine.py",
+        "backend/app/core/task_frame_store.py",
+        "backend/app/core/harness_capability_invoker.py",
+        "backend/app/scheduled_tasks/service.py",
+        "backend/app/teams/wakeup.py",
+        "backend/app/channels/service_intake.py",
+        "backend/app/public_api/runs.py",
+        "backend/app/tools/a2a_client.py",
+        "backend/app/a2a/codex_adapter.py",
+        "backend/app/tools/a2a_recovery.py",
+        "frontend-enterprise/src/pages/chat/useChatSession.ts",
+        "frontend-enterprise/src/pages/chat/chatQueueStorage.ts"
+      ],
+      "target": "Immutable LanguageContext with independent ui_locale and agent_reply_locale, persisted before durable execution and replayed without re-resolution.",
+      "verification": [
+        "four-combination locale matrix",
+        "exactly-once digest/replay tests",
+        "all-ingress propagation tests",
+        "real-model behavior remains UNVERIFIED until exercised"
+      ]
+    },
+    {
+      "id": "AGENT-PROMPT-001",
+      "severity": "P1",
+      "status": "FIXED",
+      "boundary": "Agent stages and prompts",
+      "summary": "Active Agent, Harness, response, summary, scheduled, title, General Skill, Skill authoring, memory, and local A2A prompt stages receive the immutable reply-locale contract plus raw-source markers.",
+      "evidence": [
+        "backend/app/llm/prompts/unified_agent_prompt.md",
+        "backend/app/llm/prompts/turn_planner_prompt.md",
+        "backend/app/llm/prompts/harness_agent_prompt.md",
+        "backend/app/llm/prompts/response_generator_prompt.md",
+        "backend/app/core/agent_loop.py",
+        "backend/app/core/harness_v2_engine.py",
+        "backend/app/general_skills/runner.py"
+      ],
+      "target": "Every active and compatibility stage receives reply-locale rules plus explicit raw-source markers.",
+      "verification": [
+        "stage payload tests",
+        "direct reply-fragment tests",
+        "raw pointer preservation tests"
+      ]
+    },
+    {
+      "id": "GOV-STATIC-001",
+      "severity": "P1",
+      "status": "FIXED",
+      "boundary": "static governance",
+      "summary": "Fixture-driven TypeScript/catalog and Python AST governance now covers product sinks, accessibility, non-DOM APIs, fixed locale/manual formatting, broad ignores, catalog drift, backend errors/events, raw leaks, and Agent language prompts.",
+      "evidence": [
+        "frontend-enterprise/scripts/check-i18n.cjs",
+        "frontend-enterprise/scripts/i18n/check-typescript.cjs",
+        "scripts/i18n/check_python.py",
+        "scripts/i18n/check-catalog.cjs"
+      ],
+      "target": "Fixture-driven TypeScript and Python AST checks plus catalog/ICU/parameter/usage validation with stable diagnostics.",
+      "verification": [
+        "positive and negative fixtures for every required sink",
+        "repository-wide checker run"
+      ]
+    },
+    {
+      "id": "GOV-CI-001",
+      "severity": "P1",
+      "status": "FIXED",
+      "boundary": "CI and release",
+      "summary": "A reusable four-job i18n quality workflow now exists; release builds depend on it and use lockfile-only npm ci installation.",
+      "evidence": [
+        ".github/workflows/quality.yml",
+        ".github/workflows/release.yml",
+        "frontend-enterprise/package.json",
+        "frontend-enterprise/package-lock.json",
+        "backend/tests/test_i18n_ci_contract.py",
+        "backend/tests/test_packaging_deps.py"
+      ],
+      "target": "Locked static, frontend, backend-i18n and browser jobs; release builds depend on the quality gate.",
+      "verification": [
+        "workflow and packaging contract tests passed on 2026-08-30",
+        "source verification: static-i18n, frontend and browser jobs use npm ci",
+        "source verification: release build needs the reusable quality job and uses npm ci",
+        "clean npm ci, production build, full frontend/backend suites and Chromium i18n matrix passed locally"
+      ]
+    },
+    {
+      "id": "GOV-RULES-001",
+      "severity": "P1",
+      "status": "FIXED",
+      "boundary": "project rules and architecture records",
+      "summary": "Root context, executable Agent rules, and ADR-001/002/003 now define semantic IDs, ICU, backend descriptors, LanguageContext propagation, raw boundaries, language review, compatibility removal, CI, and release gates.",
+      "evidence": [
+        "docs/agents/i18n.md",
+        "docs/agents/backend.md",
+        "docs/agents/frontend.md",
+        "docs/agents/domain.md"
+      ],
+      "target": "Executable rules plus root context and ADRs aligned with automated checks.",
+      "verification": [
+        "documentation review",
+        "checker and workflow references exist and run"
+      ]
+    },
+    {
+      "id": "EXT-LOCALE-001",
+      "severity": "P2",
+      "status": "THIRD_PARTY_CONSTRAINED",
+      "boundary": "external protocol locale negotiation",
+      "summary": "Feishu rich-post locale envelopes and remote Channel/A2A/MCP/provider text are third-party-constrained protocol/source content, not proof of StaffDeck locale support; live locale negotiation remains UNVERIFIED.",
+      "evidence": [
+        "backend/app/channels/feishu_runtime.py",
+        "backend/app/tools/a2a_client.py",
+        "backend/app/tools/mcp_client.py"
+      ],
+      "target": "Preserve remote content verbatim; forward locale only through an adapter capability explicitly supported by the external contract.",
+      "verification": [
+        "adapter contract tests where controllable",
+        "real provider negotiation remains UNVERIFIED"
+      ]
+    },
+    {
+      "id": "RUNTIME-ACCEPT-001",
+      "severity": "P1",
+      "status": "UNVERIFIED",
+      "boundary": "real runtime acceptance",
+      "summary": "The local development-browser critical matrix has evidence, but no packaging/out artifact exists; macOS arm64/x86_64, Windows, Linux, real-model adherence and live Channel/A2A/MCP/provider negotiation remain UNVERIFIED.",
+      "evidence": [
+        "docs/i18n/browser-acceptance.md",
+        "docs/i18n/validation-report.md"
+      ],
+      "target": "Record exact automated, manual, packaged and external acceptance evidence; retain UNVERIFIED for unavailable paths.",
+      "verification": [
+        "UNVERIFIED: Darwin 25.6.0 arm64 host has no packaging/out artifact to launch",
+        "UNVERIFIED: no Windows or Linux packaged artifact was available on this host",
+        "THIRD_PARTY_CONSTRAINED and UNVERIFIED: no real Channel/A2A/MCP/provider locale negotiation was exercised",
+        "Next action: after all quality gates pass, retain each CI artifact and run packaged smoke plus locale acceptance on every target platform"
+      ]
+    }
+  ],
+  "reconciliation_policy": {
+    "required_final_statuses": [
+      "FIXED",
+      "CONFIRMED_RAW",
+      "THIRD_PARTY_CONSTRAINED",
+      "UNVERIFIED"
+    ],
+    "completion_rule": "No OPEN finding may remain when completion is claimed. UNVERIFIED items are reported, never silently treated as fixed.",
+    "evidence_rule": "FIXED requires a source change or explicit no-change adjudication plus named automated or browser evidence."
+  }
+}

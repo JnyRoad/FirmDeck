@@ -10,8 +10,16 @@ on:
         required: true
         default: "0.1.0"
 
+permissions:
+  contents: read
+
 jobs:
+  quality:
+    name: Quality gate
+    uses: ./.github/workflows/quality.yml
+
   build:
+    needs: quality
     env:
       PYTHONUTF8: "1"
       PYTHONIOENCODING: "utf-8"
@@ -33,6 +41,22 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Validate tag and package.json match backend/VERSION
+        if: github.event_name != 'workflow_dispatch'
+        shell: bash
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          file_version="$(cat backend/VERSION)"
+          if [ "$tag_version" != "$file_version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match backend/VERSION ($file_version). Fix VERSION and re-tag."
+            exit 1
+          fi
+          pkg_version="$(grep -m1 '"version"' frontend-enterprise/package.json | sed -E 's/.*"version": *"([^"]*)".*/\1/')"
+          if [ "$pkg_version" != "$file_version" ]; then
+            echo "::error::frontend-enterprise/package.json ($pkg_version) does not match backend/VERSION ($file_version). Run scripts/sync_version.py, commit, and re-tag."
+            exit 1
+          fi
+
       - uses: actions/setup-node@v7
         with:
           node-version: "20"
@@ -42,7 +66,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install frontend deps
-        run: npm --prefix frontend-enterprise ci || npm --prefix frontend-enterprise install
+        run: npm --prefix frontend-enterprise ci
 
       - name: macOS tools
         if: startsWith(matrix.os, 'macos')
@@ -120,6 +144,7 @@ jobs:
       - name: Build
         env:
           VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+          STAFFDECK_RELEASE_REPOSITORY: ${{ github.repository }}
           STAFFDECK_MACOS_ARCH: ${{ matrix.macos_arch }}
         run: ${{ matrix.script }}
 

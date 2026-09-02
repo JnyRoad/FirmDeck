@@ -5,14 +5,16 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Literal, Mapping
 
-from fastapi import HTTPException
 from sqlmodel import Session
 
+from app.contracts.http import build_http_exception
 from app.db.models import ModelConfig
 from app.llm.model_protocols import (
     ModelApiProtocol,
+    ModelAuthMode,
     current_protocol_options,
     model_config_fingerprint,
+    resolve_auth_mode,
 )
 
 
@@ -31,50 +33,55 @@ class ResolvedModelConfig:
     config_revision: int
     security_revision: int
     purpose: Literal["runtime", "verification"]
+    auth_mode: ModelAuthMode = ModelAuthMode.API_KEY
     timeout_seconds: float | None = None
 
 
 def resolve_model_config_for_runtime(
     db: Session, tenant_id: str, config_id: str
 ) -> ResolvedModelConfig:
+    """Resolve an enabled and trusted model snapshot or raise a stable model contract error."""
     row = _current_model_config(db, tenant_id, config_id)
     if not row.enabled:
-        raise HTTPException(status_code=409, detail="MODEL_CONFIG_DISABLED")
+        raise build_http_exception("MODEL_CONFIG_DISABLED")
     protocol = _protocol(row)
     if row.trust_status == "legacy_trusted" or _is_implicit_legacy_openai(row, protocol):
         if protocol is not ModelApiProtocol.OPENAI_CHAT_COMPLETIONS:
-            raise HTTPException(status_code=409, detail="MODEL_CONFIG_VERIFICATION_REQUIRED")
+            raise build_http_exception("MODEL_CONFIG_VERIFICATION_REQUIRED")
     elif row.trust_status != "verified" or row.verified_fingerprint != _fingerprint(row):
-        raise HTTPException(status_code=409, detail="MODEL_CONFIG_VERIFICATION_REQUIRED")
+        raise build_http_exception("MODEL_CONFIG_VERIFICATION_REQUIRED")
     return _snapshot(row, protocol, purpose="runtime")
 
 
 def resolve_model_config_for_verification(
     db: Session, tenant_id: str, config_id: str, attempt_id: str
 ) -> ResolvedModelConfig:
+    """Resolve the model snapshot owned by the active verification attempt."""
     row = _current_model_config(db, tenant_id, config_id)
     if (
         row.verification_attempt_id != attempt_id
         or row.verification_attempt_status != "verifying"
     ):
-        raise HTTPException(status_code=409, detail="MODEL_VERIFICATION_STALE")
+        raise build_http_exception("MODEL_VERIFICATION_STALE")
     protocol = _protocol(row)
     return _snapshot(row, protocol, purpose="verification")
 
 
 def _current_model_config(db: Session, tenant_id: str, config_id: str) -> ModelConfig:
+    """Load one tenant-owned model config without inferring or exposing database details."""
     row = db.get(ModelConfig, config_id)
     if row is None or row.tenant_id != tenant_id:
-        raise HTTPException(status_code=404, detail="MODEL_CONFIG_NOT_FOUND")
+        raise build_http_exception("MODEL_CONFIG_NOT_FOUND", params={"config_id": config_id})
     db.refresh(row)
     return row
 
 
 def _protocol(row: ModelConfig) -> ModelApiProtocol:
+    """Parse a persisted protocol and return a localized-boundary-safe model error on corruption."""
     try:
         return ModelApiProtocol(row.api_protocol)
     except ValueError as exc:
-        raise HTTPException(status_code=422, detail="MODEL_PROTOCOL_UNSUPPORTED") from exc
+        raise build_http_exception("MODEL_PROTOCOL_UNSUPPORTED") from exc
 
 
 def _snapshot(
@@ -99,6 +106,7 @@ def _snapshot(
         config_revision=row.config_revision,
         security_revision=row.security_revision,
         purpose=purpose,
+        auth_mode=resolve_auth_mode(getattr(row, "auth_mode", None)),
         timeout_seconds=None,
     )
 
@@ -109,9 +117,10 @@ def _fingerprint(row: ModelConfig) -> str:
         api_protocol=row.api_protocol,
         base_url=row.base_url,
         model=row.model,
-        key_revision=row.key_revision,
+        configuration_revision=row.key_revision,
         protocol_options=current_protocol_options(row.protocol_options_json, protocol),
         security_revision=row.security_revision,
+        model_mode=getattr(row, "auth_mode", ModelAuthMode.API_KEY),
     )
 
 
@@ -173,6 +182,7 @@ def snapshot_model_config(
         ),
         config_revision=getattr(model_config, "config_revision", 1),
         security_revision=getattr(model_config, "security_revision", 1),
+        auth_mode=resolve_auth_mode(getattr(model_config, "auth_mode", None)),
         timeout_seconds=getattr(model_config, "timeout_seconds", None),
     )
 

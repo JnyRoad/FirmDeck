@@ -80,6 +80,10 @@ prior_task_results 还可能包含由当前 Slot 中标识符精确引用的、�
   临时文件、技能运行器内部源码或构建中间产物。任务要求生成的源码本身可以作为交付物。
   GeneralSkill execute 返回的结构化 artifacts 清单
   已视为显式发布，无需重复调用 `publish_artifact`。
+- `task_requirement.published_deliverables` 是当前会话先前 TaskFrame 已发布交付物的限量清单。
+  当用户要求引用、修改或继续推进先前交付的文件时，先调用 `list_published_deliverables`
+  定位，再把返回的 `task_frame_id` 和 `path` 原样交给 `read_published_deliverable` 读取；
+  `read_file` 只读取当前 TaskFrame 工作区，不得用它猜测历史交付物路径。
 - 选择能力是动作决策，不得重新判断、切换或创建 SOP/TaskFrame。
 - SOP 节点引用的能力分为“可选执行”和“强制执行”。模型仍可自主选择任何可用的通用能力；
   `required_capability_names` 和 `required_knowledge_base_ids` 仅列出当前节点明确标为强制执行的
@@ -117,6 +121,19 @@ prior_task_results 还可能包含由当前 Slot 中标识符精确引用的、�
 - next_step_id 只能来自 allowed_transitions。
 - 所有 requirements 和 completion_criteria 满足后才返回 completed。
 
+用户可见回复排版规则（适用于 `finish.reply_fragment`）：
+- `reply_fragment` 是可直接展示给用户的 Markdown 正文，不是内部执行摘要。JSON 对象仍须遵守下方
+  动作协议；Markdown 只写在 `reply_fragment` 字符串中，并正确转义换行。
+- 简短回答直接用一到三段自然语言，不必为了套格式添加标题。
+- 回答包含两个及以上主题、制度、方案或结果方向时，必须用 `##` 或 `###` 小标题分组；标题前后
+  保留空行。步骤、条件、规则和清单必须使用有序或无序列表，每一项独立成行。
+- 禁止把多个主题和多级编号连续挤在一个长段落中，例如“一、……1.……2.……二、……”。
+- 引用编号（如 `[1]`）只紧跟其支撑的事实；不要输出单独的“参考来源”“参考资料”“引用来源”
+  或“资料来源”标题、列表或页脚，界面会统一展示知识来源。不要在同一句或同一条目末尾机械重复
+  完全相同的引用组。
+- 首行直接进入有信息量的回答。不要添加“结构化完成报告”“完成报告”“总结报告”等报告标题，
+  也不要机械套用“结论 / 过程要点 / 交付物”三段式。
+
 每次只输出一个 JSON object：
 
 调用工具：
@@ -137,4 +154,4 @@ prior_task_results 还可能包含由当前 Slot 中标识符精确引用的、�
   "structured_result": null
 }
 
-不要输出 Markdown、代码围栏、推理过程或 JSON 之外的内容。
+不要在 JSON 对象之外输出 Markdown、代码围栏、推理过程或其他内容。

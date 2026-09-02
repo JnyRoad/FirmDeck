@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import logging
+import re
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Literal
 
-from sqlalchemy import update
+from sqlalchemy import exists, or_, update
 from sqlmodel import Session, select
 
 from app.core import AgentLoop
+from app.core.harness_agent import HarnessExecutionFenced
 from app.db import engine
 from app.db.models import (
     AgentProfile,
@@ -16,19 +21,44 @@ from app.db.models import (
     HarnessTurnRecord,
     Message,
     Team,
+    TeamRun,
     TeamTask,
     TeamTaskBid,
     TeamTaskEvent,
     TeamWakeEvent,
+    Tenant,
     User,
     new_id,
     utc_now,
 )
-from app.session.session_schema import ChatTurnRequest, ChatTurnResponse
+from app.i18n.language_context import LanguageContext, resolve_compatible_language_context
+from app.security.tenant import (
+    TenantExecutionKind,
+    TenantLifecycleDecision,
+    TenantLifecycleDenied,
+    require_active_tenant,
+    require_matching_admission_version,
+)
+from app.session.session_kinds import (
+    SESSION_KIND_TEAM_BID_JUDGE,
+    SESSION_KIND_TEAM_BID_SCORE,
+    SESSION_KIND_TEAM_MEMBER_BID,
+    SESSION_KIND_TEAM_MEMBER_TASK,
+    SESSION_KIND_TEAM_SYNTHESIS,
+    SESSION_KIND_TEAM_TL_REVIEW,
+)
+from app.session.session_schema import (
+    ChatTurnRequest,
+    ChatTurnResponse,
+    PlannedTaskFrame,
+    TeamPlannerContext,
+    TeamPlannerMember,
+)
 from app.teams.service import (
     BID_HP_INITIAL,
     BID_SCORE_FALLBACK,
     VERDICT_TARGET_STATUS,
+    TeamTaskTransitionError,
     apply_task_transition,
     bid_rebuttal_rounds,
     blackboard_context_lines,
@@ -45,29 +75,27 @@ from app.teams.service import (
     parse_tl_task_assignments,
     record_task_event,
     select_bid_candidates,
-    team_roster_lines,
     task_activation_state,
+    team_reason_payload,
+    team_roster_lines,
     write_blackboard_entries,
 )
 
+logger = logging.getLogger(__name__)
+
+# claimed 是一个带租约的执行态，而不是永久锁。后台线程/服务异常退出后，
+# sweeper 会依据 updated_at 心跳把事件恢复为 pending 并重新派发。
+WAKE_LEASE_TIMEOUT_SECONDS = 180.0
+WAKE_HEARTBEAT_SECONDS = 30.0
+PENDING_DISPATCH_GRACE_SECONDS = 5.0
+
 TL_ASSIGNMENT_INSTRUCTION = (
-    "派发任务的唯一方式是输出一个围栏代码块 ```json,内容形如:"
-    '{"team_tasks": [{"client_ref": "稳定的本批任务引用", "title": "任务标题", '
-    '"description": "任务描述", "assignee_agent_id": "成员的 agent_id", '
-    '"depends_on": ["同一批前置任务的 client_ref"], '
-    '"activation_condition": {"type": "all_succeeded"}}]}。'
-    "assignee_agent_id 必须来自上面的花名册;可以一次派多个任务。"
-    "省略 assignee_agent_id 即把任务投入任务池,由成员竞标、你裁决后中标者执行。"
-    "存在真实执行前置关系时才填写 depends_on;系统会登记被阻塞任务,前置条件满足后才唤醒。"
-    "activation_condition.type 支持 all_succeeded(默认)、any_succeeded、all_terminal、"
-    "minimum_succeeded;minimum_succeeded 需同时给 minimum 正整数。"
-    "不要为了表达先后叙述而制造不必要的依赖,互不依赖的任务应并行执行。"
-    "如果执行前还缺少用户必须补充的信息,先向用户提问,本轮不要输出 team_tasks。"
-    "后续阶段依赖前置任务结果时必须填写 depends_on,不得把尚未满足条件的未来阶段"
-    "创建成可立即唤醒的独立任务。"
-    "注意:只有输出该 JSON 代码块,任务才会被真正创建并交给成员执行;"
-    "只用自然语言宣布『已派发』是无效的,系统不会创建任何任务。"
-    "如果只是与人讨论、不需要派任务,就不要输出该代码块。"
+    "团队任务由 TurnPlanner 的结构化 TaskFrame 直接创建和分发，不要在回复中输出 "
+    "team_tasks JSON 代码块。需要成员执行时，让规划阶段为每个独立方向生成一个 "
+    "execution_target=team_member 的 conversation TaskFrame，并选择花名册中的精确 agent_id。"
+    "互不依赖的方向保持无依赖以便并行；确有因果关系时使用 TaskFrame 依赖表达。"
+    "员工会在自己的 Harness 中继续拆分任务并选择 SOP、技能、知识库和工具。"
+    "如果只是讨论或信息不足，应直接说明或向人提问，不要虚构已经分发的任务。"
 )
 
 TL_REVIEW_INSTRUCTION = (
@@ -120,6 +148,560 @@ TL_BID_JUDGE_REPAIR_MESSAGE = (
     "或 winner_agent_id 不在候选列表中,裁决未生效。"
     "请立即输出规定的 bid_award JSON 代码块(可只输出代码块)。"
 )
+TEAM_WAKE_EXECUTION_FAILED = "TEAM_WAKE_EXECUTION_FAILED"
+TEAM_WAKE_HEARTBEAT_FAILED = "TEAM_WAKE_HEARTBEAT_FAILED"
+_WAKE_WORKER_LEASE_SECONDS = WAKE_LEASE_TIMEOUT_SECONDS
+_WAKE_OWNER_UNSET = object()
+
+
+class _WakeExecutionFenced(RuntimeError):
+    """Internal signal that a wake claim or lifecycle fence was lost."""
+
+
+def _optional_team_admission(
+    db: Session,
+    *,
+    tenant_id: str,
+    persisted_version: object | None = None,
+    correlation_id: str,
+) -> TenantLifecycleDecision | None:
+    """Admit a team-owned operation and optionally fence an existing durable row.
+
+    A few pre-migration unit fixtures intentionally omit the Tenant row.  Their
+    legacy path remains version one; every real tenant row is checked centrally.
+    """
+    if db.get(Tenant, tenant_id) is None:
+        return None
+    decision = require_active_tenant(
+        db,
+        tenant_id,
+        TenantExecutionKind.JOB_CLAIM,
+        correlation_id,
+    )
+    if persisted_version is not None:
+        require_matching_admission_version(decision, persisted_version)
+    return decision
+
+
+def _team_lifecycle_failure_code(
+    db: Session,
+    *,
+    tenant_id: str,
+    persisted_version: object,
+    correlation_id: str,
+) -> str | None:
+    """Return a stable lifecycle code for recovery without changing old fixtures."""
+    try:
+        _optional_team_admission(
+            db,
+            tenant_id=tenant_id,
+            persisted_version=persisted_version,
+            correlation_id=correlation_id,
+        )
+    except TenantLifecycleDenied as exc:
+        return exc.code
+    return None
+
+
+def _require_wake_execution_admission(
+    db: Session,
+    event: TeamWakeEvent,
+    *,
+    task: TeamTask | None = None,
+    run: TeamRun | None = None,
+    expected_worker_owner: str | None = None,
+    expected_worker_generation: int | None = None,
+) -> TenantLifecycleDecision | None:
+    """Recheck the event and every derived row immediately before a durable write."""
+    heartbeat_failure_event = getattr(event, "_heartbeat_failure_event", None)
+    if heartbeat_failure_event is not None and heartbeat_failure_event.is_set():
+        raise _WakeExecutionFenced(TEAM_WAKE_HEARTBEAT_FAILED)
+    bound_owner, bound_generation = _wake_claim_identity(event)
+    expected_owner = str(
+        bound_owner if expected_worker_owner is None else expected_worker_owner or ""
+    ).strip()
+    expected_generation = int(
+        bound_generation
+        if expected_worker_generation is None
+        else expected_worker_generation or 0
+    )
+    # Do not let this check flush a report/message prepared by a worker whose
+    # claim was already reclaimed.  The owner+generation predicate is checked
+    # again by each conditional child write below.
+    with db.no_autoflush:
+        decision = _optional_team_admission(
+            db,
+            tenant_id=event.tenant_id,
+            persisted_version=event.tenant_lifecycle_version,
+            correlation_id=event.id,
+        )
+        # Select scalar columns instead of refreshing the ORM identity. A stale
+        # worker must keep comparing against the owner+generation it originally
+        # claimed; replacing ``event.worker_owner`` with successor values would
+        # let that worker pass a later gate.
+        current_event = db.exec(
+            select(
+                TeamWakeEvent.status,
+                TeamWakeEvent.worker_owner,
+                TeamWakeEvent.worker_generation,
+                TeamWakeEvent.worker_lease_until,
+            ).where(TeamWakeEvent.id == event.id)
+        ).first()
+        if (
+            not expected_owner
+            or expected_generation <= 0
+            or current_event is None
+            or current_event.status != "claimed"
+            or current_event.worker_owner != expected_owner
+            or int(current_event.worker_generation or 0) != expected_generation
+            or (
+                current_event.worker_lease_until is not None
+                and current_event.worker_lease_until <= utc_now()
+            )
+        ):
+            raise _WakeExecutionFenced(
+                "TEAM_WAKE_LEASE_EXPIRED"
+                if current_event is not None
+                and current_event.worker_lease_until is not None
+                and current_event.worker_lease_until <= utc_now()
+                else "TEAM_WAKE_CLAIM_LOST"
+            )
+    if decision is not None:
+        if task is not None:
+            require_matching_admission_version(
+                decision,
+                task.tenant_lifecycle_version,
+            )
+        if run is not None:
+            require_matching_admission_version(
+                decision,
+                run.tenant_lifecycle_version,
+            )
+    return decision
+
+
+def _bind_wake_claim(event: TeamWakeEvent, owner: str, generation: int) -> None:
+    """Freeze one worker claim identity for the lifetime of a wake execution."""
+    # Transient only: TeamWakeEvent remains the durable source of truth. The
+    # snapshot prevents an ORM refresh after recovery from changing the owner
+    # against which this stale worker is fenced.
+    event._wake_expected_worker_owner = str(owner or "").strip()  # type: ignore[attr-defined]
+    event._wake_expected_worker_generation = int(generation)  # type: ignore[attr-defined]
+
+
+def _wake_claim_identity(event: TeamWakeEvent) -> tuple[str, int]:
+    """Return the immutable owner+generation captured at execution admission."""
+    owner = str(
+        getattr(event, "_wake_expected_worker_owner", event.worker_owner) or ""
+    ).strip()
+    generation = int(
+        getattr(
+            event,
+            "_wake_expected_worker_generation",
+            event.worker_generation,
+        )
+        or 0
+    )
+    return owner, generation
+
+
+def _fence_wake_write(db: Session, event: TeamWakeEvent) -> None:
+    """Acquire a parent wake row under owner/generation/lifecycle CAS.
+
+    The conditional UPDATE runs before pending derived rows are flushed. It
+    both checks the current claim and takes the database row lock, preventing
+    recovery from winning between a pre-write gate and the later commit.
+    """
+    heartbeat_failure_event = getattr(event, "_heartbeat_failure_event", None)
+    if heartbeat_failure_event is not None and heartbeat_failure_event.is_set():
+        db.rollback()
+        raise _WakeExecutionFenced(TEAM_WAKE_HEARTBEAT_FAILED)
+    owner, generation = _wake_claim_identity(event)
+    if not owner or generation <= 0:
+        db.rollback()
+        raise _WakeExecutionFenced("TEAM_WAKE_CLAIM_LOST")
+    now = utc_now()
+    with db.no_autoflush:
+        result = db.exec(
+            update(TeamWakeEvent)
+            .where(
+                TeamWakeEvent.id == event.id,
+                TeamWakeEvent.status == "claimed",
+                TeamWakeEvent.tenant_lifecycle_version
+                == event.tenant_lifecycle_version,
+                TeamWakeEvent.worker_owner == owner,
+                TeamWakeEvent.worker_generation == generation,
+                TeamWakeEvent.worker_lease_until > now,
+                # Keep the intentional pre-migration fixture path, while every
+                # authoritative Tenant row still has to be active at this exact
+                # write boundary.
+                or_(
+                    ~exists(select(Tenant.id).where(Tenant.id == event.tenant_id)),
+                    _active_tenant_exists(event),
+                ),
+            )
+            # Self-assignment acquires the row lock without touching the
+            # heartbeat timestamp maintained by the heartbeat thread.
+            .values(updated_at=TeamWakeEvent.updated_at)
+        )
+    if getattr(result, "rowcount", 0) != 1:
+        db.rollback()
+        raise _WakeExecutionFenced("TEAM_WAKE_WRITE_FENCED")
+
+
+def _commit_wake_write(db: Session, event: TeamWakeEvent) -> None:
+    """Commit derived wake output only after an atomic parent claim fence."""
+    _fence_wake_write(db, event)
+    db.commit()
+
+
+def _wake_harness_admission_check(
+    db: Session,
+    wake_event_id: str,
+    *,
+    heartbeat_failure_event: threading.Event | None = None,
+) -> Callable[[], None]:
+    """Build the wake token callback passed through AgentLoop to Harness."""
+    event = db.get(TeamWakeEvent, wake_event_id)
+    if event is None:
+        raise _WakeExecutionFenced("TEAM_WAKE_CLAIM_LOST")
+    if heartbeat_failure_event is not None:
+        event._heartbeat_failure_event = heartbeat_failure_event  # type: ignore[attr-defined]
+    expected_owner, expected_generation = _wake_claim_identity(event)
+
+    def check() -> None:
+        if (
+            heartbeat_failure_event is not None
+            and heartbeat_failure_event.is_set()
+        ):
+            raise HarnessExecutionFenced(TEAM_WAKE_HEARTBEAT_FAILED)
+        current = db.get(TeamWakeEvent, wake_event_id)
+        if current is None:
+            raise HarnessExecutionFenced("TEAM_WAKE_CLAIM_LOST")
+        if heartbeat_failure_event is not None:
+            current._heartbeat_failure_event = heartbeat_failure_event  # type: ignore[attr-defined]
+        try:
+            _require_wake_execution_admission(
+                db,
+                current,
+                expected_worker_owner=expected_owner,
+                expected_worker_generation=expected_generation,
+            )
+        except _WakeExecutionFenced as exc:
+            raise HarnessExecutionFenced(str(exc)) from exc
+
+    return check
+
+
+def _wake_claim_exists(
+    event: TeamWakeEvent,
+    *,
+    worker_owner: str,
+    worker_generation: int,
+):
+    """Build an SQL predicate tying a derived write to one wake claim."""
+    return exists(
+        select(TeamWakeEvent.id).where(
+            TeamWakeEvent.id == event.id,
+            TeamWakeEvent.status == "claimed",
+            TeamWakeEvent.tenant_id == event.tenant_id,
+            TeamWakeEvent.tenant_lifecycle_version
+            == event.tenant_lifecycle_version,
+            TeamWakeEvent.worker_owner == worker_owner,
+            TeamWakeEvent.worker_generation == int(worker_generation),
+        )
+    )
+
+
+def _bound_wake_claim_args(
+    event: TeamWakeEvent,
+    worker_owner: str | None,
+    worker_generation: int,
+) -> tuple[str | None, int]:
+    """Prefer the immutable claim captured when this worker entered the wake."""
+    bound_owner = getattr(event, "_wake_expected_worker_owner", None)
+    bound_generation = getattr(event, "_wake_expected_worker_generation", None)
+    if bound_owner is not None and bound_generation is not None:
+        return str(bound_owner).strip() or None, int(bound_generation)
+    return worker_owner, int(worker_generation)
+
+
+def _active_tenant_exists(event: TeamWakeEvent):
+    """Build an SQL predicate tying a derived write to the immutable tenant admission."""
+    return exists(
+        select(Tenant.id).where(
+            Tenant.id == event.tenant_id,
+            Tenant.status == "active",
+            Tenant.lifecycle_version == event.tenant_lifecycle_version,
+        )
+    )
+
+
+def _cas_wake_task_transition(
+    db: Session,
+    event: TeamWakeEvent,
+    task: TeamTask,
+    *,
+    worker_owner: str,
+    worker_generation: int,
+    expected_status: str,
+    new_status: str,
+    actor_type: str,
+    actor_id: str | None,
+    event_type: str,
+    payload: dict | None = None,
+    report_json: dict | None = None,
+    review_json: dict | None = None,
+    extra_values: dict[str, object] | None = None,
+) -> bool:
+    """Atomically write one task transition under wake and tenant fences."""
+    worker_owner, worker_generation = _bound_wake_claim_args(
+        event,
+        worker_owner,
+        worker_generation,
+    )
+    if worker_owner is None or worker_generation <= 0:
+        db.rollback()
+        raise _WakeExecutionFenced("TEAM_WAKE_CLAIM_LOST")
+    now = utc_now()
+    values: dict[str, object] = {
+        "status": new_status,
+        "version": TeamTask.version + 1,
+        "updated_at": now,
+    }
+    if report_json is not None:
+        values["report_json"] = report_json
+    if review_json is not None:
+        values["review_json"] = review_json
+    if extra_values:
+        values.update(extra_values)
+    result = db.exec(
+        update(TeamTask)
+        .where(
+            TeamTask.id == task.id,
+            TeamTask.team_id == event.team_id,
+            TeamTask.tenant_lifecycle_version == event.tenant_lifecycle_version,
+            TeamTask.status == expected_status,
+            TeamTask.version == int(task.version),
+            _wake_claim_exists(
+                event,
+                worker_owner=worker_owner,
+                worker_generation=worker_generation,
+            ),
+            _active_tenant_exists(event),
+        )
+        .values(**values)
+    )
+    if getattr(result, "rowcount", 0) != 1:
+        db.rollback()
+        raise _WakeExecutionFenced("TEAM_TASK_WRITE_FENCED")
+    record_task_event(
+        db,
+        team_id=task.team_id,
+        task_id=task.id,
+        actor_type=actor_type,
+        actor_id=actor_id,
+        event_type=event_type,
+        payload={
+            "from_status": expected_status,
+            "to_status": new_status,
+            **dict(payload or {}),
+        },
+    )
+    db.flush()
+    db.expire(task)
+    db.refresh(task)
+    return True
+
+
+def _cas_wake_bid_score(
+    db: Session,
+    event: TeamWakeEvent,
+    bid: TeamTaskBid,
+    *,
+    worker_owner: str,
+    worker_generation: int,
+    score: float,
+    rationale: str | None,
+) -> None:
+    """Write one bid score only while the same wake claim and task admission hold."""
+    worker_owner, worker_generation = _bound_wake_claim_args(
+        event,
+        worker_owner,
+        worker_generation,
+    )
+    if worker_owner is None or worker_generation <= 0:
+        db.rollback()
+        raise _WakeExecutionFenced("TEAM_WAKE_CLAIM_LOST")
+    task_admission = exists(
+        select(TeamTask.id).where(
+            TeamTask.id == bid.task_id,
+            TeamTask.team_id == event.team_id,
+            TeamTask.tenant_id == event.tenant_id,
+            TeamTask.tenant_lifecycle_version == event.tenant_lifecycle_version,
+            TeamTask.status == "bidding",
+        )
+    )
+    result = db.exec(
+        update(TeamTaskBid)
+        .where(
+            TeamTaskBid.id == bid.id,
+            TeamTaskBid.task_id == bid.task_id,
+            TeamTaskBid.team_id == event.team_id,
+            TeamTaskBid.tenant_id == event.tenant_id,
+            task_admission,
+            _wake_claim_exists(
+                event,
+                worker_owner=worker_owner,
+                worker_generation=worker_generation,
+            ),
+            _active_tenant_exists(event),
+        )
+        .values(score=score, score_rationale=rationale)
+    )
+    if getattr(result, "rowcount", 0) != 1:
+        db.rollback()
+        raise _WakeExecutionFenced("TEAM_BID_WRITE_FENCED")
+    db.expire(bid)
+    db.refresh(bid)
+
+
+def _public_wake_failure_code() -> str:
+    """Return the stable public code used by wake and task audit payloads on failure."""
+    return TEAM_WAKE_EXECUTION_FAILED
+
+
+def _wake_failure_audit_payload(
+    event: TeamWakeEvent,
+    *,
+    reason_code: str,
+) -> dict[str, object]:
+    """Build the registered team failure envelope for a wake-triggered task outcome."""
+    if event.trigger_type in {"bid_request", "bid_judge"}:
+        round_ = int(event.payload_json.get("round") or 1)
+        return {
+            **team_reason_payload(
+                "team.task.bid.failed",
+                reason_code=reason_code,
+                params={"round": round_},
+            ),
+            "round": round_,
+        }
+    if event.trigger_type == "task_report":
+        return team_reason_payload(
+            "team.task.review.failed",
+            reason_code=reason_code,
+        )
+    return team_reason_payload(
+        "team.task.escalated",
+        reason_code=reason_code,
+    )
+
+
+def _team_language_context(
+    db: Session,
+    *,
+    snapshot: object = None,
+    event: TeamWakeEvent | None = None,
+    task: TeamTask | None = None,
+    run: TeamRun | None = None,
+    source_turn_id: str | None = None,
+    legacy_agent_reply_locale: str | None = None,
+) -> LanguageContext:
+    """Resolve one team execution snapshot without consulting mutable UI preferences.
+
+    The explicit snapshot and durable team rows are authoritative.  A source user
+    message is used only when a pre-migration row has not yet been backfilled;
+    records with no snapshot use the shared compatibility resolver so the fallback
+    remains observable and can be removed after the migration window.
+    """
+    candidates = [
+        snapshot,
+        event.language_context_json if event is not None else None,
+        task.language_context_json if task is not None else None,
+        run.language_context_json if run is not None else None,
+    ]
+    if source_turn_id:
+        source_message = db.get(Message, source_turn_id)
+        source_metadata = (
+            source_message.metadata_json
+            if source_message is not None and isinstance(source_message.metadata_json, dict)
+            else {}
+        )
+        candidates.append(source_metadata.get("language_context"))
+    for candidate in candidates:
+        if candidate is not None:
+            return resolve_compatible_language_context(
+                snapshot=candidate,
+                legacy_ui_locale=None,
+                legacy_agent_reply_locale=legacy_agent_reply_locale,
+            )
+    return resolve_compatible_language_context(
+        snapshot=None,
+        legacy_ui_locale=None,
+        legacy_agent_reply_locale=legacy_agent_reply_locale,
+    )
+
+
+def _bind_team_language_context(
+    db: Session,
+    context: LanguageContext,
+    *rows: object | None,
+) -> None:
+    """Backfill team execution rows while rejecting contradictory snapshots."""
+    expected = context.model_dump(mode="json")
+    for row in rows:
+        if row is None:
+            continue
+        current = getattr(row, "language_context_json", None)
+        if current is None:
+            row.language_context_json = expected
+        elif resolve_compatible_language_context(
+            snapshot=current,
+            legacy_ui_locale=None,
+            legacy_agent_reply_locale=None,
+        ) != context:
+            raise RuntimeError("团队执行语言快照冲突")
+        db.add(row)
+
+
+def build_team_planner_context(db: Session, team: Team) -> TeamPlannerContext:
+    """Project the trusted roster boundary used by the TL TurnPlanner."""
+
+    leader = get_team_leader(db, team.id)
+    members: list[TeamPlannerMember] = []
+    for membership in list_team_members(db, team.id):
+        agent = db.get(AgentProfile, membership.agent_id)
+        if agent is None or agent.tenant_id != team.tenant_id or agent.status != "active":
+            continue
+        metadata = agent.metadata_json if isinstance(agent.metadata_json, dict) else {}
+        raw_capabilities = (
+            metadata.get("capabilities")
+            or metadata.get("specialties")
+            or metadata.get("skills")
+            or metadata.get("expertise_tags")
+            or []
+        )
+        capabilities = (
+            [str(item).strip() for item in raw_capabilities if str(item).strip()]
+            if isinstance(raw_capabilities, list)
+            else []
+        )
+        if agent.description and agent.description.strip():
+            capabilities.insert(0, agent.description.strip())
+        members.append(
+            TeamPlannerMember(
+                agent_id=agent.id,
+                name=agent.name,
+                role=membership.role,
+                capabilities=list(dict.fromkeys(capabilities))[:12],
+            )
+        )
+    return TeamPlannerContext(
+        team_id=team.id,
+        leader_agent_id=leader.agent_id if leader is not None else "",
+        members=members,
+    )
 
 
 def build_tl_chat_context(db: Session, team: Team, user_message: str) -> str:
@@ -150,11 +732,27 @@ def build_tl_chat_message(db: Session, team: Team, user_message: str) -> str:
 
 
 def build_member_task_message(db: Session, team: Team, task: TeamTask, *, rework: bool) -> str:
-    """成员执行上下文注入:任务描述(+ 退回意见)+ 黑板 + 报告与黑板建议要求。"""
-    lines = [f"你是团队「{team.name}」的成员,请完成以下团队任务。"]
+    """Build the member's user turn from task context without changing its normal prompt."""
+    lines = ["请完成以下任务。"]
     lines.append(f"任务标题:{task.title}")
     if task.description:
         lines.append(f"任务描述:{task.description}")
+    dependencies = list(task.depends_on_task_ids_json or [])
+    if dependencies:
+        lines.append("已完成的前置任务结果:")
+        for dependency_id in dependencies:
+            dependency = db.get(TeamTask, dependency_id)
+            if dependency is None:
+                continue
+            report = dependency.report_json if isinstance(dependency.report_json, dict) else {}
+            summary = str(report.get("full_reply") or report.get("summary") or "").strip()
+            lines.append(f"- {dependency.title}({dependency.id}):{summary or '(无可用报告)'}")
+            citations = report.get("citations")
+            if isinstance(citations, list) and citations:
+                lines.append(f"  引用:{citations}")
+            artifacts = report.get("artifacts")
+            if isinstance(artifacts, list) and artifacts:
+                lines.append(f"  交付物:{artifacts}")
     if rework:
         review = dict(task.review_json or {})
         comment = str(review.get("comment") or "").strip()
@@ -170,13 +768,6 @@ def build_member_task_message(db: Session, team: Team, task: TeamTask, *, rework
     if blackboard:
         lines.append("团队黑板(相关工作记忆):")
         lines.extend(blackboard)
-    lines.append("完成后请输出结构化完成报告,包含:结论、过程要点、交付物。")
-    lines.append(
-        "如果你在执行中发现了值得全团队记住的信息(关键结论/约定口径/容易踩的坑),"
-        "请在报告末尾额外输出一个围栏代码块 ```json,内容形如:"
-        '{"blackboard_suggestions": [{"content": "值得记住的事", "tags": ["标签"]}]}。'
-        "建议由 TL 验收时裁决后才会真正写入团队黑板;没有值得记录的信息就不要输出该代码块。"
-    )
     return "\n".join(lines)
 
 
@@ -308,14 +899,68 @@ def enqueue_wake_event(
     target_agent_id: str,
     trigger_type: str,
     payload: dict | None = None,
+    language_context: LanguageContext | dict | None = None,
+    parent_event: TeamWakeEvent | None = None,
 ) -> TeamWakeEvent:
+    """Create a wake event bound to the originating team's locale snapshot."""
+    if parent_event is not None:
+        _require_wake_execution_admission(db, parent_event)
+    payload_json = dict(payload or {})
+    if parent_event is not None:
+        parent_owner, parent_generation = _wake_claim_identity(parent_event)
+        payload_json.update(
+            {
+                "parent_wake_event_id": parent_event.id,
+                "parent_worker_owner": parent_owner,
+                "parent_worker_generation": parent_generation,
+                "parent_tenant_lifecycle_version": parent_event.tenant_lifecycle_version,
+            }
+        )
+    task_id = str(payload_json.get("task_id") or "").strip()
+    admission = _optional_team_admission(
+        db,
+        tenant_id=team.tenant_id,
+        correlation_id=task_id or team.id,
+    )
+    task = db.get(TeamTask, task_id) if task_id else None
+    if task is not None and (
+        task.team_id != team.id or task.tenant_id != team.tenant_id
+    ):
+        task = None
+    run_id = str(payload_json.get("team_run_id") or "").strip()
+    run = db.get(TeamRun, run_id) if run_id else None
+    if run is not None and (run.team_id != team.id or run.tenant_id != team.tenant_id):
+        run = None
+    if admission is not None:
+        if task is not None:
+            require_matching_admission_version(
+                admission,
+                task.tenant_lifecycle_version,
+            )
+        if run is not None:
+            require_matching_admission_version(
+                admission,
+                run.tenant_lifecycle_version,
+            )
+    context = _team_language_context(
+        db,
+        snapshot=language_context,
+        task=task,
+        run=run,
+        source_turn_id=task.source_turn_id if task is not None else None,
+    )
+    _bind_team_language_context(db, context, task, run)
     event = TeamWakeEvent(
         team_id=team.id,
         tenant_id=team.tenant_id,
+        tenant_lifecycle_version=(
+            admission.lifecycle_version if admission is not None else 1
+        ),
         target_agent_id=target_agent_id,
         trigger_type=trigger_type,
-        payload_json=dict(payload or {}),
+        payload_json=payload_json,
         status="pending",
+        language_context_json=context.model_dump(mode="json"),
     )
     db.add(event)
     db.flush()
@@ -324,21 +969,532 @@ def enqueue_wake_event(
 
 def claim_wake_event(db: Session, wake_event_id: str) -> bool:
     """原子认领 pending 唤醒事件;并发/重复触发下只生效一次。"""
+    event = db.get(TeamWakeEvent, wake_event_id)
+    if event is None or event.status != "pending":
+        return False
+    now = utc_now()
+    worker_owner = new_id("wake_worker")
+    try:
+        _optional_team_admission(
+            db,
+            tenant_id=event.tenant_id,
+            persisted_version=event.tenant_lifecycle_version,
+            correlation_id=event.id,
+        )
+    except TenantLifecycleDenied as exc:
+        _terminalize_wake_lifecycle(
+            db,
+            event,
+            exc.code,
+            worker_owner=None,
+            worker_generation=int(event.worker_generation or 0),
+            expected_status="pending",
+        )
+        return False
     result = db.exec(
         update(TeamWakeEvent)
-        .where(TeamWakeEvent.id == wake_event_id, TeamWakeEvent.status == "pending")
-        .values(status="claimed", updated_at=utc_now())
+        .where(
+            TeamWakeEvent.id == wake_event_id,
+            TeamWakeEvent.status == "pending",
+            TeamWakeEvent.tenant_lifecycle_version
+            == event.tenant_lifecycle_version,
+            TeamWakeEvent.worker_owner.is_(None),
+            TeamWakeEvent.worker_lease_until.is_(None),
+        )
+        .values(
+            status="claimed",
+            worker_owner=worker_owner,
+            worker_generation=TeamWakeEvent.worker_generation + 1,
+            worker_lease_until=now + timedelta(seconds=_WAKE_WORKER_LEASE_SECONDS),
+            updated_at=now,
+        )
     )
     db.commit()
     return result.rowcount == 1
 
 
-def start_wakeup_async(wake_event_id: str) -> None:
-    threading.Thread(
-        target=_execute_wakeup_in_background,
-        args=(wake_event_id,),
-        daemon=True,
-    ).start()
+def start_wakeup_async(wake_event_id: str) -> bool:
+    try:
+        threading.Thread(
+            target=_execute_wakeup_in_background,
+            args=(wake_event_id,),
+            name=f"team-wake-{wake_event_id}",
+            daemon=True,
+        ).start()
+    except RuntimeError:
+        logger.exception("团队唤醒线程启动失败: wake_event_id=%s", wake_event_id)
+        return False
+    return True
+
+
+def _wake_task_id(event: TeamWakeEvent) -> str:
+    payload = event.payload_json if isinstance(event.payload_json, dict) else {}
+    return str(payload.get("task_id") or "")
+
+
+def _reload_wake_event(db: Session, event: TeamWakeEvent) -> TeamWakeEvent | None:
+    """Refresh one event from the database so a stale worker snapshot cannot pass a CAS gate."""
+    try:
+        db.expire(event)
+        db.refresh(event)
+        return event
+    except Exception:  # noqa: BLE001
+        return db.exec(
+            select(TeamWakeEvent)
+            .where(TeamWakeEvent.id == event.id)
+            .execution_options(populate_existing=True)
+        ).first()
+
+
+def _cas_wake_event_state(
+    db: Session,
+    event: TeamWakeEvent,
+    *,
+    worker_owner: str | None,
+    worker_generation: int,
+    expected_status: str | tuple[str, ...],
+    target_status: str,
+    error: str | None = None,
+    now: datetime | None = None,
+    expected_updated_before: datetime | None = None,
+    clear_claim: bool = True,
+    commit: bool = True,
+    allow_lifecycle_denial: bool = False,
+) -> bool:
+    """Conditionally transition a wake while retaining claim and tenant fences.
+
+    Ordinary completion/failure requires the exact active tenant admission.  A
+    lifecycle-denial terminalization is the one intentional exception: the
+    suspended/stale tenant must still be able to safely close the orphaned wake.
+    """
+    bound_owner, bound_generation = _bound_wake_claim_args(
+        event,
+        worker_owner if isinstance(worker_owner, str) else None,
+        worker_generation,
+    )
+    if bound_owner is not None or getattr(event, "_wake_expected_worker_owner", None) is not None:
+        worker_owner = bound_owner
+        worker_generation = bound_generation
+    status_predicate = (
+        TeamWakeEvent.status == expected_status
+        if isinstance(expected_status, str)
+        else TeamWakeEvent.status.in_(list(expected_status))
+    )
+    predicates = [
+        TeamWakeEvent.id == event.id,
+        status_predicate,
+        TeamWakeEvent.worker_generation == int(worker_generation),
+    ]
+    if worker_owner is None:
+        predicates.append(TeamWakeEvent.worker_owner.is_(None))
+    else:
+        predicates.append(TeamWakeEvent.worker_owner == worker_owner)
+    if expected_updated_before is not None:
+        predicates.append(TeamWakeEvent.updated_at < expected_updated_before)
+    # Pre-tenant fixtures are intentionally supported, but a real tenant row is
+    # always checked in the same UPDATE as the wake state transition.  This
+    # prevents a fast suspend/reactivate from allowing an old worker to publish
+    # done/failed under its pre-transition admission.
+    tenant_exists = exists(
+        select(Tenant.id).where(Tenant.id == event.tenant_id)
+    )
+    if allow_lifecycle_denial:
+        lifecycle_denied = exists(
+            select(Tenant.id).where(
+                Tenant.id == event.tenant_id,
+                or_(
+                    Tenant.status != "active",
+                    Tenant.lifecycle_version != event.tenant_lifecycle_version,
+                ),
+            )
+        )
+        predicates.append(or_(~tenant_exists, lifecycle_denied))
+    else:
+        predicates.append(or_(~tenant_exists, _active_tenant_exists(event)))
+    stamp = now or utc_now()
+    values: dict[str, object] = {
+        "status": target_status,
+        "error": error,
+        "updated_at": stamp,
+    }
+    if clear_claim:
+        values.update(
+            {
+                "worker_owner": None,
+                "worker_generation": TeamWakeEvent.worker_generation + 1,
+                "worker_lease_until": None,
+            }
+        )
+    result = db.exec(update(TeamWakeEvent).where(*predicates).values(**values))
+    if getattr(result, "rowcount", 0) != 1:
+        db.rollback()
+        return False
+    if commit:
+        db.commit()
+        db.expire_all()
+    return True
+
+
+def _ensure_wake_worker_claim(
+    db: Session,
+    event: TeamWakeEvent,
+    *,
+    expected_worker_owner: str | None = None,
+    expected_worker_generation: int | None = None,
+) -> tuple[TeamWakeEvent, str, int] | None:
+    """Return a fresh worker identity, claiming/adopting only this event generation."""
+    # Preserve the caller's claim identity before refreshing the ORM object.  A
+    # stale worker may hold a claimed snapshot while recovery has already reset
+    # the row to pending; that worker must never auto-claim the successor's
+    # generation.  Callers that intentionally execute a pending event (the
+    # synchronous/test path) still use the legacy auto-claim behavior.
+    requested_status = event.status
+    requested_owner = str(event.worker_owner or "").strip()
+    requested_generation = int(event.worker_generation or 0)
+    if expected_worker_owner is not None or expected_worker_generation is not None:
+        if (
+            not expected_worker_owner
+            or expected_worker_generation is None
+            or int(expected_worker_generation) <= 0
+        ):
+            return None
+        requested_status = "claimed"
+        requested_owner = expected_worker_owner
+        requested_generation = int(expected_worker_generation)
+    current = _reload_wake_event(db, event)
+    if current is None:
+        return None
+    if requested_status == "claimed" and requested_owner and requested_generation > 0:
+        if (
+            current.status != "claimed"
+            or current.worker_owner != requested_owner
+            or int(current.worker_generation or 0) != requested_generation
+        ):
+            return None
+        return current, requested_owner, requested_generation
+    if requested_status == "claimed" and current.status != "claimed":
+        # A legacy claimed snapshot is also a worker identity boundary: once
+        # recovery has reset it to pending, the old caller cannot adopt it.
+        return None
+    claimed_here = False
+    if current.status == "pending":
+        if not claim_wake_event(db, current.id):
+            return None
+        current = _reload_wake_event(db, current)
+        if current is None:
+            return None
+        claimed_here = True
+    if requested_status == "pending" and current.status == "claimed" and not claimed_here:
+        # Another worker won the race after this caller observed pending.  Do
+        # not execute under that worker's claim from a stale pending snapshot.
+        return None
+    if current.status != "claimed":
+        return None
+    owner = str(current.worker_owner or "").strip()
+    generation = int(current.worker_generation or 0)
+    if not owner or generation <= 0:
+        # A handful of pre-lease rows were written as claimed by older code.  Adopt
+        # such a row exactly once; this is itself an owner/generation CAS.
+        previous_owner = owner or None
+        owner = new_id("wake_worker")
+        now = utc_now()
+        owner_predicate = (
+            TeamWakeEvent.worker_owner == previous_owner
+            if previous_owner is not None
+            else TeamWakeEvent.worker_owner.is_(None)
+        )
+        result = db.exec(
+            update(TeamWakeEvent)
+            .where(
+                TeamWakeEvent.id == current.id,
+                TeamWakeEvent.status == "claimed",
+                TeamWakeEvent.worker_generation == generation,
+                owner_predicate,
+            )
+            .values(
+                worker_owner=owner,
+                worker_generation=TeamWakeEvent.worker_generation + 1,
+                worker_lease_until=now + timedelta(seconds=_WAKE_WORKER_LEASE_SECONDS),
+                updated_at=now,
+            )
+        )
+        db.commit()
+        if getattr(result, "rowcount", 0) != 1:
+            return None
+        current = _reload_wake_event(db, current)
+        if current is None:
+            return None
+        owner = str(current.worker_owner or "").strip()
+        generation = int(current.worker_generation or 0)
+    if not owner or generation <= 0:
+        return None
+    return current, owner, generation
+
+
+def _terminalize_wake_lifecycle(
+    db: Session,
+    event: TeamWakeEvent,
+    reason_code: str,
+    *,
+    worker_owner: str | None | object = _WAKE_OWNER_UNSET,
+    worker_generation: int | None = None,
+    expected_status: str | tuple[str, ...] | None = None,
+) -> bool:
+    """Fence a wake, its task, and its run after a lifecycle denial or version race."""
+    return _terminalize_wake_lifecycle_with_claim(
+        db,
+        event,
+        reason_code,
+        worker_owner=worker_owner,
+        worker_generation=worker_generation,
+        expected_status=expected_status,
+    )
+
+
+def _terminalize_wake_lifecycle_with_claim(
+    db: Session,
+    event: TeamWakeEvent,
+    reason_code: str,
+    *,
+    worker_owner: str | None | object = _WAKE_OWNER_UNSET,
+    worker_generation: int | None = None,
+    expected_status: str | tuple[str, ...] | None = None,
+) -> bool:
+    """CAS a wake to failed, then terminalize children only if this worker still owns it."""
+    owner = event.worker_owner if worker_owner is _WAKE_OWNER_UNSET else worker_owner
+    generation = int(
+        event.worker_generation if worker_generation is None else worker_generation
+    )
+    status = event.status if expected_status is None else expected_status
+    if status == "done" or status == "failed" or (
+        isinstance(status, tuple) and set(status).issubset({"done", "failed"})
+    ):
+        return False
+    if not _cas_wake_event_state(
+        db,
+        event,
+        worker_owner=owner if isinstance(owner, str) else None,
+        worker_generation=generation,
+        expected_status=status,
+        target_status="failed",
+        error=reason_code,
+        clear_claim=True,
+        commit=False,
+        allow_lifecycle_denial=True,
+    ):
+        return False
+    _terminalize_wake_children(db, event, reason_code)
+    db.commit()
+    db.expire_all()
+    return True
+
+
+def _terminalize_wake_children(
+    db: Session,
+    event: TeamWakeEvent,
+    reason_code: str,
+) -> None:
+    """Terminalize task/run after the event CAS succeeds; no stale event can touch children."""
+    task_id = _wake_task_id(event)
+    db.expire_all()
+    task = db.get(TeamTask, task_id) if task_id else None
+    if task is not None and task.status not in {"done", "escalated"}:
+        try:
+            apply_task_transition(
+                db,
+                task,
+                "escalated",
+                actor_type="system",
+                actor_id=None,
+                event_type="task_escalated",
+                payload={
+                    **_wake_failure_audit_payload(
+                        event,
+                        reason_code=reason_code,
+                    ),
+                    "wake_event_id": event.id,
+                },
+            )
+        except TeamTaskTransitionError:
+            # A concurrent human transition may have terminalized the task;
+            # the wake itself still remains safely fenced below.
+            db.expire(task)
+    run_id = str(
+        (event.payload_json if isinstance(event.payload_json, dict) else {}).get(
+            "team_run_id"
+        )
+        or (task.team_run_id if task is not None else "")
+        or ""
+    ).strip()
+    run = db.get(TeamRun, run_id) if run_id else None
+    if run is not None and run.status not in {"completed", "failed"}:
+        run.status = "failed"
+        run.error = reason_code
+        run.updated_at = utc_now()
+        db.add(run)
+
+
+def _terminalize_team_run_lifecycle(
+    db: Session,
+    run: TeamRun,
+    reason_code: str,
+) -> None:
+    """Terminalize all unfinished work owned by a stale team run."""
+    tasks = list(
+        db.exec(
+            select(TeamTask).where(TeamTask.team_run_id == run.id)
+        ).all()
+    )
+    task_ids = {task.id for task in tasks}
+    wake_rows = list(
+        db.exec(
+            select(TeamWakeEvent).where(
+                TeamWakeEvent.team_id == run.team_id,
+                TeamWakeEvent.status.in_(["pending", "claimed"]),
+            )
+        ).all()
+    )
+    matched_wakes = [
+        wake
+        for wake in wake_rows
+        if str(
+            (wake.payload_json if isinstance(wake.payload_json, dict) else {}).get(
+                "team_run_id"
+            )
+            or ""
+        )
+        == run.id
+        or _wake_task_id(wake) in task_ids
+    ]
+    for wake in matched_wakes:
+        _terminalize_wake_lifecycle(db, wake, reason_code)
+    for task in tasks:
+        if task.status in {"done", "escalated"}:
+            continue
+        if task.id in {_wake_task_id(wake) for wake in matched_wakes}:
+            continue
+        try:
+            apply_task_transition(
+                db,
+                task,
+                "escalated",
+                actor_type="system",
+                actor_id=None,
+                event_type="task_escalated",
+                payload={"reason": "tenant_lifecycle", "error": reason_code},
+            )
+        except TeamTaskTransitionError:
+            db.rollback()
+    if run.status not in {"completed", "failed"}:
+        run.status = "failed"
+        run.error = reason_code
+        run.updated_at = utc_now()
+        db.add(run)
+
+
+def _record_wake_lifecycle(
+    db: Session,
+    event: TeamWakeEvent,
+    event_type: str,
+    payload: dict | None = None,
+    *,
+    fence_event: TeamWakeEvent | None = None,
+) -> None:
+    if fence_event is not None:
+        _fence_wake_write(db, fence_event)
+    task_id = _wake_task_id(event)
+    if not task_id or db.get(TeamTask, task_id) is None:
+        return
+    record_task_event(
+        db,
+        team_id=event.team_id,
+        task_id=task_id,
+        actor_type="system",
+        actor_id=None,
+        event_type=event_type,
+        payload={"wake_event_id": event.id, **dict(payload or {})},
+    )
+
+
+def _wake_heartbeat(
+    wake_event_id: str,
+    stop_event: threading.Event,
+    worker_owner: str | None = None,
+    worker_generation: int | None = None,
+    heartbeat_failure_event: threading.Event | None = None,
+) -> None:
+    while not stop_event.wait(WAKE_HEARTBEAT_SECONDS):
+        try:
+            with Session(engine) as heartbeat_db:
+                event = heartbeat_db.get(TeamWakeEvent, wake_event_id)
+                if event is None or event.status != "claimed":
+                    if heartbeat_failure_event is not None:
+                        heartbeat_failure_event.set()
+                    stop_event.set()
+                    continue
+                expected_owner = (
+                    event.worker_owner if worker_owner is None else worker_owner
+                )
+                expected_generation = int(
+                    event.worker_generation
+                    if worker_generation is None
+                    else worker_generation
+                )
+                if not expected_owner or expected_generation <= 0:
+                    if heartbeat_failure_event is not None:
+                        heartbeat_failure_event.set()
+                    stop_event.set()
+                    continue
+                try:
+                    _optional_team_admission(
+                        heartbeat_db,
+                        tenant_id=event.tenant_id,
+                        persisted_version=event.tenant_lifecycle_version,
+                        correlation_id=event.id,
+                    )
+                except TenantLifecycleDenied as exc:
+                    _terminalize_wake_lifecycle(
+                        heartbeat_db,
+                        event,
+                        exc.code,
+                        worker_owner=expected_owner,
+                        worker_generation=expected_generation,
+                        expected_status="claimed",
+                    )
+                    stop_event.set()
+                    continue
+                heartbeat_at = utc_now()
+                result = heartbeat_db.exec(
+                    update(TeamWakeEvent)
+                    .where(
+                        TeamWakeEvent.id == wake_event_id,
+                        TeamWakeEvent.status == "claimed",
+                        TeamWakeEvent.tenant_lifecycle_version
+                        == event.tenant_lifecycle_version,
+                        TeamWakeEvent.worker_owner == expected_owner,
+                        TeamWakeEvent.worker_generation == expected_generation,
+                    )
+                    .values(
+                        updated_at=heartbeat_at,
+                        worker_lease_until=heartbeat_at
+                        + timedelta(seconds=_WAKE_WORKER_LEASE_SECONDS),
+                    )
+                )
+                if getattr(result, "rowcount", 0) != 1:
+                    heartbeat_db.rollback()
+                    if heartbeat_failure_event is not None:
+                        heartbeat_failure_event.set()
+                    stop_event.set()
+                    continue
+                heartbeat_db.commit()
+        except Exception:
+            logger.exception("团队唤醒租约续期失败: wake_event_id=%s", wake_event_id)
+            # A heartbeat failure means this worker cannot prove ownership or
+            # extend its lease.  Stop rather than repeatedly touching a claim;
+            # orphan recovery can safely reclaim the event after the lease.
+            if heartbeat_failure_event is not None:
+                heartbeat_failure_event.set()
+            stop_event.set()
 
 
 def _execute_wakeup_in_background(wake_event_id: str) -> None:
@@ -348,7 +1504,161 @@ def _execute_wakeup_in_background(wake_event_id: str) -> None:
         event = db.get(TeamWakeEvent, wake_event_id)
         if event is None:
             return
-        execute_wake_event(db, event)
+        _bind_wake_claim(
+            event,
+            str(event.worker_owner or ""),
+            int(event.worker_generation or 0),
+        )
+        _record_wake_lifecycle(
+            db,
+            event,
+            "wake_claimed",
+            {"trigger_type": event.trigger_type, "agent_id": event.target_agent_id},
+        )
+        _commit_wake_write(db, event)
+        heartbeat_stop = threading.Event()
+        heartbeat_failed = threading.Event()
+        heartbeat = threading.Thread(
+            target=_wake_heartbeat,
+            args=(wake_event_id, heartbeat_stop),
+            kwargs={
+                "worker_owner": event.worker_owner,
+                "worker_generation": event.worker_generation,
+                "heartbeat_failure_event": heartbeat_failed,
+            },
+            name=f"team-wake-heartbeat-{wake_event_id}",
+            daemon=True,
+        )
+        heartbeat.start()
+        try:
+            execute_wake_event(
+                db,
+                event,
+                expected_worker_owner=str(event.worker_owner or ""),
+                expected_worker_generation=int(event.worker_generation or 0),
+                heartbeat_failure_event=heartbeat_failed,
+            )
+        finally:
+            heartbeat_stop.set()
+            heartbeat.join(timeout=1.0)
+
+
+def recover_orphaned_wake_events(
+    db: Session,
+    *,
+    now: datetime | None = None,
+    lease_timeout_seconds: float = WAKE_LEASE_TIMEOUT_SECONDS,
+) -> list[str]:
+    """回收超过租约且无心跳的 claimed 事件，供重启和协程丢失后恢复。"""
+    now = now or utc_now()
+    cutoff = now - timedelta(seconds=max(1.0, lease_timeout_seconds))
+    rows = db.exec(
+        select(TeamWakeEvent).where(
+            TeamWakeEvent.status == "claimed",
+            TeamWakeEvent.updated_at < cutoff,
+        )
+    ).all()
+    recovered: list[str] = []
+    for row in rows:
+        previous_updated_at = row.updated_at
+        lifecycle_code = _team_lifecycle_failure_code(
+            db,
+            tenant_id=row.tenant_id,
+            persisted_version=row.tenant_lifecycle_version,
+            correlation_id=row.id,
+        )
+        if lifecycle_code is not None:
+            if not _terminalize_wake_lifecycle(
+                db,
+                row,
+                lifecycle_code,
+                worker_owner=row.worker_owner,
+                worker_generation=int(row.worker_generation or 0),
+                expected_status="claimed",
+            ):
+                continue
+            _record_wake_lifecycle(
+                db,
+                row,
+                "wake_recovered",
+                {
+                    "reason": "tenant_lifecycle",
+                    "error": lifecycle_code,
+                    "previous_updated_at": previous_updated_at.isoformat(),
+                },
+            )
+            recovered.append(row.id)
+            continue
+        owner_predicate = (
+            TeamWakeEvent.worker_owner == row.worker_owner
+            if row.worker_owner is not None
+            else TeamWakeEvent.worker_owner.is_(None)
+        )
+        result = db.exec(
+            update(TeamWakeEvent)
+            .where(
+                TeamWakeEvent.id == row.id,
+                TeamWakeEvent.status == "claimed",
+                TeamWakeEvent.updated_at < cutoff,
+                TeamWakeEvent.worker_generation == int(row.worker_generation or 0),
+                owner_predicate,
+            )
+            .values(
+                status="pending",
+                error=None,
+                worker_owner=None,
+                worker_generation=TeamWakeEvent.worker_generation + 1,
+                worker_lease_until=None,
+                updated_at=now,
+            )
+        )
+        if result.rowcount != 1:
+            continue
+        _record_wake_lifecycle(
+            db,
+            row,
+            "wake_recovered",
+            {"reason": "lease_expired", "previous_updated_at": previous_updated_at.isoformat()},
+        )
+        recovered.append(row.id)
+    db.commit()
+    return recovered
+
+
+def dispatch_pending_wake_events(
+    db: Session,
+    *,
+    now: datetime | None = None,
+    grace_seconds: float = PENDING_DISPATCH_GRACE_SECONDS,
+    limit: int = 50,
+) -> list[str]:
+    """补派未启动的持久化事件；claim 的原子更新保证多进程下只执行一次。"""
+    now = now or utc_now()
+    cutoff = now - timedelta(seconds=max(0.0, grace_seconds))
+    rows = db.exec(
+        select(TeamWakeEvent)
+        .where(TeamWakeEvent.status == "pending", TeamWakeEvent.updated_at <= cutoff)
+        .order_by(TeamWakeEvent.created_at)
+        .limit(max(1, limit))
+    ).all()
+    dispatched: list[str] = []
+    terminalized = False
+    for row in rows:
+        lifecycle_code = _team_lifecycle_failure_code(
+            db,
+            tenant_id=row.tenant_id,
+            persisted_version=row.tenant_lifecycle_version,
+            correlation_id=row.id,
+        )
+        if lifecycle_code is not None:
+            _terminalize_wake_lifecycle(db, row, lifecycle_code)
+            terminalized = True
+            continue
+        if start_wakeup_async(row.id):
+            dispatched.append(row.id)
+    if terminalized:
+        db.commit()
+    return dispatched
 
 
 def _ensure_wake_target_agent(db: Session, event: TeamWakeEvent) -> AgentProfile:
@@ -386,22 +1696,28 @@ def _release_member_slot(team_id: str, agent_id: str) -> None:
             _member_slot_counts[(team_id, agent_id)] = running - 1
 
 
-def _member_in_progress_count(db: Session, team: Team, agent_id: str) -> int:
-    return len(
-        db.exec(
-            select(TeamTask).where(
-                TeamTask.team_id == team.id,
-                TeamTask.assignee_agent_id == agent_id,
-                TeamTask.status == "in_progress",
-            )
-        ).all()
+def _member_in_progress_count(
+    db: Session,
+    team: Team,
+    agent_id: str,
+    *,
+    exclude_task_id: str | None = None,
+) -> int:
+    statement = select(TeamTask).where(
+        TeamTask.team_id == team.id,
+        TeamTask.assignee_agent_id == agent_id,
+        TeamTask.status == "in_progress",
     )
+    if exclude_task_id:
+        statement = statement.where(TeamTask.id != exclude_task_id)
+    return len(db.exec(statement).all())
 
 
 def _record_wake_queued(
     db: Session, event: TeamWakeEvent, team: Team, agent: AgentProfile
 ) -> None:
     """执行类唤醒排队审计:关联任务存在才记任务事件。"""
+    _fence_wake_write(db, event)
     task_id = str(event.payload_json.get("task_id") or "")
     if not task_id or db.get(TeamTask, task_id) is None:
         return
@@ -545,29 +1861,91 @@ def run_agent_turn(
     interaction_mode: Literal["team_task", "team_tl"],
     client_turn_id: str | None = None,
     allow_needs_input: bool = False,
+    message_visibility: Literal["visible", "internal"] = "visible",
+    language_context: LanguageContext | dict | None = None,
+    heartbeat_failure_event: threading.Event | None = None,
 ) -> TeamAgentTurnResult:
     """在独立会话里执行一轮 agent turn，并复用单聊落库消息作为结果源。
 
     allow_needs_input=True 时,turn 落在 awaiting_user/needs_input 不抛异常,
     由调用方决定如何安置(如成员任务转人工补充信息)。
     """
+    # If the wake row exists, evaluate its token before resolving/entering the
+    # Harness path.  A few trusted legacy callers pass a synthetic wake id; in
+    # that case defer the missing-wake failure until after the read-only session
+    # ownership check so cross-team misuse remains diagnosable.
+    wake_admission_check: Callable[[], None] | None = None
+    if db.get(TeamWakeEvent, wake_event_id) is not None:
+        wake_admission_check = _wake_harness_admission_check(
+            db,
+            wake_event_id,
+            heartbeat_failure_event=heartbeat_failure_event,
+        )
+        try:
+            wake_admission_check()
+        except HarnessExecutionFenced as exc:
+            raise _WakeExecutionFenced(str(exc)) from exc
+
+    # Resolve the session again at the execution boundary. Wake payloads and
+    # caller-supplied ids never decide which team's knowledge is visible. This
+    # is a read-only ownership check; the wake token is still evaluated before
+    # the session enters Harness/AgentLoop below.
+    session = _trusted_team_execution_session(
+        db,
+        team=team,
+        agent=agent,
+        session_id=session_id,
+    )
+    # A synthetic/missing wake is still denied before entering AgentLoop; it is
+    # only the ownership diagnostic above that is intentionally ordered first.
+    if wake_admission_check is None:
+        wake_admission_check = _wake_harness_admission_check(
+            db,
+            wake_event_id,
+            heartbeat_failure_event=heartbeat_failure_event,
+        )
+        try:
+            wake_admission_check()
+        except HarnessExecutionFenced as exc:
+            raise _WakeExecutionFenced(str(exc)) from exc
+    context = _team_language_context(
+        db,
+        snapshot=language_context,
+        legacy_agent_reply_locale=session.agent_reply_locale,
+    )
+    if session.agent_reply_locale != context.agent_reply_locale.value:
+        session.agent_reply_locale = context.agent_reply_locale.value
+        session.agent_reply_locale_source = context.agent_reply_locale_source.value
+        session.updated_at = utc_now()
+        db.add(session)
     turn_id = client_turn_id or wake_event_id
     request = ChatTurnRequest(
         tenant_id=team.tenant_id,
         session_id=session_id,
         agent_id=agent.id,
         client_turn_id=turn_id,
-        user_id=team.owner_user_id,
+        user_id=session.user_id,
         message=message,
         channel="team",
         interaction_mode=interaction_mode,
+        message_visibility=message_visibility,
+        ui_locale=context.ui_locale,
+        agent_reply_locale=context.agent_reply_locale,
+        language_context=context,
     )
     result: ChatTurnResponse | None = None
-    for item in AgentLoop(db).handle_turn_stream(request):
+    loop = AgentLoop(db)
+    stream = loop.handle_turn_stream(
+        request,
+        wake_admission_check=wake_admission_check,
+    )
+    for item in stream:
+        wake_admission_check()
         if item.get("event") in {"complete", "done"} and isinstance(item.get("data"), dict):
             result = ChatTurnResponse.model_validate(item["data"])
     if result is None:
         raise RuntimeError("团队唤醒执行未返回完整结果")
+    wake_admission_check()
     outcome = _team_harness_outcome(
         db,
         tenant_id=team.tenant_id,
@@ -576,6 +1954,7 @@ def run_agent_turn(
     )
     if outcome == "needs_input" and not allow_needs_input:
         raise RuntimeError("agent 需要补充信息才能继续,当前场景不支持挂起等待。")
+    wake_admission_check()
     assistant_message = db.exec(
         select(Message)
         .where(Message.session_id == session_id, Message.role == "assistant")
@@ -593,32 +1972,99 @@ def run_agent_turn(
     )
 
 
-def execute_wake_event(db: Session, event: TeamWakeEvent) -> TeamWakeEvent:
+def _trusted_team_execution_session(
+    db: Session,
+    *,
+    team: Team,
+    agent: AgentProfile,
+    session_id: str,
+) -> ChatSession:
+    """Return one server-validated team session for a wakeup Agent turn."""
+    session = db.get(ChatSession, session_id)
+    if (
+        session is None
+        or session.tenant_id != team.tenant_id
+        or session.team_id != team.id
+        or session.agent_id != agent.id
+    ):
+        raise RuntimeError("团队执行会话不属于当前团队或目标员工")
+    return session
+
+
+def execute_wake_event(
+    db: Session,
+    event: TeamWakeEvent,
+    *,
+    expected_worker_owner: str | None = None,
+    expected_worker_generation: int | None = None,
+    heartbeat_failure_event: threading.Event | None = None,
+) -> TeamWakeEvent:
     """唤醒执行体;任务执行/验收失败会把关联任务置为 escalated,不静默丢任务。
 
     竞标(bid_request)失败例外:只记 bid_failed 审计并尝试推进竞标,不升级任务。
     执行类唤醒(task_assigned/task_rework)受成员串行约束:占不到执行额度时
     事件保持 pending 直接返回(记 wake_queued 审计),由终态出队重新拉起。
     """
+    claimed = _ensure_wake_worker_claim(
+        db,
+        event,
+        expected_worker_owner=expected_worker_owner,
+        expected_worker_generation=expected_worker_generation,
+    )
+    if claimed is None:
+        current = _reload_wake_event(db, event)
+        return current or event
+    event, worker_owner, worker_generation = claimed
+    _bind_wake_claim(event, worker_owner, worker_generation)
+    if heartbeat_failure_event is not None:
+        # Keep the health signal attached to this identity for every nested
+        # pre-model/pre-write admission check.  It is deliberately in-memory;
+        # the durable lease remains the recovery source of truth.
+        event._heartbeat_failure_event = heartbeat_failure_event  # type: ignore[attr-defined]
     team: Team | None = None
     agent: AgentProfile | None = None
     slot_acquired = False
+    event_state_cas_applied = False
+    target_status = "done"
+    target_error: str | None = None
     try:
+        # Fail closed before resolving a target, acquiring a slot, or entering
+        # any AgentLoop/model path when the heartbeat already lost ownership.
+        _require_wake_execution_admission(db, event)
         team = db.get(Team, event.team_id)
         if team is None:
             raise RuntimeError("唤醒事件所属团队不存在")
+        # The event may have been claimed before a concurrent suspend.  Recheck
+        # the tenant before resolving the target or creating any AgentLoop work.
+        _require_wake_execution_admission(db, event)
         agent = _ensure_wake_target_agent(db, event)
         if event.trigger_type in EXECUTION_WAKE_TYPES:
             # 成员串行排队:进程内额度 + DB in_progress 计数双重判定,
             # 覆盖落库前的并发窗口与进程重启后的存量执行中任务
             limit = member_concurrency(team)
             slot_acquired = _try_acquire_member_slot(team.id, agent.id, limit)
-            if not slot_acquired or _member_in_progress_count(db, team, agent.id) >= limit:
+            if not slot_acquired or _member_in_progress_count(
+                db,
+                team,
+                agent.id,
+                exclude_task_id=_wake_task_id(event),
+            ) >= limit:
                 if slot_acquired:
                     _release_member_slot(team.id, agent.id)
                     slot_acquired = False
-                event.status = "pending"
                 _record_wake_queued(db, event, team, agent)
+                event_state_cas_applied = _cas_wake_event_state(
+                    db,
+                    event,
+                    worker_owner=worker_owner,
+                    worker_generation=worker_generation,
+                    expected_status="claimed",
+                    target_status="pending",
+                    error=None,
+                    clear_claim=True,
+                )
+                if not event_state_cas_applied:
+                    return _reload_wake_event(db, event) or event
                 return event
             _execute_member_task(db, event, team, agent)
         elif event.trigger_type == "task_report":
@@ -627,32 +2073,153 @@ def execute_wake_event(db: Session, event: TeamWakeEvent) -> TeamWakeEvent:
             _execute_bid_request(db, event, team, agent)
         elif event.trigger_type == "bid_judge":
             _execute_bid_judge(db, event, team, agent)
+        elif event.trigger_type == "team_synthesis":
+            _execute_team_synthesis(db, event, team, agent)
         else:
             raise RuntimeError(f"未知唤醒触发类型: {event.trigger_type}")
-        event.status = "done"
+        # A worker can finish its model/tool path after a lifecycle transition;
+        # do not publish an ordinary done event for that stale admission.
+        _require_wake_execution_admission(db, event)
+        _record_wake_lifecycle(
+            db,
+            event,
+            "wake_completed",
+            {"trigger_type": event.trigger_type, "agent_id": event.target_agent_id},
+            fence_event=event,
+        )
+    except TenantLifecycleDenied as exc:
+        public_error_code = exc.code
+        # Discard any partial ORM writes before fencing the event and its children.
+        db.rollback()
+        event_state_cas_applied = _terminalize_wake_lifecycle(
+            db,
+            event,
+            public_error_code,
+            worker_owner=worker_owner,
+            worker_generation=worker_generation,
+            expected_status="claimed",
+        )
+        if event_state_cas_applied:
+            _record_wake_lifecycle(
+                db,
+                event,
+                "wake_failed",
+                {
+                    "trigger_type": event.trigger_type,
+                    "agent_id": event.target_agent_id,
+                    "error": public_error_code,
+                },
+            )
+            db.commit()
     except Exception as exc:
+        public_error_code = (
+            str(exc)
+            if isinstance(exc, _WakeExecutionFenced) and str(exc)
+            else _public_wake_failure_code()
+        )
+        target_status = "failed"
+        target_error = public_error_code
+        logger.exception(
+            "team wake execution failed",
+            extra={
+                "wake_event_id": event.id,
+                "trigger_type": event.trigger_type,
+                "target_agent_id": event.target_agent_id,
+            },
+        )
+        # A failed bid request may need to enqueue the next bid/judge wake. Keep
+        # the parent claim alive while that derived wake is inserted so its
+        # payload and commit retain the exact owner+generation fence. Other
+        # trigger types terminalize first, then touch only their own children.
         if event.trigger_type == "bid_request":
-            _handle_bid_failure(db, event, exc)
-        else:
-            _escalate_task_on_failure(db, event, exc)
-        event.status = "failed"
-        event.error = str(exc)
+            _handle_bid_failure(db, event, public_error_code)
+        event_state_cas_applied = _cas_wake_event_state(
+            db,
+            event,
+            worker_owner=worker_owner,
+            worker_generation=worker_generation,
+            expected_status="claimed",
+            target_status="failed",
+            error=public_error_code,
+            clear_claim=True,
+            commit=False,
+        )
+        if event_state_cas_applied:
+            if event.trigger_type == "team_synthesis":
+                run_id = str(event.payload_json.get("team_run_id") or "")
+                run = db.get(TeamRun, run_id) if run_id else None
+                if run is not None:
+                    run.status = "failed"
+                    run.error = public_error_code
+                    run.updated_at = utc_now()
+                    db.add(run)
+                    tasks = list(
+                        db.exec(
+                            select(TeamTask)
+                            .where(TeamTask.team_run_id == run.id)
+                            .order_by(TeamTask.created_at)
+                        ).all()
+                    )
+                    _update_team_run_progress_message(db, run, tasks, phase="failed")
+            elif event.trigger_type != "bid_request":
+                _escalate_task_on_failure(db, event, public_error_code)
+            _record_wake_lifecycle(
+                db,
+                event,
+                "wake_failed",
+                {
+                    "trigger_type": event.trigger_type,
+                    "agent_id": event.target_agent_id,
+                    "error": public_error_code,
+                },
+            )
+            db.commit()
     finally:
-        event.updated_at = utc_now()
-        db.add(event)
-        db.commit()
-        db.refresh(event)
+        if (
+            heartbeat_failure_event is not None
+            and heartbeat_failure_event.is_set()
+            and not event_state_cas_applied
+        ):
+            target_status = "failed"
+            target_error = TEAM_WAKE_HEARTBEAT_FAILED
+        if not event_state_cas_applied:
+            event_state_cas_applied = _cas_wake_event_state(
+                db,
+                event,
+                worker_owner=worker_owner,
+                worker_generation=worker_generation,
+                expected_status="claimed",
+                target_status=target_status,
+                error=target_error,
+                clear_claim=True,
+            )
+        if not event_state_cas_applied:
+            event = _reload_wake_event(db, event) or event
+        else:
+            refreshed_event = _reload_wake_event(db, event)
+            if refreshed_event is not None:
+                event = refreshed_event
         if slot_acquired and team is not None and agent is not None:
             _release_member_slot(team.id, agent.id)
             # 执行额度随终态释放,出队拉起该成员最老的排队唤醒
             _drain_member_queue(db, team, agent.id)
-        if team is not None:
+        if event_state_cas_applied and team is not None:
             # 任一唤醒都可能让前置任务进入成功、失败或恢复等待状态；统一重算依赖图。
             activate_ready_tasks(db, team)
+            run_id = str(event.payload_json.get("team_run_id") or "")
+            if not run_id:
+                task_id = _wake_task_id(event)
+                task = db.get(TeamTask, task_id) if task_id else None
+                run_id = str(task.team_run_id or "") if task is not None else ""
+            if run_id and event.trigger_type != "team_synthesis":
+                maybe_enqueue_team_synthesis(db, team, run_id)
     return event
 
 
-def _escalate_task_on_failure(db: Session, event: TeamWakeEvent, exc: Exception) -> None:
+def _escalate_task_on_failure(
+    db: Session, event: TeamWakeEvent, _public_reason: str
+) -> None:
+    """Escalate one failed wake task with a safe public reason while raw details stay in logs."""
     task_id = str(event.payload_json.get("task_id") or "")
     if not task_id:
         return
@@ -667,7 +2234,13 @@ def _escalate_task_on_failure(db: Session, event: TeamWakeEvent, exc: Exception)
             actor_type="system",
             actor_id=None,
             event_type="task_escalated",
-            payload={"reason": str(exc), "wake_event_id": event.id},
+            payload={
+                **_wake_failure_audit_payload(
+                    event,
+                    reason_code="execution_failed",
+                ),
+                "wake_event_id": event.id,
+            },
         )
         db.commit()
     except Exception:
@@ -681,30 +2254,89 @@ def _execute_member_task(db: Session, event: TeamWakeEvent, team: Team, agent: A
         raise RuntimeError("唤醒事件关联的团队任务不存在")
     if task.assignee_agent_id and task.assignee_agent_id != agent.id:
         raise RuntimeError("唤醒目标与任务指派成员不一致")
+    run = db.get(TeamRun, task.team_run_id) if task.team_run_id else None
+    _require_wake_execution_admission(db, event, task=task, run=run)
+    if task.status in {"review", "done", "escalated"}:
+        _record_wake_lifecycle(
+            db,
+            event,
+            "member_execution_skipped",
+            {
+                "event_code": "team.task.member.skipped",
+                "params": {"reason_code": "task_already_terminal"},
+                "reason": {
+                    "code": "task_already_terminal",
+                    "params": {"task_status": task.status},
+                },
+                "task_status": task.status,
+            },
+            fence_event=event,
+        )
+        return
     rework = event.trigger_type == "task_rework"
-    session = ChatSession(
-        id=new_id("session"),
-        tenant_id=team.tenant_id,
-        user_id=team.owner_user_id,
-        agent_id=agent.id,
-        title=f"团队任务:{task.title}",
-        status="active",
-        team_id=team.id,
-    )
-    db.add(session)
-    db.flush()
-    task.session_id = session.id
-    apply_task_transition(
+    context = _team_language_context(
         db,
-        task,
-        "in_progress",
-        actor_type="agent",
-        actor_id=agent.id,
-        event_type="task_rework_started" if rework else "task_started",
-        payload={"wake_event_id": event.id},
+        event=event,
+        task=task,
+        run=run,
+        source_turn_id=task.source_turn_id,
     )
-    db.commit()
+    _bind_team_language_context(db, context, event, task, run)
+    session = db.get(ChatSession, task.session_id) if task.session_id else None
+    if session is None or session.team_id != team.id or session.agent_id != agent.id:
+        session = ChatSession(
+            id=new_id("session"),
+            tenant_id=team.tenant_id,
+            user_id=team.owner_user_id,
+            agent_id=agent.id,
+            title=task.title,
+            status="active",
+            team_id=team.id,
+            session_kind=SESSION_KIND_TEAM_MEMBER_TASK,
+            agent_reply_locale=context.agent_reply_locale.value,
+            agent_reply_locale_source=context.agent_reply_locale_source.value,
+        )
+        db.add(session)
+        db.flush()
+        task.session_id = session.id
+    elif session.agent_reply_locale != context.agent_reply_locale.value:
+        # Team sessions are execution-scoped; restore the source snapshot before
+        # retry/rework instead of consulting a mutable user preference.
+        session.agent_reply_locale = context.agent_reply_locale.value
+        session.agent_reply_locale_source = context.agent_reply_locale_source.value
+        session.updated_at = utc_now()
+        db.add(session)
+    # 恢复 claimed 孤儿事件时任务通常已经是 in_progress；复用原会话和
+    # client_turn_id，避免重复创建会话、重复状态迁移或丢失 Harness 幂等语义。
+    if task.status != "in_progress":
+        _cas_wake_task_transition(
+            db,
+            event,
+            task,
+            worker_owner=str(event.worker_owner or ""),
+            worker_generation=int(event.worker_generation or 0),
+            expected_status=task.status,
+            new_status="in_progress",
+            actor_type="agent",
+            actor_id=agent.id,
+            event_type="task_rework_started" if rework else "task_started",
+            payload={"wake_event_id": event.id},
+        )
+    else:
+        db.add(task)
+        _record_wake_lifecycle(
+            db,
+            event,
+            "member_execution_resumed",
+            {"session_id": session.id},
+            fence_event=event,
+        )
+        _require_wake_execution_admission(db, event, task=task, run=run)
+    _commit_wake_write(db, event)
     message = build_member_task_message(db, team, task, rework=rework)
+    # Prompt construction can perform database reads and may yield to a
+    # concurrent lifecycle transition; gate immediately before the model turn.
+    _require_wake_execution_admission(db, event, task=task, run=run)
     turn_result = _coerce_team_turn_result(run_agent_turn(
         db,
         team=team,
@@ -714,7 +2346,12 @@ def _execute_member_task(db: Session, event: TeamWakeEvent, team: Team, agent: A
         message=message,
         interaction_mode="team_task",
         allow_needs_input=True,
+        language_context=context,
+        heartbeat_failure_event=getattr(event, "_heartbeat_failure_event", None),
     ))
+    # The provider may return after a concurrent tenant suspension.  Recheck
+    # before retaining the reply or advancing the team task state.
+    _require_wake_execution_admission(db, event, task=task, run=run)
     reply = turn_result.reply
     outcome = _team_harness_outcome(
         db,
@@ -722,7 +2359,8 @@ def _execute_member_task(db: Session, event: TeamWakeEvent, team: Team, agent: A
         session_id=session.id,
         client_turn_id=event.id,
     )
-    task.report_json = {
+    _require_wake_execution_admission(db, event, task=task, run=run)
+    report_json = {
         "summary": reply[:500],
         "full_reply": reply,
         "message_id": turn_result.message_id,
@@ -734,18 +2372,23 @@ def _execute_member_task(db: Session, event: TeamWakeEvent, team: Team, agent: A
     if outcome == "needs_input":
         # 成员需要补充信息(如索要合同文本):保留提问,升级给人;
         # 人可通过改判/退回重做把补充信息带回给成员(rework 通道即答复通道)
-        task.report_json["needs_input"] = True
-        db.add(task)
-        apply_task_transition(
+        report_json["needs_input"] = True
+        _require_wake_execution_admission(db, event, task=task, run=run)
+        _cas_wake_task_transition(
             db,
+            event,
             task,
-            "escalated",
+            worker_owner=str(event.worker_owner or ""),
+            worker_generation=int(event.worker_generation or 0),
+            expected_status=task.status,
+            new_status="escalated",
             actor_type="agent",
             actor_id=agent.id,
             event_type="task_needs_input",
             payload={"wake_event_id": event.id, "question": reply[:500]},
+            report_json=report_json,
         )
-        db.commit()
+        _commit_wake_write(db, event)
         return
     # 成员黑板建议:最终回复 + frame 级 reply_fragment 并集解析;裁决权在 TL,此处只暂存
     suggestions = parse_blackboard_suggestions(reply)
@@ -760,40 +2403,561 @@ def _execute_member_task(db: Session, event: TeamWakeEvent, team: Team, agent: A
             if suggestions:
                 break
     if suggestions:
-        task.report_json["blackboard_suggestions"] = suggestions
-    apply_task_transition(
+        _require_wake_execution_admission(db, event, task=task, run=run)
+        report_json["blackboard_suggestions"] = suggestions
+    if task.team_run_id:
+        _require_wake_execution_admission(db, event, task=task, run=run)
+        _cas_wake_task_transition(
+            db,
+            event,
+            task,
+            worker_owner=str(event.worker_owner or ""),
+            worker_generation=int(event.worker_generation or 0),
+            expected_status=task.status,
+            new_status="done",
+            actor_type="agent",
+            actor_id=agent.id,
+            event_type="task_completed",
+            payload={"wake_event_id": event.id, "team_run_id": task.team_run_id},
+            report_json=report_json,
+        )
+        _commit_wake_write(db, event)
+        return
+    _require_wake_execution_admission(db, event, task=task, run=run)
+    _cas_wake_task_transition(
         db,
+        event,
         task,
-        "review",
+        worker_owner=str(event.worker_owner or ""),
+        worker_generation=int(event.worker_generation or 0),
+        expected_status=task.status,
+        new_status="review",
         actor_type="agent",
         actor_id=agent.id,
         event_type="task_reported",
         payload={"wake_event_id": event.id},
+        report_json=report_json,
     )
-    db.add(task)
     leader = get_team_leader(db, team.id)
     if leader is None:
-        apply_task_transition(
+        _require_wake_execution_admission(db, event, task=task, run=run)
+        _cas_wake_task_transition(
             db,
+            event,
             task,
-            "escalated",
+            worker_owner=str(event.worker_owner or ""),
+            worker_generation=int(event.worker_generation or 0),
+            expected_status="review",
+            new_status="escalated",
             actor_type="system",
             actor_id=None,
             event_type="task_escalated",
-            payload={"reason": "团队缺少 TL,无法验收"},
+            payload={
+                **team_reason_payload(
+                    "team.task.review.failed",
+                    reason_code="leader_unavailable",
+                ),
+            },
+            report_json=report_json,
         )
-        db.commit()
+        _commit_wake_write(db, event)
         return
-    db.commit()
     wake = enqueue_wake_event(
         db,
         team=team,
         target_agent_id=leader.agent_id,
         trigger_type="task_report",
         payload={"task_id": task.id},
+        language_context=context,
+        parent_event=event,
     )
-    db.commit()
+    _commit_wake_write(db, event)
     start_wakeup_async(wake.id)
+
+
+def _team_synthesis_evidence(
+    tasks: list[TeamTask],
+) -> tuple[list[dict[str, object]], dict[str, str]]:
+    """Globalize member citation labels and relabel each report before TL synthesis."""
+
+    citations: list[dict[str, object]] = []
+    labels_by_identity: dict[str, str] = {}
+    relabeled_results: dict[str, str] = {}
+    for task in tasks:
+        report = task.report_json if isinstance(task.report_json, dict) else {}
+        result = str(report.get("full_reply") or report.get("summary") or "").strip()
+        labels_for_task: dict[str, str] = {}
+        raw_citations = report.get("citations")
+        if isinstance(raw_citations, list):
+            for index, raw_citation in enumerate(raw_citations, 1):
+                if not isinstance(raw_citation, dict):
+                    continue
+                citation = dict(raw_citation)
+                old_label = str(citation.get("label") or f"[{index}]").strip()
+                identity = next(
+                    (
+                        f"{field}:{value}"
+                        for field in ("concept_id", "chunk_id")
+                        if (value := str(citation.get(field) or "").strip())
+                    ),
+                    "",
+                )
+                if not identity:
+                    identity = "|".join(
+                        str(citation.get(field) or "").strip()
+                        for field in ("source_path", "section_path", "title", "excerpt")
+                        if str(citation.get(field) or "").strip()
+                    )
+                if not identity:
+                    continue
+                new_label = labels_by_identity.get(identity)
+                if new_label is None:
+                    new_label = f"[{len(citations) + 1}]"
+                    labels_by_identity[identity] = new_label
+                    citations.append({**citation, "label": new_label})
+                labels_for_task[old_label] = new_label
+
+        if labels_for_task:
+            result = re.sub(
+                r"\[(\d+)\]",
+                lambda match: labels_for_task.get(match.group(0), match.group(0)),
+                result,
+            )
+        relabeled_results[task.id] = result
+    return citations, relabeled_results
+
+
+def _compact_citation_for_synthesis(citation: dict[str, object]) -> dict[str, object]:
+    compact = {
+        field: citation[field]
+        for field in ("label", "title", "source_path", "section_path", "summary")
+        if citation.get(field)
+    }
+    excerpt = str(citation.get("excerpt") or "").strip()
+    if excerpt:
+        compact["excerpt"] = excerpt[:600]
+    return compact
+
+
+def build_team_synthesis_message(
+    db: Session,
+    team: Team,
+    run: TeamRun,
+    tasks: list[TeamTask],
+) -> str:
+    source = db.get(Message, run.source_turn_id)
+    citations, relabeled_results = _team_synthesis_evidence(tasks)
+    lines = [
+        f"你是团队「{team.name}」的 TL。所有可执行的团队任务已经结束，请汇总成对人的最终回答。",
+        f"人的原始需求:{source.content if source is not None else '(原始需求不可用)'}",
+        "团队任务结果:",
+    ]
+    for index, task in enumerate(tasks, 1):
+        report = task.report_json if isinstance(task.report_json, dict) else {}
+        result = relabeled_results.get(task.id, "")
+        lines.append(
+            f"{index}. {task.title} | assignee={task.assignee_agent_id or '未指派'} "
+            f"| status={task.status}"
+        )
+        lines.append(f"   结果:{result or '(无结果)'}")
+        artifacts = report.get("artifacts")
+        if isinstance(artifacts, list) and artifacts:
+            lines.append(f"   交付物:{artifacts}")
+        if task.status == "escalated":
+            lines.append(f"   未完成原因:{task.review_json or report.get('error') or '任务已升级'}")
+    if citations:
+        lines.append("团队任务引用（编号已经全局统一，最终回答须保留相应编号）:")
+        lines.extend(
+            f"- {citation.get('label')}: {_compact_citation_for_synthesis(citation)}"
+            for citation in citations
+        )
+    lines.append(
+        "请直接回答人的原始需求：合并重复结论，保留关键依据和交付物；"
+        "对失败或缺失部分明确说明，不要声称未完成的工作已经完成。"
+        "引用编号必须沿用上面的全局编号，不要从每个任务重新从 [1] 开始。"
+    )
+    lines.extend(
+        [
+            "最终回答必须严格使用以下 Markdown 版式：",
+            "- 首行用一到两句直接给出整体答案或建议，不添加报告类标题。",
+            "- 每个团队任务方向使用 `## <方向名称>` 单独成节，节与节之间保留空行；"
+            "方向名称优先沿用上面的任务标题。",
+            "- 每节先给该方向的结论，再用项目符号或有序列表展开规则、条件、步骤和关键依据；"
+            "每一项独立成行，不得把多级编号和多个方向压进同一个长段落。",
+            "- 引用 `[n]` 只紧跟其支撑的事实；不要输出单独的“参考来源”“参考资料”"
+            "“引用来源”或“资料来源”标题、列表或页脚，界面会统一展示知识来源。",
+            "- 仅在确有失败、缺失或风险时使用 `> 注意：...` 单独说明。不要输出 assignee、"
+            "status、工具名、内部执行过程或思考链路。",
+            "- 禁止出现“结构化完成报告”“完成报告”“总结报告”等标题，也不要套用固定的"
+            "“结论 / 过程要点 / 交付物”三段式。",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _team_progress_message(db: Session, run: TeamRun) -> Message | None:
+    messages = list(
+        db.exec(
+            select(Message)
+            .where(
+                Message.tenant_id == run.tenant_id,
+                Message.session_id == run.tl_session_id,
+                Message.role == "assistant",
+            )
+            .order_by(Message.created_at.desc())
+        ).all()
+    )
+    for message in messages:
+        metadata = message.metadata_json if isinstance(message.metadata_json, dict) else {}
+        if (
+            str(metadata.get("team_run_id") or "") == run.id
+            and metadata.get("team_synthesis") is not True
+        ):
+            return message
+    return None
+
+
+def _update_team_run_progress_message(
+    db: Session,
+    run: TeamRun,
+    tasks: list[TeamTask],
+    *,
+    phase: Literal["collecting", "synthesizing", "completed", "failed"] | None = None,
+) -> Message | None:
+    """Persist canonical team progress metadata without rewriting Agent-authored content."""
+
+    message = _team_progress_message(db, run)
+    if message is None:
+        return None
+    total = len(tasks)
+    completed = sum(task.status in {"done", "escalated"} for task in tasks)
+    resolved_phase = phase
+    if resolved_phase is None:
+        if run.status == "completed":
+            resolved_phase = "completed"
+        elif run.status == "failed":
+            resolved_phase = "failed"
+        elif run.status == "synthesizing" or (total > 0 and completed == total):
+            resolved_phase = "synthesizing"
+        else:
+            resolved_phase = "collecting"
+
+    event_code = f"team.run.progress.{resolved_phase}"
+    params = (
+        {"completed_tasks": completed, "total_tasks": total}
+        if resolved_phase == "collecting"
+        else {"total_tasks": total}
+    )
+
+    metadata = dict(message.metadata_json or {})
+    current_progress = metadata.get("team_progress")
+    current_phase = (
+        str(current_progress.get("phase") or "")
+        if isinstance(current_progress, dict)
+        else ""
+    )
+    if current_phase == "completed" and resolved_phase != "completed":
+        return message
+    metadata["team_progress"] = {
+        "phase": resolved_phase,
+        "completed_tasks": completed,
+        "total_tasks": total,
+        "event_code": event_code,
+        "params": params,
+    }
+    message.metadata_json = metadata
+    db.add(message)
+    return message
+
+
+def _team_run_tenant_exists(run: TeamRun):
+    """Return the active immutable tenant predicate for a TeamRun write."""
+    tenant_exists = exists(select(Tenant.id).where(Tenant.id == run.tenant_id))
+    return or_(
+        ~tenant_exists,
+        exists(
+            select(Tenant.id).where(
+                Tenant.id == run.tenant_id,
+                Tenant.status == "active",
+                Tenant.lifecycle_version == run.tenant_lifecycle_version,
+            )
+        ),
+    )
+
+
+def _fence_team_run_write(db: Session, run: TeamRun) -> None:
+    """Lock and validate one TeamRun immediately before derived output commits."""
+    with db.no_autoflush:
+        result = db.exec(
+            update(TeamRun)
+            .where(
+                TeamRun.id == run.id,
+                TeamRun.team_id == run.team_id,
+                TeamRun.tenant_id == run.tenant_id,
+                TeamRun.tenant_lifecycle_version == run.tenant_lifecycle_version,
+                _team_run_tenant_exists(run),
+            )
+            .values(updated_at=TeamRun.updated_at)
+        )
+    if getattr(result, "rowcount", 0) != 1:
+        db.rollback()
+        raise _WakeExecutionFenced("TEAM_RUN_WRITE_FENCED")
+
+
+def _commit_team_run_write(db: Session, run: TeamRun) -> None:
+    """Commit TeamRun/session/progress projections under one lifecycle fence."""
+    _fence_team_run_write(db, run)
+    db.commit()
+
+
+def maybe_enqueue_team_synthesis(db: Session, team: Team, run_id: str) -> str | None:
+    """Start one final TL synthesis after the complete team DAG reaches a terminal state."""
+
+    run = db.get(TeamRun, run_id)
+    if run is None or run.team_id != team.id or run.status in {"synthesizing", "completed", "failed"}:
+        return None
+    try:
+        _optional_team_admission(
+            db,
+            tenant_id=run.tenant_id,
+            persisted_version=run.tenant_lifecycle_version,
+            correlation_id=run.id,
+        )
+    except TenantLifecycleDenied as exc:
+        _terminalize_team_run_lifecycle(db, run, exc.code)
+        db.commit()
+        return None
+    tasks = list(
+        db.exec(
+            select(TeamTask)
+            .where(TeamTask.team_run_id == run.id)
+            .order_by(TeamTask.created_at)
+        ).all()
+    )
+    if not tasks:
+        return None
+    context = _team_language_context(
+        db,
+        run=run,
+        source_turn_id=run.source_turn_id,
+    )
+    _bind_team_language_context(db, context, run, *tasks)
+    waiting_for_input = any(
+        task.status == "escalated"
+        and bool((task.report_json or {}).get("needs_input"))
+        for task in tasks
+    )
+    if waiting_for_input:
+        run.status = "awaiting_input"
+        run.updated_at = utc_now()
+        db.add(run)
+        _update_team_run_progress_message(db, run, tasks, phase="collecting")
+        _commit_team_run_write(db, run)
+        return None
+    terminal_statuses = {"done", "escalated"}
+    if any(task.status not in terminal_statuses for task in tasks):
+        if run.status == "awaiting_input":
+            run.status = "running"
+            run.updated_at = utc_now()
+            db.add(run)
+        _update_team_run_progress_message(db, run, tasks, phase="collecting")
+        _commit_team_run_write(db, run)
+        return None
+    claim = db.exec(
+        update(TeamRun)
+        .where(
+            TeamRun.id == run.id,
+            TeamRun.status.in_(["planning", "running", "awaiting_input"]),
+            TeamRun.tenant_lifecycle_version == run.tenant_lifecycle_version,
+            _team_run_tenant_exists(run),
+        )
+        .values(status="synthesizing", updated_at=utc_now())
+    )
+    if claim.rowcount != 1:
+        db.rollback()
+        return None
+    db.expire(run)
+    db.refresh(run)
+    _update_team_run_progress_message(db, run, tasks, phase="synthesizing")
+    leader = get_team_leader(db, team.id)
+    if leader is None:
+        run.status = "failed"
+        run.error = "团队缺少 TL，无法汇总团队结果。"
+        run.updated_at = utc_now()
+        db.add(run)
+        _update_team_run_progress_message(db, run, tasks, phase="failed")
+        _commit_team_run_write(db, run)
+        return None
+    try:
+        # Keep the run transition and wake insert in one transaction.  If the
+        # insert fails, rollback restores the pre-synthesis run state; after a
+        # successful commit the pending wake is recoverable even if dispatch
+        # startup itself fails or the process exits.
+        wake = enqueue_wake_event(
+            db,
+            team=team,
+            target_agent_id=leader.agent_id,
+            trigger_type="team_synthesis",
+            payload={"team_run_id": run.id},
+            language_context=context,
+        )
+        _fence_team_run_write(db, run)
+        _commit_team_run_write(db, run)
+    except Exception:
+        db.rollback()
+        raise
+    start_wakeup_async(wake.id)
+    return wake.id
+
+
+def _execute_team_synthesis(
+    db: Session,
+    event: TeamWakeEvent,
+    team: Team,
+    agent: AgentProfile,
+) -> None:
+    run_id = str(event.payload_json.get("team_run_id") or "")
+    run = db.get(TeamRun, run_id)
+    if run is None or run.team_id != team.id:
+        raise RuntimeError("团队汇总运行不存在")
+    _require_wake_execution_admission(db, event, run=run)
+    if run.status == "completed":
+        return
+    tasks = list(
+        db.exec(
+            select(TeamTask)
+            .where(TeamTask.team_run_id == run.id)
+            .order_by(TeamTask.created_at)
+        ).all()
+    )
+    if not tasks or any(task.status not in {"done", "escalated"} for task in tasks):
+        raise RuntimeError("团队任务尚未全部结束，不能开始最终汇总")
+    context = _team_language_context(
+        db,
+        event=event,
+        run=run,
+        source_turn_id=run.source_turn_id,
+    )
+    _bind_team_language_context(db, context, event, run, *tasks)
+    _require_wake_execution_admission(db, event, run=run)
+    _update_team_run_progress_message(db, run, tasks, phase="synthesizing")
+    _commit_wake_write(db, event)
+    synthesis_session = (
+        db.get(ChatSession, run.synthesis_session_id) if run.synthesis_session_id else None
+    )
+    if synthesis_session is None:
+        _require_wake_execution_admission(db, event, run=run)
+        synthesis_session = ChatSession(
+            id=new_id("session"),
+            tenant_id=team.tenant_id,
+            user_id=run.created_by_user_id or team.owner_user_id,
+            agent_id=agent.id,
+            title=team.name,
+            status="active",
+            team_id=team.id,
+            session_kind=SESSION_KIND_TEAM_SYNTHESIS,
+            agent_reply_locale=context.agent_reply_locale.value,
+            agent_reply_locale_source=context.agent_reply_locale_source.value,
+        )
+        db.add(synthesis_session)
+        db.flush()
+        run.synthesis_session_id = synthesis_session.id
+        run.updated_at = utc_now()
+        db.add(run)
+        _commit_wake_write(db, event)
+    elif synthesis_session.agent_reply_locale != context.agent_reply_locale.value:
+        synthesis_session.agent_reply_locale = context.agent_reply_locale.value
+        synthesis_session.agent_reply_locale_source = context.agent_reply_locale_source.value
+        synthesis_session.updated_at = utc_now()
+        db.add(synthesis_session)
+    synthesis_message = build_team_synthesis_message(db, team, run, tasks)
+    # Prompt construction may yield to a lifecycle transition; admission must
+    # be the final operation before entering the model/AgentLoop boundary.
+    _require_wake_execution_admission(db, event, run=run)
+    result = _coerce_team_turn_result(
+        run_agent_turn(
+            db,
+            team=team,
+            agent=agent,
+            session_id=synthesis_session.id,
+            wake_event_id=event.id,
+            message=synthesis_message,
+            interaction_mode="team_task",
+            message_visibility="internal",
+            language_context=context,
+            heartbeat_failure_event=getattr(event, "_heartbeat_failure_event", None),
+        )
+    )
+    # Do not retain a provider result or publish a final message after the
+    # initiating tenant admission has been suspended or superseded.
+    _require_wake_execution_admission(db, event, run=run)
+    member_citations, _ = _team_synthesis_evidence(tasks)
+    reply = result.reply.rstrip()
+    tl_session = db.get(ChatSession, run.tl_session_id)
+    if tl_session is None or tl_session.team_id != team.id:
+        raise RuntimeError("团队 TL 原始会话不存在，无法发布最终汇总")
+    _require_wake_execution_admission(db, event, run=run)
+    # Acquire the parent claim before constructing the visible final message;
+    # the commit below then covers the message and run completion together.
+    _fence_wake_write(db, event)
+    loop = AgentLoop(db)
+    loop._finalize_turn(
+        tl_session,
+        team.tenant_id,
+        reply,
+        user_message_id=run.source_turn_id,
+        assistant_metadata_override={
+            "execution_engine": "harness_v2",
+            "team_run_id": run.id,
+            "team_synthesis": True,
+            "knowledge_citations": member_citations or list(result.citations),
+            "harness_artifacts": list(result.artifacts),
+            "language_context": context.model_dump(mode="json"),
+        },
+    )
+    _require_wake_execution_admission(db, event, run=run)
+    # Keep the final assistant message and run completion in one transaction;
+    # a lifecycle denial can therefore roll both back before either is visible.
+    db.flush()
+    final_message = db.exec(
+        select(Message)
+        .where(Message.session_id == tl_session.id, Message.role == "assistant")
+        .order_by(Message.created_at.desc())
+    ).first()
+    _require_wake_execution_admission(db, event, run=run)
+    completed_at = utc_now()
+    completion = db.exec(
+        update(TeamRun)
+        .where(
+            TeamRun.id == run.id,
+            TeamRun.status == "synthesizing",
+            TeamRun.tenant_lifecycle_version == event.tenant_lifecycle_version,
+            _wake_claim_exists(
+                event,
+                worker_owner=_wake_claim_identity(event)[0],
+                worker_generation=_wake_claim_identity(event)[1],
+            ),
+            _active_tenant_exists(event),
+        )
+        .values(
+            status="completed",
+            final_message_id=final_message.id if final_message is not None else None,
+            completed_at=completed_at,
+            updated_at=completed_at,
+            error=None,
+        )
+    )
+    if getattr(completion, "rowcount", 0) != 1:
+        db.rollback()
+        _require_wake_execution_admission(db, event, run=run)
+        raise RuntimeError("团队汇总完成状态已被其他执行者接管")
+    db.expire_all()
+    run = db.get(TeamRun, run.id)
+    if run is None:
+        raise RuntimeError("团队汇总运行在完成时消失")
+    _require_wake_execution_admission(db, event, run=run)
+    _update_team_run_progress_message(db, run, tasks, phase="completed")
+    _commit_wake_write(db, event)
 
 
 def _execute_tl_review(db: Session, event: TeamWakeEvent, team: Team, agent: AgentProfile) -> None:
@@ -801,8 +2965,11 @@ def _execute_tl_review(db: Session, event: TeamWakeEvent, team: Team, agent: Age
     task = db.get(TeamTask, task_id)
     if task is None or task.team_id != team.id:
         raise RuntimeError("唤醒事件关联的团队任务不存在")
+    run = db.get(TeamRun, task.team_run_id) if task.team_run_id else None
+    _require_wake_execution_admission(db, event, task=task, run=run)
     if task.status != "review":
         # 任务可能已被人改判或退回,迟到/重复的验收唤醒直接跳过
+        _require_wake_execution_admission(db, event, task=task, run=run)
         record_task_event(
             db,
             team_id=team.id,
@@ -812,20 +2979,36 @@ def _execute_tl_review(db: Session, event: TeamWakeEvent, team: Team, agent: Age
             event_type="tl_review_skipped",
             payload={"wake_event_id": event.id, "task_status": task.status},
         )
-        db.commit()
+        _require_wake_execution_admission(db, event, task=task, run=run)
+        _commit_wake_write(db, event)
         return
+    context = _team_language_context(
+        db,
+        event=event,
+        task=task,
+        run=run,
+        source_turn_id=task.source_turn_id,
+    )
+    _bind_team_language_context(db, context, event, task, run)
     session = ChatSession(
         id=new_id("session"),
         tenant_id=team.tenant_id,
         user_id=team.owner_user_id,
         agent_id=agent.id,
-        title=f"团队任务验收:{task.title}",
+        title=task.title,
         status="active",
         team_id=team.id,
+        session_kind=SESSION_KIND_TEAM_TL_REVIEW,
+        agent_reply_locale=context.agent_reply_locale.value,
+        agent_reply_locale_source=context.agent_reply_locale_source.value,
     )
+    _require_wake_execution_admission(db, event, task=task, run=run)
     db.add(session)
-    db.commit()
+    _commit_wake_write(db, event)
     message = build_tl_review_message(db, team, task)
+    # Prompt construction can yield to recovery/new-claim; do not enter the
+    # model boundary unless this exact wake owner+generation still holds.
+    _require_wake_execution_admission(db, event, task=task, run=run)
     reply = _coerce_team_turn_result(run_agent_turn(
         db,
         team=team,
@@ -834,7 +3017,10 @@ def _execute_tl_review(db: Session, event: TeamWakeEvent, team: Team, agent: Age
         wake_event_id=event.id,
         message=message,
         interaction_mode="team_tl",
+        language_context=context,
+        heartbeat_failure_event=getattr(event, "_heartbeat_failure_event", None),
     )).reply
+    _require_wake_execution_admission(db, event, task=task, run=run)
     verdict = parse_tl_review(reply)
     if verdict is None:
         # 最终回复被 ResponseGenerator 改写时,JSON 块可能只存在于 frame 级输出
@@ -850,6 +3036,7 @@ def _execute_tl_review(db: Session, event: TeamWakeEvent, team: Team, agent: Age
                 break
     if verdict is None:
         # TL 未输出验收代码块:在原会话内补跑一次格式纠错 turn,再解析一次
+        _require_wake_execution_admission(db, event, task=task, run=run)
         record_task_event(
             db,
             team_id=team.id,
@@ -859,7 +3046,8 @@ def _execute_tl_review(db: Session, event: TeamWakeEvent, team: Team, agent: Age
             event_type="tl_review_unparsed",
             payload={"wake_event_id": event.id},
         )
-        db.commit()
+        _commit_wake_write(db, event)
+        _require_wake_execution_admission(db, event, task=task, run=run)
         repair_reply = _coerce_team_turn_result(run_agent_turn(
             db,
             team=team,
@@ -869,7 +3057,10 @@ def _execute_tl_review(db: Session, event: TeamWakeEvent, team: Team, agent: Age
             client_turn_id=f"{event.id}-repair",
             message=f"{message}\n\n{TL_REVIEW_REPAIR_MESSAGE}",
             interaction_mode="team_tl",
+            language_context=context,
+            heartbeat_failure_event=getattr(event, "_heartbeat_failure_event", None),
         )).reply
+        _require_wake_execution_admission(db, event, task=task, run=run)
         verdict = parse_tl_review(repair_reply)
         if verdict is None:
             for fragment in collect_turn_reply_fragments(
@@ -886,6 +3077,7 @@ def _execute_tl_review(db: Session, event: TeamWakeEvent, team: Team, agent: Age
             reply = repair_reply
     if verdict is None:
         # 纠错后仍无结论:不改状态,等待人介入
+        _require_wake_execution_admission(db, event, task=task, run=run)
         record_task_event(
             db,
             team_id=team.id,
@@ -893,29 +3085,43 @@ def _execute_tl_review(db: Session, event: TeamWakeEvent, team: Team, agent: Age
             actor_type="agent",
             actor_id=agent.id,
             event_type="tl_review_repair_failed",
-            payload={"wake_event_id": event.id},
+            payload={
+                **team_reason_payload(
+                    "team.task.review.failed",
+                    reason_code="repair_failed",
+                ),
+                "wake_event_id": event.id,
+            },
         )
-        db.commit()
+        _commit_wake_write(db, event)
         return
     target = VERDICT_TARGET_STATUS[verdict["verdict"]]
-    task.review_json = {
+    _require_wake_execution_admission(db, event, task=task, run=run)
+    review_json = {
         "verdict": verdict["verdict"],
         "comment": verdict["comment"],
         "raw_reply": reply,
         "reviewed_at": utc_now().isoformat(),
     }
-    apply_task_transition(
+    _cas_wake_task_transition(
         db,
+        event,
         task,
-        target,
+        worker_owner=str(event.worker_owner or ""),
+        worker_generation=int(event.worker_generation or 0),
+        expected_status=task.status,
+        new_status=target,
         actor_type="agent",
         actor_id=agent.id,
         event_type=f"tl_review_{verdict['verdict']}",
         payload={"comment": verdict["comment"], "wake_event_id": event.id},
+        review_json=review_json,
     )
     # TL 裁决认可的黑板条目并入本次验收落库,零额外唤醒;未认可的建议即视为拒绝
     blackboard_writes = verdict.get("blackboard_writes") or []
     if blackboard_writes:
+        _require_wake_execution_admission(db, event, task=task, run=run)
+        _fence_wake_write(db, event)
         written, skipped = write_blackboard_entries(
             db,
             team=team,
@@ -924,6 +3130,7 @@ def _execute_tl_review(db: Session, event: TeamWakeEvent, team: Team, agent: Age
             source_agent_id=task.assignee_agent_id,
             source_task_id=task.id,
         )
+        _require_wake_execution_admission(db, event, task=task, run=run)
         record_task_event(
             db,
             team_id=team.id,
@@ -938,18 +3145,24 @@ def _execute_tl_review(db: Session, event: TeamWakeEvent, team: Team, agent: Age
                 "skipped": skipped,
             },
         )
+    _require_wake_execution_admission(db, event, task=task, run=run)
     db.add(task)
-    db.commit()
     if verdict["verdict"] == "rework" and task.assignee_agent_id:
+        _require_wake_execution_admission(db, event, task=task, run=run)
         wake = enqueue_wake_event(
             db,
             team=team,
             target_agent_id=task.assignee_agent_id,
             trigger_type="task_rework",
             payload={"task_id": task.id},
+            language_context=context,
+            parent_event=event,
         )
-        db.commit()
+        _require_wake_execution_admission(db, event, task=task, run=run)
+        _commit_wake_write(db, event)
         start_wakeup_async(wake.id)
+    else:
+        _commit_wake_write(db, event)
 
 
 # ---------- 任务池竞标 ----------
@@ -969,7 +3182,13 @@ def start_bidding(db: Session, team: Team, task: TeamTask) -> None:
             actor_type="system",
             actor_id=None,
             event_type="task_escalated",
-            payload={"reason": "任务池竞标无候选成员"},
+            payload={
+                **team_reason_payload(
+                    "team.task.bid.failed",
+                    reason_code="no_candidates",
+                    params={"round": 1},
+                ),
+            },
         )
         db.commit()
         return
@@ -1057,23 +3276,57 @@ def _wake_pending_for_task(
 
 
 def _enqueue_bid_judge(
-    db: Session, team: Team, task: TeamTask, *, mode: str, round_: int | None = None
+    db: Session,
+    team: Team,
+    task: TeamTask,
+    *,
+    mode: str,
+    round_: int | None = None,
+    event: TeamWakeEvent | None = None,
 ) -> None:
     """入队 TL 裁决唤醒:mode=score(第 round_ 轮打分)/ award(最终裁决);幂等护栏防重复。"""
+    if event is not None:
+        _require_wake_execution_admission(db, event, task=task)
     if _wake_pending_for_task(db, team, task.id, "bid_judge", round_=round_, mode=mode):
         return
     leader = get_team_leader(db, team.id)
     if leader is None:
-        apply_task_transition(
-            db,
-            task,
-            "escalated",
-            actor_type="system",
-            actor_id=None,
-            event_type="task_escalated",
-            payload={"reason": "团队缺少 TL,无法裁决竞标"},
-        )
-        db.commit()
+        payload = {
+            **team_reason_payload(
+                "team.task.bid.failed",
+                reason_code="leader_unavailable",
+                params={"round": round_ or 1},
+            ),
+        }
+        if event is None:
+            apply_task_transition(
+                db,
+                task,
+                "escalated",
+                actor_type="system",
+                actor_id=None,
+                event_type="task_escalated",
+                payload=payload,
+            )
+        else:
+            _cas_wake_task_transition(
+                db,
+                event,
+                task,
+                worker_owner=str(event.worker_owner or ""),
+                worker_generation=int(event.worker_generation or 0),
+                expected_status=task.status,
+                new_status="escalated",
+                actor_type="system",
+                actor_id=None,
+                event_type="task_escalated",
+                payload=payload,
+            )
+            _require_wake_execution_admission(db, event, task=task)
+        if event is None:
+            db.commit()
+        else:
+            _commit_wake_write(db, event)
         return
     payload: dict = {"task_id": task.id, "mode": mode}
     if round_ is not None:
@@ -1084,8 +3337,15 @@ def _enqueue_bid_judge(
         target_agent_id=leader.agent_id,
         trigger_type="bid_judge",
         payload=payload,
+        parent_event=event,
     )
-    db.commit()
+    if event is not None:
+        _require_wake_execution_admission(db, event, task=task)
+        _commit_wake_write(db, event)
+    else:
+        db.commit()
+    if event is not None:
+        _require_wake_execution_admission(db, event, task=task)
     start_wakeup_async(wake.id)
 
 
@@ -1100,12 +3360,20 @@ def _alive_bid_candidates(candidates: list[str], bids: list[TeamTaskBid]) -> lis
     ]
 
 
-def _maybe_advance_bidding(db: Session, team: Team, task: TeamTask) -> None:
+def _maybe_advance_bidding(
+    db: Session,
+    team: Team,
+    task: TeamTask,
+    *,
+    event: TeamWakeEvent | None = None,
+) -> None:
     """竞标推进检查:每轮存活候选全部应答(或失败)后,TL 打分(非末轮)/裁决(末轮)。
 
     轮次语义:round 1 = 陈述,round 2..N = 反驳(N=bid_rebuttal_rounds);
     每轮打分扣减血条,存活 ≤1 人时直接进裁决;无人应标则升级给人。
     """
+    if event is not None:
+        _require_wake_execution_admission(db, event, task=task)
     if task.status != "bidding":
         return
     candidates = _bidding_candidates(db, task)
@@ -1119,22 +3387,48 @@ def _maybe_advance_bidding(db: Session, team: Team, task: TeamTask) -> None:
         return  # 陈述轮未齐,继续等待其余候选
     valid = [agent_id for agent_id in candidates if agent_id in stated]
     if not valid:
-        apply_task_transition(
-            db,
-            task,
-            "escalated",
-            actor_type="system",
-            actor_id=None,
-            event_type="task_escalated",
-            payload={"reason": "任务池竞标无人应标"},
-        )
-        db.commit()
+        payload = {
+            **team_reason_payload(
+                "team.task.bid.failed",
+                reason_code="no_valid_bids",
+                params={"round": 1},
+            ),
+        }
+        if event is None:
+            apply_task_transition(
+                db,
+                task,
+                "escalated",
+                actor_type="system",
+                actor_id=None,
+                event_type="task_escalated",
+                payload=payload,
+            )
+        else:
+            _cas_wake_task_transition(
+                db,
+                event,
+                task,
+                worker_owner=str(event.worker_owner or ""),
+                worker_generation=int(event.worker_generation or 0),
+                expected_status=task.status,
+                new_status="escalated",
+                actor_type="system",
+                actor_id=None,
+                event_type="task_escalated",
+                payload=payload,
+            )
+            _require_wake_execution_admission(db, event, task=task)
+        if event is None:
+            db.commit()
+        else:
+            _commit_wake_write(db, event)
         return
     total_rounds = bid_rebuttal_rounds(team)
     alive = _alive_bid_candidates(candidates, bids)
     # 辩论关闭(0/1 轮)或有效应标不足两人:陈述后直接裁决(兼容旧行为)
     if total_rounds <= 1 or len(valid) < 2:
-        _enqueue_bid_judge(db, team, task, mode="award")
+        _enqueue_bid_judge(db, team, task, mode="award", event=event)
         return
     for round_ in range(1, total_rounds + 1):
         if round_ > 1:
@@ -1150,33 +3444,40 @@ def _maybe_advance_bidding(db: Session, team: Team, task: TeamTask) -> None:
                             target_agent_id=agent_id,
                             trigger_type="bid_request",
                             payload={"task_id": task.id, "round": round_},
+                            parent_event=event,
                         )
                         for agent_id in alive
                         if agent_id not in answered and agent_id not in failed
                     ]
-                    db.commit()
+                    if event is not None:
+                        _require_wake_execution_admission(db, event, task=task)
+                        _commit_wake_write(db, event)
+                    else:
+                        db.commit()
+                    if event is not None:
+                        _require_wake_execution_admission(db, event, task=task)
                     for wake in wakes:
                         start_wakeup_async(wake.id)
                 return
         if round_ == total_rounds:
             # 末轮已齐:直接裁决
-            _enqueue_bid_judge(db, team, task, mode="award")
+            _enqueue_bid_judge(db, team, task, mode="award", event=event)
             return
         round_bids = [
             bid for bid in bids if bid.round == round_ and bid.agent_id in set(alive)
         ]
         if round_bids and not all(bid.score is not None for bid in round_bids):
             # 非末轮已齐未打分:先入队 TL 打分,打分落库后由打分执行体再次推进
-            _enqueue_bid_judge(db, team, task, mode="score", round_=round_)
+            _enqueue_bid_judge(db, team, task, mode="score", round_=round_, event=event)
             return
         # 本轮打分完成:重算血条,存活 ≤1 人提前进裁决
         alive = _alive_bid_candidates(candidates, bids)
         if len(alive) <= 1:
-            _enqueue_bid_judge(db, team, task, mode="award")
+            _enqueue_bid_judge(db, team, task, mode="award", event=event)
             return
 
 
-def _handle_bid_failure(db: Session, event: TeamWakeEvent, exc: Exception) -> None:
+def _handle_bid_failure(db: Session, event: TeamWakeEvent, _public_reason: str) -> None:
     """竞标候选执行失败:记 bid_failed 审计并尝试推进竞标,不升级任务。"""
     task_id = str(event.payload_json.get("task_id") or "")
     if not task_id:
@@ -1196,7 +3497,7 @@ def _handle_bid_failure(db: Session, event: TeamWakeEvent, exc: Exception) -> No
             event_type="bid_skipped",
             payload={"wake_event_id": event.id, "task_status": task.status},
         )
-        db.commit()
+        _commit_wake_write(db, event)
         return
     try:
         record_task_event(
@@ -1207,13 +3508,17 @@ def _handle_bid_failure(db: Session, event: TeamWakeEvent, exc: Exception) -> No
             actor_id=event.target_agent_id,
             event_type="bid_failed",
             payload={
+                **_wake_failure_audit_payload(
+                    event,
+                    reason_code="execution_failed",
+                ),
                 "wake_event_id": event.id,
-                "round": int(event.payload_json.get("round") or 1),
-                "reason": str(exc),
             },
         )
-        db.commit()
-        _maybe_advance_bidding(db, team, task)
+        # Keep this bid-request wake claimed while any follow-up wake is
+        # created; the child insert and parent commit are then one fenced path.
+        _commit_wake_write(db, event)
+        _maybe_advance_bidding(db, team, task, event=event)
     except Exception:
         db.rollback()
 
@@ -1228,8 +3533,19 @@ def _execute_bid_request(
     task = db.get(TeamTask, task_id)
     if task is None or task.team_id != team.id:
         raise RuntimeError("唤醒事件关联的团队任务不存在")
+    run = db.get(TeamRun, task.team_run_id) if task.team_run_id else None
+    _require_wake_execution_admission(db, event, task=task, run=run)
+    context = _team_language_context(
+        db,
+        event=event,
+        task=task,
+        run=run,
+        source_turn_id=task.source_turn_id,
+    )
+    _bind_team_language_context(db, context, event, task, run)
     if task.status != "bidding":
         # 任务已被人改判或已完成裁决,迟到的竞标唤醒直接跳过
+        _require_wake_execution_admission(db, event, task=task, run=run)
         record_task_event(
             db,
             team_id=team.id,
@@ -1239,7 +3555,8 @@ def _execute_bid_request(
             event_type="bid_skipped",
             payload={"wake_event_id": event.id, "task_status": task.status, "round": round_},
         )
-        db.commit()
+        _require_wake_execution_admission(db, event, task=task, run=run)
+        _commit_wake_write(db, event)
         return
     duplicate = db.exec(
         select(TeamTaskBid).where(
@@ -1251,6 +3568,7 @@ def _execute_bid_request(
     ).first()
     if duplicate is not None:
         # 重复触发:同轮同类型竞标已落库,直接跳过
+        _require_wake_execution_admission(db, event, task=task, run=run)
         record_task_event(
             db,
             team_id=team.id,
@@ -1260,20 +3578,26 @@ def _execute_bid_request(
             event_type="bid_skipped",
             payload={"wake_event_id": event.id, "reason": "duplicate", "round": round_},
         )
-        db.commit()
+        _require_wake_execution_admission(db, event, task=task, run=run)
+        _commit_wake_write(db, event)
         return
     session = ChatSession(
         id=new_id("session"),
         tenant_id=team.tenant_id,
         user_id=team.owner_user_id,
         agent_id=agent.id,
-        title=f"团队竞标:{task.title}",
+        title=task.title,
         status="active",
         team_id=team.id,
+        session_kind=SESSION_KIND_TEAM_MEMBER_BID,
+        agent_reply_locale=context.agent_reply_locale.value,
+        agent_reply_locale_source=context.agent_reply_locale_source.value,
     )
+    _require_wake_execution_admission(db, event, task=task, run=run)
     db.add(session)
-    db.commit()
+    _commit_wake_write(db, event)
     message = build_bid_request_message(db, team, task, agent, round_=round_)
+    _require_wake_execution_admission(db, event, task=task, run=run)
     reply = _coerce_team_turn_result(run_agent_turn(
         db,
         team=team,
@@ -1282,7 +3606,10 @@ def _execute_bid_request(
         wake_event_id=event.id,
         message=message,
         interaction_mode="team_task",
+        language_context=context,
+        heartbeat_failure_event=getattr(event, "_heartbeat_failure_event", None),
     )).reply
+    _require_wake_execution_admission(db, event, task=task, run=run)
     bid = parse_bid(reply)
     if bid is None:
         # 最终回复被 ResponseGenerator 改写时,竞标块可能只存在于 frame 级输出
@@ -1298,6 +3625,8 @@ def _execute_bid_request(
     content = bid["plan"] if bid else reply.strip()
     if not content:
         raise RuntimeError("候选未给出任何竞标内容")
+    _require_wake_execution_admission(db, event, task=task, run=run)
+    _fence_wake_write(db, event)
     db.add(
         TeamTaskBid(
             task_id=task.id,
@@ -1318,8 +3647,10 @@ def _execute_bid_request(
         event_type="bid_submitted",
         payload={"wake_event_id": event.id, "round": round_, "kind": kind},
     )
-    db.commit()
-    _maybe_advance_bidding(db, team, task)
+    _require_wake_execution_admission(db, event, task=task, run=run)
+    _commit_wake_write(db, event)
+    _require_wake_execution_admission(db, event, task=task, run=run)
+    _maybe_advance_bidding(db, team, task, event=event)
 
 
 def _parse_bid_award_with_fragments(
@@ -1380,8 +3711,19 @@ def _execute_bid_judge(
     task = db.get(TeamTask, task_id)
     if task is None or task.team_id != team.id:
         raise RuntimeError("唤醒事件关联的团队任务不存在")
+    run = db.get(TeamRun, task.team_run_id) if task.team_run_id else None
+    _require_wake_execution_admission(db, event, task=task, run=run)
+    context = _team_language_context(
+        db,
+        event=event,
+        task=task,
+        run=run,
+        source_turn_id=task.source_turn_id,
+    )
+    _bind_team_language_context(db, context, event, task, run)
     if task.status != "bidding":
         # 任务已被人改判,迟到的裁决唤醒直接跳过
+        _require_wake_execution_admission(db, event, task=task, run=run)
         record_task_event(
             db,
             team_id=team.id,
@@ -1391,17 +3733,22 @@ def _execute_bid_judge(
             event_type="bid_skipped",
             payload={"wake_event_id": event.id, "task_status": task.status},
         )
-        db.commit()
+        _commit_wake_write(db, event)
         return
     mode = str(event.payload_json.get("mode") or "award")
     if mode == "score":
-        _execute_bid_score(db, event, team, agent, task)
+        _execute_bid_score(db, event, team, agent, task, context)
         return
-    _execute_bid_award(db, event, team, agent, task)
+    _execute_bid_award(db, event, team, agent, task, context)
 
 
 def _execute_bid_score(
-    db: Session, event: TeamWakeEvent, team: Team, agent: AgentProfile, task: TeamTask
+    db: Session,
+    event: TeamWakeEvent,
+    team: Team,
+    agent: AgentProfile,
+    task: TeamTask,
+    context: LanguageContext,
 ) -> None:
     """TL 每轮打分执行体:分数写回该轮 bid,血条归零审计淘汰,再推进竞标。
 
@@ -1409,6 +3756,7 @@ def _execute_bid_score(
     bid_score_fallback,不阻塞流程。
     """
     round_ = int(event.payload_json.get("round") or 1)
+    _require_wake_execution_admission(db, event, task=task)
     round_bids = list(
         db.exec(
             select(TeamTaskBid)
@@ -1418,10 +3766,12 @@ def _execute_bid_score(
     )
     if not round_bids:
         # 本轮无人应标(全部失败):无分可打,直接推进
-        _maybe_advance_bidding(db, team, task)
+        _require_wake_execution_admission(db, event, task=task)
+        _maybe_advance_bidding(db, team, task, event=event)
         return
     if all(bid.score is not None for bid in round_bids):
         # 重复触发:本轮已打分,直接跳过
+        _require_wake_execution_admission(db, event, task=task)
         record_task_event(
             db,
             team_id=team.id,
@@ -1431,7 +3781,7 @@ def _execute_bid_score(
             event_type="bid_skipped",
             payload={"wake_event_id": event.id, "reason": "duplicate_score", "round": round_},
         )
-        db.commit()
+        _commit_wake_write(db, event)
         return
     candidate_ids = {bid.agent_id for bid in round_bids}
     session = ChatSession(
@@ -1439,13 +3789,18 @@ def _execute_bid_score(
         tenant_id=team.tenant_id,
         user_id=team.owner_user_id,
         agent_id=agent.id,
-        title=f"团队竞标打分:{task.title}",
+        title=task.title,
         status="active",
         team_id=team.id,
+        session_kind=SESSION_KIND_TEAM_BID_SCORE,
+        agent_reply_locale=context.agent_reply_locale.value,
+        agent_reply_locale_source=context.agent_reply_locale_source.value,
     )
+    _require_wake_execution_admission(db, event, task=task)
     db.add(session)
-    db.commit()
+    _commit_wake_write(db, event)
     message = build_bid_score_message(db, team, task, round_bids, round_=round_)
+    _require_wake_execution_admission(db, event, task=task)
     reply = _coerce_team_turn_result(run_agent_turn(
         db,
         team=team,
@@ -1454,7 +3809,10 @@ def _execute_bid_score(
         wake_event_id=event.id,
         message=message,
         interaction_mode="team_tl",
+        language_context=context,
+        heartbeat_failure_event=getattr(event, "_heartbeat_failure_event", None),
     )).reply
+    _require_wake_execution_admission(db, event, task=task)
     scores = _parse_bid_scores_with_fragments(
         db,
         team=team,
@@ -1465,6 +3823,7 @@ def _execute_bid_score(
     )
     if scores is None:
         # 未输出有效打分块:带完整上下文补一次格式纠错 turn
+        _require_wake_execution_admission(db, event, task=task)
         record_task_event(
             db,
             team_id=team.id,
@@ -1474,7 +3833,8 @@ def _execute_bid_score(
             event_type="bid_score_unparsed",
             payload={"wake_event_id": event.id, "round": round_},
         )
-        db.commit()
+        _commit_wake_write(db, event)
+        _require_wake_execution_admission(db, event, task=task)
         repair_reply = _coerce_team_turn_result(run_agent_turn(
             db,
             team=team,
@@ -1484,7 +3844,10 @@ def _execute_bid_score(
             client_turn_id=f"{event.id}-repair",
             message=f"{message}\n\n{TL_BID_SCORE_REPAIR_MESSAGE}",
             interaction_mode="team_tl",
+            language_context=context,
+            heartbeat_failure_event=getattr(event, "_heartbeat_failure_event", None),
         )).reply
+        _require_wake_execution_admission(db, event, task=task)
         scores = _parse_bid_scores_with_fragments(
             db,
             team=team,
@@ -1495,6 +3858,7 @@ def _execute_bid_score(
         )
     if scores is None:
         # 纠错后仍无有效打分:全员记兜底分,审计兜底,不阻塞竞标流程
+        _require_wake_execution_admission(db, event, task=task)
         scores = {}
         record_task_event(
             db,
@@ -1505,11 +3869,20 @@ def _execute_bid_score(
             event_type="bid_score_fallback",
             payload={"wake_event_id": event.id, "round": round_, "score": BID_SCORE_FALLBACK},
         )
+    _require_wake_execution_admission(db, event, task=task)
+    worker_owner = str(event.worker_owner or "")
+    worker_generation = int(event.worker_generation or 0)
     for bid in round_bids:
         scored = scores.get(bid.agent_id) or {"score": BID_SCORE_FALLBACK, "rationale": ""}
-        bid.score = scored["score"]
-        bid.score_rationale = scored["rationale"] or None
-        db.add(bid)
+        _cas_wake_bid_score(
+            db,
+            event,
+            bid,
+            worker_owner=worker_owner,
+            worker_generation=worker_generation,
+            score=scored["score"],
+            rationale=scored["rationale"] or None,
+        )
     record_task_event(
         db,
         team_id=team.id,
@@ -1544,14 +3917,22 @@ def _execute_bid_score(
             event_type="bid_eliminated",
             payload={"round": round_, "hp": value, "wake_event_id": event.id},
         )
-    db.commit()
-    _maybe_advance_bidding(db, team, task)
+    _require_wake_execution_admission(db, event, task=task)
+    _commit_wake_write(db, event)
+    _require_wake_execution_admission(db, event, task=task)
+    _maybe_advance_bidding(db, team, task, event=event)
 
 
 def _execute_bid_award(
-    db: Session, event: TeamWakeEvent, team: Team, agent: AgentProfile, task: TeamTask
+    db: Session,
+    event: TeamWakeEvent,
+    team: Team,
+    agent: AgentProfile,
+    task: TeamTask,
+    context: LanguageContext,
 ) -> None:
     """TL 最终裁决执行体:末轮打分写回,中标者(须在存活候选中)走 task_assigned 链路。"""
+    _require_wake_execution_admission(db, event, task=task)
     candidates = _bidding_candidates(db, task)
     bids = list(
         db.exec(
@@ -1563,29 +3944,48 @@ def _execute_bid_award(
     alive = _alive_bid_candidates(candidates, bids)
     if not alive:
         # 存活候选为空(全部淘汰/无人应标):升级给人,不静默丢任务
-        apply_task_transition(
+        _require_wake_execution_admission(db, event, task=task)
+        round_ = max((bid.round for bid in bids), default=1)
+        _cas_wake_task_transition(
             db,
+            event,
             task,
-            "escalated",
+            worker_owner=str(event.worker_owner or ""),
+            worker_generation=int(event.worker_generation or 0),
+            expected_status=task.status,
+            new_status="escalated",
             actor_type="system",
             actor_id=None,
             event_type="task_escalated",
-            payload={"reason": "竞标无存活候选,无法裁决", "wake_event_id": event.id},
+            payload={
+                **team_reason_payload(
+                    "team.task.bid.failed",
+                    reason_code="no_surviving_candidates",
+                    params={"round": round_},
+                ),
+                "wake_event_id": event.id,
+            },
         )
-        db.commit()
+        _require_wake_execution_admission(db, event, task=task)
+        _commit_wake_write(db, event)
         return
     session = ChatSession(
         id=new_id("session"),
         tenant_id=team.tenant_id,
         user_id=team.owner_user_id,
         agent_id=agent.id,
-        title=f"团队竞标裁决:{task.title}",
+        title=task.title,
         status="active",
         team_id=team.id,
+        session_kind=SESSION_KIND_TEAM_BID_JUDGE,
+        agent_reply_locale=context.agent_reply_locale.value,
+        agent_reply_locale_source=context.agent_reply_locale_source.value,
     )
+    _require_wake_execution_admission(db, event, task=task)
     db.add(session)
-    db.commit()
+    _commit_wake_write(db, event)
     message = build_bid_judge_message(db, team, task, bids, alive)
+    _require_wake_execution_admission(db, event, task=task)
     reply = _coerce_team_turn_result(run_agent_turn(
         db,
         team=team,
@@ -1594,7 +3994,10 @@ def _execute_bid_award(
         wake_event_id=event.id,
         message=message,
         interaction_mode="team_tl",
+        language_context=context,
+        heartbeat_failure_event=getattr(event, "_heartbeat_failure_event", None),
     )).reply
+    _require_wake_execution_admission(db, event, task=task)
     award = _parse_bid_award_with_fragments(
         db,
         team=team,
@@ -1605,6 +4008,7 @@ def _execute_bid_award(
     )
     if award is None:
         # 未输出有效裁决块(含 winner 不在存活候选):带完整上下文补一次格式纠错 turn
+        _require_wake_execution_admission(db, event, task=task)
         record_task_event(
             db,
             team_id=team.id,
@@ -1614,7 +4018,8 @@ def _execute_bid_award(
             event_type="bid_award_unparsed",
             payload={"wake_event_id": event.id},
         )
-        db.commit()
+        _commit_wake_write(db, event)
+        _require_wake_execution_admission(db, event, task=task)
         repair_reply = _coerce_team_turn_result(run_agent_turn(
             db,
             team=team,
@@ -1624,7 +4029,10 @@ def _execute_bid_award(
             client_turn_id=f"{event.id}-repair",
             message=f"{message}\n\n{TL_BID_JUDGE_REPAIR_MESSAGE}",
             interaction_mode="team_tl",
+            language_context=context,
+            heartbeat_failure_event=getattr(event, "_heartbeat_failure_event", None),
         )).reply
+        _require_wake_execution_admission(db, event, task=task)
         award = _parse_bid_award_with_fragments(
             db,
             team=team,
@@ -1635,18 +4043,35 @@ def _execute_bid_award(
         )
     if award is None:
         # 纠错后仍无有效裁决:升级给人,不静默丢任务
-        apply_task_transition(
+        _require_wake_execution_admission(db, event, task=task)
+        round_ = max((bid.round for bid in bids), default=1)
+        _cas_wake_task_transition(
             db,
+            event,
             task,
-            "escalated",
+            worker_owner=str(event.worker_owner or ""),
+            worker_generation=int(event.worker_generation or 0),
+            expected_status=task.status,
+            new_status="escalated",
             actor_type="system",
             actor_id=None,
             event_type="task_escalated",
-            payload={"reason": "TL 竞标裁决失败", "wake_event_id": event.id},
+            payload={
+                **team_reason_payload(
+                    "team.task.bid.failed",
+                    reason_code="award_unparsed",
+                    params={"round": round_},
+                ),
+                "wake_event_id": event.id,
+            },
         )
-        db.commit()
+        _require_wake_execution_admission(db, event, task=task)
+        _commit_wake_write(db, event)
         return
     winner = award["winner_agent_id"]
+    _require_wake_execution_admission(db, event, task=task)
+    worker_owner = str(event.worker_owner or "")
+    worker_generation = int(event.worker_generation or 0)
     for bid in bids:
         # 各轮打分已在 score 模式写回,裁决分数只补未打分的 bid(通常是末轮)
         if bid.score is not None:
@@ -1654,14 +4079,23 @@ def _execute_bid_award(
         scored = award["scores"].get(bid.agent_id)
         if scored is None:
             continue
-        bid.score = scored["score"]
-        bid.score_rationale = scored["rationale"] or None
-        db.add(bid)
-    task.assignee_agent_id = winner
-    apply_task_transition(
+        _cas_wake_bid_score(
+            db,
+            event,
+            bid,
+            worker_owner=worker_owner,
+            worker_generation=worker_generation,
+            score=scored["score"],
+            rationale=scored["rationale"] or None,
+        )
+    _cas_wake_task_transition(
         db,
+        event,
         task,
-        "pending",
+        worker_owner=str(event.worker_owner or ""),
+        worker_generation=int(event.worker_generation or 0),
+        expected_status=task.status,
+        new_status="pending",
         actor_type="agent",
         actor_id=agent.id,
         event_type="task_awarded",
@@ -1670,21 +4104,235 @@ def _execute_bid_award(
             "comment": award["comment"],
             "wake_event_id": event.id,
         },
+        extra_values={"assignee_agent_id": winner},
     )
-    db.add(task)
-    db.commit()
+    _require_wake_execution_admission(db, event, task=task)
     wake = enqueue_wake_event(
         db,
         team=team,
         target_agent_id=winner,
         trigger_type="task_assigned",
         payload={"task_id": task.id},
+        parent_event=event,
     )
-    db.commit()
+    _commit_wake_write(db, event)
     start_wakeup_async(wake.id)
 
 
 # ---------- TL 对话轮次后处理(tl_chat 端点与主聊天端共用) ----------
+
+
+@dataclass(frozen=True)
+class TeamPlanPublishResult:
+    run_id: str
+    task_ids: list[str]
+
+
+def _normalized_team_activation_condition(frame: PlannedTaskFrame) -> dict:
+    if not frame.depends_on_task_ids:
+        return {}
+    condition = dict(frame.activation_condition or {})
+    condition_type = str(condition.get("type") or "all_succeeded")
+    if condition_type not in {
+        "all_succeeded",
+        "any_succeeded",
+        "all_terminal",
+        "minimum_succeeded",
+    }:
+        condition_type = "all_succeeded"
+    condition["type"] = condition_type
+    if condition_type == "minimum_succeeded":
+        try:
+            condition["minimum"] = max(
+                1,
+                min(len(frame.depends_on_task_ids), int(condition.get("minimum") or 1)),
+            )
+        except (TypeError, ValueError):
+            condition["minimum"] = 1
+    return condition
+
+
+def publish_team_planner_frames(
+    db: Session,
+    *,
+    team: Team,
+    session: ChatSession,
+    source_turn_id: str,
+    created_by_user_id: str | None,
+    frames: list[PlannedTaskFrame],
+) -> TeamPlanPublishResult | None:
+    """Persist remote planner frames as a durable TeamTask DAG and dispatch ready nodes."""
+
+    remote_frames = [
+        frame
+        for frame in frames
+        if frame.execution_target == "team_member" and frame.assignee_agent_id
+    ]
+    if not remote_frames:
+        return None
+    admission = _optional_team_admission(
+        db,
+        tenant_id=team.tenant_id,
+        correlation_id=source_turn_id,
+    )
+    source_context = _team_language_context(
+        db,
+        source_turn_id=source_turn_id,
+        legacy_agent_reply_locale=session.agent_reply_locale,
+    )
+    existing_run = db.exec(
+        select(TeamRun).where(
+            TeamRun.tl_session_id == session.id,
+            TeamRun.source_turn_id == source_turn_id,
+        )
+    ).first()
+    if existing_run is not None:
+        if admission is not None:
+            require_matching_admission_version(
+                admission,
+                existing_run.tenant_lifecycle_version,
+            )
+        existing_tasks = list(
+            db.exec(
+                select(TeamTask)
+                .where(TeamTask.team_run_id == existing_run.id)
+                .order_by(TeamTask.created_at)
+            ).all()
+        )
+        existing_context = _team_language_context(
+            db,
+            run=existing_run,
+            source_turn_id=source_turn_id,
+            snapshot=source_context,
+        )
+        _bind_team_language_context(db, existing_context, existing_run, *existing_tasks)
+        task_ids = [
+            row.id for row in existing_tasks
+        ]
+        return TeamPlanPublishResult(run_id=existing_run.id, task_ids=task_ids)
+
+    member_ids = {item.agent_id for item in list_team_members(db, team.id)}
+    leader = get_team_leader(db, team.id)
+    leader_id = leader.agent_id if leader is not None else ""
+    valid_frames = [
+        frame
+        for frame in remote_frames
+        if frame.assignee_agent_id in member_ids and frame.assignee_agent_id != leader_id
+    ]
+    if not valid_frames:
+        return None
+
+    run = TeamRun(
+        team_id=team.id,
+        tenant_id=team.tenant_id,
+        tenant_lifecycle_version=(
+            admission.lifecycle_version if admission is not None else 1
+        ),
+        tl_session_id=session.id,
+        source_turn_id=source_turn_id,
+        created_by_user_id=created_by_user_id,
+        status="planning",
+        language_context_json=source_context.model_dump(mode="json"),
+    )
+    db.add(run)
+    db.flush()
+
+    frame_id_map: dict[str, str] = {}
+    for frame in valid_frames:
+        frame_id = str(frame.task_id or "").strip()
+        task_id = frame_id or new_id("team_task")
+        if db.get(TeamTask, task_id) is not None:
+            task_id = new_id("team_task")
+        if frame_id:
+            frame_id_map[frame_id] = task_id
+
+    created: list[TeamTask] = []
+    wake_ids: list[str] = []
+    for frame in valid_frames:
+        frame_id = str(frame.task_id or "").strip()
+        task_id = frame_id_map.get(frame_id) or new_id("team_task")
+        dependencies = [
+            frame_id_map[dependency_id]
+            for dependency_id in frame.depends_on_task_ids
+            if dependency_id in frame_id_map and frame_id_map[dependency_id] != task_id
+        ]
+        title = str(frame.user_intent or "").strip()
+        if not title and frame.requirements:
+            title = str(frame.requirements[0]).strip()
+        title = title or "团队任务"
+        description = "\n".join(
+            item for item in (str(value).strip() for value in frame.requirements) if item
+        )
+        task = TeamTask(
+            id=task_id,
+            team_id=team.id,
+            tenant_id=team.tenant_id,
+            tenant_lifecycle_version=(
+                admission.lifecycle_version if admission is not None else 1
+            ),
+            team_run_id=run.id,
+            source_turn_id=source_turn_id,
+            title=title[:200],
+            description=description or None,
+            status="blocked" if dependencies else "pending",
+            created_by_user_id=created_by_user_id,
+            created_by_tl=True,
+            assignee_agent_id=frame.assignee_agent_id,
+            depends_on_task_ids_json=dependencies,
+            activation_condition_json=_normalized_team_activation_condition(frame),
+            language_context_json=source_context.model_dump(mode="json"),
+        )
+        db.add(task)
+        db.flush()
+        record_task_event(
+            db,
+            team_id=team.id,
+            task_id=task.id,
+            actor_type="agent",
+            actor_id=leader_id or None,
+            event_type="task_created",
+            payload={
+                "source": "turn_planner",
+                "team_run_id": run.id,
+                "planner_task_frame_id": frame_id or None,
+                "assignee_agent_id": frame.assignee_agent_id,
+                "depends_on_task_ids": dependencies,
+                "activation_condition": dict(task.activation_condition_json or {}),
+            },
+        )
+        if dependencies:
+            record_task_event(
+                db,
+                team_id=team.id,
+                task_id=task.id,
+                actor_type="system",
+                actor_id=None,
+                event_type="task_blocked",
+                payload={
+                    "team_run_id": run.id,
+                    "depends_on_task_ids": dependencies,
+                    "activation_condition": dict(task.activation_condition_json or {}),
+                },
+            )
+        else:
+            wake = enqueue_wake_event(
+                db,
+                team=team,
+                target_agent_id=str(frame.assignee_agent_id),
+                trigger_type="task_assigned",
+                payload={"task_id": task.id, "team_run_id": run.id},
+                language_context=source_context,
+            )
+            wake_ids.append(wake.id)
+        created.append(task)
+
+    run.status = "running"
+    run.updated_at = utc_now()
+    db.add(run)
+    db.commit()
+    for wake_id in wake_ids:
+        start_wakeup_async(wake_id)
+    return TeamPlanPublishResult(run_id=run.id, task_ids=[task.id for task in created])
 
 
 def process_tl_reply(
@@ -1709,6 +4357,48 @@ def process_tl_reply(
     tl_agent = db.get(AgentProfile, leader.agent_id)
     if tl_agent is None:
         return []
+    admission = _optional_team_admission(
+        db,
+        tenant_id=team.tenant_id,
+        correlation_id=client_turn_id or session.id,
+    )
+    source_turn_id: str | None = None
+    source_snapshot: object = None
+    if client_turn_id:
+        receipt = db.exec(
+            select(HarnessTurnRecord).where(
+                HarnessTurnRecord.tenant_id == team.tenant_id,
+                HarnessTurnRecord.session_id == session.id,
+                HarnessTurnRecord.client_turn_id == client_turn_id,
+            )
+        ).first()
+        if receipt is not None and receipt.user_message_id:
+            if admission is not None:
+                require_matching_admission_version(
+                    admission,
+                    receipt.tenant_lifecycle_version,
+                )
+            source_turn_id = receipt.user_message_id
+            source_snapshot = receipt.language_context_json
+            run = db.exec(
+                select(TeamRun).where(
+                    TeamRun.tl_session_id == session.id,
+                    TeamRun.source_turn_id == receipt.user_message_id,
+                )
+            ).first()
+            if run is not None:
+                if admission is not None:
+                    require_matching_admission_version(
+                        admission,
+                        run.tenant_lifecycle_version,
+                    )
+                return list(
+                    db.exec(
+                        select(TeamTask)
+                        .where(TeamTask.team_run_id == run.id)
+                        .order_by(TeamTask.created_at)
+                    ).all()
+                )
     assignments = parse_tl_task_assignments(reply)
     if not assignments:
         # 最终回复被 ResponseGenerator 改写时,JSON 块可能只存在于 frame 级输出
@@ -1811,6 +4501,13 @@ def process_tl_reply(
     if graph_invalid or len(normalized) != len(prepared) or has_cycle():
         return []
 
+    source_context = _team_language_context(
+        db,
+        snapshot=source_snapshot,
+        source_turn_id=source_turn_id,
+        legacy_agent_reply_locale=session.agent_reply_locale,
+    )
+
     created: list[TeamTask] = []
     wake_ids: list[str] = []
     bidding_tasks: list[TeamTask] = []
@@ -1820,6 +4517,10 @@ def process_tl_reply(
             id=task_id,
             team_id=team.id,
             tenant_id=team.tenant_id,
+            tenant_lifecycle_version=(
+                admission.lifecycle_version if admission is not None else 1
+            ),
+            source_turn_id=source_turn_id,
             title=item["title"],
             description=item.get("description"),
             status="blocked" if dependencies else "pending",
@@ -1828,6 +4529,7 @@ def process_tl_reply(
             assignee_agent_id=assignee or None,
             depends_on_task_ids_json=dependencies,
             activation_condition_json=condition if dependencies else {},
+            language_context_json=source_context.model_dump(mode="json"),
         )
         db.add(task)
         db.flush()
@@ -1863,6 +4565,7 @@ def process_tl_reply(
                 target_agent_id=assignee,
                 trigger_type="task_assigned",
                 payload={"task_id": task.id},
+                language_context=source_context,
             )
             wake_ids.append(wake.id)
         else:

@@ -1,14 +1,16 @@
 import hashlib
 import json
+import re
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from pathlib import Path
 
 from sqlalchemy import Engine, inspect, text
-from sqlmodel import Session, SQLModel, create_engine
+from sqlmodel import Session, SQLModel, create_engine, select
 
 from app.config import get_settings
 from app.db.database_path import normalize_database_url
+from app.db.models import new_id
 
 
 def _normalize_database_url(url: str) -> str:
@@ -25,6 +27,7 @@ engine: Engine = create_engine(database_url, echo=False, connect_args=connect_ar
 _DEFAULT_MODEL_OUTPUT_LIMIT_MIGRATION_ID = "20260712_default_model_output_tokens_8192"
 _LEGACY_DEFAULT_MODEL_OUTPUT_TOKENS = 2048
 _MODEL_API_PROTOCOLS_MIGRATION_ID = "20260722_model_api_protocols_v1"
+_MODEL_AUTH_MODE_MIGRATION_ID = "20260828_model_auth_mode_v1"
 _DEFAULT_MODEL_OUTPUT_TOKENS = 8192
 _MODEL_API_PROTOCOL_COLUMNS = {
     "extra_body_json",
@@ -49,6 +52,34 @@ _CHANNEL_SCOPE_REBUILD_MIGRATION_ID = "20260719_channel_scope_rebuild"
 _CHANNEL_BINDINGS_MULTI_MIGRATION_ID = "20260721_channel_bindings_multi"
 _CHANNEL_ACCOUNT_KEY_MIGRATION_ID = "20260723_channel_account_key_v1"
 _FEISHU_CHANNEL_SCHEMA_MIGRATION_ID = "20260724_feishu_channel_schema_v1"
+_I18N_LANGUAGE_SCHEMA_MIGRATION_ID = "20260830_i18n_language_context_v1"
+_WECHAT_KF_ACCOUNTS_MIGRATION_ID = "20260831_wechat_kf_accounts_v1"
+_WECHAT_KF_ACCOUNT_OPERATIONS_MIGRATION_ID = (
+    "20260831_wechat_kf_account_operations_v1"
+)
+_SYSTEM_TENANT_CONTROL_MIGRATION_ID = "20260831_system_tenant_control_v1"
+_SYSTEM_TENANT_DURABLE_TABLES = (
+    "api_jobs",
+    "webhook_deliveries",
+    "channel_inbound_events",
+    "channel_deliveries",
+    "scheduled_task_runs",
+    "harness_task_frames",
+    "harness_runs",
+    "harness_turns",
+    "harness_invocations",
+    "team_runs",
+    "team_tasks",
+    "team_wake_events",
+    "knowledge_ingest_jobs",
+)
+_SYSTEM_TENANT_TERMINAL_EVIDENCE_TABLES = (
+    "api_jobs",
+    "webhook_deliveries",
+)
+_SYSTEM_TENANT_SLUG_PATTERN = re.compile(
+    r"^[a-z0-9](?:[a-z0-9-]{1,61}[a-z0-9])$"
+)
 _CAPABILITY_SCOPE_TABLES = (
     "general_skills",
     "tools",
@@ -56,6 +87,29 @@ _CAPABILITY_SCOPE_TABLES = (
     "knowledge_bases",
     "knowledge_base_versions",
 )
+_I18N_LANGUAGE_CONTEXT_TABLES = (
+    "api_jobs",
+    "a2a_task_runs",
+    "channel_inbound_events",
+    "channel_deliveries",
+    "human_handoff_requests",
+    "scheduled_tasks",
+    "scheduled_task_runs",
+    "harness_task_frames",
+    "harness_runs",
+    "harness_turns",
+    "harness_invocations",
+    "team_runs",
+    "team_tasks",
+    "team_wake_events",
+)
+_I18N_LANGUAGE_DEFAULT_SNAPSHOT = {
+    "version": 1,
+    "ui_locale": "zh-CN",
+    "agent_reply_locale": "zh-CN",
+    "ui_locale_source": "legacy_default",
+    "agent_reply_locale_source": "legacy_default",
+}
 
 
 def init_db() -> None:
@@ -64,6 +118,47 @@ def init_db() -> None:
     _configure_sqlite_runtime()
     SQLModel.metadata.create_all(engine)
     _migrate_sqlite_skill_schema()
+    _purge_orphaned_chat_sessions()
+
+
+def _purge_orphaned_chat_sessions() -> None:
+    """清理孤儿会话:团队/员工已被删除但会话残留(级联清理上线前的历史数据)。"""
+    from app.db.models import AgentProfile, ChatSession, Team
+    from app.session.cleanup import (
+        purge_chat_session_records,
+        remove_chat_session_workspace,
+    )
+
+    with Session(engine) as db:
+        referenced = db.exec(
+            select(ChatSession).where(
+                ChatSession.team_id.is_not(None) | ChatSession.agent_id.is_not(None)
+            )
+        ).all()
+        if not referenced:
+            return
+        team_ids = {team_id for team_id in db.exec(select(Team.id)).all()}
+        agent_ids = {agent_id for agent_id in db.exec(select(AgentProfile.id)).all()}
+        orphaned = [
+            session
+            for session in referenced
+            if (session.team_id and session.team_id not in team_ids)
+            or (session.agent_id and session.agent_id not in agent_ids)
+        ]
+        if not orphaned:
+            return
+        workspace_cleanups = []
+        for session in orphaned:
+            cleanup = purge_chat_session_records(db, session)
+            workspace_cleanups.append((session.tenant_id, session.id, cleanup.workspace_roots))
+        db.commit()
+        for tenant_id, session_id, workspace_roots in workspace_cleanups:
+            remove_chat_session_workspace(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                db=db,
+                workspace_roots=workspace_roots,
+            )
 
 
 def _configure_sqlite_runtime() -> None:
@@ -75,6 +170,7 @@ def _configure_sqlite_runtime() -> None:
 
 
 def _migrate_sqlite_skill_schema() -> None:
+    """为既有 SQLite 安装补齐应用运行所需的兼容列。"""
     if not database_url.startswith("sqlite"):
         return
 
@@ -88,6 +184,9 @@ def _migrate_sqlite_skill_schema() -> None:
     legacy_id_column = f"{legacy_key}_id"
     legacy_id_prefix = f"{legacy_key}_"
     with _sqlite_immediate_connection() as conn:
+        # Workflow: add and backfill locale metadata before other repair steps so one
+        # transaction can roll back the complete startup migration on any failure.
+        _migrate_i18n_language_schema(conn, tables)
         _migrate_model_api_protocols(conn, tables)
         _migrate_default_model_output_limit(conn, tables)
         _migrate_channel_binding_agents_backfill(conn, tables)
@@ -97,8 +196,18 @@ def _migrate_sqlite_skill_schema() -> None:
         _migrate_feishu_channel_schema(conn, tables)
         _migrate_channel_inbound_run_schema(conn, tables)
         _migrate_channel_bind_code_constraints(conn, tables)
+        _migrate_wechat_kf_accounts(conn, tables)
+        _migrate_wechat_kf_account_operations(conn, tables)
         _migrate_capability_scope_schema(conn, inspector, tables)
         _migrate_harness_v2_schema(conn, inspector, tables)
+
+        # 旧版 API 密钥只有不可逆摘要；补齐可恢复副本的加密列，但不回填历史明文。
+        if "api_credentials" in tables:
+            credential_columns = {
+                column["name"] for column in inspector.get_columns("api_credentials")
+            }
+            if "encrypted_key" not in credential_columns:
+                conn.execute(text("ALTER TABLE api_credentials ADD COLUMN encrypted_key VARCHAR"))
 
         if "api_jobs" in tables:
             job_columns = {column["name"] for column in inspector.get_columns("api_jobs")}
@@ -173,6 +282,8 @@ def _migrate_sqlite_skill_schema() -> None:
                 conn.execute(text("UPDATE sessions SET context_state_json = '{}'"))
             if "channel" not in session_columns:
                 conn.execute(text("ALTER TABLE sessions ADD COLUMN channel VARCHAR"))
+            if "session_kind" not in session_columns:
+                conn.execute(text("ALTER TABLE sessions ADD COLUMN session_kind VARCHAR"))
             if "external_conv_id" not in session_columns:
                 conn.execute(text("ALTER TABLE sessions ADD COLUMN external_conv_id VARCHAR"))
             if "channel_target_json" not in session_columns:
@@ -183,6 +294,59 @@ def _migrate_sqlite_skill_schema() -> None:
                 conn.execute(text("ALTER TABLE sessions ADD COLUMN channel_account_key VARCHAR"))
             if "team_id" not in session_columns:
                 conn.execute(text("ALTER TABLE sessions ADD COLUMN team_id VARCHAR"))
+            # Exact legacy projections are backfilled into a machine field without rewriting
+            # raw business titles. Runtime readers retain the same bounded fallback until all
+            # supported databases have completed this additive startup migration.
+            conn.execute(
+                text(
+                    """
+                    UPDATE sessions
+                    SET session_kind = CASE
+                        WHEN team_id IS NOT NULL AND title LIKE '团队 %TL 对话'
+                            THEN 'team_tl'
+                        WHEN team_id IS NOT NULL AND title LIKE '团队任务验收:%'
+                            THEN 'team_tl_review'
+                        WHEN team_id IS NOT NULL AND title LIKE '团队任务:%'
+                            THEN 'team_member_task'
+                        WHEN team_id IS NOT NULL AND title LIKE '团队竞标打分:%'
+                            THEN 'team_bid_score'
+                        WHEN team_id IS NOT NULL AND title LIKE '团队竞标裁决:%'
+                            THEN 'team_bid_judge'
+                        WHEN team_id IS NOT NULL AND title LIKE '团队竞标:%'
+                            THEN 'team_member_bid'
+                        WHEN team_id IS NOT NULL AND title LIKE '团队结果汇总:%'
+                            THEN 'team_synthesis'
+                        WHEN channel = 'skill_test'
+                            THEN 'skill_test'
+                        ELSE session_kind
+                    END
+                    WHERE session_kind IS NULL
+                    """
+                )
+            )
+            if (
+                "scheduled_task_runs" in tables
+                and "session_id" in _sqlite_table_columns(conn, "scheduled_task_runs")
+            ):
+                conn.execute(
+                    text(
+                        """
+                        UPDATE sessions
+                        SET session_kind = 'scheduled_task'
+                        WHERE session_kind IS NULL
+                          AND id IN (
+                              SELECT session_id FROM scheduled_task_runs
+                              WHERE session_id IS NOT NULL
+                          )
+                        """
+                    )
+                )
+            conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_sessions_session_kind "
+                    "ON sessions(session_kind)"
+                )
+            )
             # SQLite 唯一索引中 NULL 互不相等，web 会话（channel 为空）不受约束；
             # 含 channel_binding_id 以隔离同企业多 Bot(老三列索引先 DROP 再按新四列重建)
             session_index_columns = {
@@ -228,6 +392,8 @@ def _migrate_sqlite_skill_schema() -> None:
                 conn.execute(text("ALTER TABLE channel_bindings ADD COLUMN last_connected_at DATETIME"))
             if "team_id" not in binding_columns:
                 conn.execute(text("ALTER TABLE channel_bindings ADD COLUMN team_id VARCHAR"))
+            if "name" not in binding_columns:
+                conn.execute(text("ALTER TABLE channel_bindings ADD COLUMN name VARCHAR"))
 
         if "channel_deliveries" in tables:
             delivery_columns = {column["name"] for column in inspector.get_columns("channel_deliveries")}
@@ -330,6 +496,40 @@ def _migrate_sqlite_skill_schema() -> None:
                         "WHERE negotiated_capabilities_json IS NULL"
                     )
                 )
+            if "auth_mode" not in mcp_server_columns:
+                conn.execute(
+                    text(
+                        "ALTER TABLE mcp_servers ADD COLUMN auth_mode "
+                        "VARCHAR NOT NULL DEFAULT 'none'"
+                    )
+                )
+            if "oauth_client_id" not in mcp_server_columns:
+                conn.execute(text("ALTER TABLE mcp_servers ADD COLUMN oauth_client_id VARCHAR"))
+            if "oauth_client_metadata_url" not in mcp_server_columns:
+                conn.execute(
+                    text(
+                        "ALTER TABLE mcp_servers ADD COLUMN "
+                        "oauth_client_metadata_url VARCHAR"
+                    )
+                )
+            if "oauth_redirect_uri" not in mcp_server_columns:
+                conn.execute(
+                    text("ALTER TABLE mcp_servers ADD COLUMN oauth_redirect_uri VARCHAR")
+                )
+
+        if "mcp_user_oauth_grants" in tables:
+            grant_columns = {
+                column["name"]
+                for column in inspector.get_columns("mcp_user_oauth_grants")
+            }
+            if "config_fingerprint" not in grant_columns:
+                conn.execute(
+                    text(
+                        "ALTER TABLE mcp_user_oauth_grants ADD COLUMN "
+                        "config_fingerprint VARCHAR NOT NULL DEFAULT ''"
+                    )
+                )
+
 
         if "agent_profiles" in tables:
             agent_columns = {
@@ -354,6 +554,62 @@ def _migrate_sqlite_skill_schema() -> None:
                     text(
                         "ALTER TABLE ui_configs ADD COLUMN agent_loop_max_actions "
                         "INTEGER NOT NULL DEFAULT 32"
+                    )
+                )
+            if "context_token_budget" not in ui_columns:
+                conn.execute(
+                    text(
+                        "ALTER TABLE ui_configs ADD COLUMN context_token_budget "
+                        "INTEGER NOT NULL DEFAULT 32000"
+                    )
+                )
+            if "context_compaction_trigger_ratio" not in ui_columns:
+                conn.execute(
+                    text(
+                        "ALTER TABLE ui_configs ADD COLUMN context_compaction_trigger_ratio "
+                        "FLOAT NOT NULL DEFAULT 0.70"
+                    )
+                )
+            if "context_recent_round_limit" not in ui_columns:
+                conn.execute(
+                    text(
+                        "ALTER TABLE ui_configs ADD COLUMN context_recent_round_limit "
+                        "INTEGER NOT NULL DEFAULT 6"
+                    )
+                )
+            if "context_long_summary_token_budget" not in ui_columns:
+                conn.execute(
+                    text(
+                        "ALTER TABLE ui_configs ADD COLUMN context_long_summary_token_budget "
+                        "INTEGER NOT NULL DEFAULT 4000"
+                    )
+                )
+            if "context_medium_summary_token_budget" not in ui_columns:
+                conn.execute(
+                    text(
+                        "ALTER TABLE ui_configs ADD COLUMN context_medium_summary_token_budget "
+                        "INTEGER NOT NULL DEFAULT 4000"
+                    )
+                )
+            if "context_allowed_roles" not in ui_columns:
+                conn.execute(
+                    text(
+                        "ALTER TABLE ui_configs ADD COLUMN context_allowed_roles "
+                        "JSON NOT NULL DEFAULT '[\"user\", \"assistant\"]'"
+                    )
+                )
+            if "context_long_summary_prefix" not in ui_columns:
+                conn.execute(
+                    text(
+                        "ALTER TABLE ui_configs ADD COLUMN context_long_summary_prefix "
+                        "VARCHAR NOT NULL DEFAULT '历史的信息可以被总结为：'"
+                    )
+                )
+            if "context_medium_summary_prefix" not in ui_columns:
+                conn.execute(
+                    text(
+                        "ALTER TABLE ui_configs ADD COLUMN context_medium_summary_prefix "
+                        "VARCHAR NOT NULL DEFAULT '近期的历史信息总结为：'"
                     )
                 )
             if "sandbox_enabled" not in ui_columns:
@@ -386,6 +642,19 @@ def _migrate_sqlite_skill_schema() -> None:
             team_task_columns = {
                 column["name"] for column in inspector.get_columns("team_tasks")
             }
+            if "team_run_id" not in team_task_columns:
+                conn.execute(text("ALTER TABLE team_tasks ADD COLUMN team_run_id VARCHAR"))
+                conn.execute(
+                    text("CREATE INDEX IF NOT EXISTS ix_team_tasks_team_run_id ON team_tasks (team_run_id)")
+                )
+            if "source_turn_id" not in team_task_columns:
+                conn.execute(text("ALTER TABLE team_tasks ADD COLUMN source_turn_id VARCHAR"))
+                conn.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS ix_team_tasks_source_turn_id "
+                        "ON team_tasks (source_turn_id)"
+                    )
+                )
             if "depends_on_task_ids_json" not in team_task_columns:
                 conn.execute(text("ALTER TABLE team_tasks ADD COLUMN depends_on_task_ids_json JSON"))
                 conn.execute(
@@ -513,6 +782,11 @@ def _migrate_sqlite_skill_schema() -> None:
             _seed_agent_branch_state(conn, inspector, tables)
             _sync_explicit_skill_tool_bindings(conn, tables)
 
+        # Keep tenant-control repair in this same BEGIN IMMEDIATE batch. It deliberately
+        # runs after older additive repairs so their live columns are available, while a
+        # tenant-control failure still rolls the entire startup migration back.
+        _migrate_system_tenant_control(conn)
+
 
 @contextmanager
 def _sqlite_immediate_connection():
@@ -526,6 +800,1117 @@ def _sqlite_immediate_connection():
         raise
     finally:
         conn.close()
+
+
+def _sqlite_table_columns(conn, table_name: str) -> set[str]:
+    """Read live SQLite columns so interrupted migrations can be repaired safely."""
+    return {
+        str(row[1])
+        for row in conn.execute(text(f"PRAGMA table_info({table_name})")).all()
+    }
+
+
+def _sqlite_table_names(conn) -> set[str]:
+    """Read live table names without relying on a pre-transaction Inspector cache."""
+    return {
+        str(row[0])
+        for row in conn.execute(
+            text("SELECT name FROM sqlite_master WHERE type = 'table'")
+        ).all()
+    }
+
+
+def _sqlite_index_shape(conn, table_name: str, index_name: str) -> tuple[bool, tuple[str, ...]] | None:
+    """Return one live SQLite index's uniqueness and ordered columns."""
+    for row in conn.execute(text(f"PRAGMA index_list({table_name})")).mappings().all():
+        if str(row["name"]) != index_name:
+            continue
+        columns = tuple(
+            str(column["name"])
+            for column in conn.execute(
+                text(f"PRAGMA index_info({index_name})")
+            ).mappings().all()
+        )
+        return bool(row["unique"]), columns
+    return None
+
+
+def _ensure_sqlite_index(
+    conn,
+    *,
+    table_name: str,
+    index_name: str,
+    columns: tuple[str, ...],
+    unique: bool = False,
+) -> None:
+    """Create or repair a named application index from live SQLite metadata."""
+    current = _sqlite_index_shape(conn, table_name, index_name)
+    expected = (unique, columns)
+    if current == expected:
+        return
+    if current is not None:
+        conn.execute(text(f"DROP INDEX {index_name}"))
+    qualifier = "UNIQUE " if unique else ""
+    column_sql = ", ".join(columns)
+    conn.execute(
+        text(
+            f"CREATE {qualifier}INDEX {index_name} "
+            f"ON {table_name} ({column_sql})"
+        )
+    )
+
+
+def _normalize_legacy_tenant_slug(value: object) -> str:
+    """Normalize a legacy identity component into a bounded slug candidate."""
+    normalized = re.sub(r"[^a-z0-9]+", "-", str(value or "").lower()).strip("-")
+    normalized = normalized[:63].rstrip("-")
+    return normalized if _SYSTEM_TENANT_SLUG_PATTERN.fullmatch(normalized) else ""
+
+
+def _assign_legacy_tenant_slugs(conn) -> None:
+    """Preserve valid slugs and deterministically repair every absent/invalid collision."""
+    rows = conn.execute(
+        text("SELECT id, name, slug FROM tenants ORDER BY id")
+    ).mappings().all()
+
+    # Reserve each already-valid slug for its lexicographically first stable tenant ID.
+    valid_owners: dict[str, str] = {}
+    for row in rows:
+        slug = str(row.get("slug") or "")
+        tenant_id = str(row["id"])
+        if _SYSTEM_TENANT_SLUG_PATTERN.fullmatch(slug):
+            valid_owners.setdefault(slug, tenant_id)
+    used = set(valid_owners)
+
+    for row in rows:
+        tenant_id = str(row["id"])
+        existing = str(row.get("slug") or "")
+        if valid_owners.get(existing) == tenant_id:
+            continue
+
+        if tenant_id == "tenant_demo" and "demo" not in used:
+            candidate = "demo"
+        else:
+            candidate = _normalize_legacy_tenant_slug(tenant_id)
+            if not candidate:
+                candidate = _normalize_legacy_tenant_slug(row.get("name"))
+            if not candidate:
+                candidate = "tenant"
+
+        if candidate in used:
+            nonce = 0
+            while True:
+                stable_identity = tenant_id if nonce == 0 else f"{tenant_id}:{nonce}"
+                suffix = hashlib.sha256(stable_identity.encode("utf-8")).hexdigest()[:12]
+                prefix = candidate[: 63 - len(suffix) - 1].rstrip("-") or "tenant"
+                suffixed = f"{prefix}-{suffix}"
+                if suffixed not in used:
+                    candidate = suffixed
+                    break
+                nonce += 1
+
+        if not _SYSTEM_TENANT_SLUG_PATTERN.fullmatch(candidate):
+            raise RuntimeError(f"Could not derive a valid slug for tenant {tenant_id!r}")
+        conn.execute(
+            text("UPDATE tenants SET slug = :slug WHERE id = :tenant_id"),
+            {"slug": candidate, "tenant_id": tenant_id},
+        )
+        used.add(candidate)
+
+
+def _create_system_control_tables(conn) -> None:
+    """Create the installation-scoped identity and safe append-only audit tables."""
+    conn.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS system_admins (
+                id VARCHAR NOT NULL PRIMARY KEY,
+                username VARCHAR(128) NOT NULL,
+                display_name VARCHAR(255),
+                password_hash VARCHAR NOT NULL,
+                status VARCHAR NOT NULL,
+                auth_version INTEGER NOT NULL,
+                must_change_password BOOLEAN NOT NULL DEFAULT 0,
+                password_changed_at DATETIME,
+                last_login_at DATETIME,
+                created_at DATETIME NOT NULL,
+                updated_at DATETIME NOT NULL,
+                CONSTRAINT ck_system_admins_status
+                    CHECK (status IN ('active', 'disabled')),
+                CONSTRAINT ck_system_admins_auth_version_positive
+                    CHECK (auth_version > 0)
+            )
+            """
+        )
+    )
+    conn.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS system_control_audits (
+                id VARCHAR NOT NULL PRIMARY KEY,
+                actor_system_admin_id VARCHAR,
+                actor_label VARCHAR(255),
+                action VARCHAR(64) NOT NULL,
+                target_type VARCHAR(64) NOT NULL,
+                target_id VARCHAR,
+                result VARCHAR(16) NOT NULL,
+                reason_code VARCHAR(128) NOT NULL,
+                operator_reason VARCHAR(500),
+                status_before VARCHAR(16),
+                status_after VARCHAR(16),
+                lifecycle_version INTEGER,
+                request_id VARCHAR,
+                trace_id VARCHAR,
+                safe_params_json JSON,
+                created_at DATETIME NOT NULL,
+                CONSTRAINT ck_system_control_audits_result
+                    CHECK (result IN ('succeeded', 'rejected', 'failed'))
+            )
+            """
+        )
+    )
+    conn.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS installation_password_policies (
+                scope VARCHAR(32) NOT NULL PRIMARY KEY,
+                min_length INTEGER NOT NULL,
+                max_length INTEGER NOT NULL,
+                complexity_enabled BOOLEAN NOT NULL,
+                require_uppercase BOOLEAN NOT NULL,
+                require_lowercase BOOLEAN NOT NULL,
+                require_digit BOOLEAN NOT NULL,
+                require_special BOOLEAN NOT NULL,
+                updated_at DATETIME NOT NULL,
+                CHECK (scope IN ('system', 'tenant_default')),
+                CHECK (min_length BETWEEN 8 AND 20),
+                CHECK (max_length BETWEEN 8 AND 20),
+                CHECK (min_length <= max_length)
+            )
+            """
+        )
+    )
+    conn.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS tenant_password_policies (
+                tenant_id VARCHAR NOT NULL PRIMARY KEY,
+                mode VARCHAR(16) NOT NULL,
+                min_length INTEGER,
+                max_length INTEGER,
+                complexity_enabled BOOLEAN,
+                require_uppercase BOOLEAN,
+                require_lowercase BOOLEAN,
+                require_digit BOOLEAN,
+                require_special BOOLEAN,
+                updated_at DATETIME NOT NULL,
+                CHECK (mode IN ('inherit', 'custom'))
+            )
+            """
+        )
+    )
+
+    indexes = (
+        ("system_admins", "ix_system_admins_username", ("username",), True),
+        ("system_admins", "ix_system_admins_status", ("status",), False),
+        (
+            "system_control_audits",
+            "ix_system_control_audits_actor_system_admin_id",
+            ("actor_system_admin_id",),
+            False,
+        ),
+        ("system_control_audits", "ix_system_control_audits_action", ("action",), False),
+        ("system_control_audits", "ix_system_control_audits_target_id", ("target_id",), False),
+        ("system_control_audits", "ix_system_control_audits_result", ("result",), False),
+        ("system_control_audits", "ix_system_control_audits_request_id", ("request_id",), False),
+        ("system_control_audits", "ix_system_control_audits_trace_id", ("trace_id",), False),
+        ("system_control_audits", "ix_system_control_audits_created_at", ("created_at",), False),
+    )
+    for table_name, index_name, columns, unique in indexes:
+        _ensure_sqlite_index(
+            conn,
+            table_name=table_name,
+            index_name=index_name,
+            columns=columns,
+            unique=unique,
+        )
+
+
+def _migrate_tenant_control_columns(conn, tables: set[str]) -> None:
+    """Add and backfill Tenant/User control fields without rewriting business identities."""
+    if "tenants" in tables:
+        columns = _sqlite_table_columns(conn, "tenants")
+        tenant_columns = (
+            (
+                "slug",
+                (
+                    "ALTER TABLE tenants ADD COLUMN slug VARCHAR(63) "
+                    "CHECK (slug IS NULL OR (length(slug) BETWEEN 3 AND 63 "
+                    "AND slug GLOB '[a-z0-9]*' AND slug GLOB '*[a-z0-9]' "
+                    "AND slug NOT GLOB '*[^a-z0-9-]*'))"
+                ),
+            ),
+            (
+                "status",
+                (
+                    "ALTER TABLE tenants ADD COLUMN status VARCHAR NOT NULL DEFAULT 'active' "
+                    "CHECK (status IN ('active', 'suspended'))"
+                ),
+            ),
+            (
+                "lifecycle_version",
+                (
+                    "ALTER TABLE tenants ADD COLUMN lifecycle_version INTEGER NOT NULL DEFAULT 1 "
+                    "CHECK (lifecycle_version > 0)"
+                ),
+            ),
+            (
+                "initial_admin_user_id",
+                "ALTER TABLE tenants ADD COLUMN initial_admin_user_id VARCHAR",
+            ),
+            ("suspended_at", "ALTER TABLE tenants ADD COLUMN suspended_at DATETIME"),
+            (
+                "suspension_reason",
+                "ALTER TABLE tenants ADD COLUMN suspension_reason VARCHAR(500)",
+            ),
+            ("reactivated_at", "ALTER TABLE tenants ADD COLUMN reactivated_at DATETIME"),
+            ("updated_at", "ALTER TABLE tenants ADD COLUMN updated_at DATETIME"),
+        )
+        for column_name, ddl in tenant_columns:
+            if column_name not in columns:
+                conn.execute(text(ddl))
+                columns.add(column_name)
+
+        conn.execute(
+            text("UPDATE tenants SET status = 'active' WHERE status IS NULL OR TRIM(status) = ''")
+        )
+        conn.execute(
+            text("UPDATE tenants SET lifecycle_version = 1 WHERE lifecycle_version IS NULL")
+        )
+        if "created_at" in columns:
+            conn.execute(
+                text(
+                    "UPDATE tenants SET updated_at = COALESCE(created_at, CURRENT_TIMESTAMP) "
+                    "WHERE updated_at IS NULL"
+                )
+            )
+        else:
+            conn.execute(
+                text("UPDATE tenants SET updated_at = CURRENT_TIMESTAMP WHERE updated_at IS NULL")
+            )
+        _assign_legacy_tenant_slugs(conn)
+
+        _ensure_sqlite_index(
+            conn,
+            table_name="tenants",
+            index_name="ix_tenants_slug",
+            columns=("slug",),
+            unique=True,
+        )
+        _ensure_sqlite_index(
+            conn,
+            table_name="tenants",
+            index_name="ix_tenants_status",
+            columns=("status",),
+        )
+        _ensure_sqlite_index(
+            conn,
+            table_name="tenants",
+            index_name="ix_tenants_initial_admin_user_id",
+            columns=("initial_admin_user_id",),
+        )
+
+    if "users" in tables:
+        columns = _sqlite_table_columns(conn, "users")
+        user_columns = (
+            (
+                "auth_version",
+                (
+                    "ALTER TABLE users ADD COLUMN auth_version INTEGER NOT NULL DEFAULT 1 "
+                    "CHECK (auth_version > 0)"
+                ),
+            ),
+            (
+                "must_change_password",
+                "ALTER TABLE users ADD COLUMN must_change_password BOOLEAN NOT NULL DEFAULT 0",
+            ),
+            (
+                "password_changed_at",
+                "ALTER TABLE users ADD COLUMN password_changed_at DATETIME",
+            ),
+        )
+        for column_name, ddl in user_columns:
+            if column_name not in columns:
+                conn.execute(text(ddl))
+                columns.add(column_name)
+        conn.execute(
+            text("UPDATE users SET auth_version = 1 WHERE auth_version IS NULL")
+        )
+        conn.execute(
+            text(
+                "UPDATE users SET must_change_password = 0 "
+                "WHERE must_change_password IS NULL"
+            )
+        )
+
+    if "system_admins" in tables:
+        columns = _sqlite_table_columns(conn, "system_admins")
+        system_admin_columns = (
+            (
+                "must_change_password",
+                "ALTER TABLE system_admins ADD COLUMN must_change_password "
+                "BOOLEAN NOT NULL DEFAULT 0",
+            ),
+            (
+                "password_changed_at",
+                "ALTER TABLE system_admins ADD COLUMN password_changed_at DATETIME",
+            ),
+        )
+        for column_name, ddl in system_admin_columns:
+            if column_name not in columns:
+                conn.execute(text(ddl))
+                columns.add(column_name)
+        conn.execute(
+            text(
+                "UPDATE system_admins SET must_change_password = 0 "
+                "WHERE must_change_password IS NULL"
+            )
+        )
+    if "tenants" not in tables or "users" not in tables:
+        return
+    tenant_columns = _sqlite_table_columns(conn, "tenants")
+    user_columns = _sqlite_table_columns(conn, "users")
+    required_user_columns = {"id", "tenant_id", "role"}
+    if not required_user_columns <= user_columns:
+        missing = sorted(required_user_columns - user_columns)
+        raise RuntimeError(f"Cannot resolve tenant administrators; users missing {missing}")
+
+    active_predicate = "AND u.active = 1" if "active" in user_columns else ""
+    if "created_at" in user_columns:
+        admin_order = "u.created_at ASC, u.id ASC"
+    else:
+        admin_order = "u.id ASC"
+    conn.execute(
+        text(
+            "UPDATE tenants SET initial_admin_user_id = ("
+            "SELECT u.id FROM users AS u "
+            "WHERE u.tenant_id = tenants.id AND u.role = 'admin' "
+            f"{active_predicate} ORDER BY {admin_order} LIMIT 1) "
+            "WHERE initial_admin_user_id IS NULL"
+        )
+    )
+
+
+def _migrate_durable_tenant_versions(conn, tables: set[str]) -> None:
+    """Fence every present tenant-owned durable row with a resolvable tenant version."""
+    # Focused legacy schema tests and installations may contain a namesake work table
+    # without the tenant domain at all. There is no owner to resolve in that database;
+    # live-schema repair will run again if/when a tenants table is introduced.
+    if "tenants" not in tables:
+        return
+    for table_name in _SYSTEM_TENANT_DURABLE_TABLES:
+        if table_name not in tables:
+            continue
+        columns = _sqlite_table_columns(conn, table_name)
+        if "tenant_id" not in columns:
+            raise RuntimeError(f"Tenant-owned table {table_name} has no tenant_id")
+
+        unresolved = conn.execute(
+            text(
+                f"SELECT COUNT(*) FROM {table_name} AS work "
+                "LEFT JOIN tenants ON tenants.id = work.tenant_id "
+                "WHERE work.tenant_id IS NULL OR tenants.id IS NULL"
+            )
+        ).scalar_one()
+        if int(unresolved):
+            raise RuntimeError(
+                f"Tenant-owned table {table_name} has {unresolved} unresolved tenant rows"
+            )
+
+        added = "tenant_lifecycle_version" not in columns
+        if added:
+            conn.execute(
+                text(
+                    f"ALTER TABLE {table_name} ADD COLUMN tenant_lifecycle_version "
+                    "INTEGER NOT NULL DEFAULT 1 CHECK (tenant_lifecycle_version > 0)"
+                )
+            )
+        update_predicate = "1 = 1" if added else "tenant_lifecycle_version IS NULL"
+        conn.execute(
+            text(
+                f"UPDATE {table_name} SET tenant_lifecycle_version = ("
+                "SELECT tenants.lifecycle_version FROM tenants "
+                f"WHERE tenants.id = {table_name}.tenant_id) "
+                f"WHERE {update_predicate}"
+            )
+        )
+        _ensure_sqlite_index(
+            conn,
+            table_name=table_name,
+            index_name=f"ix_{table_name}_tenant_lifecycle_version",
+            columns=("tenant_lifecycle_version",),
+        )
+
+        incomplete = conn.execute(
+            text(
+                f"SELECT COUNT(*) FROM {table_name} "
+                "WHERE tenant_lifecycle_version IS NULL "
+                "OR tenant_lifecycle_version <= 0"
+            )
+        ).scalar_one()
+        if int(incomplete):
+            raise RuntimeError(
+                f"Tenant-owned table {table_name} has incomplete lifecycle fencing"
+            )
+
+
+def _migrate_knowledge_ingest_claim_schema(conn, tables: set[str]) -> None:
+    """Add and repair the durable owner/generation lease for knowledge ingestion workers."""
+    table_name = "knowledge_ingest_jobs"
+    if table_name not in tables or "tenants" not in tables:
+        return
+
+    columns = _sqlite_table_columns(conn, table_name)
+    required = {
+        "tenant_lifecycle_version",
+        "execution_owner",
+        "execution_generation",
+        "lease_expires_at",
+    }
+    lifecycle_added = "tenant_lifecycle_version" not in columns
+    if lifecycle_added:
+        conn.execute(
+            text(
+                f"ALTER TABLE {table_name} ADD COLUMN tenant_lifecycle_version "
+                "INTEGER NOT NULL DEFAULT 1 CHECK (tenant_lifecycle_version > 0)"
+            )
+        )
+        columns.add("tenant_lifecycle_version")
+    if "execution_owner" not in columns:
+        conn.execute(
+            text(f"ALTER TABLE {table_name} ADD COLUMN execution_owner VARCHAR")
+        )
+        columns.add("execution_owner")
+    if "execution_generation" not in columns:
+        conn.execute(
+            text(
+                f"ALTER TABLE {table_name} ADD COLUMN execution_generation "
+                "INTEGER NOT NULL DEFAULT 0"
+            )
+        )
+        columns.add("execution_generation")
+    if "lease_expires_at" not in columns:
+        conn.execute(
+            text(f"ALTER TABLE {table_name} ADD COLUMN lease_expires_at DATETIME")
+        )
+        columns.add("lease_expires_at")
+
+    unresolved = conn.execute(
+        text(
+            f"SELECT COUNT(*) FROM {table_name} AS work "
+            "LEFT JOIN tenants ON tenants.id = work.tenant_id "
+            "WHERE work.tenant_id IS NULL OR tenants.id IS NULL"
+        )
+    ).scalar_one()
+    if int(unresolved):
+        raise RuntimeError(
+            f"Tenant-owned table {table_name} has {unresolved} unresolved tenant rows"
+        )
+    lifecycle_predicate = (
+        "1 = 1"
+        if lifecycle_added
+        else (
+            f"{table_name}.tenant_lifecycle_version IS NULL "
+            f"OR {table_name}.tenant_lifecycle_version <= 0"
+        )
+    )
+    conn.execute(
+        text(
+            f"UPDATE {table_name} SET tenant_lifecycle_version = ("
+            "SELECT tenants.lifecycle_version FROM tenants "
+            f"WHERE tenants.id = {table_name}.tenant_id) "
+            f"WHERE {lifecycle_predicate}"
+        )
+    )
+    conn.execute(
+        text(
+            f"UPDATE {table_name} SET execution_generation = 0 "
+            f"WHERE execution_generation IS NULL OR execution_generation < 0"
+        )
+    )
+    for column_name in required:
+        if column_name not in _sqlite_table_columns(conn, table_name):
+            raise RuntimeError(
+                f"Knowledge ingest claim column missing from {table_name}: {column_name}"
+            )
+    _ensure_sqlite_index(
+        conn,
+        table_name=table_name,
+        index_name="ix_knowledge_ingest_jobs_tenant_lifecycle_version",
+        columns=("tenant_lifecycle_version",),
+    )
+    _ensure_sqlite_index(
+        conn,
+        table_name=table_name,
+        index_name="ix_knowledge_ingest_jobs_execution_owner",
+        columns=("execution_owner",),
+    )
+    _ensure_sqlite_index(
+        conn,
+        table_name=table_name,
+        index_name="ix_knowledge_ingest_jobs_execution_generation",
+        columns=("execution_generation",),
+    )
+    _ensure_sqlite_index(
+        conn,
+        table_name=table_name,
+        index_name="ix_knowledge_ingest_jobs_lease_expires_at",
+        columns=("lease_expires_at",),
+    )
+    invalid = conn.execute(
+        text(
+            f"SELECT COUNT(*) FROM {table_name} "
+            "WHERE tenant_lifecycle_version IS NULL "
+            "OR tenant_lifecycle_version <= 0 "
+            "OR execution_generation IS NULL "
+            "OR execution_generation < 0"
+        )
+    ).scalar_one()
+    if int(invalid):
+        raise RuntimeError("Knowledge ingest claim backfill is incomplete")
+
+
+def _migrate_tenant_terminal_evidence(conn, tables: set[str]) -> None:
+    """Add explicit terminal reason and uncertain-outcome evidence to durable external work."""
+    for table_name in _SYSTEM_TENANT_TERMINAL_EVIDENCE_TABLES:
+        if table_name not in tables:
+            continue
+        columns = _sqlite_table_columns(conn, table_name)
+        if "terminal_reason" not in columns:
+            conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN terminal_reason VARCHAR"))
+        if "outcome_unknown" not in columns:
+            conn.execute(
+                text(
+                    f"ALTER TABLE {table_name} ADD COLUMN outcome_unknown "
+                    "BOOLEAN NOT NULL DEFAULT 0"
+                )
+            )
+        _ensure_sqlite_index(
+            conn,
+            table_name=table_name,
+            index_name=f"ix_{table_name}_terminal_reason",
+            columns=("terminal_reason",),
+        )
+
+
+def _migrate_a2a_worker_claims(conn, tables: set[str]) -> None:
+    """Add durable owner/generation leases used to prevent duplicate A2A workers."""
+    table_name = "a2a_task_runs"
+    if table_name not in tables:
+        return
+    columns = _sqlite_table_columns(conn, table_name)
+    additions = (
+        ("worker_owner", "ALTER TABLE a2a_task_runs ADD COLUMN worker_owner VARCHAR"),
+        (
+            "worker_generation",
+            "ALTER TABLE a2a_task_runs ADD COLUMN worker_generation INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "worker_lease_until",
+            "ALTER TABLE a2a_task_runs ADD COLUMN worker_lease_until DATETIME",
+        ),
+    )
+    for column_name, ddl in additions:
+        if column_name not in columns:
+            conn.execute(text(ddl))
+            columns.add(column_name)
+    conn.execute(
+        text(
+            "UPDATE a2a_task_runs SET worker_generation = 0 "
+            "WHERE worker_generation IS NULL OR worker_generation < 0"
+        )
+    )
+    _ensure_sqlite_index(
+        conn,
+        table_name=table_name,
+        index_name="ix_a2a_task_runs_worker_owner",
+        columns=("worker_owner",),
+    )
+    _ensure_sqlite_index(
+        conn,
+        table_name=table_name,
+        index_name="ix_a2a_task_runs_worker_lease_until",
+        columns=("worker_lease_until",),
+    )
+
+
+def _migrate_team_wake_worker_claims(conn, tables: set[str]) -> None:
+    """Add durable owner/generation leases used to fence stale team wake workers."""
+    table_name = "team_wake_events"
+    if table_name not in tables:
+        return
+    columns = _sqlite_table_columns(conn, table_name)
+    additions = (
+        (
+            "worker_owner",
+            "ALTER TABLE team_wake_events ADD COLUMN worker_owner VARCHAR",
+        ),
+        (
+            "worker_generation",
+            "ALTER TABLE team_wake_events ADD COLUMN worker_generation INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "worker_lease_until",
+            "ALTER TABLE team_wake_events ADD COLUMN worker_lease_until DATETIME",
+        ),
+    )
+    for column_name, ddl in additions:
+        if column_name not in columns:
+            conn.execute(text(ddl))
+            columns.add(column_name)
+    conn.execute(
+        text(
+            "UPDATE team_wake_events SET worker_generation = 0 "
+            "WHERE worker_generation IS NULL OR worker_generation < 0"
+        )
+    )
+    _ensure_sqlite_index(
+        conn,
+        table_name=table_name,
+        index_name="ix_team_wake_events_worker_owner",
+        columns=("worker_owner",),
+    )
+    _ensure_sqlite_index(
+        conn,
+        table_name=table_name,
+        index_name="ix_team_wake_events_worker_generation",
+        columns=("worker_generation",),
+    )
+    _ensure_sqlite_index(
+        conn,
+        table_name=table_name,
+        index_name="ix_team_wake_events_worker_lease_until",
+        columns=("worker_lease_until",),
+    )
+
+
+def _verify_system_tenant_control(conn, tables: set[str]) -> None:
+    """Fail closed unless the live control schema, data, and indexes are complete."""
+    expected_system_columns = {
+        "system_admins": {
+            "id",
+            "username",
+            "display_name",
+            "password_hash",
+            "status",
+            "auth_version",
+            "must_change_password",
+            "password_changed_at",
+            "last_login_at",
+            "created_at",
+            "updated_at",
+        },
+        "system_control_audits": {
+            "id",
+            "actor_system_admin_id",
+            "actor_label",
+            "action",
+            "target_type",
+            "target_id",
+            "result",
+            "reason_code",
+            "operator_reason",
+            "status_before",
+            "status_after",
+            "lifecycle_version",
+            "request_id",
+            "trace_id",
+            "safe_params_json",
+            "created_at",
+        },
+    }
+    for table_name, expected_columns in expected_system_columns.items():
+        actual_columns = _sqlite_table_columns(conn, table_name)
+        if actual_columns != expected_columns:
+            raise RuntimeError(
+                f"System control table {table_name} has unexpected live columns"
+            )
+
+    expected_policy_columns = {
+        "installation_password_policies": {
+            "scope",
+            "min_length",
+            "max_length",
+            "complexity_enabled",
+            "require_uppercase",
+            "require_lowercase",
+            "require_digit",
+            "require_special",
+            "updated_at",
+        },
+        "tenant_password_policies": {
+            "tenant_id",
+            "mode",
+            "min_length",
+            "max_length",
+            "complexity_enabled",
+            "require_uppercase",
+            "require_lowercase",
+            "require_digit",
+            "require_special",
+            "updated_at",
+        },
+    }
+    for table_name, expected_columns in expected_policy_columns.items():
+        if _sqlite_table_columns(conn, table_name) != expected_columns:
+            raise RuntimeError(f"Password policy table {table_name} has unexpected live columns")
+
+    system_table_sql = {
+        str(row["name"]): str(row["sql"] or "")
+        for row in conn.execute(
+            text(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'table' "
+                "AND name IN ('system_admins', 'system_control_audits')"
+            )
+        ).mappings().all()
+    }
+    required_checks = {
+        "system_admins": {
+            "ck_system_admins_status",
+            "ck_system_admins_auth_version_positive",
+        },
+        "system_control_audits": {"ck_system_control_audits_result"},
+    }
+    for table_name, check_names in required_checks.items():
+        if not all(name in system_table_sql.get(table_name, "") for name in check_names):
+            raise RuntimeError(f"System control table {table_name} is missing checks")
+
+    required_system_indexes = (
+        ("system_admins", "ix_system_admins_username", ("username",), True),
+        ("system_admins", "ix_system_admins_status", ("status",), False),
+        (
+            "system_control_audits",
+            "ix_system_control_audits_actor_system_admin_id",
+            ("actor_system_admin_id",),
+            False,
+        ),
+        ("system_control_audits", "ix_system_control_audits_action", ("action",), False),
+        ("system_control_audits", "ix_system_control_audits_target_id", ("target_id",), False),
+        ("system_control_audits", "ix_system_control_audits_result", ("result",), False),
+        ("system_control_audits", "ix_system_control_audits_request_id", ("request_id",), False),
+        ("system_control_audits", "ix_system_control_audits_trace_id", ("trace_id",), False),
+        ("system_control_audits", "ix_system_control_audits_created_at", ("created_at",), False),
+    )
+    for table_name, index_name, columns, unique in required_system_indexes:
+        if _sqlite_index_shape(conn, table_name, index_name) != (unique, columns):
+            raise RuntimeError(f"System control index {index_name} is incomplete")
+
+    invalid_system_admins = conn.execute(
+        text(
+            "SELECT COUNT(*) FROM system_admins "
+            "WHERE id IS NULL OR username IS NULL OR TRIM(username) = '' "
+            "OR password_hash IS NULL OR status NOT IN ('active', 'disabled') "
+            "OR auth_version IS NULL OR auth_version <= 0 "
+            "OR must_change_password IS NULL "
+            "OR created_at IS NULL OR updated_at IS NULL"
+        )
+    ).scalar_one()
+    if int(invalid_system_admins):
+        raise RuntimeError("System administrator control data is invalid")
+    invalid_system_audits = conn.execute(
+        text(
+            "SELECT COUNT(*) FROM system_control_audits "
+            "WHERE id IS NULL OR action IS NULL OR target_type IS NULL "
+            "OR result NOT IN ('succeeded', 'rejected', 'failed') "
+            "OR reason_code IS NULL OR created_at IS NULL "
+            "OR (lifecycle_version IS NOT NULL AND lifecycle_version <= 0)"
+        )
+    ).scalar_one()
+    if int(invalid_system_audits):
+        raise RuntimeError("System control audit data is invalid")
+
+    if "tenants" in tables:
+        required = {
+            "slug",
+            "status",
+            "lifecycle_version",
+            "initial_admin_user_id",
+            "suspended_at",
+            "suspension_reason",
+            "reactivated_at",
+            "updated_at",
+        }
+        missing = required - _sqlite_table_columns(conn, "tenants")
+        if missing:
+            raise RuntimeError(f"Tenant control columns missing: {sorted(missing)}")
+        tenant_rows = conn.execute(
+            text("SELECT id, slug, status, lifecycle_version, updated_at FROM tenants")
+        ).mappings().all()
+        slugs: set[str] = set()
+        for row in tenant_rows:
+            slug = str(row.get("slug") or "")
+            if not _SYSTEM_TENANT_SLUG_PATTERN.fullmatch(slug) or slug in slugs:
+                raise RuntimeError(f"Tenant {row['id']!r} has an invalid or duplicate slug")
+            slugs.add(slug)
+            if row["status"] not in {"active", "suspended"}:
+                raise RuntimeError(f"Tenant {row['id']!r} has an invalid status")
+            if not isinstance(row["lifecycle_version"], int) or row["lifecycle_version"] <= 0:
+                raise RuntimeError(f"Tenant {row['id']!r} has an invalid lifecycle version")
+            if row["updated_at"] is None:
+                raise RuntimeError(f"Tenant {row['id']!r} has no control update timestamp")
+        if "users" in tables:
+            user_columns = _sqlite_table_columns(conn, "users")
+            active_predicate = "AND u.active = 1" if "active" in user_columns else ""
+            invalid_admins = conn.execute(
+                text(
+                    "SELECT COUNT(*) FROM tenants "
+                    "WHERE initial_admin_user_id IS NOT NULL "
+                    "AND NOT EXISTS ("
+                    "SELECT 1 FROM users AS u "
+                    "WHERE u.id = tenants.initial_admin_user_id "
+                    "AND u.tenant_id = tenants.id AND u.role = 'admin' "
+                    f"{active_predicate})"
+                )
+            ).scalar_one()
+            if int(invalid_admins):
+                raise RuntimeError(
+                    "Tenant initial administrator is not an active same-tenant administrator"
+                )
+        else:
+            invalid_admins = conn.execute(
+                text(
+                    "SELECT COUNT(*) FROM tenants "
+                    "WHERE initial_admin_user_id IS NOT NULL"
+                )
+            ).scalar_one()
+            if int(invalid_admins):
+                raise RuntimeError("Tenant initial administrator has no user domain")
+
+        required_indexes = (
+            ("ix_tenants_slug", ("slug",), True),
+            ("ix_tenants_status", ("status",), False),
+            ("ix_tenants_initial_admin_user_id", ("initial_admin_user_id",), False),
+        )
+        for index_name, columns, unique in required_indexes:
+            if _sqlite_index_shape(conn, "tenants", index_name) != (unique, columns):
+                raise RuntimeError(f"Tenant control index {index_name} is incomplete")
+
+    if "users" in tables:
+        required = {"auth_version", "must_change_password", "password_changed_at"}
+        missing = required - _sqlite_table_columns(conn, "users")
+        if missing:
+            raise RuntimeError(f"User control columns missing: {sorted(missing)}")
+        invalid_users = conn.execute(
+            text(
+                "SELECT COUNT(*) FROM users WHERE auth_version IS NULL OR auth_version <= 0 "
+                "OR must_change_password IS NULL"
+            )
+        ).scalar_one()
+        if int(invalid_users):
+            raise RuntimeError("User authentication control backfill is incomplete")
+
+    if "tenants" in tables:
+        for table_name in _SYSTEM_TENANT_DURABLE_TABLES:
+            if table_name not in tables:
+                continue
+            if "tenant_lifecycle_version" not in _sqlite_table_columns(conn, table_name):
+                raise RuntimeError(f"Tenant lifecycle column missing from {table_name}")
+            index_name = f"ix_{table_name}_tenant_lifecycle_version"
+            if _sqlite_index_shape(conn, table_name, index_name) != (
+                False,
+                ("tenant_lifecycle_version",),
+            ):
+                raise RuntimeError(f"Tenant lifecycle index missing from {table_name}")
+        for table_name in _SYSTEM_TENANT_TERMINAL_EVIDENCE_TABLES:
+            if table_name not in tables:
+                continue
+            required = {"terminal_reason", "outcome_unknown"}
+            missing = required - _sqlite_table_columns(conn, table_name)
+            if missing:
+                raise RuntimeError(
+                    f"Tenant terminal evidence columns missing from {table_name}: {sorted(missing)}"
+                )
+            if _sqlite_index_shape(
+                conn,
+                table_name,
+                f"ix_{table_name}_terminal_reason",
+            ) != (False, ("terminal_reason",)):
+                raise RuntimeError(f"Tenant terminal evidence index missing from {table_name}")
+        if "team_wake_events" in tables:
+            wake_columns = _sqlite_table_columns(conn, "team_wake_events")
+            required_wake_columns = {
+                "worker_owner",
+                "worker_generation",
+                "worker_lease_until",
+            }
+            missing_wake_columns = required_wake_columns - wake_columns
+            if missing_wake_columns:
+                raise RuntimeError(
+                    "Team wake worker claim columns missing: "
+                    f"{sorted(missing_wake_columns)}"
+                )
+            invalid_wake_generations = conn.execute(
+                text(
+                    "SELECT COUNT(*) FROM team_wake_events "
+                    "WHERE worker_generation IS NULL OR worker_generation < 0"
+                )
+            ).scalar_one()
+            if int(invalid_wake_generations):
+                raise RuntimeError("Team wake worker generation backfill is incomplete")
+            for index_name, columns in (
+                ("ix_team_wake_events_worker_owner", ("worker_owner",)),
+                ("ix_team_wake_events_worker_generation", ("worker_generation",)),
+                ("ix_team_wake_events_worker_lease_until", ("worker_lease_until",)),
+            ):
+                if _sqlite_index_shape(conn, "team_wake_events", index_name) != (
+                    False,
+                    columns,
+                ):
+                    raise RuntimeError(f"Team wake worker index missing: {index_name}")
+
+
+def _migrate_system_tenant_control(conn) -> None:
+    """Apply and verify the additive tenant-control migration in the caller's transaction."""
+    conn.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS app_data_migrations (
+                id VARCHAR PRIMARY KEY,
+                applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+    )
+    _create_system_control_tables(conn)
+    tables = _sqlite_table_names(conn)
+    _migrate_tenant_control_columns(conn, tables)
+    _migrate_durable_tenant_versions(conn, tables)
+    _migrate_knowledge_ingest_claim_schema(conn, tables)
+    _migrate_tenant_terminal_evidence(conn, tables)
+    _migrate_a2a_worker_claims(conn, tables)
+    _migrate_team_wake_worker_claims(conn, tables)
+    _verify_system_tenant_control(conn, tables)
+
+    # Marker is deliberately the final semantic write. Its presence never bypasses repair.
+    conn.execute(
+        text("INSERT OR IGNORE INTO app_data_migrations (id) VALUES (:id)"),
+        {"id": _SYSTEM_TENANT_CONTROL_MIGRATION_ID},
+    )
+    marker_count = conn.execute(
+        text("SELECT COUNT(*) FROM app_data_migrations WHERE id = :id"),
+        {"id": _SYSTEM_TENANT_CONTROL_MIGRATION_ID},
+    ).scalar_one()
+    if int(marker_count) != 1:
+        raise RuntimeError("System tenant control migration marker is not unique")
+
+
+def _migrate_i18n_language_schema(conn, tables: set[str]) -> None:
+    """Add locale preferences and immutable execution snapshots without rewriting source data.
+
+    Existing rows receive only the deterministic compatibility snapshot when the new value is
+    absent. The marker is informational; live column inspection always takes precedence so an
+    interrupted migration is repaired on the next startup.
+    """
+    language_tables = {"users", "sessions", *_I18N_LANGUAGE_CONTEXT_TABLES}
+    present_tables = language_tables.intersection(tables)
+    if not present_tables:
+        return
+
+    # Workflow: ensure the shared marker table exists before any additive DDL is attempted.
+    conn.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS app_data_migrations (
+                id VARCHAR PRIMARY KEY,
+                applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+    )
+
+    # Workflow: repair every missing column from live metadata rather than trusting the marker.
+    additive_columns = {
+        "users": {
+            "ui_locale": "ALTER TABLE users ADD COLUMN ui_locale VARCHAR",
+            "agent_reply_locale": (
+                "ALTER TABLE users ADD COLUMN agent_reply_locale VARCHAR"
+            ),
+        },
+        "sessions": {
+            "agent_reply_locale": (
+                "ALTER TABLE sessions ADD COLUMN agent_reply_locale VARCHAR"
+            ),
+            "agent_reply_locale_source": (
+                "ALTER TABLE sessions ADD COLUMN agent_reply_locale_source VARCHAR"
+            ),
+        },
+    }
+    for table_name in _I18N_LANGUAGE_CONTEXT_TABLES:
+        additive_columns[table_name] = {
+            "language_context_json": (
+                f"ALTER TABLE {table_name} ADD COLUMN language_context_json JSON"
+            )
+        }
+    for table_name in sorted(present_tables):
+        columns = _sqlite_table_columns(conn, table_name)
+        for column_name, ddl in additive_columns.get(table_name, {}).items():
+            if column_name not in columns:
+                conn.execute(text(ddl))
+
+    # Workflow: backfill only absent values; historical content and explicit locale choices stay raw.
+    if "users" in present_tables:
+        conn.execute(
+            text(
+                "UPDATE users SET ui_locale = :default_locale "
+                "WHERE ui_locale IS NULL OR TRIM(ui_locale) = ''"
+            ),
+            {"default_locale": "zh-CN"},
+        )
+        conn.execute(
+            text(
+                "UPDATE users SET agent_reply_locale = :default_locale "
+                "WHERE agent_reply_locale IS NULL OR TRIM(agent_reply_locale) = ''"
+            ),
+            {"default_locale": "zh-CN"},
+        )
+    if "sessions" in present_tables:
+        conn.execute(
+            text(
+                "UPDATE sessions SET agent_reply_locale = :default_locale "
+                "WHERE agent_reply_locale IS NULL OR TRIM(agent_reply_locale) = ''"
+            ),
+            {"default_locale": "zh-CN"},
+        )
+        conn.execute(
+            text(
+                "UPDATE sessions SET agent_reply_locale_source = :default_source "
+                "WHERE agent_reply_locale_source IS NULL OR TRIM(agent_reply_locale_source) = ''"
+            ),
+            {"default_source": "legacy_default"},
+        )
+    snapshot_json = json.dumps(
+        _I18N_LANGUAGE_DEFAULT_SNAPSHOT,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    for table_name in _I18N_LANGUAGE_CONTEXT_TABLES:
+        if table_name not in present_tables:
+            continue
+        conn.execute(
+            text(
+                f"UPDATE {table_name} SET language_context_json = :snapshot "
+                "WHERE language_context_json IS NULL "
+                "OR TRIM(CAST(language_context_json AS TEXT)) = ''"
+            ),
+            {"snapshot": snapshot_json},
+        )
+
+    # Workflow: record completion only after all additions and deterministic backfills succeed.
+    conn.execute(
+        text("INSERT OR IGNORE INTO app_data_migrations (id) VALUES (:id)"),
+        {"id": _I18N_LANGUAGE_SCHEMA_MIGRATION_ID},
+    )
 
 
 def _migrate_default_model_output_limit(conn, tables: set[str]) -> None:
@@ -1060,6 +2445,155 @@ def _migrate_channel_bindings_multi(conn, inspector, tables: set[str]) -> None:
     )
 
 
+def _migrate_wechat_kf_accounts(conn, tables: set[str]) -> None:
+    """Create and backfill the WeChat客服 routing table without changing existing bindings.
+
+    The migration writes only additive schema and one active account row for each legacy
+    binding that already carries ``open_kfid``. Repeated execution is a no-op. Invalid legacy
+    JSON or bindings without an account identifier are skipped instead of aborting startup.
+    """
+    conn.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS wechat_kf_accounts (
+                id VARCHAR PRIMARY KEY,
+                tenant_id VARCHAR NOT NULL,
+                binding_id VARCHAR NOT NULL,
+                open_kfid VARCHAR NOT NULL,
+                name VARCHAR NOT NULL DEFAULT '',
+                agent_id VARCHAR,
+                team_id VARCHAR,
+                status VARCHAR NOT NULL DEFAULT 'active',
+                sync_cursor VARCHAR NOT NULL DEFAULT '',
+                last_error VARCHAR,
+                last_sync_at DATETIME,
+                created_at DATETIME NOT NULL,
+                updated_at DATETIME NOT NULL,
+                CONSTRAINT uq_wechat_kf_account_binding_kfid
+                    UNIQUE (binding_id, open_kfid),
+                CONSTRAINT uq_wechat_kf_account_tenant_kfid
+                    UNIQUE (tenant_id, open_kfid)
+            )
+            """
+        )
+    )
+    for column in ("tenant_id", "binding_id", "open_kfid", "agent_id", "team_id", "status"):
+        conn.execute(
+            text(
+                f"CREATE INDEX IF NOT EXISTS ix_wechat_kf_accounts_{column} "
+                f"ON wechat_kf_accounts ({column})"
+            )
+        )
+    conn.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS app_data_migrations (
+                id VARCHAR PRIMARY KEY,
+                applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+    )
+    applied = conn.execute(
+        text("SELECT id FROM app_data_migrations WHERE id = :id"),
+        {"id": _WECHAT_KF_ACCOUNTS_MIGRATION_ID},
+    ).first()
+    if applied:
+        return
+
+    # Metadata creation may have created the target table before this data backfill runs.
+    if "channel_bindings" in tables:
+        binding_columns = _sqlite_table_columns(conn, "channel_bindings")
+        team_id_projection = "team_id" if "team_id" in binding_columns else "NULL AS team_id"
+        rows = conn.execute(
+            text(
+                f"SELECT id, tenant_id, agent_id, {team_id_projection}, config_json "
+                "FROM channel_bindings WHERE channel = 'wechat_kf'"
+            )
+        ).mappings().all()
+        for row in rows:
+            config = _json_object(row["config_json"])
+            open_kfid = str(config.get("open_kfid") or "").strip()
+            if not open_kfid:
+                continue
+            conn.execute(
+                text(
+                    "INSERT OR IGNORE INTO wechat_kf_accounts "
+                    "(id, tenant_id, binding_id, open_kfid, name, agent_id, team_id, status, "
+                    "sync_cursor, created_at, updated_at) "
+                    "VALUES (:id, :tenant_id, :binding_id, :open_kfid, '', :agent_id, :team_id, "
+                    "'active', '', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+                ),
+                {
+                    "id": new_id("wka"),
+                    "tenant_id": row["tenant_id"],
+                    "binding_id": row["id"],
+                    "open_kfid": open_kfid,
+                    "agent_id": row["agent_id"] if not row["team_id"] else None,
+                    "team_id": row["team_id"],
+                },
+            )
+    conn.execute(
+        text("INSERT OR IGNORE INTO app_data_migrations (id) VALUES (:id)"),
+        {"id": _WECHAT_KF_ACCOUNTS_MIGRATION_ID},
+    )
+
+
+def _migrate_wechat_kf_account_operations(conn, tables: set[str]) -> None:
+    """Create the additive durable operation-intent table for existing SQLite installs."""
+    # Keep only desired state and stable error codes; provider bodies and credentials never persist.
+    conn.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS wechat_kf_account_operations (
+                id VARCHAR PRIMARY KEY,
+                tenant_id VARCHAR NOT NULL,
+                binding_id VARCHAR NOT NULL,
+                kind VARCHAR NOT NULL,
+                status VARCHAR NOT NULL DEFAULT 'prepared',
+                open_kfid VARCHAR,
+                desired_name VARCHAR NOT NULL DEFAULT '',
+                desired_media_id VARCHAR,
+                binding_revision INTEGER NOT NULL DEFAULT 0,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error_code VARCHAR,
+                provider_applied_at DATETIME,
+                completed_at DATETIME,
+                created_at DATETIME NOT NULL,
+                updated_at DATETIME NOT NULL
+            )
+            """
+        )
+    )
+    conn.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS app_data_migrations (
+                id VARCHAR PRIMARY KEY,
+                applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+    )
+    conn.execute(
+        text("INSERT OR IGNORE INTO app_data_migrations (id) VALUES (:id)"),
+        {"id": _WECHAT_KF_ACCOUNT_OPERATIONS_MIGRATION_ID},
+    )
+    for column in ("tenant_id", "binding_id", "kind", "status", "open_kfid"):
+        conn.execute(
+            text(
+                f"CREATE INDEX IF NOT EXISTS ix_wechat_kf_account_operations_{column} "
+                f"ON wechat_kf_account_operations ({column})"
+            )
+        )
+    conn.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_wechat_kf_account_operations_binding_status "
+            "ON wechat_kf_account_operations (binding_id, status)"
+        )
+    )
+
+
 def _channel_account_key_from_row(channel: str, config: object) -> str | None:
     parsed = _json_object(config)
     if channel == "wecom":
@@ -1330,9 +2864,41 @@ def _migrate_channel_account_key_schema(conn, tables: set[str]) -> None:
         )
 
 
+def _migrate_model_auth_modes(conn, tables: set[str]) -> None:
+    if "model_configs" not in tables:
+        return
+
+    conn.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS app_data_migrations (
+                id VARCHAR PRIMARY KEY,
+                applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+    )
+    columns = {
+        str(row[1]) for row in conn.execute(text("PRAGMA table_info(model_configs)")).all()
+    }
+    if "auth_mode" not in columns:
+        conn.execute(
+            text(
+                "ALTER TABLE model_configs ADD COLUMN auth_mode VARCHAR "
+                "NOT NULL DEFAULT 'api_key'"
+            )
+        )
+    conn.execute(
+        text("INSERT OR IGNORE INTO app_data_migrations (id) VALUES (:id)"),
+        {"id": _MODEL_AUTH_MODE_MIGRATION_ID},
+    )
+
+
 def _migrate_model_api_protocols(conn, tables: set[str]) -> None:
     if "model_configs" not in tables:
         return
+
+    _migrate_model_auth_modes(conn, tables)
 
     conn.execute(
         text(
@@ -1853,6 +3419,9 @@ def _migrate_harness_v2_schema(conn, inspector, tables: set[str]) -> None:
             "lease_expires_at": (
                 "ALTER TABLE harness_task_frames ADD COLUMN lease_expires_at DATETIME"
             ),
+            "workspace_root": (
+                "ALTER TABLE harness_task_frames ADD COLUMN workspace_root VARCHAR"
+            ),
         }
         for column_name, ddl in task_frame_column_sql.items():
             if column_name not in task_frame_columns:
@@ -2001,7 +3570,122 @@ def _migrate_harness_v2_schema(conn, inspector, tables: set[str]) -> None:
     )
 
 
+def _migrate_shared_knowledge_schema(conn, inspector, tables: set[str]) -> None:
+    """补齐共享知识库持久化结构；旧数据只回填为专用，不创建任何共享关系。"""
+    if "knowledge_bases" in tables:
+        knowledge_base_columns = {
+            column["name"] for column in inspector.get_columns("knowledge_bases")
+        }
+        if "mode" not in knowledge_base_columns:
+            conn.execute(
+                text(
+                    "ALTER TABLE knowledge_bases ADD COLUMN mode "
+                    "VARCHAR NOT NULL DEFAULT 'dedicated'"
+                )
+            )
+        if "published_version_id" not in knowledge_base_columns:
+            conn.execute(
+                text("ALTER TABLE knowledge_bases ADD COLUMN published_version_id VARCHAR")
+            )
+        conn.execute(
+            text(
+                "UPDATE knowledge_bases SET mode = 'dedicated' "
+                "WHERE mode IS NULL OR mode = ''"
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_knowledge_bases_mode "
+                "ON knowledge_bases(mode)"
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_knowledge_bases_published_version_id "
+                "ON knowledge_bases(published_version_id)"
+            )
+        )
+
+    if "knowledge_base_versions" in tables:
+        version_columns = {
+            column["name"]
+            for column in inspector.get_columns("knowledge_base_versions")
+        }
+        version_column_sql = {
+            "parent_version_id": (
+                "ALTER TABLE knowledge_base_versions ADD COLUMN parent_version_id VARCHAR"
+            ),
+            "publication_state": (
+                "ALTER TABLE knowledge_base_versions ADD COLUMN publication_state "
+                "VARCHAR NOT NULL DEFAULT 'released'"
+            ),
+            "source_team_id": (
+                "ALTER TABLE knowledge_base_versions ADD COLUMN source_team_id VARCHAR"
+            ),
+            "created_by_agent_id": (
+                "ALTER TABLE knowledge_base_versions ADD COLUMN created_by_agent_id VARCHAR"
+            ),
+            "created_by_user_id": (
+                "ALTER TABLE knowledge_base_versions ADD COLUMN created_by_user_id VARCHAR"
+            ),
+            "change_reason": (
+                "ALTER TABLE knowledge_base_versions ADD COLUMN change_reason VARCHAR"
+            ),
+            "published_at": (
+                "ALTER TABLE knowledge_base_versions ADD COLUMN published_at DATETIME"
+            ),
+        }
+        for column_name, ddl in version_column_sql.items():
+            if column_name not in version_columns:
+                conn.execute(text(ddl))
+        conn.execute(
+            text(
+                "UPDATE knowledge_base_versions SET publication_state = 'released' "
+                "WHERE publication_state IS NULL OR publication_state = ''"
+            )
+        )
+        for column_name in (
+            "parent_version_id",
+            "publication_state",
+            "source_team_id",
+            "created_by_agent_id",
+            "created_by_user_id",
+        ):
+            conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS "
+                    f"ix_knowledge_base_versions_{column_name} "
+                    f"ON knowledge_base_versions({column_name})"
+                )
+            )
+
+    if "teams" in tables:
+        team_columns = {column["name"] for column in inspector.get_columns("teams")}
+        if "default_knowledge_base_id" not in team_columns:
+            conn.execute(
+                text("ALTER TABLE teams ADD COLUMN default_knowledge_base_id VARCHAR")
+            )
+        conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_teams_default_knowledge_base_id "
+                "ON teams(default_knowledge_base_id)"
+            )
+        )
+
+    # 新关系表没有历史数据可回填，只按模型约束安全建空表。
+    from app.db import models as _models  # noqa: F401
+
+    for table_name in (
+        "team_knowledge_base_bindings",
+        "team_knowledge_base_grants",
+        "knowledge_base_audit_events",
+    ):
+        SQLModel.metadata.tables[table_name].create(bind=conn, checkfirst=True)
+
+
 def _migrate_knowledge_base_schema(conn, inspector, tables: set[str]) -> None:
+    """迁移知识库版本关联，并在任何历史数据处理前补齐共享知识库结构。"""
+    _migrate_shared_knowledge_schema(conn, inspector, tables)
     tenant_ids = _tenant_ids(conn, tables)
     if "knowledge_bases" in tables:
         for tenant_id in tenant_ids:
@@ -2016,11 +3700,11 @@ def _migrate_knowledge_base_schema(conn, inspector, tables: set[str]) -> None:
                         """
                         INSERT INTO knowledge_bases (
                             id, tenant_id, name, description, status, capability_scope,
-                            metadata_json, created_at, updated_at
+                            mode, metadata_json, created_at, updated_at
                         )
                         VALUES (
                             :id, :tenant_id, :name, :description, 'active', 'general',
-                            '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                            'dedicated', '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
                         )
                         """
                     ),
@@ -2089,11 +3773,12 @@ def _migrate_knowledge_base_schema(conn, inspector, tables: set[str]) -> None:
                         """
                         INSERT INTO knowledge_base_versions (
                             id, tenant_id, knowledge_base_id, version, name, description,
-                            status, capability_scope, metadata_json, created_at, updated_at
+                            status, publication_state, capability_scope, metadata_json,
+                            created_at, updated_at
                         )
                         VALUES (
                             :id, :tenant_id, :knowledge_base_id, '1.0.0', :name, :description,
-                            :status, :capability_scope, :metadata_json,
+                            :status, 'released', :capability_scope, :metadata_json,
                             CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
                         )
                         """
@@ -2157,6 +3842,7 @@ def _migrate_knowledge_base_schema(conn, inspector, tables: set[str]) -> None:
 
 
 def _split_document_backed_knowledge_bases(conn, tables: set[str]) -> None:
+    """把旧专用多文档根拆为独立专用库；共享库保持原样，写入发生在当前迁移事务。"""
     required_tables = {"knowledge_bases", "knowledge_base_versions", "knowledge_documents"}
     if not required_tables.issubset(tables):
         return
@@ -2184,7 +3870,7 @@ def _split_document_backed_knowledge_bases(conn, tables: set[str]) -> None:
             text("SELECT * FROM knowledge_bases WHERE id = :id"),
             {"id": source_knowledge_base_id},
         ).mappings().first()
-        if not source:
+        if not source or source.get("mode") != "dedicated":
             continue
         documents = conn.execute(
             text(
@@ -2225,11 +3911,12 @@ def _split_document_backed_knowledge_bases(conn, tables: set[str]) -> None:
                     text(
                         """
                         INSERT INTO knowledge_bases (
-                            id, tenant_id, name, description, status, capability_scope,
+                            id, tenant_id, name, description, status, mode, capability_scope,
                             metadata_json, created_at, updated_at
                         )
                         VALUES (
-                            :id, :tenant_id, :name, :description, :status, :capability_scope,
+                            :id, :tenant_id, :name, :description, :status, 'dedicated',
+                            :capability_scope,
                             :metadata_json, :created_at, CURRENT_TIMESTAMP
                         )
                         """
@@ -2260,11 +3947,12 @@ def _split_document_backed_knowledge_bases(conn, tables: set[str]) -> None:
                         """
                         INSERT INTO knowledge_base_versions (
                             id, tenant_id, knowledge_base_id, version, name, description,
-                            status, capability_scope, metadata_json, created_at, updated_at
+                            status, publication_state, capability_scope, metadata_json,
+                            created_at, updated_at
                         )
                         VALUES (
                             :id, :tenant_id, :knowledge_base_id, '1.0.0', :name, :description,
-                            'active', :capability_scope, :metadata_json,
+                            'active', 'released', :capability_scope, :metadata_json,
                             CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
                         )
                         """

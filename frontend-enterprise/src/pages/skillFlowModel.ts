@@ -19,6 +19,22 @@ export type SkillFlowPoint = {
   y: number;
 };
 
+export function countSkillFlowEdgeLabels<T extends Record<string, unknown>>(
+  edges: T[],
+  labelForEdge: (edge: T) => string,
+): Map<string, Map<string, number>> {
+  const counts = new Map<string, Map<string, number>>();
+  edges.forEach((edge) => {
+    const sourceId = String(edge.source_node_id || '').trim();
+    if (!sourceId) return;
+    const label = labelForEdge(edge);
+    const sourceCounts = counts.get(sourceId) ?? new Map<string, number>();
+    sourceCounts.set(label, (sourceCounts.get(label) ?? 0) + 1);
+    counts.set(sourceId, sourceCounts);
+  });
+  return counts;
+}
+
 const FLOW_POSITION_KEY = 'flow_position';
 
 export function skillNodeFlowPosition(node: Record<string, unknown>): SkillFlowPosition | null {

@@ -3,6 +3,9 @@ import type { ReactNode } from 'react';
 import { DataTable, type DataTableColumn } from '@/components/DataTable';
 import { Paginator } from '@/components/Paginator';
 import { UnderlineTabs, type UnderlineTabItem } from '@/components/ui';
+import { useAppIntl, type MessageId, type MessageValues } from '@/i18n';
+
+type TaskSectionMessageId = MessageId;
 
 export type TaskSectionProps<TFilter extends string, TRow> = {
   /** Leading header icon (14px). */
@@ -54,6 +57,13 @@ export function TaskSection<TFilter extends string, TRow>({
   onPageChange,
   renderMobileCard,
 }: TaskSectionProps<TFilter, TRow>) {
+  const { t: appT } = useAppIntl();
+
+  /** Format section accessibility labels without concatenating product prose. */
+  function t(id: TaskSectionMessageId, values?: MessageValues): string {
+    return appT(id, values);
+  }
+
   return (
     <section aria-label={title}>
       <div className="mb-[16px] flex items-center gap-[6px] px-[12px] text-[#757f9c]">
@@ -61,7 +71,7 @@ export function TaskSection<TFilter extends string, TRow>({
         <span className="text-[14px] font-normal leading-none">{title}</span>
       </div>
       <UnderlineTabs
-        aria-label={`${title}筛选`}
+        aria-label={t('scheduledTasksPage.section.filterAria', { title })}
         variant="line"
         className="mb-[16px]"
         value={filter}
@@ -89,7 +99,7 @@ export function TaskSection<TFilter extends string, TRow>({
         />
         {rows.length > 0 && (
           <Paginator
-            aria-label={`${title}分页`}
+            aria-label={t('scheduledTasksPage.section.paginationAria', { title })}
             page={page}
             pageCount={pageCount}
             onChange={onPageChange}

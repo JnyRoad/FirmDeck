@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
+from sqlalchemy import Engine
 from sqlmodel import Session, select
 
 from app.agents.branching import (
@@ -19,8 +21,12 @@ from app.agents.branching import (
     user_creator_metadata,
     visible_tool_rows,
 )
-from app.config import get_settings
 from app.capability_scope import normalize_capability_scope
+from app.config import get_settings
+from app.contracts.error_registry import ERROR_REGISTRY, ErrorVisibility
+from app.contracts.errors import ErrorDescriptor, ErrorOccurrence, InternalErrorContext
+from app.contracts.http import build_http_exception
+from app.contracts.projections import project_public_error
 from app.db import get_session
 from app.db.models import (
     A2ATaskEvent,
@@ -28,10 +34,17 @@ from app.db.models import (
     AgentEvent,
     AgentProfile,
     AgentResourceBinding,
+    MCPOAuthFlow,
     MCPServer,
+    MCPUserOAuthGrant,
     Tool,
     User,
     utc_now,
+)
+from app.i18n.language_context import (
+    LanguageContextInputs,
+    resolve_compatible_language_context,
+    resolve_language_context,
 )
 from app.security.auth import ensure_current_user_tenant, get_current_user
 from app.security.permissions import (
@@ -51,13 +64,20 @@ from app.tools.mcp_client import (
     execute_mcp_tool,
     read_mcp_resource,
 )
+from app.tools.mcp_oauth_policy import (
+    mcp_oauth_config_fingerprint,
+    mcp_oauth_headers_fingerprint,
+)
+from app.tools.mcp_oauth_service import MCPGrantTokenStorage
+from app.tools.mcp_sdk_adapter import MCPAdapterError, MCPSDKAdapter
+from app.tools.tool_executor import _run_coroutine
 from app.tools.tool_schema import (
     MCPAppResourceRead,
     MCPAppToolCallRequest,
     MCPAppToolCallResponse,
+    MCPDiscoveredTool,
     MCPDiscoverRequest,
     MCPDiscoverResponse,
-    MCPDiscoveredTool,
     MCPServerConnection,
     MCPServerCreateRequest,
     MCPServerRead,
@@ -80,6 +100,125 @@ from app.tools.tool_schema import (
 router = APIRouter(prefix="/api/enterprise/tools", tags=["enterprise:tools"])
 mcp_router = APIRouter(prefix="/api/enterprise/mcp-servers", tags=["enterprise:mcp-servers"])
 MCP_APP_RESOURCE_MAX_BYTES = 10 * 1024 * 1024
+logger = logging.getLogger(__name__)
+
+_TOOL_HTTP_CODES = {
+    400: "TOOL_BAD_REQUEST",
+    403: "TOOL_FORBIDDEN",
+    404: "TOOL_NOT_FOUND",
+    409: "TOOL_CONFLICT",
+    502: "TOOL_UPSTREAM_ERROR",
+}
+
+
+def _tool_occurrence(
+    code: str,
+    *,
+    raw_context: object | None = None,
+    request_id: str | None = None,
+    trace_id: str | None = None,
+) -> ErrorOccurrence:
+    """Resolve one Tool error through the registry and keep legacy prose private."""
+    entry = ERROR_REGISTRY.get(code) or ERROR_REGISTRY.require("INTERNAL_ERROR")
+    internal = None
+    if raw_context is not None or entry.code != code:
+        internal = InternalErrorContext(
+            source="tool-api",
+            raw_message=str(raw_context) if raw_context is not None else None,
+            upstream_code=code,
+        )
+    return ErrorOccurrence(
+        descriptor=ErrorDescriptor(
+            code=entry.code,
+            params={},
+            retryable=entry.retryable_default,
+            request_id=request_id,
+            trace_id=trace_id,
+        ),
+        internal=internal,
+    )
+
+
+def _tool_http_error(status_code: int, detail: object | None = None) -> HTTPException:
+    """Return an HTTP error with canonical public detail and private legacy context."""
+    code = _TOOL_HTTP_CODES.get(status_code, "INTERNAL_ERROR")
+    occurrence = _tool_occurrence(
+        code,
+        raw_context=detail,
+    )
+    return HTTPException(status_code=status_code, detail=project_public_error(occurrence, ERROR_REGISTRY))
+
+
+def _typed_tool_error(code: str, raw_context: object | None = None) -> ToolError:
+    """Build a typed Tool error without publishing provider or exception prose."""
+    occurrence = _tool_occurrence(code, raw_context=raw_context)
+    return ToolError.from_occurrence(occurrence)
+
+
+def _tool_result_error(result: ToolResult) -> ToolError | None:
+    """Re-project a nested Tool result error before returning a typed API response."""
+    if result.error is None:
+        return None
+    return ToolError.from_occurrence(result.error.to_occurrence())
+
+
+def _tool_result_error_code(result: ToolResult) -> str | None:
+    """Read only the registry-validated code for a private audit event payload."""
+    if result.error is None:
+        return None
+    return result.error.to_descriptor().code
+
+
+def _discovery_error(discovery: MCPDiscoverResponse) -> ToolError | None:
+    """Re-project a discovery error through ToolError's exact registry validation."""
+    if discovery.error is None:
+        return None
+    return ToolError.from_occurrence(discovery.error.to_occurrence())
+
+
+def _project_persisted_tool_error(error_json: object) -> dict[str, Any]:
+    """Fail closed when projecting a durable Tool/A2A error from legacy JSON."""
+    if not isinstance(error_json, dict) or not error_json:
+        return {}
+    code = str(error_json.get("code") or "INTERNAL_ERROR")
+    entry = ERROR_REGISTRY.get(code)
+    raw_message = error_json.get("message")
+    params = error_json.get("params", {})
+    retryable = error_json.get(
+        "retryable",
+        entry.retryable_default if entry is not None else False,
+    )
+    request_id = error_json.get("request_id")
+    trace_id = error_json.get("trace_id")
+    if (
+        entry is None
+        or not isinstance(params, dict)
+        or not isinstance(retryable, bool)
+        or (request_id is not None and not isinstance(request_id, str))
+        or (trace_id is not None and not isinstance(trace_id, str))
+    ):
+        occurrence = _tool_occurrence("INTERNAL_ERROR", raw_context=error_json)
+        return project_public_error(occurrence, ERROR_REGISTRY)
+    try:
+        descriptor = ErrorDescriptor(
+            code=code,
+            params=params,
+            retryable=retryable,
+            request_id=request_id,
+            trace_id=trace_id,
+        )
+    except ValueError:
+        occurrence = _tool_occurrence("INTERNAL_ERROR", raw_context=error_json)
+        return project_public_error(occurrence, ERROR_REGISTRY)
+    occurrence = ErrorOccurrence(
+        descriptor=descriptor,
+        internal=InternalErrorContext(
+            source="tool-api-persisted",
+            raw_message=str(raw_message) if raw_message is not None else None,
+            upstream_code=code,
+        ),
+    )
+    return project_public_error(occurrence, ERROR_REGISTRY)
 
 
 class A2ATaskEventRead(BaseModel):
@@ -106,17 +245,28 @@ class A2ATaskRunRead(BaseModel):
     started_at: str | None = None
     finished_at: str | None = None
     updated_at: str
+    language_context: dict[str, Any] = Field(default_factory=dict)
     events: list[A2ATaskEventRead] = Field(default_factory=list)
 
 
 class CodexA2AAdapterRead(BaseModel):
-    enabled: bool
+    available: bool
     endpoint_url: str
     agent_card_url: str
-    command: str
-    workspace_root: str
     timeout_seconds: float
-    token_configured: bool
+
+
+def _task_language_context_payload(snapshot: object) -> dict[str, Any]:
+    """Project a durable A2A locale snapshot and fail closed for malformed legacy rows."""
+    try:
+        context = resolve_compatible_language_context(
+            snapshot=snapshot if isinstance(snapshot, dict) else None,
+            legacy_ui_locale=None,
+            legacy_agent_reply_locale=None,
+        )
+    except (TypeError, ValueError):
+        context = resolve_language_context(LanguageContextInputs())
+    return context.model_dump(mode="json")
 
 
 def tool_read(row: Tool, metadata: dict[str, Any] | None = None) -> ToolRead:
@@ -199,7 +349,7 @@ def create_tool(
         select(Tool).where(Tool.tenant_id == request.tenant_id, Tool.name == request.name)
     ).first()
     if existing:
-        raise HTTPException(status_code=409, detail="Tool name already exists for this tenant")
+        raise _tool_http_error(status_code=409, detail="Tool name already exists for this tenant")
     agent = ensure_agent_scope_manager(db, request.tenant_id, agent_id, current_user)
     row = Tool(
         tenant_id=request.tenant_id,
@@ -268,13 +418,13 @@ def probe_tool(
             return ToolProbeResponse(
                 success=False,
                 status_code=400,
-                error=ToolError(code="MCP_ERROR", message=str(exc)),
+                error=_typed_tool_error("MCP_ERROR", exc),
             )
         except Exception as exc:
             return ToolProbeResponse(
                 success=False,
                 status_code=500,
-                error=ToolError(code="MCP_PROBE_ERROR", message=str(exc)),
+                error=_typed_tool_error("MCP_PROBE_ERROR", exc),
             )
         return ToolProbeResponse(
             success=True,
@@ -310,7 +460,7 @@ def probe_tool(
             inferred_output_schema=(
                 _infer_json_schema(result.data) if result.success else {}
             ),
-            error=result.error,
+            error=_tool_result_error(result),
         )
     url = _normalize_probe_url(request.url)
     executor = ToolExecutor(db)
@@ -334,12 +484,12 @@ def probe_tool(
     except httpx.TimeoutException:
         return ToolProbeResponse(
             success=False,
-            error=ToolError(code="TIMEOUT", message="工具探测超时。"),
+            error=_typed_tool_error("TIMEOUT", "工具探测超时。"),
         )
     except Exception as exc:
         return ToolProbeResponse(
             success=False,
-            error=ToolError(code="PROBE_ERROR", message=str(exc)),
+            error=_typed_tool_error("PROBE_ERROR", exc),
         )
 
     data_preview = _response_preview(response)
@@ -351,8 +501,8 @@ def probe_tool(
         inferred_output_schema=_infer_json_schema(data_preview) if success else {},
         error=None
         if success
-        else ToolError(
-            code="HTTP_ERROR", message=f"工具探测返回异常状态码：{response.status_code}"
+        else _typed_tool_error(
+            "HTTP_ERROR", f"工具探测返回异常状态码：{response.status_code}"
         ),
     )
 
@@ -364,14 +514,18 @@ def probe_tool(
 )
 def get_codex_a2a_adapter() -> CodexA2AAdapterRead:
     settings = get_settings()
+    token = getattr(settings, "codex_a2a_token", "")
+    configured_timeout = getattr(settings, "codex_a2a_timeout_seconds", None)
     return CodexA2AAdapterRead(
-        enabled=bool(settings.codex_a2a_enabled),
+        available=(
+            bool(getattr(settings, "codex_a2a_enabled", False))
+            and isinstance(token, str)
+            and bool(token)
+            and token == token.strip()
+        ),
         endpoint_url="/api/a2a/codex",
         agent_card_url="/.well-known/agent-card.json",
-        command=settings.codex_a2a_command,
-        workspace_root=settings.codex_a2a_workspace_root,
-        timeout_seconds=settings.codex_a2a_timeout_seconds,
-        token_configured=bool(settings.codex_a2a_token),
+        timeout_seconds=float(1800.0 if configured_timeout is None else configured_timeout),
     )
 
 
@@ -390,7 +544,7 @@ def list_a2a_task_runs(
     row = _get_tool(db, tenant_id, tool_id)
     _ensure_tool_visible(db, tenant_id, row, agent_id)
     if row.tool_type != "a2a":
-        raise HTTPException(status_code=400, detail="仅 A2A 工具包含持久化任务记录")
+        raise _tool_http_error(status_code=400, detail="仅 A2A 工具包含持久化任务记录")
     runs = list(
         db.exec(
             select(A2ATaskRun)
@@ -438,7 +592,7 @@ def cancel_a2a_task_run(
     _ensure_tool_visible(db, tenant_id, row, agent_id)
     run = db.get(A2ATaskRun, run_id)
     if run is None or run.tenant_id != tenant_id or run.tool_id != tool_id:
-        raise HTTPException(status_code=404, detail="A2A 任务不存在")
+        raise _tool_http_error(status_code=404, detail="A2A 任务不存在")
     if run.status not in {"completed", "failed", "canceled", "cancelled", "rejected"}:
         run.cancel_requested = True
         run.updated_at = utc_now()
@@ -479,12 +633,12 @@ def update_tool(
         source_was_open_gallery = is_open_gallery_resource(db, request.tenant_id, "tool", row)
         row = _ensure_private_tool_for_agent(db, request.tenant_id, agent, row)
         if not source_was_open_gallery and request.name.strip() != row.name:
-            raise HTTPException(status_code=400, detail="Tool name cannot be modified")
+            raise _tool_http_error(status_code=400, detail="Tool name cannot be modified")
     else:
         ensure_open_gallery_admin(request.tenant_id, current_user)
         source_tool_id = row.id
         if request.name.strip() != row.name:
-            raise HTTPException(status_code=400, detail="Tool name cannot be modified")
+            raise _tool_http_error(status_code=400, detail="Tool name cannot be modified")
     row.display_name = request.display_name
     row.description = request.description
     row.bucket = _normalize_bucket(request.bucket)
@@ -560,10 +714,10 @@ def delete_tool(
             db.add(binding)
             db.commit()
             return {"status": "hidden"}
-        raise HTTPException(status_code=404, detail="Tool not visible to this agent")
+        raise _tool_http_error(status_code=404, detail="Tool not visible to this agent")
     if agent and agent.is_overall:
         if not is_open_gallery_resource(db, tenant_id, "tool", row):
-            raise HTTPException(status_code=404, detail="Tool not visible in open gallery")
+            raise _tool_http_error(status_code=404, detail="Tool not visible in open gallery")
         ensure_open_gallery_admin(tenant_id, current_user)
         hide_open_gallery_binding(db, tenant_id, "tool", row.id)
         db.commit()
@@ -590,6 +744,7 @@ def test_tool(
         request.tenant_id,
         ToolCall(name=row.name, arguments=request.arguments),
         agent_id=agent_id,
+        user_id=current_user.id,
     )
 
 
@@ -597,7 +752,7 @@ def _get_tool(db: Session, tenant_id: str, tool_id: str) -> Tool:
     ensure_tenant(db, tenant_id)
     row = db.get(Tool, tool_id)
     if not row or row.tenant_id != tenant_id:
-        raise HTTPException(status_code=404, detail="Tool not found")
+        raise _tool_http_error(status_code=404, detail="Tool not found")
     return row
 
 
@@ -617,11 +772,12 @@ def _a2a_task_run_read(
         cancel_requested=run.cancel_requested,
         recovery_attempts=run.recovery_attempts,
         artifacts=list(run.artifacts_json or []),
-        error=dict(run.error_json or {}),
+        error=_project_persisted_tool_error(run.error_json),
         created_at=run.created_at.isoformat(),
         started_at=run.started_at.isoformat() if run.started_at else None,
         finished_at=run.finished_at.isoformat() if run.finished_at else None,
         updated_at=run.updated_at.isoformat(),
+        language_context=_task_language_context_payload(run.language_context_json),
         events=events,
     )
 
@@ -634,7 +790,7 @@ def _visible_tool_rows(
 ) -> list[Tool]:
     agent = get_agent(db, tenant_id, agent_id)
     if agent_id and not agent:
-        raise HTTPException(status_code=404, detail="Agent not found")
+        raise _tool_http_error(status_code=404, detail="Agent not found")
     rows = visible_tool_rows(db, tenant_id, agent_id, include_inactive=True)
     if bucket and bucket != "__all__":
         return [row for row in rows if row.bucket == bucket]
@@ -644,15 +800,15 @@ def _visible_tool_rows(
 def _ensure_tool_visible(db: Session, tenant_id: str, row: Tool, agent_id: str | None) -> None:
     agent = get_agent(db, tenant_id, agent_id)
     if agent_id and not agent:
-        raise HTTPException(status_code=404, detail="Agent not found")
+        raise _tool_http_error(status_code=404, detail="Agent not found")
     if agent and not agent.is_overall:
         binding = _tool_binding(db, tenant_id, agent.id, row.id)
         if not binding or not is_bound_resource_visible_for_agent(
             db, tenant_id, "tool", row, binding
         ):
-            raise HTTPException(status_code=404, detail="Tool not visible to this agent")
+            raise _tool_http_error(status_code=404, detail="Tool not visible to this agent")
     if (not agent or agent.is_overall) and not is_open_gallery_resource(db, tenant_id, "tool", row):
-        raise HTTPException(status_code=404, detail="Tool not visible in open gallery")
+        raise _tool_http_error(status_code=404, detail="Tool not visible in open gallery")
 
 
 def _tool_binding(
@@ -849,6 +1005,10 @@ def mcp_server_read(row: MCPServer, db: Session) -> MCPServerRead:
         bucket=row.bucket or "MCP 工具",
         connection=_server_connection(row),
         apps_mode=row.apps_mode or "disabled",
+        auth_mode=row.auth_mode or "none",
+        oauth_client_id=row.oauth_client_id,
+        oauth_client_metadata_url=row.oauth_client_metadata_url,
+        oauth_redirect_uri=row.oauth_redirect_uri,
         apps_negotiated=_apps_negotiated(row.negotiated_capabilities_json or {}),
         negotiated_capabilities=dict(row.negotiated_capabilities_json or {}),
         capability_scope=normalize_capability_scope(row.capability_scope),
@@ -870,6 +1030,80 @@ def _update_inherited_mcp_tool_scopes(db: Session, server: MCPServer) -> None:
         tool.capability_scope_inherited = True
         tool.updated_at = utc_now()
         db.add(tool)
+
+
+def _mcp_oauth_binding_values(
+    server: MCPServer,
+) -> tuple[str, str, str, str, str, str, str]:
+    """Return the persisted server identity whose changes invalidate personal grants."""
+    return (
+        server.auth_mode or "none",
+        server.transport or "",
+        server.url or "",
+        server.oauth_client_id or "",
+        server.oauth_client_metadata_url or "",
+        server.oauth_redirect_uri or "",
+        mcp_oauth_headers_fingerprint(server.headers_json),
+    )
+
+
+def _request_oauth_binding_values(
+    request: MCPServerUpdateRequest,
+) -> tuple[str, str, str, str, str, str, str]:
+    """Return the requested server identity in the same grant-binding order."""
+    return (
+        request.auth_mode,
+        request.connection.transport,
+        request.connection.url or "",
+        request.oauth_client_id or "",
+        request.oauth_client_metadata_url or "",
+        request.oauth_redirect_uri or "",
+        mcp_oauth_headers_fingerprint(request.connection.headers),
+    )
+
+
+def _delete_mcp_oauth_grants(db: Session, tenant_id: str, server_id: str) -> None:
+    """Delete every personal grant bound to one tenant-owned MCP server."""
+    grants = db.exec(
+        select(MCPUserOAuthGrant).where(
+            MCPUserOAuthGrant.tenant_id == tenant_id,
+            MCPUserOAuthGrant.server_id == server_id,
+        )
+    ).all()
+    for grant in grants:
+        db.delete(grant)
+
+
+def _cancel_mcp_oauth_flows(db: Session, tenant_id: str, server_id: str) -> None:
+    """Invalidate callbacks that still target a changed or deleted server identity."""
+    flows = db.exec(
+        select(MCPOAuthFlow).where(
+            MCPOAuthFlow.tenant_id == tenant_id,
+            MCPOAuthFlow.server_id == server_id,
+            MCPOAuthFlow.status.in_({"pending", "callback_received"}),
+        )
+    ).all()
+    for flow in flows:
+        flow.status = "cancelled"
+        flow.error_code = "MCP_AUTHORIZATION_REQUIRED"
+        flow.updated_at = utc_now()
+        db.add(flow)
+
+
+def _begin_mcp_oauth_server_change(
+    db: Session,
+    tenant_id: str,
+    server_id: str,
+) -> Any:
+    """Hold a process-local OAuth fence across one server database transaction."""
+    from app.api.mcp_oauth import _coordinator_for_engine
+
+    bind = db.get_bind()
+    if not isinstance(bind, Engine):
+        raise TypeError("MCP OAuth requires an engine-bound database session")
+    coordinator = _coordinator_for_engine(bind)
+    coordinator.begin_server_change(tenant_id, server_id)
+    return coordinator
 
 
 @mcp_router.get(
@@ -899,7 +1133,7 @@ def create_mcp_server(
         )
     ).first()
     if existing:
-        raise HTTPException(
+        raise _tool_http_error(
             status_code=409, detail="MCP server name already exists for this tenant"
         )
     conn = request.connection
@@ -917,6 +1151,10 @@ def create_mcp_server(
         env_json=conn.env,
         cwd=conn.cwd,
         apps_mode=request.apps_mode,
+        auth_mode=request.auth_mode,
+        oauth_client_id=request.oauth_client_id,
+        oauth_client_metadata_url=request.oauth_client_metadata_url,
+        oauth_redirect_uri=request.oauth_redirect_uri,
         negotiated_capabilities_json={},
         capability_scope=request.capability_scope,
         enabled=request.enabled,
@@ -949,20 +1187,29 @@ def get_mcp_app_resource(
     ensure_current_user_tenant(tenant_id, current_user)
     server = _get_mcp_server(db, tenant_id, server_id)
     if server.apps_mode != "auto":
-        raise HTTPException(status_code=404, detail="MCP Apps is not enabled for this server")
+        raise _tool_http_error(status_code=404, detail="MCP Apps is not enabled for this server")
     tool = _app_tool_for_uri(db, server, uri)
     if tool is None:
-        raise HTTPException(status_code=404, detail="MCP App resource is not declared by a tool")
+        raise _tool_http_error(status_code=404, detail="MCP App resource is not declared by a tool")
     _ensure_tool_visible(db, tenant_id, tool, agent_id)
     try:
-        result = read_mcp_resource(
-            _server_client_config(server),
-            uri,
-            timeout_seconds=get_settings().tool_timeout_seconds,
+        result = (
+            _read_protected_resource(server, current_user.id, db, uri)
+            if server.auth_mode == "oauth_personal"
+            else read_mcp_resource(
+                _server_client_config(server),
+                uri,
+                timeout_seconds=get_settings().tool_timeout_seconds,
+            )
         )
         content, meta = _extract_app_resource(result, uri)
+    except MCPAdapterError as exc:
+        entry = ERROR_REGISTRY.get(exc.code)
+        if entry is None or entry.visibility is not ErrorVisibility.PUBLIC:
+            entry = ERROR_REGISTRY.require("INTERNAL_ERROR")
+        raise build_http_exception(entry.code) from exc
     except MCPClientError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise _tool_http_error(status_code=502, detail=str(exc)) from exc
     return MCPAppResourceRead(
         server_id=server.id,
         uri=uri,
@@ -982,19 +1229,19 @@ def call_mcp_app_tool(
     ensure_current_user_tenant(request.tenant_id, current_user)
     server = _get_mcp_server(db, request.tenant_id, server_id)
     if server.apps_mode != "auto":
-        raise HTTPException(status_code=404, detail="MCP Apps is not enabled for this server")
+        raise _tool_http_error(status_code=404, detail="MCP Apps is not enabled for this server")
     tool = _app_tool_by_name(db, server, request.tool_name)
     if tool is None:
-        raise HTTPException(status_code=404, detail="MCP App tool not found")
+        raise _tool_http_error(status_code=404, detail="MCP App tool not found")
     _ensure_tool_visible(db, request.tenant_id, tool, request.agent_id)
     config = dict(tool.config_json or {})
     app = config.get("mcp_apps") if isinstance(config.get("mcp_apps"), dict) else {}
     visibility = app.get("visibility") if isinstance(app.get("visibility"), list) else []
     if "app" not in visibility:
-        raise HTTPException(status_code=403, detail="Tool is not available to MCP Apps")
+        raise _tool_http_error(status_code=403, detail="Tool is not available to MCP Apps")
     if normalize_capability_scope(tool.capability_scope) == "sop_specific":
         if not request.active_skill_id or request.active_skill_id not in tool.allowed_skills_json:
-            raise HTTPException(
+            raise _tool_http_error(
                 status_code=403,
                 detail="SOP-specific tool is not authorized by the active SOP",
             )
@@ -1012,6 +1259,7 @@ def call_mcp_app_tool(
         active_skill_id=request.active_skill_id,
         agent_id=request.agent_id,
         session_id=request.session_id,
+        user_id=current_user.id,
     )
     if result.mcp_app is not None:
         # Nested App views are not rendered inside another App. Keep the tool
@@ -1030,7 +1278,7 @@ def call_mcp_app_tool(
                     "read_only": read_only,
                     "confirmed": bool(request.confirm_side_effect),
                     "success": result.success,
-                    "error_code": result.error.code if result.error else None,
+                    "error_code": _tool_result_error_code(result),
                 },
             )
         )
@@ -1047,28 +1295,47 @@ def update_mcp_server(
 ) -> MCPServerRead:
     row = _get_mcp_server(db, request.tenant_id, server_id)
     ensure_open_gallery_admin(request.tenant_id, current_user)
-    conn = request.connection
-    row.name = request.name
-    row.display_name = request.display_name
-    row.description = request.description
-    row.bucket = _normalize_bucket(request.bucket) if request.bucket else "MCP 工具"
-    row.transport = conn.transport
-    row.url = conn.url
-    row.headers_json = conn.headers
-    row.command = conn.command
-    row.args_json = conn.args
-    row.env_json = conn.env
-    row.cwd = conn.cwd
-    if row.apps_mode != request.apps_mode:
-        row.negotiated_capabilities_json = {}
-    row.apps_mode = request.apps_mode
-    if request.capability_scope is not None:
-        row.capability_scope = request.capability_scope
-        _update_inherited_mcp_tool_scopes(db, row)
-    row.enabled = request.enabled
-    row.updated_at = utc_now()
-    db.add(row)
-    db.commit()
+    oauth_binding_changed = (
+        _mcp_oauth_binding_values(row) != _request_oauth_binding_values(request)
+    )
+    change_coordinator = (
+        _begin_mcp_oauth_server_change(db, request.tenant_id, row.id)
+        if oauth_binding_changed
+        else None
+    )
+    try:
+        conn = request.connection
+        row.name = request.name
+        row.display_name = request.display_name
+        row.description = request.description
+        row.bucket = _normalize_bucket(request.bucket) if request.bucket else "MCP 工具"
+        row.transport = conn.transport
+        row.url = conn.url
+        row.headers_json = conn.headers
+        row.command = conn.command
+        row.args_json = conn.args
+        row.env_json = conn.env
+        row.cwd = conn.cwd
+        if row.apps_mode != request.apps_mode:
+            row.negotiated_capabilities_json = {}
+        row.apps_mode = request.apps_mode
+        row.auth_mode = request.auth_mode
+        row.oauth_client_id = request.oauth_client_id
+        row.oauth_client_metadata_url = request.oauth_client_metadata_url
+        row.oauth_redirect_uri = request.oauth_redirect_uri
+        if request.capability_scope is not None:
+            row.capability_scope = request.capability_scope
+            _update_inherited_mcp_tool_scopes(db, row)
+        row.enabled = request.enabled
+        row.updated_at = utc_now()
+        db.add(row)
+        if oauth_binding_changed:
+            _cancel_mcp_oauth_flows(db, request.tenant_id, row.id)
+            _delete_mcp_oauth_grants(db, request.tenant_id, row.id)
+        db.commit()
+    finally:
+        if change_coordinator is not None:
+            change_coordinator.end_server_change(request.tenant_id, row.id)
     db.refresh(row)
     return mcp_server_read(row, db)
 
@@ -1089,12 +1356,18 @@ def delete_mcp_server(
     require_overall_agent(db, tenant_id, agent_id)
     ensure_open_gallery_admin(tenant_id, current_user)
     row = _get_mcp_server(db, tenant_id, server_id)
-    if remove_tools:
-        tools = db.exec(select(Tool).where(Tool.mcp_server_id == server_id)).all()
-        for tool in tools:
-            db.delete(tool)
-    db.delete(row)
-    db.commit()
+    change_coordinator = _begin_mcp_oauth_server_change(db, tenant_id, row.id)
+    try:
+        if remove_tools:
+            tools = db.exec(select(Tool).where(Tool.mcp_server_id == server_id)).all()
+            for tool in tools:
+                db.delete(tool)
+        _cancel_mcp_oauth_flows(db, tenant_id, row.id)
+        _delete_mcp_oauth_grants(db, tenant_id, row.id)
+        db.delete(row)
+        db.commit()
+    finally:
+        change_coordinator.end_server_change(tenant_id, row.id)
     return {"status": "deleted"}
 
 
@@ -1110,7 +1383,7 @@ def discover_mcp_tools_adhoc(
     if request.connection is None:
         return MCPDiscoverResponse(
             success=False,
-            error=ToolError(code="MISSING_CONNECTION", message="缺少 MCP 连接配置。"),
+            error=_typed_tool_error("MISSING_CONNECTION", "缺少 MCP 连接配置。"),
         )
     return _discover_response(request.connection, apps_mode=request.apps_mode)
 
@@ -1127,12 +1400,15 @@ def discover_mcp_tools(
     row = _get_mcp_server(db, request.tenant_id, server_id)
     ensure_open_gallery_admin(request.tenant_id, current_user)
     if agent_id and get_agent(db, request.tenant_id, agent_id) is None:
-        raise HTTPException(status_code=404, detail="Agent not found")
-    connection = request.connection or _server_connection(row)
-    response = _discover_response(
-        connection,
-        apps_mode=request.apps_mode if request.connection is not None else row.apps_mode,
-    )
+        raise _tool_http_error(status_code=404, detail="Agent not found")
+    if row.auth_mode == "oauth_personal":
+        response = _discover_protected_server(row, current_user.id, db)
+    else:
+        connection = request.connection or _server_connection(row)
+        response = _discover_response(
+            connection,
+            apps_mode=request.apps_mode if request.connection is not None else row.apps_mode,
+        )
     if response.success:
         row.discovered_tools_json = [tool.model_dump() for tool in response.tools]
         row.negotiated_capabilities_json = dict(response.server_capabilities)
@@ -1176,10 +1452,13 @@ def sync_mcp_tools(
     """把发现到的工具落成 Tool 行（新建/更新 schema），可选择导入的子集。"""
     row = _get_mcp_server(db, request.tenant_id, server_id)
     ensure_open_gallery_admin(request.tenant_id, current_user)
-    connection = _server_connection(row)
-    discovery = _discover_response(connection, apps_mode=row.apps_mode)
+    discovery = (
+        _discover_protected_server(row, current_user.id, db)
+        if row.auth_mode == "oauth_personal"
+        else _discover_response(_server_connection(row), apps_mode=row.apps_mode)
+    )
     if not discovery.success:
-        return MCPSyncResponse(success=False, error=discovery.error)
+        return MCPSyncResponse(success=False, error=_discovery_error(discovery))
 
     row.discovered_tools_json = [tool.model_dump() for tool in discovery.tools]
     row.negotiated_capabilities_json = dict(discovery.server_capabilities)
@@ -1295,12 +1574,12 @@ def _discover_response(
     except MCPClientError as exc:
         return MCPDiscoverResponse(
             success=False,
-            error=ToolError(code="MCP_DISCOVER_ERROR", message=str(exc)),
+            error=_typed_tool_error("MCP_DISCOVER_ERROR", exc),
         )
     except Exception as exc:  # noqa: BLE001
         return MCPDiscoverResponse(
             success=False,
-            error=ToolError(code="MCP_DISCOVER_UNEXPECTED", message=str(exc)),
+            error=_typed_tool_error("MCP_DISCOVER_UNEXPECTED", exc),
         )
     return MCPDiscoverResponse(
         success=True,
@@ -1321,6 +1600,118 @@ def _discover_response(
             if item.get("name")
         ],
     )
+
+
+def _discover_protected_server(
+    server: MCPServer,
+    user_id: str,
+    db: Session,
+) -> MCPDiscoverResponse:
+    """Discover one saved protected server through the current user's official SDK grant."""
+    bind = db.get_bind()
+    if (
+        not isinstance(bind, Engine)
+        or server.transport != "streamable_http"
+        or not server.url
+        or not server.oauth_redirect_uri
+    ):
+        return MCPDiscoverResponse(
+            success=False,
+            error=_typed_tool_error("MCP_OAUTH_PROVIDER_UNSUPPORTED"),
+        )
+    storage = MCPGrantTokenStorage(
+        bind,
+        server.tenant_id,
+        server.id,
+        user_id,
+        public_client_id=server.oauth_client_id,
+        client_metadata_url=server.oauth_client_metadata_url,
+        redirect_uri=server.oauth_redirect_uri,
+        config_fingerprint=mcp_oauth_config_fingerprint(server),
+        enforce_owner_binding=True,
+    )
+    status = storage.read_status()
+    if status.state != "connected":
+        code = (
+            "MCP_TOKEN_REFRESH_FAILED"
+            if status.state == "reconnect_required"
+            else "MCP_AUTHORIZATION_REQUIRED"
+        )
+        return MCPDiscoverResponse(success=False, error=_typed_tool_error(code))
+    adapter = MCPSDKAdapter(
+        server_url=server.url,
+        headers=dict(server.headers_json or {}),
+        storage=storage,
+        redirect_uri=server.oauth_redirect_uri,
+        client_metadata_url=server.oauth_client_metadata_url,
+        timeout_seconds=get_settings().tool_timeout_seconds,
+    )
+    try:
+        discovery = _run_coroutine(adapter.discover())
+    except MCPAdapterError as exc:
+        if exc.code == "MCP_TOKEN_REFRESH_FAILED":
+            storage.mark_reconnect_required()
+        return MCPDiscoverResponse(success=False, error=_typed_tool_error(exc.code))
+    return MCPDiscoverResponse(
+        success=True,
+        server_capabilities=discovery.get("server_capabilities", {}),
+        server_info=discovery.get("server_info", {}),
+        tools=[
+            MCPDiscoveredTool(**item)
+            for item in discovery.get("tools", [])
+            if isinstance(item, dict) and item.get("name")
+        ],
+    )
+
+
+def _read_protected_resource(
+    server: MCPServer,
+    user_id: str,
+    db: Session,
+    uri: str,
+) -> dict[str, Any]:
+    """Read one MCP Apps resource with the signed-in user's OAuth grant."""
+    bind = db.get_bind()
+    if (
+        not isinstance(bind, Engine)
+        or server.transport != "streamable_http"
+        or not server.url
+        or not server.oauth_redirect_uri
+    ):
+        raise MCPAdapterError("MCP_OAUTH_PROVIDER_UNSUPPORTED")
+    storage = MCPGrantTokenStorage(
+        bind,
+        server.tenant_id,
+        server.id,
+        user_id,
+        public_client_id=server.oauth_client_id,
+        client_metadata_url=server.oauth_client_metadata_url,
+        redirect_uri=server.oauth_redirect_uri,
+        config_fingerprint=mcp_oauth_config_fingerprint(server),
+        enforce_owner_binding=True,
+    )
+    status = storage.read_status()
+    if status.state != "connected":
+        code = (
+            "MCP_TOKEN_REFRESH_FAILED"
+            if status.state == "reconnect_required"
+            else "MCP_AUTHORIZATION_REQUIRED"
+        )
+        raise MCPAdapterError(code)
+    adapter = MCPSDKAdapter(
+        server_url=server.url,
+        headers=dict(server.headers_json or {}),
+        storage=storage,
+        redirect_uri=server.oauth_redirect_uri,
+        client_metadata_url=server.oauth_client_metadata_url,
+        timeout_seconds=get_settings().tool_timeout_seconds,
+    )
+    try:
+        return _run_coroutine(adapter.read_resource(uri))
+    except MCPAdapterError as exc:
+        if exc.code == "MCP_TOKEN_REFRESH_FAILED":
+            storage.mark_reconnect_required()
+        raise
 
 
 def _synced_mcp_tool_config(tool: MCPDiscoveredTool) -> dict[str, Any]:
@@ -1435,7 +1826,7 @@ def _remove_mcp_server_from_agent(
         db.add(binding)
         hidden += 1
     if not hidden:
-        raise HTTPException(status_code=404, detail="MCP server not visible to this agent")
+        raise _tool_http_error(status_code=404, detail="MCP server not visible to this agent")
     db.commit()
     return {"status": "hidden"}
 
@@ -1444,5 +1835,5 @@ def _get_mcp_server(db: Session, tenant_id: str, server_id: str) -> MCPServer:
     ensure_tenant(db, tenant_id)
     row = db.get(MCPServer, server_id)
     if not row or row.tenant_id != tenant_id:
-        raise HTTPException(status_code=404, detail="MCP server not found")
+        raise _tool_http_error(status_code=404, detail="MCP server not found")
     return row

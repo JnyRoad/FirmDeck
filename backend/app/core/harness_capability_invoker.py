@@ -1,3 +1,5 @@
+"""执行单个 TaskFrame 冻结能力，并在副作用前进行实时授权复核。"""
+
 from __future__ import annotations
 
 import base64
@@ -6,16 +8,29 @@ import json
 import mimetypes
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
+from pydantic import ValidationError
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
+from app.async_jobs import enqueue_async_job
+from app.capabilities.contracts import CapabilityContext
 from app.capabilities.local_general_skill import (
     package_from_row,
 )
+from app.capabilities.local_knowledge import (
+    SharedKnowledgeAgentActionResult,
+    SharedKnowledgeAgentRuntime,
+)
+from app.contracts.error_registry import (
+    ERROR_REGISTRY,
+    ErrorContractViolation,
+    ErrorVisibility,
+)
+from app.contracts.errors import ErrorDescriptor, InternalErrorContext
 from app.core.capability_discovery import (
     CAPABILITY_SEARCH_MAX_RESULTS,
     catalog_entry,
@@ -28,21 +43,33 @@ from app.core.capability_manifest import (
     general_skill_snapshot_digest,
     tool_snapshot_digest,
 )
-from app.core.harness_agent import HarnessExecutionCancelled
-from app.core.harness_session_cleanup import harness_task_workspace_path
+from app.core.harness_agent import HarnessExecutionCancelled, HarnessExecutionFenced
+from app.core.harness_session_cleanup import (
+    HarnessWorkspaceArtifactConflictError,
+    harness_task_workspace_path,
+    open_harness_task_artifact,
+)
+from app.core.published_deliverables import (
+    MAX_PUBLISHED_DELIVERABLES,
+    find_published_deliverable,
+    list_published_deliverables,
+)
 from app.core.task_request_compiler import CapabilityDescriptor, CapabilityManifest
 from app.core.tool_replay_policy import ToolReplayPolicy
 from app.db.models import (
     ChatSession,
     GeneralSkill,
     HarnessInvocationRecord,
+    HarnessRunRecord,
     ModelConfig,
     Skill,
+    Tenant,
     Tool,
     UIConfig,
     new_id,
     utc_now,
 )
+from app.general_skills.runner import canonical_general_skill_trace_payload
 from app.harness import (
     HarnessArtifactAccessError,
     HarnessExecutor,
@@ -55,20 +82,35 @@ from app.harness import (
     register_skill_script_tools,
     snapshot_harness_workspace,
 )
-from app.harness.execution_context import SANDBOX_WORKSPACE
 from app.harness.errors import HarnessExecutionError
+from app.harness.execution_context import SANDBOX_WORKSPACE
+from app.harness.filesystem import ReadFileArguments, read_opened_harness_artifact
 from app.harness.sandbox import parse_network_policy
+from app.i18n.language_context import (
+    LanguageContext,
+    LanguageContextInputs,
+    resolve_compatible_language_context,
+    resolve_language_context,
+)
 from app.knowledge.citations import knowledge_citations_from_results
+from app.knowledge.errors import KnowledgeError
 from app.knowledge.schema import KnowledgeSearchRequest
 from app.knowledge.service import KnowledgeService
+from app.security.tenant import (
+    TenantExecutionKind,
+    TenantLifecycleDecision,
+    TenantLifecycleDenied,
+    require_active_tenant,
+    require_matching_admission_version,
+)
 from app.tools.tool_executor import ToolExecutor
 from app.tools.tool_schema import ToolCall
-
 
 _INLINE_JSON_TOOL_RESULT_MAX_CHARS = 2_000
 _INTERNAL_TOOL_RESULT_DIRECTORY = ".harness/tool-results"
 _GENERAL_SKILL_PACKAGE_DIRECTORY = ".harness/skill-packages"
 _SANDBOX_JSON_FILE_KIND = "sandbox_json_file"
+_INTERNAL_ERROR_CODE = "INTERNAL_ERROR"
 
 
 class HarnessCapabilityInvoker:
@@ -92,7 +134,10 @@ class HarnessCapabilityInvoker:
         ensure_execution_lease: Any | None = None,
         trace_sink: Callable[[str, dict[str, Any]], None] | None = None,
         step_deadline_monotonic: float | None = None,
+        language_context: LanguageContext | dict[str, Any] | None = None,
+        admission_check: Callable[[], None] | None = None,
     ) -> None:
+        """Bind capability execution to the immutable locale snapshot of its Harness run."""
         self.db = db
         self.tenant_id = tenant_id
         self.session = session
@@ -109,7 +154,14 @@ class HarnessCapabilityInvoker:
         self.ensure_execution_lease = ensure_execution_lease
         self.trace_sink = trace_sink
         self.step_deadline_monotonic = step_deadline_monotonic
+        self.admission_check = admission_check
         self.run_id = str(run_id or new_id("hrun"))
+        self.language_context = _invoker_language_context(
+            db,
+            self.run_id,
+            session,
+            language_context,
+        )
         self.workspace_root = _workspace_root(
             tenant_id, session.id, task_frame_id, db=self.db
         )
@@ -160,15 +212,72 @@ class HarnessCapabilityInvoker:
         )
 
     def invoke(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        """执行一个已展开能力，记录幂等调用，并在结束后调度持久摄取任务。"""
+        # 先确认本轮仍可执行，并从冻结清单取得唯一能力描述。
+        self._check_admission()
         self._raise_if_cancelled()
         if callable(self.ensure_execution_lease):
             self.ensure_execution_lease()
+        admission_error: TenantLifecycleDenied | None = None
+        try:
+            admission = self._optional_tenant_admission()
+        except TenantLifecycleDenied as exc:
+            # Keep the denial observable as a failed invocation.  In particular,
+            # a suspended tenant must not make the caller retry the same logical
+            # action merely because the gate ran before the invocation row existed.
+            admission = None
+            admission_error = exc
         descriptor = self._descriptors.get(name)
         if descriptor is None:
             return _failure(
                 "TOOL_NOT_AVAILABLE",
                 "该能力不在当前 TaskFrame 的冻结清单中。",
             )
+        if admission_error is not None:
+            call_id = new_id("hcall")
+            admission_error_code = admission_error.code
+            admission_error_entry = ERROR_REGISTRY.get(admission_error_code)
+            if admission_error_entry is None:
+                admission_error_code = _INTERNAL_ERROR_CODE
+            else:
+                admission_error_code = admission_error_entry.code
+            tenant = self.db.get(Tenant, self.tenant_id)
+            invocation = HarnessInvocationRecord(
+                tenant_id=self.tenant_id,
+                tenant_lifecycle_version=(
+                    int(tenant.lifecycle_version or 1) if tenant is not None else 1
+                ),
+                session_id=self.session.id,
+                task_id=self.task_frame_id,
+                run_id=self.run_id,
+                call_id=call_id,
+                tool_name=name,
+                request_digest=_request_digest(name, arguments),
+                logical_action_key=None,
+                status="failed",
+                arguments_json=_audit_arguments(arguments),
+                language_context_json=self.language_context.model_dump(mode="json"),
+                result_json=_audit_result(
+                    _failure(
+                        admission_error_code,
+                        admission_error_code,
+                        request_id=call_id,
+                        trace_id=self.run_id,
+                    )
+                ),
+                response_cache_json=_failure(
+                    admission_error_code,
+                    admission_error_code,
+                    request_id=call_id,
+                    trace_id=self.run_id,
+                ),
+                finished_at=utc_now(),
+                updated_at=utc_now(),
+            )
+            self.db.add(invocation)
+            self._check_admission()
+            self.db.commit()
+            return dict(invocation.response_cache_json or {})
         if name not in self._activated_names:
             return _failure(
                 "CAPABILITY_NOT_ACTIVATED",
@@ -192,6 +301,9 @@ class HarnessCapabilityInvoker:
         call_id = new_id("hcall")
         invocation = HarnessInvocationRecord(
             tenant_id=self.tenant_id,
+            tenant_lifecycle_version=(
+                admission.lifecycle_version if admission is not None else 1
+            ),
             session_id=self.session.id,
             task_id=self.task_frame_id,
             run_id=self.run_id,
@@ -201,9 +313,11 @@ class HarnessCapabilityInvoker:
             logical_action_key=logical_action_key,
             status="started",
             arguments_json=_audit_arguments(arguments),
+            language_context_json=self.language_context.model_dump(mode="json"),
         )
         self.db.add(invocation)
         try:
+            self._check_admission()
             self.db.commit()
         except IntegrityError:
             self.db.rollback()
@@ -212,7 +326,15 @@ class HarnessCapabilityInvoker:
                 if replayed is not None:
                     return replayed
             raise
+        post_commit_ingest_job_id: str | None = None
+        side_effect_started = False
         try:
+            # The invocation row is committed before the side effect. Re-read the
+            # tenant immediately before dispatch so a concurrent suspension cannot
+            # turn a claimed call into an external action.
+            self._require_current_tenant_admission(admission)
+            side_effect_started = True
+            # 按能力类型调用唯一适配器；知识维护动作额外保留提交后调度标记。
             self._raise_if_cancelled()
             if descriptor.kind == "internal":
                 result = self._invoke_internal(name, arguments)
@@ -225,14 +347,35 @@ class HarnessCapabilityInvoker:
                     arguments,
                 )
             elif descriptor.kind == "knowledge":
-                result = self._search_knowledge(
-                    _intersect_knowledge_metadata(
-                        descriptor.metadata,
-                        current_descriptor.metadata,
-                    ),
-                    arguments,
-                    call_id=call_id,
+                live_metadata = _intersect_knowledge_metadata(
+                    descriptor.metadata,
+                    current_descriptor.metadata,
                 )
+                if name == "knowledge_search":
+                    result = self._search_knowledge(
+                        live_metadata,
+                        arguments,
+                        call_id=call_id,
+                    )
+                else:
+                    try:
+                        action_result = self._invoke_shared_knowledge_action(
+                            name,
+                            arguments,
+                            live_metadata,
+                            call_id=call_id,
+                        )
+                    except KnowledgeError as exc:
+                        entry = ERROR_REGISTRY.get(exc.code)
+                        result = (
+                            _failure(_INTERNAL_ERROR_CODE, "共享知识动作失败。")
+                            if entry is None
+                            else _failure(entry.code, exc.message, params=exc.details)
+                        )
+                    else:
+                        result = {"success": True, "data": action_result.data}
+                        if not action_result.replayed:
+                            post_commit_ingest_job_id = action_result.ingest_job_id
             elif descriptor.kind == "tool":
                 result = self._invoke_external_tool(
                     descriptor.capability_id,
@@ -251,11 +394,58 @@ class HarnessCapabilityInvoker:
             invocation.finished_at = utc_now()
             invocation.updated_at = utc_now()
             self.db.add(invocation)
+            self._check_admission()
             self.db.commit()
             raise
-        except Exception as exc:
-            result = _failure("HARNESS_TOOL_ERROR", str(exc))
-        if result.get("success") is True:
+        except HarnessExecutionFenced:
+            # Leave a started invocation for recovery reconciliation rather than
+            # allowing the stale worker to publish a fabricated tool result.
+            raise
+        except Exception as exc:  # noqa: BLE001 - map provider failures to a stable tool result.
+            if isinstance(exc, TenantLifecycleDenied):
+                lifecycle_error_code = exc.code
+                lifecycle_error_entry = ERROR_REGISTRY.get(lifecycle_error_code)
+                if lifecycle_error_entry is None:
+                    lifecycle_error_code = _INTERNAL_ERROR_CODE
+                else:
+                    lifecycle_error_code = lifecycle_error_entry.code
+                result = _failure(
+                    lifecycle_error_code,
+                    lifecycle_error_code,
+                    request_id=call_id,
+                    trace_id=self.run_id,
+                )
+            else:
+                result = _failure(
+                    "HARNESS_TOOL_ERROR",
+                    str(exc),
+                    request_id=call_id,
+                    trace_id=self.run_id,
+                    internal=InternalErrorContext(
+                        source="harness_capability",
+                        exception_type=type(exc).__name__,
+                        raw_message=str(exc),
+                    ),
+                )
+        lifecycle_changed = False
+        try:
+            self._require_current_tenant_admission(admission)
+        except TenantLifecycleDenied:
+            lifecycle_changed = side_effect_started and admission is not None
+        if lifecycle_changed:
+            # Once dispatch began, a lifecycle change makes the provider outcome
+            # unknowable; never expose or replay it as ordinary success.
+            result = _failure(
+                "TOOL_CALL_OUTCOME_UNKNOWN",
+                "工具调用已跨越租户生命周期边界，远端结果未知。",
+                request_id=call_id,
+                trace_id=self.run_id,
+            )
+            result["error"]["outcome_unknown"] = True
+        # 将业务结果与调用记录一次提交；失败类型决定 Harness 是否释放重试声明。
+        if lifecycle_changed:
+            invocation.status = "outcome_unknown"
+        elif result.get("success") is True:
             invocation.status = "completed"
         elif _failure_was_not_sent(result):
             # Configuration/authorization failures are known to occur before
@@ -273,8 +463,50 @@ class HarnessCapabilityInvoker:
         invocation.finished_at = utc_now()
         invocation.updated_at = utc_now()
         self.db.add(invocation)
+        self._check_admission()
         self.db.commit()
+        if post_commit_ingest_job_id:
+            # 持久任务必须先提交，再交给复用的异步知识摄取执行器读取。
+            enqueue_async_job(
+                "knowledge_ingest",
+                KnowledgeService(self.db).run_ingest_job,
+                post_commit_ingest_job_id,
+                metadata={
+                    "tenant_id": self.tenant_id,
+                    "source": "shared_knowledge_agent",
+                },
+            )
         return result
+
+    def _optional_tenant_admission(self) -> TenantLifecycleDecision | None:
+        """Read the current lifecycle decision for this invocation when a Tenant exists."""
+        if self.db.get(Tenant, self.tenant_id) is None:
+            return None
+        return require_active_tenant(
+            self.db,
+            self.tenant_id,
+            TenantExecutionKind.JOB_CLAIM,
+            self.run_id,
+        )
+
+    def _check_admission(self) -> None:
+        """Run the enclosing Team wake token before any model/tool-visible step."""
+        check = self.admission_check
+        if callable(check):
+            check()
+
+    def _require_current_tenant_admission(
+        self,
+        admitted: TenantLifecycleDecision | None,
+    ) -> None:
+        """Recheck status and exact version immediately before/after a side effect."""
+        self._check_admission()
+        if admitted is None:
+            return
+        current = self._optional_tenant_admission()
+        if current is None:
+            return
+        require_matching_admission_version(current, admitted.lifecycle_version)
 
     def discover_artifacts(self) -> list[dict[str, Any]]:
         """Publish every user-facing file changed during this AgentLoop run."""
@@ -348,6 +580,7 @@ class HarnessCapabilityInvoker:
         self,
         logical_action_key: str,
     ) -> dict[str, Any] | None:
+        """Replay a completed action or block a duplicate whose remote outcome is unknown."""
         prior = self.db.exec(
             select(HarnessInvocationRecord).where(
                 HarnessInvocationRecord.logical_action_key
@@ -361,13 +594,15 @@ class HarnessCapabilityInvoker:
             and prior.response_cache_json.get("success") is True
         ):
             return _replayed_result(prior)
-        return _failure(
+        blocked = _failure(
             "TOOL_CALL_OUTCOME_UNKNOWN",
             (
                 "相同副作用调用已有未完成的持久化记录；为避免重复提交，"
                 "Harness 不会自动重试，请先核对外部系统状态。"
             ),
         )
+        blocked["error"]["outcome_unknown"] = True
+        return blocked
 
     def _raise_if_cancelled(self) -> None:
         if callable(self.is_cancelled) and self.is_cancelled():
@@ -379,12 +614,14 @@ class HarnessCapabilityInvoker:
         self,
         frozen: CapabilityDescriptor,
     ) -> CapabilityDescriptor | None:
+        """按会话的实时团队权限重验能力；返回值不替换冻结清单中的知识版本。"""
         try:
             current = CapabilityManifestBuilder(self.db).build(
                 self.tenant_id,
                 self.agent_id,
                 self.active_skill,
                 self.active_step_id,
+                team_id=self.session.team_id,
             )
         except CapabilityAuthorizationError:
             return None
@@ -494,10 +731,128 @@ class HarnessCapabilityInvoker:
             return self._search_capabilities(arguments)
         if name == "capability_describe":
             return self._describe_capabilities(arguments)
+        if name == "list_published_deliverables":
+            return self._list_published_deliverables(arguments)
+        if name == "read_published_deliverable":
+            return self._read_published_deliverable(arguments)
         return _failure(
             "UNSUPPORTED_INTERNAL_CAPABILITY",
             "不支持的 Harness 内部能力。",
         )
+
+    def _list_published_deliverables(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        raw_limit = arguments.get("limit", MAX_PUBLISHED_DELIVERABLES)
+        if isinstance(raw_limit, bool) or not isinstance(raw_limit, int):
+            return _failure("INVALID_ARGUMENTS", "limit 必须是整数。")
+        rows = list_published_deliverables(
+            self.db,
+            tenant_id=self.tenant_id,
+            session_id=self.session.id,
+            query=str(arguments.get("query") or ""),
+            limit=raw_limit,
+            exclude_task_frame_id=self.task_frame_id,
+        )
+        return {
+            "success": True,
+            "data": {
+                "deliverables": rows,
+                "count": len(rows),
+                "notice": (
+                    "使用 read_published_deliverable 读取所需文件，"
+                    "不要用 read_file 猜测旧工作区路径。"
+                ),
+            },
+        }
+
+    def _read_published_deliverable(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        task_frame_id = str(arguments.get("task_frame_id") or "").strip()
+        path = str(arguments.get("path") or "").strip()
+        if not task_frame_id or not path:
+            return _failure("INVALID_ARGUMENTS", "task_frame_id 和 path 不能为空。")
+        artifact = find_published_deliverable(
+            self.db,
+            tenant_id=self.tenant_id,
+            session_id=self.session.id,
+            task_frame_id=task_frame_id,
+            path=path,
+        )
+        if artifact is None:
+            return _failure(
+                "PUBLISHED_DELIVERABLE_NOT_FOUND",
+                "当前会话中没有该历史交付物。",
+            )
+        read_arguments = {
+            key: arguments[key]
+            for key in ("path", "offset", "max_bytes", "continuation_token")
+            if key in arguments
+        }
+        try:
+            read_file_arguments = ReadFileArguments.model_validate(read_arguments)
+        except ValidationError:
+            return _failure(
+                "INVALID_ARGUMENTS",
+                "Tool arguments failed schema validation.",
+            )
+
+        opened = None
+        try:
+            opened, _workspace_root = open_harness_task_artifact(
+                tenant_id=self.tenant_id,
+                session_id=self.session.id,
+                task_frame_id=task_frame_id,
+                path=path,
+                db=self.db,
+            )
+            actual_sha256 = opened.sha256()
+            expected_sha256 = str(artifact.get("sha256") or "").strip().lower()
+            expected_size = artifact.get("size")
+            if (
+                (expected_sha256 and expected_sha256 != actual_sha256.lower())
+                or (isinstance(expected_size, int) and expected_size != opened.size)
+            ):
+                return _failure(
+                    "PUBLISHED_DELIVERABLE_CHANGED",
+                    "历史交付物在发布后已发生变化，拒绝读取。",
+                )
+            data = read_opened_harness_artifact(
+                self._file_context,
+                read_file_arguments,
+                opened,
+                path=str(artifact.get("path") or path),
+                sha256=actual_sha256,
+            )
+        except HarnessWorkspaceArtifactConflictError:
+            return _failure(
+                "PUBLISHED_DELIVERABLE_LOCATION_CONFLICT",
+                "历史交付物在多个兼容工作区位置同时存在，拒绝读取。",
+            )
+        except (HarnessArtifactAccessError, OSError):
+            return _failure(
+                "PUBLISHED_DELIVERABLE_NOT_FOUND",
+                "历史交付物不存在或无法安全读取。",
+            )
+        except HarnessExecutionError as exc:
+            entry = ERROR_REGISTRY.get(exc.error.code)
+            if entry is None:
+                return _failure(_INTERNAL_ERROR_CODE, "历史交付物读取失败。")
+            return _failure(
+                entry.code,
+                exc.error.message,
+                retryable=exc.error.retryable,
+                params=dict(exc.error.details),
+            )
+        finally:
+            if opened is not None:
+                opened.close()
+
+        data.update(
+            {
+                "task_frame_id": task_frame_id,
+                "display_name": artifact.get("display_name"),
+                "published_at": artifact.get("published_at"),
+            }
+        )
+        return {"success": True, "data": data}
 
     def _search_capabilities(self, arguments: dict[str, Any]) -> dict[str, Any]:
         query = str(arguments.get("query") or "").strip()
@@ -657,7 +1012,6 @@ class HarnessCapabilityInvoker:
                 "operation": "read",
                 "requested_operation": requested_operation,
                 "phase": "instructions_loaded",
-                "message": "已加载技能说明，AgentLoop 将按说明选择 Harness 工具",
             },
         )
         return result
@@ -780,6 +1134,9 @@ class HarnessCapabilityInvoker:
         event_type: str,
         payload: dict[str, Any],
     ) -> None:
+        """Emit a trace event, projecting general-Skill payloads to stable descriptors."""
+        if event_type == "general_skill_trace":
+            payload = canonical_general_skill_trace_payload(payload)
         if callable(self.trace_sink):
             self.trace_sink(event_type, payload)
 
@@ -819,20 +1176,35 @@ class HarnessCapabilityInvoker:
             for kb_id in selected
             if str(version_by_base.get(kb_id) or "").strip()
         ]
-        response = KnowledgeService(self.db).search(
-            KnowledgeSearchRequest(
-                tenant_id=self.tenant_id,
-                agent_id=self.agent_id,
-                query=query,
-                mode="chat",
-                knowledge_base_ids=selected,
-                knowledge_base_version_ids=selected_version_ids,
-                max_chunks=max(
-                    1, min(int(arguments.get("max_chunks") or 8), 12)
+        authorized_versions = {
+            knowledge_base_id: str(version_by_base[knowledge_base_id])
+            for knowledge_base_id in selected
+            if str(version_by_base.get(knowledge_base_id) or "").strip()
+        }
+        try:
+            response = KnowledgeService(self.db).search(
+                KnowledgeSearchRequest(
+                    tenant_id=self.tenant_id,
+                    agent_id=self.agent_id,
+                    query=query,
+                    mode="chat",
+                    knowledge_base_ids=selected,
+                    knowledge_base_version_ids=selected_version_ids,
+                    max_chunks=max(
+                        1, min(int(arguments.get("max_chunks") or 8), 12)
+                    ),
                 ),
-            ),
-            self.model_config,
-        )
+                self.model_config,
+                trusted_team_id=self.session.team_id,
+                authorized_knowledge_versions=authorized_versions,
+            )
+        except KnowledgeError as exc:
+            entry = ERROR_REGISTRY.get(exc.code)
+            return (
+                _failure(_INTERNAL_ERROR_CODE, "知识检索失败。")
+                if entry is None
+                else _failure(entry.code, exc.message, params=exc.details)
+            )
         payload = response.model_dump(mode="json")
         result = {
             "success": True,
@@ -840,6 +1212,45 @@ class HarnessCapabilityInvoker:
             "citations": knowledge_citations_from_results([payload]),
         }
         return self._persist_large_json_result(result, call_id=call_id)
+
+    def _invoke_shared_knowledge_action(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        metadata: dict[str, Any],
+        *,
+        call_id: str,
+    ) -> SharedKnowledgeAgentActionResult:
+        """用 Harness 服务端身份执行共享知识动作，并传入本轮冻结版本映射。"""
+        if not self.agent_id:
+            raise KnowledgeError(
+                "KNOWLEDGE_CONTEXT_MISMATCH",
+                "共享知识 Agent 动作缺少员工身份。",
+            )
+        context = CapabilityContext(
+            request_id=call_id,
+            tenant_id=self.tenant_id,
+            agent_id=self.agent_id,
+            user_id=str(self.session.user_id or "harness"),
+            session_id=self.session.id,
+            turn_id=self.task_frame_id,
+            channel=str(self.session.channel or "harness_v2"),
+            team_id=self.session.team_id,
+        )
+        frozen_versions = (
+            metadata.get("knowledge_version_by_base_id")
+            if isinstance(metadata.get("knowledge_version_by_base_id"), dict)
+            else {}
+        )
+        return SharedKnowledgeAgentRuntime(self.db).execute(
+            context,
+            name,
+            arguments,
+            frozen_knowledge_versions={
+                str(knowledge_base_id): str(version_id)
+                for knowledge_base_id, version_id in frozen_versions.items()
+            },
+        )
 
     def _invoke_external_tool(
         self,
@@ -877,20 +1288,29 @@ class HarnessCapabilityInvoker:
                 schema=(tool.input_schema if isinstance(tool.input_schema, dict) else None),
             )
         except HarnessExecutionError as exc:
+            entry = ERROR_REGISTRY.get(exc.error.code)
+            if entry is None:
+                return _failure(_INTERNAL_ERROR_CODE, "工具结果引用解析失败。")
             return _failure(
-                exc.error.code,
+                entry.code,
                 exc.error.message,
                 retryable=exc.error.retryable,
-                details=dict(exc.error.details),
+                params=dict(exc.error.details),
             )
         result = ToolExecutor(self.db).execute(
             self.tenant_id,
-            ToolCall(name=source_tool_name, arguments=resolved_arguments),
+            ToolCall(
+                name=source_tool_name,
+                arguments=resolved_arguments,
+                language_context=self.language_context,
+            ),
             active_skill_id=self.active_skill_id,
             agent_id=self.agent_id,
             session_id=self.session.id,
             invocation_id=call_id,
             timeout_seconds_override=self._remaining_step_seconds(),
+            language_context=self.language_context,
+            user_id=self.session.user_id,
         )
         payload = result.model_dump(mode="json")
         # MCP Apps payloads belong to the host UI, not to the isolated model
@@ -1201,13 +1621,67 @@ def _intersect_knowledge_metadata(
     }
 
 
-def _failure(code: str, message: str, **details: Any) -> dict[str, Any]:
-    error = {
-        "code": code,
-        "message": message,
-        "retryable": False,
-    }
-    error.update(details)
+def _failure(
+    code: str,
+    message: str,
+    *,
+    params: Mapping[str, Any] | None = None,
+    retryable: bool = False,
+    request_id: str | None = None,
+    trace_id: str | None = None,
+    internal: InternalErrorContext | None = None,
+    details: Mapping[str, Any] | None = None,
+    cause: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Project one Harness failure after exact registry validation and private-cause separation."""
+    # Compatibility workflow: accept the historical details alias as safe params, then
+    # validate the complete descriptor before choosing a public code.
+    safe_params = dict(params or {})
+    safe_params.update(details or {})
+    public_code = code
+    public_retryable = retryable
+    private_internal = internal
+    try:
+        entry = ERROR_REGISTRY.require(code)
+        if entry.visibility is not ErrorVisibility.PUBLIC:
+            raise ErrorContractViolation(f"non-public Harness error code: {code}")
+        descriptor = ErrorDescriptor(
+            code=code,
+            params=safe_params,
+            retryable=retryable,
+            request_id=request_id,
+            trace_id=trace_id,
+        )
+        ERROR_REGISTRY.validate(descriptor)
+    except (ErrorContractViolation, ValidationError):
+        # Unknown or drifted producer data is never allowed to reach a product sink;
+        # preserve the original code and prose only through a private diagnostic cause.
+        public_code = _INTERNAL_ERROR_CODE
+        safe_params = {}
+        public_retryable = ERROR_REGISTRY.require(public_code).retryable_default
+        if private_internal is None:
+            private_internal = InternalErrorContext(
+                source="harness_failure",
+                exception_type="ErrorContractViolation",
+                raw_message=message,
+                upstream_code=code,
+            )
+    if cause is not None and private_internal is None:
+        private_internal = InternalErrorContext(
+            source="harness_failure",
+            exception_type="HarnessFailureCause",
+            raw_message=str(cause.get("message") or message),
+            upstream_code=str(cause.get("code") or code),
+        )
+    error = HarnessExecutionError(
+        public_code,
+        message,
+        retryable=public_retryable,
+        details=safe_params,
+        request_id=request_id,
+        trace_id=trace_id,
+        internal=private_internal,
+    ).to_public_payload()
     return {
         "success": False,
         "error": error,
@@ -1330,6 +1804,7 @@ def _safe_general_skill_file_path(path: str) -> str:
 
 
 def _failure_was_not_sent(result: dict[str, Any]) -> bool:
+    """判断失败是否发生在任何外部或持久副作用之前，以决定是否释放重试声明。"""
     error = result.get("error")
     code = str(error.get("code") or "") if isinstance(error, dict) else ""
     return code in {
@@ -1343,7 +1818,47 @@ def _failure_was_not_sent(result: dict[str, Any]) -> bool:
         "CAPABILITY_NOT_ACTIVATED",
         "CAPABILITY_NOT_AVAILABLE",
         "INVALID_ARGUMENTS",
+        "KNOWLEDGE_CONTEXT_MISMATCH",
+        "KNOWLEDGE_GRANT_REQUIRED",
+        "KNOWLEDGE_DEFAULT_NOT_CONFIGURED",
+        "KNOWLEDGE_PUBLISH_CONFLICT",
+        "KNOWLEDGE_VERSION_NOT_READY",
+        "KNOWLEDGE_MODE_INVALID",
+        "KNOWLEDGE_IDEMPOTENCY_CONFLICT",
+        "KNOWLEDGE_IDEMPOTENCY_REQUIRED",
     }
+
+
+def _invoker_language_context(
+    db: Any,
+    run_id: str,
+    session: ChatSession,
+    supplied: LanguageContext | dict[str, Any] | None,
+) -> LanguageContext:
+    """Resolve invoker locale from a supplied, durable run, or controlled legacy session snapshot."""
+    candidates: list[object] = [supplied]
+    if run_id:
+        run = db.get(HarnessRunRecord, run_id)
+        if run is not None:
+            candidates.append(run.language_context_json)
+    candidates.append(None)
+    for snapshot in candidates:
+        if snapshot is None:
+            continue
+        try:
+            return resolve_compatible_language_context(
+                snapshot=snapshot,
+                legacy_ui_locale=getattr(session, "ui_locale", None),
+                legacy_agent_reply_locale=getattr(session, "agent_reply_locale", None),
+            )
+        except (TypeError, ValueError):
+            continue
+    return resolve_language_context(
+        LanguageContextInputs(
+            user_ui_locale=getattr(session, "ui_locale", None),
+            session_agent_reply_locale=getattr(session, "agent_reply_locale", None),
+        )
+    )
 
 
 def _replayed_result(invocation: HarnessInvocationRecord) -> dict[str, Any]:

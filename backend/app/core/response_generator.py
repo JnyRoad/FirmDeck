@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import re
 from collections.abc import Iterator
 
 from app import paths
+from app.contracts.error_registry import ERROR_REGISTRY, ErrorVisibility
 from app.core.context_projection import (
     compact_citation_hints,
     compact_current_step,
@@ -11,13 +11,15 @@ from app.core.context_projection import (
     compact_response_step_result,
 )
 from app.db.models import ChatSession, ModelConfig, Skill
+from app.i18n.language_context import LanguageContext
+from app.i18n.raw_source import RawSourceKind, RawSourceMarker
 from app.knowledge.citations import knowledge_citations_from_results
 from app.llm import LLMClient
+from app.llm.prompts.language import language_prompt_contract, localized_compat_text
 from app.llm.stage_protocol import stage_payload, unified_system_prompt
 from app.observability.spans import llm_operation
 from app.session.session_schema import RouterDecision, StepAgentResult
 from app.tools.tool_schema import ToolResult
-
 
 PROMPT_PATH = paths.resource_dir() / "app" / "llm" / "prompts" / "response_generator_prompt.md"
 FALLBACK_REPLY = "抱歉，我暂时无法处理这个问题。您可以换个说法，或者我可以帮您转人工。"
@@ -25,13 +27,26 @@ MODEL_FAILURE_SUGGESTION = "请检查模型配置、API Key、网络或模型服
 TOOL_FAILURE_SUGGESTION = "请检查工具配置、调用参数或外部服务状态后重试。"
 
 
+_LEGACY_ERROR_CODE_ALIASES = {
+    "LLM_ERROR": "MODEL_UPSTREAM_ERROR",
+    "HARNESS_V2_ERROR": "INTERNAL_ERROR",
+}
+
+
+def public_error_code(value: object, fallback: str = "INTERNAL_ERROR") -> str:
+    """Return a registered public error code without exposing provider-owned identifiers."""
+    candidate = value.strip() if isinstance(value, str) else ""
+    candidate = _LEGACY_ERROR_CODE_ALIASES.get(candidate, candidate)
+    entry = ERROR_REGISTRY.get(candidate)
+    if entry is None or entry.visibility is not ErrorVisibility.PUBLIC:
+        return fallback
+    return entry.code
+
+
 def public_error_detail(value: object, fallback: str = "未知原因") -> str:
-    detail = re.sub(r"\s+", " ", str(value or "")).strip()
-    detail = re.sub(r"\bsk-[A-Za-z0-9_-]{8,}\b", "sk-***", detail)
-    detail = re.sub(r"\bpt-[A-Za-z0-9_-]{8,}\b", "pt-***", detail)
-    if not detail:
-        detail = fallback
-    return detail[:500]
+    """Return a caller-owned compatibility placeholder; raw exception text is never public."""
+    del value
+    return fallback
 
 
 def format_runtime_failure_reply(
@@ -39,28 +54,65 @@ def format_runtime_failure_reply(
     detail: object,
     code: str | None = None,
     suggestion: str | None = None,
+    language_context: LanguageContext | None = None,
 ) -> str:
-    normalized_detail = public_error_detail(detail)
-    normalized_code = public_error_detail(code, "").strip()
-    code_part = f"（{normalized_code}）" if normalized_code else ""
-    normalized_detail = normalized_detail.rstrip("。.!！")
-    suffix = (suggestion or "请稍后重试，或联系管理员查看执行记录。").strip()
+    """Format a developer-owned runtime fallback in the bound reply locale."""
+    del detail, suggestion
+    normalized_code = public_error_code(code, "") if code else ""
+    is_english = localized_compat_text(
+        language_context,
+        zh_cn="zh",
+        en_us="en",
+    ) == "en"
+    code_part = (
+        f" ({normalized_code})"
+        if normalized_code and is_english
+        else f"（{normalized_code}）" if normalized_code else ""
+    )
+    normalized_detail = localized_compat_text(
+        language_context,
+        zh_cn="本次操作未完成",
+        en_us="The operation could not be completed",
+    )
+    suffix = localized_compat_text(
+        language_context,
+        zh_cn="请稍后重试，或联系管理员查看执行记录。",
+        en_us="Please try again later or ask an administrator to inspect the run record.",
+    ).strip()
+    if is_english:
+        return f"{title}{code_part}: {normalized_detail}. {suffix}"
     return f"{title}{code_part}：{normalized_detail}。{suffix}"
 
 
-def model_failure_suggestion(detail: object) -> str:
-    return MODEL_FAILURE_SUGGESTION
+def model_failure_suggestion(language_context: LanguageContext | None = None) -> str:
+    """Return the locale-bound model recovery hint without exposing the raw failure."""
+    return localized_compat_text(
+        language_context,
+        zh_cn=MODEL_FAILURE_SUGGESTION,
+        en_us="Check the model configuration, API key, network, or model service and retry.",
+    )
 
 
-def tool_failure_reply(tool_result: ToolResult) -> str:
-    error = tool_result.error
-    code = error.code if error else None
-    detail = error.message if error else "工具未返回可用结果"
+def tool_failure_reply(
+    tool_result: ToolResult,
+    language_context: LanguageContext | None = None,
+) -> str:
+    """Project a tool failure through a locale-bound compatibility template."""
+    error_value = getattr(tool_result, "error", None)
+    code = public_error_code(
+        getattr(error_value, "code", None),
+        fallback="TOOL_UPSTREAM_ERROR",
+    )
     return format_runtime_failure_reply(
-        f"工具调用失败：{tool_result.tool_name}",
-        detail,
+        localized_compat_text(
+            language_context,
+            zh_cn="工具调用失败",
+            en_us="Tool call failed",
+        ),
+        "",
         code,
-        TOOL_FAILURE_SUGGESTION,
+        None,
+        language_context,
     )
 
 
@@ -78,7 +130,9 @@ class ResponseGenerator:
         memory_context: list[dict[str, object]] | None = None,
         conversation_context: dict[str, object] | None = None,
         task_results: list[dict[str, object]] | None = None,
+        language_context: LanguageContext | None = None,
     ) -> str:
+        """Generate one final reply using reply locale while retaining raw source fields verbatim."""
         if self._can_use_step_reply_directly(step_result, tool_result, task_results):
             return step_result.reply.strip()
         raw_payload = self._payload(
@@ -92,20 +146,43 @@ class ResponseGenerator:
             conversation_context,
             task_results,
         )
-        payload = self._stage_payload(raw_payload, persona_prompt)
+        payload = self._stage_payload(raw_payload, persona_prompt, language_context)
         try:
             if tool_result and not tool_result.success and not task_results:
-                return tool_failure_reply(tool_result)
+                return tool_failure_reply(tool_result, language_context)
             with llm_operation("response.generate"):
                 text = LLMClient(model_config).generate_text(
                     unified_system_prompt(), payload
                 )
-            reply = text.strip() or step_result.reply or self._minimal_fallback(router_decision)
+            reply = text.strip() or step_result.reply or self._minimal_fallback(
+                router_decision,
+                language_context,
+            )
             return self._visible_reply_or_fallback(
-                reply, session, router_decision, step_result, tool_result, skill
+                reply,
+                session,
+                router_decision,
+                step_result,
+                tool_result,
+                skill,
+                language_context,
             )
         except Exception as exc:
-            return format_runtime_failure_reply("模型调用失败", exc, "LLM_ERROR", model_failure_suggestion(exc))
+            safe_code = public_error_code(
+                getattr(exc, "code", None),
+                "MODEL_UPSTREAM_ERROR",
+            )
+            return format_runtime_failure_reply(
+                localized_compat_text(
+                    language_context,
+                    zh_cn="模型调用失败",
+                    en_us="Model call failed",
+                ),
+                "",
+                safe_code,
+                model_failure_suggestion(language_context),
+                language_context,
+            )
 
     def generate_stream(
         self,
@@ -120,7 +197,9 @@ class ResponseGenerator:
         memory_context: list[dict[str, object]] | None = None,
         conversation_context: dict[str, object] | None = None,
         task_results: list[dict[str, object]] | None = None,
+        language_context: LanguageContext | None = None,
     ) -> Iterator[str]:
+        """Stream a locale-bound reply while preserving raw fragments and deterministic fallbacks."""
         if self._can_use_step_reply_directly(step_result, tool_result, task_results):
             yield from self.chunk_text(step_result.reply or "")
             return
@@ -135,10 +214,10 @@ class ResponseGenerator:
             conversation_context,
             task_results,
         )
-        payload = self._stage_payload(raw_payload, persona_prompt)
+        payload = self._stage_payload(raw_payload, persona_prompt, language_context)
         try:
             if tool_result and not tool_result.success and not task_results:
-                yield from self.chunk_text(tool_failure_reply(tool_result))
+                yield from self.chunk_text(tool_failure_reply(tool_result, language_context))
                 return
             if router_decision.decision == "clarify" and step_result.reply:
                 yield from self.chunk_text(step_result.reply)
@@ -162,18 +241,35 @@ class ResponseGenerator:
             if has_streamed:
                 return
             reply = self._visible_reply_or_fallback(
-                "".join(reply_parts).strip() or step_result.reply or self._minimal_fallback(router_decision),
+                "".join(reply_parts).strip()
+                or step_result.reply
+                or self._minimal_fallback(router_decision, language_context),
                 session,
                 router_decision,
                 step_result,
                 tool_result,
                 skill,
+                language_context,
             )
             yield from self.chunk_text(reply)
             return
         except Exception as exc:
+            safe_code = public_error_code(
+                getattr(exc, "code", None),
+                "MODEL_UPSTREAM_ERROR",
+            )
             yield from self.chunk_text(
-                format_runtime_failure_reply("模型调用失败", exc, "LLM_ERROR", model_failure_suggestion(exc))
+                format_runtime_failure_reply(
+                    localized_compat_text(
+                        language_context,
+                        zh_cn="模型调用失败",
+                        en_us="Model call failed",
+                    ),
+                    "",
+                    safe_code,
+                    model_failure_suggestion(language_context),
+                    language_context,
+                )
             )
 
     def chunk_text(self, text: str, chunk_size: int = 8) -> Iterator[str]:
@@ -273,6 +369,7 @@ class ResponseGenerator:
                     "task_frame_id": item.get("task_frame_id"),
                     "status": item.get("status"),
                     "task_summary": item.get("task_summary"),
+                    "structured_result": item.get("structured_result"),
                     "current_step": compact_current_step(
                         content, str(item.get("current_step_id") or "") or None
                     ),
@@ -312,25 +409,38 @@ class ResponseGenerator:
         step_result: StepAgentResult,
         tool_result: ToolResult | None,
         skill: Skill | None = None,
+        language_context: LanguageContext | None = None,
     ) -> str:
+        """Choose the first usable reply with locale-bound developer fallbacks."""
         completion_ready = self._skill_completion_ready(session, skill, step_result, tool_result)
-        completion_fallback = self._completion_fallback() if completion_ready else ""
+        completion_fallback = (
+            self._completion_fallback(language_context) if completion_ready else ""
+        )
         prefer_step_reply = bool(step_result.reply and router_decision.decision == "clarify")
+        fallback_reply = localized_compat_text(
+            language_context,
+            zh_cn=FALLBACK_REPLY,
+            en_us=(
+                "Sorry, I cannot handle this request right now. Try rephrasing it, "
+                "or I can help you contact a person."
+            ),
+        )
         candidates = self._reply_candidates(
             reply,
             step_result.reply or "",
             completion_fallback,
-            self._minimal_fallback_for_session(session),
+            self._minimal_fallback_for_session(session, language_context),
             tool_result,
             completion_ready,
             prefer_step_reply,
+            fallback_reply,
         )
         for candidate in candidates:
             stripped = candidate.strip()
             if not stripped:
                 continue
             return stripped
-        return FALLBACK_REPLY
+        return fallback_reply
 
     def _reply_candidates(
         self,
@@ -341,14 +451,16 @@ class ResponseGenerator:
         tool_result: ToolResult | None,
         completion_ready: bool,
         prefer_step_reply: bool,
+        fallback_reply: str = FALLBACK_REPLY,
     ) -> tuple[str, ...]:
+        """Order model, direct, completion, and compatibility replies for one turn state."""
         if prefer_step_reply:
             return (
                 step_reply,
                 model_reply,
                 completion_fallback,
                 session_fallback,
-                FALLBACK_REPLY,
+                fallback_reply,
             )
         if completion_ready:
             return (
@@ -356,7 +468,7 @@ class ResponseGenerator:
                 completion_fallback,
                 step_reply,
                 session_fallback,
-                FALLBACK_REPLY,
+                fallback_reply,
             )
         if tool_result is not None:
             return (
@@ -364,14 +476,14 @@ class ResponseGenerator:
                 step_reply,
                 completion_fallback,
                 session_fallback,
-                FALLBACK_REPLY,
+                fallback_reply,
             )
         return (
             model_reply,
             step_reply,
             completion_fallback,
             session_fallback,
-            FALLBACK_REPLY,
+            fallback_reply,
         )
 
     def _progress_payload(
@@ -441,23 +553,56 @@ class ResponseGenerator:
         value = slots.get(field)
         return value is not None and value != ""
 
-    def _completion_fallback(self) -> str:
-        return "已记录完整信息。请问还有其他需要帮助的吗？"
+    def _completion_fallback(
+        self,
+        language_context: LanguageContext | None = None,
+    ) -> str:
+        """Return the locale-bound completion fallback for a fully satisfied step."""
+        return localized_compat_text(
+            language_context,
+            zh_cn="已记录完整信息。请问还有其他需要帮助的吗？",
+            en_us="The complete information has been recorded. Is there anything else I can help with?",
+        )
 
-    def _minimal_fallback_for_session(self, session: ChatSession) -> str:
-        return "请您再补充一下具体诉求，我会继续帮您处理。"
+    def _minimal_fallback_for_session(
+        self,
+        session: ChatSession,
+        language_context: LanguageContext | None = None,
+    ) -> str:
+        """Return the locale-bound prompt used when a session has no visible reply."""
+        return localized_compat_text(
+            language_context,
+            zh_cn="请您再补充一下具体诉求，我会继续帮您处理。",
+            en_us="Please add a little more detail about your request and I will continue.",
+        )
 
-    def _minimal_fallback(self, router_decision: RouterDecision) -> str:
+    def _minimal_fallback(
+        self,
+        router_decision: RouterDecision,
+        language_context: LanguageContext | None = None,
+    ) -> str:
+        """Use a planner clarification when present, otherwise return a locale-bound fallback."""
         if router_decision.decision == "clarify" and router_decision.clarification_question:
             return router_decision.clarification_question
-        return FALLBACK_REPLY
+        return localized_compat_text(
+            language_context,
+            zh_cn=FALLBACK_REPLY,
+            en_us=(
+                "Sorry, I cannot handle this request right now. Try rephrasing it, "
+                "or I can help you contact a person."
+            ),
+        )
 
     def _system_prompt(self, persona_prompt: str | None) -> str:
         return unified_system_prompt()
 
     def _stage_payload(
-        self, payload: dict[str, object], persona_prompt: str | None
+        self,
+        payload: dict[str, object],
+        persona_prompt: str | None,
+        language_context: LanguageContext | None = None,
     ) -> dict[str, object]:
+        """Wrap response inputs with reply-locale control and exact raw-source markers."""
         stage_data = {
             key: value
             for key, value in payload.items()
@@ -465,6 +610,47 @@ class ResponseGenerator:
         }
         if persona_prompt:
             stage_data = {"employee_identity": persona_prompt.strip(), **stage_data}
+        markers = [
+            RawSourceMarker(
+                json_pointer="/user_message",
+                kind=RawSourceKind.USER_INPUT,
+            ),
+            RawSourceMarker(
+                json_pointer="/conversation_context",
+                kind=RawSourceKind.HISTORY,
+            ),
+            RawSourceMarker(
+                json_pointer="/task_results",
+                kind=RawSourceKind.TOOL_PROVIDER_OUTPUT,
+            ),
+            RawSourceMarker(
+                json_pointer="/step_summary",
+                kind=RawSourceKind.TOOL_PROVIDER_OUTPUT,
+            ),
+            RawSourceMarker(
+                json_pointer="/tool_result",
+                kind=RawSourceKind.TOOL_PROVIDER_OUTPUT,
+            ),
+            RawSourceMarker(
+                json_pointer="/retrieved_knowledge",
+                kind=RawSourceKind.KNOWLEDGE,
+            ),
+            RawSourceMarker(
+                json_pointer="/knowledge_citation_hints",
+                kind=RawSourceKind.KNOWLEDGE,
+            ),
+        ]
+        if persona_prompt:
+            markers.append(
+                RawSourceMarker(
+                    json_pointer="/employee_identity",
+                    kind=RawSourceKind.BUSINESS_RECORD,
+                )
+            )
+        stage_data = {
+            **language_prompt_contract(language_context, markers),
+            **stage_data,
+        }
         return stage_payload(
             phase="Response Generator",
             user_message=str(payload.get("user_message") or ""),
@@ -474,5 +660,8 @@ class ResponseGenerator:
             memory_context=None,
             instructions=PROMPT_PATH.read_text(encoding="utf-8"),
             stage_data=stage_data,
-            output_contract="只输出最终用户可见的纯文本，不输出 JSON、Markdown 代码围栏、分析过程或内部状态。",
+            output_contract=(
+                "只输出最终用户可见的 Markdown 正文，不输出 JSON 外壳、分析过程或内部状态；"
+                "除非用户明确请求代码，否则不要使用 Markdown 代码围栏。"
+            ),
         )

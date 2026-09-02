@@ -4,8 +4,8 @@ from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.i18n.language_context import LanguageContext, SupportedLocale, normalize_locale
 from app.tools.tool_schema import ToolCall, ToolResult
-
 
 RouterDecisionValue = Literal[
     "continue_active",
@@ -19,6 +19,7 @@ RouterDecisionValue = Literal[
     "clarify",
 ]
 TaskFrameKind = Literal["sop", "conversation"]
+TaskFrameExecutionTarget = Literal["self", "team_member"]
 TaskFrameRunStatus = Literal[
     "queued",
     "running",
@@ -58,11 +59,19 @@ class PlannedTaskFrame(BaseModel):
     requirements: list[str] = Field(default_factory=list)
     slot_hints: dict[str, Any] = Field(default_factory=dict)
     depends_on_task_ids: list[str] = Field(default_factory=list)
+    execution_target: TaskFrameExecutionTarget = "self"
+    assignee_agent_id: Optional[str] = None
+    activation_condition: dict[str, Any] = Field(default_factory=dict)
     source_message: Optional[str] = None
 
     @field_validator("slot_hints", mode="before")
     @classmethod
     def _default_null_slot_hints(cls, value: Any) -> Any:
+        return {} if value is None else value
+
+    @field_validator("activation_condition", mode="before")
+    @classmethod
+    def _default_null_activation_condition(cls, value: Any) -> Any:
         return {} if value is None else value
 
     @field_validator("requirements", "depends_on_task_ids", mode="before")
@@ -209,9 +218,13 @@ class ChatTurnRequest(BaseModel):
     client_turn_id: Optional[str] = None
     user_id: Optional[str] = None
     message: str
+    ui_locale: SupportedLocale | None = None
+    agent_reply_locale: SupportedLocale | None = None
+    language_context: LanguageContext | None = Field(default=None, exclude=True)
     attachments: list["ChatAttachmentRead"] = Field(default_factory=list)
     channel: str = "web"
     interaction_mode: Literal["normal", "scheduled_task", "team_task", "team_tl"] = "normal"
+    team_context: Optional["TeamPlannerContext"] = Field(default=None, exclude=True)
     # Server-only prompt prefix. It is consumed by the runtime but never persisted as
     # the user's visible message or serialized into background-job payloads.
     context_injection: Optional[str] = Field(default=None, exclude=True)
@@ -228,6 +241,25 @@ class ChatTurnRequest(BaseModel):
     forced_sop_snapshot: Optional[dict[str, Any]] = Field(default=None, exclude=True)
     client_timezone: Optional[str] = None
     debug: bool = False
+
+    @field_validator("ui_locale", "agent_reply_locale", mode="before")
+    @classmethod
+    def _normalize_locale_fields(cls, value: Any) -> SupportedLocale | None:
+        """Normalize request locale aliases to the supported BCP 47 enum values."""
+        return normalize_locale(value)
+
+
+class TeamPlannerMember(BaseModel):
+    agent_id: str
+    name: str
+    role: Optional[str] = None
+    capabilities: list[str] = Field(default_factory=list)
+
+
+class TeamPlannerContext(BaseModel):
+    team_id: str
+    leader_agent_id: str
+    members: list[TeamPlannerMember] = Field(default_factory=list)
 
 
 class ChatAttachmentRead(BaseModel):
@@ -248,6 +280,9 @@ class ChatAttachmentRead(BaseModel):
 class ChatTurnResponse(BaseModel):
     reply: str
     session_id: str
+    ui_locale: SupportedLocale | None = None
+    agent_reply_locale: SupportedLocale | None = None
+    language_context: LanguageContext | None = None
     runtime_error_code: Optional[str] = None
     router_decision: Optional[RouterDecision] = None
     step_result: Optional[StepAgentResult] = None
@@ -277,6 +312,10 @@ class ChatSessionRead(BaseModel):
     active_skill_id: Optional[str]
     active_step_id: Optional[str]
     status: str
+    # Public session reads expose the authoritative Agent reply locale only;
+    # UI locale remains a user preference and is never inferred from session data.
+    agent_reply_locale: SupportedLocale | None = None
+    agent_reply_locale_source: str | None = None
     summary: Optional[str]
     last_agent_question: Optional[str]
     is_scheduled: bool = False

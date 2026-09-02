@@ -1,6 +1,7 @@
 import os as _os
 from functools import lru_cache
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -8,6 +9,8 @@ class Settings(BaseSettings):
     app_name: str = "Skill Agent Loop Service"
     database_url: str = "sqlite:///./skill_agent_loop.db"
     app_secret: str = "change-me-in-development"
+    staffdeck_public_url: str = ""
+    system_admin_secret: str = Field(default="", repr=False, exclude=True)
     demo_model_base_url: str = "http://localhost:52010/v1"
     demo_model_name: str = "qwen3.6-27b"
     demo_model_api_key: str = ""
@@ -21,7 +24,9 @@ class Settings(BaseSettings):
     codex_a2a_command: str = "codex"
     codex_a2a_workspace_root: str = ""
     codex_a2a_timeout_seconds: float = 1800.0
-    codex_a2a_token: str = ""
+    codex_a2a_token: str = Field(default="", repr=False, exclude=True)
+    codex_subscription_command: str = "codex"
+    codex_subscription_timeout_seconds: float = 30.0
     tool_base_url: str = "http://localhost:5173"
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
     general_skill_runtime_python: str = ""
@@ -55,6 +60,12 @@ class Settings(BaseSettings):
     # 一张独立卡片展示智能体每一步（SOP/工具/知识检索），与正文回复互不影响。
     # 仅影响飞书渠道；关闭时退化为仅发最终回复。
     channel_feishu_trace_enabled: bool = True
+    # 飞书 trace 卡片 SOP 紧凑展示开关：开启后匹配 SOP（判断意图/进入流程）之后的
+    # 中间步骤不再逐行展示，仅显示"翻书动画 + 正在推进SOP"，等待用户补充信息时
+    # 定格为"📖 流程已暂停"，SOP 结束时定格为"✅ 流程已结束"。设为 False 可整体
+    # 回滚为逐行展示的旧样式；binding 的 config_json.compact_trace=false 可对单个
+    # 绑定回滚。
+    channel_feishu_trace_compact_sop: bool = True
 
     model_config = SettingsConfigDict(
         env_file=_os.environ.get("ULTRARAG_DOTENV", ".env"),

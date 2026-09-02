@@ -9,18 +9,27 @@ from urllib.parse import urlparse
 
 from app import paths
 from app.db.models import ModelConfig
+from app.i18n.language_context import LanguageContext
+from app.i18n.raw_source import RawSourceKind, RawSourceMarker
 from app.llm import LLMClient, LLMError
+from app.llm.prompts.language import language_prompt_contract, resolve_prompt_language_context
 from app.skills.llm_limits import skill_model_config
-from app.skills.skill_reflection import reflect_skill_response, reflect_skill_response_stream
+from app.skills.skill_reflection import (
+    ExecutionFence,
+    fenced_provider_call,
+    reflect_skill_response,
+    reflect_skill_response_stream,
+    skill_status_event,
+)
 from app.skills.skill_schema import (
+    SkillCard,
     SkillDistillRequest,
     SkillDistillResponse,
-    SkillCard,
     SkillGraphNode,
     ToolSuggestion,
+    resolve_skill_language_context,
 )
 from app.skills.step_ids import ensure_unique_node_ids, skill_card_with_unique_step_ids
-
 
 PROMPT_PATH = paths.resource_dir() / "app" / "llm" / "prompts" / "skill_distiller_prompt.md"
 STREAM_INTERVAL_SECONDS = 0.035
@@ -52,55 +61,188 @@ ADAPTIVE_STEP_INSTRUCTION_SUFFIX = (
 FINAL_RESPONSE_INSTRUCTION_SUFFIX = "给用户明确最终回复；无法闭环时转人工，不要只说请稍候。"
 
 
+def _skill_language_contract(language_context: LanguageContext | None) -> dict[str, object]:
+    """Describe the generated-prose locale and exact source fields preserved verbatim."""
+    return language_prompt_contract(
+        language_context,
+        [
+            RawSourceMarker(json_pointer="/title", kind=RawSourceKind.USER_INPUT),
+            RawSourceMarker(json_pointer="/raw_content", kind=RawSourceKind.USER_INPUT),
+            RawSourceMarker(
+                json_pointer="/available_tools", kind=RawSourceKind.BUSINESS_RECORD
+            ),
+            RawSourceMarker(
+                json_pointer="/available_general_skills", kind=RawSourceKind.BUSINESS_RECORD
+            ),
+            RawSourceMarker(
+                json_pointer="/available_knowledge_bases", kind=RawSourceKind.BUSINESS_RECORD
+            ),
+        ],
+    )
+
+
+def _localized_skill_text(
+    language_context: LanguageContext | None,
+    *,
+    zh_cn: str,
+    en_us: str,
+) -> str:
+    """Select a deterministic authoring message without translating raw Skill source content."""
+    context = resolve_prompt_language_context(language_context)
+    return en_us if context.agent_reply_locale.value == "en-US" else zh_cn
+
+
+def _model_input_payload(
+    payload: dict[str, Any],
+    model_input: str,
+) -> dict[str, Any]:
+    """Wrap the source summary with a structured locale contract for the initial LLM call."""
+    return {**payload, "input": model_input}
+
+
 class SkillDistiller:
     def distill(
-        self, request: SkillDistillRequest, model_config: ModelConfig
+        self,
+        request: SkillDistillRequest,
+        model_config: ModelConfig,
+        *,
+        execution_fence: ExecutionFence | None = None,
     ) -> SkillDistillResponse:
-        return self._generate_response(request, model_config)
+        """Generate one Skill Card while binding all generated prose to request locale."""
+        request = self._with_language_context(request)
+        return self._generate_response(
+            request,
+            model_config,
+            execution_fence=execution_fence,
+        )
 
     def distill_stream(
-        self, request: SkillDistillRequest, model_config: ModelConfig
+        self,
+        request: SkillDistillRequest,
+        model_config: ModelConfig,
+        *,
+        execution_fence: ExecutionFence | None = None,
     ) -> SkillDistillResponse:
-        return self._generate_response(request, model_config)
+        """Run the compatibility non-SSE entry point with the same immutable locale contract."""
+        request = self._with_language_context(request)
+        return self._generate_response(
+            request,
+            model_config,
+            execution_fence=execution_fence,
+        )
 
-    def stream_text(self, request: SkillDistillRequest, model_config: ModelConfig):
+    def stream_text(
+        self,
+        request: SkillDistillRequest,
+        model_config: ModelConfig,
+        *,
+        execution_fence: ExecutionFence | None = None,
+    ):
+        """Yield progress and raw draft output with a locale-bound producer envelope."""
+        request = self._with_language_context(request)
         payload = self._payload(request)
         model_input = self._model_input(request, payload)
         chunks: list[str] = []
         prompt = PROMPT_PATH.read_text(encoding="utf-8")
         client = LLMClient(skill_model_config(model_config))
         try:
-            yield {"event": "status", "data": {"text": "模型正在规划技能结构"}}
-            for chunk in client.generate_text_stream(prompt, model_input):
-                chunks.append(chunk)
-                yield {"event": "chunk", "data": {"content": chunk}}
-            yield {"event": "status", "data": {"text": "正在校验模型输出结构"}}
+            yield skill_status_event(
+                _localized_skill_text(
+                    request.language_context,
+                    zh_cn="模型正在规划技能结构",
+                    en_us="Planning the Skill structure",
+                ),
+                request.language_context,
+            )
+            if execution_fence is not None:
+                execution_fence()
+            try:
+                for chunk in client.generate_text_stream(
+                    prompt, _model_input_payload(payload, model_input)
+                ):
+                    chunks.append(chunk)
+                    yield {"event": "chunk", "data": {"content": chunk}}
+            finally:
+                if execution_fence is not None:
+                    execution_fence()
+            yield skill_status_event(
+                _localized_skill_text(
+                    request.language_context,
+                    zh_cn="正在校验模型输出结构",
+                    en_us="Validating the model output structure",
+                ),
+                request.language_context,
+            )
             response = self._response_from_text("".join(chunks), request)
         except (LLMError, json.JSONDecodeError, TypeError, ValueError) as exc:
             try:
-                yield {"event": "status", "data": {"text": "模型输出需要修复，正在重试"}}
+                yield skill_status_event(
+                    _localized_skill_text(
+                        request.language_context,
+                        zh_cn="模型输出需要修复，正在重试",
+                        en_us="The model output needs repair; retrying",
+                    ),
+                    request.language_context,
+                )
                 response = self._repair_response(
-                    client, prompt, payload, "".join(chunks), str(exc), request
+                    client,
+                    prompt,
+                    payload,
+                    "".join(chunks),
+                    str(exc),
+                    request,
+                    execution_fence=execution_fence,
                 )
             except (LLMError, json.JSONDecodeError, TypeError, ValueError) as repair_exc:
                 try:
-                    yield {"event": "status", "data": {"text": "模型修复失败，改用分段生成"}}
-                    response = self._staged_response(
-                        client, prompt, payload, request, str(repair_exc)
+                    yield skill_status_event(
+                        _localized_skill_text(
+                            request.language_context,
+                            zh_cn="模型修复失败，改用分段生成",
+                            en_us="Repair failed; switching to staged generation",
+                        ),
+                        request.language_context,
                     )
-                except (LLMError, json.JSONDecodeError, TypeError, ValueError) as staged_exc:
-                    yield {
-                        "event": "status",
-                        "data": {"text": "模型多轮生成失败，使用最低可运行草稿"},
-                    }
+                    response = self._staged_response(
+                        client,
+                        prompt,
+                        payload,
+                        request,
+                        str(repair_exc),
+                        execution_fence=execution_fence,
+                    )
+                except (LLMError, json.JSONDecodeError, TypeError, ValueError):
+                    yield skill_status_event(
+                        _localized_skill_text(
+                            request.language_context,
+                            zh_cn="模型多轮生成失败，使用最低可运行草稿",
+                            en_us="Multi-step generation failed; using a minimal runnable draft",
+                        ),
+                        request.language_context,
+                    )
                     response = self._fallback_response(
-                        request, f"模型多轮生成未能完成，已使用最低可运行草稿：{staged_exc}"
+                        request,
+                        _localized_skill_text(
+                            request.language_context,
+                            zh_cn="模型多轮生成未能完成，已使用最低可运行草稿。",
+                            en_us=(
+                                "Model generation could not complete; a minimal runnable "
+                                "draft was used."
+                            ),
+                        ),
                     )
             yield {"event": "chunk_reset", "data": {}}
             for chunk in _chunk_text(_serialize_response_for_stream(response)):
                 yield {"event": "chunk", "data": {"content": chunk}}
                 sleep(STREAM_INTERVAL_SECONDS)
-        yield {"event": "status", "data": {"text": "正在校验步骤闭环与工具接入"}}
+        yield skill_status_event(
+            _localized_skill_text(
+                request.language_context,
+                zh_cn="正在校验步骤闭环与工具接入",
+                en_us="Validating closed-loop steps and tool integration",
+            ),
+            request.language_context,
+        )
         before_reflection = response.model_dump(mode="json")
         response = yield from reflect_skill_response_stream(
             client=client,
@@ -111,38 +253,94 @@ class SkillDistiller:
             current_warnings=response.warnings,
             tool_suggestions=response.tool_suggestions,
             normalize_response=lambda raw: self._normalize_response(raw, request),
+            language_context=request.language_context,
+            execution_fence=execution_fence,
         )
-        yield {"event": "status", "data": {"text": "正在整理校验后的技能草稿"}}
+        yield skill_status_event(
+            _localized_skill_text(
+                request.language_context,
+                zh_cn="正在整理校验后的技能草稿",
+                en_us="Organizing the validated Skill draft",
+            ),
+            request.language_context,
+        )
         if response.model_dump(mode="json") != before_reflection:
             yield {"event": "chunk_reset", "data": {}}
             for chunk in _chunk_text(_serialize_response_for_stream(response)):
                 yield {"event": "chunk", "data": {"content": chunk}}
                 sleep(STREAM_INTERVAL_SECONDS)
-        yield {"event": "status", "data": {"text": "校验完成，已完成 Skill Card 结构化"}}
+        yield skill_status_event(
+            _localized_skill_text(
+                request.language_context,
+                zh_cn="校验完成，已完成 Skill Card 结构化",
+                en_us="Validation complete; the Skill Card is structured",
+            ),
+            request.language_context,
+        )
         yield {"event": "complete", "data": response.model_dump(mode="json")}
 
+    def _with_language_context(self, request: SkillDistillRequest) -> SkillDistillRequest:
+        """Attach an immutable request snapshot before any model call or stream event is emitted."""
+        context = resolve_skill_language_context(request)
+        if request.language_context == context:
+            return request
+        return request.model_copy(update={"language_context": context})
+
     def _generate_response(
-        self, request: SkillDistillRequest, model_config: ModelConfig
+        self,
+        request: SkillDistillRequest,
+        model_config: ModelConfig,
+        *,
+        execution_fence: ExecutionFence | None = None,
     ) -> SkillDistillResponse:
+        """Generate, repair, and reflect a Skill Card without translating source-owned fields."""
+        request = self._with_language_context(request)
         payload = self._payload(request)
         model_input = self._model_input(request, payload)
         prompt = PROMPT_PATH.read_text(encoding="utf-8")
         client = LLMClient(skill_model_config(model_config))
         output = ""
         try:
-            output = client.generate_text(prompt, model_input)
+            output = fenced_provider_call(
+                lambda: client.generate_text(
+                    prompt,
+                    _model_input_payload(payload, model_input),
+                ),
+                execution_fence,
+            )
             response = self._response_from_text(output, request)
         except (LLMError, json.JSONDecodeError, TypeError, ValueError) as exc:
             try:
-                response = self._repair_response(client, prompt, payload, output, str(exc), request)
+                response = self._repair_response(
+                    client,
+                    prompt,
+                    payload,
+                    output,
+                    str(exc),
+                    request,
+                    execution_fence=execution_fence,
+                )
             except (LLMError, json.JSONDecodeError, TypeError, ValueError) as repair_exc:
                 try:
                     response = self._staged_response(
-                        client, prompt, payload, request, str(repair_exc)
+                        client,
+                        prompt,
+                        payload,
+                        request,
+                        str(repair_exc),
+                        execution_fence=execution_fence,
                     )
-                except (LLMError, json.JSONDecodeError, TypeError, ValueError) as staged_exc:
+                except (LLMError, json.JSONDecodeError, TypeError, ValueError):
                     response = self._fallback_response(
-                        request, f"模型多轮生成未能完成，已使用最低可运行草稿：{staged_exc}"
+                        request,
+                        _localized_skill_text(
+                            request.language_context,
+                            zh_cn="模型多轮生成未能完成，已使用最低可运行草稿。",
+                            en_us=(
+                                "Model generation could not complete; a minimal runnable "
+                                "draft was used."
+                            ),
+                        ),
                     )
         return reflect_skill_response(
             client=client,
@@ -153,6 +351,8 @@ class SkillDistiller:
             current_warnings=response.warnings,
             tool_suggestions=response.tool_suggestions,
             normalize_response=lambda raw: self._normalize_response(raw, request),
+            language_context=request.language_context,
+            execution_fence=execution_fence,
         )
 
     def _response_from_text(self, text: str, request: SkillDistillRequest) -> SkillDistillResponse:
@@ -167,6 +367,8 @@ class SkillDistiller:
         previous_output: str,
         previous_error: str,
         request: SkillDistillRequest,
+        *,
+        execution_fence: ExecutionFence | None = None,
     ) -> SkillDistillResponse:
         output = previous_output
         error = previous_error
@@ -181,7 +383,10 @@ class SkillDistiller:
                     "不要解释，不要使用代码围栏。必须保留原始流程中的节点、边、工具建议和闭环约束。"
                 ),
             }
-            output = client.generate_text(prompt, repair_payload)
+            output = fenced_provider_call(
+                lambda repair_payload=repair_payload: client.generate_text(prompt, repair_payload),
+                execution_fence,
+            )
             try:
                 return self._response_from_text(output, request)
             except (json.JSONDecodeError, TypeError, ValueError) as exc:
@@ -195,19 +400,22 @@ class SkillDistiller:
         payload: dict[str, Any],
         request: SkillDistillRequest,
         previous_error: str,
+        *,
+        execution_fence: ExecutionFence | None = None,
     ) -> SkillDistillResponse:
-        outline_text = client.generate_text(
-            prompt,
-            {
-                **payload,
-                "generation_mode": "outline_only",
-                "previous_error": previous_error,
-                "generation_instruction": (
-                    "先生成完整但紧凑的 Skill Card graph 大纲。nodes/edges 必须覆盖原始流程全部节点与条件推进关系，"
-                    "每个 instruction 只写一句目标说明；保留 response_rules、slot_filling_policy、"
-                    "interruption_policy 和 tool_mentions。只输出 JSON。"
-                ),
-            },
+        outline_payload = {
+            **payload,
+            "generation_mode": "outline_only",
+            "previous_error": previous_error,
+            "generation_instruction": (
+                "先生成完整但紧凑的 Skill Card graph 大纲。nodes/edges 必须覆盖原始流程全部节点与条件推进关系，"
+                "每个 instruction 只写一句目标说明；保留 response_rules、slot_filling_policy、"
+                "interruption_policy 和 tool_mentions。只输出 JSON。"
+            ),
+        }
+        outline_text = fenced_provider_call(
+            lambda: client.generate_text(prompt, outline_payload),
+            execution_fence,
         )
         outline = self._response_from_text(outline_text, request)
         draft_data = outline.draft_skill.model_dump(mode="json")
@@ -216,21 +424,22 @@ class SkillDistiller:
         nodes = [node for node in draft_data.get("nodes", []) if isinstance(node, dict)]
 
         for index, node in enumerate(nodes):
-            node_text = client.generate_text(
-                prompt,
-                {
-                    **payload,
-                    "generation_mode": "expand_node",
-                    "current_draft": draft_data,
-                    "target_node_index": index,
-                    "target_node": node,
-                    "generation_instruction": (
-                        '只扩写 target_node。输出 JSON：{"node": {...}, "warnings": [], '
-                        '"tool_mentions": []}。node 必须包含 node_id、type、name、instruction、'
-                        "expected_user_info、allowed_actions、capability_refs。capability_refs 中"
-                        "允许能力与 required_*_ids 强制能力必须区分；不要输出完整技能。"
-                    ),
-                },
+            node_payload = {
+                **payload,
+                "generation_mode": "expand_node",
+                "current_draft": draft_data,
+                "target_node_index": index,
+                "target_node": node,
+                "generation_instruction": (
+                    '只扩写 target_node。输出 JSON：{"node": {...}, "warnings": [], '
+                    '"tool_mentions": []}。node 必须包含 node_id、type、name、instruction、'
+                    "expected_user_info、allowed_actions、capability_refs。capability_refs 中"
+                    "允许能力与 required_*_ids 强制能力必须区分；不要输出完整技能。"
+                ),
+            }
+            node_text = fenced_provider_call(
+                lambda node_payload=node_payload: client.generate_text(prompt, node_payload),
+                execution_fence,
             )
             try:
                 node_raw = _raw_json_from_text(node_text)
@@ -245,25 +454,26 @@ class SkillDistiller:
                     tool_mentions.extend(
                         item for item in node_raw["tool_mentions"] if isinstance(item, dict)
                     )
-            except (json.JSONDecodeError, TypeError, ValueError) as exc:
-                warnings.append(f"模型未能扩写节点 {index + 1}，已保留大纲节点：{exc}")
+            except (json.JSONDecodeError, TypeError, ValueError):
+                warnings.append(f"模型未能扩写节点 {index + 1}，已保留大纲节点。")
 
         draft_data["nodes"] = nodes
         reviewed = self._normalize_response(
             {"draft_skill": draft_data, "warnings": warnings, "tool_mentions": tool_mentions},
             request,
         )
-        review_text = client.generate_text(
-            prompt,
-            {
-                **payload,
-                "generation_mode": "final_review",
-                "current_draft": reviewed.draft_skill.model_dump(mode="json"),
-                "generation_instruction": (
-                    "检查 current_draft 是否遗漏原始流程、闭环回复、工具建议或中断策略。"
-                    "如需修正，返回完整 draft_skill；如果无需修正，也返回完整 draft_skill。只输出 JSON。"
-                ),
-            },
+        review_payload = {
+            **payload,
+            "generation_mode": "final_review",
+            "current_draft": reviewed.draft_skill.model_dump(mode="json"),
+            "generation_instruction": (
+                "检查 current_draft 是否遗漏原始流程、闭环回复、工具建议或中断策略。"
+                "如需修正，返回完整 draft_skill；如果无需修正，也返回完整 draft_skill。只输出 JSON。"
+            ),
+        }
+        review_text = fenced_provider_call(
+            lambda: client.generate_text(prompt, review_payload),
+            execution_fence,
         )
         try:
             return self._response_from_text(review_text, request)
@@ -271,7 +481,8 @@ class SkillDistiller:
             return reviewed
 
     def _payload(self, request: SkillDistillRequest) -> dict[str, Any]:
-        return {
+        """Build the compact model payload and attach exact language/raw-source metadata."""
+        payload = {
             "title": request.title,
             "business_domain": request.business_domain,
             "raw_content": request.raw_content,
@@ -279,7 +490,19 @@ class SkillDistiller:
                 request.available_tools,
                 source_text=_request_text(request),
             ),
+            "available_general_skills": _compact_named_capabilities(
+                request.available_general_skills,
+                source_text=_request_text(request),
+                alias_fields=("slug", "name"),
+            ),
+            "available_knowledge_bases": _compact_named_capabilities(
+                request.available_knowledge_bases,
+                source_text=_request_text(request),
+                alias_fields=("name",),
+            ),
         }
+        payload.update(_skill_language_contract(request.language_context))
+        return payload
 
     def _model_input(
         self,
@@ -293,11 +516,17 @@ class SkillDistiller:
             raw_content=request.raw_content,
             available_tools=projected.get("available_tools", []),
             total_tool_count=len(request.available_tools),
+            available_general_skills=projected.get("available_general_skills", []),
+            total_general_skill_count=len(request.available_general_skills),
+            available_knowledge_bases=projected.get("available_knowledge_bases", []),
+            total_knowledge_base_count=len(request.available_knowledge_bases),
         )
 
     def _normalize_response(
         self, raw: dict[str, Any], request: SkillDistillRequest
     ) -> SkillDistillResponse:
+        """Normalize model output while carrying the request's immutable language snapshot."""
+        request = self._with_language_context(request)
         draft = raw.get("draft_skill") if isinstance(raw.get("draft_skill"), dict) else raw
         warnings = list(raw.get("warnings") or [])
         fallback = self._fallback_card(request)
@@ -330,6 +559,8 @@ class SkillDistiller:
             request.available_tools,
             _tool_action_names_from_suggestions(tool_resolutions),
         )
+        nodes, capability_warnings = _normalize_node_capability_refs(nodes, request)
+        warnings.extend(capability_warnings)
         for tool_name in missing_tool_names:
             warnings.append(
                 f"技能草稿引用了未配置工具 {tool_name}，已移出 allowed_actions；"
@@ -398,6 +629,7 @@ class SkillDistiller:
             draft_skill=draft_skill,
             warnings=_compact_warnings(warnings),
             tool_suggestions=tool_suggestions,
+            language_context=request.language_context,
         )
         return response
 
@@ -466,6 +698,11 @@ class SkillDistiller:
                     "allowed_actions": _normalize_actions(
                         _string_list(item.get("allowed_actions"), fallback.allowed_actions)
                     ),
+                    "capability_refs": (
+                        item.get("capability_refs")
+                        if isinstance(item.get("capability_refs"), dict)
+                        else fallback.capability_refs.model_dump(mode="json")
+                    ),
                     "knowledge_scope": item.get("knowledge_scope")
                     if isinstance(item.get("knowledge_scope"), dict)
                     else fallback.knowledge_scope,
@@ -528,8 +765,11 @@ class SkillDistiller:
     def _fallback_response(
         self, request: SkillDistillRequest, warning: str
     ) -> SkillDistillResponse:
+        """Return a safe fallback draft without exposing provider or parser diagnostics."""
         return SkillDistillResponse(
-            draft_skill=self._fallback_card(request), warnings=_compact_warnings([warning])
+            draft_skill=self._fallback_card(request),
+            warnings=_compact_warnings([warning]),
+            language_context=request.language_context,
         )
 
     def _fallback_card(self, request: SkillDistillRequest) -> SkillCard:
@@ -736,6 +976,10 @@ def _distill_model_input(
     raw_content: str,
     available_tools: Any,
     total_tool_count: int,
+    available_general_skills: Any,
+    total_general_skill_count: int,
+    available_knowledge_bases: Any,
+    total_knowledge_base_count: int,
 ) -> str:
     sections = [f"技能标题：{title.strip() or '新SOP'}"]
     if business_domain and business_domain.strip():
@@ -750,30 +994,75 @@ def _distill_model_input(
     sections.append("可用工具（只选择与原始流程语义匹配的工具）：")
     if not tools:
         sections.append("无可用工具。流程需要外部接口时，请指出缺少的接口，不要臆造工具。")
-        return "\n".join(sections)
-
-    for tool in tools:
-        name = str(tool.get("name") or "").strip()
-        display_name = str(tool.get("display_name") or "").strip()
-        description = str(tool.get("description") or "").strip()
-        heading = name
-        if display_name and display_name != name:
-            heading = f"{name}（{display_name}）"
-        line = f"- {heading}"
-        if description:
-            line += f"：{description}"
-        sections.append(line)
-        parameter_text = _model_tool_parameter_text(tool.get("input_schema"))
-        if parameter_text:
-            sections.append(f"  输入参数：{parameter_text}")
-        if tool.get("requires_confirmation") is True:
-            sections.append("  调用前需要用户确认。")
+    else:
+        for tool in tools:
+            tool_id = str(tool.get("id") or tool.get("name") or "").strip()
+            name = str(tool.get("name") or "").strip()
+            display_name = str(tool.get("display_name") or "").strip()
+            description = str(tool.get("description") or "").strip()
+            heading = name
+            if display_name and display_name != name:
+                heading = f"{name}（{display_name}）"
+            line = f"- ID={tool_id}；调用名={heading}"
+            if description:
+                line += f"；说明={description}"
+            sections.append(line)
+            parameter_text = _model_tool_parameter_text(tool.get("input_schema"))
+            if parameter_text:
+                sections.append(f"  输入参数：{parameter_text}")
+            if tool.get("requires_confirmation") is True:
+                sections.append("  调用前需要用户确认。")
 
     omitted = max(0, total_tool_count - len(tools))
     if omitted:
         sections.append(
             f"另有 {omitted} 个与当前流程相关性较低的工具未展开；不得猜测或调用未列出的工具。"
         )
+
+    general_skills = (
+        [item for item in available_general_skills if isinstance(item, dict)]
+        if isinstance(available_general_skills, list)
+        else []
+    )
+    sections.append("可用通用技能（capability_refs.general_skill_ids 必须填写对应 ID）：")
+    if not general_skills:
+        sections.append("无可用通用技能。")
+    else:
+        for skill in general_skills:
+            skill_id = str(skill.get("id") or skill.get("slug") or "").strip()
+            slug = str(skill.get("slug") or "").strip()
+            name = str(skill.get("name") or slug).strip()
+            description = str(skill.get("description") or "").strip()
+            line = f"- ID={skill_id}；技能名={name}"
+            if slug:
+                line += f"；调用名=general_skill.{slug}"
+            if description:
+                line += f"；说明={description}"
+            sections.append(line)
+    omitted_general_skills = max(0, total_general_skill_count - len(general_skills))
+    if omitted_general_skills:
+        sections.append(f"另有 {omitted_general_skills} 个低相关通用技能未展开。")
+
+    knowledge_bases = (
+        [item for item in available_knowledge_bases if isinstance(item, dict)]
+        if isinstance(available_knowledge_bases, list)
+        else []
+    )
+    sections.append("可用知识库（capability_refs.knowledge_base_ids 必须填写对应 ID）：")
+    if not knowledge_bases:
+        sections.append("无可用知识库。")
+    else:
+        for knowledge in knowledge_bases:
+            knowledge_id = str(knowledge.get("id") or knowledge.get("name") or "").strip()
+            name = str(knowledge.get("name") or knowledge_id).strip()
+            description = str(knowledge.get("description") or "").strip()
+            line = f"- ID={knowledge_id}；名称={name}"
+            if description:
+                line += f"；说明={description}"
+            sections.append(line)
+    omitted_knowledge_bases = max(0, total_knowledge_base_count - len(knowledge_bases))
+    if omitted_knowledge_bases:
+        sections.append(f"另有 {omitted_knowledge_bases} 个低相关知识库未展开。")
     return "\n".join(sections)
 
 
@@ -794,6 +1083,7 @@ def _compact_available_tools(
         seen_names.add(name)
         description = _limited_text(tool.get("description"), MODEL_TOOL_DESCRIPTION_CHAR_LIMIT)
         projected: dict[str, Any] = {
+            "id": str(tool.get("id") or name).strip(),
             "name": name,
             "display_name": _limited_text(tool.get("display_name"), 120),
             "description": description,
@@ -810,6 +1100,64 @@ def _compact_available_tools(
         score = len(source_terms & _tool_relevance_terms(candidate_text))
         lowered_source = source_text.lower()
         for exact in (name, str(tool.get("display_name") or "").strip()):
+            if exact and exact.lower() in lowered_source:
+                score += 20
+        ranked.append((score, index, projected))
+
+    ranked.sort(key=lambda item: (-item[0], item[1]))
+    compacted: list[dict[str, Any]] = []
+    catalog_chars = 0
+    for _score, _index, projected in ranked:
+        if len(compacted) >= MODEL_TOOL_LIMIT:
+            break
+        projected_chars = len(json.dumps(projected, ensure_ascii=False, separators=(",", ":")))
+        if compacted and catalog_chars + projected_chars > MODEL_TOOL_CATALOG_CHAR_LIMIT:
+            break
+        compacted.append(projected)
+        catalog_chars += projected_chars
+    return compacted
+
+
+def _compact_named_capabilities(
+    values: list[dict[str, Any]],
+    *,
+    source_text: str,
+    alias_fields: tuple[str, ...],
+) -> list[dict[str, Any]]:
+    source_terms = _tool_relevance_terms(source_text)
+    ranked: list[tuple[int, int, dict[str, Any]]] = []
+    seen_ids: set[str] = set()
+    for index, value in enumerate(values):
+        if not isinstance(value, dict):
+            continue
+        capability_id = str(value.get("id") or "").strip()
+        if not capability_id:
+            capability_id = next(
+                (str(value.get(field) or "").strip() for field in alias_fields if value.get(field)),
+                "",
+            )
+        if not capability_id or capability_id in seen_ids:
+            continue
+        seen_ids.add(capability_id)
+        projected = {
+            "id": capability_id,
+            **{
+                field: _limited_text(value.get(field), 120)
+                for field in alias_fields
+                if _limited_text(value.get(field), 120)
+            },
+            "description": _limited_text(
+                value.get("description"), MODEL_TOOL_DESCRIPTION_CHAR_LIMIT
+            ),
+        }
+        projected = {
+            key: item for key, item in projected.items() if item not in (None, "", [], {})
+        }
+        candidate_text = " ".join(str(projected.get(key) or "") for key in projected)
+        score = len(source_terms & _tool_relevance_terms(candidate_text))
+        lowered_source = source_text.lower()
+        for field in alias_fields:
+            exact = str(value.get(field) or "").strip()
             if exact and exact.lower() in lowered_source:
                 score += 20
         ranked.append((score, index, projected))
@@ -1021,6 +1369,284 @@ def _available_tool_names(available_tools: list[dict[str, Any]]) -> set[str]:
         if name:
             names.add(name)
     return names
+
+
+def _capability_alias_map(
+    values: list[dict[str, Any]],
+    *,
+    alias_fields: tuple[str, ...],
+) -> dict[str, str]:
+    aliases: dict[str, str] = {}
+    for value in values:
+        if not isinstance(value, dict):
+            continue
+        canonical = str(value.get("id") or "").strip()
+        if not canonical:
+            canonical = next(
+                (str(value.get(field) or "").strip() for field in alias_fields if value.get(field)),
+                "",
+            )
+        if not canonical:
+            continue
+        candidates = {canonical}
+        for field in alias_fields:
+            alias = str(value.get(field) or "").strip()
+            if alias:
+                candidates.add(alias)
+                if field == "slug":
+                    candidates.add(f"general_skill.{alias}")
+        for alias in candidates:
+            aliases.setdefault(alias, canonical)
+            aliases.setdefault(alias.lower(), canonical)
+    return aliases
+
+
+def _resolved_capability_refs(
+    value: Any,
+    aliases: dict[str, str],
+) -> tuple[list[str], list[str]]:
+    resolved: list[str] = []
+    unknown: list[str] = []
+    raw_values = value if isinstance(value, list) else []
+    for raw in raw_values:
+        reference = str(raw or "").strip()
+        if not reference:
+            continue
+        canonical = aliases.get(reference) or aliases.get(reference.lower())
+        if canonical:
+            if canonical not in resolved:
+                resolved.append(canonical)
+        elif reference not in unknown:
+            unknown.append(reference)
+    return resolved, unknown
+
+
+def _normalize_node_capability_refs(
+    nodes: list[dict[str, Any]],
+    request: SkillDistillRequest,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    catalogs = {
+        "general_skill": _capability_alias_map(
+            request.available_general_skills,
+            alias_fields=("slug", "name"),
+        ),
+        "tool": _capability_alias_map(
+            request.available_tools,
+            alias_fields=("name", "display_name"),
+        ),
+        "knowledge_base": _capability_alias_map(
+            request.available_knowledge_bases,
+            alias_fields=("name",),
+        ),
+    }
+    field_catalogs = {
+        "general_skill_ids": catalogs["general_skill"],
+        "tool_ids": catalogs["tool"],
+        "knowledge_base_ids": catalogs["knowledge_base"],
+    }
+    required_fields = {
+        "general_skill_ids": "required_general_skill_ids",
+        "tool_ids": "required_tool_ids",
+        "knowledge_base_ids": "required_knowledge_base_ids",
+    }
+    warnings: list[str] = []
+    normalized_nodes: list[dict[str, Any]] = []
+    for node in nodes:
+        normalized = dict(node)
+        raw_refs = node.get("capability_refs")
+        refs = raw_refs if isinstance(raw_refs, dict) else {}
+        next_refs: dict[str, list[str]] = {}
+        node_unknown: list[str] = []
+        for allowed_field, aliases in field_catalogs.items():
+            allowed, unknown_allowed = _resolved_capability_refs(refs.get(allowed_field), aliases)
+            required_field = required_fields[allowed_field]
+            required, unknown_required = _resolved_capability_refs(
+                refs.get(required_field), aliases
+            )
+            for reference in required:
+                if reference not in allowed:
+                    allowed.append(reference)
+            next_refs[allowed_field] = allowed
+            next_refs[required_field] = required
+            node_unknown.extend([*unknown_allowed, *unknown_required])
+
+        tool_aliases = catalogs["tool"]
+        for action in normalized.get("allowed_actions", []):
+            action_text = str(action or "")
+            if not action_text.startswith("call_tool:"):
+                continue
+            tool_name = action_text.partition(":")[2].strip()
+            tool_id = tool_aliases.get(tool_name) or tool_aliases.get(tool_name.lower())
+            if tool_id and tool_id not in next_refs["tool_ids"]:
+                next_refs["tool_ids"].append(tool_id)
+
+        knowledge_scope = normalized.get("knowledge_scope")
+        if isinstance(knowledge_scope, dict):
+            knowledge_ids, unknown_knowledge = _resolved_capability_refs(
+                knowledge_scope.get("knowledge_base_ids"),
+                catalogs["knowledge_base"],
+            )
+            for knowledge_id in knowledge_ids:
+                if knowledge_id not in next_refs["knowledge_base_ids"]:
+                    next_refs["knowledge_base_ids"].append(knowledge_id)
+            node_unknown.extend(unknown_knowledge)
+
+        normalized["capability_refs"] = next_refs
+        normalized_nodes.append(normalized)
+        unique_unknown = list(dict.fromkeys(node_unknown))
+        if unique_unknown:
+            node_label = str(node.get("name") or node.get("node_id") or "未命名节点")
+            warnings.append(
+                f"节点「{node_label}」引用了当前员工不可用的能力，已移除："
+                + "、".join(unique_unknown)
+            )
+    explicit_mentions = {
+        "general_skill_ids": _explicit_capability_mentions(
+            request.available_general_skills,
+            source_text=_request_text(request),
+            alias_fields=("slug", "name"),
+        ),
+        "tool_ids": _explicit_capability_mentions(
+            request.available_tools,
+            source_text=_request_text(request),
+            alias_fields=("name", "display_name"),
+        ),
+        "knowledge_base_ids": _explicit_capability_mentions(
+            request.available_knowledge_bases,
+            source_text=_request_text(request),
+            alias_fields=("name",),
+        ),
+    }
+    catalog_values = {
+        "general_skill_ids": request.available_general_skills,
+        "tool_ids": request.available_tools,
+        "knowledge_base_ids": request.available_knowledge_bases,
+    }
+    required_by_field = {
+        "general_skill_ids": "required_general_skill_ids",
+        "tool_ids": "required_tool_ids",
+        "knowledge_base_ids": "required_knowledge_base_ids",
+    }
+    for field_name, mentions in explicit_mentions.items():
+        for capability_id, is_required in mentions.items():
+            matching_indexes = [
+                index
+                for index, node in enumerate(normalized_nodes)
+                if capability_id in node["capability_refs"][field_name]
+            ]
+            if not matching_indexes:
+                matching_indexes = [
+                    _capability_target_node_index(
+                        normalized_nodes,
+                        capability_id,
+                        catalog_values[field_name],
+                        field_name,
+                    )
+                ]
+                target_refs = normalized_nodes[matching_indexes[0]]["capability_refs"]
+                target_refs[field_name].append(capability_id)
+            if is_required:
+                required_field = required_by_field[field_name]
+                for index in matching_indexes:
+                    target_refs = normalized_nodes[index]["capability_refs"]
+                    if capability_id not in target_refs[required_field]:
+                        target_refs[required_field].append(capability_id)
+    return normalized_nodes, warnings
+
+
+def _explicit_capability_mentions(
+    values: list[dict[str, Any]],
+    *,
+    source_text: str,
+    alias_fields: tuple[str, ...],
+) -> dict[str, bool]:
+    aliases = _capability_alias_map(values, alias_fields=alias_fields)
+    source_lower = source_text.lower()
+    mentions: dict[str, bool] = {}
+    candidates = sorted(
+        {
+            (alias.lower(), canonical)
+            for alias, canonical in aliases.items()
+            if len(alias.strip()) >= 2
+        },
+        key=lambda item: -len(item[0]),
+    )
+    for alias, canonical in candidates:
+        match = source_lower.find(alias)
+        if match < 0:
+            continue
+        required = _capability_mention_is_required(source_lower, match, len(alias))
+        mentions[canonical] = mentions.get(canonical, False) or required
+    return mentions
+
+
+def _capability_mention_is_required(source_text: str, start: int, length: int) -> bool:
+    window = source_text[max(0, start - 24) : min(len(source_text), start + length + 24)]
+    return any(
+        marker in window
+        for marker in ("必须", "务必", "应当", "需要使用", "需使用", "依次", "must", "required")
+    )
+
+
+def _capability_target_node_index(
+    nodes: list[dict[str, Any]],
+    capability_id: str,
+    catalog: list[dict[str, Any]],
+    field_name: str,
+) -> int:
+    capability = next(
+        (item for item in catalog if str(item.get("id") or "").strip() == capability_id),
+        {},
+    )
+    aliases = [
+        str(capability.get(field) or "").strip().lower()
+        for field in ("name", "display_name", "slug")
+        if str(capability.get(field) or "").strip()
+    ]
+    if capability.get("slug"):
+        aliases.append(f"general_skill.{str(capability['slug']).strip().lower()}")
+    candidate_indexes = [
+        index
+        for index, node in enumerate(nodes)
+        if str(node.get("type") or "").lower() not in {"response", "handoff", "handoff_human"}
+    ] or list(range(len(nodes)))
+    best_index = candidate_indexes[0]
+    best_score = 0
+    for index in candidate_indexes:
+        node_text = " ".join(
+            [
+                str(nodes[index].get("name") or ""),
+                str(nodes[index].get("instruction") or ""),
+                *[str(item) for item in nodes[index].get("allowed_actions", [])],
+            ]
+        ).lower()
+        score = max((len(alias) for alias in aliases if alias in node_text), default=0)
+        if score > best_score:
+            best_index = index
+            best_score = score
+    if best_score:
+        return best_index
+    if field_name in {"general_skill_ids", "tool_ids"}:
+        for index in candidate_indexes:
+            node = nodes[index]
+            node_type = str(node.get("type") or "").lower()
+            actions = [str(item) for item in node.get("allowed_actions", [])]
+            if any(token in node_type for token in ("action", "tool", "execute")) or any(
+                action.startswith("call_tool:") for action in actions
+            ):
+                return index
+    if field_name == "knowledge_base_ids":
+        for index in candidate_indexes:
+            node_text = " ".join(
+                [
+                    str(nodes[index].get("type") or ""),
+                    str(nodes[index].get("name") or ""),
+                    str(nodes[index].get("instruction") or ""),
+                ]
+            ).lower()
+            if any(token in node_text for token in ("knowledge", "search", "知识", "检索")):
+                return index
+    return best_index
 
 
 def _remove_unknown_tool_actions(

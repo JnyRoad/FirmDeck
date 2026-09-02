@@ -94,8 +94,10 @@ plus /workspace/gallery before reporting success.
     - [2. Configure a Model](#2-configure-a-model)
     - [3. Launch the Web Demo](#3-launch-the-web-demo)
     - [4. Verify the Installation](#4-verify-the-installation)
+    - [System Tenant Administration](#system-tenant-administration)
     - [Useful Commands](#useful-commands)
       - [Unified Python Entry](#unified-python-entry)
+  - [MCP OAuth 2.1 + PKCE](#mcp-oauth-21--pkce)
   - [Core Workflows](#core-workflows)
   - [Project Structure](#project-structure)
   - [FAQ](#faq)
@@ -114,7 +116,7 @@ plus /workspace/gallery before reporting success.
 - macOS, Linux, WSL, or Windows PowerShell
 - Python **3.11+**
 - Node.js **20+** and npm
-- An OpenAI-compatible Chat Completions endpoint and API key
+- One model connection option: an OpenAI-compatible endpoint and API key, or a ChatGPT subscription through a locally installed and authenticated Codex CLI
 - No CUDA requirement for the application itself; hardware requirements depend on the selected model service
 
 ### 1. Clone and Install
@@ -155,7 +157,18 @@ DEMO_MODEL_NAME="your-model-name"
 DEMO_MODEL_API_KEY="your-api-key"
 ```
 
-The API key is used to create the initial model configuration and is encrypted before being stored in the database. Do not commit `backend/.env`. After startup, model services can also be managed from **Admin → Model Configuration**.
+The API key is used to create the initial model configuration and is encrypted before being stored in the database. Do not commit `backend/.env`.
+
+Alternatively, start StaffDeck, open **Admin → Model Configuration → New Model**, select
+**ChatGPT subscription (Codex)**, and choose **Connect ChatGPT subscription**. StaffDeck opens the
+Codex-managed ChatGPT login page in the default browser on the same machine. The configured
+`CODEX_SUBSCRIPTION_COMMAND` defaults to `codex` and is resolved from `PATH` at runtime, so the
+actual installed Codex CLI is used. StaffDeck does not ask for, return, or store a ChatGPT OAuth
+code, callback, access token, refresh token, or subscription credential. API Key and subscription
+models can coexist. Signing out signs the local Codex CLI out of ChatGPT, affecting every
+subscription model and potentially other applications on the same computer that share that Codex
+login. This flow requires a local Codex CLI that can open a browser; it is not supported from
+remote or headless deployments.
 
 ### 3. Launch the Web Demo
 
@@ -166,7 +179,7 @@ The API key is used to create the initial model configuration and is encrypted b
 
 Both wrappers call the same cross-platform Python lifecycle entry, `scripts/dev.py`. The startup process builds the StaffDeck frontend and serves the UI, API, and Swagger documentation from one FastAPI process on port `5173`.
 
-Initial administrator credentials: username `admin`, password `admin`. Please change the password after first login.
+Initial demo-tenant credentials: tenant slug `demo`, username `admin`, password `admin`. Please change the password after first login.
 
 ### 4. Verify the Installation
 
@@ -189,6 +202,61 @@ Expected output:
 ```
 
 Open [http://127.0.0.1:5173/workspace/gallery](http://127.0.0.1:5173/workspace/gallery), select a digital employee, and send the first message. The answer and its execution record should stream into the same conversation turn.
+
+### System Tenant Administration
+
+Tenant administrators remain scoped to one tenant. Installation-wide tenant management uses a
+separate system administrator, signing secret, token audience, API client, browser session, and
+`/system/*` console. A system administrator can create tenants, rename their display names, reset
+the initial tenant administrator password, suspend/reactivate tenants, and inspect control audits;
+it cannot impersonate tenant users, read tenant business data through the control API, or hard-delete
+tenants.
+
+Generate a dedicated secret that is different from `APP_SECRET`, store it only in your local
+`backend/.env`, then run the normal application startup so the schema migration completes:
+
+```dotenv
+SYSTEM_ADMIN_SECRET="replace-with-a-different-long-random-secret"
+```
+
+Bootstrap the development system administrator locally. The command creates the fixed initial
+credential `sysadmin` / `sysadmin` and marks it for mandatory password replacement. Until that
+replacement succeeds, the system session cannot access tenant-control operations. Do not use this
+development bootstrap credential as a production provisioning mechanism:
+
+```bash
+cd backend
+.venv/bin/python -m app.system_admin.cli bootstrap
+cd ..
+```
+
+Open [http://127.0.0.1:5173/system/login](http://127.0.0.1:5173/system/login). This route is
+intentionally absent from ordinary tenant navigation. On first login, replace the initial password
+with an 8–20 character password that satisfies the configured system policy. The system console can
+subsequently rotate its own password and configure the installation default or per-tenant password
+policy. If local CLI recovery is required, run:
+
+```bash
+cd backend
+.venv/bin/python -m app.system_admin.cli reset-password --username sysadmin
+cd ..
+```
+
+Rotation invalidates existing system tokens. Missing or whitespace-tainted `SYSTEM_ADMIN_SECRET`
+disables system HTTP authentication; it never falls back to `APP_SECRET`.
+
+Tenant suspension is an execution-control boundary, not a delete. New tenant admission is denied,
+in-flight durable workers are fenced by lifecycle version/worker generation, and pre-suspension work
+is not replayed after reactivation. Do not treat suspension as production-ready until the lifecycle
+matrix, isolated-browser journey, migration checks, and security inspection in
+`specs/001-system-tenant-management/quickstart.md` are complete. Mocked provider tests do not verify
+real third-party behavior.
+
+Codex A2A is installation-owned (`system_runtime_key=codex_a2a`), not a tenant and not the Codex
+desktop application itself. Enabling it requires both `CODEX_A2A_ENABLED=true` and a dedicated,
+non-empty `CODEX_A2A_TOKEN`. New development databases use the explicit owner schema; a development
+database containing the old `a2a_codex` pseudo-tenant/schema must be rebuilt only after its exact path
+is confirmed. StaffDeck does not add a runtime compatibility branch or automatically delete that data.
 
 ### Useful Commands
 
@@ -218,6 +286,39 @@ Replace `up --detach` with another lifecycle argument when needed:
 | Stop the local service | `down` |
 
 > Full guide → [StaffDeck Tutorial](https://staffdeck.openbmb.cn/#/docs/introduce?lang=en)
+
+## MCP OAuth 2.1 + PKCE
+
+Saved Streamable HTTP MCP servers can opt in to per-user OAuth from the MCP server editor. StaffDeck
+uses the pinned official Python MCP SDK for protected discovery and invocation while preserving the
+existing client for no-auth, stdio, builtin, and legacy SSE connections.
+
+- Configure only public client data: either a pre-registered public client ID or a provider-supported
+  client metadata document URL, plus the exact redirect URI. Do not paste access tokens, refresh
+  tokens, PKCE verifiers, or client secrets into headers or the editor.
+- Each signed-in user connects and disconnects independently. SDK token and dynamic client models are
+  encrypted at rest and are never returned by server/status APIs.
+- The configured redirect URI must use the exact
+  `/api/enterprise/mcp-servers/oauth/callback` path. In deployed environments its HTTPS origin must
+  match `STAFFDECK_PUBLIC_URL`; loopback HTTP is allowed only for local development.
+- The callback is accepted only from the same browser flow that started authorization, using a
+  short-lived HttpOnly, SameSite cookie scoped to the callback path.
+- Every SDK HTTP target is restricted to HTTPS and public addresses. DNS is resolved and validated
+  again at connection time, then the TCP connection is pinned to the validated numeric address.
+- An unfinished browser authorization expires after 10 minutes and cannot resume after a process
+  restart. The start request and callback use process-local coordination, so multi-worker deployments
+  must route both requests to the same application process (for example with sticky routing) or add
+  a distributed coordinator.
+- Refresh operations are serialized per tenant/server/user in the current process and guarded by an
+  optimistic database version. Multi-worker deployments do not have a distributed refresh lock, so
+  route one user's OAuth work to a single process or add a distributed lock before scaling this path.
+- Frozen builds collect the `mcp` package modules and distribution metadata because the adapter checks
+  the reviewed SDK version at runtime.
+
+Provider registration remains external: the provider must accept the StaffDeck redirect URI and the
+configured public client identity, CIMD document, or SDK-supported dynamic registration. Live-provider
+interoperability is not implied by the controlled tests and must be validated separately with an
+approved StaffDeck client registration.
 
 
 
@@ -281,13 +382,18 @@ StaffDeck/
 <details>
 <summary><strong>The page opens, but the digital employee does not answer.</strong></summary>
 
-Check the selected model configuration, API key, model name, and model service network. Then inspect the execution record and `.dev/logs/app.log` to identify the exact error returned by the model service.
+Check the selected model configuration, model name, and connection path. For API Key models,
+check the key and model-service network; for subscription models, confirm the intended local Codex
+CLI is installed and signed in to ChatGPT. Then inspect the execution record and `.dev/logs/app.log`
+for the error code.
 </details>
 
 <details>
 <summary><strong>Can StaffDeck run without a local GPU?</strong></summary>
 
-Yes. The application calls an OpenAI-compatible model endpoint, so GPU requirements depend on the model service you deploy or use.
+Yes. API Key models call the endpoint you configure, while subscription models use the local Codex
+runtime; neither path requires a GPU for StaffDeck itself. GPU requirements depend on the model
+service you deploy or use.
 </details>
 
 <details>

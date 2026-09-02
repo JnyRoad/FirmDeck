@@ -1,6 +1,6 @@
 [project]
 name = "skill-agent-loop-backend"
-version = "0.1.0"
+dynamic = ["version"]
 description = "FastAPI MVP for an enterprise Skill Agent Loop service"
 requires-python = ">=3.11"
 dependencies = [
@@ -13,6 +13,7 @@ dependencies = [
   "greenlet>=3.0.3",
   "lark-channel-sdk==1.2.0",
   "httpx>=0.27.0",
+  "mcp==2.1.1",
   "openai>=1.40.0",
   "packaging>=24.0",
   "beautifulsoup4>=4.12.3",
@@ -27,7 +28,8 @@ dependencies = [
   "tzdata>=2025.2",
   "uvicorn[standard]>=0.30.0",
   "wecom-aibot-python-sdk>=1.0.2",
-  "dingtalk-stream>=0.24.3,<0.25.0"
+  "dingtalk-stream>=0.24.3,<0.25.0",
+  "defusedxml>=0.7.1"
 ]
 
 [project.optional-dependencies]
@@ -48,8 +50,11 @@ packaging = [
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
+[tool.setuptools.dynamic]
+version = {file = ["VERSION"]}
+
 [tool.setuptools]
-py-modules = ["desktop_launcher", "feishu_connector_worker", "single_port_app"]
+py-modules = ["desktop_launcher", "feishu_connector_worker", "runtime_network", "single_port_app"]
 
 [tool.setuptools.packages.find]
 include = ["app*", "mock_servers*"]

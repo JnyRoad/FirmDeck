@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from datetime import timedelta
 
+from sqlalchemy import update
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
+from app.core import harness_recovery as harness_recovery_module
 from app.core.harness_recovery import RECOVERY_REPLY, recover_orphan_harness_runs
 from app.db.models import (
     AgentEvent,
@@ -15,7 +17,13 @@ from app.db.models import (
     HarnessTaskFrameRecord,
     HarnessTurnRecord,
     Message,
+    Tenant,
     utc_now,
+)
+from app.i18n.language_context import (
+    LanguageContext,
+    LocaleResolutionSource,
+    SupportedLocale,
 )
 
 
@@ -34,7 +42,9 @@ def _add_active_execution(
     *,
     lease_expires_at,
     session_id: str = "session-orphan",
+    language_context_json: dict | None = None,
 ) -> None:
+    """Seed an active execution with an optional immutable source-turn snapshot."""
     session = ChatSession(
         id=session_id,
         tenant_id="tenant-demo",
@@ -42,6 +52,16 @@ def _add_active_execution(
         active_skill_id="after_sales_refund",
         active_step_id="confirm_refund_order",
         slots_json={"order_id": "ORDER-1"},
+        agent_reply_locale=(
+            language_context_json.get("agent_reply_locale")
+            if isinstance(language_context_json, dict)
+            else None
+        ),
+        agent_reply_locale_source=(
+            language_context_json.get("agent_reply_locale_source")
+            if isinstance(language_context_json, dict)
+            else None
+        ),
     )
     user_message = Message(
         id="msg-user",
@@ -59,6 +79,7 @@ def _add_active_execution(
         lease_owner="turn-worker",
         lease_expires_at=lease_expires_at,
         user_message_id=user_message.id,
+        language_context_json=language_context_json,
     )
     loop = HarnessAgentLoopRecord(
         id="hloop-orphan",
@@ -85,6 +106,7 @@ def _add_active_execution(
         attempt_no=3,
         lease_owner="frame-worker",
         lease_expires_at=lease_expires_at,
+        language_context_json=language_context_json,
     )
     run = HarnessRunRecord(
         id="hrun-orphan",
@@ -97,6 +119,7 @@ def _add_active_execution(
         attempt_no=frame.attempt_no,
         lease_owner=frame.lease_owner,
         lease_expires_at=lease_expires_at,
+        language_context_json=language_context_json,
     )
     lease = HarnessSessionLeaseRecord(
         id="hslease-orphan",
@@ -110,6 +133,7 @@ def _add_active_execution(
 
 
 def test_startup_recovery_terminalizes_attempt_and_preserves_checkpoint() -> None:
+    """Recover an orphan with a registered safe code and the legacy zh-CN reply locale."""
     engine = _engine()
     now = utc_now()
     with Session(engine) as db:
@@ -129,7 +153,7 @@ def test_startup_recovery_terminalizes_attempt_and_preserves_checkpoint() -> Non
         turn = db.get(HarnessTurnRecord, "hturn-orphan")
         session = db.get(ChatSession, "session-orphan")
         assert run is not None and run.status == "abandoned"
-        assert run.result_json["error"]["code"] == "SERVICE_RESTARTED"
+        assert run.result_json["error"]["code"] == "INTERNAL_ERROR"
         assert frame is not None and frame.status == "queued"
         assert frame.step_id == "confirm_refund_order"
         assert frame.slots_json == {"order_id": "ORDER-1"}
@@ -157,6 +181,15 @@ def test_startup_recovery_terminalizes_attempt_and_preserves_checkpoint() -> Non
             "assistant_message_created",
             "harness_execution_recovered",
         }
+        recovery_event = next(
+            event
+            for event in events
+            if event.event_type == "harness_execution_recovered"
+        )
+        assert recovery_event.payload_json["schema_version"] == 2
+        assert recovery_event.payload_json["event_code"] == "harness.execution.recovered"
+        assert recovery_event.payload_json["params"] == {"error_code": "INTERNAL_ERROR"}
+        assert "reply" not in recovery_event.payload_json
 
         repeated = recover_orphan_harness_runs(db, startup=True, now=now)
         assert repeated == repeated.__class__()
@@ -186,6 +219,7 @@ def test_runtime_sweeper_ignores_live_execution() -> None:
 
 
 def test_runtime_sweeper_recovers_expired_execution() -> None:
+    """Use the same registered recovery code for an expired execution sweep."""
     engine = _engine()
     now = utc_now()
     with Session(engine) as db:
@@ -199,5 +233,250 @@ def test_runtime_sweeper_recovers_expired_execution() -> None:
         assert db.get(HarnessRunRecord, "hrun-orphan").status == "abandoned"
         assert db.get(HarnessTaskFrameRecord, "htask-orphan").status == "queued"
         turn = db.get(HarnessTurnRecord, "hturn-orphan")
-        assert turn is not None and turn.error_json["code"] == "HARNESS_EXECUTION_LOST"
+        assert turn is not None and turn.error_json["code"] == "INTERNAL_ERROR"
         assert db.get(ChatSession, "session-orphan").status == "active"
+
+
+def test_recovery_does_not_overwrite_a_successor_run_or_frame_claim(monkeypatch) -> None:
+    """Recovery snapshots must lose a CAS race instead of closing the successor."""
+    engine = _engine()
+    now = utc_now()
+    with Session(engine) as db:
+        _add_active_execution(db, lease_expires_at=now - timedelta(seconds=1))
+        raced = False
+        original = harness_recovery_module._lifecycle_failure_code
+
+        def inject_successor_claim(*args, **kwargs):
+            nonlocal raced
+            if not raced:
+                with Session(engine) as successor_db:
+                    successor_db.exec(
+                        update(HarnessRunRecord)
+                        .where(
+                            HarnessRunRecord.id == "hrun-orphan",
+                            HarnessRunRecord.status == "running",
+                            HarnessRunRecord.lease_owner == "frame-worker",
+                            HarnessRunRecord.attempt_no == 3,
+                        )
+                        .values(
+                            lease_owner="successor-run",
+                            attempt_no=4,
+                            lease_expires_at=now + timedelta(minutes=5),
+                        )
+                    )
+                    successor_db.exec(
+                        update(HarnessTaskFrameRecord)
+                        .where(
+                            HarnessTaskFrameRecord.id == "htask-orphan",
+                            HarnessTaskFrameRecord.status == "running",
+                            HarnessTaskFrameRecord.lease_owner == "frame-worker",
+                            HarnessTaskFrameRecord.attempt_no == 3,
+                        )
+                        .values(
+                            lease_owner="successor-frame",
+                            attempt_no=4,
+                            lease_expires_at=now + timedelta(minutes=5),
+                        )
+                    )
+                    successor_db.commit()
+                raced = True
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(
+            harness_recovery_module,
+            "_lifecycle_failure_code",
+            inject_successor_claim,
+        )
+
+        result = recover_orphan_harness_runs(db, now=now)
+
+        db.expire_all()
+        run = db.get(HarnessRunRecord, "hrun-orphan")
+        frame = db.get(HarnessTaskFrameRecord, "htask-orphan")
+        turn = db.get(HarnessTurnRecord, "hturn-orphan")
+        assert result.run_count == 0
+        assert result.frame_count == 0
+        assert run is not None
+        assert run.status == "running"
+        assert run.lease_owner == "successor-run"
+        assert run.attempt_no == 4
+        assert frame is not None
+        assert frame.status == "running"
+        assert frame.lease_owner == "successor-frame"
+        assert frame.attempt_no == 4
+        assert turn is not None and turn.status == "started"
+        assert not db.exec(
+            select(Message).where(
+                Message.session_id == "session-orphan",
+                Message.role == "assistant",
+            )
+        ).all()
+
+
+def test_recovery_preserves_bound_snapshot_for_retry_and_raw_user_content() -> None:
+    """Recovery must replay the source locale while keeping the original user message untouched."""
+    context = LanguageContext(
+        ui_locale="en-US",
+        agent_reply_locale="zh-CN",
+        ui_locale_source=LocaleResolutionSource.EXPLICIT_REQUEST,
+        agent_reply_locale_source=LocaleResolutionSource.EXPLICIT_REQUEST,
+    )
+    expected_snapshot = context.model_dump(mode="json")
+    engine = _engine()
+    now = utc_now()
+
+    with Session(engine) as db:
+        _add_active_execution(
+            db,
+            lease_expires_at=now - timedelta(seconds=1),
+            language_context_json=expected_snapshot,
+        )
+        session = db.get(ChatSession, "session-orphan")
+        assert session is not None
+        # UI preference changes are independent of the already-bound reply locale.
+        session.agent_reply_locale = "en-US"
+        session.agent_reply_locale_source = "user_preference"
+        db.add(session)
+        db.commit()
+
+        result = recover_orphan_harness_runs(db, now=now)
+
+        assert result.message_count == 1
+        run = db.get(HarnessRunRecord, "hrun-orphan")
+        frame = db.get(HarnessTaskFrameRecord, "htask-orphan")
+        turn = db.get(HarnessTurnRecord, "hturn-orphan")
+        assert run is not None and run.language_context_json == expected_snapshot
+        assert frame is not None and frame.language_context_json == expected_snapshot
+        assert turn is not None and turn.language_context_json == expected_snapshot
+        user_message = db.get(Message, "msg-user")
+        assert user_message is not None
+        assert user_message.content == "ORDER-1"
+        recovery = db.exec(
+            select(Message).where(
+                Message.session_id == "session-orphan",
+                Message.role == "assistant",
+            )
+        ).one()
+        assert recovery.metadata_json["language_context"] == expected_snapshot
+        assert recovery.content == RECOVERY_REPLY
+
+
+def test_legacy_recovery_uses_controlled_default_snapshot() -> None:
+    """Pre-migration recovery records use only the explicit zh-CN compatibility fallback."""
+    engine = _engine()
+    now = utc_now()
+    with Session(engine) as db:
+        _add_active_execution(db, lease_expires_at=now - timedelta(seconds=1))
+
+        recover_orphan_harness_runs(db, now=now)
+
+        recovery = db.exec(
+            select(Message).where(
+                Message.session_id == "session-orphan",
+                Message.role == "assistant",
+            )
+        ).one()
+        assert recovery.metadata_json["language_context"] == {
+            "version": 1,
+            "ui_locale": "zh-CN",
+            "agent_reply_locale": "zh-CN",
+            "ui_locale_source": "legacy_default",
+            "agent_reply_locale_source": "legacy_default",
+        }
+
+
+def test_recovery_reply_uses_persisted_agent_locale_not_ui_locale() -> None:
+    """Render recovery prose from the durable reply locale without translating source content."""
+    context = LanguageContext(
+        ui_locale=SupportedLocale.ZH_CN,
+        agent_reply_locale=SupportedLocale.EN_US,
+        ui_locale_source=LocaleResolutionSource.EXPLICIT_REQUEST,
+        agent_reply_locale_source=LocaleResolutionSource.EXPLICIT_REQUEST,
+    )
+    engine = _engine()
+    now = utc_now()
+
+    with Session(engine) as db:
+        _add_active_execution(
+            db,
+            lease_expires_at=now - timedelta(seconds=1),
+            language_context_json=context.model_dump(mode="json"),
+        )
+
+        recover_orphan_harness_runs(db, now=now)
+
+        recovery = db.exec(
+            select(Message).where(
+                Message.session_id == "session-orphan",
+                Message.role == "assistant",
+            )
+        ).one()
+        session = db.get(ChatSession, "session-orphan")
+
+    assert recovery.content.startswith("This run ended because")
+    assert "本轮执行" not in recovery.content
+    assert session is not None
+    assert session.summary == recovery.content[:120]
+
+
+def test_suspended_orphan_recovery_terminalizes_harness_work_without_requeue() -> None:
+    """Recovery must fail closed for suspended tenants and leave no executable queued frame."""
+    engine = _engine()
+    now = utc_now()
+    with Session(engine) as db:
+        db.add(
+            Tenant(
+                id="tenant-demo",
+                name="Demo",
+                status="suspended",
+                lifecycle_version=2,
+            )
+        )
+        _add_active_execution(db, lease_expires_at=now + timedelta(minutes=10))
+
+        result = recover_orphan_harness_runs(db, startup=True, now=now)
+
+        assert result.run_count == 1
+        run = db.get(HarnessRunRecord, "hrun-orphan")
+        frame = db.get(HarnessTaskFrameRecord, "htask-orphan")
+        turn = db.get(HarnessTurnRecord, "hturn-orphan")
+        assert run is not None and run.status != "running"
+        assert frame is not None and frame.status not in {"queued", "running"}
+        assert turn is not None and turn.status == "failed"
+        assert (frame.error_json or {}).get("code") == "TENANT_SUSPENDED"
+        assert (run.result_json.get("error") or {}).get("code") == "TENANT_SUSPENDED"
+
+
+def test_fast_reactivation_does_not_requeue_a_pre_transition_harness_orphan() -> None:
+    """A version mismatch remains terminal after suspend/reactivate before the recovery scan."""
+    engine = _engine()
+    now = utc_now()
+    with Session(engine) as db:
+        db.add(
+            Tenant(
+                id="tenant-demo",
+                name="Demo",
+                status="active",
+                lifecycle_version=3,
+            )
+        )
+        _add_active_execution(db, lease_expires_at=now + timedelta(minutes=10))
+
+        result = recover_orphan_harness_runs(db, startup=True, now=now)
+
+        assert result.run_count == 1
+        run = db.get(HarnessRunRecord, "hrun-orphan")
+        frame = db.get(HarnessTaskFrameRecord, "htask-orphan")
+        assert run is not None and run.status != "running"
+        assert frame is not None and frame.status not in {"queued", "running"}
+        assert (frame.error_json or {}).get("code") == "TENANT_LIFECYCLE_CHECK_FAILED"
+        assert (run.result_json.get("error") or {}).get("code") == (
+            "TENANT_LIFECYCLE_CHECK_FAILED"
+        )
+
+        db.expire_all()
+        repeated = recover_orphan_harness_runs(db, startup=True, now=now)
+
+        assert repeated == repeated.__class__()
+        frame = db.get(HarnessTaskFrameRecord, "htask-orphan")
+        assert frame is not None and frame.status not in {"queued", "running"}

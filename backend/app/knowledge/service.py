@@ -10,16 +10,17 @@ from pathlib import Path
 from typing import Any
 
 from pydantic import ValidationError
-from sqlalchemy import delete
+from sqlalchemy import delete, or_, update
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
-from app.capability_scope import normalize_capability_scope
 from app import paths
+from app.capability_scope import normalize_capability_scope
 from app.db import engine
 from app.db.models import (
-    KnowledgeBucket,
     KnowledgeBase,
+    KnowledgeBaseVersion,
+    KnowledgeBucket,
     KnowledgeChunk,
     KnowledgeConcept,
     KnowledgeDiscoverySuggestion,
@@ -27,17 +28,13 @@ from app.db.models import (
     KnowledgeIngestJob,
     ModelConfig,
     Skill,
+    Tenant,
     Tool,
+    new_id,
     utc_now,
 )
-from app.knowledge.parser import KnowledgeParseError, extract_text
-from app.llm.model_config_resolver import resolve_model_config_for_runtime
-from app.knowledge.schema import (
-    KnowledgeBucketRead,
-    KnowledgeChunkRead,
-    KnowledgeSearchRequest,
-    KnowledgeSearchResponse,
-)
+from app.knowledge.access import KnowledgeAccessService
+from app.knowledge.citations import CITATION_EXCERPT_CHAR_LIMIT
 from app.knowledge.okf import (
     build_okf_for_document,
     okf_citations_for_concepts,
@@ -45,11 +42,26 @@ from app.knowledge.okf import (
     selected_concept_cards,
     upsert_concepts,
 )
-from app.knowledge.citations import CITATION_EXCERPT_CHAR_LIMIT
+from app.knowledge.parser import KnowledgeParseError, extract_text
+from app.knowledge.schema import (
+    KnowledgeBucketRead,
+    KnowledgeChunkRead,
+    KnowledgeIngestStep,
+    KnowledgeSearchRequest,
+    KnowledgeSearchResponse,
+    KnowledgeStageDescriptor,
+    KnowledgeTraceItem,
+)
 from app.llm import LLMClient, LLMError
+from app.llm.model_config_resolver import resolve_model_config_for_runtime
 from app.observability.spans import llm_operation, observed_span
+from app.security.tenant import (
+    TenantExecutionKind,
+    TenantLifecycleDenied,
+    require_active_tenant,
+    require_matching_admission_version,
+)
 from app.skills.skill_schema import SkillCard, SkillGraphEdge, SkillGraphNode
-
 
 PROMPT_DIR = paths.resource_dir() / "app" / "llm" / "prompts"
 BUCKET_PROMPT = PROMPT_DIR / "knowledge_bucket_prompt.md"
@@ -65,7 +77,9 @@ SEARCH_DOCUMENT_ROUTE_LIMIT = 120
 SEARCH_BUCKET_ROUTE_LIMIT = 160
 TERMINAL_INGEST_STATUSES = {"succeeded", "failed", "cancelled"}
 CANCELLING_INGEST_STATUSES = {"cancel_requested", "cancelled"}
+FENCED_INGEST_STATUSES = {"running", "cancel_requested"}
 CANCEL_REQUEST_STALE_AFTER = timedelta(seconds=15)
+INGEST_JOB_LEASE_SECONDS = 15 * 60
 SEARCH_MIN_DOCUMENT_SCORE = 2.0
 SEARCH_MIN_BUCKET_SCORE = 2.0
 SEARCH_MIN_CHUNK_SCORE = 2.0
@@ -88,20 +102,73 @@ QUERY_NOISE_PHRASES = (
 )
 
 INGEST_STAGES: list[dict[str, Any]] = [
-    {"key": "queued", "label": "排队中", "progress": 0.0},
-    {"key": "parsing", "label": "解析原始资料", "progress": 0.08},
-    {"key": "normalizing", "label": "规范化 Source", "progress": 0.16},
-    {"key": "documenting", "label": "写入 Source Document", "progress": 0.24},
-    {"key": "bucketing", "label": "规划 Wiki 页面", "progress": 0.36},
-    {"key": "bucket_writing", "label": "写入 OKF Wiki", "progress": 0.48},
-    {"key": "chunking", "label": "生成引用来源", "progress": 0.62},
-    {"key": "summarizing", "label": "刷新 PageIndex", "progress": 0.74},
-    {"key": "discovering", "label": "发现 SOP/工具", "progress": 0.88},
-    {"key": "done", "label": "完成入库", "progress": 1.0},
+    {"key": "queued", "code": "queued", "progress": 0.0},
+    {"key": "parsing", "code": "parsing", "progress": 0.08},
+    {"key": "normalizing", "code": "normalizing", "progress": 0.16},
+    {"key": "documenting", "code": "documenting", "progress": 0.24},
+    {"key": "bucketing", "code": "bucketing", "progress": 0.36},
+    {"key": "bucket_writing", "code": "bucket_writing", "progress": 0.48},
+    {"key": "chunking", "code": "chunking", "progress": 0.62},
+    {"key": "summarizing", "code": "summarizing", "progress": 0.74},
+    {"key": "discovering", "code": "discovering", "progress": 0.88},
+    {"key": "done", "code": "done", "progress": 1.0},
 ]
 
 INGEST_STAGE_BY_KEY = {stage["key"]: stage for stage in INGEST_STAGES}
 logger = logging.getLogger(__name__)
+
+
+def _knowledge_trace(
+    phase: str,
+    *,
+    params: dict[str, Any] | None = None,
+    **fields: Any,
+) -> KnowledgeTraceItem:
+    """Build one stable retrieval trace item while keeping provider prose private."""
+    item: KnowledgeTraceItem = {
+        "phase": phase,
+        "code": phase,
+        "params": dict(params or {}),
+    }
+    item.update(fields)
+    return item
+
+
+def _knowledge_stage_descriptor(
+    code: str,
+    params: dict[str, Any] | None = None,
+) -> KnowledgeStageDescriptor:
+    """Build one persisted ingest-stage descriptor from a stable code and safe params."""
+    return {"code": code, "params": dict(params or {})}
+
+
+def _internal_knowledge_error_payload(
+    *,
+    retryable: bool = False,
+    raw_context: object | None = None,
+) -> dict[str, Any]:
+    """Return the only replay-safe ingest error payload currently allowed."""
+    del raw_context
+    return {
+        "code": "INTERNAL_ERROR",
+        "params": {},
+        "retryable": retryable,
+        "request_id": None,
+        "trace_id": None,
+    }
+
+
+def serialize_knowledge_error(
+    *,
+    retryable: bool = False,
+    raw_context: object | None = None,
+) -> str:
+    """Serialize one persisted knowledge error as canonical JSON for later safe replay."""
+    return json.dumps(
+        _internal_knowledge_error_payload(retryable=retryable, raw_context=raw_context),
+        ensure_ascii=False,
+        sort_keys=True,
+    )
 
 
 @dataclass
@@ -210,13 +277,26 @@ class KnowledgeIngestCancelled(RuntimeError):
     """Raised inside the ingest worker when a persisted job is cancelled."""
 
 
+class KnowledgeIngestExecutionFenceLost(RuntimeError):
+    """Raised when another worker or cancellation has replaced this ingest generation."""
+
+
 class KnowledgeService:
     def __init__(self, db: Session):
         self.db = db
+        self._execution_owner: str | None = None
+        self._execution_generation: int | None = None
 
     def create_ingest_job(self, payload: IngestPayload) -> KnowledgeIngestJob:
+        admission = require_active_tenant(
+            self.db,
+            tenant_id=payload.tenant_id,
+            execution_kind=TenantExecutionKind.JOB_CLAIM,
+            correlation_id="knowledge-ingest-admission",
+        )
         job = KnowledgeIngestJob(
             tenant_id=payload.tenant_id,
+            tenant_lifecycle_version=admission.lifecycle_version,
             knowledge_base_id=payload.knowledge_base_id,
             knowledge_base_version_id=payload.knowledge_base_version_id
             or _default_knowledge_base_version_id(payload.knowledge_base_id),
@@ -348,21 +428,24 @@ class KnowledgeService:
         return document
 
     def cancel_ingest_job(self, job_id: str, tenant_id: str) -> KnowledgeIngestJob | None:
+        """Request or finalize cancellation for one tenant-owned ingest job."""
         job = self.db.get(KnowledgeIngestJob, job_id)
         if not job or job.tenant_id != tenant_id:
             return None
         if job.status in TERMINAL_INGEST_STATUSES:
             return job
         if job.status == "queued":
-            self._finalize_cancelled_job(job, "入库任务已取消")
+            self._finalize_cancelled_job(job)
             return job
         if job.status == "cancel_requested":
-            self._finalize_cancelled_job(job, "入库任务已取消")
+            self._finalize_cancelled_job(job)
             return job
 
         metadata = dict(job.metadata_json or {})
-        metadata["stage_label"] = "取消中"
-        metadata["stage_detail"] = "已收到取消请求，正在停止当前入库阶段"
+        metadata.pop("stage_label", None)
+        metadata["stage_code"] = job.stage
+        metadata["stage_params"] = {}
+        metadata["stage_detail"] = _knowledge_stage_descriptor("cancel_requested")
         metadata["cancel_requested_at"] = utc_now().isoformat()
         metadata["ingest_steps"] = _ingest_steps_for(job.stage, float(job.progress or 0.0), "cancel_requested")
         job.metadata_json = metadata
@@ -390,13 +473,260 @@ class KnowledgeService:
         job: KnowledgeIngestJob,
         grace_period: timedelta = CANCEL_REQUEST_STALE_AFTER,
     ) -> KnowledgeIngestJob | None:
+        """Finalize a cancellation request only after its bounded grace period expires."""
         if job.status != "cancel_requested":
             return None
         last_update = job.updated_at or job.created_at
         if utc_now() - last_update < grace_period:
             return None
-        self._finalize_cancelled_job(job, "入库任务已取消")
+        self._finalize_cancelled_job(job)
         return job
+
+    def _claim_ingest_job(
+        self,
+        job_id: str,
+        owner: str,
+    ) -> KnowledgeIngestJob | None:
+        """Claim one queued ingest generation after a fresh tenant admission read."""
+        self.db.rollback()
+        candidate = self.db.get(KnowledgeIngestJob, job_id)
+        if candidate is None or candidate.status in TERMINAL_INGEST_STATUSES:
+            return None
+        if candidate.status in CANCELLING_INGEST_STATUSES:
+            self._finalize_cancelled_job(candidate)
+            return None
+        try:
+            decision = require_active_tenant(
+                self.db,
+                tenant_id=candidate.tenant_id,
+                execution_kind=TenantExecutionKind.JOB_CLAIM,
+                correlation_id=job_id,
+            )
+            require_matching_admission_version(
+                decision,
+                candidate.tenant_lifecycle_version,
+            )
+        except TenantLifecycleDenied as denial:
+            self.db.rollback()
+            current = self.db.get(KnowledgeIngestJob, job_id)
+            if current is not None and current.status in {"queued", "running"}:
+                self._terminalize_ingest_denial(
+                    current,
+                    denial,
+                    owner=None,
+                    generation=current.execution_generation,
+                )
+            return None
+
+        # End the authoritative read transaction before attempting the claim CAS.
+        self.db.rollback()
+        now = utc_now()
+        claim = self.db.exec(
+            update(KnowledgeIngestJob)
+            .where(
+                KnowledgeIngestJob.id == job_id,
+                or_(
+                    KnowledgeIngestJob.status == "queued",
+                    (KnowledgeIngestJob.status == "running")
+                    & KnowledgeIngestJob.execution_owner.is_(None),
+                ),
+                KnowledgeIngestJob.tenant_lifecycle_version
+                == candidate.tenant_lifecycle_version,
+                select(Tenant.id)
+                .where(
+                    Tenant.id == KnowledgeIngestJob.tenant_id,
+                    Tenant.status == "active",
+                    Tenant.lifecycle_version
+                    == KnowledgeIngestJob.tenant_lifecycle_version,
+                )
+                .exists(),
+            )
+            .values(
+                status="running",
+                execution_owner=owner,
+                execution_generation=KnowledgeIngestJob.execution_generation + 1,
+                lease_expires_at=now + timedelta(seconds=INGEST_JOB_LEASE_SECONDS),
+                started_at=now,
+                updated_at=now,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        if getattr(claim, "rowcount", 0) != 1:
+            self.db.rollback()
+            return None
+        self.db.commit()
+        claimed = self.db.get(KnowledgeIngestJob, job_id)
+        if claimed is None:
+            return None
+        self._execution_owner = owner
+        self._execution_generation = claimed.execution_generation
+        return claimed
+
+    def _require_ingest_execution_fence(self, job: KnowledgeIngestJob) -> None:
+        """Require the worker's owner/generation and exact active tenant version."""
+        owner = self._execution_owner
+        generation = self._execution_generation
+        if owner is None or generation is None:
+            raise KnowledgeIngestExecutionFenceLost("ingest worker claim is missing")
+        self.db.rollback()
+        current = self.db.get(KnowledgeIngestJob, job.id)
+        if (
+            current is None
+            or current.status not in FENCED_INGEST_STATUSES
+            or current.execution_owner != owner
+            or current.execution_generation != generation
+        ):
+            raise KnowledgeIngestExecutionFenceLost("ingest worker claim was replaced")
+        decision = require_active_tenant(
+            self.db,
+            tenant_id=current.tenant_id,
+            execution_kind=TenantExecutionKind.JOB_CLAIM,
+            correlation_id=current.id,
+        )
+        require_matching_admission_version(
+            decision,
+            current.tenant_lifecycle_version,
+        )
+        self.db.rollback()
+
+    def _commit_ingest_fenced(self, job: KnowledgeIngestJob) -> None:
+        """Commit local writes only while this owner/generation still holds the active lease."""
+        if self._execution_owner is None or self._execution_generation is None:
+            if job.status in TERMINAL_INGEST_STATUSES:
+                job.execution_owner = None
+                job.lease_expires_at = None
+                self.db.add(job)
+            self.db.commit()
+            self.db.refresh(job)
+            return
+        # Cancellation may be observed after the API has moved a claimed row to
+        # ``cancel_requested``.  That row is still owned by this generation until
+        # the terminal CAS below releases it, so permit the same fenced cleanup
+        # transaction to advance from either in-flight status.
+        claimable_statuses = ("running", "cancel_requested")
+        # Terminal status changes are pending on ``job`` before the CAS.  Keep
+        # them unflushed while checking the still-running owner row, then flush
+        # the guarded local write only after the conditional update succeeds.
+        terminal_transition = job.status in TERMINAL_INGEST_STATUSES
+        terminal_values = {
+            "execution_owner": None,
+            "lease_expires_at": None,
+        } if terminal_transition else {}
+        where = (
+            update(KnowledgeIngestJob)
+            .where(
+                KnowledgeIngestJob.id == job.id,
+                KnowledgeIngestJob.status.in_(claimable_statuses),
+                KnowledgeIngestJob.execution_owner == self._execution_owner,
+                KnowledgeIngestJob.execution_generation == self._execution_generation,
+                KnowledgeIngestJob.tenant_lifecycle_version
+                == job.tenant_lifecycle_version,
+                select(Tenant.id)
+                .where(
+                    Tenant.id == KnowledgeIngestJob.tenant_id,
+                    Tenant.status == "active",
+                    Tenant.lifecycle_version
+                    == KnowledgeIngestJob.tenant_lifecycle_version,
+                )
+                .exists(),
+            )
+            .values(updated_at=utc_now(), **terminal_values)
+            .execution_options(synchronize_session=False)
+        )
+        if terminal_transition:
+            with self.db.no_autoflush:
+                result = self.db.exec(where)
+        else:
+            self.db.flush()
+            result = self.db.exec(where)
+        if getattr(result, "rowcount", 0) != 1:
+            self.db.rollback()
+            current = self.db.get(KnowledgeIngestJob, job.id)
+            if current is not None and current.status in FENCED_INGEST_STATUSES:
+                # Re-raise the authoritative lifecycle denial when that is the reason for
+                # the CAS miss; otherwise the owner/generation fence is simply lost.
+                self._require_ingest_execution_fence(current)
+            raise KnowledgeIngestExecutionFenceLost("ingest commit fence was lost")
+        if terminal_transition:
+            self.db.flush()
+        self.db.commit()
+        self.db.refresh(job)
+
+    def _terminalize_ingest_denial(
+        self,
+        job: KnowledgeIngestJob,
+        denial: TenantLifecycleDenied,
+        *,
+        owner: str | None,
+        generation: int,
+    ) -> KnowledgeIngestJob | None:
+        """Terminalize a denied claim without creating a replayable queued row."""
+        self.db.rollback()
+        current = self.db.get(KnowledgeIngestJob, job.id)
+        if current is None or current.status not in {"queued", *FENCED_INGEST_STATUSES}:
+            return None
+        if current.execution_generation != generation:
+            return None
+        if owner is None:
+            owner_predicate = KnowledgeIngestJob.execution_owner.is_(None)
+        else:
+            owner_predicate = KnowledgeIngestJob.execution_owner == owner
+        if current.document_id:
+            for model in (
+                KnowledgeDiscoverySuggestion,
+                KnowledgeConcept,
+                KnowledgeChunk,
+                KnowledgeBucket,
+            ):
+                self.db.exec(delete(model).where(model.document_id == current.document_id))
+            document = self.db.get(KnowledgeDocument, current.document_id)
+            if document is not None:
+                self.db.delete(document)
+        metadata = dict(current.metadata_json or {})
+        metadata.pop("content_base64", None)
+        metadata.pop("stage_label", None)
+        metadata["stage_code"] = "cancelled"
+        metadata["stage_params"] = {}
+        metadata["stage_detail"] = _knowledge_stage_descriptor(denial.code)
+        metadata["cancelled_at"] = utc_now().isoformat()
+        result = self.db.exec(
+            update(KnowledgeIngestJob)
+            .where(
+                KnowledgeIngestJob.id == current.id,
+                KnowledgeIngestJob.status.in_(["queued", *FENCED_INGEST_STATUSES]),
+                owner_predicate,
+                KnowledgeIngestJob.execution_generation == generation,
+            )
+            .values(
+                status="cancelled",
+                stage="cancelled",
+                progress=float(current.progress or 0.0),
+                error=json.dumps(
+                    {
+                        "code": denial.code,
+                        "params": {},
+                        "retryable": False,
+                        "request_id": None,
+                        "trace_id": None,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                metadata_json=metadata,
+                document_id=None,
+                finished_at=utc_now(),
+                updated_at=utc_now(),
+                execution_owner=None,
+                execution_generation=generation + 1,
+                lease_expires_at=None,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        if getattr(result, "rowcount", 0) != 1:
+            self.db.rollback()
+            return None
+        self.db.commit()
+        return self.db.get(KnowledgeIngestJob, current.id)
 
     def run_ingest_job(self, job_id: str) -> None:
         with Session(engine) as db:
@@ -404,8 +734,18 @@ class KnowledgeService:
             service._run_ingest_job(job_id)
 
     def _run_ingest_job(self, job_id: str) -> None:
+        """Execute one ingest job and persist only canonical failure payloads on error."""
         job = self.db.get(KnowledgeIngestJob, job_id)
         if not job:
+            return
+        if job.status in TERMINAL_INGEST_STATUSES:
+            return
+        if job.status in CANCELLING_INGEST_STATUSES:
+            self._finalize_cancelled_job(job)
+            return
+        owner = new_id("kjoblease")
+        job = self._claim_ingest_job(job_id, owner)
+        if job is None:
             return
         try:
             self._update_ingest_stage(
@@ -413,7 +753,7 @@ class KnowledgeService:
                 "parsing",
                 status="running",
                 started_at=utc_now(),
-                detail="正在识别文件格式并抽取正文",
+                detail_code="parsing",
             )
             metadata = job.metadata_json or {}
             content = base64.b64decode(str(metadata.get("content_base64") or ""))
@@ -422,7 +762,7 @@ class KnowledgeService:
             self._update_ingest_stage(
                 job,
                 "normalizing",
-                detail=f"已抽取 {file_type} 文本，正在清理空行和段落",
+                detail_code="normalizing",
             )
             normalized_text = _normalize_text(text)
             if not normalized_text:
@@ -432,7 +772,7 @@ class KnowledgeService:
             self._update_ingest_stage(
                 job,
                 "documenting",
-                detail=f"已获得 {len(normalized_text):,} 字符，正在识别章节导航树",
+                detail_code="documenting",
                 stats={"char_count": len(normalized_text), "file_type": file_type},
             )
             section_nodes = _build_section_nodes(normalized_text)
@@ -464,17 +804,19 @@ class KnowledgeService:
                     },
                 },
             )
+            self._require_ingest_execution_fence(job)
             self.db.add(document)
-            self.db.commit()
+            self.db.flush()
             self.db.refresh(document)
             job.document_id = document.id
             self.db.add(job)
-            self.db.commit()
+            self._commit_ingest_fenced(job)
+            self.db.refresh(job)
             self.db.refresh(job)
             self._update_ingest_stage(
                 job,
                 "bucketing",
-                detail="正在按目录结构、章节语义和任务用途规划 OKF Wiki 页面",
+                detail_code="bucketing",
                 document_id=document.id,
                 stats={"section_count": len(section_nodes)},
             )
@@ -491,25 +833,27 @@ class KnowledgeService:
             self._update_ingest_stage(
                 job,
                 "bucket_writing",
-                detail=f"已规划 {len(buckets)} 个知识主题，正在写入 OKF Wiki 与内部索引",
+                detail_code="bucket_writing",
                 stats={"bucket_count": len(buckets), "section_count": len(section_nodes)},
             )
             self._update_ingest_stage(
                 job,
                 "chunking",
-                detail="正在从 OKF Wiki 与原始资料回填引用来源",
+                detail_code="chunking",
                 stats={"bucket_count": len(buckets)},
             )
             chunk_count = self._build_chunks(job.tenant_id, job.knowledge_base_id, document, buckets, section_nodes, job)
             self._raise_if_ingest_cancelled(job)
             okf_concepts = build_okf_for_document(document, section_nodes, buckets)
             self._raise_if_ingest_cancelled(job)
+            self._require_ingest_execution_fence(job)
             concept_rows = upsert_concepts(
                 self.db,
                 job.tenant_id,
                 job.knowledge_base_id,
                 document.knowledge_base_version_id,
                 okf_concepts,
+                commit=False,
             )
 
             document.bucket_count = len(buckets)
@@ -539,54 +883,115 @@ class KnowledgeService:
             }
             document.updated_at = utc_now()
             self.db.add(document)
+            self._commit_ingest_fenced(job)
             self._update_ingest_stage(
                 job,
                 "summarizing",
-                detail=f"已生成 {chunk_count} 个引用来源，正在刷新 PageIndex 与来源摘要",
+                detail_code="summarizing",
                 stats={"concept_count": len(concept_rows), "bucket_count": len(buckets), "chunk_count": chunk_count},
             )
             self._update_ingest_stage(
                 job,
                 "discovering",
-                detail="正在从 OKF Wiki 和引用来源发现可确认的 SOP/工具建议",
+                detail_code="discovering",
                 stats={"bucket_count": len(buckets), "chunk_count": chunk_count},
             )
 
             self._discover_from_document(job.tenant_id, job.knowledge_base_id, document, buckets, job)
+            self._clear_embedded_content(job)
             self._update_ingest_stage(
                 job,
                 "done",
                 status="succeeded",
                 finished_at=utc_now(),
-                detail=f"完成入库：{len(concept_rows)} 个 Wiki 页面，{len(buckets)} 个内部索引，{chunk_count} 个引用来源",
+                detail_code="done",
                 stats={
                     "concept_count": len(concept_rows),
                     "bucket_count": len(buckets),
                     "chunk_count": chunk_count,
                 },
             )
-            self._clear_embedded_content(job)
-        except KnowledgeIngestCancelled as exc:
-            self._finalize_cancelled_job(job, str(exc) or "入库任务已取消")
+        except KnowledgeIngestCancelled:
+            try:
+                self._finalize_cancelled_job(job)
+            except TenantLifecycleDenied as denial:
+                if self._execution_generation is not None:
+                    self._terminalize_ingest_denial(
+                        job,
+                        denial,
+                        owner=self._execution_owner,
+                        generation=self._execution_generation,
+                    )
+            except KnowledgeIngestExecutionFenceLost:
+                self.db.rollback()
+        except TenantLifecycleDenied as denial:
+            if self._execution_generation is not None:
+                self._terminalize_ingest_denial(
+                    job,
+                    denial,
+                    owner=self._execution_owner,
+                    generation=self._execution_generation,
+                )
+        except KnowledgeIngestExecutionFenceLost:
+            self.db.rollback()
+            return
         except Exception as exc:  # noqa: BLE001 - persist stable job failure.
-            if job.document_id:
-                document = self.db.get(KnowledgeDocument, job.document_id)
-                if document:
-                    document.status = "failed"
-                    document.error = str(exc)
-                    document.updated_at = utc_now()
-                    self.db.add(document)
-            self._update_ingest_stage(
-                job,
-                "failed",
-                status="failed",
-                error=str(exc),
-                finished_at=utc_now(),
-                detail=str(exc),
-            )
-            self._clear_embedded_content(job)
+            logger.exception("Knowledge ingest job %s failed", job_id)
+            self.db.rollback()
+            current = self.db.get(KnowledgeIngestJob, job_id)
+            if (
+                current is None
+                or current.execution_owner != self._execution_owner
+                or current.execution_generation != self._execution_generation
+                or current.status not in {"running", "cancel_requested"}
+            ):
+                return
+            job = current
+            public_error = serialize_knowledge_error(raw_context=exc)
+            try:
+                self._clear_embedded_content(job)
+                if job.document_id:
+                    document = self.db.get(KnowledgeDocument, job.document_id)
+                    if document:
+                        document.status = "failed"
+                        document.error = public_error
+                        document.updated_at = utc_now()
+                        self.db.add(document)
+                self._update_ingest_stage(
+                    job,
+                    "failed",
+                    status="failed",
+                    error=public_error,
+                    finished_at=utc_now(),
+                    detail_code="failed",
+                )
+            except (TenantLifecycleDenied, KnowledgeIngestExecutionFenceLost):
+                self.db.rollback()
+                return
 
-    def search(self, request: KnowledgeSearchRequest, model_config: ModelConfig | None = None) -> KnowledgeSearchResponse:
+    def search(
+        self,
+        request: KnowledgeSearchRequest,
+        model_config: ModelConfig | None = None,
+        *,
+        trusted_team_id: str | None = None,
+        authorized_knowledge_versions: dict[str, str] | None = None,
+    ) -> KnowledgeSearchResponse:
+        """检索知识；内部调用可附带服务端授权映射以执行实时二次校验。"""
+        authorization_scope_applied = authorized_knowledge_versions is not None
+        if authorized_knowledge_versions is not None:
+            request = self._authorized_search_request(
+                request,
+                trusted_team_id=trusted_team_id,
+                authorized_knowledge_versions=authorized_knowledge_versions,
+            )
+        if (
+            authorization_scope_applied
+            and not request.knowledge_base_ids
+            and not request.knowledge_base_version_ids
+        ):
+            route_trace = [_knowledge_trace("no_visible_knowledge")]
+            return KnowledgeSearchResponse(trace=route_trace, route_trace=route_trace)
         with observed_span(
             "knowledge_span",
             "knowledge.search",
@@ -597,13 +1002,62 @@ class KnowledgeService:
         ):
             return self._search(request, model_config)
 
+    def _authorized_search_request(
+        self,
+        request: KnowledgeSearchRequest,
+        *,
+        trusted_team_id: str | None,
+        authorized_knowledge_versions: dict[str, str],
+    ) -> KnowledgeSearchRequest:
+        """实时重验上下文并只保留仍授权且版本归属正确的服务端冻结映射。"""
+        live_by_base = {}
+        if request.agent_id:
+            live = KnowledgeAccessService(self.db).resolve_projections(
+                tenant_id=request.tenant_id,
+                agent_id=request.agent_id,
+                team_id=trusted_team_id,
+            )
+            live_by_base = {
+                projection.knowledge_base_id: projection for projection in live
+            }
+        requested_ids = set(request.knowledge_base_ids) or set(
+            authorized_knowledge_versions
+        )
+        allowed_ids = set(live_by_base) if request.agent_id else set(
+            authorized_knowledge_versions
+        )
+        selected_versions: dict[str, str] = {}
+        for knowledge_base_id in sorted(
+            requested_ids & allowed_ids & set(authorized_knowledge_versions)
+        ):
+            version_id = authorized_knowledge_versions[knowledge_base_id]
+            version = self.db.get(KnowledgeBaseVersion, version_id)
+            knowledge_base = self.db.get(KnowledgeBase, knowledge_base_id)
+            if (
+                version is None
+                or knowledge_base is None
+                or knowledge_base.tenant_id != request.tenant_id
+                or version.tenant_id != request.tenant_id
+                or version.knowledge_base_id != knowledge_base_id
+            ):
+                continue
+            if knowledge_base.mode == "shared" and version.publication_state != "released":
+                continue
+            selected_versions[knowledge_base_id] = version.id
+        return request.model_copy(
+            update={
+                "knowledge_base_ids": list(selected_versions),
+                "knowledge_base_version_ids": list(selected_versions.values()),
+            }
+        )
+
     def _search(self, request: KnowledgeSearchRequest, model_config: ModelConfig | None = None) -> KnowledgeSearchResponse:
         query = request.query.strip()
         if not query:
             return KnowledgeSearchResponse()
-        route_trace: list[dict[str, Any]] = []
+        route_trace: list[KnowledgeTraceItem] = []
         if request.agent_id and not request.knowledge_base_ids and not request.knowledge_base_version_ids:
-            route_trace.append({"phase": "no_visible_knowledge", "message": "当前智能体没有可见知识"})
+            route_trace.append(_knowledge_trace("no_visible_knowledge"))
             return KnowledgeSearchResponse(trace=route_trace, route_trace=route_trace)
 
         with observed_span("knowledge_span", "knowledge.load_concepts") as span:
@@ -618,22 +1072,21 @@ class KnowledgeService:
         okf_citations = okf_citations_for_concepts(selected_concepts)
         if concepts:
             route_trace.append(
-                {
-                    "phase": "okf_concept_route",
-                    "message": "正在选择 OKF Wiki 页面",
-                    "candidate_count": len(concepts),
-                    "selected_count": len(selected_concepts),
-                }
+                _knowledge_trace(
+                    "okf_concept_route",
+                    candidate_count=len(concepts),
+                    selected_count=len(selected_concepts),
+                )
             )
 
         with observed_span("knowledge_span", "knowledge.load_documents") as span:
             documents = self._load_documents_for_search(request)
             span.finish(candidate_count=len(documents))
         if not documents and not selected_concepts:
-            route_trace.append({"phase": "no_documents", "message": "没有可检索的知识文档或 OKF 概念"})
+            route_trace.append(_knowledge_trace("no_documents"))
             return KnowledgeSearchResponse(trace=route_trace, route_trace=route_trace)
         if not documents:
-            route_trace.append({"phase": "okf_only", "message": "仅命中 OKF Wiki 页面"})
+            route_trace.append(_knowledge_trace("okf_only"))
             return KnowledgeSearchResponse(
                 trace=route_trace,
                 route_trace=route_trace,
@@ -642,12 +1095,11 @@ class KnowledgeService:
             )
 
         route_trace.append(
-            {
-                "phase": "document_route",
-                "message": "正在选择知识文档",
-                "candidate_count": len(documents),
-                "mode": request.mode,
-            }
+            _knowledge_trace(
+                "document_route",
+                candidate_count=len(documents),
+                mode=request.mode,
+            )
         )
         with observed_span(
             "knowledge_span",
@@ -670,22 +1122,20 @@ class KnowledgeService:
                         row.id for row in _score_documents(query, documents)[:5]
                     ]
                     route_trace.append(
-                        {
-                            "phase": "document_route_lexical_fallback",
-                            "message": "模型路由不可用，已按检索相关性选择知识文档",
-                            "selected_count": len(selected_document_ids),
-                        }
+                        _knowledge_trace(
+                            "document_route_lexical_fallback",
+                            selected_count=len(selected_document_ids),
+                        )
                     )
                 else:
                     selected_document_ids = llm_document_ids
             else:
                 selected_document_ids = [row.id for row in _score_documents(query, documents)[:5]]
                 route_trace.append(
-                    {
-                        "phase": "document_route_lexical",
-                        "message": "按检索相关性选择知识文档",
-                        "selected_count": len(selected_document_ids),
-                    }
+                    _knowledge_trace(
+                        "document_route_lexical",
+                        selected_count=len(selected_document_ids),
+                    )
                 )
             span.finish(selected_count=len(selected_document_ids))
         concept_document_ids = [
@@ -699,7 +1149,7 @@ class KnowledgeService:
         selected_documents = [row for row in documents if row.id in set(selected_document_ids)]
         selected_document_cards = [_document_card_for_search(row) for row in selected_documents]
         if not selected_documents and not selected_concepts:
-            route_trace.append({"phase": "document_route_no_match", "message": "没有足够相关的知识文档"})
+            route_trace.append(_knowledge_trace("document_route_no_match"))
             return KnowledgeSearchResponse(trace=route_trace, route_trace=route_trace)
 
         with observed_span(
@@ -708,7 +1158,7 @@ class KnowledgeService:
             buckets = self._load_buckets_for_search(request, selected_document_ids)
             span.finish(candidate_count=len(buckets))
         if not buckets:
-            route_trace.append({"phase": "no_buckets", "message": "所选文档没有可展开的内部索引"})
+            route_trace.append(_knowledge_trace("no_buckets"))
             return KnowledgeSearchResponse(
                 trace=route_trace,
                 route_trace=route_trace,
@@ -718,12 +1168,11 @@ class KnowledgeService:
             )
 
         route_trace.append(
-            {
-                "phase": "bucket_route",
-                    "message": "正在选择内部索引",
-                "candidate_count": len(buckets),
-                "selected_document_ids": selected_document_ids,
-            }
+            _knowledge_trace(
+                "bucket_route",
+                candidate_count=len(buckets),
+                selected_document_ids=selected_document_ids,
+            )
         )
         with observed_span(
             "knowledge_span",
@@ -754,11 +1203,10 @@ class KnowledgeService:
                         ]
                     ]
                     route_trace.append(
-                        {
-                            "phase": "bucket_route_lexical_fallback",
-                            "message": "模型路由不可用，已按检索相关性选择内部索引",
-                            "selected_count": len(selected_ids),
-                        }
+                        _knowledge_trace(
+                            "bucket_route_lexical_fallback",
+                            selected_count=len(selected_ids),
+                        )
                     )
                 else:
                     selected_ids = llm_bucket_ids
@@ -770,18 +1218,17 @@ class KnowledgeService:
                     ]
                 ]
                 route_trace.append(
-                    {
-                        "phase": "bucket_route_lexical",
-                        "message": "按检索相关性选择内部索引",
-                        "selected_count": len(selected_ids),
-                    }
+                    _knowledge_trace(
+                        "bucket_route_lexical",
+                        selected_count=len(selected_ids),
+                    )
                 )
             span.finish(selected_count=len(selected_ids))
 
         bucket_by_id = {bucket.id: bucket for bucket in buckets}
         selected_buckets = [bucket_by_id[bucket_id] for bucket_id in selected_ids if bucket_id in bucket_by_id]
         if not selected_buckets and not selected_concepts:
-            route_trace.append({"phase": "bucket_route_no_match", "message": "没有足够相关的内部索引"})
+            route_trace.append(_knowledge_trace("bucket_route_no_match"))
             return KnowledgeSearchResponse(
                 trace=route_trace,
                 route_trace=route_trace,
@@ -798,11 +1245,7 @@ class KnowledgeService:
             )
             span.finish(section_count=len(expanded_sections))
         route_trace.append(
-            {
-                "phase": "section_expand",
-                "message": "正在展开章节",
-                "section_count": len(expanded_sections),
-            }
+            _knowledge_trace("section_expand", section_count=len(expanded_sections))
         )
         with observed_span(
             "knowledge_span", "knowledge.load_chunks", bucket_count=len(selected_ids)
@@ -842,8 +1285,8 @@ class KnowledgeService:
             span.finish(evidence_count=len(evidence_pack))
         route_trace.extend(
             [
-                {"phase": "read_chunks", "message": "读取引用来源", "chunk_count": len(ranked_chunks)},
-                {"phase": "evidence_pack", "message": "整理引用来源包", "evidence_count": len(evidence_pack)},
+                _knowledge_trace("read_chunks", chunk_count=len(ranked_chunks)),
+                _knowledge_trace("evidence_pack", evidence_count=len(evidence_pack)),
             ]
         )
         return KnowledgeSearchResponse(
@@ -905,10 +1348,12 @@ class KnowledgeService:
         *,
         use_llm: bool = True,
     ) -> list[KnowledgeBucket]:
+        if job is not None and self._execution_owner is not None:
+            self._require_ingest_execution_fence(job)
         model_config = self._default_model_config(tenant_id)
         structure_buckets = _structure_bucket_specs(section_nodes)
         llm_buckets = (
-            self._bucket_with_llm(section_nodes, model_config)
+            self._bucket_with_llm(section_nodes, model_config, job=job)
             if use_llm and model_config
             else []
         )
@@ -960,7 +1405,10 @@ class KnowledgeService:
             )
             self.db.add(row)
             rows.append(row)
-        self.db.commit()
+        if job is not None and self._execution_owner is not None:
+            self._commit_ingest_fenced(job)
+        else:
+            self.db.commit()
         for row in rows:
             self.db.refresh(row)
         return rows
@@ -974,6 +1422,8 @@ class KnowledgeService:
         section_nodes: list[dict[str, Any]],
         job: KnowledgeIngestJob | None,
     ) -> int:
+        if job is not None and self._execution_owner is not None:
+            self._require_ingest_execution_fence(job)
         count = 0
         chunk_ids_by_bucket: dict[str, list[str]] = {}
         section_by_id = {str(node.get("section_id")): node for node in section_nodes}
@@ -1081,7 +1531,10 @@ class KnowledgeService:
             bucket.metadata_json = metadata
             bucket.updated_at = utc_now()
             self.db.add(bucket)
-        self.db.commit()
+        if job is not None and self._execution_owner is not None:
+            self._commit_ingest_fenced(job)
+        else:
+            self.db.commit()
         return count
 
     def _discover_from_document(
@@ -1096,6 +1549,8 @@ class KnowledgeService:
         if not model_config:
             return
         self._raise_if_ingest_cancelled(job)
+        if self._execution_owner is not None:
+            self._require_ingest_execution_fence(job)
         payload = {
             "document": {
                 "id": document.id,
@@ -1114,12 +1569,18 @@ class KnowledgeService:
             ],
         }
         try:
-            with llm_operation("knowledge.discovery", bucket_count=len(buckets)):
-                raw = LLMClient(model_config).generate_json(
-                    DISCOVERY_PROMPT.read_text(encoding="utf-8"), payload
-                )
-        except (LLMError, Exception):
-            return
+            try:
+                with llm_operation("knowledge.discovery", bucket_count=len(buckets)):
+                    raw = LLMClient(model_config).generate_json(
+                        DISCOVERY_PROMPT.read_text(encoding="utf-8"), payload
+                    )
+            except TenantLifecycleDenied:
+                raise
+            except (LLMError, Exception):
+                return
+        finally:
+            if self._execution_owner is not None:
+                self._require_ingest_execution_fence(job)
         self._raise_if_ingest_cancelled(job)
         discoveries = raw.get("discoveries") if isinstance(raw, dict) else None
         if not isinstance(discoveries, list):
@@ -1169,13 +1630,22 @@ class KnowledgeService:
                 reason=reason,
             )
             self.db.add(row)
-        self.db.commit()
+        if self._execution_owner is not None:
+            self._commit_ingest_fenced(job)
+        else:
+            self.db.commit()
 
     def _bucket_with_llm(
-        self, section_nodes: list[dict[str, Any]], model_config: ModelConfig | None
+        self,
+        section_nodes: list[dict[str, Any]],
+        model_config: ModelConfig | None,
+        *,
+        job: KnowledgeIngestJob | None = None,
     ) -> list[dict[str, Any]]:
         if not model_config:
             return []
+        if job is not None and self._execution_owner is not None:
+            self._require_ingest_execution_fence(job)
         payload = {
             "sections": [
                 {
@@ -1189,12 +1659,18 @@ class KnowledgeService:
             ]
         }
         try:
-            with llm_operation("knowledge.ingest_bucket", section_count=len(section_nodes)):
-                raw = LLMClient(model_config).generate_json(
-                    BUCKET_PROMPT.read_text(encoding="utf-8"), payload
-                )
-        except (LLMError, Exception):
-            return []
+            try:
+                with llm_operation("knowledge.ingest_bucket", section_count=len(section_nodes)):
+                    raw = LLMClient(model_config).generate_json(
+                        BUCKET_PROMPT.read_text(encoding="utf-8"), payload
+                    )
+            except TenantLifecycleDenied:
+                raise
+            except (LLMError, Exception):
+                return []
+        finally:
+            if job is not None and self._execution_owner is not None:
+                self._require_ingest_execution_fence(job)
         buckets = raw.get("buckets") if isinstance(raw, dict) else None
         return [item for item in buckets if isinstance(item, dict)] if isinstance(buckets, list) else []
 
@@ -1243,7 +1719,7 @@ class KnowledgeService:
         documents: list[KnowledgeDocument],
         max_documents: int,
         model_config: ModelConfig,
-        trace: list[dict[str, Any]],
+        trace: list[KnowledgeTraceItem],
     ) -> list[str] | None:
         payload = {
             "query": query,
@@ -1255,12 +1731,12 @@ class KnowledgeService:
                 raw = LLMClient(model_config).generate_json(
                     DOCUMENT_ROUTE_PROMPT.read_text(encoding="utf-8"), payload
                 )
-        except (LLMError, Exception) as exc:
-            trace.append({"phase": "document_route_failed", "message": str(exc)})
+        except Exception:  # noqa: BLE001 - provider diagnostics stay private.
+            trace.append(_knowledge_trace("document_route_failed"))
             return None
         ids = raw.get("selected_document_ids") if isinstance(raw, dict) else None
         if not isinstance(ids, list):
-            trace.append({"phase": "document_route_invalid", "message": "模型未返回文档 ID 数组"})
+            trace.append(_knowledge_trace("document_route_invalid"))
             return None
         allowed = {row.id for row in documents}
         return [str(item) for item in ids if str(item) in allowed][:max_documents]
@@ -1271,7 +1747,7 @@ class KnowledgeService:
         buckets: list[KnowledgeBucket],
         max_buckets: int,
         model_config: ModelConfig,
-        trace: list[dict[str, Any]],
+        trace: list[KnowledgeTraceItem],
         query_type: str = "answer",
     ) -> list[str] | None:
         payload = {
@@ -1301,12 +1777,12 @@ class KnowledgeService:
                 raw = LLMClient(model_config).generate_json(
                     SEARCH_PROMPT.read_text(encoding="utf-8"), payload
                 )
-        except (LLMError, Exception) as exc:
-            trace.append({"phase": "bucket_selection_failed", "message": str(exc)})
+        except Exception:  # noqa: BLE001 - provider diagnostics stay private.
+            trace.append(_knowledge_trace("bucket_selection_failed"))
             return None
         ids = raw.get("selected_bucket_ids") if isinstance(raw, dict) else None
         if not isinstance(ids, list):
-            trace.append({"phase": "bucket_route_invalid", "message": "模型未返回内部索引 ID 数组"})
+            trace.append(_knowledge_trace("bucket_route_invalid"))
             return None
         allowed = {bucket.id for bucket in buckets}
         return [str(item) for item in ids if str(item) in allowed][:max_buckets]
@@ -1420,8 +1896,7 @@ class KnowledgeService:
             setattr(job, key, value)
         job.updated_at = utc_now()
         self.db.add(job)
-        self.db.commit()
-        self.db.refresh(job)
+        self._commit_ingest_fenced(job)
 
     def _raise_if_ingest_cancelled(self, job: KnowledgeIngestJob | None) -> None:
         if job is None:
@@ -1430,14 +1905,17 @@ class KnowledgeService:
         if job.status in CANCELLING_INGEST_STATUSES:
             raise KnowledgeIngestCancelled("入库任务已取消")
 
-    def _finalize_cancelled_job(self, job: KnowledgeIngestJob, detail: str) -> None:
+    def _finalize_cancelled_job(self, job: KnowledgeIngestJob) -> None:
+        """Finalize cancellation with stable stage data and remove any partial artifacts."""
         cancelled_document_id = job.document_id
         if cancelled_document_id:
             self._delete_partial_ingest_document(job)
         metadata = dict(job.metadata_json or {})
         metadata.pop("content_base64", None)
-        metadata["stage_label"] = "已取消"
-        metadata["stage_detail"] = detail
+        metadata.pop("stage_label", None)
+        metadata["stage_code"] = "cancelled"
+        metadata["stage_params"] = {}
+        metadata["stage_detail"] = _knowledge_stage_descriptor("cancelled")
         metadata["cancelled_at"] = utc_now().isoformat()
         if cancelled_document_id:
             metadata["cancelled_document_id"] = cancelled_document_id
@@ -1464,23 +1942,31 @@ class KnowledgeService:
             self.db.delete(document)
         job.document_id = None
         self.db.add(job)
-        self.db.commit()
+        self._commit_ingest_fenced(job)
 
     def _update_ingest_stage(
         self,
         job: KnowledgeIngestJob,
         stage: str,
-        detail: str = "",
+        detail_code: str | None = None,
+        detail_params: dict[str, Any] | None = None,
         stats: dict[str, Any] | None = None,
         **changes: Any,
     ) -> None:
+        """Persist one ingest stage using stable codes while keeping diagnostics out of metadata."""
         if changes.get("status") not in {"failed", "cancelled"}:
+            self._require_ingest_execution_fence(job)
             self._raise_if_ingest_cancelled(job)
         stage_def = INGEST_STAGE_BY_KEY.get(stage)
         progress = float(stage_def["progress"]) if stage_def else float(job.progress or 0.0)
         metadata = dict(job.metadata_json or {})
-        metadata["stage_label"] = str(stage_def["label"] if stage_def else stage)
-        metadata["stage_detail"] = detail
+        metadata.pop("stage_label", None)
+        metadata["stage_code"] = stage
+        metadata["stage_params"] = {}
+        metadata["stage_detail"] = _knowledge_stage_descriptor(
+            detail_code or stage,
+            detail_params,
+        )
         if stats is not None:
             metadata["stage_stats"] = stats
         metadata["ingest_steps"] = _ingest_steps_for(stage, progress, changes.get("status") or job.status)
@@ -1488,12 +1974,14 @@ class KnowledgeService:
         self._update_job(job, stage=stage, progress=progress, **changes)
 
     def _clear_embedded_content(self, job: KnowledgeIngestJob) -> None:
+        if self._execution_owner is not None:
+            self._require_ingest_execution_fence(job)
         metadata = dict(job.metadata_json or {})
         metadata.pop("content_base64", None)
         job.metadata_json = metadata
         job.updated_at = utc_now()
         self.db.add(job)
-        self.db.commit()
+        self._commit_ingest_fenced(job)
 
 
 def bucket_read(row: KnowledgeBucket) -> KnowledgeBucketRead:
@@ -1695,18 +2183,25 @@ def _hard_split_text(text: str, max_chars: int) -> list[str]:
     return [text[index:index + max_chars].strip() for index in range(0, len(text), max_chars) if text[index:index + max_chars].strip()]
 
 
-def _ingest_steps_for(stage: str, progress: float, status: str) -> list[dict[str, Any]]:
+def _ingest_steps_for(stage: str, progress: float, status: str) -> list[KnowledgeIngestStep]:
+    """Build ingest progress data from stable stage codes without localized labels."""
     if stage == "failed" or status in {"failed", "cancelled"}:
         return [
             {
-                **item,
+                "key": item["key"],
+                "code": item["code"],
+                "params": {},
+                "progress": float(item["progress"]),
                 "status": "done" if float(item["progress"]) < progress else "pending",
             }
             for item in INGEST_STAGES
         ]
     return [
         {
-            **item,
+            "key": item["key"],
+            "code": item["code"],
+            "params": {},
+            "progress": float(item["progress"]),
             "status": (
                 "running"
                 if item["key"] == stage

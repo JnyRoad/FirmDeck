@@ -4,6 +4,8 @@ import { cleanup, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { AppIntlProvider } from '@/i18n/provider';
+import type { AppLocale } from '@/i18n/locales';
 import { I18nProvider } from '@/i18n';
 import { SidebarProvider } from '@/components/ui/sidebar';
 import { TooltipProvider } from '@/components/ui/tooltip';
@@ -35,6 +37,29 @@ const team: TeamRead = {
   created_at: '2026-08-01T00:00:00Z',
   updated_at: '2026-08-01T00:00:00Z',
 };
+
+const semanticSidebarCopy = {
+  'zh-CN': {
+    marketplace: '开放广场平台',
+    profile: '员工档案',
+    knowledge: '知识库',
+    accounts: '账号管理',
+    models: '模型配置',
+    collapse: '收起边栏',
+    employeeSwitcher: '切换当前员工',
+    chatSwitcher: '切换到对话端',
+  },
+  'en-US': {
+    marketplace: 'Open Marketplace',
+    profile: 'Employee Profile',
+    knowledge: 'Knowledge Base',
+    accounts: 'Account Management',
+    models: 'Model settings',
+    collapse: 'Collapse Sidebar',
+    employeeSwitcher: 'Switch current employee',
+    chatSwitcher: 'Switch to Chat',
+  },
+} as const satisfies Record<AppLocale, Record<string, string>>;
 
 function stubRadixPointerApis() {
   if (!window.ResizeObserver) {
@@ -92,9 +117,34 @@ function renderSidebar(props: {
   );
 }
 
+/** 在不挂载 legacy Provider 的前提下渲染管理侧边栏，验证语义消息和可访问名称。 */
+function renderSemanticSidebar(locale: AppLocale) {
+  return render(
+    <AppIntlProvider initialLocale={locale}>
+      <TooltipProvider>
+        <SidebarProvider>
+          <AppSidebar
+            selected="/enterprise/dashboard"
+            onNavigate={() => {}}
+            isAdmin
+            sidebarAgent={agent}
+            scopeAgents={[agent]}
+            scopeTeams={[team]}
+            selectedAgentId="agent-1"
+            onSelectAgent={() => {}}
+            onOpenChat={() => {}}
+          />
+        </SidebarProvider>
+      </TooltipProvider>
+    </AppIntlProvider>,
+  );
+}
+
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
+  window.localStorage.clear();
+  document.documentElement.lang = '';
 });
 
 beforeEach(() => {
@@ -134,6 +184,54 @@ describe('AppSidebar agent switcher team group', () => {
     const trigger = screen.getByLabelText('切换当前员工');
     expect(within(trigger).getByText('当前团队')).toBeTruthy();
     expect(within(trigger).getByText('团队')).toBeTruthy();
+  });
+});
+
+describe('AppSidebar semantic navigation matrix', () => {
+  it.each(['zh-CN', 'en-US'] as const)(
+    'localizes shell navigation and ARIA names in %s without a legacy observer',
+    (locale) => {
+      const copy = semanticSidebarCopy[locale];
+      renderSemanticSidebar(locale);
+
+      expect(document.documentElement.lang).toBe(locale);
+      expect(screen.getByText(copy.marketplace)).toBeTruthy();
+      expect(screen.getByText(copy.profile)).toBeTruthy();
+      expect(screen.getByText(copy.knowledge)).toBeTruthy();
+      expect(screen.getByText(copy.accounts)).toBeTruthy();
+      const modelLabel = screen.getByText(copy.models);
+      expect(modelLabel.className).toContain('whitespace-nowrap');
+      expect(modelLabel.className).toContain('truncate');
+      expect(screen.getByRole('button', { name: copy.collapse })).toBeTruthy();
+      expect(screen.getByLabelText(copy.employeeSwitcher)).toBeTruthy();
+      expect(screen.getByRole('button', { name: copy.chatSwitcher })).toBeTruthy();
+    },
+  );
+
+  it('never exposes system tenant management from the ordinary tenant-admin sidebar', async () => {
+    const user = userEvent.setup();
+    const view = renderSemanticSidebar('zh-CN');
+
+    expect(screen.queryByText('租户管理')).toBeNull();
+    expect(screen.queryByText('系统管理员')).toBeNull();
+    expect(screen.getByText('账号管理')).toBeTruthy();
+    expect(view.container.innerHTML).not.toContain('/system/');
+
+    await user.click(screen.getByRole('button', { name: '收起边栏' }));
+    expect(view.container.innerHTML).not.toContain('/system/');
+    expect(screen.queryByText('租户管理')).toBeNull();
+  });
+
+  it('never exposes system tenant management from an ordinary tenant-member sidebar', async () => {
+    const user = userEvent.setup();
+    const view = renderSidebar({ selectedAgentId: 'agent-1' });
+
+    expect(screen.queryByText('租户管理')).toBeNull();
+    expect(screen.queryByText('系统管理员')).toBeNull();
+    expect(view.container.innerHTML).not.toContain('/system/');
+    await user.click(screen.getByRole('button', { name: '收起边栏' }));
+    expect(view.container.innerHTML).not.toContain('/system/');
+    expect(screen.queryByText('租户管理')).toBeNull();
   });
 });
 

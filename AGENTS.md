@@ -1,45 +1,20 @@
-# Repository Guidelines
+# StaffDeck Agent 规则路由
 
-## Project Structure & Module Organization
+本文件仅用于路由项目规则。不要预加载规则文件；仅按当前任务读取下表选中的文件。当任务
+跨越多个范围时，读取所有匹配的文件。
 
-StaffDeck combines a Python 3.11+ FastAPI service with a React/TypeScript console. Backend application code lives in `backend/app/`; entry points such as `backend/single_port_app.py` support the desktop and single-port runtime. Backend tests are in `backend/tests/`, and the supported conversation runtime is Harness v2. Frontend code is in `frontend-enterprise/src/`, with static assets in `frontend-enterprise/public/` and colocated `*.test.ts` or `*.test.tsx` files. Use `scripts/` for development lifecycle tooling and `packaging/` for platform release assets.
+| 任务范围 | 读取 |
+|---|---|
+| 读取、修改、测试或调试后端代码 | `docs/agents/domain.md` + `docs/agents/backend.md` + `docs/agents/tenancy.md` |
+| 读取、修改、测试或调试前端代码 | `docs/agents/domain.md` + `docs/agents/frontend.md` + `docs/agents/tenancy.md` |
+| 修改 UI 文案、本地化或语言区域行为 | `docs/agents/i18n.md`（修改前端代码时还需读取 `docs/agents/frontend.md`） |
+| 运行本地应用 | `docs/agents/local-runtime.md` |
+| 修改配置、凭据或安全敏感行为 | `docs/agents/security.md` |
+| 编写或整理项目文档 | `docs/agents/documentation.md` |
+| 编写涉及领域术语或 ADR 的项目文档 | `docs/agents/domain.md` + `docs/agents/documentation.md` |
+| 创建或管理 Issue | `docs/agents/issue-tracker.md` + `docs/agents/triage-labels.md` |
+| 提交、推送、创建或审查 Pull Request | `docs/agents/git.md` |
+| 准备带版本号的发布或修改应用版本 | `docs/agents/release.md` |
 
-## Build, Test, and Development Commands
-
-- `python3 -m venv backend/.venv && backend/.venv/bin/python -m pip install -e "backend[dev]"` installs backend and test dependencies.
-- `npm --prefix frontend-enterprise ci` installs the locked frontend dependencies.
-- `scripts/dev_up.sh --detach` builds the frontend and starts the single-port app; use `scripts/dev_status.sh` and `scripts/dev_down.sh` to inspect or stop it.
-- `backend/.venv/bin/python -m pytest backend/tests` runs the backend suite.
-- `backend/.venv/bin/ruff check backend` checks Python style.
-- `npm --prefix frontend-enterprise test` runs Vitest; `npm --prefix frontend-enterprise run build` performs TypeScript checking and the production Vite build.
-- Run `i18n:check` and `config:check` from `frontend-enterprise` when changing UI text or Vite environment usage.
-
-## Coding Style & Naming Conventions
-
-Python uses four-space indentation, type hints, `snake_case` functions/modules, and `PascalCase` classes; Ruff targets Python 3.11 with a 100-character line limit. TypeScript is strict and follows the existing two-space, single-quote, semicolon style. Name React components in `PascalCase`, hooks with `use...`, and tests after the unit under test. Prefer the `@/` alias for frontend imports.
-
-## Testing Guidelines
-
-Name Python tests `test_*.py` and frontend tests `*.test.ts(x)`. Add focused regression tests for behavior changes, especially permissions, persistence, streaming, and channel routing. No numeric coverage threshold is configured; changed paths should still be exercised. For UI changes, also verify the affected route and user role in a browser.
-
-## Commit & Pull Request Guidelines
-
-Follow the history’s concise Conventional Commit pattern, such as `feat(channels): add binding status` or `fix: reject unsafe avatar URLs`. Keep commits focused. Pull requests should explain intent and risk, link relevant issues, list tests run, and identify routes and roles used for UI validation. Include screenshots for visible changes and preserve unrelated worktree changes.
-
-## Security & Configuration
-
-Copy `backend/.env.example` to `backend/.env`; never commit secrets or channel credentials. Use strong `APP_SECRET` values and least-privilege external credentials. The supported production migration path currently assumes SQLite.
-
-## Agent skills
-
-### Issue tracker
-
-Do not create or manage issues for this repository. See `docs/agents/issue-tracker.md`.
-
-### Triage labels
-
-Issue triage labels are not used. See `docs/agents/triage-labels.md`.
-
-### Domain docs
-
-Use the single-context documentation layout. See `docs/agents/domain.md`.
+如无路由匹配，无需加载项目专项规则。仅当任务发生变化，或对话上下文不再包含已读规则时，
+重新读取相应文件。

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import replace
 from time import monotonic
 from uuid import uuid4
@@ -9,6 +10,18 @@ from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
+from app.codex_subscription import (
+    CodexSubscriptionAccount,
+    CodexSubscriptionError,
+    get_codex_subscription_service,
+)
+from app.contracts.error_registry import (
+    ERROR_REGISTRY,
+    ErrorContractViolation,
+    ErrorVisibility,
+)
+from app.contracts.errors import ErrorDescriptor, InternalErrorContext
+from app.contracts.http import build_http_exception
 from app.db import get_session
 from app.db.models import AgentModelBinding, ModelConfig, User, utc_now
 from app.llm import LLMClient, LLMError
@@ -20,19 +33,25 @@ from app.llm.model_config_resolver import (
 from app.llm.model_protocols import (
     LEGACY_OPENAI_PROVIDER,
     ModelApiProtocol,
+    ModelAuthMode,
     available_model_protocols,
     current_protocol_options,
     model_config_fingerprint,
     normalize_chat_protocol_options,
     resolve_api_protocol,
+    resolve_auth_mode,
     validate_model_base_url,
 )
 from app.llm.schemas import (
+    CodexSubscriptionAccountRead,
     ModelCapabilityTestResult,
     ModelConfigCreateRequest,
     ModelConfigRead,
     ModelConfigTestResponse,
     ModelConfigUpdateRequest,
+    ModelListModelsRequest,
+    ModelListModelsResponse,
+    ModelOption,
     ModelProviderErrorDetail,
 )
 from app.security.auth import get_current_user, require_current_tenant
@@ -46,11 +65,11 @@ router = APIRouter(
     dependencies=[Depends(get_current_user)],
 )
 
+# 保存前只做一次有界连通性探测，不再把流式和 JSON 能力校验串在管理员保存流程中。
+# 总截止时间仍保留为外层安全阀；唯一探针自身最多运行 25 秒。
 MODEL_VERIFICATION_DEADLINE_SECONDS = 90.0
 MODEL_VERIFICATION_PROBES = (
     ("text", 25.0),
-    ("stream", 25.0),
-    ("json", 35.0),
 )
 
 
@@ -62,14 +81,86 @@ def list_model_protocols(tenant_id: str = Query(...)) -> dict[str, list[str]]:
     return {"protocols": available_model_protocols()}
 
 
+@router.post("/list-models", response_model=ModelListModelsResponse)
+def list_provider_models(
+    request: ModelListModelsRequest,
+    current_user: User = Depends(get_current_user),
+) -> ModelListModelsResponse:
+    """按渠道自身的接口拉取可用模型，供新建模型向导自动填充；不落库、不需要已存在的模型配置。"""
+    ensure_tenant_admin(request.tenant_id, current_user)
+    protocol = resolve_api_protocol(request.api_protocol, None)
+    is_subscription = protocol is ModelApiProtocol.CODEX_APP_SERVER
+    if is_subscription:
+        base_url = None
+        api_key_encrypted = ""
+        auth_mode = ModelAuthMode.CHATGPT_SUBSCRIPTION
+    else:
+        if not request.api_key:
+            raise build_http_exception("MODEL_API_KEY_REQUIRED")
+        validate_model_base_url(request.base_url)
+        base_url = request.base_url
+        api_key_encrypted = encrypt_secret(request.api_key)
+        auth_mode = ModelAuthMode.API_KEY
+    config = ResolvedModelConfig(
+        id="",
+        tenant_id=request.tenant_id,
+        api_protocol=protocol,
+        base_url=base_url,
+        api_key_encrypted=api_key_encrypted,
+        model="",
+        temperature=0.2,
+        max_output_tokens=1,
+        protocol_options={},
+        legacy_extra_body={},
+        config_revision=0,
+        security_revision=0,
+        purpose="verification",
+        auth_mode=auth_mode,
+        timeout_seconds=15.0,
+    )
+    try:
+        options = LLMClient(config).list_models()
+    except LLMError as exc:
+        return ModelListModelsResponse(
+            success=False,
+            models=[],
+            error=_model_provider_error_detail(exc),
+        )
+    return ModelListModelsResponse(
+        success=True,
+        models=[ModelOption(id=item["id"], label=item["label"]) for item in options],
+    )
+
+
+def _model_provider_error_detail(exc: LLMError) -> ModelProviderErrorDetail:
+    """Project an LLM failure to code/params/correlation fields without raw provider text."""
+    code = _verification_error_code(exc)
+    if ERROR_REGISTRY.get(code) is None:
+        code = "MODEL_CONNECTION_FAILED"
+    return ModelProviderErrorDetail(
+        code=code,
+        message=code,
+        message_key=ERROR_REGISTRY.require(code).message_key,
+        params={},
+        request_id=exc.request_id,
+        retryable=exc.retryable,
+    )
+
+
 def model_config_read(row: ModelConfig) -> ModelConfigRead:
-    api_key = decrypt_secret(row.api_key_encrypted)
+    auth_mode = resolve_auth_mode(getattr(row, "auth_mode", None))
+    api_key = (
+        decrypt_secret(row.api_key_encrypted)
+        if auth_mode is ModelAuthMode.API_KEY and row.api_key_encrypted
+        else ""
+    )
     extra_body = row.extra_body_json if isinstance(row.extra_body_json, dict) else {}
     return ModelConfigRead(
         id=row.id,
         tenant_id=row.tenant_id,
         name=row.name,
         provider=row.provider,
+        auth_mode=auth_mode.value,
         api_protocol=row.api_protocol,
         base_url=row.base_url,
         api_key_masked=mask_secret(api_key),
@@ -103,6 +194,54 @@ def list_model_configs(
     return [model_config_read(row) for row in rows]
 
 
+@router.get(
+    "/codex-subscription/account",
+    response_model=CodexSubscriptionAccountRead,
+    dependencies=[Depends(require_current_tenant)],
+)
+def get_codex_subscription_account(
+    tenant_id: str = Query(...), current_user: User = Depends(get_current_user)
+) -> CodexSubscriptionAccountRead:
+    ensure_tenant_admin(tenant_id, current_user)
+    return _subscription_account_response(get_codex_subscription_service().account_status)
+
+
+@router.post(
+    "/codex-subscription/login",
+    response_model=CodexSubscriptionAccountRead,
+    dependencies=[Depends(require_current_tenant)],
+)
+def start_codex_subscription_login(
+    tenant_id: str = Query(...), current_user: User = Depends(get_current_user)
+) -> CodexSubscriptionAccountRead:
+    ensure_tenant_admin(tenant_id, current_user)
+    return _subscription_account_response(get_codex_subscription_service().start_login)
+
+
+@router.post(
+    "/codex-subscription/login/cancel",
+    response_model=CodexSubscriptionAccountRead,
+    dependencies=[Depends(require_current_tenant)],
+)
+def cancel_codex_subscription_login(
+    tenant_id: str = Query(...), current_user: User = Depends(get_current_user)
+) -> CodexSubscriptionAccountRead:
+    ensure_tenant_admin(tenant_id, current_user)
+    return _subscription_account_response(get_codex_subscription_service().cancel_login)
+
+
+@router.post(
+    "/codex-subscription/logout",
+    response_model=CodexSubscriptionAccountRead,
+    dependencies=[Depends(require_current_tenant)],
+)
+def logout_codex_subscription(
+    tenant_id: str = Query(...), current_user: User = Depends(get_current_user)
+) -> CodexSubscriptionAccountRead:
+    ensure_tenant_admin(tenant_id, current_user)
+    return _subscription_account_response(get_codex_subscription_service().logout)
+
+
 @router.post("", response_model=ModelConfigRead)
 def create_model_config(
     request: ModelConfigCreateRequest,
@@ -110,22 +249,35 @@ def create_model_config(
     db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ) -> ModelConfigRead:
+    """Create a tenant model configuration with canonical validation errors."""
     ensure_tenant_admin(request.tenant_id, current_user)
     ensure_tenant(db, request.tenant_id)
-    protocol = resolve_api_protocol(request.api_protocol, request.provider)
-    if not request.api_key:
-        raise HTTPException(status_code=422, detail="MODEL_API_KEY_REQUIRED")
-    validate_model_base_url(request.base_url)
+    auth_mode = resolve_auth_mode(request.auth_mode)
+    if auth_mode is ModelAuthMode.CHATGPT_SUBSCRIPTION:
+        _validate_subscription_request(request)
+        protocol = ModelApiProtocol.CODEX_APP_SERVER
+        base_url = None
+        api_key_encrypted = ""
+        options = {}
+        extra_body = {}
+    else:
+        protocol = resolve_api_protocol(request.api_protocol, request.provider)
+        if not request.api_key:
+            raise build_http_exception("MODEL_API_KEY_REQUIRED")
+        validate_model_base_url(request.base_url)
+        base_url = request.base_url
+        api_key_encrypted = encrypt_secret(request.api_key)
+        options = _request_protocol_options(request.protocol_options, protocol)
+        extra_body = _request_extra_body(request.extra_body, protocol)
     _validate_sampling(protocol, request.temperature, request.max_output_tokens)
-    options = _request_protocol_options(request.protocol_options, protocol)
-    extra_body = _request_extra_body(request.extra_body, protocol)
     row = ModelConfig(
         tenant_id=request.tenant_id,
         name=request.name,
         provider=LEGACY_OPENAI_PROVIDER,
+        auth_mode=auth_mode.value,
         api_protocol=protocol.value,
-        base_url=request.base_url,
-        api_key_encrypted=encrypt_secret(request.api_key),
+        base_url=base_url,
+        api_key_encrypted=api_key_encrypted,
         model=request.model,
         temperature=request.temperature,
         max_output_tokens=request.max_output_tokens,
@@ -155,16 +307,38 @@ def update_model_config(
     db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ) -> ModelConfigRead:
+    """Update a model configuration while preserving trust and default invariants."""
     ensure_tenant_admin(request.tenant_id, current_user)
     row = _get_model_config(db, request.tenant_id, config_id)
     has_other_available_model = _has_available_model(
         db, request.tenant_id, exclude_config_id=config_id
     )
-    protocol = (
-        resolve_api_protocol(request.api_protocol, request.provider)
-        if (request.api_protocol is not None or request.provider is not None)
-        else ModelApiProtocol(row.api_protocol)
-    )
+    current_auth_mode = resolve_auth_mode(getattr(row, "auth_mode", None))
+    auth_mode = resolve_auth_mode(request.auth_mode or current_auth_mode)
+    if auth_mode is ModelAuthMode.CHATGPT_SUBSCRIPTION:
+        _validate_subscription_update_request(request)
+        protocol = ModelApiProtocol.CODEX_APP_SERVER
+    else:
+        if (
+            current_auth_mode is ModelAuthMode.CHATGPT_SUBSCRIPTION
+            and request.auth_mode is not None
+            and not request.api_key
+        ):
+            raise build_http_exception("MODEL_API_KEY_REQUIRED")
+        protocol = (
+            resolve_api_protocol(request.api_protocol, request.provider)
+            if (request.api_protocol is not None or request.provider is not None)
+            else ModelApiProtocol(row.api_protocol)
+        )
+        # Existing credentials are scoped to a specific provider endpoint and
+        # protocol. Never silently carry one to a newly supplied destination;
+        # the browser validation is a UX aid, while this check is the API
+        # contract for every caller.
+        endpoint_changed = protocol.value != row.api_protocol or (
+            request.base_url is not None and request.base_url != row.base_url
+        )
+        if endpoint_changed and not request.api_key:
+            raise build_http_exception("MODEL_API_KEY_REQUIRED")
     target_temperature = request.temperature if request.temperature is not None else row.temperature
     target_tokens = (
         request.max_output_tokens
@@ -172,33 +346,45 @@ def update_model_config(
         else row.max_output_tokens
     )
     _validate_sampling(protocol, target_temperature, target_tokens)
-    if request.base_url is not None:
+    if auth_mode is ModelAuthMode.API_KEY and request.base_url is not None:
         validate_model_base_url(request.base_url)
-    security_changed = protocol.value != row.api_protocol
+    security_changed = (
+        auth_mode is not current_auth_mode or protocol.value != row.api_protocol
+    )
     for field in ("base_url", "model"):
         value = getattr(request, field)
         if value is not None and value != getattr(row, field):
             security_changed = True
-    if request.api_key not in {None, ""}:
+    if auth_mode is ModelAuthMode.API_KEY and request.api_key not in {None, ""}:
         security_changed = True
     requested_options = None
-    if request.protocol_options is not None:
+    if auth_mode is ModelAuthMode.API_KEY and request.protocol_options is not None:
         requested_options = _request_protocol_options(request.protocol_options, protocol)
         if requested_options != current_protocol_options(row.protocol_options_json, protocol):
             security_changed = True
     requested_extra_body = None
-    if request.extra_body is not None:
+    if auth_mode is ModelAuthMode.API_KEY and request.extra_body is not None:
         requested_extra_body = _request_extra_body(request.extra_body, protocol)
         if requested_extra_body != dict(row.extra_body_json or {}):
             security_changed = True
 
-    for field in ("name", "base_url", "model", "temperature", "max_output_tokens"):
+    for field in ("name", "model", "temperature", "max_output_tokens"):
         value = getattr(request, field)
         if value is not None:
             setattr(row, field, value)
+    if auth_mode is ModelAuthMode.API_KEY and request.base_url is not None:
+        row.base_url = request.base_url
+    row.auth_mode = auth_mode.value
     row.api_protocol = protocol.value
     row.provider = LEGACY_OPENAI_PROVIDER
-    if request.api_key not in {None, ""}:
+    if auth_mode is ModelAuthMode.CHATGPT_SUBSCRIPTION:
+        if row.api_key_encrypted:
+            row.key_revision += 1
+        row.api_key_encrypted = ""
+        row.base_url = None
+        row.protocol_options_json = {}
+        row.extra_body_json = {}
+    elif request.api_key not in {None, ""}:
         row.api_key_encrypted = encrypt_secret(request.api_key)
         row.key_revision += 1
     if requested_options is not None:
@@ -238,7 +424,7 @@ def update_model_config(
         if request.is_default is True:
             _require_trusted(row)
             if not row.enabled:
-                raise HTTPException(status_code=409, detail="MODEL_CONFIG_DISABLED")
+                raise build_http_exception("MODEL_CONFIG_DISABLED")
             _clear_default(db, request.tenant_id)
             row.is_default = True
         elif request.is_default is False:
@@ -280,10 +466,11 @@ def delete_model_config(
 def set_default_model_config(
     config_id: str, tenant_id: str = Query(...), db: Session = Depends(get_session)
 ) -> ModelConfigRead:
+    """Make a verified enabled model the tenant default or return a safe model error."""
     row = _get_model_config(db, tenant_id, config_id)
     _require_trusted(row)
     if not row.enabled:
-        raise HTTPException(status_code=409, detail="MODEL_CONFIG_DISABLED")
+        raise build_http_exception("MODEL_CONFIG_DISABLED")
     _clear_default(db, tenant_id)
     row.is_default = True
     row.updated_at = utc_now()
@@ -304,6 +491,7 @@ def test_model_config(
     activate_if_initial: bool = False,
     db: Session = Depends(get_session),
 ) -> ModelConfigTestResponse:
+    """Run verification probes and return a stable result without provider prose leakage."""
     row = _get_model_config(db, tenant_id, config_id)
     initial_activation_candidate = (
         activate_if_initial
@@ -392,7 +580,11 @@ def test_model_config(
             db.commit()
         completed_ids = {item.id for item in capabilities}
         failed_id = next(
-            (item for item in ("text", "stream", "json") if item not in completed_ids),
+            (
+                capability_id
+                for capability_id, _ in MODEL_VERIFICATION_PROBES
+                if capability_id not in completed_ids
+            ),
             None,
         )
         if failed_id is not None:
@@ -416,19 +608,31 @@ def test_model_config(
             trust_status=row.trust_status,
             attempt_status=row.verification_attempt_status,
             capabilities=capabilities,
-            error=ModelProviderErrorDetail.model_validate(exc.public_detail()),
+            error=_model_provider_error_detail(exc),
         )
     except HTTPException as exc:
-        detail = str(exc.detail)
-        error_code = detail if detail.startswith("MODEL_") else "MODEL_VERIFICATION_FAILED"
+        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        error_code = (
+            detail.get("code")
+            if isinstance(detail.get("code"), str) and detail["code"].startswith("MODEL_")
+            else "MODEL_VERIFICATION_FAILED"
+        )
         _mark_verification_failed(db, row, attempt_id, error_code)
         raise
-    except Exception:
+    except Exception as exc:
         _mark_verification_failed(db, row, attempt_id, "MODEL_VERIFICATION_INTERNAL_ERROR")
-        raise
+        raise build_http_exception(
+            "MODEL_VERIFICATION_INTERNAL_ERROR",
+            internal=InternalErrorContext(
+                source="model_verification",
+                exception_type=type(exc).__name__,
+                raw_message=str(exc),
+            ),
+        ) from exc
 
 
 def _verify_candidate_for_save(row: ModelConfig) -> None:
+    """Verify a candidate model and convert provider failures to the canonical HTTP contract."""
     attempt_id = uuid4().hex
     row.verification_attempt_id = attempt_id
     row.verification_attempt_status = "verifying"
@@ -438,7 +642,38 @@ def _verify_candidate_for_save(row: ModelConfig) -> None:
     try:
         _run_verification_probes(config)
     except LLMError as exc:
-        raise HTTPException(status_code=502, detail=exc.public_detail()) from exc
+        code = _verification_error_code(exc)
+        # Workflow: resolve provider-derived codes through the registry, validate the
+        # empty parameter contract, then fail closed to the model-specific fallback.
+        entry = ERROR_REGISTRY.get(code)
+        safe_retryable = exc.retryable
+        if entry is None or entry.visibility is not ErrorVisibility.PUBLIC:
+            entry = ERROR_REGISTRY.require("MODEL_VERIFICATION_FAILED")
+            safe_retryable = entry.retryable_default
+        else:
+            try:
+                ERROR_REGISTRY.validate(
+                    ErrorDescriptor(
+                        code=entry.code,
+                        params={},
+                        retryable=entry.retryable_default,
+                    )
+                )
+            except ErrorContractViolation:
+                entry = ERROR_REGISTRY.require("MODEL_VERIFICATION_FAILED")
+                safe_retryable = entry.retryable_default
+        raise build_http_exception(
+            entry.code,
+            retryable=safe_retryable,
+            request_id=exc.request_id,
+            internal=InternalErrorContext(
+                source="model_provider",
+                exception_type=type(exc).__name__,
+                raw_message=str(exc),
+                upstream_code=exc.provider_code,
+                upstream_status=exc.status_code,
+            ),
+        ) from exc
     row.trust_status = "verified"
     row.verified_at = utc_now()
     row.verified_fingerprint = _fingerprint(row)
@@ -469,20 +704,6 @@ def _run_verification_probes(
                 "你是一个连接测试助手。请用一句中文回复连接成功。",
                 {"message": "ping"},
             )
-        elif capability_id == "stream":
-            stream_text = "".join(
-                probe_client.generate_text_stream(
-                    "你是一个连接测试助手。", {"message": "请回复 stream-ok"}
-                )
-            )
-            if not stream_text.strip():
-                raise LLMError("MODEL_EMPTY_OUTPUT")
-        else:
-            json_output = probe_client.generate_json(
-                "只返回 JSON object。", {"message": '返回 {"ok": true}'}
-            )
-            if not isinstance(json_output, dict):
-                raise LLMError("MODEL_INVALID_JSON")
         capabilities.append(ModelCapabilityTestResult(id=capability_id, success=True))
     return capabilities, output
 
@@ -509,10 +730,11 @@ def _mark_verification_failed(
 
 
 def _get_model_config(db: Session, tenant_id: str, config_id: str) -> ModelConfig:
+    """Load one tenant-owned model configuration through the canonical not-found contract."""
     ensure_tenant(db, tenant_id)
     row = db.get(ModelConfig, config_id)
     if not row or row.tenant_id != tenant_id:
-        raise HTTPException(status_code=404, detail="Model config not found")
+        raise build_http_exception("MODEL_CONFIG_NOT_FOUND", params={"config_id": config_id})
     return row
 
 
@@ -539,16 +761,84 @@ def _clear_default(db: Session, tenant_id: str) -> None:
     )
 
 
+def _validate_subscription_request(request: ModelConfigCreateRequest) -> None:
+    """Reject API-key-only fields on subscription model requests with stable model codes."""
+    if request.api_key:
+        raise build_http_exception("MODEL_SUBSCRIPTION_API_KEY_FORBIDDEN")
+    if request.base_url or request.provider or request.api_protocol:
+        raise build_http_exception("MODEL_SUBSCRIPTION_DIRECT_CONFIG_FORBIDDEN")
+    if request.extra_body or request.protocol_options:
+        raise build_http_exception("MODEL_SUBSCRIPTION_DIRECT_CONFIG_FORBIDDEN")
+
+
+def _subscription_account_response(
+    operation: Callable[[], CodexSubscriptionAccount],
+) -> CodexSubscriptionAccountRead:
+    """Run a subscription operation and project known runtime failures by code and status."""
+    try:
+        result = operation()
+    except CodexSubscriptionError as exc:
+        # Workflow: accept only a registered subscription code and keep raw process
+        # diagnostics private to the raised exception context.
+        entry = ERROR_REGISTRY.get(exc.code)
+        if entry is None or entry.visibility is not ErrorVisibility.PUBLIC:
+            entry = ERROR_REGISTRY.require("MODEL_SUBSCRIPTION_RUNTIME_FAILED")
+        else:
+            try:
+                ERROR_REGISTRY.validate(
+                    ErrorDescriptor(
+                        code=entry.code,
+                        params={},
+                        retryable=entry.retryable_default,
+                    )
+                )
+            except ErrorContractViolation:
+                entry = ERROR_REGISTRY.require("MODEL_SUBSCRIPTION_RUNTIME_FAILED")
+        raise build_http_exception(
+            entry.code,
+            status_code=_subscription_error_status(entry.code),
+        ) from exc
+    return CodexSubscriptionAccountRead(**result.to_dict())
+
+
+def _subscription_error_status(code: str) -> int:
+    """将订阅运行时安全错误码映射为稳定 HTTP 状态，不暴露子进程细节。"""
+    if code in {
+        "MODEL_SUBSCRIPTION_BROWSER_UNAVAILABLE",
+        "MODEL_SUBSCRIPTION_RUNTIME_UNAVAILABLE",
+    }:
+        return 503
+    if code == "MODEL_SUBSCRIPTION_RUNTIME_TIMEOUT":
+        return 504
+    if code in {
+        "MODEL_SUBSCRIPTION_RUNTIME_PROTOCOL_ERROR",
+        "MODEL_SUBSCRIPTION_RUNTIME_FAILED",
+    }:
+        return 502
+    return 503
+
+
+def _validate_subscription_update_request(request: ModelConfigUpdateRequest) -> None:
+    """Reject forbidden subscription update fields without returning natural-language detail."""
+    if request.api_key:
+        raise build_http_exception("MODEL_SUBSCRIPTION_API_KEY_FORBIDDEN")
+    if request.base_url or request.provider or request.api_protocol:
+        raise build_http_exception("MODEL_SUBSCRIPTION_DIRECT_CONFIG_FORBIDDEN")
+    if request.extra_body or request.protocol_options:
+        raise build_http_exception("MODEL_SUBSCRIPTION_DIRECT_CONFIG_FORBIDDEN")
+
+
 def _request_protocol_options(
     protocol_options: dict | None,
     protocol: ModelApiProtocol,
 ) -> dict:
+    """Validate protocol options and return a stable code for unsupported combinations."""
     if protocol_options is None:
         return {}
     if protocol is ModelApiProtocol.OPENAI_CHAT_COMPLETIONS:
         return normalize_chat_protocol_options(protocol_options)
     if protocol_options:
-        raise HTTPException(status_code=422, detail="MODEL_PROTOCOL_OPTIONS_INVALID")
+        raise build_http_exception("MODEL_PROTOCOL_OPTIONS_INVALID")
     return {}
 
 
@@ -557,25 +847,27 @@ def _request_extra_body(extra_body: dict | None, protocol: ModelApiProtocol) -> 
     if not extra_body:
         return {}
     if protocol is not ModelApiProtocol.OPENAI_CHAT_COMPLETIONS:
-        raise HTTPException(status_code=422, detail="MODEL_EXTRA_BODY_UNSUPPORTED")
+        raise build_http_exception("MODEL_EXTRA_BODY_UNSUPPORTED")
     return dict(extra_body)
 
 
 def _validate_sampling(
     protocol: ModelApiProtocol, temperature: float, max_output_tokens: int
 ) -> None:
+    """Validate sampling bounds using stable model validation codes."""
     max_temperature = 1 if protocol is ModelApiProtocol.ANTHROPIC_MESSAGES else 2
     if not 0 <= temperature <= max_temperature:
-        raise HTTPException(status_code=422, detail="MODEL_TEMPERATURE_INVALID")
+        raise build_http_exception("MODEL_TEMPERATURE_INVALID")
     if max_output_tokens <= 0:
-        raise HTTPException(status_code=422, detail="MODEL_MAX_OUTPUT_TOKENS_INVALID")
+        raise build_http_exception("MODEL_MAX_OUTPUT_TOKENS_INVALID")
 
 
 def _require_trusted(row: ModelConfig) -> None:
+    """Require a verified model fingerprint before enabling or selecting a configuration."""
     if row.trust_status == "legacy_trusted" and row.api_protocol == "openai_chat_completions":
         return
     if row.trust_status != "verified" or row.verified_fingerprint != _fingerprint(row):
-        raise HTTPException(status_code=409, detail="MODEL_CONFIG_VERIFICATION_REQUIRED")
+        raise build_http_exception("MODEL_CONFIG_VERIFICATION_REQUIRED")
 
 
 def _fingerprint(row: ModelConfig) -> str:
@@ -584,15 +876,17 @@ def _fingerprint(row: ModelConfig) -> str:
         api_protocol=row.api_protocol,
         base_url=row.base_url,
         model=row.model,
-        key_revision=row.key_revision,
+        configuration_revision=row.key_revision,
         protocol_options=current_protocol_options(row.protocol_options_json, protocol),
         security_revision=row.security_revision,
+        model_mode=getattr(row, "auth_mode", ModelAuthMode.API_KEY),
     )
 
 
 def _commit_or_conflict(db: Session) -> None:
+    """Commit model changes and convert uniqueness races to a stable conflict response."""
     try:
         db.commit()
     except IntegrityError as exc:
         db.rollback()
-        raise HTTPException(status_code=409, detail="MODEL_DEFAULT_CONFLICT") from exc
+        raise build_http_exception("MODEL_DEFAULT_CONFLICT") from exc

@@ -13,6 +13,10 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .ruff_cache/
+# Spec-Kit 的共享规则与功能规格必须进入版本控制；仅忽略本机生成的集成命令副本。
+.specify/_unused/
+# 本机 Superpowers 工作流产物不属于项目源代码。
+/.superpowers/
 .mypy_cache/
 .venv/
 venv/
@@ -22,11 +26,19 @@ exports/
 dist/
 build/
 node_modules/
+playwright-report/
+test-results/
 .pnpm-store/
 /frontend-site/
 /official-site/
 /frontend-chat/
-/docs/
+/docs/*
+!/docs/agents/
+!/docs/agents/**
+!/docs/adr/
+!/docs/adr/**
+!/docs/i18n/
+!/docs/i18n/**
 # 打包产物（PyInstaller 输出、附带 python、下载缓存）—— 不进 git
 packaging/out/
 packaging/build/

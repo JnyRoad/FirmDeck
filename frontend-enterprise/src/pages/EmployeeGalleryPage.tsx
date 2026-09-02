@@ -1,13 +1,17 @@
 import { UnderlineTabs, type UnderlineTabItem } from '@/components/ui';
 import { notify } from '@/components/ui/app-toast';
+import { RawContent } from '@/i18n/RawContent';
+import { useAppIntl } from '@/i18n/useAppIntl';
+import { apiErrorMessage } from '@/lib/apiErrorMessages';
 
 import IconSearch from '../assets/icons/search.svg?react';
 
 import { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 
-import { api, TENANT_ID } from '../api/client';
+import { createTenantClient } from '../api/tenant-client';
 import { isGalleryEmployee, type EnterpriseAuthUser } from '../auth';
+import { useTenantSession } from '../contexts/TenantSessionContext';
 
 import AppHeader from '../components/AppHeader';
 import { ConfirmDialog } from '../components/ConfirmDialog';
@@ -23,11 +27,18 @@ import {
   isMyEmployeeAgent,
   visibleEmployeeAgents,
 } from '../employee';
+import { clearSharedAgentScope, persistSharedAgentScope, readEmployeeScope } from '../lib/agent-scope-storage';
 import type { AgentProfileRead, TeamRead } from '../types';
 
-const ENTERPRISE_AGENT_STORAGE_KEY = 'ultrarag_enterprise_agent_scope';
-
 type GalleryScope = 'all' | 'mine' | 'teams' | 'gallery';
+
+/** 统一把未知异常折叠为安全语义文案，避免把 Error.message 直接暴露到最终 UI。 */
+function galleryErrorMessage(error: unknown, fallback: string): string {
+  const message = apiErrorMessage(error, 'common.error.generic');
+  return message === '发生错误，请稍后重试' || message === 'Something went wrong. Please try again later.'
+    ? fallback
+    : message;
+}
 
 export default function EmployeeGalleryPage({
   currentUser,
@@ -40,8 +51,12 @@ export default function EmployeeGalleryPage({
   onStartChat?: (agent: AgentProfileRead) => void | Promise<void>;
   onLogout?: () => void;
 }) {
+  const { t } = useAppIntl();
+  const tenantContext = useTenantSession();
+  const tenantApi = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
   const [agents, setAgents] = useState<AgentProfileRead[]>([]);
   const [teams, setTeams] = useState<TeamRead[]>([]);
+  const [teamsLoadFailed, setTeamsLoadFailed] = useState(false);
   const [loading, setLoading] = useState(false);
   const [avatarAgent, setAvatarAgent] = useState<AgentProfileRead | null>(null);
   const [profileAgent, setProfileAgent] = useState<AgentProfileRead | null>(null);
@@ -54,35 +69,66 @@ export default function EmployeeGalleryPage({
   const navigate = useNavigate();
 
   async function load() {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     setLoading(true);
     try {
-      const rows = await api.get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${TENANT_ID}`);
+      const rows = await tenantApi.get<AgentProfileRead[]>('/api/enterprise/agents');
+      if (!context.isCurrentGeneration(generation)) return;
       setAgents(rows);
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '加载员工失败');
+      if (!context.isCurrentGeneration(generation)) return;
+      notify.error(galleryErrorMessage(error, t('employeeGalleryPage.toast.loadEmployeesFailed')));
     } finally {
-      setLoading(false);
+      if (context.isCurrentGeneration(generation)) setLoading(false);
     }
   }
 
   async function loadTeams() {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     try {
-      const rows = await api.get<TeamRead[]>(`/api/enterprise/teams?tenant_id=${TENANT_ID}`);
+      const rows = await tenantApi.get<TeamRead[]>('/api/enterprise/teams');
+      if (!context.isCurrentGeneration(generation)) return;
       setTeams(rows);
+      setTeamsLoadFailed(false);
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '加载团队失败');
+      if (!context.isCurrentGeneration(generation)) return;
+      setTeamsLoadFailed(true);
+      notify.error(galleryErrorMessage(error, t('employeeGalleryPage.toast.loadTeamsFailed')));
     }
   }
 
   useEffect(() => {
     void load();
     void loadTeams();
-  }, []);
+  }, [tenantApi]);
+
+  useEffect(() => {
+    setDeleting(false);
+    setStartingAgentId(null);
+    setStartingTeamId(null);
+  }, [tenantContext?.generation]);
+
+  // Clear tenant-A records and editor state while the replacement tenant is
+  // still being verified by TenantSessionProvider.
+  useEffect(() => {
+    if (tenantContext) return;
+    setAgents([]);
+    setTeams([]);
+    setTeamsLoadFailed(false);
+    setAvatarAgent(null);
+    setProfileAgent(null);
+    setDeleteTarget(null);
+    setLoading(false);
+  }, [tenantContext]);
 
   // Keep these tabs aligned with the rest of the app:
   // - 所有员工: employees the current user can access and chat with
   // - 我的数字员工: employees the current user can manage/edit
-  // - 我的团队: teams owned by the current user
+  // - 团队对话: teams the backend has authorized for the current tenant
   // - 数字员工广场: public employees not already listed as mine
   const availableAgents = useMemo(
     () => visibleEmployeeAgents(agents, currentUser, { activeOnly: true }),
@@ -117,13 +163,7 @@ export default function EmployeeGalleryPage({
     ].some((value) => value.toLowerCase().includes(keyword));
   });
 
-  // 与「我的数字员工」语义对齐：优先展示当前用户拥有的团队；
-  // 没有用户信息时（如未登录预览）回退为全部团队。
-  const myTeams = useMemo(
-    () => (currentUser ? teams.filter((team) => team.owner_user_id === currentUser.id) : teams),
-    [teams, currentUser],
-  );
-  const filteredTeams = myTeams.filter((team) => {
+  const filteredTeams = teams.filter((team) => {
     const keyword = searchTerm.trim().toLowerCase();
     if (!keyword) return true;
     return [
@@ -135,53 +175,74 @@ export default function EmployeeGalleryPage({
 
   async function startEmployeeChat(row: AgentProfileRead) {
     if (startingAgentId) return;
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     setStartingAgentId(row.id);
     try {
       if (onStartChat) {
         await onStartChat(row);
+        if (!context.isCurrentGeneration(generation)) return;
         return;
       }
+      if (!context.isCurrentGeneration(generation)) return;
       navigate(`/workspace/chat/draft/${row.id}`);
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '发起对话失败');
+      if (!context.isCurrentGeneration(generation)) return;
+      notify.error(galleryErrorMessage(error, t('employeeGalleryPage.toast.startChatFailed')));
     } finally {
-      setStartingAgentId(null);
+      if (context.isCurrentGeneration(generation)) setStartingAgentId(null);
     }
   }
 
   async function startTeamChat(team: TeamRead) {
     if (startingTeamId) return;
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     setStartingTeamId(team.id);
     try {
-      const result = await api.post<{ session_id: string }>(
+      const result = await tenantApi.post<{ session_id: string }>(
         `/api/enterprise/teams/${team.id}/tl/session`,
-        { tenant_id: TENANT_ID },
       );
-      if (!result.session_id) throw new Error('未返回团队群聊');
+      if (!context.isCurrentGeneration(generation)) return;
+      if (!result.session_id) throw new Error(t('employeeGalleryPage.error.missingTeamSession'));
       navigate(`/workspace/chat/${result.session_id}`);
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '发起团队对话失败');
+      if (!context.isCurrentGeneration(generation)) return;
+      notify.error(galleryErrorMessage(error, t('employeeGalleryPage.toast.startTeamChatFailed')));
     } finally {
-      setStartingTeamId(null);
+      if (context.isCurrentGeneration(generation)) setStartingTeamId(null);
     }
   }
 
   async function updateStatus(row: AgentProfileRead, status: 'active' | 'archived') {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     try {
-      await api.put<AgentProfileRead>(`/api/enterprise/agents/${row.id}`, {
-        tenant_id: TENANT_ID,
+      await tenantApi.put<AgentProfileRead>(`/api/enterprise/agents/${row.id}`, {
         status,
         metadata: row.metadata || {},
       });
-      notify.success(status === 'active' ? '员工已上线' : '员工已下线');
+      if (!context.isCurrentGeneration(generation)) return;
+      notify.successText(
+        status === 'active'
+          ? t('employeeGalleryPage.toast.published')
+          : t('employeeGalleryPage.toast.archived'),
+      );
       await load();
       window.dispatchEvent(new Event('ultrarag-enterprise-agent-scope-refresh'));
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '更新员工状态失败');
+      if (!context.isCurrentGeneration(generation)) return;
+      notify.error(galleryErrorMessage(error, t('employeeGalleryPage.toast.updateStatusFailed')));
     }
   }
 
   async function updateGalleryState(row: AgentProfileRead, published: boolean) {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     try {
       const metadata: Record<string, unknown> = {
         ...(row.metadata || {}),
@@ -193,43 +254,53 @@ export default function EmployeeGalleryPage({
         delete metadata.gallery_unpublished_at;
         delete metadata.gallery_unpublished_by;
       }
-      await api.put<AgentProfileRead>(`/api/enterprise/agents/${row.id}`, {
-        tenant_id: TENANT_ID,
+      await tenantApi.put<AgentProfileRead>(`/api/enterprise/agents/${row.id}`, {
         metadata,
       });
-      notify.success(published ? '已发布到广场' : '已从广场下架');
+      if (!context.isCurrentGeneration(generation)) return;
+      notify.successText(
+        published
+          ? t('employeeGalleryPage.toast.marketplacePublished')
+          : t('employeeGalleryPage.toast.marketplaceUnpublished'),
+      );
       await load();
       window.dispatchEvent(new Event('ultrarag-enterprise-agent-scope-refresh'));
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '更新广场状态失败');
+      if (!context.isCurrentGeneration(generation)) return;
+      notify.error(galleryErrorMessage(error, t('employeeGalleryPage.toast.updateGalleryFailed')));
     }
   }
 
   async function confirmDelete() {
     const row = deleteTarget;
     if (!row) return;
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
     setDeleting(true);
     try {
-      await api.delete(`/api/enterprise/agents/${row.id}?tenant_id=${TENANT_ID}`);
-      if (window.localStorage.getItem(ENTERPRISE_AGENT_STORAGE_KEY) === row.id) {
+      await tenantApi.delete(`/api/enterprise/agents/${row.id}`);
+      if (!context.isCurrentGeneration(generation)) return;
+      if (readEmployeeScope(context.tenantId, context.userId) === row.id) {
         const nextAgent = availableAgents.find((item) => item.id !== row.id && item.status === 'active')
           || availableAgents.find((item) => item.id !== row.id);
         if (nextAgent) {
-          window.localStorage.setItem(ENTERPRISE_AGENT_STORAGE_KEY, nextAgent.id);
+          persistSharedAgentScope(nextAgent.id, context.tenantId, context.userId);
           window.dispatchEvent(new CustomEvent('ultrarag-enterprise-agent-scope-change', { detail: { agentId: nextAgent.id } }));
         } else {
-          window.localStorage.removeItem(ENTERPRISE_AGENT_STORAGE_KEY);
+          clearSharedAgentScope(context.tenantId, context.userId);
           window.dispatchEvent(new CustomEvent('ultrarag-enterprise-agent-scope-change', { detail: { agentId: '' } }));
         }
       }
-      notify.success('员工已删除');
+      notify.successText(t('employeeGalleryPage.toast.deleted'));
       setDeleteTarget(null);
       await load();
       window.dispatchEvent(new Event('ultrarag-enterprise-agent-scope-refresh'));
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '删除员工失败');
+      if (!context.isCurrentGeneration(generation)) return;
+      notify.error(galleryErrorMessage(error, t('employeeGalleryPage.toast.deleteFailed')));
     } finally {
-      setDeleting(false);
+      if (context.isCurrentGeneration(generation)) setDeleting(false);
     }
   }
 
@@ -238,21 +309,32 @@ export default function EmployeeGalleryPage({
   }
 
   const galleryTabs: UnderlineTabItem<GalleryScope>[] = [
-    { value: 'all', label: '所有员工' },
-    { value: 'mine', label: '我的数字员工' },
-    { value: 'teams', label: '团队对话' },
-    { value: 'gallery', label: '数字员工广场' },
+    { value: 'all', label: t('employeeGalleryPage.tabs.all') },
+    { value: 'mine', label: t('employeeGalleryPage.tabs.mine') },
+    { value: 'teams', label: t('employeeGalleryPage.tabs.teams') },
+    { value: 'gallery', label: t('employeeGalleryPage.tabs.gallery') },
   ];
 
+  function changeScope(nextScope: GalleryScope) {
+    setScope(nextScope);
+    if (nextScope === 'teams' && teamsLoadFailed) {
+      void loadTeams();
+    }
+  }
+
   const hasSearchTerm = Boolean(searchTerm.trim());
-  const emptyText = hasSearchTerm ? '没有匹配的数字员工' : '暂无数字员工';
+  const emptyText = hasSearchTerm
+    ? t('employeeGalleryPage.empty.filtered.title')
+    : t('employeeGalleryPage.empty.default.title');
   const emptyDescription = hasSearchTerm
-    ? '换个关键词，或切换员工分类再试试'
-    : '当前分类还没有可用员工';
-  const teamsEmptyText = hasSearchTerm ? '没有匹配的团队' : '暂无团队';
+    ? t('employeeGalleryPage.empty.filtered.description')
+    : t('employeeGalleryPage.empty.default.description');
+  const teamsEmptyText = hasSearchTerm
+    ? t('employeeGalleryPage.empty.teamsFiltered.title')
+    : t('employeeGalleryPage.empty.teams.title');
   const teamsEmptyDescription = hasSearchTerm
-    ? '换个关键词再试试'
-    : '请先在管理端创建团队并设置项目领导';
+    ? t('employeeGalleryPage.empty.teamsFiltered.description')
+    : t('employeeGalleryPage.empty.teams.description');
 
   return (
     <div className="min-h-full box-border px-[48px] pt-[32px] pb-[43px] max-[900px]:px-[16px]" aria-busy={loading}>
@@ -269,8 +351,8 @@ export default function EmployeeGalleryPage({
               data-bwignore="true"
               value={searchTerm}
               onChange={(event) => setSearchTerm(event.target.value)}
-              placeholder="搜索"
-              aria-label="搜索数字员工"
+              placeholder={t('employeeGalleryPage.search.placeholder')}
+              aria-label={t('employeeGalleryPage.search.label')}
               className="min-w-0 flex-1 border-0 bg-transparent text-[14px] text-[#18181A] outline-none placeholder:text-[#757F9C]"
             />
           </div>
@@ -278,16 +360,16 @@ export default function EmployeeGalleryPage({
       />
 
       <UnderlineTabs
-        className="mt-[36px] mb-[16px] max-[560px]:w-full"
-        aria-label="数字员工分类"
+        className="mt-[36px] mb-[16px] w-full max-w-[680px]"
+        aria-label={t('employeeGalleryPage.tabs.ariaLabel')}
         value={scope}
-        onChange={setScope}
+        onChange={changeScope}
         items={galleryTabs}
-        tabClassName="max-[560px]:min-h-[54px] max-[560px]:w-auto max-[560px]:flex-1 max-[560px]:px-[6px] max-[560px]:text-[12px] max-[560px]:leading-[16px]"
+        tabClassName="min-w-max flex-1 px-[12px] max-[560px]:px-[8px] max-[560px]:text-[12px]"
       />
 
       {scope === 'teams' ? (
-        <section aria-label="团队">
+        <section aria-label={t('employeeGalleryPage.teams.sectionLabel')}>
           <div className="grid grid-cols-1 content-start gap-[32px] sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4 max-[900px]:gap-[18px]">
             {filteredTeams.map((team) => (
               <TeamCard
@@ -346,8 +428,14 @@ export default function EmployeeGalleryPage({
           if (!open) setDeleteTarget(null);
         }}
         loading={deleting}
-        title={`删除员工「${deleteTarget ? employeeDisplayName(deleteTarget) : ''}」？`}
-        description="删除后该员工的所有配置将一并移除，操作不可撤销。"
+        title={deleteTarget ? (
+          <>
+            {t('employeeGalleryPage.dialog.delete.titlePrefix')}
+            <RawContent value={employeeDisplayName(deleteTarget)} />
+            {t('employeeGalleryPage.dialog.delete.titleSuffix')}
+          </>
+        ) : ''}
+        description={t('employeeGalleryPage.dialog.delete.description')}
         onConfirm={() => void confirmDelete()}
       />
     </div>

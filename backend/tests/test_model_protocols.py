@@ -8,13 +8,14 @@ from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine
 
 from app.db.models import ModelConfig
+from app.llm.client import _normalize_extra_body
 from app.llm.model_config_resolver import (
     resolve_model_config_for_runtime,
     resolve_model_config_for_verification,
 )
-from app.llm.client import _normalize_extra_body
 from app.llm.model_protocols import (
     ModelApiProtocol,
+    ModelAuthMode,
     available_model_protocols,
     model_config_fingerprint,
     normalize_chat_protocol_options,
@@ -57,7 +58,7 @@ def test_protocol_boundary_accepts_only_chat_compatibility() -> None:
     )
     with pytest.raises(HTTPException) as exc_info:
         resolve_api_protocol(None, "anthropic")
-    assert exc_info.value.detail == "MODEL_PROVIDER_UNSUPPORTED"
+    assert exc_info.value.detail["code"] == "MODEL_PROVIDER_UNSUPPORTED"
 
 
 def test_chat_thinking_options_are_strictly_typed() -> None:
@@ -66,19 +67,35 @@ def test_chat_thinking_options_are_strictly_typed() -> None:
     ) == {"thinking": {"type": "disabled", "clear_thinking": True}}
     with pytest.raises(HTTPException) as exc_info:
         normalize_chat_protocol_options({"thinking": {"type": "disabled", "vendor": 1}})
-    assert exc_info.value.detail == "MODEL_PROTOCOL_OPTIONS_INVALID"
+    assert exc_info.value.detail["code"] == "MODEL_PROTOCOL_OPTIONS_INVALID"
 
 
 def test_fingerprint_normalizes_equivalent_base_urls() -> None:
     common = {
         "api_protocol": "openai_chat_completions",
         "model": "model-a",
-        "key_revision": 1,
+        "configuration_revision": 1,
         "protocol_options": {},
         "security_revision": 1,
+        "model_mode": ModelAuthMode.API_KEY,
     }
     assert model_config_fingerprint(base_url="HTTPS://EXAMPLE.COM:443/v1/", **common) == (
         model_config_fingerprint(base_url="https://example.com/v1", **common)
+    )
+
+
+def test_fingerprint_keeps_non_secret_configuration_revision_compatible() -> None:
+    assert (
+        model_config_fingerprint(
+            api_protocol="openai_chat_completions",
+            base_url="https://example.com/v1",
+            model="gpt-5",
+            configuration_revision=1,
+            protocol_options={},
+            security_revision=1,
+            model_mode="api_key",
+        )
+        == "4b6fa0173a7d7f3367451039c32c1b262a50820b615872f70ad2d29407a09b34"
     )
 
 
@@ -134,7 +151,7 @@ def test_runtime_resolver_rejects_unverified_but_verification_resolver_allows_it
 
         with pytest.raises(HTTPException) as exc_info:
             resolve_model_config_for_runtime(db, "tenant_a", "model_a")
-        assert exc_info.value.detail == "MODEL_CONFIG_DISABLED"
+        assert exc_info.value.detail["code"] == "MODEL_CONFIG_DISABLED"
 
         resolved = resolve_model_config_for_verification(
             db, "tenant_a", "model_a", "attempt_a"
@@ -149,7 +166,7 @@ def test_verified_runtime_requires_matching_fingerprint() -> None:
 
         with pytest.raises(HTTPException) as exc_info:
             resolve_model_config_for_runtime(db, "tenant_a", "model_a")
-        assert exc_info.value.detail == "MODEL_CONFIG_VERIFICATION_REQUIRED"
+        assert exc_info.value.detail["code"] == "MODEL_CONFIG_VERIFICATION_REQUIRED"
 
 
 def test_all_implemented_protocols_are_available() -> None:
@@ -159,6 +176,12 @@ def test_all_implemented_protocols_are_available() -> None:
         "anthropic_messages",
         "gemini_generate_content",
     ]
+
+
+def test_model_config_defaults_to_api_key_authentication_mode() -> None:
+    config = _row()
+
+    assert getattr(config, "auth_mode", None) == "api_key"
 
 
 def test_snapshot_model_config_preserves_anthropic_protocol_and_options() -> None:

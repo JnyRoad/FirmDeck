@@ -35,8 +35,17 @@ from app.db.models import (
     utc_now,
 )
 from app.teams import wakeup
-from app.teams.schema import AwardOverrideRequest, TeamBlackboardPromoteRequest
-from app.teams.service import member_concurrency, record_task_event
+from app.teams.schema import (
+    AwardOverrideRequest,
+    TeamBlackboardPromoteRequest,
+    TeamKnowledgeSelection,
+    TeamSharedKnowledgeCreate,
+)
+from app.teams.service import (
+    bind_team_knowledge_base,
+    member_concurrency,
+    record_task_event,
+)
 from app.teams.sweeper import (
     DEFAULT_TASK_TIMEOUT_MINUTES,
     sweep_timed_out_tasks,
@@ -409,6 +418,15 @@ def test_blackboard_promote_creates_ingest_job_idempotent(
     with _test_session() as db:
         team = _seed_pool_team(db)
         admin = _admin_user()
+        binding = bind_team_knowledge_base(
+            db,
+            team=team,
+            selection=TeamKnowledgeSelection(
+                create_shared=TeamSharedKnowledgeCreate(name="团队黑板共享库"),
+                is_default=True,
+            ),
+            actor_user_id=admin.id,
+        )
         task = _make_pool_task(db, team, title="来源任务")
         entry = TeamBlackboardEntry(
             team_id=team.id, tenant_id=team.tenant_id,
@@ -432,18 +450,25 @@ def test_blackboard_promote_creates_ingest_job_idempotent(
         )
 
         assert resp.already_promoted is False
-        assert resp.knowledge_base_id
+        assert resp.knowledge_base_id == binding.knowledge_base_id
         job = db.get(KnowledgeIngestJob, resp.ingest_job_id)
         assert job is not None
         assert job.status == "queued"
         assert job.tenant_id == "tenant_demo"
         assert job.knowledge_base_id == resp.knowledge_base_id
-        # 原始资料 markdown:含条目内容、tags、来源团队/任务标注
+        # 业务正文逐字保留，产品来源信息使用结构化元数据而不混入正文。
         markdown = base64.b64decode(job.metadata_json["content_base64"]).decode("utf-8")
-        assert "竞品 A 定价 99 元" in markdown
-        assert "pricing" in markdown
-        assert team.name in markdown
-        assert task.title in markdown
+        assert markdown == "竞品 A 定价 99 元"
+        assert job.metadata_json["title"] == "竞品 A 定价 99 元"
+        assert job.metadata_json["metadata"] == {
+            "source": "team_blackboard",
+            "team_id": team.id,
+            "team_name": team.name,
+            "blackboard_entry_id": entry.id,
+            "source_task_id": task.id,
+            "source_task_title": task.title,
+            "tags": ["pricing"],
+        }
         # citation 回写
         db.refresh(entry)
         assert entry.citation_json["knowledge_base_id"] == resp.knowledge_base_id

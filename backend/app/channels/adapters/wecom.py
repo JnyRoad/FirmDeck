@@ -21,7 +21,6 @@ from app.channels.adapters.base import (
     ChannelInbound,
     ChannelInboundAttachment,
     register_channel_adapter,
-    split_channel_text,
 )
 from app.channels.crypto import decrypt_channel_secret
 from app.channels.media import (
@@ -29,8 +28,11 @@ from app.channels.media import (
     MAX_ENCRYPTED_CHANNEL_MEDIA_BYTES,
     ensure_channel_media_size,
 )
+from app.channels.service_routing import ChannelNotice, render_channel_notice
+from app.contracts.event_registry import EVENT_REGISTRY
 from app.db import engine
-from app.db.models import ChannelBinding, utc_now
+from app.db.models import ChannelBinding, GeneralSkill, Skill, Tool, utc_now
+from app.i18n.language_context import LanguageContext, resolve_compatible_language_context
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +43,30 @@ WECOM_DISCONNECT_ALERT_MINUTES = 15
 WECOM_API_BASE = "https://qyapi.weixin.qq.com/cgi-bin"
 WECOM_TOKEN_REFRESH_SKEW_SECONDS = 300
 WECOM_MEDIA_HOSTS = {"ww-aibot-img-1258476243.cos.ap-guangzhou.myqcloud.com"}
+WECOM_STREAM_MIN_INTERVAL_SECONDS = 0.5
+WECOM_PROGRESS_FRAMES = ("📖", "📗", "📘", "📙", "📕")
+WECOM_PROCESSING_FRAMES = ("⏳", "⌛")
+# Mobile WeCom clients truncate long stream cards more aggressively than desktop.
+WECOM_STREAM_MAX_BYTES = 1800
+
+_WECOM_CANONICAL_EVENT_ALIASES = {
+    "public.run.intent": "router_decision_created",
+    "run.sop.state": "skill_state",
+    "run.sop.step": "step_result",
+    "run.task_frame.started": "task_frame_started",
+    "run.task_frame.finished": "task_frame_finished",
+    "run.task_frame.completed": "task_frame_completed",
+    "run.task_frame.waiting": "task_frame_dependency_waiting",
+    "run.task_frame.released": "task_frame_dependencies_released",
+    "run.action.started": "harness_action_created",
+    "run.capability.completed": "harness_tool_completed",
+    "run.tool.completed": "tool_result",
+    "run.citation": "knowledge_result",
+    "run.skill.completed": "skill_completed",
+    "public.run.status": "stream_status",
+    "public.run.failed": "error_occurred",
+    "public.run.cancelled": "error_occurred",
+}
 
 
 def validate_wecom_media_url(url: str) -> bool:
@@ -49,6 +75,94 @@ def validate_wecom_media_url(url: str) -> bool:
     except ValueError:
         return False
     return parsed.scheme == "https" and (parsed.hostname or "").lower() in WECOM_MEDIA_HOSTS
+
+
+def _wecom_event_label(payload: dict[str, Any], *keys: str) -> str:
+    """Read one bounded display label from a stable event payload without exposing arbitrary data."""
+    for key in keys:
+        raw_value = payload.get(key)
+        if not isinstance(raw_value, (str, int, float)) or isinstance(raw_value, bool):
+            continue
+        value = str(raw_value).strip()
+        if value:
+            return value[:80]
+    return ""
+
+
+def _split_wecom_text(text: str, max_bytes: int = WECOM_STREAM_MAX_BYTES) -> list[str]:
+    """Split outbound WeCom text on Unicode code-point boundaries under a UTF-8 byte limit."""
+    if max_bytes <= 0:
+        raise ValueError("max_bytes must be positive")
+    chunks: list[str] = []
+    current: list[str] = []
+    current_bytes = 0
+    for char in str(text or ""):
+        char_bytes = len(char.encode("utf-8"))
+        if char_bytes > max_bytes:
+            raise ValueError("one Unicode code point exceeds the configured byte limit")
+        if current and current_bytes + char_bytes > max_bytes:
+            chunks.append("".join(current))
+            current = []
+            current_bytes = 0
+        current.append(char)
+        current_bytes += char_bytes
+    if current:
+        chunks.append("".join(current))
+    return chunks
+
+
+def _truncate_wecom_text(text: str, max_bytes: int) -> str:
+    """Keep a quote fragment within a byte budget while never splitting UTF-8 characters."""
+    if max_bytes <= 0:
+        return ""
+    return _split_wecom_text(text, max_bytes=max_bytes)[0] if text else ""
+
+
+def _sanitize_wecom_quote_field(value: object, max_bytes: int) -> str:
+    """Project quote metadata to one markdown-safe line without mentioning arbitrary users."""
+    compact = " ".join(str(value or "").replace("\r", " ").replace("\n", " ").split())
+    escaped = (
+        compact.replace("\\", "\\\\")
+        .replace("`", "\\`")
+        .replace("*", "\\*")
+        .replace("_", "\\_")
+        .replace("[", "\\[")
+        .replace("]", "\\]")
+        .replace("<", "\\<")
+        .replace(">", "\\>")
+    )
+    return _truncate_wecom_text(escaped, max_bytes)
+
+
+def _load_wecom_progress_names(
+    binding: ChannelBinding,
+) -> tuple[dict[str, str], dict[str, dict[str, str]], dict[str, str]]:
+    """Load tenant-owned raw names used as progress parameters without translating them."""
+    with Session(engine) as db:
+        skill_names: dict[str, str] = {}
+        step_names: dict[str, dict[str, str]] = {}
+        for skill in db.exec(select(Skill).where(Skill.tenant_id == binding.tenant_id)).all():
+            skill_names[skill.skill_id] = skill.name
+            steps = {
+                str(node.get("node_id") or "").strip(): str(node.get("name") or "").strip()
+                for node in (skill.content_json or {}).get("nodes") or []
+                if isinstance(node, dict)
+                and str(node.get("node_id") or "").strip()
+                and str(node.get("name") or "").strip()
+            }
+            if steps:
+                step_names[skill.skill_id] = steps
+        tool_names = {
+            tool.name: str(tool.display_name or tool.description or "").strip()
+            for tool in db.exec(select(Tool).where(Tool.tenant_id == binding.tenant_id)).all()
+            if str(tool.display_name or tool.description or "").strip()
+        }
+        for skill in db.exec(
+            select(GeneralSkill).where(GeneralSkill.tenant_id == binding.tenant_id)
+        ).all():
+            if skill.slug and skill.name:
+                tool_names[f"general_skill.{skill.slug}"] = skill.name
+    return skill_names, step_names, tool_names
 
 
 async def _download_wecom_media_limited(url: str, aes_key: str) -> tuple[bytes, str | None]:
@@ -86,7 +200,21 @@ def is_self_frame(frame: dict[str, Any]) -> bool:
     return bool(sender) and bool(bot_id) and sender == bot_id
 
 
-def normalize_wecom_frame(frame: dict[str, Any], *, account_scope: str = "") -> ChannelInbound | None:
+def _strip_bot_mention(text: str, *, is_group: bool, bot_id: str) -> str:
+    """Remove only the leading bot mention for group command parsing and preserve the rest verbatim."""
+    if not is_group or not bot_id:
+        return text
+    escaped_bot_id = re.escape(bot_id)
+    return re.sub(
+        rf"^\s*(?:<@{escaped_bot_id}>|@{escaped_bot_id})(?=\s|$)\s*",
+        "",
+        text,
+    ).strip()
+
+
+def normalize_wecom_frame(
+    frame: dict[str, Any], *, account_scope: str = ""
+) -> ChannelInbound | None:
     """归一化企微 WS 消息帧；自身消息/非文本语音/缺字段返回 None（丢弃）。"""
     if not isinstance(frame, dict) or is_self_frame(frame):
         return None
@@ -192,6 +320,14 @@ def normalize_wecom_frame(frame: dict[str, Any], *, account_scope: str = "") -> 
         chattype = "single"
     # 官方文档：chatid 仅群聊返回
     is_group = bool(chat_id)
+    if text:
+        text = _strip_bot_mention(
+            text,
+            is_group=is_group,
+            bot_id=str(body.get("aibotid") or "").strip(),
+        )
+    if not text and not attachments:
+        return None
     headers = frame.get("headers") or {}
     event_id = str(body.get("msgid") or body.get("msg_id") or headers.get("req_id") or "").strip()
     if not event_id:
@@ -237,6 +373,519 @@ class _StreamState:
         self.callbacks_inflight = 0
         self.worker_stop_sent = False
         self.disconnect_sent = False
+
+
+class WeComStreamReply:
+    """Render localized progress and raw answer deltas into two stable WeCom streams."""
+
+    def __init__(
+        self,
+        binding: ChannelBinding,
+        frame: dict[str, Any],
+        stream: tuple[Any, Any],
+        *,
+        skill_names: dict[str, str] | None = None,
+        step_names: dict[str, dict[str, str]] | None = None,
+        tool_names: dict[str, str] | None = None,
+        progress_names_loader: Callable[
+            [], tuple[dict[str, str], dict[str, dict[str, str]], dict[str, str]]
+        ]
+        | None = None,
+        language_context: LanguageContext | dict[str, Any] | None = None,
+    ) -> None:
+        """Bind one immutable locale snapshot and start a bounded background sender."""
+        self._binding = binding
+        self._frame = frame
+        self._client, self._loop = stream
+        body = frame.get("body") if isinstance(frame, dict) else None
+        body = body if isinstance(body, dict) else {}
+        event_id = str(body.get("msgid") or body.get("msg_id") or "").strip()
+        if not event_id:
+            headers = frame.get("headers") if isinstance(frame, dict) else None
+            event_id = str((headers or {}).get("req_id") or "").strip()
+        base_stream_id = f"staffdeck:{binding.id}:{event_id}"
+        self._stream_id = f"{base_stream_id}:progress"
+        self._answer_stream_id = f"{base_stream_id}:answer"
+        self._is_group = bool(body.get("chatid"))
+        self._language_context = resolve_compatible_language_context(
+            snapshot=language_context,
+            legacy_ui_locale=None,
+            legacy_agent_reply_locale=None,
+        )
+        self._condition = threading.Condition()
+        self._progress: list[tuple[str, str]] = [
+            ("status", self._render_notice("wecom.progress.thinking", {"icon": "📖"}))
+        ]
+        self._answer = ""
+        self._answer_started = False
+        self._dirty = False
+        self._finished = False
+        self._failed = False
+        self._animation_frame = 0
+        # Group messages are kept to one event-driven status line for mobile clients;
+        # direct messages retain the lightweight animation while no answer exists.
+        self._animation_enabled = not self._is_group
+        self._processing_key: str | None = None
+        self._last_progress_sent = ""
+        self._last_answer_sent = ""
+        self._skill_names = dict(skill_names or {})
+        self._step_names = dict(step_names or {})
+        self._tool_names = dict(tool_names or {})
+        self._progress_names_loader = progress_names_loader
+        self._progress_names_lock = threading.Lock()
+        self._worker = threading.Thread(
+            target=self._run,
+            name=f"staffdeck-wecom-reply-{self._stream_id[-24:]}",
+            daemon=True,
+        )
+        self._worker.start()
+        with self._condition:
+            self._dirty = True
+            self._condition.notify_all()
+
+    @property
+    def failed(self) -> bool:
+        """Return whether the sender observed an SDK or payload failure."""
+        with self._condition:
+            return self._failed
+
+    def on_delta(self, delta: str) -> None:
+        """Append one raw model delta until terminalization without rewriting its content."""
+        if not delta:
+            return
+        with self._condition:
+            if self._finished or self._failed:
+                return
+            self._answer += delta
+            self._answer_started = True
+            self._animation_enabled = False
+            self._dirty = True
+            self._condition.notify_all()
+
+    def replace_answer(self, answer: str) -> None:
+        """Replace the pending answer before finalization so persisted and streamed text agree."""
+        with self._condition:
+            if self._finished or self._failed:
+                return
+            self._answer = str(answer or "")
+            self._answer_started = bool(self._answer)
+            self._animation_enabled = False
+            self._last_answer_sent = ""
+            self._dirty = True
+            self._condition.notify_all()
+
+    def on_event(self, event_type: str, payload: dict[str, Any]) -> None:
+        """Project a known canonical/legacy execution event to localized progress chrome."""
+        progress = self._event_progress(event_type, payload)
+        if not progress:
+            return
+        key, notice = progress
+        message = self._render_notice(notice.code, dict(notice.params))
+        with self._condition:
+            if self._finished or self._failed:
+                return
+            if self._is_group and self._answer_started:
+                return
+            self._animation_enabled = False
+            if self._is_group:
+                # Group-chat mobile clients are sensitive to changing message height.
+                self._progress = [("status", message)]
+                self._processing_key = None
+                self._dirty = True
+                self._condition.notify_all()
+                return
+            if key == "intent":
+                self._progress = [item for item in self._progress if item[0] != "status"]
+            if key in {"skill", "step", "task", "tool", "knowledge"} and message.startswith(
+                ("⏳", "⌛")
+            ):
+                self._processing_key = key
+                self._animation_enabled = True
+            elif key in {"status", "intent"} or message.startswith(("✅", "❌", "📖")):
+                self._processing_key = None
+            self._upsert_progress(key, message)
+            self._dirty = True
+            self._condition.notify_all()
+
+    def _ensure_progress_names(self) -> None:
+        """Load tenant-owned display names at most once, only when an event needs them."""
+        if self._progress_names_loader is None:
+            return
+        with self._progress_names_lock:
+            loader = self._progress_names_loader
+            if loader is None:
+                return
+            self._progress_names_loader = None
+            try:
+                skill_names, step_names, tool_names = loader()
+            except Exception:  # noqa: BLE001 - optional progress labels must not fail a turn
+                logger.exception(
+                    "企微进度名称加载失败 binding=%s",
+                    self._binding.id,
+                )
+                return
+            self._skill_names = dict(skill_names)
+            self._step_names = dict(step_names)
+            self._tool_names = dict(tool_names)
+
+    def _event_progress(
+        self,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> tuple[str, ChannelNotice] | None:
+        """Map only allowlisted event shapes to typed notices, ignoring unknown payloads."""
+        if not isinstance(payload, dict):
+            return None
+        event_name = str(event_type or "").strip()
+        # Canonical SystemEvent delivery uses ``event_code`` plus a typed ``params``
+        # object, while the compatibility sink still supplies legacy event names.
+        # Accept only a registered public descriptor and discard all envelope fields
+        # before extracting display parameters; this keeps private payloads out of UI.
+        registry_entry = EVENT_REGISTRY.get(event_name)
+        if registry_entry is None:
+            payload_event_code = payload.get("event_code")
+            if isinstance(payload_event_code, str):
+                registry_entry = EVENT_REGISTRY.get(payload_event_code.strip())
+        if registry_entry is not None:
+            canonical_name = registry_entry.event_code
+            event_name = _WECOM_CANONICAL_EVENT_ALIASES.get(canonical_name, "")
+            if not event_name:
+                return None
+            canonical_params = payload.get("params")
+            payload = canonical_params if isinstance(canonical_params, dict) else {}
+        if event_name == "router_decision_created":
+            intent = _wecom_event_label(payload, "user_intent", "intent", "decision")
+            return (
+                "intent",
+                ChannelNotice("wecom.progress.intent", {"intent": intent})
+                if intent
+                else ChannelNotice("wecom.progress.thinking", {"icon": "📖"}),
+            )
+        if event_name in {"skill_started", "skill_resumed"}:
+            skill_id = _wecom_event_label(payload, "to_skill_id", "from_skill_id", "skill_id")
+            name = _wecom_event_label(payload, "skill_name", "skillName", "name")
+            if not name and skill_id:
+                self._ensure_progress_names()
+            name = name or self._skill_names.get(skill_id, "")
+            key = "skill"
+            notice_code = (
+                "wecom.progress.skill_started"
+                if event_name == "skill_started"
+                else "wecom.progress.skill_resumed"
+            )
+            return key, ChannelNotice(notice_code, {"skill_name": name})
+        if event_name == "skill_step_changed":
+            skill_id = _wecom_event_label(payload, "to_skill_id", "from_skill_id", "skill_id")
+            step_id = _wecom_event_label(payload, "to_step_id", "step_id")
+            step = _wecom_event_label(payload, "to_step_name", "step_name")
+            if not step and step_id:
+                self._ensure_progress_names()
+            step = step or self._step_names.get(skill_id, {}).get(step_id, "") or step_id
+            return "step", ChannelNotice("wecom.progress.step", {"step_name": step})
+        if event_name == "task_frame_started":
+            skill_id = _wecom_event_label(payload, "skill_id")
+            step_id = _wecom_event_label(payload, "step_id")
+            name = _wecom_event_label(payload, "skill_name", "name", "title")
+            if skill_id or step_id:
+                self._ensure_progress_names()
+            name = self._step_names.get(skill_id, {}).get(step_id, "") or name
+            name = name or self._skill_names.get(skill_id, "")
+            if name:
+                return "task", ChannelNotice("wecom.progress.task", {"task_name": name})
+            return "task", ChannelNotice("wecom.progress.task_default")
+        if event_name in {
+            "tool_call_started",
+            "capability_started",
+            "harness_action_created",
+        }:
+            action = str(payload.get("action") or "").strip()
+            if event_name == "harness_action_created" and action not in {"tool", ""}:
+                return None
+            name = _wecom_event_label(
+                payload,
+                "toolName",
+                "tool_display_name",
+                "display_name",
+                "tool_name",
+                "name",
+                "toolId",
+            )
+            if name:
+                self._ensure_progress_names()
+            name = self._tool_names.get(name, name)
+            code = "wecom.progress.tool_started" if name else "wecom.progress.tool_started_default"
+            params = {"tool_name": name} if name else {}
+            return "tool", ChannelNotice(code, params)
+        if event_name in {
+            "tool_result",
+            "tool_call_finished",
+            "capability_completed",
+            "harness_tool_completed",
+        }:
+            name = _wecom_event_label(
+                payload,
+                "toolName",
+                "tool_display_name",
+                "display_name",
+                "tool_name",
+                "name",
+            )
+            if name:
+                self._ensure_progress_names()
+            name = self._tool_names.get(name, name)
+            failed = payload.get("isError") is True or payload.get("success") is False
+            if failed:
+                code = (
+                    "wecom.progress.tool_failed" if name else "wecom.progress.tool_failed_default"
+                )
+            else:
+                code = (
+                    "wecom.progress.tool_completed"
+                    if name
+                    else "wecom.progress.tool_completed_default"
+                )
+            params = {"tool_name": name} if name else {}
+            return "tool", ChannelNotice(code, params)
+        if event_name in {"knowledge_query_started", "knowledge_search_started"}:
+            query = payload.get("query")
+            if isinstance(query, dict):
+                query = query.get("query")
+            query_text = str(query or payload.get("text") or "").strip()[:80]
+            if query_text:
+                return "knowledge", ChannelNotice(
+                    "wecom.progress.knowledge_started", {"query": query_text}
+                )
+            return "knowledge", ChannelNotice("wecom.progress.knowledge_started_default")
+        if event_name in {
+            "knowledge_query_finished",
+            "knowledge_result",
+            "knowledge_search_completed",
+        }:
+            chunks = payload.get("chunks")
+            count = len(chunks) if isinstance(chunks, list) else 0
+            return "knowledge", ChannelNotice(
+                "wecom.progress.knowledge_completed", {"count": count}
+            )
+        if event_name == "skill_state":
+            state = _wecom_event_label(payload, "state", "status").lower()
+            if state in {"started", "running", "active"}:
+                return "skill", ChannelNotice("wecom.progress.task_default")
+            if state in {"resumed", "resume"}:
+                return "skill", ChannelNotice("wecom.progress.task_default")
+            if state in {"completed", "finished", "done"}:
+                return "skill", ChannelNotice("wecom.progress.skill_completed")
+            if state in {"handoff", "human_handoff"}:
+                return "status", ChannelNotice("wecom.progress.handoff")
+            if state in {"awaiting_user", "waiting"}:
+                return "status", ChannelNotice("wecom.progress.awaiting_user")
+            return None
+        if event_name == "step_result":
+            step_name = _wecom_event_label(payload, "step_name", "step", "step_id")
+            if not step_name:
+                return None
+            return "step", ChannelNotice("wecom.progress.step", {"step_name": step_name})
+        if event_name in {"task_frame_finished", "task_frame_completed"}:
+            status = _wecom_event_label(payload, "status").lower()
+            if status in {"handoff", "human_handoff"}:
+                return "status", ChannelNotice("wecom.progress.handoff")
+            if status in {"awaiting_user", "waiting"}:
+                return "status", ChannelNotice("wecom.progress.awaiting_user")
+            if status in {"failed", "error"}:
+                return "status", ChannelNotice("wecom.progress.error")
+            return "status", ChannelNotice("wecom.progress.finished")
+        if event_name in {
+            "task_frame_dependency_waiting",
+            "task_frame_dependencies_released",
+        }:
+            status = "awaiting_user" if event_name == "task_frame_dependency_waiting" else "task"
+            return (
+                "status",
+                ChannelNotice("wecom.progress.awaiting_user")
+                if status == "awaiting_user"
+                else ChannelNotice("wecom.progress.task_default"),
+            )
+        if event_name == "stream_status":
+            phase = _wecom_event_label(payload, "phase").lower()
+            if phase == "error":
+                return "status", ChannelNotice("wecom.progress.error")
+            if phase in {"complete", "completed", "finished"}:
+                return "status", ChannelNotice("wecom.progress.finished")
+            return "status", ChannelNotice("wecom.progress.thinking", {"icon": "📖"})
+        fixed: dict[str, tuple[str, ChannelNotice]] = {
+            "handoff_requested": ("status", ChannelNotice("wecom.progress.handoff")),
+            "awaiting_user": ("status", ChannelNotice("wecom.progress.awaiting_user")),
+            "skill_completed": ("skill", ChannelNotice("wecom.progress.skill_completed")),
+            "error_occurred": ("status", ChannelNotice("wecom.progress.error")),
+        }
+        return fixed.get(event_name)
+
+    def _event_message(self, event_type: str, payload: dict[str, Any]) -> str | None:
+        """Return a localized message for focused callers while ignoring unregistered events."""
+        progress = self._event_progress(event_type, payload)
+        if not progress:
+            return None
+        _key, notice = progress
+        return self._render_notice(notice.code, dict(notice.params))
+
+    def _render_notice(self, code: str, params: dict[str, object] | None = None) -> str:
+        """Render one owned notice through the immutable reply-locale catalog."""
+        context = getattr(self, "_language_context", None)
+        context = resolve_compatible_language_context(
+            snapshot=context,
+            legacy_ui_locale=None,
+            legacy_agent_reply_locale=None,
+        )
+        return render_channel_notice(ChannelNotice(code, params or {}), context)
+
+    def _upsert_progress(self, key: str, message: str) -> None:
+        """Replace a progress category in place and bound direct-chat history to five rows."""
+        for index, (existing_key, _existing_message) in enumerate(self._progress):
+            if existing_key == key:
+                self._progress[index] = (key, message)
+                return
+        self._progress.append((key, message))
+        self._progress = self._progress[-5:]
+
+    def finish(self) -> bool:
+        """Finalize both streams once and report whether the sender thread drained successfully."""
+        with self._condition:
+            if self._failed:
+                return False
+            if self._finished:
+                worker = self._worker
+            elif not self._answer.strip():
+                self._failed = True
+                self._finished = True
+                self._dirty = False
+                self._condition.notify_all()
+                worker = self._worker
+            else:
+                self._upsert_progress("status", self._render_notice("wecom.progress.finished"))
+                self._finished = True
+                self._animation_enabled = False
+                self._processing_key = None
+                self._dirty = True
+                self._condition.notify_all()
+                worker = self._worker
+        if worker.is_alive() and worker is not threading.current_thread():
+            worker.join(timeout=SEND_TIMEOUT_SECONDS)
+        return not self.failed and not worker.is_alive()
+
+    def abort(self) -> None:
+        """Stop pending progress delivery without fabricating an answer or terminal success."""
+        with self._condition:
+            self._failed = True
+            self._finished = True
+            self._dirty = False
+            self._condition.notify_all()
+        worker = self._worker
+        if worker.is_alive() and worker is not threading.current_thread():
+            worker.join(timeout=SEND_TIMEOUT_SECONDS)
+
+    def _run(self) -> None:
+        """Drain coalesced updates on a daemon thread and fail closed on SDK errors or oversize frames."""
+        while True:
+            with self._condition:
+                if self._failed:
+                    self._dirty = False
+                    return
+                while not self._dirty and not self._finished:
+                    self._condition.wait(timeout=WECOM_STREAM_MIN_INTERVAL_SECONDS)
+                    if self._failed:
+                        self._dirty = False
+                        return
+                    if not self._dirty and not self._finished and self._animation_enabled:
+                        self._animation_frame += 1
+                        if self._processing_key:
+                            for index, (key, message) in enumerate(self._progress):
+                                if (
+                                    key == self._processing_key
+                                    and message[:1] in WECOM_PROCESSING_FRAMES
+                                ):
+                                    frame = WECOM_PROCESSING_FRAMES[self._animation_frame % 2]
+                                    self._progress[index] = (key, f"{frame}{message[1:]}")
+                                    break
+                        elif not self._answer:
+                            icon = WECOM_PROGRESS_FRAMES[
+                                self._animation_frame % len(WECOM_PROGRESS_FRAMES)
+                            ]
+                            self._upsert_progress(
+                                "status",
+                                self._render_notice("wecom.progress.thinking", {"icon": icon}),
+                            )
+                        self._dirty = True
+                if not self._dirty and not self._finished:
+                    continue
+                self._dirty = False
+                if self._failed:
+                    return
+                finished = self._finished
+                progress = self._render_progress_unlocked()
+                answer = self._answer
+            operations: list[tuple[str, str, bool]] = []
+            if finished:
+                operations.append((self._stream_id, progress, True))
+                if answer:
+                    operations.append((self._answer_stream_id, answer, True))
+            else:
+                if progress != self._last_progress_sent:
+                    operations.append((self._stream_id, progress, False))
+                if answer and answer != self._last_answer_sent:
+                    operations.append((self._answer_stream_id, answer, False))
+            for stream_id, content, stream_finished in operations:
+                with self._condition:
+                    if self._failed:
+                        return
+                if not content:
+                    continue
+                if len(content.encode("utf-8")) > WECOM_STREAM_MAX_BYTES:
+                    logger.warning(
+                        "企微流式消息超过移动端安全长度，降级普通消息 binding=%s bytes=%s",
+                        self._binding.id,
+                        len(content.encode("utf-8")),
+                    )
+                    with self._condition:
+                        self._failed = True
+                    return
+                if not stream_finished:
+                    time.sleep(WECOM_STREAM_MIN_INTERVAL_SECONDS)
+                try:
+                    future = asyncio.run_coroutine_threadsafe(
+                        self._client.reply_stream(
+                            self._frame,
+                            stream_id,
+                            content,
+                            finish=stream_finished,
+                        ),
+                        self._loop,
+                    )
+                    future.result(timeout=SEND_TIMEOUT_SECONDS)
+                    if stream_id == self._stream_id:
+                        self._last_progress_sent = content
+                    else:
+                        self._last_answer_sent = content
+                except Exception:
+                    logger.exception("企微流式回复失败 binding=%s", self._binding.id)
+                    with self._condition:
+                        self._failed = True
+                    return
+            if finished:
+                return
+
+    def _render_progress(self) -> str:
+        """Return the current localized progress body under the state lock."""
+        with self._condition:
+            return self._render_progress_unlocked()
+
+    def _render_progress_unlocked(self) -> str:
+        """Join progress rows without modifying raw parameter values."""
+        return "\n\n".join(message for _key, message in self._progress)
+
+    def _render_content(self) -> str:
+        """Return progress plus the exact accumulated answer for diagnostics and focused tests."""
+        with self._condition:
+            progress = self._render_progress_unlocked()
+            return f"{progress}\n\n---\n\n{self._answer}" if self._answer else progress
 
 
 class WeComStreamManager:
@@ -825,6 +1474,7 @@ class WeComAdapter:
         *,
         idempotency_key: str | None = None,
     ) -> None:
+        """Send complete WeCom messages, quoting group context and splitting by UTF-8 bytes."""
         chat_id = str(target.get("to_user_id") or "").strip()
         if not chat_id:
             raise ValueError("企微投递目标缺少 to_user_id(chatid)")
@@ -835,10 +1485,47 @@ class WeComAdapter:
         if not stream:
             raise RuntimeError(f"企微连接未就绪 binding={binding.id}")
         client, loop = stream
-        for chunk in split_channel_text(text):
+        reply_to_user_id = str(target.get("reply_to_user_id") or "").strip()
+        is_group = bool(target.get("is_group") and reply_to_user_id)
+        quote = target.get("reply_quote") if isinstance(target.get("reply_quote"), dict) else {}
+        quote_sender = _sanitize_wecom_quote_field(
+            quote.get("sender_name") or reply_to_user_id, 240
+        )
+        quote_text = _sanitize_wecom_quote_field(quote.get("text"), 720)
+        quote_prefix = f"> {quote_sender}：{quote_text}\n\n" if is_group and quote_text else ""
+        if len(quote_prefix.encode("utf-8")) > WECOM_STREAM_MAX_BYTES:
+            quote_prefix = _truncate_wecom_text(quote_prefix, WECOM_STREAM_MAX_BYTES)
+        quote_prefix_bytes = len(quote_prefix.encode("utf-8"))
+        content_limit = max(1, WECOM_STREAM_MAX_BYTES - quote_prefix_bytes)
+        for chunk in _split_wecom_text(text, max_bytes=content_limit):
+            if is_group:
+                # WeCom does not expose an asynchronous native quote target.
+                # Render the original sender and text as a Markdown quote.
+                chunk = f"{quote_prefix}{chunk}"
             body = {"msgtype": "markdown", "markdown": {"content": chunk}}
             future = asyncio.run_coroutine_threadsafe(client.send_message(chat_id, body), loop)
             future.result(timeout=SEND_TIMEOUT_SECONDS)
+
+    def create_stream_reply(
+        self,
+        binding: ChannelBinding,
+        frame: dict[str, Any],
+        *,
+        language_context: LanguageContext | dict[str, Any] | None = None,
+    ) -> WeComStreamReply | None:
+        """Create a localized stream sink for one inbound WeCom frame when the WS loop is ready."""
+        from app.channels import get_wecom_stream_manager
+
+        stream = get_wecom_stream_manager().get_stream(binding.id)
+        if not stream or not isinstance(frame, dict):
+            return None
+        return WeComStreamReply(
+            binding,
+            frame,
+            stream,
+            progress_names_loader=lambda: _load_wecom_progress_names(binding),
+            language_context=language_context,
+        )
 
     def start_ingress(self, binding_id: str) -> None:
         from app.channels import get_wecom_stream_manager

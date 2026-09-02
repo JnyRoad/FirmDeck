@@ -1,28 +1,27 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ComponentType, ReactNode, SVGProps } from 'react';
 import { useNavigate } from 'react-router-dom';
+
 import { Badge, Button as UiButton, Tabs, TabsList, TabsTrigger, notify } from '@/components/ui';
-import { EnterpriseRoute } from '../../enums/routes';
+import { RawContent, RawIdentifier } from '@/i18n/RawContent';
+import { useAppIntl } from '@/i18n/useAppIntl';
+import { apiErrorMessage } from '@/lib/apiErrorMessages';
+
+import { createTenantClient } from '../../api/tenant-client';
+import type { EnterpriseAuthUser } from '../../auth';
+import { useTenantSession } from '../../contexts/TenantSessionContext';
 import IconChat from '../../assets/icons/chat.svg?react';
 import IconEdit from '../../assets/icons/edit.svg?react';
-import IconAccount from '../../assets/icons/sys-accounts.svg?react';
-import IconProfileFile from '../../assets/icons/profile-file.svg?react';
 import IconProfileAlarm from '../../assets/icons/profile-alarm.svg?react';
-import IconProfileHistory from '../../assets/icons/profile-history.svg?react';
 import IconProfileCalendar from '../../assets/icons/profile-calendar.svg?react';
-import { api, TENANT_ID } from '../../api/client';
-import type { EnterpriseAuthUser } from '../../auth';
+import IconProfileFile from '../../assets/icons/profile-file.svg?react';
+import IconProfileHistory from '../../assets/icons/profile-history.svg?react';
+import IconAccount from '../../assets/icons/sys-accounts.svg?react';
 import AppHeader from '../../components/AppHeader';
 import EmployeeAvatar from '../../components/EmployeeAvatar';
 import EmployeeAvatarEditor from '../../components/EmployeeAvatarEditor';
 import EmployeeProfileEditor from '../../components/EmployeeProfileEditor';
 import StaffdeckIcon from '../../components/StaffdeckIcon';
-import ScheduledTasksTab from './ScheduledTasksTab';
-import MemoriesTab from './MemoriesTab';
-import ConversationLogsTab from './ConversationLogsTab';
-import WorkRecordTab from './WorkRecordTab';
-import EvolutionPanel from './EvolutionPanel';
-import { employeeDashboardMetrics } from './employeeDashboardMetrics';
 import {
   agentResourceCount,
   canManageEmployeeAgent,
@@ -33,6 +32,14 @@ import {
   preferredEmployeeAgent,
   staffdeckDisplayText,
 } from '../../employee';
+import { EnterpriseRoute } from '../../enums/routes';
+import {
+  emitAgentScopeChange,
+  isTeamScope,
+  persistSharedAgentScope,
+  readEmployeeScope,
+} from '../../lib/agent-scope-storage';
+import { parseBackendDateTime } from '../../lib/timezone';
 import type {
   AgentProfileRead,
   AgentWorkRecordEventRead,
@@ -46,9 +53,45 @@ import type {
   SkillRead,
   ToolRead,
 } from '../../types';
-import { isTeamScope, readEmployeeScope } from '../../lib/agent-scope-storage';
+import ConversationLogsTab from './ConversationLogsTab';
+import EvolutionPanel from './EvolutionPanel';
+import MemoriesTab from './MemoriesTab';
+import ScheduledTasksTab from './ScheduledTasksTab';
+import WorkRecordTab from './WorkRecordTab';
+import { employeeDashboardMetrics } from './employeeDashboardMetrics';
 
-const ENTERPRISE_AGENT_STORAGE_KEY = 'ultrarag_enterprise_agent_scope';
+type ProfileTabKey = 'work' | 'scheduled' | 'memories' | 'logs';
+
+const PROFILE_TABS: {
+  key: ProfileTabKey;
+  Icon: ComponentType<SVGProps<SVGSVGElement>>;
+  route: EnterpriseRoute;
+}[] = [
+  { key: 'work', Icon: IconProfileFile, route: EnterpriseRoute.Dashboard },
+  { key: 'scheduled', Icon: IconProfileAlarm, route: EnterpriseRoute.ScheduledTasks },
+  { key: 'memories', Icon: IconProfileHistory, route: EnterpriseRoute.Memories },
+  { key: 'logs', Icon: IconProfileCalendar, route: EnterpriseRoute.Feedback },
+];
+
+/** 将未知异常折叠为安全语义错误，避免把原始 Error.message 暴露到最终 UI。 */
+function dashboardErrorMessage(error: unknown, fallback: string, genericMessage: string): string {
+  const message = apiErrorMessage(error, 'common.error.generic');
+  return message === genericMessage ? fallback : message;
+}
+
+/** 按 locale 格式化员工入职日期；无效时间统一回退为占位符。 */
+function formatDashboardDate(value: string, locale: 'zh-CN' | 'en-US', emptyText: string): string {
+  const date = parseBackendDateTime(value);
+  if (Number.isNaN(date.getTime())) return emptyText;
+  return new Intl.DateTimeFormat(locale, { dateStyle: 'medium' }).format(date);
+}
+
+/** 为缺少自定义简介的员工生成安全摘要，并保留原始岗位名作为插值。 */
+function fallbackSystemSummary(translate: ReturnType<typeof useAppIntl>['t'], roleName: string): string {
+  return translate('dashboard.page.summary.fallback', {
+    role: roleName || translate('dashboard.page.value.none'),
+  });
+}
 
 export default function DashboardPage({
   currentUser,
@@ -61,7 +104,17 @@ export default function DashboardPage({
   profileTab?: ProfileTabKey;
   onLogout?: () => void;
 }) {
+  const { locale, t } = useAppIntl();
   const navigate = useNavigate();
+  const tenantContext = useTenantSession();
+  const tenantClient = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
+  const tenantId = tenantContext?.tenantId || '';
+  const userId = tenantContext?.userId || '';
+  const tenantScopeKey = tenantContext
+    ? `${tenantId}:${userId}:${tenantContext.generation}`
+    : '';
+  const scopeKeyRef = useRef('');
+  const [scopeReady, setScopeReady] = useState(false);
   const [agents, setAgents] = useState<AgentProfileRead[]>([]);
   const [skills, setSkills] = useState<SkillRead[]>([]);
   const [generalSkills, setGeneralSkills] = useState<GeneralSkillRead[]>([]);
@@ -72,43 +125,75 @@ export default function DashboardPage({
   const [feedbackSummary, setFeedbackSummary] = useState<FeedbackSummaryRead | null>(null);
   const [scheduledTasks, setScheduledTasks] = useState<ScheduledTaskRead[]>([]);
   const [activityEvents, setActivityEvents] = useState<AgentWorkRecordEventRead[]>([]);
-  const [agentId, setAgentId] = useState(readEmployeeScope);
+  const [agentId, setAgentId] = useState('');
   const [avatarEditorOpen, setAvatarEditorOpen] = useState(false);
   const [profileEditorOpen, setProfileEditorOpen] = useState(false);
   const [loaded, setLoaded] = useState(false);
 
   useEffect(() => {
+    if (!tenantContext || !tenantId || !userId) {
+      scopeKeyRef.current = '';
+      setScopeReady(false);
+      setAgentId('');
+      return;
+    }
+    scopeKeyRef.current = tenantScopeKey;
+    setAgentId(readEmployeeScope(tenantId, userId));
+    setScopeReady(true);
+  }, [tenantContext, tenantId, tenantScopeKey, userId]);
+
+  useEffect(() => {
     const onScopeChange = (event: Event) => {
       const next = (event as CustomEvent<{ agentId?: string }>).detail?.agentId || '';
-      setAgentId(next && !isTeamScope(next) ? next : readEmployeeScope());
+      if (!tenantContext || !tenantId || !userId || scopeKeyRef.current !== tenantScopeKey) return;
+      setAgentId(next && !isTeamScope(next) ? next : readEmployeeScope(tenantId, userId));
     };
     window.addEventListener('ultrarag-enterprise-agent-scope-change', onScopeChange);
     return () => window.removeEventListener('ultrarag-enterprise-agent-scope-change', onScopeChange);
-  }, []);
+  }, [tenantContext, tenantId, tenantScopeKey, userId]);
 
   useEffect(() => {
-    let cancelled = false;
+    if (!tenantContext || !tenantId || !userId || !scopeReady || scopeKeyRef.current !== tenantScopeKey) return;
+    const requestController = new AbortController();
+    const generation = tenantContext.generation;
+    const isCurrent = () => (
+      !requestController.signal.aborted
+      && tenantContext.isCurrentGeneration(generation)
+      && scopeKeyRef.current === tenantScopeKey
+    );
     let switchingAgent = false;
     setLoaded(false);
-    Promise.all([
-      api.get<AgentProfileRead[]>(`/api/enterprise/agents?tenant_id=${TENANT_ID}`),
-      api.get<SkillRead[]>(`/api/enterprise/skills?tenant_id=${TENANT_ID}${agentId ? `&agent_id=${encodeURIComponent(agentId)}` : ''}`),
-      api.get<GeneralSkillRead[]>(`/api/enterprise/general-skills?tenant_id=${TENANT_ID}${agentId ? `&agent_id=${encodeURIComponent(agentId)}` : ''}`),
-      api.get<KnowledgeBaseRead[]>(`/api/enterprise/knowledge-bases?tenant_id=${TENANT_ID}${agentId ? `&agent_id=${encodeURIComponent(agentId)}` : ''}`),
-      api.get<ModelConfigRead[]>(`/api/enterprise/model-configs?tenant_id=${TENANT_ID}`),
-      api.get<ToolRead[]>(`/api/enterprise/tools?tenant_id=${TENANT_ID}${agentId ? `&agent_id=${encodeURIComponent(agentId)}` : ''}`),
-      api.get<EnterpriseChatSessionRead[]>(`/api/enterprise/sessions?tenant_id=${TENANT_ID}${agentId ? `&agent_id=${encodeURIComponent(agentId)}` : ''}`),
-      api.get<FeedbackSummaryRead>(`/api/enterprise/feedback/summary?tenant_id=${TENANT_ID}${agentId ? `&agent_id=${encodeURIComponent(agentId)}` : ''}`),
-      api.get<ScheduledTaskRead[]>(`/api/enterprise/scheduled-tasks?tenant_id=${TENANT_ID}${agentId ? `&agent_id=${encodeURIComponent(agentId)}` : ''}`),
+    setAgents([]);
+    setSkills([]);
+    setGeneralSkills([]);
+    setKnowledgeBases([]);
+    setModels([]);
+    setTools([]);
+    setSessions([]);
+    setFeedbackSummary(null);
+    setScheduledTasks([]);
+    const agentQuery = agentId ? `?agent_id=${encodeURIComponent(agentId)}` : '';
+    Promise.allSettled([
+      tenantClient.get<AgentProfileRead[]>('/api/enterprise/agents', { signal: requestController.signal }),
+      tenantClient.get<SkillRead[]>(`/api/enterprise/skills${agentQuery}`, { signal: requestController.signal }),
+      tenantClient.get<GeneralSkillRead[]>(`/api/enterprise/general-skills${agentQuery}`, { signal: requestController.signal }),
+      tenantClient.get<KnowledgeBaseRead[]>(`/api/enterprise/knowledge-bases${agentQuery}`, { signal: requestController.signal }),
+      tenantClient.get<ModelConfigRead[]>('/api/enterprise/model-configs', { signal: requestController.signal }),
+      tenantClient.get<ToolRead[]>(`/api/enterprise/tools${agentQuery}`, { signal: requestController.signal }),
+      tenantClient.get<EnterpriseChatSessionRead[]>(`/api/enterprise/sessions${agentQuery}`, { signal: requestController.signal }),
+      tenantClient.get<FeedbackSummaryRead>(`/api/enterprise/feedback/summary${agentQuery}`, { signal: requestController.signal }),
+      tenantClient.get<ScheduledTaskRead[]>(`/api/enterprise/scheduled-tasks${agentQuery}`, { signal: requestController.signal }),
     ])
-      .then(([agentRows, skillRows, generalSkillRows, kbRows, modelRows, toolRows, sessionRows, feedbackRows, taskRows]) => {
-        if (cancelled) return;
-        const visibleAgents = agentRows.filter((item) => canSelectCurrentEmployeeAgent(item, currentUser, {
+      .then(([agentResult, skillResult, generalSkillResult, kbResult, modelResult, toolResult, sessionResult, feedbackResult, taskResult]) => {
+        if (!isCurrent()) return;
+        const visibleAgents = agentResult.status === 'fulfilled'
+          ? agentResult.value.filter((item) => canSelectCurrentEmployeeAgent(item, currentUser, {
           activeOnly: true,
-        }));
+          }))
+          : [];
         setAgents(visibleAgents);
-        setModels(modelRows);
-        if (!agentId || !visibleAgents.some((item) => item.id === agentId)) {
+        if (modelResult.status === 'fulfilled') setModels(modelResult.value);
+        if (agentResult.status === 'fulfilled' && (!agentId || !visibleAgents.some((item) => item.id === agentId))) {
           const manageableAgents = visibleAgents.filter((item) => canManageEmployeeAgent(item, currentUser));
           const next = isAdmin
             ? preferredEmployeeAgent(visibleAgents)?.id || ''
@@ -117,29 +202,34 @@ export default function DashboardPage({
               || '';
           if (next) {
             switchingAgent = true;
-            window.localStorage.setItem(ENTERPRISE_AGENT_STORAGE_KEY, next);
-            window.dispatchEvent(new CustomEvent('ultrarag-enterprise-agent-scope-change', { detail: { agentId: next } }));
+            persistSharedAgentScope(next, tenantId, userId);
+            emitAgentScopeChange(next);
             setAgentId(next);
             return;
           }
         }
-        setSkills(skillRows);
-        setGeneralSkills(generalSkillRows);
-        setKnowledgeBases(kbRows);
-        setTools(toolRows);
-        setSessions(sessionRows);
-        setFeedbackSummary(feedbackRows);
-        setScheduledTasks(taskRows.filter((item) => item.status !== 'archived'));
-        setLoaded(true);
+        if (skillResult.status === 'fulfilled') setSkills(skillResult.value);
+        if (generalSkillResult.status === 'fulfilled') setGeneralSkills(generalSkillResult.value);
+        if (kbResult.status === 'fulfilled') setKnowledgeBases(kbResult.value);
+        if (toolResult.status === 'fulfilled') setTools(toolResult.value);
+        if (sessionResult.status === 'fulfilled') setSessions(sessionResult.value);
+        if (feedbackResult.status === 'fulfilled') setFeedbackSummary(feedbackResult.value);
+        if (taskResult.status === 'fulfilled') {
+          setScheduledTasks(taskResult.value.filter((item) => item.status !== 'archived'));
+        }
+        const failure = [agentResult, skillResult, generalSkillResult, kbResult, modelResult, toolResult, sessionResult, feedbackResult, taskResult]
+          .find((item) => item.status === 'rejected');
+        if (failure) {
+          notify.error(t('dashboard.page.toast.loadProfileFailed'));
+        }
       })
-      .catch((error) => notify.error(error instanceof Error ? error.message : '加载数字员工档案失败'))
       .finally(() => {
-        if (!cancelled && !switchingAgent) setLoaded(true);
+        if (isCurrent() && !switchingAgent) setLoaded(true);
       });
     return () => {
-      cancelled = true;
+      requestController.abort();
     };
-  }, [agentId, currentUser, isAdmin]);
+  }, [agentId, currentUser, isAdmin, scopeReady, t, tenantClient, tenantContext, tenantId, tenantScopeKey, userId]);
 
   const selectedAgent = agents.find((item) => item.id === agentId)
     || agents.find((item) => !item.is_overall)
@@ -149,38 +239,46 @@ export default function DashboardPage({
     : sessions.filter((item) => item.agent_id === selectedAgent?.id);
 
   useEffect(() => {
-    let cancelled = false;
+    if (!tenantContext || !tenantId || !userId || !scopeReady || scopeKeyRef.current !== tenantScopeKey) return;
+    const requestController = new AbortController();
+    const generation = tenantContext.generation;
+    const isCurrent = () => (
+      !requestController.signal.aborted
+      && tenantContext.isCurrentGeneration(generation)
+      && scopeKeyRef.current === tenantScopeKey
+    );
     async function loadWorkRecord() {
       if (!selectedAgent || selectedAgent.is_overall) {
-        setActivityEvents([]);
+        if (isCurrent()) setActivityEvents([]);
         return;
       }
       try {
         const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'Asia/Shanghai';
-        const workRecord = await api.get<AgentWorkRecordRead>(
-          `/api/enterprise/agents/${encodeURIComponent(selectedAgent.id)}/work-record?tenant_id=${TENANT_ID}&timezone=${encodeURIComponent(timezone)}`,
+        const workRecord = await tenantClient.get<AgentWorkRecordRead>(
+          `/api/enterprise/agents/${encodeURIComponent(selectedAgent.id)}/work-record?timezone=${encodeURIComponent(timezone)}`,
+          { signal: requestController.signal },
         );
-        if (cancelled) return;
+        if (!isCurrent()) return;
         setActivityEvents(workRecord.events);
       } catch (error) {
-        if (cancelled) return;
+        if (!isCurrent()) return;
         setActivityEvents([]);
-        notify.error(error instanceof Error ? error.message : '加载员工工作记录失败');
+        notify.error(dashboardErrorMessage(error, t('dashboard.page.toast.loadWorkRecordFailed'), t('common.error.generic')));
       }
     }
     void loadWorkRecord();
     return () => {
-      cancelled = true;
+      requestController.abort();
     };
-  }, [selectedAgent?.id, selectedAgent?.is_overall]);
+  }, [scopeReady, selectedAgent?.id, selectedAgent?.is_overall, t, tenantClient, tenantContext, tenantId, tenantScopeKey, userId]);
+
   const defaultModel = models.find((item) => item.is_default);
   const totalCalls = skills.reduce((sum, item) => sum + (item.total_call_count || item.call_count || 0), 0);
   const positiveFeedback = skills.reduce((sum, item) => sum + (item.total_positive_feedback_count || 0), 0);
   const negativeFeedback = skills.reduce((sum, item) => sum + (item.total_negative_feedback_count || 0), 0);
   const visibleKnowledgeBases = knowledgeBases.filter((item) => !isEmptyDefaultKnowledgeBase(item));
 
-  // Avoid flashing the 开放广场 / empty state before the agents API resolves,
-  // which would otherwise briefly render before the employee profile appears.
+  // Avoid flashing the marketplace or permission empty state before the agent list resolves.
   if (!loaded && agents.length === 0) {
     return <div className="page dashboard-page" />;
   }
@@ -189,13 +287,11 @@ export default function DashboardPage({
     return (
       <div className="page dashboard-page">
         <div className="empty-workspace-card p-[24px]">
-          <h3 className="m-0 text-[20px] font-semibold text-foreground">还没有数字员工</h3>
-          <p className="mt-[8px] text-[14px] text-muted-foreground">
-            点击左下角「新建数字员工」开始创建，或前往员工广场选择已发布的员工。
-          </p>
+          <h3 className="m-0 text-[20px] font-semibold text-foreground">{t('dashboard.page.empty.title')}</h3>
+          <p className="mt-[8px] text-[14px] text-muted-foreground">{t('dashboard.page.empty.description')}</p>
           <div className="mt-[16px] flex gap-[8px]">
-            <UiButton onClick={() => navigate('/enterprise/agents')}>查看我的数字员工</UiButton>
-            <UiButton variant="outline" onClick={() => navigate('/enterprise/feedback')}>查看对话日志</UiButton>
+            <UiButton onClick={() => navigate('/enterprise/agents')}>{t('dashboard.page.empty.viewEmployees')}</UiButton>
+            <UiButton variant="outline" onClick={() => navigate('/enterprise/feedback')}>{t('dashboard.page.empty.viewLogs')}</UiButton>
           </div>
         </div>
       </div>
@@ -206,35 +302,41 @@ export default function DashboardPage({
     return (
       <div className="page dashboard-page">
         <div className="page-title">
-          <h3>开放广场</h3>
+          <h3>{t('dashboard.page.marketplace.title')}</h3>
         </div>
         <section className="employee-hero org-hero">
           <div>
-            <span className="section-kicker">开放广场</span>
-            <h2 className="ui-typography">开放广场</h2>
-            <p className="ui-typography">
-              汇集所有可共享的 SOP、知识库、技能和工具，新建数字员工时可以从这里复制配置作为起点。
-            </p>
+            <span className="section-kicker">{t('dashboard.page.marketplace.title')}</span>
+            <h2 className="ui-typography">{t('dashboard.page.marketplace.title')}</h2>
+            <p className="ui-typography">{t('dashboard.page.marketplace.description')}</p>
           </div>
           <div className="employee-hero-metrics">
-            <MetricTile label="员工" value={agents.filter((item) => !item.is_overall).length} />
-            <MetricTile label="对话" value={sessions.length} />
-            <MetricTile label="反馈" value={feedbackSummary?.total_feedback || 0} />
+            <MetricTile label={t('dashboard.page.metric.employees')} value={agents.filter((item) => !item.is_overall).length} />
+            <MetricTile label={t('dashboard.page.metric.conversations')} value={sessions.length} />
+            <MetricTile label={t('dashboard.page.metric.feedback')} value={feedbackSummary?.total_feedback || 0} />
           </div>
         </section>
         <div className="org-dashboard-grid">
-          <DashboardStat title="SOP" value={skills.length} icon={<StaffdeckIcon name="filter" />} />
-          <DashboardStat title="技能" value={generalSkills.length} icon={<StaffdeckIcon name="spark" />} />
-          <DashboardStat title="知识库" value={visibleKnowledgeBases.length} icon={<StaffdeckIcon name="file" />} />
-          <DashboardStat title="可用工具" value={tools.filter((item) => item.enabled).length} icon={<StaffdeckIcon name="tool" />} />
-          <DashboardStat title="SOP 调用" value={totalCalls} icon={<StaffdeckIcon name="chat" />} />
-          <DashboardStat title="好评" value={positiveFeedback || feedbackSummary?.up_count || 0} icon={<StaffdeckIcon name="chat" />} />
-          <DashboardStat title="差评" value={negativeFeedback || feedbackSummary?.down_count || 0} icon={<StaffdeckIcon name="chat" />} />
+          <DashboardStat title={t('dashboard.page.stat.sop')} value={skills.length} icon={<StaffdeckIcon name="filter" />} />
+          <DashboardStat title={t('dashboard.page.stat.skills')} value={generalSkills.length} icon={<StaffdeckIcon name="spark" />} />
+          <DashboardStat title={t('dashboard.page.stat.knowledge')} value={visibleKnowledgeBases.length} icon={<StaffdeckIcon name="file" />} />
+          <DashboardStat title={t('dashboard.page.stat.tools')} value={tools.filter((item) => item.enabled).length} icon={<StaffdeckIcon name="tool" />} />
+          <DashboardStat title={t('dashboard.page.stat.sopCalls')} value={totalCalls} icon={<StaffdeckIcon name="chat" />} />
+          <DashboardStat title={t('dashboard.page.stat.positive')} value={positiveFeedback || feedbackSummary?.up_count || 0} icon={<StaffdeckIcon name="chat" />} />
+          <DashboardStat title={t('dashboard.page.stat.negative')} value={negativeFeedback || feedbackSummary?.down_count || 0} icon={<StaffdeckIcon name="chat" />} />
           <div className="org-dashboard-card">
             <div className="ui-card-body p-[24px]">
               <span className="org-dashboard-icon"><StaffdeckIcon name="model" /></span>
-              <span className="text-[13px] text-muted-foreground">默认模型</span>
-              <span className="text-[15px] text-foreground">{defaultModel ? `${defaultModel.name} / ${defaultModel.model}` : '未配置'}</span>
+              <span className="text-[13px] text-muted-foreground">{t('dashboard.page.defaultModel.label')}</span>
+              <span className="text-[15px] text-foreground">
+                {defaultModel
+                  ? (
+                    <>
+                      <RawContent value={defaultModel.name} /> / <RawIdentifier value={defaultModel.model} />
+                    </>
+                  )
+                  : t('dashboard.page.defaultModel.missing')}
+              </span>
             </div>
           </div>
         </div>
@@ -259,7 +361,12 @@ export default function DashboardPage({
     ? selectedAgent.metadata.system_prompt_summary
     : '';
   const systemSummary = compactSummary(
-    staffdeckDisplayText(selectedAgent.persona_prompt || systemPromptSummary || selectedAgent.description || `${employee.roleName}，负责接收任务、调用知识库、执行 SOP 并沉淀对话质量反馈。`),
+    staffdeckDisplayText(
+      selectedAgent.persona_prompt
+      || systemPromptSummary
+      || selectedAgent.description
+      || fallbackSystemSummary(t, employee.roleName),
+    ),
     132,
   );
 
@@ -288,13 +395,13 @@ export default function DashboardPage({
                 <button
                   type="button"
                   onClick={() => setAvatarEditorOpen(true)}
-                  aria-label="更换头像"
+                  aria-label={t('dashboard.page.action.replaceAvatar')}
                   className="group relative block cursor-pointer border-0 bg-transparent p-0"
                 >
                   {heroAvatar}
                   <span className="pointer-events-none absolute inset-x-0 bottom-0 flex items-center justify-center gap-1 bg-black/45 py-1 text-[11px] text-white opacity-0 transition-opacity group-hover:opacity-100">
                     <IconAccount className="size-3" />
-                    更换头像
+                    {t('dashboard.page.action.replaceAvatar')}
                   </span>
                 </button>
               ) : (
@@ -307,7 +414,7 @@ export default function DashboardPage({
                   onClick={() => { window.location.href = '/workspace/chat'; }}
                 >
                   <IconChat className="size-[14px]" />
-                  去对话
+                  {t('dashboard.page.action.openChat')}
                 </UiButton>
                 {canEditSelectedAgent && (
                   <UiButton
@@ -316,7 +423,7 @@ export default function DashboardPage({
                     onClick={() => setProfileEditorOpen(true)}
                   >
                     <IconEdit className="size-[14px]" />
-                    编辑资料
+                    {t('dashboard.page.action.editProfile')}
                   </UiButton>
                 )}
               </div>
@@ -325,9 +432,11 @@ export default function DashboardPage({
             <div className="flex min-w-[280px] flex-1 flex-col gap-2">
               <div className="flex items-end gap-2">
                 <h2 className="m-0 text-[22px] leading-none font-semibold text-[#18181a]">
-                  {employeeDisplayName(selectedAgent)}
+                  <RawContent value={employeeDisplayName(selectedAgent)} />
                 </h2>
-                <span className="text-[13px] leading-none text-[#757f9c]">{employee.roleName || employeeDisplayName(selectedAgent)}</span>
+                <span className="text-[13px] leading-none text-[#757f9c]">
+                  <RawContent value={employee.roleName || employeeDisplayName(selectedAgent)} />
+                </span>
               </div>
 
               <div className="flex flex-wrap items-center gap-4">
@@ -337,11 +446,21 @@ export default function DashboardPage({
                     style={{ background: selectedAgent.status === 'active' ? '#22c55e' : '#c4c9d4' }}
                   />
                   <span className="text-[12px] text-[#757f9c]">
-                    {selectedAgent.status === 'active' ? '在线' : '下线'}
+                    {selectedAgent.status === 'active'
+                      ? t('dashboard.page.status.online')
+                      : t('dashboard.page.status.offline')}
                   </span>
                 </span>
-                <span className="text-[12px] text-[#757f9c]">创建者：{employeeCreator}</span>
-                <span className="text-[12px] text-[#757f9c]">入职时间：{employee.onboardedAt}</span>
+                <span className="text-[12px] text-[#757f9c]">
+                  {t('dashboard.page.meta.createdBy', {
+                    value: employeeCreator || t('dashboard.page.value.none'),
+                  })}
+                </span>
+                <span className="text-[12px] text-[#757f9c]">
+                  {t('dashboard.page.meta.onboardedAt', {
+                    value: formatDashboardDate(employee.onboardedAt, locale, t('dashboard.page.value.none')),
+                  })}
+                </span>
                 <div className="flex flex-wrap items-center gap-3">
                   {employee.workStyles.slice(0, 3).map((item) => (
                     <Badge
@@ -349,21 +468,21 @@ export default function DashboardPage({
                       variant="outline"
                       className="h-auto rounded-[10px] border-[0.5px] border-[#e3e7f1] px-4 py-1 text-[12px] font-normal text-[#757f9c]"
                     >
-                      {item}
+                      <RawContent value={item} />
                     </Badge>
                   ))}
                 </div>
               </div>
 
               <p className="m-0 line-clamp-2 max-w-[720px] text-[14px] leading-[22px] text-[#757f9c]">
-                {systemSummary}
+                <RawContent value={systemSummary} />
               </p>
 
               <div className="flex w-full max-w-[514px] gap-3">
-                <HeroMetric value={selectedKnowledgeCount} label="资料" />
-                <HeroMetric value={selectedGeneralSkillCount} label="技能" />
-                <HeroMetric value={selectedSkillCount} label="SOP" />
-                <HeroMetric value={activeScheduledTasks.length} label="定时任务" />
+                <HeroMetric value={selectedKnowledgeCount} label={t('dashboard.page.hero.knowledge')} />
+                <HeroMetric value={selectedGeneralSkillCount} label={t('dashboard.page.hero.skills')} />
+                <HeroMetric value={selectedSkillCount} label={t('dashboard.page.hero.sop')} />
+                <HeroMetric value={activeScheduledTasks.length} label={t('dashboard.page.hero.scheduled')} />
               </div>
             </div>
           </div>
@@ -409,7 +528,7 @@ export default function DashboardPage({
   );
 }
 
-function DashboardStat({ title, value, icon }: { title: string; value: number; icon: ReactNode }) {
+function DashboardStat({ title, value, icon }: { title: ReactNode; value: number; icon: ReactNode }) {
   return (
     <div className="org-dashboard-card">
       <div className="ui-card-body p-[24px]">
@@ -434,7 +553,7 @@ function isEmptyDefaultKnowledgeBase(item: KnowledgeBaseRead): boolean {
   );
 }
 
-function MetricTile({ label, value }: { label: string; value: number }) {
+function MetricTile({ label, value }: { label: ReactNode; value: number }) {
   return (
     <div className="employee-metric-tile">
       <span>{label}</span>
@@ -443,22 +562,16 @@ function MetricTile({ label, value }: { label: string; value: number }) {
   );
 }
 
-type ProfileTabKey = 'work' | 'scheduled' | 'memories' | 'logs';
-
-const PROFILE_TABS: {
-  key: ProfileTabKey;
-  label: string;
-  Icon: ComponentType<SVGProps<SVGSVGElement>>;
-  route: EnterpriseRoute;
-}[] = [
-  { key: 'work', label: '工作记录', Icon: IconProfileFile, route: EnterpriseRoute.Dashboard },
-  { key: 'scheduled', label: '定时任务', Icon: IconProfileAlarm, route: EnterpriseRoute.ScheduledTasks },
-  { key: 'memories', label: '记忆', Icon: IconProfileHistory, route: EnterpriseRoute.Memories },
-  { key: 'logs', label: '对话日志', Icon: IconProfileCalendar, route: EnterpriseRoute.Feedback },
-];
-
+/** 为员工仪表盘 tabs 注入当前 locale 的语义标签，保持路由和 chrome 一致。 */
 function EmployeeProfileTabs({ activeKey = 'work' }: { activeKey?: ProfileTabKey }) {
+  const { t } = useAppIntl();
   const navigate = useNavigate();
+  const labels: Record<ProfileTabKey, string> = {
+    work: t('dashboard.page.tab.work'),
+    scheduled: t('dashboard.page.tab.scheduled'),
+    memories: t('dashboard.page.tab.memories'),
+    logs: t('dashboard.page.tab.logs'),
+  };
   return (
     <Tabs
       value={activeKey}
@@ -469,17 +582,17 @@ function EmployeeProfileTabs({ activeKey = 'work' }: { activeKey?: ProfileTabKey
       className="flex w-full flex-col items-center"
     >
       <TabsList
-        aria-label="个人档案分区"
+        aria-label={t('dashboard.page.profileSections')}
         className="h-[35px]! w-[504px] max-w-full gap-2 rounded-none bg-transparent p-0"
       >
-        {PROFILE_TABS.map(({ key, label, Icon }) => (
+        {PROFILE_TABS.map(({ key, Icon }) => (
           <TabsTrigger
             key={key}
             value={key}
             className="h-[35px] flex-1 gap-[7px] rounded-t-lg rounded-b-none border-0 text-[14px] font-bold text-[#8b94aa] hover:text-[#202226] data-[state=active]:bg-white data-[state=active]:text-[#202226] data-[state=active]:shadow-[0_-12px_28px_rgba(21,26,38,0.04)] in-data-[theme=dark]:text-[#8f98aa] in-data-[theme=dark]:hover:text-[#f0f2f6] in-data-[theme=dark]:data-[state=active]:bg-[#202126] in-data-[theme=dark]:data-[state=active]:text-[#c5ccd8] in-data-[theme=dark]:data-[state=active]:shadow-none"
           >
             <Icon />
-            {label}
+            {labels[key]}
           </TabsTrigger>
         ))}
       </TabsList>
@@ -487,7 +600,7 @@ function EmployeeProfileTabs({ activeKey = 'work' }: { activeKey?: ProfileTabKey
   );
 }
 
-function HeroMetric({ label, value }: { label: string; value: number }) {
+function HeroMetric({ label, value }: { label: ReactNode; value: number }) {
   return (
     <div className="flex flex-1 items-end gap-1 rounded-[10px] bg-[#f6f6f6] px-5 py-2">
       <strong className="text-[14px] leading-none font-medium text-[#18181a]">{value}</strong>
@@ -496,6 +609,7 @@ function HeroMetric({ label, value }: { label: string; value: number }) {
   );
 }
 
+/** 规整员工简介摘要，避免长原文撑破档案头部布局。 */
 function compactSummary(value: string, maxLength: number): string {
   const compact = value.replace(/\s+/g, ' ').trim();
   return compact.length > maxLength ? `${compact.slice(0, maxLength)}...` : compact;

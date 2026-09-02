@@ -1,19 +1,21 @@
 from __future__ import annotations
 
 import ast
-from collections.abc import Iterator, Mapping
 import copy
 import hashlib
 import json
 import math
 import re
+from collections.abc import Iterator, Mapping
+from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlsplit
 
 import httpx
-from openai import OpenAI
 from anthropic import Anthropic
+from openai import OpenAI
 
+from app.codex_subscription import CodexSubscriptionError, get_codex_subscription_service
 from app.config import get_settings
 from app.db.models import ModelConfig
 from app.llm.model_protocols import ModelApiProtocol
@@ -25,10 +27,15 @@ from app.llm.protocol_drivers import (
     AnthropicMessagesDriver,
     CancellationToken,
     ChatCompletionsDriver,
+    CodexAppServerDriver,
     GeminiGenerateContentDriver,
     OpenAIResponsesDriver,
     ProtocolCallError,
+    _codex_runtime_call_error,
+    _gemini_headers,
+    _gemini_list_endpoint,
     _protocol_call_error,
+    _raise_for_gemini_response,
 )
 from app.llm.stage_protocol import (
     STAGE_PROTOCOL_KEY,
@@ -66,15 +73,16 @@ class LLMError(Exception):
         self.retryable = retryable
 
     def public_detail(self) -> dict[str, Any]:
+        """Return only stable model metadata; provider prose remains private on the exception."""
+        code = self.code or "MODEL_CONNECTION_FAILED"
         return {
-            "code": self.code or "MODEL_CONNECTION_FAILED",
-            "message": str(self),
-            "upstream_status": self.status_code,
-            "provider_code": self.provider_code,
-            "provider_message": self.provider_message,
-            "upstream_body": self.upstream_body,
+            "code": code,
+            "message": code,
+            "params": {},
             "request_id": self.request_id,
+            "trace_id": None,
             "retryable": self.retryable,
+            "deprecated_fields": ["message"],
         }
 
 
@@ -83,6 +91,21 @@ EMPTY_RESPONSE_RETRIES = 2
 EMPTY_RESPONSE_MESSAGE = "Model returned an empty response"
 DEFAULT_MODEL_API_TIMEOUT_SECONDS = 600.0
 DEFAULT_INPUT_TOKEN_BUDGET = 32_000
+# High-confidence, low-maintenance denylist: these categories are never chat
+# models regardless of vendor, so excluding them from the model picker can't
+# hide a model a user actually wants. Deliberately not denylisting specific
+# legacy chat snapshots (e.g. "gpt-4-0314") — the recency sort in list_models
+# already pushes those down without needing to track every deprecation.
+_NON_CHAT_MODEL_ID_MARKERS = ("embedding", "whisper", "tts", "dall-e", "moderation")
+# Bounds the Gemini catalog page-follow loop — a malformed or misbehaving
+# endpoint that keeps returning a nextPageToken must not spin forever.
+_GEMINI_MAX_LIST_PAGES = 50
+# Some third-party OpenAI/Anthropic-compatible gateways run a WAF that blocks
+# requests carrying the official SDKs' default User-Agent (e.g. "OpenAI/Python
+# 2.48.0"). Send an honest, identifiable UA instead of spoofing a browser: a
+# browser UA that doesn't match the connection's TLS/HTTP2 fingerprint risks
+# being flagged as suspicious by stricter WAFs.
+_OUTBOUND_USER_AGENT = "StaffDeck"
 TURN_STAGE_MESSAGE_MARKER = "_agent_turn_message"
 class _CurrentStageText(str):
     pass
@@ -90,26 +113,35 @@ class _CurrentStageText(str):
 
 class LLMClient:
     def __init__(self, model_config: ModelConfig):
+        """按模型协议构造 SDK 或本机 runtime 驱动；订阅协议不读取 API Key。"""
         try:
             protocol = ModelApiProtocol(
                 getattr(model_config, "api_protocol", "openai_chat_completions")
             )
         except ValueError as exc:
             raise LLMError("MODEL_PROTOCOL_UNSUPPORTED") from exc
-        api_key = decrypt_secret(model_config.api_key_encrypted)
-        if not api_key:
-            raise LLMError("Model API key is not configured")
+        api_key = ""
+        if protocol is not ModelApiProtocol.CODEX_APP_SERVER:
+            api_key = decrypt_secret(model_config.api_key_encrypted)
+            if not api_key:
+                raise LLMError("Model API key is not configured")
         self.timeout_seconds = (
             getattr(model_config, "timeout_seconds", None)
             or get_settings().model_api_timeout_seconds
             or DEFAULT_MODEL_API_TIMEOUT_SECONDS
         )
         self.base_url = str(model_config.base_url or "")
-        if protocol is ModelApiProtocol.OPENAI_CHAT_COMPLETIONS:
+        if protocol is ModelApiProtocol.CODEX_APP_SERVER:
+            self.client = None
+            self.driver = CodexAppServerDriver(
+                get_codex_subscription_service().create_session,
+            )
+        elif protocol is ModelApiProtocol.OPENAI_CHAT_COMPLETIONS:
             self.client = OpenAI(
                 api_key=api_key,
                 base_url=self.base_url,
                 timeout=self.timeout_seconds,
+                default_headers={"User-Agent": _OUTBOUND_USER_AGENT},
             )
             self.driver = ChatCompletionsDriver(self.client)
         elif protocol is ModelApiProtocol.OPENAI_RESPONSES:
@@ -117,6 +149,7 @@ class LLMClient:
                 api_key=api_key,
                 base_url=self.base_url,
                 timeout=self.timeout_seconds,
+                default_headers={"User-Agent": _OUTBOUND_USER_AGENT},
             )
             self.driver = OpenAIResponsesDriver(self.client)
         elif protocol is ModelApiProtocol.ANTHROPIC_MESSAGES:
@@ -124,6 +157,7 @@ class LLMClient:
                 "api_key": api_key,
                 "timeout": self.timeout_seconds,
                 "max_retries": 0,
+                "default_headers": {"User-Agent": _OUTBOUND_USER_AGENT},
             }
             if self.base_url:
                 # Anthropic's SDK always appends /v1/messages. If an operator
@@ -140,7 +174,10 @@ class LLMClient:
             self.client = Anthropic(**kwargs)
             self.driver = AnthropicMessagesDriver(self.client)
         elif protocol is ModelApiProtocol.GEMINI_GENERATE_CONTENT:
-            self.client = httpx.Client(timeout=self.timeout_seconds)
+            self.client = httpx.Client(
+                timeout=self.timeout_seconds,
+                headers={"User-Agent": _OUTBOUND_USER_AGENT},
+            )
             self.driver = GeminiGenerateContentDriver(
                 self.client,
                 self.base_url,
@@ -170,6 +207,85 @@ class LLMClient:
                 self.model,
             )
         )
+
+    def list_models(self) -> list[dict[str, str]]:
+        """向渠道自身的接口拉取可用模型列表；订阅协议改由本机 Codex 的 model/list 提供。"""
+        if self.api_protocol is ModelApiProtocol.CODEX_APP_SERVER:
+            session = None
+            try:
+                session = self.driver.session_factory()
+                response = session.model_list()
+            except CodexSubscriptionError as exc:
+                raise _llm_error_from_protocol(self, _codex_runtime_call_error(exc)) from exc
+            finally:
+                if session is not None:
+                    session.close()
+            models: list[dict[str, str]] = []
+            for item in response.get("data") or []:
+                model_id = item.get("id") or item.get("model")
+                if not isinstance(model_id, str) or not model_id:
+                    continue
+                label = item.get("displayName") or model_id
+                models.append({"id": model_id, "label": label})
+            return models
+        try:
+            if self.api_protocol in (
+                ModelApiProtocol.OPENAI_CHAT_COMPLETIONS,
+                ModelApiProtocol.OPENAI_RESPONSES,
+            ):
+                # The raw catalog mixes in non-chat models (embeddings, TTS,
+                # moderation, ...) and lists everything in an arbitrary order —
+                # newest-first by creation date, chat models only, reads much
+                # closer to how a curated picker (e.g. Claude's) presents models.
+                items = sorted(
+                    self.client.models.list(),
+                    key=lambda item: getattr(item, "created", 0) or 0,
+                    reverse=True,
+                )
+                return [
+                    {"id": item.id, "label": item.id}
+                    for item in items
+                    if not any(marker in item.id.lower() for marker in _NON_CHAT_MODEL_ID_MARKERS)
+                ]
+            if self.api_protocol is ModelApiProtocol.ANTHROPIC_MESSAGES:
+                items = sorted(
+                    self.client.models.list(),
+                    key=lambda item: getattr(item, "created_at", None) or datetime.min.replace(tzinfo=timezone.utc),
+                    reverse=True,
+                )
+                return [
+                    {"id": item.id, "label": getattr(item, "display_name", None) or item.id}
+                    for item in items
+                ]
+            models: list[dict[str, str]] = []
+            page_token: str | None = None
+            # The catalog is paginated (nextPageToken) — a single request only
+            # returns the first page, silently dropping the rest of the models.
+            for _ in range(_GEMINI_MAX_LIST_PAGES):
+                response = self.client.get(
+                    _gemini_list_endpoint(self.base_url, page_token),
+                    headers=_gemini_headers(self.api_key),
+                )
+                _raise_for_gemini_response(response)
+                data = response.json()
+                for item in data.get("models") or []:
+                    methods = item.get("supportedGenerationMethods") or []
+                    if methods and "generateContent" not in methods:
+                        continue
+                    name = str(item.get("name", "")).removeprefix("models/")
+                    if not name:
+                        continue
+                    models.append({"id": name, "label": item.get("displayName") or name})
+                page_token = data.get("nextPageToken") or None
+                if not page_token:
+                    break
+            return models
+        except Exception as exc:
+            if isinstance(exc, LLMError):
+                raise
+            if isinstance(exc, ProtocolCallError):
+                raise _llm_error_from_protocol(self, exc) from exc
+            raise _llm_error_from_protocol(self, _protocol_call_error(exc)) from exc
 
     def generate_text(
         self,
@@ -245,8 +361,9 @@ class LLMClient:
                 try:
                     completion = driver.complete(request)
                 except BaseException as exc:
+                    failure_exception_type = exc.__class__.__name__
                     span.fail(
-                        exc,
+                        exception_type=failure_exception_type,
                         response_text="",
                         **_completion_span_metrics(None),
                     )
@@ -423,8 +540,9 @@ class LLMClient:
                             pending_parts.clear()
                             yield buffered
                 except BaseException as exc:
+                    failure_exception_type = exc.__class__.__name__
                     span.fail(
-                        exc,
+                        exception_type=failure_exception_type,
                         provider_setup_ms=provider_setup_ms,
                         ttft_ms=first_content_ms,
                         output_chars=output_chars,
@@ -517,6 +635,7 @@ class LLMClient:
     ) -> (
         ChatCompletionsDriver
         | OpenAIResponsesDriver
+        | CodexAppServerDriver
         | AnthropicMessagesDriver
         | GeminiGenerateContentDriver
     ):
@@ -532,6 +651,10 @@ class LLMClient:
                     getattr(self, "api_key", ""),
                     self.model,
                 )
+            elif protocol is ModelApiProtocol.CODEX_APP_SERVER:
+                driver = CodexAppServerDriver(
+                    get_codex_subscription_service().create_session,
+                )
             elif protocol is ModelApiProtocol.OPENAI_RESPONSES:
                 driver = OpenAIResponsesDriver(self.client)
             else:
@@ -544,7 +667,9 @@ class LLMClient:
         system_prompt: str,
         user_payload: dict[str, Any],
         cancellation: CancellationToken | None = None,
-    ) -> dict[str, Any]:
+        *,
+        accept_json_sequence: bool = False,
+    ) -> Any:
         outputs: list[str] = []
         next_payload = user_payload
         last_error: json.JSONDecodeError | None = None
@@ -579,6 +704,20 @@ class LLMClient:
                 )
                 return parsed
             except json.JSONDecodeError as exc:
+                if accept_json_sequence:
+                    try:
+                        parsed_sequence = _loads_llm_json_sequence(text)
+                    except json.JSONDecodeError:
+                        pass
+                    else:
+                        _record_stage_exchange(
+                            next_payload,
+                            text,
+                            request_user_content=getattr(
+                                self, "_last_stage_request_user_content", None
+                            ),
+                        )
+                        return parsed_sequence
                 last_error = exc
                 _record_stage_exchange(
                     next_payload,
@@ -611,6 +750,28 @@ class LLMClient:
         raise LLMError(
             f"Model did not return valid JSON after {JSON_REPAIR_ATTEMPTS} repair attempts; {previews}"
         ) from last_error
+
+    def generate_json_sequence(
+        self,
+        system_prompt: str,
+        user_payload: dict[str, Any],
+        cancellation: CancellationToken | None = None,
+    ) -> Any:
+        """Accept consecutive top-level JSON values for sequence-aware consumers.
+
+        Most callers require exactly one JSON document and continue to use
+        :meth:`generate_json`. Harness is sequence-aware: some Responses-compatible
+        providers flatten multiple valid action items into consecutive JSON objects.
+        This opt-in entry point preserves those objects in provider order instead of
+        spending all repair attempts on text that is individually valid per item.
+        """
+
+        return self.generate_json(
+            system_prompt,
+            user_payload,
+            cancellation,
+            accept_json_sequence=True,
+        )
 
     def _generate_json_candidate(
         self,
@@ -1481,6 +1642,41 @@ def _loads_llm_json(text: str) -> Any:
     if last_error is not None:
         raise last_error
     raise json.JSONDecodeError("Could not decode JSON", candidate, 0)
+
+
+def _loads_llm_json_sequence(text: str) -> list[Any]:
+    """Decode two or more consecutive top-level JSON values without reordering."""
+
+    candidate = _extract_json(text)
+    last_error: json.JSONDecodeError | None = None
+    seen: set[str] = set()
+    for variant in _json_candidate_variants(candidate):
+        if variant in seen:
+            continue
+        seen.add(variant)
+        decoder = json.JSONDecoder()
+        values: list[Any] = []
+        index = 0
+        try:
+            while index < len(variant):
+                while index < len(variant) and variant[index].isspace():
+                    index += 1
+                if index >= len(variant):
+                    break
+                value, index = decoder.raw_decode(variant, index)
+                values.append(value)
+        except json.JSONDecodeError as exc:
+            last_error = exc
+            continue
+        if len(values) >= 2:
+            return values
+    if last_error is not None:
+        raise last_error
+    raise json.JSONDecodeError(
+        "Expected multiple consecutive JSON values",
+        candidate,
+        0,
+    )
 
 
 def _json_candidate_variants(text: str) -> tuple[str, ...]:
