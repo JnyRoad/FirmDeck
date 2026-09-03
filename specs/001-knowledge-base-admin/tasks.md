@@ -62,8 +62,8 @@
 - [ ] T025 实现变基：backend/app/knowledge/rebase.py（三方合并、冲突块、落库）、backend/app/api/knowledge_admin.py A3/A4 路由、backend/app/knowledge/versioning.py（publish 的 stale 判定与 `force_overwrite`）、事件 `knowledge.version.published` 发出
 - [ ] T026 [P] [测试] 在 backend/tests/test_knowledge_review_writeback.py 编写失败测试：`POST …/versions/{draft}/review` 写入 `metadata.review`；`expected_updated_at` 不匹配 → `KNOWLEDGE_PUBLISH_CONFLICT`；非草稿 → `KNOWLEDGE_VERSION_NOT_READY`；审计 `draft_reviewed` 与事件
 - [ ] T027 实现审阅写回：backend/app/api/knowledge_admin.py A5 路由与 backend/app/knowledge/versioning.py
-- [ ] T028 [P] [测试] 在 frontend-enterprise/src/api/knowledgeAdmin.test.ts 编写失败测试（mock tenant client）：每个函数的 method/路径/query/body 与 contracts/knowledge-admin-api.md 一致
-- [ ] T029 实现 frontend-enterprise/src/api/knowledgeAdmin.ts（包住 `createTenantClient`，函数与契约 A/B 一一对应）
+- [X] T028 [P] [测试] 在 frontend-enterprise/src/api/knowledgeAdmin.test.ts 编写失败测试（mock tenant client）：每个函数的 method/路径/query/body 与 contracts/knowledge-admin-api.md 一致
+- [X] T029 实现 frontend-enterprise/src/api/knowledgeAdmin.ts（包住 `createTenantClient`，函数与契约 A/B 一一对应）
 
 **Checkpoint**: 后端六项能力与前端 API 层就绪，用户故事可并行开始
 
