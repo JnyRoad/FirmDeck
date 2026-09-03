@@ -33,12 +33,12 @@
 - [X] T005 [P] 在 backend/app/contracts/error_registry.py 注册上述四个错误码（含 params 名称：`base_version`/`published_version`/`conflict_count`、`document_count`、`level`、`lineage_id`）
 - [X] T006 [P] [测试] 在 backend/tests/test_event_contracts.py 增加断言：`knowledge.version.published`、`knowledge.draft.rebased`、`knowledge.draft.reviewed` 已注册且 params schema 与 data-model.md §8 一致
 - [X] T007 [P] 在 backend/app/contracts/event_registry.py 注册三个事件（与现有 `knowledge.ingest.*` 事件同处），声明 params schema、visibility，legacy projection 为 none
-- [ ] T008 [P] [测试] 在 frontend-enterprise/src/i18n/knowledgeAdmin.i18n.test.ts 编写失败测试：`knowledgeAdmin.*` 与 `errors.knowledge.{baselineStale,rebaseConflictsUnresolved,versionLevelInvalid,documentLineageMismatch}` 在 en-US 与 zh-CN 目录键集合对等且 ICU 参数一致
-- [ ] T009 [P] 在 frontend-enterprise/src/i18n/messages/en-US.json 与 zh-CN.json 新增 `knowledgeAdmin.*` 命名空间（按 contracts/frontend-surface.md 子域）与 `shell.nav.knowledgeAdmin`、四条 `errors.knowledge.*`
+- [X] T008 [P] [测试] 在 frontend-enterprise/src/i18n/knowledgeAdmin.i18n.test.ts 编写失败测试：`knowledgeAdmin.*` 与 `errors.knowledge.{baselineStale,rebaseConflictsUnresolved,versionLevelInvalid,documentLineageMismatch}` 在 en-US 与 zh-CN 目录键集合对等且 ICU 参数一致
+- [X] T009 [P] 在 frontend-enterprise/src/i18n/messages/en-US.json 与 zh-CN.json 新增 `knowledgeAdmin.*` 命名空间（按 contracts/frontend-surface.md 子域）与 `shell.nav.knowledgeAdmin`、四条 `errors.knowledge.*`
 - [ ] T010 [P] [测试] 在 frontend-enterprise/src/App.test.tsx 增加失败测试：admin 可打开 `/enterprise/knowledge-admin` 与 `/enterprise/knowledge-admin/:kbId`；非 admin 被重定向到 Gallery
 - [ ] T011 [P] [测试] 在 frontend-enterprise/src/components/AppSidebar.test.tsx 增加失败测试：admin 的系统管理组出现「知识库管理」，非 admin 不出现
 - [ ] T012 实现路由与菜单：frontend-enterprise/src/enums/routes.ts 增加 `KnowledgeAdmin`；frontend-enterprise/src/App.tsx 增加两条 admin-only 路由（占位页面组件）；frontend-enterprise/src/components/AppSidebar.tsx `SYSTEM_NAV` 追加项；新增 frontend-enterprise/src/assets/icons/sys-knowledge.svg
-- [ ] T013 [P] 新增 frontend-enterprise/src/enums/knowledge.ts（`KnowledgeBaseMode`、`PublicationState`、`KnowledgePermission`、`VersionLevel`）与 frontend-enterprise/src/types/knowledgeAdmin.ts（按 contracts/knowledge-admin-api.md 的响应类型）
+- [X] T013 [P] 新增 frontend-enterprise/src/enums/knowledge.ts（`KnowledgeBaseMode`、`PublicationState`、`KnowledgePermission`、`VersionLevel`）与 frontend-enterprise/src/types/knowledgeAdmin.ts（按 contracts/knowledge-admin-api.md 的响应类型）
 
 ---
 
