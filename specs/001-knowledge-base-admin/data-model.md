@@ -109,9 +109,9 @@ RebaseResult
 
 | event_code | params | 用途 |
 |---|---|---|
-| `knowledge.version_published` | `knowledge_base_id`, `version`, `stale_draft_count` | 通知其他草稿持有者基线过期（本期仅记录与站内派生提示） |
-| `knowledge.draft_rebased` | `knowledge_base_id`, `draft_name`, `to_base_version` | 审计与通知 |
-| `knowledge.draft_reviewed` | `knowledge_base_id`, `draft_name`, `staged`, `pending` | 发布框展示审阅状态 |
+| `knowledge.version.published` | `knowledge_base_id`, `version`, `stale_draft_count` | 通知其他草稿持有者基线过期（本期仅记录与站内派生提示） |
+| `knowledge.draft.rebased` | `knowledge_base_id`, `draft_name`, `to_base_version` | 审计与通知 |
+| `knowledge.draft.reviewed` | `knowledge_base_id`, `draft_name`, `staged`, `pending` | 发布框展示审阅状态 |
 
 ## 9. 错误码（error_registry，新增）
 

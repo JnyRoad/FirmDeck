@@ -26,7 +26,7 @@
 
 ## R4 基线过期判定与提示
 
-- **Decision**: 派生字段，不新增存储：`KnowledgeBaseVersionRead.is_stale = (publication_state=='draft' and parent_version_id != knowledge_base.published_version_id)`；同时 `base_version` 投影 `parent` 的 `version` 标签。发布时若 stale 且未带 `force_overwrite=true` → `KNOWLEDGE_BASELINE_STALE`（409，params: `base_version`, `published_version`, `conflict_count`）。提示"正式版已更新"由前端在草稿横幅与发布框根据 `is_stale` 展示；后端注册事件 `knowledge.version_published`（params: `knowledge_base_id`, `version`, `stale_draft_count`）供后续推送复用。
+- **Decision**: 派生字段，不新增存储：`KnowledgeBaseVersionRead.is_stale = (publication_state=='draft' and parent_version_id != knowledge_base.published_version_id)`；同时 `base_version` 投影 `parent` 的 `version` 标签。发布时若 stale 且未带 `force_overwrite=true` → `KNOWLEDGE_BASELINE_STALE`（409，params: `base_version`, `published_version`, `conflict_count`）。提示"正式版已更新"由前端在草稿横幅与发布框根据 `is_stale` 展示；后端注册事件 `knowledge.version.published`（params: `knowledge_base_id`, `version`, `stale_draft_count`）供后续推送复用。
 - **Rationale**: 读时派生零迁移，且与现有 `expected_published_version_id` CAS 互补（CAS 防并发，stale 防语义覆盖）。
 - **Alternatives**: 发布时批量写 `stale=True` 到其他草稿——被拒：多一处写放大与一致性维护。
 

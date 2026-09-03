@@ -41,7 +41,7 @@ Git 式协作：草稿即分支（不占版本号）、编辑器式变更审阅�
 | 原则 | 本设计如何满足 | 状态 |
 |---|---|---|
 | I 语义消息与双语目录 | 新增 UI 文案全部放在 `knowledgeAdmin.*` 命名空间，`en-US` canonical 与 `zh-CN` 同步；知识库/文档名与正文用 `RawContent`/`RawIdentifier`；日期用共享 formatter；diff 行内容是 raw 文本，不进目录 | PASS |
-| II 稳定错误与事件契约 | 新增错误码 `KNOWLEDGE_BASELINE_STALE`、`KNOWLEDGE_REBASE_CONFLICTS_UNRESOLVED`、`KNOWLEDGE_VERSION_LEVEL_INVALID`、`KNOWLEDGE_DOCUMENT_LINEAGE_MISMATCH` 注册到 `error_registry.py`；新增事件 `knowledge.version_published`、`knowledge.draft_rebased`、`knowledge.draft_reviewed` 注册到 EventRegistry；公共响应只含 code/params | PASS |
+| II 稳定错误与事件契约 | 新增错误码 `KNOWLEDGE_BASELINE_STALE`、`KNOWLEDGE_REBASE_CONFLICTS_UNRESOLVED`、`KNOWLEDGE_VERSION_LEVEL_INVALID`、`KNOWLEDGE_DOCUMENT_LINEAGE_MISMATCH` 注册到 `error_registry.py`；新增事件 `knowledge.version.published`、`knowledge.draft.rebased`、`knowledge.draft.reviewed` 注册到 EventRegistry；公共响应只含 code/params | PASS |
 | III 语言上下文分离 | 本功能不新增 Agent 执行入口，不改 `LanguageContext`；管理端只用 `ui_locale`；不在任何接口传递 reply locale | PASS（无新入口） |
 | IV 多租户控制面与权限边界 | 页面与所有新端点 `ensure_tenant_admin`；`require_team_knowledge_manager` 增加"管理员 + team_id 为空"旁路，不引入新角色；不触碰系统控制面 | PASS |
 | V 知识域一致性 | 正式指针语义不变；草稿改为分支语义（`version` 列存草稿名，`parent_version_id` 作基线）；发布/驳回/回滚/变基/审阅写回全部带乐观锁并写审计；删除连带清理依赖独立修复任务（见 Complexity Tracking） | PASS（有外部依赖） |

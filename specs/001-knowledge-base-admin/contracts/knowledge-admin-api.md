@@ -69,7 +69,7 @@ Errors: `KNOWLEDGE_REBASE_CONFLICTS_UNRESOLVED`、`KNOWLEDGE_PUBLISH_CONFLICT`�
 ### A5 `POST /knowledge-admin/knowledge-bases/{kb_id}/versions/{version_id}/review` — 写入审阅状态 **admin 或团队 manager**
 
 Body: `{"tenant_id": "…", "staged": 4, "pending": 0, "documents_adjusted": 2, "expected_updated_at": "…"}`
-Response `200`: `KnowledgeBaseVersionRead`（含 `metadata.review`）。审计 `draft_reviewed`，事件 `knowledge.draft_reviewed`。
+Response `200`: `KnowledgeBaseVersionRead`（含 `metadata.review`）。审计 `draft_reviewed`，事件 `knowledge.draft.reviewed`。
 Errors: `KNOWLEDGE_VERSION_NOT_READY`（非草稿）、`KNOWLEDGE_PUBLISH_CONFLICT`（`expected_updated_at` 不匹配）。
 
 ### A6 `GET /knowledge-admin/teams` — 可绑定群组候选 **admin**
