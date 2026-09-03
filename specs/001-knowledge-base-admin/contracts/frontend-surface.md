@@ -21,6 +21,8 @@
 - `dialogs.{createKb,createDraft,publish,delete,unbind}.*`、`toast.*`
 - 错误映射：`errors.knowledge.baselineStale`、`rebaseConflictsUnresolved`、`versionLevelInvalid`、`documentLineageMismatch`
 
+版本号显示约定：后端存储与 API 传输均不带 `v`（如 `1.0.1`），UI 展示统一由 `knowledgeAdminModel.formatVersion()` 加 `v` 前缀（`v1.0.1`）；草稿名原样显示。
+
 Raw 边界：知识库名、描述、文档标题、草稿名、版本号、群组名、员工名、diff 行文本、审计 reason 一律
 `RawContent` / `RawIdentifier`；不得进入 `values` 以外的位置。
 

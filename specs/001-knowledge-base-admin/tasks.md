@@ -32,7 +32,7 @@
 - [ ] T004 [P] [测试] 在 backend/tests/test_error_contracts.py 增加断言：`KNOWLEDGE_BASELINE_STALE`(409)、`KNOWLEDGE_REBASE_CONFLICTS_UNRESOLVED`(409)、`KNOWLEDGE_VERSION_LEVEL_INVALID`(400)、`KNOWLEDGE_DOCUMENT_LINEAGE_MISMATCH`(409) 已注册且 message_key 为 `errors.knowledge.*`
 - [ ] T005 [P] 在 backend/app/contracts/error_registry.py 注册上述四个错误码（含 params 名称：`base_version`/`published_version`/`conflict_count`、`document_count`、`level`、`lineage_id`）
 - [ ] T006 [P] [测试] 在 backend/tests/test_event_contracts.py 增加断言：`knowledge.version_published`、`knowledge.draft_rebased`、`knowledge.draft_reviewed` 已注册且 params schema 与 data-model.md §8 一致
-- [ ] T007 [P] 在 EventRegistry 定义模块注册三个事件（定位：`grep -rn "class EventRegistry" backend/app`，与现有 knowledge 事件同文件），补 legacy projection 声明为 none
+- [ ] T007 [P] 在 backend/app/contracts/event_registry.py 注册三个事件（与现有 `knowledge.ingest.*` 事件同处），声明 params schema、visibility，legacy projection 为 none
 - [ ] T008 [P] [测试] 在 frontend-enterprise/src/i18n/knowledgeAdmin.i18n.test.ts 编写失败测试：`knowledgeAdmin.*` 与 `errors.knowledge.{baselineStale,rebaseConflictsUnresolved,versionLevelInvalid,documentLineageMismatch}` 在 en-US 与 zh-CN 目录键集合对等且 ICU 参数一致
 - [ ] T009 [P] 在 frontend-enterprise/src/i18n/messages/en-US.json 与 zh-CN.json 新增 `knowledgeAdmin.*` 命名空间（按 contracts/frontend-surface.md 子域）与 `shell.nav.knowledgeAdmin`、四条 `errors.knowledge.*`
 - [ ] T010 [P] [测试] 在 frontend-enterprise/src/App.test.tsx 增加失败测试：admin 可打开 `/enterprise/knowledge-admin` 与 `/enterprise/knowledge-admin/:kbId`；非 admin 被重定向到 Gallery
@@ -50,7 +50,7 @@
 
 - [ ] T014 [P] [测试] 在 backend/tests/test_knowledge_lineage.py 编写失败测试：新建文档写入 `metadata_json.lineage_id`；`clone_knowledge_version_assets` 克隆时继承 lineage；缺失 lineage 的历史文档对比时按 filename 回退并标 `pairing="filename"`
 - [ ] T015 实现 lineage：backend/app/agents/branching.py（`clone_knowledge_version_assets`）与 backend/app/knowledge/service.py（新建文档）写入/继承 `lineage_id`
-- [ ] T016 [P] [测试] 在 backend/tests/test_knowledge_version_labels.py 编写失败测试：建草稿 `version=draft-<4hex>` 且 `parent_version_id=published`；`publish(level)` 按 patch/minor/major 递进且高于现有最高 released；非法 level → `KNOWLEDGE_VERSION_LEVEL_INVALID`；驳回保留草稿名；`KnowledgeBaseVersionRead` 含 `is_stale`/`base_version`/`draft_name`/`next_version_preview`；版本列表顺序 草稿(新在前)→released(semver 降序)→rejected
+- [ ] T016 [P] [测试] 在 backend/tests/test_knowledge_version_labels.py 编写失败测试：建草稿 `version=draft-<4hex>` 且 `parent_version_id=published`；`publish(level)` 按 patch/minor/major 递进且高于现有最高 released；非法 level → `KNOWLEDGE_VERSION_LEVEL_INVALID`；驳回保留草稿名；草稿名与同库既有 `version` 冲突时自动加长为 6/8 位十六进制；手工数据已占用 `1.0.1` 时 patch 发布分配 `1.0.2`；`KnowledgeBaseVersionRead` 含 `is_stale`/`base_version`/`draft_name`/`next_version_preview`；版本列表顺序 草稿(新在前)→released(semver 降序)→rejected
 - [ ] T017 实现版本规则：backend/app/knowledge/versioning.py（草稿命名、`_next_shared_version_label(level)` 移到发布时、审计 details 增 `draft_name`/`version_level`）、backend/app/knowledge/schema.py（`SharedKnowledgePublishRequest.level`/`force_overwrite`，`KnowledgeBaseVersionRead` 新字段）、backend/app/api/knowledge_bases.py（versions 端点排序与投影）
 - [ ] T018 [P] [测试] 在 backend/tests/test_knowledge_admin_bypass.py 编写失败测试：租户 admin 不带 team_id 可 drafts/publish/reject/rollback 未绑定群组的共享库，审计 `team_id=None` 且 `details.actor_context="tenant_admin"`；非 admin 不带 team_id → `KNOWLEDGE_GRANT_REQUIRED`；文档上传/更新指向草稿时 admin 无 team 亦可写
 - [ ] T019 实现管理员旁路：backend/app/knowledge/management.py（`require_team_knowledge_manager` 的 team_id 可选分支）、backend/app/knowledge/schema.py（四个请求 `team_id: str | None`）、backend/app/api/knowledge_bases.py 与 backend/app/api/knowledge.py 调用点
@@ -58,7 +58,7 @@
 - [ ] T021 实现列表：backend/app/knowledge/listing.py（查询与聚合）、backend/app/api/knowledge_admin.py（A1、A6 路由，`ensure_tenant_admin`）、backend/app/main.py 注册路由、backend/app/knowledge/schema.py 响应模型
 - [ ] T022 [P] [测试] 在 backend/tests/test_knowledge_diff.py 编写 fixture 失败测试：新增/修改/删除文档级清单；`hunks` 的 equal/change 块与行区间；change 块内相似度配对 `pairs`；`against=base|published`；`max_lines` 截断 `truncated=true`；非 admin 且非 history viewer 403
 - [ ] T023 实现对比：backend/app/knowledge/diff.py（`difflib.SequenceMatcher(autojunk=False)`）与 backend/app/api/knowledge_admin.py A2 路由
-- [ ] T024 [P] [测试] 在 backend/tests/test_knowledge_rebase.py 编写 fixture 失败测试：仅 ours 变/仅 theirs 变/双方不交叠 → 自动合并并直接落库（新快照、草稿名不变、`parent=published`、旧快照 `superseded_by`）；交叠 → 返回 `conflicts[]` 不落库；`resolve` 残留 `<<<<<<<` → `KNOWLEDGE_REBASE_CONFLICTS_UNRESOLVED`；`to_base_version_id` 已变 → `KNOWLEDGE_PUBLISH_CONFLICT`；缺 resolution → `KNOWLEDGE_DOCUMENT_LINEAGE_MISMATCH`；非 stale 草稿 → `KNOWLEDGE_VERSION_NOT_READY`；审计 `draft_rebased` 与事件 `knowledge.draft_rebased`；publish stale 未 force → `KNOWLEDGE_BASELINE_STALE`，force → 审计 `forced_overwrite`
+- [ ] T024 [P] [测试] 在 backend/tests/test_knowledge_rebase.py 编写 fixture 失败测试：仅 ours 变/仅 theirs 变/双方不交叠 → 自动合并并直接落库（新快照、草稿名不变、`parent=published`、旧快照 `superseded_by`）；交叠 → 返回 `conflicts[]` 不落库；`resolve` 残留 `<<<<<<<` → `KNOWLEDGE_REBASE_CONFLICTS_UNRESOLVED`；`to_base_version_id` 已变 → `KNOWLEDGE_PUBLISH_CONFLICT`；缺 resolution → `KNOWLEDGE_DOCUMENT_LINEAGE_MISMATCH`；非 stale 草稿 → `KNOWLEDGE_VERSION_NOT_READY`；团队 owner 通过绑定团队（带 `team_id`）变基成功、非 owner 非 admin → `KNOWLEDGE_GRANT_REQUIRED`；审计 `draft_rebased` 与事件 `knowledge.draft_rebased`；publish stale 未 force → `KNOWLEDGE_BASELINE_STALE`，force → 审计 `forced_overwrite`
 - [ ] T025 实现变基：backend/app/knowledge/rebase.py（三方合并、冲突块、落库）、backend/app/api/knowledge_admin.py A3/A4 路由、backend/app/knowledge/versioning.py（publish 的 stale 判定与 `force_overwrite`）、事件 `knowledge.version_published` 发出
 - [ ] T026 [P] [测试] 在 backend/tests/test_knowledge_review_writeback.py 编写失败测试：`POST …/versions/{draft}/review` 写入 `metadata.review`；`expected_updated_at` 不匹配 → `KNOWLEDGE_PUBLISH_CONFLICT`；非草稿 → `KNOWLEDGE_VERSION_NOT_READY`；审计 `draft_reviewed` 与事件
 - [ ] T027 实现审阅写回：backend/app/api/knowledge_admin.py A5 路由与 backend/app/knowledge/versioning.py
@@ -84,7 +84,7 @@
 ### Implementation for User Story 1
 
 - [ ] T033 [US1] 实现 frontend-enterprise/src/pages/knowledge-admin/knowledgeAdminModel.ts
-- [ ] T034 [US1] 实现 frontend-enterprise/src/pages/knowledge-admin/KnowledgeAdminListPage.tsx 与 dialogs/CreateKnowledgeBaseDialog.tsx、dialogs/DeleteDialog.tsx（复用 `KnowledgeTypeBadge`、shadcn 组件、`RawContent`）
+- [ ] T034 [US1] 实现 frontend-enterprise/src/pages/knowledge-admin/KnowledgeAdminListPage.tsx 与 dialogs/CreateKnowledgeBaseDialog.tsx、dialogs/DeleteDialog.tsx（复用 `KnowledgeTypeBadge`、shadcn 组件、`RawContent`；行菜单「导出备份」「图谱检查」复用现有 `GET …/okf/export` 与 `POST …/okf/lint` 端点）
 - [ ] T035 [US1] 实现 frontend-enterprise/src/pages/knowledge-admin/KnowledgeAdminDetailPage.tsx 与 shared/SettingsTab.tsx（其余 Tab 先占位），替换 T012 的占位组件
 
 **Checkpoint**: US1 可独立演示（列表 + 详情设置）
@@ -104,7 +104,7 @@
 - [ ] T038 [P] [US2] [测试] 在 frontend-enterprise/src/pages/knowledge-admin/review/staging.test.ts 编写失败测试：`stage` 更新暂存基线与后续记录偏移、`unstage` 精确校验与偏移回退、接受全部按降序、拒绝、重置、`pending`/`hasWork`
 - [ ] T039 [US2] [测试] 在 frontend-enterprise/src/pages/knowledge-admin/review/ReviewEditor.test.tsx 编写失败测试：输入后整篇重算与光标保持；Enter 拆行/Backspace 合并/Delete；跨行选区 Backspace、insertText、粘贴多行；composition 期间不重绘、结束后同步；块接受折叠为 ✓ 行 + 撤销接受；红行 ↩ 恢复（配对替换 / 未配对插回）；绿行 ✕；选区撤销按钮启用与执行；新增文档整篇拒绝、删除文档拒绝恢复；顶部计数与 apply 可用性
 - [ ] T040 [P] [US2] [测试] 在 frontend-enterprise/src/pages/knowledge-admin/shared/ContentTab.test.tsx 编写失败测试：视图切换器；正式视图只读且隐藏草稿新增；草稿视图新增/修改/删除标记与恢复；横幅信息（创建者、来源、基线、发布后版本号预览、原因）与按钮；上传/编辑/删除请求携带草稿 `knowledge_base_version_id`
-- [ ] T041 [P] [US2] [测试] 在 frontend-enterprise/src/pages/knowledge-admin/shared/ContentTab.reviewApply.test.tsx 编写失败测试：「应用到草稿」按审阅结果调用文档更新（`content_md`+`expected_updated_at`）、新增拒绝归档、删除拒绝恢复，最后调用 review 端点；成功后 toast 与刷新；从发布框进入时应用后返回发布框
+- [ ] T041 [P] [US2] [测试] 在 frontend-enterprise/src/pages/knowledge-admin/shared/ContentTab.reviewApply.test.tsx 编写失败测试：「应用到草稿」按审阅结果调用文档更新（`content_md`+`expected_updated_at`）、新增拒绝归档、删除拒绝恢复，最后调用 review 端点；成功后 toast 与刷新；从发布框进入时应用后返回发布框；文档更新或 review 返回 `KNOWLEDGE_PUBLISH_CONFLICT` 时提示"草稿已被他人修改，请刷新后重新审阅"且不提交剩余写回
 - [ ] T042 [P] [US2] [测试] 在 frontend-enterprise/src/pages/knowledge-admin/shared/VersionsTab.test.tsx 编写失败测试：服务端顺序原样展示、草稿行 查看变更/发布/驳回、released 行回滚、当前正式版标记、创建草稿对话框（原因必填、来源上下文含"管理员直连"）
 - [ ] T043 [P] [US2] [测试] 在 frontend-enterprise/src/pages/knowledge-admin/dialogs/PublishDialog.test.tsx 编写失败测试：标题显示 `draft → next`；level 下拉切换更新结果号；审阅状态展示；非 stale 单按钮确认；stale 时展示冲突数与三按钮（变基/仍然覆盖发布/取消），覆盖发布调用 `force_overwrite=true`
 - [ ] T044 [P] [US2] [测试] 在 frontend-enterprise/src/pages/knowledge-admin/shared/AuditTab.test.tsx 编写失败测试：动作/群组/操作者/版本筛选、分页加载更多、raw 字段用 `RawContent`
@@ -197,9 +197,10 @@
 
 - [ ] T074 [P] 运行 `npm --prefix frontend-enterprise run i18n:check` 并补齐/修正 en-US 与 zh-CN 缺键、ICU 参数不一致
 - [ ] T075 [P] 运行 `backend/.venv/bin/ruff check backend`、`backend/.venv/bin/python -m pytest backend/tests`、`backend/.venv/bin/python scripts/i18n/check_python.py`，修复失败
-- [ ] T076 [P] 运行 `npm --prefix frontend-enterprise test` 与 `npm --prefix frontend-enterprise run build`，修复失败
+- [ ] T076 [P] 运行 `npm --prefix frontend-enterprise test` 与 `npm --prefix frontend-enterprise run build`，修复失败；确认 frontend-enterprise/src/pages/KnowledgePage.test.tsx 等既有员工侧知识库测试全部通过（FR-003）
 - [ ] T077 按 quickstart.md S1–S5 在 `zh-CN` 与 `en-US` 各做一遍真实浏览器验收（含中文输入法、跨行选区、粘贴），记录结果与截图到 PR；未能运行的项标 `UNVERIFIED`
 - [ ] T078 [P] 校对 specs/001-knowledge-base-admin/{spec,plan,contracts}/ 与实现的偏差，先改 artifact 再改代码；更新本文件 Notes 中的外部依赖结论
+- [ ] T079 [P] 性能验证（SC-007）：在 backend/tests/test_knowledge_admin_perf.py 用 200 个知识库 fixture 断言列表端点 p95 ≤ 2s、2000 行文档 diff 端点 ≤ 1s；在 frontend-enterprise/src/pages/knowledge-admin/review/ReviewEditor.perf.test.tsx 断言 2000 行文档单次按键重绘 ≤ 50ms；结果写入 PR，未达标视为阻塞
 
 ---
 
@@ -275,6 +276,28 @@ Task: "T040 shared/ContentTab.test.tsx" / "T042 shared/VersionsTab.test.tsx" / "
 5. Phase 6、Phase 7 可由不同人并行；各自通过 S4/S5 后合入；T077 补 S4/S5
 
 ---
+
+## Traceability（需求 → 任务）
+
+| 需求 | 任务 |
+|---|---|
+| FR-001 / FR-002 | T010–T012, T032, T035 |
+| FR-003 | T076（回归） |
+| FR-010 / FR-012 / FR-014 | T020, T021, T031, T034 |
+| FR-011 | T020, T021（服务端分页，P0）；T069, T073（分页 UI，P1） |
+| FR-013 | T031, T034 |
+| FR-020 / FR-021 / FR-022 | T015–T019, T040, T049 |
+| FR-023 / FR-030 / FR-031 / FR-032 / FR-033 / FR-034 | T016–T019, T042, T043, T050, T051 |
+| FR-040 – FR-045 | T022, T023, T026, T027, T036–T053 |
+| FR-050 – FR-053 | T006, T007, T016, T024, T025, T043, T051, T054–T061 |
+| FR-060 / FR-061 | T020, T021（A6）, T062–T065 |
+| FR-070 | T044, T052 |
+| FR-071 | T001–T003, T032, T035 |
+| FR-080 / FR-081 / FR-082 | T066–T072 |
+| SC-007 | T079 |
+| SC-008 | T016, T018, T024, T026 |
+| 契约 A1–A6 | T020/T021, T022/T023, T024/T025, T026/T027 |
+| 契约 B1–B4 | T016–T019, T014/T015, T001–T003 |
 
 ## Notes
 

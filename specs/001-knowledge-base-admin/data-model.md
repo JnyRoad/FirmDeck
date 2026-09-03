@@ -16,7 +16,7 @@
 
 | 字段 | 现状 | 本功能约定 |
 |---|---|---|
-| `version` | 建草稿时即分配 semver | **草稿**：`draft-<4 位十六进制>`；**发布时**改写为按 level 递进的 semver；驳回保留草稿名 |
+| `version` | 建草稿时即分配 semver | **草稿**：`draft-<4 位十六进制>`（取版本 id 末 4 位；与同库既有 `version` 冲突时依次加长为 6、8 位）；**发布时**改写为按 level 递进的 semver；驳回保留草稿名 |
 | `publication_state` | `draft` / `released` / `rejected` | 不变 |
 | `parent_version_id` | 克隆来源 | 作为**草稿基线**；变基后更新为最新正式版 id |
 | `source_team_id` | 必填团队 | 管理员直连时为 `NULL` |
