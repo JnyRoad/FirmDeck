@@ -1369,6 +1369,11 @@ def clone_knowledge_version_assets(
 
     if not target_has_documents:
         for document in source_documents:
+            # 继承源文档的 lineage_id；源文档缺失（历史数据）时以源文档自身 id 回填，
+            # 使跨版本对比/变基（diff.py、rebase.py）能按 lineage_id 配对同一篇文档。
+            source_lineage_id = str((document.metadata_json or {}).get("lineage_id") or document.id)
+            clone_metadata = deepcopy(document.metadata_json or {})
+            clone_metadata["lineage_id"] = source_lineage_id
             clone = KnowledgeDocument(
                 tenant_id=document.tenant_id,
                 knowledge_base_id=target_base_id,
@@ -1379,7 +1384,7 @@ def clone_knowledge_version_assets(
                 status=document.status,
                 bucket_count=document.bucket_count,
                 chunk_count=document.chunk_count,
-                metadata_json=deepcopy(document.metadata_json or {}),
+                metadata_json=clone_metadata,
                 error=document.error,
                 created_at=document.created_at,
                 updated_at=utc_now(),

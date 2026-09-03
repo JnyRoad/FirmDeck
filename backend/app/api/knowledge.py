@@ -451,6 +451,8 @@ def import_okf_bundle(
             "okf": {"version": "0.1", "concept_count": len(parsed_docs)},
         },
     )
+    # 首次出现的文档：lineage_id 取自身 id，作为跨版本身份的起点（R5）。
+    document.metadata_json = {**document.metadata_json, "lineage_id": document.id}
     db.add(document)
     db.flush()
     concept_rows = upsert_concepts(

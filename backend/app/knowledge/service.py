@@ -804,6 +804,8 @@ class KnowledgeService:
                     },
                 },
             )
+            # 首次出现的文档：lineage_id 取自身 id，作为跨版本身份的起点（R5）。
+            document.metadata_json = {**document.metadata_json, "lineage_id": document.id}
             self._require_ingest_execution_fence(job)
             self.db.add(document)
             self.db.flush()
