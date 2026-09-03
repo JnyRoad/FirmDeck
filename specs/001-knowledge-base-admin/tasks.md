@@ -26,9 +26,9 @@
 
 **Purpose**: 外部依赖确认、契约注册、i18n 命名空间、路由与菜单骨架
 
-- [ ] T001 验证外部修复是否已合入：检查 backend/app/api/knowledge_bases.py 的无 agent_id 删除分支是否已同事务清理 `TeamKnowledgeBaseBinding`、`TeamKnowledgeBaseGrant` 与 `Team.default_knowledge_base_id`（`git log --all -- backend/app/api/knowledge_bases.py` + 读代码）；把结论写入本文件 Notes；未合入则执行 T002/T003，已合入则跳过并勾选
-- [ ] T002 [兜底·测试] 在 backend/tests/test_knowledge_admin_delete_cleanup.py 编写失败测试：管理员删除共享库后绑定、授权、团队默认写入指针全部清理，私有库删除清理分支与资源绑定
-- [ ] T003 [兜底] 在 backend/app/api/knowledge_bases.py 删除分支实现同事务清理（仅当 T001 判定未合入）
+- [X] T001 验证外部修复是否已合入：检查 backend/app/api/knowledge_bases.py 的无 agent_id 删除分支是否已同事务清理 `TeamKnowledgeBaseBinding`、`TeamKnowledgeBaseGrant` 与 `Team.default_knowledge_base_id`（`git log --all -- backend/app/api/knowledge_bases.py` + 读代码）；把结论写入本文件 Notes；未合入则执行 T002/T003，已合入则跳过并勾选
+- [X] T002 [兜底·测试] 在 backend/tests/test_knowledge_admin_delete_cleanup.py 编写失败测试：管理员删除共享库后绑定、授权、团队默认写入指针全部清理，私有库删除清理分支与资源绑定
+- [X] T003 [兜底] 在 backend/app/api/knowledge_bases.py 删除分支实现同事务清理（仅当 T001 判定未合入）
 - [ ] T004 [P] [测试] 在 backend/tests/test_error_contracts.py 增加断言：`KNOWLEDGE_BASELINE_STALE`(409)、`KNOWLEDGE_REBASE_CONFLICTS_UNRESOLVED`(409)、`KNOWLEDGE_VERSION_LEVEL_INVALID`(400)、`KNOWLEDGE_DOCUMENT_LINEAGE_MISMATCH`(409) 已注册且 message_key 为 `errors.knowledge.*`
 - [ ] T005 [P] 在 backend/app/contracts/error_registry.py 注册上述四个错误码（含 params 名称：`base_version`/`published_version`/`conflict_count`、`document_count`、`level`、`lineage_id`）
 - [ ] T006 [P] [测试] 在 backend/tests/test_event_contracts.py 增加断言：`knowledge.version.published`、`knowledge.draft.rebased`、`knowledge.draft.reviewed` 已注册且 params schema 与 data-model.md §8 一致
@@ -48,8 +48,8 @@
 
 **⚠️ CRITICAL**: 未完成前不得开始任何用户故事
 
-- [ ] T014 [P] [测试] 在 backend/tests/test_knowledge_lineage.py 编写失败测试：新建文档写入 `metadata_json.lineage_id`；`clone_knowledge_version_assets` 克隆时继承 lineage；缺失 lineage 的历史文档对比时按 filename 回退并标 `pairing="filename"`
-- [ ] T015 实现 lineage：backend/app/agents/branching.py（`clone_knowledge_version_assets`）与 backend/app/knowledge/service.py（新建文档）写入/继承 `lineage_id`
+- [X] T014 [P] [测试] 在 backend/tests/test_knowledge_lineage.py 编写失败测试：新建文档写入 `metadata_json.lineage_id`；`clone_knowledge_version_assets` 克隆时继承 lineage；缺失 lineage 的历史文档对比时按 filename 回退并标 `pairing="filename"`
+- [X] T015 实现 lineage：backend/app/agents/branching.py（`clone_knowledge_version_assets`）与 backend/app/knowledge/service.py（新建文档）写入/继承 `lineage_id`
 - [ ] T016 [P] [测试] 在 backend/tests/test_knowledge_version_labels.py 编写失败测试：建草稿 `version=draft-<4hex>` 且 `parent_version_id=published`；`publish(level)` 按 patch/minor/major 递进且高于现有最高 released；非法 level → `KNOWLEDGE_VERSION_LEVEL_INVALID`；驳回保留草稿名；草稿名与同库既有 `version` 冲突时自动加长为 6/8 位十六进制；手工数据已占用 `1.0.1` 时 patch 发布分配 `1.0.2`；`KnowledgeBaseVersionRead` 含 `is_stale`/`base_version`/`draft_name`/`next_version_preview`；版本列表顺序 草稿(新在前)→released(semver 降序)→rejected
 - [ ] T017 实现版本规则：backend/app/knowledge/versioning.py（草稿命名、`_next_shared_version_label(level)` 移到发布时、审计 details 增 `draft_name`/`version_level`）、backend/app/knowledge/schema.py（`SharedKnowledgePublishRequest.level`/`force_overwrite`，`KnowledgeBaseVersionRead` 新字段）、backend/app/api/knowledge_bases.py（versions 端点排序与投影）
 - [ ] T018 [P] [测试] 在 backend/tests/test_knowledge_admin_bypass.py 编写失败测试：租户 admin 不带 team_id 可 drafts/publish/reject/rollback 未绑定群组的共享库，审计 `team_id=None` 且 `details.actor_context="tenant_admin"`；非 admin 不带 team_id → `KNOWLEDGE_GRANT_REQUIRED`；文档上传/更新指向草稿时 admin 无 team 亦可写
@@ -301,7 +301,7 @@ Task: "T040 shared/ContentTab.test.tsx" / "T042 shared/VersionsTab.test.tsx" / "
 
 ## Notes
 
-- 外部依赖结论（T001 回填）：`TODO`
+- 外部依赖结论（T001 回填）：已合入 main（PR #25 fix/knowledge-base-delete-team-cleanup，含 backend/tests/test_knowledge_base_delete_cleanup.py）；T002/T003 无需执行，按"已合入"勾选。
 - 每完成一个任务立即勾选 `[X]`，不攒批
 - 实现中发现 spec/plan/contracts 有误：先停下改 artifact（T078 的原则），确认后再改代码
 - 任何未真实运行的浏览器/输入法/第三方路径在 PR 中标 `UNVERIFIED`
