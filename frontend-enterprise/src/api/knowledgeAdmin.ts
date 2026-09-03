@@ -11,7 +11,7 @@
  * 交由后端应用契约默认值）。
  */
 import type { TenantSessionContextValue } from '@/contexts/TenantSessionContext';
-import { VersionLevel } from '@/enums/knowledge';
+import { KnowledgeBaseMode, VersionLevel } from '@/enums/knowledge';
 import type {
   CapabilityScope,
   KnowledgeBaseAuditPageRead,
@@ -49,7 +49,7 @@ function appendQuery(
 
 /** A1 `GET /knowledge-admin/knowledge-bases` 查询参数（`tenant_id` 由 tenant client 注入）。 */
 export type ListKnowledgeBasesParams = {
-  mode?: 'shared' | 'dedicated';
+  mode?: KnowledgeBaseMode;
   status?: 'active' | 'archived';
   ownerAgentId?: string;
   teamId?: string;
@@ -130,7 +130,10 @@ export type RollbackVersionBody = {
   idempotencyKey?: string;
 };
 
-/** B1 `rollback` 响应：正式指针移动结果（无独立契约类型，字段见 A/B 说明）。 */
+/**
+ * B1 `rollback` 响应：正式指针移动结果（无独立契约类型，字段见 A/B 说明）。
+ * 镜像 `backend/app/api/knowledge_bases.py` 中 `rollback_knowledge_base` 的共享库分支返回体。
+ */
 export type RollbackVersionResult = {
   status: string;
   knowledge_base_id: string;
@@ -213,7 +216,7 @@ export type ConvertToSharedBody = {
   defaultForTeamId?: string;
 };
 
-/** OKF lint 结果：无独立契约类型，字段见 `knowledge_bases.py` `lint_okf`。 */
+/** OKF lint 结果：无独立契约类型，镜像 `backend/app/api/knowledge_bases.py` 中 `lint_okf` 的返回体。 */
 export type OkfLintResult = {
   status: string;
   issue_count: number;
@@ -399,7 +402,10 @@ export function createKnowledgeAdminApi(
       });
     },
 
-    /** B3 归档文档：复用文档更新接口，固定写入 `status=archived`。 */
+    /**
+     * B3 归档文档：`backend/app/api/knowledge.py` 目前没有独立 DELETE/归档路由，
+     * 复用 `PUT /knowledge/documents/{id}`（`update_document`），固定写入 `status: 'archived'`。
+     */
     archiveDocument(
       docId: string,
       body: ArchiveDocumentBody = {},

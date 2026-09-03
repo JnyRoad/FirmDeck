@@ -11,6 +11,7 @@
  * （由 tenant-client.test.ts 覆盖）。
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { KnowledgeBaseMode } from '@/enums/knowledge';
 
 const getMock = vi.fn();
 const postMock = vi.fn();
@@ -81,7 +82,7 @@ describe('createKnowledgeAdminApi', () => {
     const api = createKnowledgeAdminApi(null, fakeClient as never);
 
     await api.listKnowledgeBases({
-      mode: 'shared',
+      mode: KnowledgeBaseMode.Shared,
       status: 'active',
       ownerAgentId: 'ag_1',
       teamId: 'team_1',
