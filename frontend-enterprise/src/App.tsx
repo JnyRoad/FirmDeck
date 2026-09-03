@@ -54,6 +54,8 @@ import GeneralSkillsPage, {
   GeneralSkillNewPage,
 } from "./pages/GeneralSkillsPage";
 import KnowledgeManagePage, { KnowledgeAddPage } from "./pages/KnowledgePage";
+import KnowledgeAdminListPage from "./pages/knowledge-admin/KnowledgeAdminListPage";
+import KnowledgeAdminDetailPage from "./pages/knowledge-admin/KnowledgeAdminDetailPage";
 import LoginPage from "./pages/LoginPage";
 import ModelsPage from "./pages/ModelsPage";
 import RuntimeSettingsPage from "./pages/RuntimeSettingsPage";
@@ -772,6 +774,26 @@ function Shell({
                 element={
                   isAdmin ? (
                     <AccountsPage currentUser={auth.user} onLogout={onLogout} />
+                  ) : (
+                    <Navigate to={EnterpriseRoute.Gallery} replace />
+                  )
+                }
+              />
+              <Route
+                path={EnterpriseRoute.KnowledgeAdmin}
+                element={
+                  isAdmin ? (
+                    <KnowledgeAdminListPage />
+                  ) : (
+                    <Navigate to={EnterpriseRoute.Gallery} replace />
+                  )
+                }
+              />
+              <Route
+                path={`${EnterpriseRoute.KnowledgeAdmin}/:kbId`}
+                element={
+                  isAdmin ? (
+                    <KnowledgeAdminDetailPage />
                   ) : (
                     <Navigate to={EnterpriseRoute.Gallery} replace />
                   )

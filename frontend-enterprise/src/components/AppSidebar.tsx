@@ -45,6 +45,7 @@ import IconToggle from '../assets/icons/action-toggle.svg?react';
 import IconHeaderCollapse from '../assets/icons/header-collapse.svg?react';
 import IconAccounts from '../assets/icons/sys-accounts.svg?react';
 import IconModels from '../assets/icons/sys-models.svg?react';
+import IconKnowledgeAdmin from '../assets/icons/sys-knowledge.svg?react';
 import IconSettings from '../assets/icons/action-toggle.svg?react';
 import IconChevronDown from '../assets/icons/chevron-down.svg?react';
 import IconAdd from '../assets/icons/add.svg?react';
@@ -86,6 +87,7 @@ const CAPABILITY_NAV: NavItem[] = [
 
 const SYSTEM_NAV: NavItem[] = [
   { route: EnterpriseRoute.Accounts, labelId: 'shell.nav.accounts', Icon: IconAccounts },
+  { route: EnterpriseRoute.KnowledgeAdmin, labelId: 'shell.nav.knowledgeAdmin', Icon: IconKnowledgeAdmin },
   { route: EnterpriseRoute.Models, labelId: 'shell.nav.models', Icon: IconModels },
   { route: EnterpriseRoute.RuntimeSettings, labelId: 'shell.nav.runtimeSettings', Icon: IconSettings },
 ];

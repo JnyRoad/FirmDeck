@@ -237,6 +237,74 @@ describe('App team scope selection', () => {
   });
 });
 
+describe('App knowledge base admin routes', () => {
+  it('lets an enterprise admin open the knowledge base admin list route', async () => {
+    stubAppFetch();
+    window.history.pushState({}, '', '/enterprise/knowledge-admin');
+
+    render(<I18nProvider><App /></I18nProvider>);
+
+    expect(await screen.findByRole('heading', { name: '知识库管理' })).toBeTruthy();
+    expect(window.location.pathname).toBe('/enterprise/knowledge-admin');
+  });
+
+  it('lets an enterprise admin open a knowledge base admin detail route with the kbId param', async () => {
+    stubAppFetch();
+    window.history.pushState({}, '', '/enterprise/knowledge-admin/kb-test-1');
+
+    render(<I18nProvider><App /></I18nProvider>);
+
+    expect(await screen.findByText('kb-test-1')).toBeTruthy();
+    expect(window.location.pathname).toBe('/enterprise/knowledge-admin/kb-test-1');
+  });
+
+  it('redirects a non-admin user away from the knowledge base admin list to Gallery', async () => {
+    const memberUser = { ...authUser, role: 'member' as const };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = (init?.method || 'GET').toUpperCase();
+      if (method === 'POST' && url.includes('/tl/session')) return jsonResponse({ session_id: 'session-tl-1' });
+      if (url.includes('/api/auth/me')) return jsonResponse(memberUser);
+      if (url.includes('/api/enterprise/agents')) return jsonResponse([agent]);
+      if (url.includes('/api/enterprise/model-configs')) return jsonResponse([modelConfig]);
+      if (url.includes('/api/chat/')) return jsonResponse([]);
+      if (url.includes('/api/enterprise/')) return jsonResponse([]);
+      return jsonResponse({});
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    window.history.pushState({}, '', '/enterprise/knowledge-admin');
+
+    render(<I18nProvider><App /></I18nProvider>);
+
+    await waitFor(() => {
+      expect(window.location.pathname).toBe('/workspace/gallery');
+    });
+  });
+
+  it('redirects a non-admin user away from a knowledge base admin detail route to Gallery', async () => {
+    const memberUser = { ...authUser, role: 'member' as const };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = (init?.method || 'GET').toUpperCase();
+      if (method === 'POST' && url.includes('/tl/session')) return jsonResponse({ session_id: 'session-tl-1' });
+      if (url.includes('/api/auth/me')) return jsonResponse(memberUser);
+      if (url.includes('/api/enterprise/agents')) return jsonResponse([agent]);
+      if (url.includes('/api/enterprise/model-configs')) return jsonResponse([modelConfig]);
+      if (url.includes('/api/chat/')) return jsonResponse([]);
+      if (url.includes('/api/enterprise/')) return jsonResponse([]);
+      return jsonResponse({});
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    window.history.pushState({}, '', '/enterprise/knowledge-admin/kb-test-1');
+
+    render(<I18nProvider><App /></I18nProvider>);
+
+    await waitFor(() => {
+      expect(window.location.pathname).toBe('/workspace/gallery');
+    });
+  });
+});
+
 const SYSTEM_AUTH_MODULE_PATH = './system-auth';
 
 async function seedSystemSession() {
