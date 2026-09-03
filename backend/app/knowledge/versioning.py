@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import base64
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, Literal
 
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select, update
@@ -15,6 +15,7 @@ from app.db.models import (
     KnowledgeBaseVersion,
     KnowledgeDocument,
     KnowledgeIngestJob,
+    new_id,
     utc_now,
 )
 from app.knowledge.audit import KnowledgeAuditService
@@ -22,10 +23,14 @@ from app.knowledge.errors import (
     KNOWLEDGE_CONTEXT_MISMATCH,
     KNOWLEDGE_MODE_INVALID,
     KNOWLEDGE_PUBLISH_CONFLICT,
+    KNOWLEDGE_VERSION_LEVEL_INVALID,
     KNOWLEDGE_VERSION_NOT_READY,
     KnowledgeError,
     knowledge_error,
 )
+
+VersionLevel = Literal["patch", "minor", "major"]
+_VERSION_LEVELS: tuple[str, ...] = ("patch", "minor", "major")
 
 
 def _required_reason(value: str | None) -> str:
@@ -47,13 +52,52 @@ def _semantic_version_parts(value: str) -> tuple[int, int, int] | None:
     return int(parts[0]), int(parts[1]), int(parts[2])
 
 
-def _next_shared_version_label(versions: Sequence[str]) -> str:
-    """从现有共享版本中分配唯一的下一次次版本标签。"""
-    parsed = [parts for value in versions if (parts := _semantic_version_parts(value))]
+def _bump_version(parts: tuple[int, int, int], level: str) -> tuple[int, int, int]:
+    """按发布级别递进单个 semver 三元组，不做占用检查。"""
+    major, minor, patch = parts
+    if level == "major":
+        return (major + 1, 0, 0)
+    if level == "minor":
+        return (major, minor + 1, 0)
+    return (major, minor, patch + 1)
+
+
+def _next_shared_version_label(
+    released_versions: Sequence[str],
+    level: str,
+    *,
+    occupied_versions: Sequence[str] = (),
+) -> str:
+    """发布时按 level 从现有最高正式版本递进分配唯一 semver 标签。"""
+    if level not in _VERSION_LEVELS:
+        raise knowledge_error(
+            KNOWLEDGE_VERSION_LEVEL_INVALID,
+            details={"level": level},
+        )
+    parsed = [
+        parts for value in released_versions if (parts := _semantic_version_parts(value))
+    ]
     if not parsed:
         return "1.0.0"
-    major, minor, _patch = max(parsed)
-    return f"{major}.{minor + 1}.0"
+    candidate = max(parsed)
+    occupied = set(occupied_versions)
+    while True:
+        candidate = _bump_version(candidate, level)
+        label = f"{candidate[0]}.{candidate[1]}.{candidate[2]}"
+        if label not in occupied:
+            return label
+
+
+def _draft_version_label(version_id: str, existing_labels: Sequence[str]) -> str:
+    """从版本 id 末位十六进制生成草稿分支名，与既有标签冲突时依次加长为 6、8 位。"""
+    suffix_source = version_id.rsplit("_", 1)[-1]
+    occupied = set(existing_labels)
+    for length in (4, 6, 8):
+        candidate = f"draft-{suffix_source[-length:]}"
+        if candidate not in occupied:
+            return candidate
+    # 极端情况下 8 位仍冲突：退回完整十六进制后缀，唯一约束兜底保证不重复。
+    return f"draft-{suffix_source}"
 
 
 def _required_text(value: str | None, field_name: str) -> str:
@@ -117,7 +161,8 @@ class SharedKnowledgeVersionService:
         ):
             raise self._publish_conflict(base, expected_published_version_id)
 
-        # 版本标签按已有快照单调分配；唯一约束负责检测并行分配冲突。
+        # 草稿名基于版本 id 末位十六进制生成，语义版本号留到发布时再分配；
+        # 唯一约束负责检测并行分配冲突。
         labels = self.db.exec(
             select(KnowledgeBaseVersion.version).where(
                 KnowledgeBaseVersion.tenant_id == tenant_id,
@@ -130,10 +175,13 @@ class SharedKnowledgeVersionService:
             "source_conversation_id": source_conversation_id,
             "source_references": list(source_references or []),
         }
+        draft_id = new_id("kbver")
+        draft_name = _draft_version_label(draft_id, labels)
         draft = KnowledgeBaseVersion(
+            id=draft_id,
             tenant_id=tenant_id,
             knowledge_base_id=knowledge_base_id,
-            version=_next_shared_version_label(labels),
+            version=draft_name,
             name=base.name,
             description=base.description,
             status="active",
@@ -147,6 +195,7 @@ class SharedKnowledgeVersionService:
             metadata_json={
                 **dict(base.metadata_json or {}),
                 "draft_change_reason": reason,
+                "draft_name": draft_name,
                 "provenance": provenance,
             },
         )
@@ -344,10 +393,16 @@ class SharedKnowledgeVersionService:
         actor_id: str,
         source_team_id: str | None,
         change_reason: str,
+        level: VersionLevel = "patch",
         idempotency_key: str | None = None,
         request_payload: Any = None,
     ) -> KnowledgeBaseVersion:
-        """校验草稿后以 CAS 原子替换全局正式指针。"""
+        """校验草稿后按发布级别分配语义版本号，并以 CAS 原子替换全局正式指针。"""
+        if level not in _VERSION_LEVELS:
+            raise knowledge_error(
+                KNOWLEDGE_VERSION_LEVEL_INVALID,
+                details={"level": level},
+            )
         base = self._shared_base(tenant_id, knowledge_base_id)
         draft = self.require_writable_draft(
             tenant_id=tenant_id,
@@ -358,6 +413,26 @@ class SharedKnowledgeVersionService:
         if draft.parent_version_id != expected_published_version_id:
             raise self._publish_conflict(base, expected_published_version_id)
         self.ensure_ready(draft)
+
+        # 草稿名在发布前即为当前 version 值；语义版本号在发布这一刻按 level 分配，
+        # 并跳过历史手工数据已占用的标签，直到找到未使用的组合。
+        draft_name = draft.version
+        existing_versions = self.db.exec(
+            select(
+                KnowledgeBaseVersion.version,
+                KnowledgeBaseVersion.publication_state,
+            ).where(
+                KnowledgeBaseVersion.tenant_id == tenant_id,
+                KnowledgeBaseVersion.knowledge_base_id == knowledge_base_id,
+            )
+        ).all()
+        released_labels = [label for label, state in existing_versions if state == "released"]
+        occupied_labels = [label for label, _state in existing_versions]
+        new_version_label = _next_shared_version_label(
+            released_labels,
+            level,
+            occupied_versions=occupied_labels,
+        )
 
         # 单条条件更新是全局正式版本的并发闸门；失败时不触碰草稿状态。
         now = utc_now()
@@ -379,6 +454,13 @@ class SharedKnowledgeVersionService:
         draft.published_at = now
         draft.change_reason = reason
         draft.updated_at = now
+        draft.version = new_version_label
+        draft.metadata_json = {
+            **dict(draft.metadata_json or {}),
+            "draft_name": draft_name,
+            "published_from_draft": True,
+            "version_level": level,
+        }
         self.db.add(draft)
         self.db.flush()
         self.db.refresh(base)
@@ -399,6 +481,8 @@ class SharedKnowledgeVersionService:
             details={
                 "previous_published_version_id": expected_published_version_id,
                 "published_version_id": draft.id,
+                "draft_name": draft_name,
+                "version_level": level,
             },
             idempotency_key=idempotency_key,
             request_payload=request_payload,

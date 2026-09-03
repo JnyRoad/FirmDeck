@@ -230,12 +230,17 @@ def test_shared_knowledge_teams_are_loaded_in_one_authorized_projection() -> Non
 
 
 def test_create_draft_maps_version_label_collision_to_publish_conflict(monkeypatch) -> None:
-    """并行草稿版本标签冲突时返回可重试领域错误，不泄漏数据库异常。"""
+    """并行草稿分支名冲突时返回可重试领域错误，不泄漏数据库异常。
+
+    草稿命名规则变更为 R3：草稿名基于版本 id 生成（`versioning._draft_version_label`），
+    不再复用旧的语义版本号分配函数 `_next_shared_version_label`（该函数现在只在
+    发布时调用）。因此并发碰撞的模拟目标随之更新为 `_draft_version_label`。
+    """
     with _test_session() as db:
         _base, released = _seed_shared_base(db)
         monkeypatch.setattr(
-            "app.knowledge.versioning._next_shared_version_label",
-            lambda _labels: released.version,
+            "app.knowledge.versioning._draft_version_label",
+            lambda _version_id, _labels: released.version,
         )
 
         with pytest.raises(KnowledgeError) as conflict:

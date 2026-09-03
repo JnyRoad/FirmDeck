@@ -28,6 +28,7 @@ KNOWLEDGE_BINDING_REVISION_CONFLICT = "KNOWLEDGE_BINDING_REVISION_CONFLICT"
 KNOWLEDGE_IDEMPOTENCY_CONFLICT = "KNOWLEDGE_IDEMPOTENCY_CONFLICT"
 KNOWLEDGE_IDEMPOTENCY_REQUIRED = "KNOWLEDGE_IDEMPOTENCY_REQUIRED"
 KNOWLEDGE_CONVERSION_VALIDATION_FAILED = "KNOWLEDGE_CONVERSION_VALIDATION_FAILED"
+KNOWLEDGE_VERSION_LEVEL_INVALID = "KNOWLEDGE_VERSION_LEVEL_INVALID"
 
 _ERROR_DEFAULTS: dict[str, tuple[int, str]] = {
     KNOWLEDGE_CONTEXT_MISMATCH: (403, "当前会话与知识库上下文不匹配。"),
@@ -40,6 +41,7 @@ _ERROR_DEFAULTS: dict[str, tuple[int, str]] = {
     KNOWLEDGE_IDEMPOTENCY_CONFLICT: (409, "同一幂等键已用于不同的知识库操作。"),
     KNOWLEDGE_IDEMPOTENCY_REQUIRED: (400, "Agent 知识库变更必须提供幂等键。"),
     KNOWLEDGE_CONVERSION_VALIDATION_FAILED: (409, "知识库转换后的资产校验失败。"),
+    KNOWLEDGE_VERSION_LEVEL_INVALID: (400, "知识版本发布级别无效，仅支持 patch/minor/major。"),
 }
 
 _SAFE_PARAM_SUFFIXES = (
@@ -53,7 +55,7 @@ _SAFE_PARAM_SUFFIXES = (
     "_status",
     "_version",
 )
-_SAFE_PARAM_NAMES = {"count", "revision", "status", "version"}
+_SAFE_PARAM_NAMES = {"count", "revision", "status", "version", "level"}
 
 
 def _is_safe_param_value(value: Any) -> bool:

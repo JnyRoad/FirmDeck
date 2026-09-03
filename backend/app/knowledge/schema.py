@@ -129,6 +129,10 @@ class KnowledgeBaseVersionRead(BaseModel):
     change_reason: str | None = None
     published_at: datetime | None = None
     is_published_head: bool = False
+    is_stale: bool = False
+    base_version: str | None = None
+    draft_name: str | None = None
+    next_version_preview: dict[str, str] | None = None
     capability_scope: CapabilityScope = "general"
     metadata: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
@@ -180,6 +184,8 @@ class SharedKnowledgePublishRequest(BaseModel):
     team_id: str
     expected_published_version_id: NonEmptyText
     change_reason: NonEmptyText
+    level: Literal["patch", "minor", "major"] = "patch"
+    force_overwrite: bool = False
     idempotency_key: str | None = None
 
 
