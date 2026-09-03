@@ -29,10 +29,10 @@
 - [X] T001 验证外部修复是否已合入：检查 backend/app/api/knowledge_bases.py 的无 agent_id 删除分支是否已同事务清理 `TeamKnowledgeBaseBinding`、`TeamKnowledgeBaseGrant` 与 `Team.default_knowledge_base_id`（`git log --all -- backend/app/api/knowledge_bases.py` + 读代码）；把结论写入本文件 Notes；未合入则执行 T002/T003，已合入则跳过并勾选
 - [X] T002 [兜底·测试] 在 backend/tests/test_knowledge_admin_delete_cleanup.py 编写失败测试：管理员删除共享库后绑定、授权、团队默认写入指针全部清理，私有库删除清理分支与资源绑定
 - [X] T003 [兜底] 在 backend/app/api/knowledge_bases.py 删除分支实现同事务清理（仅当 T001 判定未合入）
-- [ ] T004 [P] [测试] 在 backend/tests/test_error_contracts.py 增加断言：`KNOWLEDGE_BASELINE_STALE`(409)、`KNOWLEDGE_REBASE_CONFLICTS_UNRESOLVED`(409)、`KNOWLEDGE_VERSION_LEVEL_INVALID`(400)、`KNOWLEDGE_DOCUMENT_LINEAGE_MISMATCH`(409) 已注册且 message_key 为 `errors.knowledge.*`
-- [ ] T005 [P] 在 backend/app/contracts/error_registry.py 注册上述四个错误码（含 params 名称：`base_version`/`published_version`/`conflict_count`、`document_count`、`level`、`lineage_id`）
-- [ ] T006 [P] [测试] 在 backend/tests/test_event_contracts.py 增加断言：`knowledge.version.published`、`knowledge.draft.rebased`、`knowledge.draft.reviewed` 已注册且 params schema 与 data-model.md §8 一致
-- [ ] T007 [P] 在 backend/app/contracts/event_registry.py 注册三个事件（与现有 `knowledge.ingest.*` 事件同处），声明 params schema、visibility，legacy projection 为 none
+- [X] T004 [P] [测试] 在 backend/tests/test_error_contracts.py 增加断言：`KNOWLEDGE_BASELINE_STALE`(409)、`KNOWLEDGE_REBASE_CONFLICTS_UNRESOLVED`(409)、`KNOWLEDGE_VERSION_LEVEL_INVALID`(400)、`KNOWLEDGE_DOCUMENT_LINEAGE_MISMATCH`(409) 已注册且 message_key 为 `errors.knowledge.*`
+- [X] T005 [P] 在 backend/app/contracts/error_registry.py 注册上述四个错误码（含 params 名称：`base_version`/`published_version`/`conflict_count`、`document_count`、`level`、`lineage_id`）
+- [X] T006 [P] [测试] 在 backend/tests/test_event_contracts.py 增加断言：`knowledge.version.published`、`knowledge.draft.rebased`、`knowledge.draft.reviewed` 已注册且 params schema 与 data-model.md §8 一致
+- [X] T007 [P] 在 backend/app/contracts/event_registry.py 注册三个事件（与现有 `knowledge.ingest.*` 事件同处），声明 params schema、visibility，legacy projection 为 none
 - [ ] T008 [P] [测试] 在 frontend-enterprise/src/i18n/knowledgeAdmin.i18n.test.ts 编写失败测试：`knowledgeAdmin.*` 与 `errors.knowledge.{baselineStale,rebaseConflictsUnresolved,versionLevelInvalid,documentLineageMismatch}` 在 en-US 与 zh-CN 目录键集合对等且 ICU 参数一致
 - [ ] T009 [P] 在 frontend-enterprise/src/i18n/messages/en-US.json 与 zh-CN.json 新增 `knowledgeAdmin.*` 命名空间（按 contracts/frontend-surface.md 子域）与 `shell.nav.knowledgeAdmin`、四条 `errors.knowledge.*`
 - [ ] T010 [P] [测试] 在 frontend-enterprise/src/App.test.tsx 增加失败测试：admin 可打开 `/enterprise/knowledge-admin` 与 `/enterprise/knowledge-admin/:kbId`；非 admin 被重定向到 Gallery
