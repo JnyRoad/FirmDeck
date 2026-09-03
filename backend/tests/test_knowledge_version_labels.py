@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from fastapi import HTTPException
 from test_shared_knowledge_versions import (
     _admin_user,
     _bind_team,
@@ -142,6 +143,55 @@ def test_publish_draft_rejects_invalid_level() -> None:
 
     assert invalid_level.value.code == KNOWLEDGE_VERSION_LEVEL_INVALID
     assert invalid_level.value.details == {"level": "urgent"}
+
+
+def test_publish_route_rejects_invalid_level_as_domain_error_not_422() -> None:
+    """发布路由必须让非法 level 打到领域校验，而不是被 Pydantic 折叠成通用 422。
+
+    SharedKnowledgePublishRequest.level 曾经是 Literal["patch","minor","major"]，
+    这会让 FastAPI 在请求体校验阶段就拒绝非法值，经全局
+    request_validation_error_handler 转成通用 VALIDATION_ERROR（422，
+    params.error_count），永远到不了 SharedKnowledgeVersionService.publish_draft
+    里的 KNOWLEDGE_VERSION_LEVEL_INVALID（400，params.level）判断。这里改为 str，
+    并直接调用路由函数（而非只调用 service）验证契约要求的错误码、状态码与
+    params.level 都正确透出。
+    """
+    with _test_session() as db:
+        base, released = _seed_shared_base(db)
+        _bind_team(db, base)
+        owner = _owner_user()
+
+        draft = create_shared_knowledge_draft(
+            base.id,
+            SharedKnowledgeDraftCreateRequest(
+                tenant_id="tenant_demo",
+                team_id="team_content",
+                change_reason="待发布",
+                expected_published_version_id=released.id,
+            ),
+            db=db,
+            current_user=owner,
+        )
+
+        request = SharedKnowledgePublishRequest(
+            tenant_id="tenant_demo",
+            team_id="team_content",
+            expected_published_version_id=released.id,
+            change_reason="非法级别",
+            level="urgent",
+        )
+        with pytest.raises(HTTPException) as invalid_level:
+            publish_shared_knowledge_version(
+                base.id,
+                draft.id,
+                request,
+                db=db,
+                current_user=owner,
+            )
+
+    assert invalid_level.value.status_code == 400
+    assert invalid_level.value.detail["code"] == KNOWLEDGE_VERSION_LEVEL_INVALID
+    assert invalid_level.value.detail["params"] == {"level": "urgent"}
 
 
 def test_reject_draft_keeps_its_branch_name() -> None:

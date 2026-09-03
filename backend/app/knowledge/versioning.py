@@ -461,8 +461,14 @@ class SharedKnowledgeVersionService:
             "published_from_draft": True,
             "version_level": level,
         }
-        self.db.add(draft)
-        self.db.flush()
+        # 与 create_draft 一致：极端并发下候选标签仍可能撞车，唯一约束兜底，
+        # 映射为可重试的发布冲突而不是泄漏原始数据库异常。
+        try:
+            with self.db.begin_nested():
+                self.db.add(draft)
+                self.db.flush()
+        except IntegrityError as exc:
+            raise self._publish_conflict(base, expected_published_version_id) from exc
         self.db.refresh(base)
         base.metadata_json = {
             **dict(base.metadata_json or {}),

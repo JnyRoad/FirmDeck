@@ -184,7 +184,10 @@ class SharedKnowledgePublishRequest(BaseModel):
     team_id: str
     expected_published_version_id: NonEmptyText
     change_reason: NonEmptyText
-    level: Literal["patch", "minor", "major"] = "patch"
+    # 保持 str 而非 Literal：非法值必须经由领域校验映射为
+    # KNOWLEDGE_VERSION_LEVEL_INVALID（400, params.level），而不是被 Pydantic
+    # 在到达路由前拒绝并折叠成通用 VALIDATION_ERROR（422）。
+    level: str = "patch"
     force_overwrite: bool = False
     idempotency_key: str | None = None
 
