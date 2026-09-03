@@ -195,6 +195,38 @@ _T007_EXPECTED_ENTRIES = {
     "EXTERNAL_OUTCOME_UNKNOWN": ("errors.tenant.externalOutcomeUnknown", 409, False, {}),
 }
 
+# knowledge-base-admin (data-model.md §9): draft baseline/rebase/publish error contracts.
+_KNOWLEDGE_ADMIN_EXPECTED_ENTRIES = {
+    "KNOWLEDGE_BASELINE_STALE": (
+        "errors.knowledge.baselineStale",
+        409,
+        False,
+        {
+            "base_version": "string",
+            "published_version": "string",
+            "conflict_count": "integer",
+        },
+    ),
+    "KNOWLEDGE_REBASE_CONFLICTS_UNRESOLVED": (
+        "errors.knowledge.rebaseConflictsUnresolved",
+        409,
+        False,
+        {"document_count": "integer"},
+    ),
+    "KNOWLEDGE_VERSION_LEVEL_INVALID": (
+        "errors.knowledge.versionLevelInvalid",
+        400,
+        False,
+        {"level": "string"},
+    ),
+    "KNOWLEDGE_DOCUMENT_LINEAGE_MISMATCH": (
+        "errors.knowledge.documentLineageMismatch",
+        409,
+        False,
+        {"lineage_id": "string"},
+    ),
+}
+
 
 def build_registry() -> ErrorRegistry:
     """Build a small isolated registry; it has no process-global or database side effects."""
@@ -239,6 +271,26 @@ def test_t007_system_tenant_error_contracts_are_registered_with_safe_public_shap
     entries = ERROR_REGISTRY.entries()
     assert len(entries) == len({entry.code for entry in entries})
     for code, (message_key, status, retryable, params_schema) in _T007_EXPECTED_ENTRIES.items():
+        entry = ERROR_REGISTRY.require(code)
+        assert entry.visibility is ErrorVisibility.PUBLIC
+        assert (entry.message_key, entry.default_http_status, entry.retryable_default) == (
+            message_key,
+            status,
+            retryable,
+        )
+        assert entry.params_schema == params_schema
+
+
+def test_knowledge_admin_error_contracts_are_registered_with_safe_public_shapes() -> None:
+    """Require every knowledge-base-admin draft/rebase/publish error to be public and parameter-exact."""
+    entries = ERROR_REGISTRY.entries()
+    assert len(entries) == len({entry.code for entry in entries})
+    for code, (
+        message_key,
+        status,
+        retryable,
+        params_schema,
+    ) in _KNOWLEDGE_ADMIN_EXPECTED_ENTRIES.items():
         entry = ERROR_REGISTRY.require(code)
         assert entry.visibility is ErrorVisibility.PUBLIC
         assert (entry.message_key, entry.default_http_status, entry.retryable_default) == (

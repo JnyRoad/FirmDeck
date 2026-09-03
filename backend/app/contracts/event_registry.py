@@ -468,6 +468,44 @@ def _register_default_product_events() -> None:
             raw_source_allowed=False,
             requires_language_context=False,
         ),
+        # knowledge-base-admin (data-model.md §8): draft publish/rebase/review notifications.
+        EventRegistryEntry(
+            event_code="knowledge.version.published",
+            message_key="events.knowledge.versionPublished",
+            params_schema={
+                "knowledge_base_id": "string",
+                "version": "string",
+                "stale_draft_count": "integer",
+            },
+            visibility=EventVisibility.PUBLIC,
+            raw_source_allowed=False,
+            requires_language_context=True,
+        ),
+        EventRegistryEntry(
+            event_code="knowledge.draft.rebased",
+            message_key="events.knowledge.draftRebased",
+            params_schema={
+                "knowledge_base_id": "string",
+                "draft_name": "string",
+                "to_base_version": "string",
+            },
+            visibility=EventVisibility.PUBLIC,
+            raw_source_allowed=False,
+            requires_language_context=True,
+        ),
+        EventRegistryEntry(
+            event_code="knowledge.draft.reviewed",
+            message_key="events.knowledge.draftReviewed",
+            params_schema={
+                "knowledge_base_id": "string",
+                "draft_name": "string",
+                "staged": "integer",
+                "pending": "integer",
+            },
+            visibility=EventVisibility.PUBLIC,
+            raw_source_allowed=False,
+            requires_language_context=True,
+        ),
         EventRegistryEntry(
             event_code="harness.execution.recovered",
             message_key="events.harness.executionRecovered",
