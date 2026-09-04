@@ -26,7 +26,7 @@ import { Dialog, DialogContent, DialogTitle, Input, Textarea } from '@/component
 import { Button } from '@/components/ui/button';
 import { notify } from '@/components/ui/app-toast';
 import { useAppIntl } from '@/i18n';
-import { RawContent } from '@/i18n/RawContent';
+import { RawContent, RawIdentifier } from '@/i18n/RawContent';
 import {
   DIALOG_CANCEL_BUTTON_CLASS,
   DIALOG_FOOTER_CLASS,
@@ -108,6 +108,10 @@ export function ContentTab({ api, kb, ownerAgentId, ownerAgentName, onChanged }:
   const [editContent, setEditContent] = useState('');
   const [editLoading, setEditLoading] = useState(false);
   const [saving, setSaving] = useState(false);
+
+  // 编辑框正文是否为空（读取失败，或 `documentSourceMarkdown` 兜底后仍拼不出内容）；
+  // 为空时禁止保存并提示，避免管理员在没看到警告的情况下用空正文覆盖真实文档。
+  const editContentMissing = Boolean(editTarget) && !editLoading && !editContent.trim();
 
   const headVersion = useMemo(
     () => versions.find((version) => version.is_head) || versions[0] || null,
@@ -294,8 +298,9 @@ export function ContentTab({ api, kb, ownerAgentId, ownerAgentName, onChanged }:
     <div className="flex flex-col gap-[14px]">
       <div className="flex flex-wrap items-center justify-between gap-[10px] rounded-[12px] border-[0.5px] border-[#e3e7f1] bg-[#f7f8fa] px-[14px] py-[10px]">
         <p className="text-[12px] text-[#464c5e]">
-          {t('knowledgeAdmin.private.content.banner.viewing', {
-            name: ownerAgentName || ownerAgentId,
+          {t('knowledgeAdmin.private.content.banner.viewingPrefix')}
+          <RawIdentifier value={ownerAgentName || ownerAgentId} />
+          {t('knowledgeAdmin.private.content.banner.viewingSuffix', {
             version: formatVersion(headVersion?.version),
           })}
           <span className="ml-[8px] text-[#858b9c]">{t(branchSyncMessageId(kb.branch_sync_state))}</span>
@@ -351,13 +356,18 @@ export function ContentTab({ api, kb, ownerAgentId, ownerAgentName, onChanged }:
               className="min-h-[220px]"
               onChange={(event) => setEditContent(event.target.value)}
             />
+            {editContentMissing && (
+              <p role="alert" className="rounded-[8px] bg-[#fff4e5] px-[10px] py-[8px] text-[12px] text-[#a15c00]">
+                {t('knowledgeAdmin.private.content.editDialog.contentMissingWarning')}
+              </p>
+            )}
           </div>
           <div className={DIALOG_FOOTER_CLASS}>
             <Button variant="outline" disabled={saving} onClick={() => setEditTarget(null)} className={DIALOG_CANCEL_BUTTON_CLASS}>
               {t('knowledgeAdmin.private.content.editDialog.cancel')}
             </Button>
             <Button
-              disabled={saving || editLoading}
+              disabled={saving || editLoading || editContentMissing}
               onClick={() => void handleSaveEdit()}
               className="h-[32px] min-w-[80px] rounded-[10px] bg-[#18181a] px-[12px] text-[14px] font-normal text-white hover:bg-[#303030]"
             >

@@ -20,6 +20,7 @@ import { DataTable, type DataTableColumn } from '@/components/DataTable';
 import { Button } from '@/components/ui/button';
 import { notify } from '@/components/ui/app-toast';
 import { useAppIntl } from '@/i18n';
+import { RawIdentifier } from '@/i18n/RawContent';
 import { formatDateTime, OUTLINE_ACTION_BUTTON_SM_CLASS } from '@/lib/enterprise-ui';
 import type { KnowledgeAdminApi } from '@/api/knowledgeAdmin';
 import type { KnowledgeBaseRead } from '@/types';
@@ -174,7 +175,9 @@ export function BranchTab({ api, kb, ownerAgentId, ownerAgentName, onChanged }: 
         <dl className="mt-[12px] grid grid-cols-2 gap-[12px] sm:grid-cols-4">
           <div>
             <dt className="text-[11px] text-[#858b9c]">{t('knowledgeAdmin.private.branch.statusCard.owner')}</dt>
-            <dd className="mt-[2px] text-[13px] font-medium text-[#18181a]">{ownerAgentName || ownerAgentId}</dd>
+            <dd className="mt-[2px] text-[13px] font-medium text-[#18181a]">
+              <RawIdentifier value={ownerAgentName || ownerAgentId} />
+            </dd>
           </div>
           <div>
             <dt className="text-[11px] text-[#858b9c]">{t('knowledgeAdmin.private.branch.statusCard.baseVersion')}</dt>

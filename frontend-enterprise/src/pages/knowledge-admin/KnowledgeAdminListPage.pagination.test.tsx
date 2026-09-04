@@ -194,4 +194,25 @@ describe('KnowledgeAdminListPage pagination', () => {
     ));
     await screen.findByText('知识库 01');
   });
+
+  it('sends exactly one list request when a filter changes while paged past page 1', async () => {
+    const user = userEvent.setup();
+    primeDefaultMocks();
+    renderPage();
+
+    await screen.findByText('知识库 01');
+    await user.click(screen.getByRole('button', { name: '03' }));
+    await screen.findByText('知识库 41');
+
+    mockApi.listKnowledgeBases.mockClear();
+    await user.click(screen.getByRole('tab', { name: /^专用/ }));
+
+    await screen.findByText('知识库 01');
+    // 筛选变化时页码从 3 重置回 1，只应触发一次列表请求（不应先带着旧页码请求一次、
+    // 页码归 1 后再请求一次）。
+    expect(mockApi.listKnowledgeBases).toHaveBeenCalledTimes(1);
+    expect(mockApi.listKnowledgeBases).toHaveBeenCalledWith(
+      expect.objectContaining({ mode: 'dedicated', offset: 0, limit: 20 }),
+    );
+  });
 });

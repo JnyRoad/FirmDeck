@@ -117,10 +117,13 @@ afterEach(() => {
 describe('private ContentTab', () => {
   it('shows a banner with the owner, branch head version, and sync state', async () => {
     const api = createMockApi();
-    renderTab(api);
+    const { container } = renderTab(api);
 
     await waitFor(() => expect(api.listVersions).toHaveBeenCalledWith('kb_1', 'ag_1'));
-    expect(await screen.findByText(/当前查看员工 林晓 的分支头版本 v3/)).toBeTruthy();
+    // 归属员工名必须渲染在 RawIdentifier 边界内，不能拼进 t() 的产品文案字符串里。
+    await screen.findByText(/分支头版本 v3/);
+    const rawOwnerNodes = Array.from(container.querySelectorAll('[data-i18n-raw-kind="identifier"]'));
+    expect(rawOwnerNodes.some((node) => node.textContent === '林晓')).toBe(true);
     expect(screen.getByText('有差异')).toBeTruthy();
   });
 
@@ -201,5 +204,36 @@ describe('private ContentTab', () => {
       'ag_1',
     ));
     expect(onChanged).toHaveBeenCalled();
+  });
+
+  it('warns and disables save when the prefill reconstructs no content', async () => {
+    const user = userEvent.setup();
+    const api = createMockApi();
+    // 默认 mock 的 getDocument 返回空 metadata，documentSourceMarkdown 拼不出任何正文。
+    renderTab(api);
+
+    await screen.findByText('话术文档 A');
+    await user.click(screen.getByRole('button', { name: '编辑' }));
+
+    await screen.findByRole('dialog');
+    await screen.findByLabelText('正文');
+    expect(screen.getByRole('alert').textContent).toBe('无法读取当前内容，保存将覆盖原文。');
+    expect((screen.getByRole('button', { name: '保存' }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it('does not warn and keeps save enabled when the prefill succeeds with content', async () => {
+    const user = userEvent.setup();
+    const api = createMockApi();
+    api.getDocument.mockResolvedValueOnce({ id: 'doc_a', metadata: { raw_text: '已有正文' } });
+    renderTab(api);
+
+    await screen.findByText('话术文档 A');
+    await user.click(screen.getByRole('button', { name: '编辑' }));
+
+    await screen.findByRole('dialog');
+    const contentBox = await screen.findByLabelText('正文');
+    await waitFor(() => expect((contentBox as HTMLTextAreaElement).value).toBe('已有正文'));
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect((screen.getByRole('button', { name: '保存' }) as HTMLButtonElement).disabled).toBe(false);
   });
 });

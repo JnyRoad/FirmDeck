@@ -142,7 +142,7 @@ export default function KnowledgeAdminListPage({ currentUser, onLogout }: Knowle
    * 按当前全部筛选（含类型）+ 当前页向 A1 请求表格行；类型页签/筛选切换会触发重新请求
    * （并在下面的 effect 里先把 `page` 重置为 1），翻页只改变 `offset`。
    */
-  async function loadList() {
+  async function loadList(targetPage: number = page) {
     const context = tenantContext;
     const generation = context?.generation;
     if (!context || generation === undefined) return;
@@ -155,7 +155,7 @@ export default function KnowledgeAdminListPage({ currentUser, onLogout }: Knowle
         ownerAgentId: toApiFilterValue(filters.ownerAgentId),
         teamId: toApiFilterValue(filters.teamId),
         q: filters.q,
-        offset: (page - 1) * LIST_PAGE_SIZE,
+        offset: (targetPage - 1) * LIST_PAGE_SIZE,
         limit: LIST_PAGE_SIZE,
       });
       if (!context.isCurrentGeneration(generation) || listRequestSeqRef.current !== seq) return;
@@ -221,15 +221,27 @@ export default function KnowledgeAdminListPage({ currentUser, onLogout }: Knowle
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [api]);
 
-  // 筛选（含类型页签）变化时回到第 1 页；`page` 本身不在这个 effect 的依赖里，
-  // 避免"筛选变化 -> 重置页码"和"翻页"互相触发对方。
-  useEffect(() => {
-    setPage(1);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [api, filters.mode, filters.status, filters.ownerAgentId, filters.teamId, filters.q]);
+  // 筛选（含类型页签）变化时把页码重置回第 1 页，且这次重置要用的页码在同一个 effect
+  // 里同步算出来并直接发起请求；`lastLoadKeyRef` 记录"筛选 key + 页码"这个组合最近一次
+  // 已经加载过，用来在 `setPage(1)` 引发的下一次 effect 重跑（`page` 依赖变化）里判断
+  // 出那其实是这次重置的回显，从而跳过重复请求——避免旧写法里"筛选变化但仍在旧页码
+  // 请求一次、`page` 变成 1 后又用新页码请求一次"的两次请求。`prevApiRef` 单独跟踪
+  // `api`（租户切换会换一个新实例），保证租户切换即使筛选/页码都没变也照常重新加载。
+  const lastLoadKeyRef = useRef('');
+  const prevApiRef = useRef<typeof api | null>(null);
 
   useEffect(() => {
-    void loadList();
+    const filtersKey = JSON.stringify([filters.mode, filters.status, filters.ownerAgentId, filters.teamId, filters.q]);
+    const apiChanged = prevApiRef.current !== null && prevApiRef.current !== api;
+    prevApiRef.current = api;
+    const filtersChanged = lastLoadKeyRef.current !== '' && !lastLoadKeyRef.current.startsWith(`${filtersKey}|`);
+    const targetPage = filtersChanged ? 1 : page;
+    if (filtersChanged && page !== targetPage) setPage(targetPage);
+
+    const loadKey = `${filtersKey}|${targetPage}`;
+    if (!apiChanged && loadKey === lastLoadKeyRef.current) return;
+    lastLoadKeyRef.current = loadKey;
+    void loadList(targetPage);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [api, filters.mode, filters.status, filters.ownerAgentId, filters.teamId, filters.q, page]);
 

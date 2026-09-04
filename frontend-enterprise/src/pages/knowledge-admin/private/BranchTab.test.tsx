@@ -89,7 +89,9 @@ describe('private BranchTab', () => {
 
     await waitFor(() => expect(api.listVersions).toHaveBeenCalledWith('kb_1', 'ag_1'));
     const card = await screen.findByLabelText('分支状态');
-    expect(card.textContent).toContain('林晓');
+    // 归属员工名必须渲染在 RawIdentifier 边界内，不能和产品文案拼在同一个 t() 字符串里。
+    const rawOwnerNode = card.querySelector('[data-i18n-raw-kind="identifier"]');
+    expect(rawOwnerNode?.textContent).toBe('林晓');
     expect(card.textContent).toContain('v3');
     expect(card.textContent).toContain('已同步');
   });
