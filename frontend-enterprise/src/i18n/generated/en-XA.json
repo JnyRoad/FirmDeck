@@ -2536,7 +2536,7 @@
   "knowledgeAdmin.dialogs.publish.reviewLink": "⟦Ŕééṽîîééŵ çħååñĝééš⟧",
   "knowledgeAdmin.dialogs.publish.reviewStatus": "⟦Ŕééṽîîééŵ šŧååŧûûš: {staged} šŧååĝééð, {pending} þééñðîîñĝ⟧",
   "knowledgeAdmin.dialogs.publish.staleNotice": "⟦Ŧħéé ƀååšéé ṽééŕšîîööñ çħååñĝééð; {count} ðööçûûṁééñŧ(š) ṁååý çööñƒŀîîçŧ.⟧",
-  "knowledgeAdmin.dialogs.publish.title": "⟦Þûûƀŀîîšħ ðŕååƒŧ {draft} → ṽ{next}⟧",
+  "knowledgeAdmin.dialogs.publish.title": "⟦Þûûƀŀîîšħ ðŕååƒŧ {draft} → {next}⟧",
   "knowledgeAdmin.list.actions.create": "⟦Ñééŵ ķñööŵŀééðĝéé ƀååšéé⟧",
   "knowledgeAdmin.list.actions.refresh": "⟦Ŕééƒŕééšħ⟧",
   "knowledgeAdmin.list.columns.actions": "⟦ÅÅçŧîîööñš⟧",

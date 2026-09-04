@@ -104,7 +104,7 @@ export function PublishDialog({
     <Dialog open={open} onOpenChange={(next) => !submitting && onOpenChange(next)}>
       <DialogContent className="w-[min(520px,calc(100vw-32px))] gap-0 overflow-hidden rounded-[16px] border-0 bg-white p-0 shadow-[0px_12px_32px_rgba(0,0,0,0.16)]">
         <DialogTitle className="px-[24px] pt-[20px] pb-[12px] text-[16px] font-semibold text-[#18181a]">
-          {t('knowledgeAdmin.dialogs.publish.title', { draft: draft.draft_name || draft.version, next: nextVersion })}
+          {t('knowledgeAdmin.dialogs.publish.title', { draft: draft.draft_name || draft.version, next: formatVersion(nextVersion) })}
         </DialogTitle>
         <div className="flex flex-col gap-[16px] px-[24px] pb-[16px]">
           <div className="flex flex-col gap-[6px]">

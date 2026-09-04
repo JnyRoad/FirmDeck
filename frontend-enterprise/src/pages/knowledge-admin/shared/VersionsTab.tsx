@@ -87,10 +87,20 @@ export function VersionsTab({ api, kb, onChanged }: VersionsTabProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [api, kb.id]);
 
-  function openDraftContent(versionId: string) {
+  /**
+   * 跳到内容 Tab 对应草稿视图；`reviewIntent=true` 时额外带上 `publish`/`review=1`——
+   * 版本 Tab 自己的发布框状态（`publishTarget`）在切 Tab 时随组件卸载丢失，无法直接带
+   * 过去，改为让内容 Tab 按这两个 URL 参数自己重新打开审阅框并在应用后回到发布框
+   * （同一份草稿），见 ContentTab.tsx 里消费这两个参数的 effect。
+   */
+  function openDraftContent(versionId: string, options: { reviewIntent?: boolean } = {}) {
     const params = new URLSearchParams(searchParams);
     params.set('tab', 'content');
     params.set('view', versionId);
+    if (options.reviewIntent) {
+      params.set('publish', versionId);
+      params.set('review', '1');
+    }
     setSearchParams(params);
   }
 
@@ -298,7 +308,7 @@ export function VersionsTab({ api, kb, onChanged }: VersionsTabProps) {
         submitting={publishing}
         onSubmit={(input) => void handlePublish(input)}
         onRebase={() => toastNotifier.error(createMessageDescriptor('knowledgeAdmin.dialogs.publish.rebaseNotAvailable'))}
-        onReview={publishTarget ? () => openDraftContent(publishTarget.id) : undefined}
+        onReview={publishTarget ? () => openDraftContent(publishTarget.id, { reviewIntent: true }) : undefined}
       />
 
       <Dialog open={Boolean(rejectTarget)} onOpenChange={(next) => !rejecting && !next && setRejectTarget(null)}>

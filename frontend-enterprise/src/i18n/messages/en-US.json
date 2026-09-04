@@ -2614,7 +2614,7 @@
   "knowledgeAdmin.dialogs.createDraft.reasonRequired": "Enter a reason first",
   "knowledgeAdmin.dialogs.createDraft.cancel": "Cancel",
   "knowledgeAdmin.dialogs.createDraft.submit": "Create",
-  "knowledgeAdmin.dialogs.publish.title": "Publish draft {draft} → v{next}",
+  "knowledgeAdmin.dialogs.publish.title": "Publish draft {draft} → {next}",
   "knowledgeAdmin.dialogs.publish.levelLabel": "Version bump",
   "knowledgeAdmin.dialogs.publish.levelPatch": "Patch",
   "knowledgeAdmin.dialogs.publish.levelMinor": "Minor",

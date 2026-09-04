@@ -168,6 +168,26 @@ export function ContentTab({ api, kb, onChanged }: ContentTabProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [api, kb.id, targetVersionId]);
 
+  // 从版本 Tab 的发布框点「去审阅」会带 `?tab=content&view=<id>&publish=<id>&review=1`
+  // 跳到本 Tab（版本 Tab 自身的发布框状态在切 Tab 时被卸载，无法直接保留）；
+  // 这里在草稿视图数据就绪后据此显式打开审阅框（`reviewReturnToPublish=true`），
+  // 应用后自动回到本 Tab 自己渲染的发布框（同一份草稿）。只消费一次，随后清掉这两个
+  // 意图参数，避免用户后续手动关闭/重开审阅框时被重复触发。
+  const consumedReviewIntentRef = useRef(false);
+  useEffect(() => {
+    if (consumedReviewIntentRef.current) return;
+    if (!currentDraft || loadingDiff) return;
+    const wantsReview = searchParams.get('review') === '1' && searchParams.get('publish') === currentDraft.id;
+    if (!wantsReview) return;
+    consumedReviewIntentRef.current = true;
+    openReview(true);
+    const params = new URLSearchParams(searchParams);
+    params.delete('review');
+    params.delete('publish');
+    setSearchParams(params, { replace: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentDraft, loadingDiff, searchParams]);
+
   function setView(next: string) {
     const params = new URLSearchParams(searchParams);
     if (next === PUB_VIEW) params.delete('view');

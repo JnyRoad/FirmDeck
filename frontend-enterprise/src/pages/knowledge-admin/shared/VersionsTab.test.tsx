@@ -8,7 +8,7 @@
  */
 import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { MemoryRouter } from 'react-router-dom';
+import { MemoryRouter, useSearchParams } from 'react-router-dom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { I18nProvider } from '@/i18n';
@@ -16,6 +16,7 @@ import { TooltipProvider } from '@/components/ui/tooltip';
 import type { KnowledgeBaseRead } from '@/types';
 import type { KnowledgeAdminVersionRead } from '@/types/knowledgeAdmin';
 
+import { ContentTab } from './ContentTab';
 import { VersionsTab } from './VersionsTab';
 
 const sharedKb: KnowledgeBaseRead = {
@@ -77,6 +78,11 @@ function createMockApi() {
       summary: { added: 0, modified: 0, deleted: 0 },
       documents: [],
     }),
+    // Needed only by ContentTab, mounted for the cross-tab publish/review flow test below.
+    uploadDocument: vi.fn(),
+    updateDocument: vi.fn(),
+    archiveDocument: vi.fn(),
+    recordReview: vi.fn().mockResolvedValue({}),
   };
 }
 
@@ -87,6 +93,31 @@ function renderVersionsTab(mockApi: ReturnType<typeof createMockApi>) {
         <MemoryRouter initialEntries={['/kb?tab=versions']}>
           {/* eslint-disable-next-line @typescript-eslint/no-explicit-any */}
           <VersionsTab api={mockApi as any} kb={sharedKb} />
+        </MemoryRouter>
+      </TooltipProvider>
+    </I18nProvider>,
+  );
+}
+
+/**
+ * Minimal stand-in for the slice of KnowledgeAdminDetailPage that matters here: it renders
+ * VersionsTab or ContentTab from the same `?tab=` query param they both read/write, so a
+ * cross-tab navigation (Versions -> "去审阅" -> Content) can be exercised without touching
+ * KnowledgeAdminDetailPage.tsx itself (owned by another in-flight change).
+ */
+function DetailPageStub({ api }: { api: ReturnType<typeof createMockApi> }) {
+  const [searchParams] = useSearchParams();
+  const tab = searchParams.get('tab') || 'versions';
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return tab === 'content' ? <ContentTab api={api as any} kb={sharedKb} /> : <VersionsTab api={api as any} kb={sharedKb} />;
+}
+
+function renderDetailPageStub(mockApi: ReturnType<typeof createMockApi>) {
+  return render(
+    <I18nProvider>
+      <TooltipProvider>
+        <MemoryRouter initialEntries={['/kb?tab=versions']}>
+          <DetailPageStub api={mockApi} />
         </MemoryRouter>
       </TooltipProvider>
     </I18nProvider>,
@@ -162,5 +193,36 @@ describe('VersionsTab', () => {
       changeReason: '扩充产品条款',
       expectedPublishedVersionId: 'kbver_current',
     }));
+  });
+
+  it('returns to the publish dialog for the same draft after applying a review opened from the Versions-tab publish dialog', async () => {
+    const user = userEvent.setup();
+    const api = createMockApi();
+    renderDetailPageStub(api);
+
+    // Open the publish dialog for draft-bb22 from the Versions tab.
+    await screen.findByText('draft-bb22');
+    const draftRow = screen.getByText('draft-bb22').closest('tr')!;
+    await user.click(within(draftRow).getByRole('button', { name: '发布' }));
+    expect(await screen.findByRole('heading', { name: /draft-bb22/ })).toBeTruthy();
+
+    // "去审阅" navigates to the Content tab (VersionsTab, and its publishTarget state,
+    // unmount here) carrying the publish/review intent in the URL.
+    await user.click(screen.getByText('去审阅'));
+
+    // ContentTab picks up the intent and opens the review dialog itself.
+    expect(await screen.findByRole('heading', { name: '审阅变更' })).toBeTruthy();
+    const applyButton = (await screen.findByRole('button', { name: '应用到草稿' })) as HTMLButtonElement;
+    await waitFor(() => expect(applyButton.disabled).toBe(false));
+    await user.click(applyButton);
+
+    await waitFor(() => expect(api.recordReview).toHaveBeenCalledWith('kb_1', 'kbver_draft_2', expect.objectContaining({
+      staged: 0,
+      pending: 0,
+    })));
+
+    // Back to a publish dialog, for the same draft, without going through the Versions tab again.
+    expect(await screen.findByRole('heading', { name: /draft-bb22/ })).toBeTruthy();
+    expect(screen.queryByRole('heading', { name: '审阅变更' })).toBeNull();
   });
 });

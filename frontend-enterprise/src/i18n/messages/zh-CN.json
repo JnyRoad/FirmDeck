@@ -2614,7 +2614,7 @@
   "knowledgeAdmin.dialogs.createDraft.reasonRequired": "请先填写原因",
   "knowledgeAdmin.dialogs.createDraft.cancel": "取消",
   "knowledgeAdmin.dialogs.createDraft.submit": "创建",
-  "knowledgeAdmin.dialogs.publish.title": "发布草稿 {draft} → v{next}",
+  "knowledgeAdmin.dialogs.publish.title": "发布草稿 {draft} → {next}",
   "knowledgeAdmin.dialogs.publish.levelLabel": "版本递进",
   "knowledgeAdmin.dialogs.publish.levelPatch": "修订号",
   "knowledgeAdmin.dialogs.publish.levelMinor": "次版本",
