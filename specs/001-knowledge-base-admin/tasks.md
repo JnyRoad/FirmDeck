@@ -103,11 +103,11 @@
 - [X] T037 [P] [US2] [测试] 在 frontend-enterprise/src/pages/knowledge-admin/review/hunkModel.test.ts 编写失败测试：rows/hunks 构建（`insertAt`/`bs`/`bi`）、相似度配对 `alignHunk`、字符级 `charOps`/`innerHtml`、`restorePos`
 - [X] T038 [P] [US2] [测试] 在 frontend-enterprise/src/pages/knowledge-admin/review/staging.test.ts 编写失败测试：`stage` 更新暂存基线与后续记录偏移、`unstage` 精确校验与偏移回退、接受全部按降序、拒绝、重置、`pending`/`hasWork`
 - [X] T039 [US2] [测试] 在 frontend-enterprise/src/pages/knowledge-admin/review/ReviewEditor.test.tsx 编写失败测试：输入后整篇重算与光标保持；Enter 拆行/Backspace 合并/Delete；跨行选区 Backspace、insertText、粘贴多行；composition 期间不重绘、结束后同步；块接受折叠为 ✓ 行 + 撤销接受；红行 ↩ 恢复（配对替换 / 未配对插回）；绿行 ✕；选区撤销按钮启用与执行；新增文档整篇拒绝、删除文档拒绝恢复；顶部计数与 apply 可用性
-- [ ] T040 [P] [US2] [测试] 在 frontend-enterprise/src/pages/knowledge-admin/shared/ContentTab.test.tsx 编写失败测试：视图切换器；正式视图只读且隐藏草稿新增；草稿视图新增/修改/删除标记与恢复；横幅信息（创建者、来源、基线、发布后版本号预览、原因）与按钮；上传/编辑/删除请求携带草稿 `knowledge_base_version_id`
-- [ ] T041 [P] [US2] [测试] 在 frontend-enterprise/src/pages/knowledge-admin/shared/ContentTab.reviewApply.test.tsx 编写失败测试：「应用到草稿」按审阅结果调用文档更新（`content_md`+`expected_updated_at`）、新增拒绝归档、删除拒绝恢复，最后调用 review 端点；成功后 toast 与刷新；从发布框进入时应用后返回发布框；文档更新或 review 返回 `KNOWLEDGE_PUBLISH_CONFLICT` 时提示"草稿已被他人修改，请刷新后重新审阅"且不提交剩余写回
-- [ ] T042 [P] [US2] [测试] 在 frontend-enterprise/src/pages/knowledge-admin/shared/VersionsTab.test.tsx 编写失败测试：服务端顺序原样展示、草稿行 查看变更/发布/驳回、released 行回滚、当前正式版标记、创建草稿对话框（原因必填、来源上下文含"管理员直连"）
-- [ ] T043 [P] [US2] [测试] 在 frontend-enterprise/src/pages/knowledge-admin/dialogs/PublishDialog.test.tsx 编写失败测试：标题显示 `draft → next`；level 下拉切换更新结果号；审阅状态展示；非 stale 单按钮确认；stale 时展示冲突数与三按钮（变基/仍然覆盖发布/取消），覆盖发布调用 `force_overwrite=true`
-- [ ] T044 [P] [US2] [测试] 在 frontend-enterprise/src/pages/knowledge-admin/shared/AuditTab.test.tsx 编写失败测试：动作/群组/操作者/版本筛选、分页加载更多、raw 字段用 `RawContent`
+- [X] T040 [P] [US2] [测试] 在 frontend-enterprise/src/pages/knowledge-admin/shared/ContentTab.test.tsx 编写失败测试：视图切换器；正式视图只读且隐藏草稿新增；草稿视图新增/修改/删除标记与恢复；横幅信息（创建者、来源、基线、发布后版本号预览、原因）与按钮；上传/编辑/删除请求携带草稿 `knowledge_base_version_id`
+- [X] T041 [P] [US2] [测试] 在 frontend-enterprise/src/pages/knowledge-admin/shared/ContentTab.reviewApply.test.tsx 编写失败测试：「应用到草稿」按审阅结果调用文档更新（`content_md`+`expected_updated_at`）、新增拒绝归档、删除拒绝恢复，最后调用 review 端点；成功后 toast 与刷新；从发布框进入时应用后返回发布框；文档更新或 review 返回 `KNOWLEDGE_PUBLISH_CONFLICT` 时提示"草稿已被他人修改，请刷新后重新审阅"且不提交剩余写回
+- [X] T042 [P] [US2] [测试] 在 frontend-enterprise/src/pages/knowledge-admin/shared/VersionsTab.test.tsx 编写失败测试：服务端顺序原样展示、草稿行 查看变更/发布/驳回、released 行回滚、当前正式版标记、创建草稿对话框（原因必填、来源上下文含"管理员直连"）
+- [X] T043 [P] [US2] [测试] 在 frontend-enterprise/src/pages/knowledge-admin/dialogs/PublishDialog.test.tsx 编写失败测试：标题显示 `draft → next`；level 下拉切换更新结果号；审阅状态展示；非 stale 单按钮确认；stale 时展示冲突数与三按钮（变基/仍然覆盖发布/取消），覆盖发布调用 `force_overwrite=true`
+- [X] T044 [P] [US2] [测试] 在 frontend-enterprise/src/pages/knowledge-admin/shared/AuditTab.test.tsx 编写失败测试：动作/群组/操作者/版本筛选、分页加载更多、raw 字段用 `RawContent`
 
 ### Implementation for User Story 2
 
@@ -115,11 +115,11 @@
 - [X] T046 [P] [US2] 实现 frontend-enterprise/src/pages/knowledge-admin/review/hunkModel.ts
 - [X] T047 [P] [US2] 实现 frontend-enterprise/src/pages/knowledge-admin/review/staging.ts
 - [X] T048 [US2] 实现 frontend-enterprise/src/pages/knowledge-admin/review/editorDom.ts（光标定位、行读取、选区映射）与 review/ReviewEditor.tsx（contenteditable 行编辑器、事件处理、暂存折叠渲染、行级/选区操作；文案由 props 注入）
-- [ ] T049 [US2] 实现 frontend-enterprise/src/pages/knowledge-admin/shared/ContentTab.tsx（含审阅打开与写回、复用现有文档编辑对话框）
-- [ ] T050 [US2] 实现 frontend-enterprise/src/pages/knowledge-admin/shared/VersionsTab.tsx 与 dialogs/CreateDraftDialog.tsx
-- [ ] T051 [US2] 实现 frontend-enterprise/src/pages/knowledge-admin/dialogs/PublishDialog.tsx（stale 分支通过 `onRebase` 回调交给 US3）
-- [ ] T052 [US2] 实现 frontend-enterprise/src/pages/knowledge-admin/shared/AuditTab.tsx
-- [ ] T053 [US2] 在 frontend-enterprise/src/pages/knowledge-admin/KnowledgeAdminDetailPage.tsx 接入 ContentTab/VersionsTab/AuditTab，删除占位
+- [X] T049 [US2] 实现 frontend-enterprise/src/pages/knowledge-admin/shared/ContentTab.tsx（含审阅打开与写回、复用现有文档编辑对话框）
+- [X] T050 [US2] 实现 frontend-enterprise/src/pages/knowledge-admin/shared/VersionsTab.tsx 与 dialogs/CreateDraftDialog.tsx
+- [X] T051 [US2] 实现 frontend-enterprise/src/pages/knowledge-admin/dialogs/PublishDialog.tsx（stale 分支通过 `onRebase` 回调交给 US3）
+- [X] T052 [US2] 实现 frontend-enterprise/src/pages/knowledge-admin/shared/AuditTab.tsx
+- [X] T053 [US2] 在 frontend-enterprise/src/pages/knowledge-admin/KnowledgeAdminDetailPage.tsx 接入 ContentTab/VersionsTab/AuditTab，删除占位
 
 **Checkpoint**: US1 + US2 可独立演示（quickstart S1、S2）
 
