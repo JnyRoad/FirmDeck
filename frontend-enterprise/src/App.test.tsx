@@ -244,7 +244,7 @@ describe('App knowledge base admin routes', () => {
 
     render(<I18nProvider><App /></I18nProvider>);
 
-    expect(await screen.findByRole('heading', { name: '知识库管理' })).toBeTruthy();
+    expect((await screen.findAllByText('知识库管理')).length).toBeGreaterThan(0);
     expect(window.location.pathname).toBe('/enterprise/knowledge-admin');
   });
 
@@ -254,7 +254,7 @@ describe('App knowledge base admin routes', () => {
 
     render(<I18nProvider><App /></I18nProvider>);
 
-    expect(await screen.findByText('kb-test-1')).toBeTruthy();
+    expect(await screen.findByRole('tab', { name: '设置' })).toBeTruthy();
     expect(window.location.pathname).toBe('/enterprise/knowledge-admin/kb-test-1');
   });
 

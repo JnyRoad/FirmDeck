@@ -13,6 +13,7 @@
 import type { TenantSessionContextValue } from '@/contexts/TenantSessionContext';
 import { KnowledgeBaseMode, VersionLevel } from '@/enums/knowledge';
 import type {
+  AgentProfileRead,
   CapabilityScope,
   KnowledgeBaseAuditPageRead,
   KnowledgeBaseConversionRead,
@@ -166,6 +167,20 @@ export type ArchiveDocumentBody = {
   expectedUpdatedAt?: string;
 };
 
+/**
+ * 既有端点复用：`POST /knowledge-bases`（无独立契约条目，路径/方法与
+ * `KnowledgePage.tsx` 中 `createEmptyKnowledgeBase` 的内联调用一致）。
+ * `mode='shared'` 时 `agentId` 必须省略，与后端 `KnowledgeBaseCreateRequest` 的
+ * `validate_shared_has_no_employee_owner` 校验保持一致。
+ */
+export type CreateKnowledgeBaseBody = {
+  name: string;
+  description?: string;
+  mode: KnowledgeBaseMode;
+  agentId?: string;
+  capabilityScope?: CapabilityScope;
+};
+
 /** 既有端点复用：`PUT /knowledge-bases/{kb_id}` 请求体。 */
 export type UpdateKnowledgeBaseBody = {
   name?: string;
@@ -250,6 +265,11 @@ export function createKnowledgeAdminApi(
       return client.get(appendQuery('/api/enterprise/knowledge-admin/teams', {
         exclude_bound_to: params.excludeBoundTo,
       }));
+    },
+
+    /** 既有端点：租户全部员工列表，供"新建私有知识库"归属员工选择器使用（`AgentsPage.tsx` 同款调用）。 */
+    listAgents(): Promise<AgentProfileRead[]> {
+      return client.get('/api/enterprise/agents');
     },
 
     /** A2 版本对比：`against` 默认 `base`，超过 `max_lines` 的文档不含 `hunks`。 */
@@ -416,6 +436,17 @@ export function createKnowledgeAdminApi(
       }), {
         status: 'archived',
         expected_updated_at: body.expectedUpdatedAt,
+      });
+    },
+
+    /** 既有端点：创建知识库（共享/私有），路径与方法复用 `KnowledgePage.tsx` 内联调用。 */
+    createKnowledgeBase(body: CreateKnowledgeBaseBody): Promise<KnowledgeBaseRead> {
+      return client.post('/api/enterprise/knowledge-bases', {
+        name: body.name,
+        description: body.description,
+        mode: body.mode,
+        agent_id: body.mode === KnowledgeBaseMode.Dedicated ? body.agentId : undefined,
+        capability_scope: body.capabilityScope,
       });
     },
 

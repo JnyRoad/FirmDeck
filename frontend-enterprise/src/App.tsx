@@ -783,7 +783,7 @@ function Shell({
                 path={EnterpriseRoute.KnowledgeAdmin}
                 element={
                   isAdmin ? (
-                    <KnowledgeAdminListPage />
+                    <KnowledgeAdminListPage currentUser={auth.user} onLogout={onLogout} />
                   ) : (
                     <Navigate to={EnterpriseRoute.Gallery} replace />
                   )
@@ -793,7 +793,7 @@ function Shell({
                 path={`${EnterpriseRoute.KnowledgeAdmin}/:kbId`}
                 element={
                   isAdmin ? (
-                    <KnowledgeAdminDetailPage />
+                    <KnowledgeAdminDetailPage currentUser={auth.user} onLogout={onLogout} />
                   ) : (
                     <Navigate to={EnterpriseRoute.Gallery} replace />
                   )
