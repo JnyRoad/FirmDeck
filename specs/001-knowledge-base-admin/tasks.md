@@ -203,8 +203,8 @@
 - [ ] T079 [P] 性能验证（SC-007）：在 backend/tests/test_knowledge_admin_perf.py 用 200 个知识库 fixture 断言列表端点 p95 ≤ 2s、2000 行文档 diff 端点 ≤ 1s；在 frontend-enterprise/src/pages/knowledge-admin/review/ReviewEditor.perf.test.tsx 断言 2000 行文档单次按键重绘 ≤ 50ms；结果写入 PR，未达标视为阻塞
 - [X] T080 [P] [测试] 【P0 发布阻塞：US2-b 写回依赖真实文档 id】在 backend/tests/test_knowledge_version_documents.py 编写失败测试：`GET /api/enterprise/knowledge-admin/knowledge-bases/{kb_id}/versions/{version_id}/documents` 返回该版本全部文档（id、lineage_id、title、filename、status、bucket_count、updated_at，含未改动文档），admin 或 history viewer 可访问，非法版本 404/403；diff 响应的每篇文档增加 `base_document_id` / `target_document_id`
 - [X] T081 实现版本文档列表端点与 diff 响应的文档 id：backend/app/api/knowledge_admin.py（A2b 路由）、backend/app/knowledge/diff.py（DocumentSnapshot 携带 document_id 并投影）、backend/app/knowledge/schema.py；同步 contracts/knowledge-admin-api.md（A2b）与 frontend-enterprise/src/api/knowledgeAdmin.ts（`listVersionDocuments`）+ types
-- [ ] T082 [测试] 在 frontend-enterprise/src/pages/knowledge-admin/shared/toast.test.tsx 编写失败测试：知识库管理页的错误提示（SettingsTab 保存失败、ListPage 删除失败、ContentTab 写回冲突）必须真正弹出本地化文案（legacy `notify.error(text)` 会静默丢弃预本地化字符串）
-- [ ] T083 统一知识库管理页的 toast 出口：shared/errorMessage.ts 改为基于 `createToastNotifier` 的 descriptor 通知（或复用 US2-b 的做法），替换 SettingsTab.tsx / KnowledgeAdminListPage.tsx / ContentTab.tsx 中的 legacy `notify` 调用；ContentTab 改用 T081 的版本文档列表展示未改动文档并用 document_id 写回
+- [X] T082 [测试] 在 frontend-enterprise/src/pages/knowledge-admin/shared/toast.test.tsx 编写失败测试：知识库管理页的错误提示（SettingsTab 保存失败、ListPage 删除失败、ContentTab 写回冲突）必须真正弹出本地化文案（legacy `notify.error(text)` 会静默丢弃预本地化字符串）
+- [X] T083 统一知识库管理页的 toast 出口：shared/errorMessage.ts 改为基于 `createToastNotifier` 的 descriptor 通知（或复用 US2-b 的做法），替换 SettingsTab.tsx / KnowledgeAdminListPage.tsx / ContentTab.tsx 中的 legacy `notify` 调用；ContentTab 改用 T081 的版本文档列表展示未改动文档并用 document_id 写回
 - [ ] T084 迁移剩余 toast 调用点到 `useKnowledgeAdminToast`：frontend-enterprise/src/pages/knowledge-admin/KnowledgeAdminListPage.tsx、KnowledgeAdminDetailPage.tsx、private/ContentTab.tsx、private/BranchTab.tsx（T083 因并行编辑未覆盖）；对应测试断言注册错误码显示具体本地化文案；完成后删除 shared/errorMessage.ts 的兼容旧导出（若无调用方）
 
 ---
