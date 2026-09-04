@@ -157,13 +157,13 @@
 
 ### Tests for User Story 4
 
-- [ ] T062 [P] [US4] [测试] 在 frontend-enterprise/src/components/knowledge/TeamKnowledgePermissionMatrix.test.tsx 增加失败测试：新增批量设置（全部 reader/editor/撤销）后矩阵状态正确，且不影响 TeamDetailPage 既有用法
-- [ ] T063 [P] [US4] [测试] 在 frontend-enterprise/src/pages/knowledge-admin/shared/GrantsTab.test.tsx 编写失败测试：绑定群组候选来自 `GET /knowledge-admin/teams`；绑定后成员默认未授权；设为默认写入；解绑二次确认；保存矩阵携带 `expected_revision`，冲突时提示刷新
+- [X] T062 [P] [US4] [测试] 在 frontend-enterprise/src/components/knowledge/TeamKnowledgePermissionMatrix.test.tsx 增加失败测试：新增批量设置（全部 reader/editor/撤销）后矩阵状态正确，且不影响 TeamDetailPage 既有用法
+- [X] T063 [P] [US4] [测试] 在 frontend-enterprise/src/pages/knowledge-admin/shared/GrantsTab.test.tsx 编写失败测试：绑定群组候选来自 `GET /knowledge-admin/teams`；绑定后成员默认未授权；设为默认写入；解绑二次确认；保存矩阵携带 `expected_revision`，冲突时提示刷新
 
 ### Implementation for User Story 4
 
-- [ ] T064 [US4] 扩展 frontend-enterprise/src/components/knowledge/TeamKnowledgePermissionMatrix.tsx 增加批量设置（可选 props，向后兼容）
-- [ ] T065 [US4] 实现 frontend-enterprise/src/pages/knowledge-admin/shared/GrantsTab.tsx 并接入 KnowledgeAdminDetailPage.tsx
+- [X] T064 [US4] 扩展 frontend-enterprise/src/components/knowledge/TeamKnowledgePermissionMatrix.tsx 增加批量设置（可选 props，向后兼容）
+- [X] T065 [US4] 实现 frontend-enterprise/src/pages/knowledge-admin/shared/GrantsTab.tsx 并接入 KnowledgeAdminDetailPage.tsx
 
 **Checkpoint**: US4 可独立演示
 
