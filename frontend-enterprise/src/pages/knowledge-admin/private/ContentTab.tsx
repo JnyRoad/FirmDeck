@@ -24,8 +24,8 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { DataTable, type DataTableColumn } from '@/components/DataTable';
 import { Dialog, DialogContent, DialogTitle, Input, Textarea } from '@/components/ui';
 import { Button } from '@/components/ui/button';
-import { notify } from '@/components/ui/app-toast';
 import { useAppIntl } from '@/i18n';
+import { createMessageDescriptor } from '@/i18n/descriptors';
 import { RawContent, RawIdentifier } from '@/i18n/RawContent';
 import {
   DIALOG_CANCEL_BUTTON_CLASS,
@@ -38,7 +38,7 @@ import type { KnowledgeBaseRead, KnowledgeDocumentRead } from '@/types';
 import type { KnowledgeAdminVersionRead, VersionDocument } from '@/types/knowledgeAdmin';
 
 import { formatVersion } from '../knowledgeAdminModel';
-import { knowledgeAdminErrorMessage } from '../shared/errorMessage';
+import { useKnowledgeAdminToast } from '../shared/errorMessage';
 import { branchSyncMessageId } from './branchStatus';
 
 export type PrivateContentTabProps = {
@@ -95,6 +95,7 @@ function fileToBase64(file: File): Promise<string> {
 /** 私有库内容 Tab：分支头文档表 + 上传 / 编辑 / 删除 / 恢复，每次写入都产生新分支版本。 */
 export function ContentTab({ api, kb, ownerAgentId, ownerAgentName, onChanged }: PrivateContentTabProps) {
   const { t } = useAppIntl();
+  const toast = useKnowledgeAdminToast();
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const [versions, setVersions] = useState<KnowledgeAdminVersionRead[]>([]);
@@ -123,7 +124,7 @@ export function ContentTab({ api, kb, ownerAgentId, ownerAgentName, onChanged }:
       const rows = await api.listVersionDocuments(kb.id, headVersionId);
       setDocuments(Array.isArray(rows) ? rows : []);
     } catch (error) {
-      notify.error(knowledgeAdminErrorMessage(error, 'knowledgeAdmin.toast.loadFailed', { t }));
+      toast.error(error, 'knowledgeAdmin.toast.loadFailed');
     }
   }
 
@@ -141,7 +142,7 @@ export function ContentTab({ api, kb, ownerAgentId, ownerAgentName, onChanged }:
         setDocuments([]);
       }
     } catch (error) {
-      notify.error(knowledgeAdminErrorMessage(error, 'knowledgeAdmin.toast.loadFailed', { t }));
+      toast.error(error, 'knowledgeAdmin.toast.loadFailed');
     } finally {
       setLoading(false);
     }
@@ -160,11 +161,11 @@ export function ContentTab({ api, kb, ownerAgentId, ownerAgentName, onChanged }:
         { knowledgeBaseId: kb.id, filename: file.name, contentBase64, title: file.name },
         ownerAgentId,
       );
-      notify.successText(t('knowledgeAdmin.toast.uploadSuccess'));
+      toast.success(createMessageDescriptor('knowledgeAdmin.toast.uploadSuccess'));
       await reloadAll();
       onChanged?.();
     } catch (error) {
-      notify.error(knowledgeAdminErrorMessage(error, 'knowledgeAdmin.toast.updateError', { t }));
+      toast.error(error, 'knowledgeAdmin.toast.updateError');
     } finally {
       setUploading(false);
       if (fileInputRef.current) fileInputRef.current.value = '';
@@ -195,12 +196,12 @@ export function ContentTab({ api, kb, ownerAgentId, ownerAgentName, onChanged }:
         { title: editTitle, contentMd: editContent, expectedUpdatedAt: editTarget.updated_at },
         ownerAgentId,
       );
-      notify.successText(t('knowledgeAdmin.toast.updateSuccess'));
+      toast.success(createMessageDescriptor('knowledgeAdmin.toast.updateSuccess'));
       setEditTarget(null);
       await reloadAll();
       onChanged?.();
     } catch (error) {
-      notify.error(knowledgeAdminErrorMessage(error, 'knowledgeAdmin.toast.updateError', { t }));
+      toast.error(error, 'knowledgeAdmin.toast.updateError');
     } finally {
       setSaving(false);
     }
@@ -210,11 +211,11 @@ export function ContentTab({ api, kb, ownerAgentId, ownerAgentName, onChanged }:
     setBusyId(document.id);
     try {
       await api.archiveDocument(document.id, { expectedUpdatedAt: document.updated_at }, ownerAgentId);
-      notify.successText(t('knowledgeAdmin.toast.archiveDocumentSuccess'));
+      toast.success(createMessageDescriptor('knowledgeAdmin.toast.archiveDocumentSuccess'));
       await reloadAll();
       onChanged?.();
     } catch (error) {
-      notify.error(knowledgeAdminErrorMessage(error, 'knowledgeAdmin.toast.deleteError', { t }));
+      toast.error(error, 'knowledgeAdmin.toast.deleteError');
     } finally {
       setBusyId(null);
     }
@@ -224,11 +225,11 @@ export function ContentTab({ api, kb, ownerAgentId, ownerAgentName, onChanged }:
     setBusyId(document.id);
     try {
       await api.updateDocument(document.id, { status: 'ready', expectedUpdatedAt: document.updated_at }, ownerAgentId);
-      notify.successText(t('knowledgeAdmin.toast.restoreDocumentSuccess'));
+      toast.success(createMessageDescriptor('knowledgeAdmin.toast.restoreDocumentSuccess'));
       await reloadAll();
       onChanged?.();
     } catch (error) {
-      notify.error(knowledgeAdminErrorMessage(error, 'knowledgeAdmin.toast.updateError', { t }));
+      toast.error(error, 'knowledgeAdmin.toast.updateError');
     } finally {
       setBusyId(null);
     }

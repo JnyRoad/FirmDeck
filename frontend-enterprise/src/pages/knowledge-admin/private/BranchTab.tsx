@@ -18,8 +18,8 @@ import { useEffect, useMemo, useState } from 'react';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
 import { DataTable, type DataTableColumn } from '@/components/DataTable';
 import { Button } from '@/components/ui/button';
-import { notify } from '@/components/ui/app-toast';
 import { useAppIntl } from '@/i18n';
+import { createMessageDescriptor } from '@/i18n/descriptors';
 import { RawIdentifier } from '@/i18n/RawContent';
 import { formatDateTime, OUTLINE_ACTION_BUTTON_SM_CLASS } from '@/lib/enterprise-ui';
 import type { KnowledgeAdminApi } from '@/api/knowledgeAdmin';
@@ -27,7 +27,7 @@ import type { KnowledgeBaseRead } from '@/types';
 import type { KnowledgeAdminVersionRead } from '@/types/knowledgeAdmin';
 
 import { formatVersion } from '../knowledgeAdminModel';
-import { knowledgeAdminErrorMessage } from '../shared/errorMessage';
+import { useKnowledgeAdminToast } from '../shared/errorMessage';
 import { branchSyncMessageId } from './branchStatus';
 
 export type PrivateBranchTabProps = {
@@ -41,6 +41,7 @@ export type PrivateBranchTabProps = {
 /** 私有库分支 Tab：状态卡 + 同步/发布到广场 + 历史版本回滚。 */
 export function BranchTab({ api, kb, ownerAgentId, ownerAgentName, onChanged }: PrivateBranchTabProps) {
   const { t } = useAppIntl();
+  const toast = useKnowledgeAdminToast();
   const [versions, setVersions] = useState<KnowledgeAdminVersionRead[]>([]);
   const [loading, setLoading] = useState(false);
 
@@ -61,7 +62,7 @@ export function BranchTab({ api, kb, ownerAgentId, ownerAgentName, onChanged }: 
       const rows = await api.listVersions(kb.id, ownerAgentId);
       setVersions(Array.isArray(rows) ? rows : []);
     } catch (error) {
-      notify.error(knowledgeAdminErrorMessage(error, 'knowledgeAdmin.toast.loadFailed', { t }));
+      toast.error(error, 'knowledgeAdmin.toast.loadFailed');
     } finally {
       setLoading(false);
     }
@@ -76,12 +77,12 @@ export function BranchTab({ api, kb, ownerAgentId, ownerAgentName, onChanged }: 
     setSyncing(true);
     try {
       await api.syncFromOverall(kb.id, ownerAgentId);
-      notify.successText(t('knowledgeAdmin.private.branch.toast.syncSuccess'));
+      toast.success(createMessageDescriptor('knowledgeAdmin.private.branch.toast.syncSuccess'));
       setSyncOpen(false);
       await load();
       onChanged?.();
     } catch (error) {
-      notify.error(knowledgeAdminErrorMessage(error, 'knowledgeAdmin.toast.updateError', { t }));
+      toast.error(error, 'knowledgeAdmin.toast.updateError');
     } finally {
       setSyncing(false);
     }
@@ -91,12 +92,12 @@ export function BranchTab({ api, kb, ownerAgentId, ownerAgentName, onChanged }: 
     setPromoting(true);
     try {
       await api.promoteToOverall(kb.id, ownerAgentId);
-      notify.successText(t('knowledgeAdmin.private.branch.toast.promoteSuccess'));
+      toast.success(createMessageDescriptor('knowledgeAdmin.private.branch.toast.promoteSuccess'));
       setPromoteOpen(false);
       await load();
       onChanged?.();
     } catch (error) {
-      notify.error(knowledgeAdminErrorMessage(error, 'knowledgeAdmin.toast.updateError', { t }));
+      toast.error(error, 'knowledgeAdmin.toast.updateError');
     } finally {
       setPromoting(false);
     }
@@ -107,14 +108,14 @@ export function BranchTab({ api, kb, ownerAgentId, ownerAgentName, onChanged }: 
     setRollingBack(true);
     try {
       await api.rollbackDedicatedBranch(kb.id, { agentId: ownerAgentId, version: rollbackTarget.version });
-      notify.successText(
-        t('knowledgeAdmin.private.branch.toast.rollbackSuccess', { version: formatVersion(rollbackTarget.version) }),
+      toast.success(
+        createMessageDescriptor('knowledgeAdmin.private.branch.toast.rollbackSuccess', { version: formatVersion(rollbackTarget.version) }),
       );
       setRollbackTarget(null);
       await load();
       onChanged?.();
     } catch (error) {
-      notify.error(knowledgeAdminErrorMessage(error, 'knowledgeAdmin.toast.updateError', { t }));
+      toast.error(error, 'knowledgeAdmin.toast.updateError');
     } finally {
       setRollingBack(false);
     }

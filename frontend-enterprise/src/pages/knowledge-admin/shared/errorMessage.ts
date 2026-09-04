@@ -1,12 +1,12 @@
 /**
- * 知识库管理端统一 toast 出口（T083）。
+ * 知识库管理端统一 toast 出口（T083；T084 完成全量调用点迁移）。
  *
  * 背景：`notify.error(message)`（legacy facade，见 `components/ui/app-toast.tsx`）内部经
  * `localizedLegacyMessage → apiErrorMessage(typeof message==='string' ? message : undefined)`，
  * 只接受**稳定错误码字符串**，不接受任意已翻译好的自然语言文本——传入已翻译文本时，
  * `apiErrorCode` 无法从中解析出稳定码，于是静默退化成通用兜底文案
- * （`common.error.generic`），把 `knowledgeAdminErrorMessage(...)` 已经算出来的、更具体的
- * 错误说明（例如 `errors.knowledge.baselineStale` 的冲突详情）整个丢弃。
+ * （`common.error.generic`），把原本算出来的、更具体的错误说明（例如
+ * `errors.knowledge.baselineStale` 的冲突详情）整个丢弃。
  *
  * 修复方式：不先把错误"翻译成字符串"再喂给 legacy `notify`，而是像 `GrantsTab.tsx` 那样
  * 直接用 `createToastNotifier({t})` + `MessageDescriptor`（id + 具名参数）驱动 toast，
@@ -21,17 +21,15 @@
  *   在特定业务场景下需要比契约默认文案更精确的措辞，如 `ContentTab.tsx` 的
  *   `KNOWLEDGE_PUBLISH_CONFLICT` 在"应用审阅"场景下要显示专属提示），跳过错误码映射直接显示。
  *
- * 旧的 `knowledgeAdminErrorMessage`/`KnowledgeAdminFallbackMessageId` 原样保留兼容签名——
- * `private/*`、`KnowledgeAdminListPage.tsx`、`KnowledgeAdminDetailPage.tsx`（US5 并发编辑中，
- * 本次改动范围不包含这些文件的调用点迁移）仍在使用，未做一次性全量替换。
+ * `private/*`、`KnowledgeAdminListPage.tsx`、`KnowledgeAdminDetailPage.tsx` 在 T084 已迁移
+ * 到 `useKnowledgeAdminToast()`；旧的 `knowledgeAdminErrorMessage` 兼容导出无调用方后已移除。
  */
 import { useMemo } from 'react';
 
 import { createToastNotifier, type AppToastOptions } from '@/components/ui/app-toast';
 import { useAppIntl } from '@/i18n';
 import { createMessageDescriptor, type MessageDescriptor } from '@/i18n/descriptors';
-import { apiErrorMessage, backendErrorMessageDescriptor } from '@/lib/apiErrorMessages';
-import type { AppTranslator } from '@/i18n';
+import { backendErrorMessageDescriptor } from '@/lib/apiErrorMessages';
 
 export type KnowledgeAdminFallbackMessageId =
   | 'knowledgeAdmin.toast.loadFailed'
@@ -69,18 +67,4 @@ export function useKnowledgeAdminToast() {
     /** 调用方已确定要显示的具体 descriptor（跳过错误码→契约文案的默认映射）。 */
     errorDescriptor: (descriptor: MessageDescriptor, options?: AppToastOptions) => toast.error(descriptor, options),
   }), [toast]);
-}
-
-/**
- * @deprecated 保留旧调用点兼容签名（`private/*`、`KnowledgeAdminListPage.tsx`、
- * `KnowledgeAdminDetailPage.tsx` 仍在使用）；新调用点改用 `useKnowledgeAdminToast().error`。
- * 稳定错误码命中时使用后端映射文案；未命中（通用兜底）时改用本页面语义化的兜底键。
- */
-export function knowledgeAdminErrorMessage(
-  error: unknown,
-  fallbackId: KnowledgeAdminFallbackMessageId,
-  translator: Pick<AppTranslator, 't'>,
-): string {
-  const message = apiErrorMessage(error, fallbackId, translator);
-  return message === translator.t('common.error.generic') ? translator.t(fallbackId) : message;
 }

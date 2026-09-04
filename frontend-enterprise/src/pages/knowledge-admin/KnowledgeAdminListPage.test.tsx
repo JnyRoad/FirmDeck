@@ -7,7 +7,7 @@
  * `⋯` 菜单项按 mode 差异、新建对话框（私有未选员工阻止）、下线/删除二次确认
  * （展示 draft_count）。`api/knowledgeAdmin.ts` 整体 mock，不发真实网络请求。
  */
-import type { ComponentProps } from 'react';
+import type { ComponentProps, ReactElement } from 'react';
 import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
@@ -76,6 +76,11 @@ vi.mock('@/components/ui/input', () => ({
 vi.mock('@/components/ui/textarea', () => ({
   Textarea: (props: ComponentProps<'textarea'>) => <textarea {...props} />,
 }));
+
+// T084：断言迁移后的 toast 出口——已注册错误码要显示契约里的具体本地化文案，
+// 而不是 legacy notify 把整句译文当错误码解析失败后退化成的通用兜底文案。
+const sonnerSpies = vi.hoisted(() => ({ custom: vi.fn() }));
+vi.mock('sonner', () => ({ toast: sonnerSpies }));
 
 import KnowledgeAdminListPage from './KnowledgeAdminListPage';
 
@@ -491,5 +496,18 @@ describe('KnowledgeAdminListPage', () => {
     await user.click(screen.getByRole('button', { name: '删除' }));
 
     await waitFor(() => expect(mockApi.deleteKnowledgeBase).toHaveBeenCalledWith('kb_shared_1'));
+  });
+
+  it('shows the registered error code\'s specific localized text (not the generic fallback) when the list fails to load', async () => {
+    mockApi.listKnowledgeBases.mockRejectedValue({ code: 'KNOWLEDGE_BASE_NOT_FOUND' });
+    mockApi.listAgents.mockResolvedValue(agents);
+    mockApi.listBindableTeams.mockResolvedValue([]);
+    renderPage();
+
+    await waitFor(() => expect(sonnerSpies.custom).toHaveBeenCalled());
+    const renderer = sonnerSpies.custom.mock.calls[sonnerSpies.custom.mock.calls.length - 1]?.[0];
+    const { container } = render((renderer as () => ReactElement)());
+    expect(container.textContent).toMatch(/未找到请求的资源/);
+    expect(container.textContent).not.toMatch(/操作失败，请稍后重试/);
   });
 });

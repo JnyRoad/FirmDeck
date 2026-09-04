@@ -6,6 +6,7 @@
  * `listVersionDocuments(kb.id, headVersionId)`；上传/编辑/删除后分支头版本 +1
  * （`listVersions` 重新拉取返回新的 head）且列表随之刷新，`onChanged` 被调用。
  */
+import type { ReactElement } from 'react';
 import { cleanup, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -13,6 +14,11 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { I18nProvider } from '@/i18n';
 import type { KnowledgeBaseRead } from '@/types';
 import type { KnowledgeAdminVersionRead, VersionDocument } from '@/types/knowledgeAdmin';
+
+// T084：断言迁移后的 toast 出口——已注册错误码要显示契约里的具体本地化文案，
+// 而不是 legacy notify 把整句译文当错误码解析失败后退化成的通用兜底文案。
+const sonnerSpies = vi.hoisted(() => ({ custom: vi.fn() }));
+vi.mock('sonner', () => ({ toast: sonnerSpies }));
 
 import { ContentTab } from './ContentTab';
 
@@ -235,5 +241,27 @@ describe('private ContentTab', () => {
     await waitFor(() => expect((contentBox as HTMLTextAreaElement).value).toBe('已有正文'));
     expect(screen.queryByRole('alert')).toBeNull();
     expect((screen.getByRole('button', { name: '保存' }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it('shows the registered error code\'s specific localized text (not the generic fallback) when saving an edit conflicts', async () => {
+    const user = userEvent.setup();
+    const api = createMockApi();
+    api.updateDocument.mockRejectedValue({ code: 'KNOWLEDGE_PUBLISH_CONFLICT' });
+    renderTab(api);
+
+    await screen.findByText('话术文档 A');
+    await user.click(screen.getByRole('button', { name: '编辑' }));
+
+    await screen.findByRole('dialog');
+    const contentBox = await screen.findByLabelText('正文');
+    await user.clear(contentBox);
+    await user.type(contentBox, '更新后的正文');
+    await user.click(screen.getByRole('button', { name: '保存' }));
+
+    await waitFor(() => expect(sonnerSpies.custom).toHaveBeenCalled());
+    const renderer = sonnerSpies.custom.mock.calls[sonnerSpies.custom.mock.calls.length - 1]?.[0];
+    const { container } = render((renderer as () => ReactElement)());
+    expect(container.textContent).toMatch(/正式版本已变化/);
+    expect(container.textContent).not.toMatch(/操作失败，请稍后重试/);
   });
 });

@@ -36,7 +36,6 @@ import {
   TabsTrigger,
 } from '@/components/ui';
 import { Button } from '@/components/ui/button';
-import { notify } from '@/components/ui/app-toast';
 import { useTenantSession } from '@/contexts/TenantSessionContext';
 import { KnowledgeBaseMode } from '@/enums/knowledge';
 import { EnterpriseRoute } from '@/enums/routes';
@@ -62,7 +61,7 @@ import IconRefresh from '../../assets/icons/refresh.svg?react';
 import type { EnterpriseAuthUser } from '../../auth';
 import { CreateKnowledgeBaseDialog, type CreateKnowledgeBaseDraft } from './dialogs/CreateKnowledgeBaseDialog';
 import { DeleteDialog } from './dialogs/DeleteDialog';
-import { knowledgeAdminErrorMessage } from './shared/errorMessage';
+import { useKnowledgeAdminToast } from './shared/errorMessage';
 import {
   ALL_FILTER_VALUE,
   defaultKnowledgeAdminListFilters,
@@ -94,6 +93,7 @@ export type KnowledgeAdminListPageProps = {
 export default function KnowledgeAdminListPage({ currentUser, onLogout }: KnowledgeAdminListPageProps = {}) {
   const navigate = useNavigate();
   const { t } = useAppIntl();
+  const toast = useKnowledgeAdminToast();
   const tenantContext = useTenantSession();
   const api = useMemo(() => createKnowledgeAdminApi(tenantContext), [tenantContext]);
   const uiSinks = useMemo(() => createUiSinks({ t }), [t]);
@@ -164,7 +164,7 @@ export default function KnowledgeAdminListPage({ currentUser, onLogout }: Knowle
       setHasMore(Boolean(listResult?.has_more));
     } catch (error) {
       if (!context.isCurrentGeneration(generation) || listRequestSeqRef.current !== seq) return;
-      notify.error(knowledgeAdminErrorMessage(error, 'knowledgeAdmin.toast.loadFailed', { t }));
+      toast.error(error, 'knowledgeAdmin.toast.loadFailed');
     } finally {
       if (context.isCurrentGeneration(generation) && listRequestSeqRef.current === seq) setLoading(false);
     }
@@ -191,7 +191,7 @@ export default function KnowledgeAdminListPage({ currentUser, onLogout }: Knowle
       setSummary(result?.summary ?? EMPTY_SUMMARY);
     } catch (error) {
       if (!context.isCurrentGeneration(generation) || summaryRequestSeqRef.current !== seq) return;
-      notify.error(knowledgeAdminErrorMessage(error, 'knowledgeAdmin.toast.loadFailed', { t }));
+      toast.error(error, 'knowledgeAdmin.toast.loadFailed');
     }
   }
 
@@ -207,7 +207,7 @@ export default function KnowledgeAdminListPage({ currentUser, onLogout }: Knowle
       setTeams(Array.isArray(teamsResult) ? teamsResult : []);
     } catch (error) {
       if (!context.isCurrentGeneration(generation)) return;
-      notify.error(knowledgeAdminErrorMessage(error, 'knowledgeAdmin.toast.loadFailed', { t }));
+      toast.error(error, 'knowledgeAdmin.toast.loadFailed');
     }
   }
 
@@ -254,10 +254,10 @@ export default function KnowledgeAdminListPage({ currentUser, onLogout }: Knowle
   async function toggleStatus(row: KnowledgeAdminListItem) {
     try {
       await api.updateKnowledgeBase(row.id, { status: row.status === 'active' ? 'archived' : 'active' });
-      notify.successText(t('knowledgeAdmin.toast.updateSuccess'));
+      toast.success(createMessageDescriptor('knowledgeAdmin.toast.updateSuccess'));
       await Promise.all([loadList(), loadSummary()]);
     } catch (error) {
-      notify.error(knowledgeAdminErrorMessage(error, 'knowledgeAdmin.toast.updateError', { t }));
+      toast.error(error, 'knowledgeAdmin.toast.updateError');
     }
   }
 
@@ -265,22 +265,22 @@ export default function KnowledgeAdminListPage({ currentUser, onLogout }: Knowle
     try {
       const blob = await api.exportOkf(row.id, row.owner_agent?.id);
       uiSinks.download(blob, createMessageDescriptor('knowledgePage.download.backupPrefix'), row.name, 'okf.zip');
-      notify.successText(t('knowledgeAdmin.toast.exportSuccess'));
+      toast.success(createMessageDescriptor('knowledgeAdmin.toast.exportSuccess'));
     } catch (error) {
-      notify.error(knowledgeAdminErrorMessage(error, 'knowledgeAdmin.toast.exportError', { t }));
+      toast.error(error, 'knowledgeAdmin.toast.exportError');
     }
   }
 
   async function handleLint(row: KnowledgeAdminListItem) {
     try {
       const result = await api.lintOkf(row.id, row.owner_agent?.id);
-      notify.successText(
+      toast.success(
         result.issue_count
-          ? t('knowledgeAdmin.toast.lintIssues', { count: result.issue_count })
-          : t('knowledgeAdmin.toast.lintPassed'),
+          ? createMessageDescriptor('knowledgeAdmin.toast.lintIssues', { count: result.issue_count })
+          : createMessageDescriptor('knowledgeAdmin.toast.lintPassed'),
       );
     } catch (error) {
-      notify.error(knowledgeAdminErrorMessage(error, 'knowledgeAdmin.toast.lintError', { t }));
+      toast.error(error, 'knowledgeAdmin.toast.lintError');
     }
   }
 
@@ -290,12 +290,12 @@ export default function KnowledgeAdminListPage({ currentUser, onLogout }: Knowle
       const full = await api.getKnowledgeBase(row.id, row.owner_agent.id);
       setConversionState({ kb: full, agentId: row.owner_agent.id });
     } catch (error) {
-      notify.error(knowledgeAdminErrorMessage(error, 'knowledgeAdmin.toast.loadFailed', { t }));
+      toast.error(error, 'knowledgeAdmin.toast.loadFailed');
     }
   }
 
   async function handleConverted() {
-    notify.successText(t('knowledgeAdmin.toast.convertSuccess'));
+    toast.success(createMessageDescriptor('knowledgeAdmin.toast.convertSuccess'));
     setConversionState(null);
     await Promise.all([loadList(), loadSummary()]);
   }
@@ -309,11 +309,11 @@ export default function KnowledgeAdminListPage({ currentUser, onLogout }: Knowle
         mode: draft.mode,
         agentId: draft.mode === KnowledgeBaseMode.Dedicated ? draft.ownerAgentId : undefined,
       });
-      notify.successText(t('knowledgeAdmin.toast.createSuccess'));
+      toast.success(createMessageDescriptor('knowledgeAdmin.toast.createSuccess'));
       setCreateOpen(false);
       navigate(`${EnterpriseRoute.KnowledgeAdmin}/${created.id}`);
     } catch (error) {
-      notify.error(knowledgeAdminErrorMessage(error, 'knowledgeAdmin.toast.createError', { t }));
+      toast.error(error, 'knowledgeAdmin.toast.createError');
     } finally {
       setCreating(false);
     }
@@ -324,11 +324,11 @@ export default function KnowledgeAdminListPage({ currentUser, onLogout }: Knowle
     setDeleting(true);
     try {
       await api.deleteKnowledgeBase(deleteTarget.id);
-      notify.successText(t('knowledgeAdmin.toast.deleteSuccess'));
+      toast.success(createMessageDescriptor('knowledgeAdmin.toast.deleteSuccess'));
       setDeleteTarget(null);
       await Promise.all([loadList(), loadSummary()]);
     } catch (error) {
-      notify.error(knowledgeAdminErrorMessage(error, 'knowledgeAdmin.toast.deleteError', { t }));
+      toast.error(error, 'knowledgeAdmin.toast.deleteError');
     } finally {
       setDeleting(false);
     }

@@ -4,10 +4,10 @@
  * 知识库管理端统一 toast 出口测试（T082，先于 T083 实现编写，验证当前 RED）。
  *
  * 背景：`notify.error(text)`（legacy facade）只接受稳定错误码字符串，传入任意已翻译好的
- * 自然语言文本时会静默退化成通用兜底文案（`common.error.generic`），把
- * `knowledgeAdminErrorMessage(...)` 算出来的具体错误说明整个丢弃——这正是 SettingsTab 保存
- * 失败、ListPage 删除失败、ContentTab 写回冲突等场景里，用户只看到"操作失败，请稍后重试。"
- * 而看不到具体原因的根因。
+ * 自然语言文本时会静默退化成通用兜底文案（`common.error.generic`），把旧的
+ * `knowledgeAdminErrorMessage(...)`（已在 T084 随全部调用点迁移移除）算出来的具体错误说明
+ * 整个丢弃——这正是 SettingsTab 保存失败、ListPage 删除失败、ContentTab 写回冲突等场景里，
+ * 用户只看到"操作失败，请稍后重试。"而看不到具体原因的根因。
  *
  * 覆盖：
  * 1. 已注册错误码（`KNOWLEDGE_BASELINE_STALE`、`KNOWLEDGE_PUBLISH_CONFLICT`）经统一出口显示

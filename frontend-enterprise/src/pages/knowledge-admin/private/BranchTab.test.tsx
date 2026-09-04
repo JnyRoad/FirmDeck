@@ -6,6 +6,7 @@
  * 「从广场同步」/「发布到广场为模板」/历史版本「回滚到此版本」都走二次确认，
  * 确认后调用对应 API 并刷新（`onChanged` 被调用）。
  */
+import type { ReactElement } from 'react';
 import { cleanup, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -13,6 +14,11 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { I18nProvider } from '@/i18n';
 import type { KnowledgeBaseRead } from '@/types';
 import type { KnowledgeAdminVersionRead } from '@/types/knowledgeAdmin';
+
+// T084：断言迁移后的 toast 出口——已注册错误码要显示契约里的具体本地化文案，
+// 而不是 legacy notify 把整句译文当错误码解析失败后退化成的通用兜底文案。
+const sonnerSpies = vi.hoisted(() => ({ custom: vi.fn() }));
+vi.mock('sonner', () => ({ toast: sonnerSpies }));
 
 import { BranchTab } from './BranchTab';
 
@@ -141,5 +147,22 @@ describe('private BranchTab', () => {
 
     await waitFor(() => expect(api.rollbackDedicatedBranch).toHaveBeenCalledWith('kb_1', { agentId: 'ag_1', version: '2' }));
     expect(onChanged).toHaveBeenCalled();
+  });
+
+  it('shows the registered error code\'s specific localized text (not the generic fallback) when syncing from the marketplace conflicts', async () => {
+    const user = userEvent.setup();
+    const api = createMockApi();
+    api.syncFromOverall.mockRejectedValue({ code: 'KNOWLEDGE_BINDING_REVISION_CONFLICT' });
+    renderTab(api);
+
+    await screen.findByLabelText('分支状态');
+    await user.click(screen.getByRole('button', { name: '从广场同步' }));
+    await user.click(await screen.findByRole('button', { name: '同步' }));
+
+    await waitFor(() => expect(sonnerSpies.custom).toHaveBeenCalled());
+    const renderer = sonnerSpies.custom.mock.calls[sonnerSpies.custom.mock.calls.length - 1]?.[0];
+    const { container } = render((renderer as () => ReactElement)());
+    expect(container.textContent).toMatch(/权限配置已被其他管理员更新/);
+    expect(container.textContent).not.toMatch(/操作失败，请稍后重试/);
   });
 });

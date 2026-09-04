@@ -18,11 +18,11 @@ import AppHeader from '@/components/AppHeader';
 import { SharedKnowledgeConversionDialog } from '@/components/knowledge/SharedKnowledgeConversionDialog';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui';
 import { Button } from '@/components/ui/button';
-import { notify } from '@/components/ui/app-toast';
 import { useTenantSession } from '@/contexts/TenantSessionContext';
 import { PublicationState } from '@/enums/knowledge';
 import { EnterpriseRoute } from '@/enums/routes';
 import { useAppIntl, type MessageId } from '@/i18n';
+import { createMessageDescriptor } from '@/i18n/descriptors';
 import { RawContent } from '@/i18n/RawContent';
 import type { KnowledgeBaseConversionRead, KnowledgeBaseRead } from '@/types';
 
@@ -31,7 +31,7 @@ import { BranchTab as PrivateBranchTab } from './private/BranchTab';
 import { ContentTab as PrivateContentTab } from './private/ContentTab';
 import { AuditTab } from './shared/AuditTab';
 import { ContentTab } from './shared/ContentTab';
-import { knowledgeAdminErrorMessage } from './shared/errorMessage';
+import { useKnowledgeAdminToast } from './shared/errorMessage';
 import { GrantsTab } from './shared/GrantsTab';
 import { PlaceholderTab } from './shared/PlaceholderTab';
 import { SettingsTab } from './shared/SettingsTab';
@@ -65,6 +65,7 @@ export default function KnowledgeAdminDetailPage({ currentUser, onLogout }: Know
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const { t } = useAppIntl();
+  const toast = useKnowledgeAdminToast();
   const tenantContext = useTenantSession();
   const api = useMemo(() => createKnowledgeAdminApi(tenantContext), [tenantContext]);
 
@@ -135,7 +136,7 @@ export default function KnowledgeAdminDetailPage({ currentUser, onLogout }: Know
       }
     } catch (error) {
       if (!context.isCurrentGeneration(generation)) return;
-      notify.error(knowledgeAdminErrorMessage(error, 'knowledgeAdmin.detail.loadError', { t }));
+      toast.error(error, 'knowledgeAdmin.detail.loadError');
     } finally {
       if (context.isCurrentGeneration(generation)) setLoading(false);
     }
@@ -169,7 +170,7 @@ export default function KnowledgeAdminDetailPage({ currentUser, onLogout }: Know
 
   /** 转共享成功：源库已归档、新共享库带首个正式版落地，跳到新库的「群组与权限」页。 */
   async function handleConverted(result: KnowledgeBaseConversionRead) {
-    notify.successText(t('knowledgeAdmin.toast.convertSuccess'));
+    toast.success(createMessageDescriptor('knowledgeAdmin.toast.convertSuccess'));
     setConversionOpen(false);
     navigate(`${EnterpriseRoute.KnowledgeAdmin}/${result.new_knowledge_base.id}?tab=grants`, { replace: true });
   }
