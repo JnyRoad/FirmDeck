@@ -103,6 +103,7 @@ export function ContentTab({ api, kb, onChanged }: ContentTabProps) {
   const toastNotifier = useMemo(() => createToastNotifier({ t }), [t]);
 
   const [versions, setVersions] = useState<KnowledgeAdminVersionRead[]>([]);
+  const [versionsLoaded, setVersionsLoaded] = useState(false);
   const [diff, setDiff] = useState<VersionDiff | null>(null);
   const [loadingDiff, setLoadingDiff] = useState(false);
   const [uploading, setUploading] = useState(false);
@@ -137,8 +138,13 @@ export function ContentTab({ api, kb, onChanged }: ContentTabProps) {
     try {
       const result = await api.listVersions(kb.id);
       setVersions(Array.isArray(result) ? result : []);
+      setVersionsLoaded(true);
     } catch (error) {
       notify.error(knowledgeAdminErrorMessage(error, 'knowledgeAdmin.toast.loadFailed', { t }));
+      // `currentDraft` can never resolve if the version list failed to load — without
+      // this, a pending `publish=<id>&review=1` review-intent would linger in the URL
+      // forever (the intent-consuming effect below never sees a matching draft).
+      clearReviewIntentParams();
     }
   }
 
@@ -174,11 +180,38 @@ export function ContentTab({ api, kb, onChanged }: ContentTabProps) {
   // 应用后自动回到本 Tab 自己渲染的发布框（同一份草稿）。只消费一次，随后清掉这两个
   // 意图参数，避免用户后续手动关闭/重开审阅框时被重复触发。
   const consumedReviewIntentRef = useRef(false);
+
+  /** 清掉 `publish`/`review` 两个意图参数但不打开审阅框（草稿加载失败/草稿已不存在时）。 */
+  function clearReviewIntentParams() {
+    if (consumedReviewIntentRef.current) return;
+    if (!searchParams.get('review') && !searchParams.get('publish')) return;
+    consumedReviewIntentRef.current = true;
+    const params = new URLSearchParams(searchParams);
+    params.delete('review');
+    params.delete('publish');
+    setSearchParams(params, { replace: true });
+  }
+
   useEffect(() => {
     if (consumedReviewIntentRef.current) return;
-    if (!currentDraft || loadingDiff) return;
-    const wantsReview = searchParams.get('review') === '1' && searchParams.get('publish') === currentDraft.id;
+    const publishIntentId = searchParams.get('publish');
+    const wantsReview = searchParams.get('review') === '1' && Boolean(publishIntentId);
     if (!wantsReview) return;
+
+    // 版本列表已加载但意图指向的草稿不存在（例如已被他人发布/驳回）：清掉参数，不打开审阅框。
+    if (versionsLoaded && !versions.some((version) => version.id === publishIntentId)) {
+      clearReviewIntentParams();
+      return;
+    }
+
+    if (!currentDraft) return;
+    // 不能只靠 `loadingDiff`（见 fix round 2 报告的竞态分析）：`targetVersionId` 从正式版
+    // 切到本草稿的那次渲染里，`loadDiff` effect 调用 `setLoadingDiff(true)` 属于"本次渲染
+    // 提交后才生效"的新一轮 state，本 effect 在同一批渲染里读到的仍是旧闭包里的
+    // `loadingDiff===false`，而 `diff` 这时可能还是上一个目标（例如正式版）的对比结果。
+    // 因此直接判断已加载的 `diff` 是否确实属于当前草稿，而不是判断 `loadingDiff` 是否为 false。
+    if (!diff || diff.target_version_id !== currentDraft.id) return;
+
     consumedReviewIntentRef.current = true;
     openReview(true);
     const params = new URLSearchParams(searchParams);
@@ -186,7 +219,7 @@ export function ContentTab({ api, kb, onChanged }: ContentTabProps) {
     params.delete('publish');
     setSearchParams(params, { replace: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentDraft, loadingDiff, searchParams]);
+  }, [currentDraft, diff, versions, versionsLoaded, searchParams]);
 
   function setView(next: string) {
     const params = new URLSearchParams(searchParams);

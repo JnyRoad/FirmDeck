@@ -10,7 +10,7 @@
  */
 import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { MemoryRouter } from 'react-router-dom';
+import { MemoryRouter, useLocation } from 'react-router-dom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { I18nProvider } from '@/i18n';
@@ -98,11 +98,19 @@ function createMockApi() {
   };
 }
 
+// Exposes the router's current `location.search` via a testid, since `MemoryRouter`
+// keeps its own in-memory history and never touches `window.location`.
+function LocationSearchProbe() {
+  const location = useLocation();
+  return <span data-testid="location-search">{location.search}</span>;
+}
+
 function renderContentTab(mockApi: ReturnType<typeof createMockApi>, initialEntry = '/kb') {
   return render(
     <I18nProvider>
       <TooltipProvider>
         <MemoryRouter initialEntries={[initialEntry]}>
+          <LocationSearchProbe />
           {/* eslint-disable-next-line @typescript-eslint/no-explicit-any */}
           <ContentTab api={mockApi as any} kb={sharedKb} />
         </MemoryRouter>
@@ -205,5 +213,50 @@ describe('ContentTab', () => {
 
     await user.click(screen.getByRole('button', { name: '恢复' }));
     await waitFor(() => expect(api.updateDocument).toHaveBeenCalledWith('doc_del_1', expect.objectContaining({ status: 'ready' })));
+  });
+
+  // Regression for the fix-round-1 race: on a fresh mount with `?view=<draftId>` already
+  // in the URL (exactly what the Versions-tab publish dialog's "去审阅" link produces),
+  // `versions` starts out `[]`, so `targetVersionId` first falls back to
+  // `kb.published_version_id` and `loadDiff()` fetches the PUBLISHED diff before
+  // `loadVersions()` resolves. The review-intent effect must NOT open the review editor
+  // against that stale published diff — it must wait until the loaded `diff` actually
+  // belongs to the draft being reviewed.
+  it('review-intent deep link waits for the draft diff, not the still-loading published diff (race regression)', async () => {
+    const api = createMockApi();
+    // Force `listVersions()` to resolve strictly after the (immediate) published-diff
+    // fetch, so `currentDraft`/`targetVersionId` only flip to the draft well after
+    // `diff` has already settled on the published version's diff — the exact ordering
+    // the fix-round-1 race depends on (network timing means either request can win).
+    api.listVersions.mockImplementation(
+      () => new Promise((resolve) => setTimeout(() => resolve([draftVersion]), 30)),
+    );
+    renderContentTab(api, '/kb?view=kbver_draft_1&publish=kbver_draft_1&review=1');
+
+    const dialog = await screen.findByRole('dialog', { name: '审阅变更' });
+    // Must show the draft's own diff documents...
+    expect(within(dialog).getByText('新增文档')).toBeTruthy();
+    expect(within(dialog).getByText('修改文档')).toBeTruthy();
+    // ...never the published version's diff document that was fetched first.
+    expect(within(dialog).queryByText('发布说明')).toBeNull();
+  });
+
+  it('review-intent deep link strips `publish`/`review` from the URL once consumed', async () => {
+    const api = createMockApi();
+    renderContentTab(api, '/kb?view=kbver_draft_1&publish=kbver_draft_1&review=1');
+
+    await screen.findByRole('dialog', { name: '审阅变更' });
+    await waitFor(() => expect(screen.getByTestId('location-search').textContent || '').not.toContain('review'));
+    expect(screen.getByTestId('location-search').textContent || '').not.toContain('publish');
+  });
+
+  it('clears a stale review-intent from the URL if loadVersions() fails, without opening review', async () => {
+    const api = createMockApi();
+    api.listVersions.mockRejectedValueOnce(new Error('network error'));
+    renderContentTab(api, '/kb?view=kbver_draft_1&publish=kbver_draft_1&review=1');
+
+    await waitFor(() => expect(screen.getByTestId('location-search').textContent || '').not.toContain('review'));
+    expect(screen.getByTestId('location-search').textContent || '').not.toContain('publish');
+    expect(screen.queryByRole('dialog', { name: '审阅变更' })).toBeNull();
   });
 });

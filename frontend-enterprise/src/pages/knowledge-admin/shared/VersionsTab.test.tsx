@@ -71,13 +71,16 @@ function createMockApi() {
     publishDraft: vi.fn(),
     rejectDraft: vi.fn(),
     rollbackVersion: vi.fn().mockResolvedValue({ status: 'ok' }),
-    getVersionDiff: vi.fn().mockResolvedValue({
+    // `target_version_id` echoes the requested version id (not a fixed constant) —
+    // ContentTab's review-intent effect gates on `diff.target_version_id ===
+    // currentDraft.id`, so a static mock would never satisfy it for any draft.
+    getVersionDiff: vi.fn().mockImplementation((_kbId: string, versionId: string) => Promise.resolve({
       base_version_id: null,
-      target_version_id: 'x',
+      target_version_id: versionId,
       pairing: 'lineage',
       summary: { added: 0, modified: 0, deleted: 0 },
       documents: [],
-    }),
+    })),
     // Needed only by ContentTab, mounted for the cross-tab publish/review flow test below.
     uploadDocument: vi.fn(),
     updateDocument: vi.fn(),
