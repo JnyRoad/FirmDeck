@@ -10,6 +10,7 @@ import {
 import { I18nProvider } from '@/i18n';
 import { tenantUserStorageKey } from '@/lib/tenant-storage';
 import type { AgentProfileRead, TeamRead } from '@/types';
+import type { KnowledgeAdminListItem } from '@/types/knowledgeAdmin';
 
 import App from './App';
 
@@ -58,6 +59,26 @@ const team: TeamRead = {
   status: 'active',
   members: [],
   created_at: '2026-08-01T00:00:00Z',
+  updated_at: '2026-08-01T00:00:00Z',
+};
+
+// 详情页 load() 的首个也是主要数据源（admin-first，见 KnowledgeAdminDetailPage.tsx）。
+// 不给这条路由单独打桩时，通用 `/api/enterprise/` 兜底会回 `[]`，
+// `item.bound_teams.length` 抛错，页面落入错误态而不渲染 Tabs。
+const sharedAdminItem: KnowledgeAdminListItem = {
+  id: 'kb-test-1',
+  name: '共享知识库',
+  description: '',
+  mode: 'shared',
+  status: 'active',
+  capability_scope: 'general',
+  published_version: '1.0.0',
+  published_version_id: 'kbver-1',
+  draft_count: 0,
+  document_count: 0,
+  owner_agent: null,
+  bound_teams: [],
+  branch: null,
   updated_at: '2026-08-01T00:00:00Z',
 };
 
@@ -139,6 +160,18 @@ function stubAppFetch() {
     }
     if (url.includes('/api/auth/me')) return jsonResponse(authUser);
     if (url.includes('/api/enterprise/agents')) return jsonResponse([agent]);
+    if (/\/api\/enterprise\/knowledge-admin\/knowledge-bases\/kb-test-1\/versions\/[^/]+\/diff/.test(url)) {
+      return jsonResponse({
+        base_version_id: 'kbver-1',
+        target_version_id: 'kbver-1',
+        pairing: 'lineage',
+        summary: { added: 0, modified: 0, deleted: 0 },
+        documents: [],
+      });
+    }
+    if (url.includes('/api/enterprise/knowledge-admin/knowledge-bases/kb-test-1')) {
+      return jsonResponse(sharedAdminItem);
+    }
     if (/\/api\/enterprise\/teams\/team-1\/(tasks|blackboard|events)/.test(url)) {
       return jsonResponse([]);
     }
