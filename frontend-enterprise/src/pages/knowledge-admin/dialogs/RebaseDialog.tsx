@@ -15,7 +15,7 @@
 
 import { useEffect, useState } from 'react';
 
-import { Dialog, DialogContent, DialogTitle, Textarea } from '@/components/ui';
+import { Dialog, DialogContent, DialogDescription, DialogTitle, Textarea } from '@/components/ui';
 import { Button } from '@/components/ui/button';
 import { useAppIntl } from '@/i18n';
 import { createMessageDescriptor } from '@/i18n/descriptors';
@@ -152,13 +152,15 @@ export function RebaseDialog({ open, onOpenChange, api, kbId, draft, onRebased }
   return (
     <Dialog open={open} onOpenChange={(next) => !submitting && onOpenChange(next)}>
       <DialogContent className="w-[min(560px,calc(100vw-32px))] gap-0 overflow-hidden rounded-[16px] border-0 bg-white p-0 shadow-[0px_12px_32px_rgba(0,0,0,0.16)]">
-        <DialogTitle className="px-[24px] pt-[20px] pb-[12px] text-[16px] font-semibold text-[#18181a]">
+        <DialogTitle className="px-[24px] pt-[20px] pb-[8px] text-[16px] font-semibold text-[#18181a]">
           {t('knowledgeAdmin.rebase.title', { draft: draft.draft_name || draft.version })}
         </DialogTitle>
+        <DialogDescription className="px-[24px] pb-[12px] text-[12px] text-[#858b9c]">
+          {t('knowledgeAdmin.rebase.intro')}
+        </DialogDescription>
 
         {!preview ? (
           <div className="flex flex-col gap-[12px] px-[24px] pb-[16px]">
-            <p className="text-[12px] text-[#858b9c]">{t('knowledgeAdmin.rebase.intro')}</p>
             <div className="flex flex-col gap-[6px]">
               <span className="text-[12px] font-medium text-[#464c5e]">{t('knowledgeAdmin.rebase.reasonLabel')}</span>
               <Textarea

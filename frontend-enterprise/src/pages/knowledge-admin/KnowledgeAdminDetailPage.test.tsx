@@ -411,6 +411,28 @@ describe('KnowledgeAdminDetailPage', () => {
     expect(container.textContent).not.toMatch(/操作失败，请稍后重试/);
   });
 
+  // 回归（I11）：`load()` 失败前，页面在 `!kb` 时无条件渲染「加载中…」，
+  // 从不区分"还在等首次响应"与"已经失败"——请求失败后页面永远卡在 Loading，
+  // 除了上面已覆盖的 toast 之外没有任何可操作的出口。现在失败且尚无 `kb` 时改渲染
+  // 一个带「重试」按钮的错误态，点击后重新调用 `load()`；成功后照常渲染详情页。
+  it('shows a retry error block (not an endless loading label) when the detail fails to load, and recovers on retry', async () => {
+    const user = userEvent.setup();
+    mockApi.getAdminKnowledgeBase.mockRejectedValueOnce({ code: 'KNOWLEDGE_BASE_NOT_FOUND' });
+    mockApi.getKnowledgeBase.mockResolvedValue(sharedKb);
+    renderDetail('/enterprise/knowledge-admin/kb_shared_1');
+
+    expect(await screen.findByRole('alert')).toBeTruthy();
+    expect(screen.queryByText('加载中…')).toBeNull();
+    const retryButton = screen.getByRole('button', { name: '重试' });
+
+    mockApi.getAdminKnowledgeBase.mockResolvedValueOnce(sharedAdminItem);
+    await user.click(retryButton);
+
+    await screen.findByText('产品 FAQ 共享库');
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(mockApi.getAdminKnowledgeBase).toHaveBeenCalledTimes(2);
+  });
+
   // 缺陷回归（T077 缺陷 1）：员工侧 `GET /knowledge-bases/{id}` 不带 `agent_id` 只暴露开放
   // 广场库，管理员打开共享/专用库的详情页此前会 404（`KNOWLEDGE_BASE_VERSION_NOT_VISIBLE`）
   // 卡在 Loading。现在 admin-first 端点是主数据源，即便员工侧调用失败页面也要能渲染。

@@ -140,6 +140,24 @@ afterEach(() => {
 });
 
 describe('RebaseDialog', () => {
+  // I13：Radix 的 `Dialog.Content` 只有在渲染树里挂了一个 `Dialog.Description`
+  // （`@radix-ui/react-dialog` 通过 context 里的 `descriptionCount` 判断）时，才会给
+  // `role="dialog"` 元素带上 `aria-describedby` 并指向一个真实存在、非空的元素——这是本
+  // 项目当前锁定的 radix-ui 版本里唯一可观测的"有没有 Description"信号（这个版本的
+  // `@radix-ui/react-dialog` 构建产物里没有 `console.warn`/`console.error` 形式的
+  // "Missing `Description`" a11y 提示，实测确认过）。断言这条关联链路成立，证明
+  // `DialogDescription`（包住既有的 `knowledgeAdmin.rebase.intro` 段落）确实生效，
+  // 而不是又挂了一个没有内容/没有关联上的空壳。
+  it('associates DialogContent with a real, non-empty DialogDescription via aria-describedby (Radix a11y wiring)', () => {
+    renderDialog();
+    const dialog = screen.getByRole('dialog', { name: '变基草稿 draft-b' });
+    const describedById = dialog.getAttribute('aria-describedby');
+    expect(describedById).toBeTruthy();
+    const description = document.getElementById(describedById!);
+    expect(description).toBeTruthy();
+    expect(description!.textContent).toBe('把草稿变更重放到最新正式版之上：无交集的文档自动合并，双方都改过的文档需要逐篇解决冲突。');
+  });
+
   it('submits a reason and calls rebaseDraft, then lists auto-merged and conflicting documents from the preview', async () => {
     const user = userEvent.setup();
     const { api } = renderDialog();

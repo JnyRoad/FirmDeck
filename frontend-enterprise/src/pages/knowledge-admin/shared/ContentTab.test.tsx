@@ -3,10 +3,11 @@
 /**
  * ContentTab 测试（T040）。
  * 覆盖：视图切换器（正式版/草稿）；正式视图只读且隐藏草稿新增/修改/删除标记；
- * 草稿视图展示新增/修改/删除标记，删除标记可恢复；横幅信息（创建者、来源、
- * 基线、发布后版本号预览、原因）与按钮；上传/删除/恢复请求携带草稿
- * `knowledge_base_version_id`（上传）或以 `lineage_id` 定位文档（删除/恢复，见
- * ContentTab.tsx 顶部注释的已知限制）。
+ * 草稿视图展示新增/修改/删除标记，删除标记可恢复（含已删除文档不在 A2b 列表里、
+ * 完全靠 diff 并入展示的场景——见 ContentTab.tsx 顶部注释）；横幅信息（创建者、来源、
+ * 基线、发布后版本号预览、原因）与按钮；上传请求携带草稿 `knowledge_base_version_id`；
+ * 删除/恢复请求以真实行 id 定位文档（未删除文档来自 A2b、已删除文档来自 diff 的
+ * `target_document_id`），不是 `lineage_id`。
  */
 import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -67,6 +68,8 @@ const pubDiff: VersionDiff = {
       truncated: false,
       base_document_id: null,
       target_document_id: 'doc_pub_1',
+      base_updated_at: null,
+      target_updated_at: null,
     },
   ],
 };
@@ -84,6 +87,8 @@ const draftDiff: VersionDiff = {
       truncated: false,
       base_document_id: null,
       target_document_id: 'doc_new_1',
+      base_updated_at: null,
+      target_updated_at: null,
     },
     {
       lineage_id: 'doc_mod_1',
@@ -92,6 +97,8 @@ const draftDiff: VersionDiff = {
       truncated: false,
       base_document_id: 'doc_mod_1_base',
       target_document_id: 'doc_mod_1',
+      base_updated_at: null,
+      target_updated_at: null,
       hunks: [
         { type: 'change', base_start: 0, base_lines: ['旧内容'], target_start: 0, target_lines: ['新内容'], pairs: [[0, 0]] },
       ],
@@ -102,7 +109,15 @@ const draftDiff: VersionDiff = {
       kind: 'deleted',
       truncated: false,
       base_document_id: 'doc_del_1',
-      target_document_id: null,
+      // backend commit ab58668: for a deleted entry this is the draft's own archived
+      // row id (not null anymore) — deliberately distinct from any A2b row id below so
+      // a test asserting on this value can't pass by accident via `documentRowByLineage`.
+      target_document_id: 'doc_del_1_archived',
+      base_updated_at: null,
+      // Optimistic-lock field completion round: the archived row's own `updated_at`,
+      // deliberately distinct from every A2b row timestamp below so a test asserting on
+      // this value can't pass by accident via `documentRowByLineage`.
+      target_updated_at: '2026-08-21T04:00:00Z',
     },
   ],
 };
@@ -113,10 +128,12 @@ const draftDiff: VersionDiff = {
 // Write-back (delete/restore) must target these real ids, not `lineage_id` (T083).
 // 行时间戳刻意与 `draftVersion.updated_at`（版本行）不同：手工删除/恢复带的
 // `expectedUpdatedAt` 必须来自文档行本身（C1 统一三处写回的锁口径）。
+//
+// backend commit ab58668: A2b now excludes `status='archived'` rows entirely, so the
+// deleted document (`doc_del_1`) never appears here — only in `draftDiff` above.
 const draftVersionDocuments = [
   { id: 'doc_new_1_row', lineage_id: 'doc_new_1', title: '新增文档', filename: 'doc_new_1.md', status: 'ready', bucket_count: 0, chunk_count: 0, updated_at: '2026-08-21T01:00:00Z' },
   { id: 'doc_mod_1_row', lineage_id: 'doc_mod_1', title: '修改文档', filename: 'doc_mod_1.md', status: 'ready', bucket_count: 0, chunk_count: 0, updated_at: '2026-08-21T02:00:00Z' },
-  { id: 'doc_del_1_row', lineage_id: 'doc_del_1', title: '删除文档', filename: 'doc_del_1.md', status: 'archived', bucket_count: 0, chunk_count: 0, updated_at: '2026-08-21T03:00:00Z' },
 ];
 
 function createMockApi() {
@@ -185,7 +202,11 @@ describe('ContentTab', () => {
     expect(screen.getByRole('button', { name: '创建草稿' })).toBeTruthy();
   });
 
-  it('draft view shows added/modified/deleted badges with a restore action for deleted rows', async () => {
+  // 回归覆盖（backend commit ab58668）：A2b `listVersionDocuments` mock（`draftVersionDocuments`）
+  // 完全不含 `doc_del_1`——真实后端现在把 `status='archived'` 的行整个排除在这份列表之外。
+  // 「删除文档」这一行必须仍然出现（并带「草稿删除」标记 + 「恢复」按钮），证明它是从
+  // `draftDiff` 的 `kind==='deleted'` 条目并入的，而不是继续依赖 A2b 主列表。
+  it('draft view shows added/modified/deleted badges with a restore action for deleted rows, even when the deleted row is absent from the A2b list', async () => {
     const user = userEvent.setup();
     const api = createMockApi();
     renderContentTab(api);
@@ -254,8 +275,15 @@ describe('ContentTab', () => {
     await waitFor(() => expect(api.archiveDocument).toHaveBeenCalledWith('doc_new_1_row', { expectedUpdatedAt: '2026-08-21T01:00:00Z' }));
     expect(api.archiveDocument).not.toHaveBeenCalledWith('doc_new_1', expect.anything());
 
+    // Restoring a deleted document: the row never appears in A2b (`listVersionDocuments`
+    // hides `status='archived'` rows — backend commit ab58668), so write-back must resolve
+    // through the diff's `target_document_id`/`target_updated_at` instead of
+    // `listVersionDocuments`/`lineage_id`.
     await user.click(screen.getByRole('button', { name: '恢复' }));
-    await waitFor(() => expect(api.updateDocument).toHaveBeenCalledWith('doc_del_1_row', { status: 'ready', expectedUpdatedAt: '2026-08-21T03:00:00Z' }));
+    await waitFor(() => expect(api.updateDocument).toHaveBeenCalledWith('doc_del_1_archived', {
+      status: 'ready',
+      expectedUpdatedAt: '2026-08-21T04:00:00Z',
+    }));
     expect(api.updateDocument).not.toHaveBeenCalledWith('doc_del_1', expect.anything());
   });
 

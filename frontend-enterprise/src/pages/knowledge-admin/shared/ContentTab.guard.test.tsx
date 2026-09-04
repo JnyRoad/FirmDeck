@@ -71,7 +71,7 @@ function diffFor(versionId: string, title: string): VersionDiff {
     pairing: 'lineage',
     summary: { added: 1, modified: 0, deleted: 0 },
     documents: [
-      { lineage_id: `${versionId}_lineage`, title, kind: 'added', truncated: false, base_document_id: null, target_document_id: `${versionId}_doc` },
+      { lineage_id: `${versionId}_lineage`, title, kind: 'added', truncated: false, base_document_id: null, target_document_id: `${versionId}_doc`, base_updated_at: null, target_updated_at: null },
     ],
   };
 }

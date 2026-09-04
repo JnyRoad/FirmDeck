@@ -78,8 +78,19 @@ const draftVersion: KnowledgeAdminVersionRead = {
 const DOC_UPDATED_AT = {
   doc_new_1: '2026-08-21T01:00:00Z',
   doc_mod_1: '2026-08-21T02:00:00Z',
-  doc_del_1: '2026-08-21T03:00:00Z',
 } as const;
+
+/**
+ * backend commit ab58668 + the optimistic-lock field completion round: for the deleted
+ * document's diff entry, `target_document_id`/`target_updated_at` are now the draft's own
+ * archived row's real id/`updated_at.isoformat()` (neither is `null`) — deliberately
+ * distinct from any A2b row id/timestamp below so an assertion on these values can't pass
+ * by accident via `documentRowByLineage`. A2b (`listVersionDocuments`) now excludes
+ * `status='archived'` rows entirely, so write-back must resolve both the id and the
+ * optimistic-lock timestamp from the diff instead.
+ */
+const DOC_DEL_1_TARGET_ID = 'doc_del_1_archived';
+const DOC_DEL_1_TARGET_UPDATED_AT = '2026-08-21T04:00:00Z';
 
 const draftDiff: VersionDiff = {
   base_version_id: 'kbver_pub',
@@ -94,6 +105,8 @@ const draftDiff: VersionDiff = {
       truncated: false,
       base_document_id: null,
       target_document_id: 'doc_new_1',
+      base_updated_at: null,
+      target_updated_at: null,
     },
     {
       lineage_id: 'doc_mod_1',
@@ -102,6 +115,8 @@ const draftDiff: VersionDiff = {
       truncated: false,
       base_document_id: 'doc_mod_1_base',
       target_document_id: 'doc_mod_1',
+      base_updated_at: null,
+      target_updated_at: null,
       hunks: [
         { type: 'change', base_start: 0, base_lines: ['旧内容'], target_start: 0, target_lines: ['新内容'], pairs: [[0, 0]] },
       ],
@@ -112,7 +127,9 @@ const draftDiff: VersionDiff = {
       kind: 'deleted',
       truncated: false,
       base_document_id: 'doc_del_1',
-      target_document_id: null,
+      target_document_id: DOC_DEL_1_TARGET_ID,
+      base_updated_at: null,
+      target_updated_at: DOC_DEL_1_TARGET_UPDATED_AT,
     },
   ],
 };
@@ -139,10 +156,11 @@ function createMockApi() {
     // `document.lineageId` from the review output.
     // 每一行的 `updated_at` 都刻意与草稿版本的 `updated_at` 不同（且行与行之间也不同），
     // 这样"写回带的是文档行时间戳"这条断言不可能因为两者恰好相等而蒙混通过（C1）。
+    // backend commit ab58668: A2b excludes `status='archived'` rows entirely, so the
+    // deleted document (`doc_del_1`) never appears here — only in `draftDiff` above.
     listVersionDocuments: vi.fn().mockResolvedValue([
       { id: 'doc_new_1_row', lineage_id: 'doc_new_1', title: '新增文档', filename: 'doc_new_1.md', status: 'ready', bucket_count: 0, chunk_count: 0, updated_at: DOC_UPDATED_AT.doc_new_1 },
       { id: 'doc_mod_1_row', lineage_id: 'doc_mod_1', title: '修改文档', filename: 'doc_mod_1.md', status: 'ready', bucket_count: 0, chunk_count: 0, updated_at: DOC_UPDATED_AT.doc_mod_1 },
-      { id: 'doc_del_1_row', lineage_id: 'doc_del_1', title: '删除文档', filename: 'doc_del_1.md', status: 'archived', bucket_count: 0, chunk_count: 0, updated_at: DOC_UPDATED_AT.doc_del_1 },
     ]),
     uploadDocument: vi.fn(),
     updateDocument: vi.fn().mockResolvedValue({ id: 'doc' }),
@@ -226,13 +244,17 @@ describe('ContentTab review-apply flow', () => {
     }));
     await user.click(screen.getByRole('button', { name: '应用到草稿' }));
 
-    // Both assertions use the real row id (`_row` suffix), not the review output's
+    // The addition uses the real A2b row id (`_row` suffix), not the review output's
     // `lineageId` — same T083 regression coverage as the "modified" case above.
     await waitFor(() => expect(api.archiveDocument).toHaveBeenCalledWith('doc_new_1_row', { expectedUpdatedAt: DOC_UPDATED_AT.doc_new_1 }));
-    await waitFor(() => expect(api.updateDocument).toHaveBeenCalledWith('doc_del_1_row', {
+    // The deletion restore instead uses the diff's `target_document_id`/`target_updated_at`
+    // (`DOC_DEL_1_TARGET_ID`/`DOC_DEL_1_TARGET_UPDATED_AT`) — A2b no longer has a row for
+    // it at all (backend commit ab58668).
+    await waitFor(() => expect(api.updateDocument).toHaveBeenCalledWith(DOC_DEL_1_TARGET_ID, {
       status: 'ready',
-      expectedUpdatedAt: DOC_UPDATED_AT.doc_del_1,
+      expectedUpdatedAt: DOC_DEL_1_TARGET_UPDATED_AT,
     }));
+    expect(api.updateDocument).not.toHaveBeenCalledWith('doc_del_1', expect.anything());
   });
 
   it('shows the document-level conflict message and reloads on KNOWLEDGE_DOCUMENT_CONFLICT', async () => {

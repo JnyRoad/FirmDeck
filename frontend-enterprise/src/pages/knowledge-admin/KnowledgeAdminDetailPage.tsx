@@ -109,6 +109,10 @@ export default function KnowledgeAdminDetailPage({ currentUser, onLogout }: Know
 
   const [kb, setKb] = useState<KnowledgeBaseRead | null>(null);
   const [loading, setLoading] = useState(false);
+  /** `load()` 失败且尚无 `kb` 可渲染时为 true（I11）：驱动下面带「重试」按钮的错误态，
+   * 避免加载失败后页面永远卡在「加载中…」。成功渲染过一次后 `kb` 不再是 `null`，
+   * 后续刷新失败改由各 Tab/子组件自己的错误态处理，不影响这里。 */
+  const [loadFailed, setLoadFailed] = useState(false);
   /** 设置 Tab 删除确认展示的进行中草稿数；私有库分支没有独立草稿概念，恒为 0。 */
   const [draftCount, setDraftCount] = useState(0);
   /** 草稿数是否未知（`listVersions` 单独失败）；与 `draftCount` 分开，避免把失败悄悄当成 0。 */
@@ -122,6 +126,7 @@ export default function KnowledgeAdminDetailPage({ currentUser, onLogout }: Know
     const generation = context?.generation;
     if (!context || generation === undefined || !kbId) return;
     setLoading(true);
+    setLoadFailed(false);
     try {
       // Admin-first：员工侧 `GET /knowledge-bases/{id}` 不带 `agent_id` 时只暴露"开放广场"
       // 库，管理员打开共享/专用库详情会 404（`KNOWLEDGE_BASE_VERSION_NOT_VISIBLE`），页面
@@ -180,6 +185,7 @@ export default function KnowledgeAdminDetailPage({ currentUser, onLogout }: Know
     } catch (error) {
       if (!context.isCurrentGeneration(generation)) return;
       toast.error(error, 'knowledgeAdmin.detail.loadError');
+      setLoadFailed(true);
     } finally {
       if (context.isCurrentGeneration(generation)) setLoading(false);
     }
@@ -234,7 +240,19 @@ export default function KnowledgeAdminDetailPage({ currentUser, onLogout }: Know
         </Button>
       </div>
 
-      {!kb ? (
+      {!kb && loadFailed ? (
+        <div className="mt-[24px] flex flex-col items-start gap-[10px]">
+          <p role="alert" className="text-[13px] text-[#d20b0b]">{t('knowledgeAdmin.detail.loadError')}</p>
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => void load()}
+            className="h-[32px] rounded-[10px] border-[#e3e7f1] px-[12px] text-[12px] font-normal text-[#464c5e]"
+          >
+            {t('knowledgeAdmin.detail.error.retry')}
+          </Button>
+        </div>
+      ) : !kb ? (
         <p className="mt-[24px] text-[13px] text-[#858b9c]">{t('knowledgeAdmin.detail.loading')}</p>
       ) : (
         <>

@@ -10,29 +10,39 @@
  * `lineage_id` 配上「草稿新增/修改/删除」标记（`kindByLineage`）；未出现在本次对比里的
  * 行标记为 `unchanged`，不显示标记但同样可删除。
  *
+ * 已删除文档（backend commit ab58668 之后）：A2b `listVersionDocuments` 现在按
+ * data-model §3 把 `status='archived'` 的行视为"该版本内不存在"，一并从列表里排除
+ * （行本身仍在，只是对消费方不可见）——因此已删除文档不会出现在上面的 A2b 主列表里，
+ * `visibleDocuments` 必须把 `getVersionDiff` 里 `kind==='deleted'` 的条目单独并入
+ * 才能展示「已删除」标记与「恢复」操作。与此同时 `target_document_id` 对这些条目也不
+ * 再恒为 `null`：只要目标版本里确有那一行归档记录，后端就会回填该归档行的真实 id
+ * （见 `backend/app/knowledge/diff.py` `DiffDocument` 的说明），因此"恢复已删除文档"
+ * 现在直接用 diff 自己的 `target_document_id` 定位真实行，不再依赖 `documentRowByLineage`
+ * （A2b 已经拿不到这些行）。同一批「乐观锁字段补全」还给 `DiffDocument` 加了
+ * `target_updated_at`（该归档行的 `updated_at.isoformat()`），因此这条写回路径也不再
+ * 需要省略 `expected_updated_at`——直接原样透传 `target_updated_at`。
+ *
  * 写回定位（T083，修复原「已知限制」）：本 Tab 与审阅应用（`applyReview`）调用
- * `updateDocument`/`archiveDocument` 一律用 `documentRowByLineage`（源自
- * `listVersionDocuments` 的 `lineage_id → 文档行` 映射）解析出的真实行 id，不再把
- * `lineage_id` 当作文档 id 传入——`lineage_id` 对"本草稿内新建"的文档恰好等于其自身
- * id，但对"跨版本克隆而来的已改动文档"并不准确（克隆会分配新的行 id，只在 metadata
- * 中保留原始 lineage_id）。`listVersionDocuments` 同时包含已被删除（`status='archived'`）
- * 的行，因此"恢复已删除文档"也能拿到真实 id——这是 `getVersionDiff` 的
- * `target_document_id` 做不到的：对 `kind==='deleted'` 的文档它恒为 `null`（该文档在
- * target 里已没有 ready 状态的对应行，但底层归档行本身仍在，只是不出现在 diff 里）。
+ * `updateDocument`/`archiveDocument` 一律用真实行 id，不再把 `lineage_id` 当作文档 id
+ * 传入——`lineage_id` 对"本草稿内新建"的文档恰好等于其自身 id，但对"跨版本克隆而来的
+ * 已改动文档"并不准确（克隆会分配新的行 id，只在 metadata 中保留原始 lineage_id）。
+ * 未删除的文档从 `documentRowByLineage`（源自 `listVersionDocuments` 的
+ * `lineage_id → 文档行` 映射）解析；已删除文档（上面 A2b 已排除）改用 diff 的
+ * `target_document_id`/`target_updated_at`（`deletedDocumentByLineage`）。
  *
  * 乐观锁口径（C1）：`updateDocument`/`archiveDocument` 的 `expected_updated_at` 在后端
  * 比对的是**文档行**的 `updated_at`（`backend/app/api/knowledge.py` 的
  * `source_row.updated_at.isoformat()`），只有 A5 `recordReview` 比对的是草稿**版本行**的
  * （`backend/app/knowledge/versioning.py`）。因此本 Tab 的手工删除/恢复与 `applyReview`
- * 的三处写回统一从 `documentRowByLineage` / 表格行取 `updated_at` 原样透传，
- * `recordReview` 才用 `currentDraft.updated_at`。
+ * 的三处写回统一从 `documentRowByLineage` / `deletedDocumentByLineage` / 表格行取
+ * `updated_at` 原样透传，`recordReview` 才用 `currentDraft.updated_at`。
  */
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 
 import { DataTable, type DataTableColumn } from '@/components/DataTable';
-import { Dialog, DialogContent, DialogTitle, Select, SelectContent, SelectItem, SelectTrigger, SelectValue, Textarea } from '@/components/ui';
+import { Dialog, DialogContent, DialogDescription, DialogTitle, Select, SelectContent, SelectItem, SelectTrigger, SelectValue, Textarea } from '@/components/ui';
 import { Button } from '@/components/ui/button';
 import { useAppIntl } from '@/i18n';
 import { createMessageDescriptor } from '@/i18n/descriptors';
@@ -284,8 +294,10 @@ export function ContentTab({ api, kb, onChanged }: ContentTabProps) {
     return map;
   }, [diff]);
 
-  // `lineage_id → A2b 文档行`：草稿视图写回定位（真实行 id）与乐观锁（行 `updated_at`）
-  // 的唯一来源，见文件头注释与 applyReview 处的说明。
+  // `lineage_id → A2b 文档行`：未删除文档的写回定位（真实行 id）与乐观锁（行
+  // `updated_at`）来源，见文件头注释与 applyReview 处的说明。A2b 现在排除
+  // `status='archived'` 的行，因此这份映射不会覆盖已删除文档——那部分改用
+  // 下面的 `deletedDocumentByLineage`。
   const documentRowByLineage = useMemo(() => {
     const map = new Map<string, VersionDocument>();
     for (const row of versionDocuments) {
@@ -293,6 +305,23 @@ export function ContentTab({ api, kb, onChanged }: ContentTabProps) {
     }
     return map;
   }, [versionDocuments]);
+
+  // `lineage_id → 已删除文档的真实行 id + 乐观锁时间戳`：仅取自 diff 里
+  // `kind==='deleted'` 且 `target_document_id` 非空的条目（backend commit ab58668 起该
+  // 字段回填归档行的真实 id，`target_updated_at` 是该行的 `updated_at.isoformat()`，
+  // 见文件头注释）。A2b 已经把这些行排除在外，`documentRowByLineage` 里不会有它们，
+  // 写回（表格「恢复」按钮与 `applyReview` 的拒绝删除分支）都要从这里取 id/时间戳。
+  const deletedDocumentByLineage = useMemo(() => {
+    const map = new Map<string, { id: string; updatedAt: string | null }>();
+    if (diff) {
+      for (const document of diff.documents) {
+        if (document.kind === 'deleted' && document.target_document_id) {
+          map.set(document.lineage_id, { id: document.target_document_id, updatedAt: document.target_updated_at });
+        }
+      }
+    }
+    return map;
+  }, [diff]);
 
   const visibleDocuments: ContentRow[] = useMemo(() => {
     if (!diff) return [];
@@ -308,15 +337,30 @@ export function ContentTab({ api, kb, onChanged }: ContentTabProps) {
           updatedAt: null,
         }));
     }
-    // 草稿视图：以 `listVersionDocuments` 全量列表为主（含未改动、已删除的行，真实 id），
-    // 按 lineage_id 配上 diff 算出的「新增/修改/删除」标记；未变化的行标记为 unchanged。
-    return versionDocuments.map((row) => ({
+    // 草稿视图：以 `listVersionDocuments` 全量列表为主（含未改动的行，真实 id），按
+    // lineage_id 配上 diff 算出的「新增/修改」标记；未变化的行标记为 unchanged。
+    const rows: ContentRow[] = versionDocuments.map((row) => ({
       documentId: row.id,
       title: row.title,
       kind: (row.lineage_id ? kindByLineage.get(row.lineage_id) : undefined) ?? 'unchanged',
       updatedAt: row.updated_at ?? null,
     }));
-  }, [diff, isDraftView, versionDocuments, kindByLineage]);
+    // 已删除文档单独从 diff 并入（见文件头注释）：A2b 现在把 `status='archived'` 的行
+    // 整个排除，`versionDocuments` 里不会再出现它们，删除标记与「恢复」操作只能靠
+    // `getVersionDiff` 的 `kind==='deleted'` 条目展示，真实行 id 与 `updated_at` 都从
+    // `deletedDocumentByLineage`（diff 的 `target_document_id`/`target_updated_at`）取。
+    for (const document of diff.documents) {
+      if (document.kind !== 'deleted') continue;
+      const deletedRow = deletedDocumentByLineage.get(document.lineage_id);
+      rows.push({
+        documentId: deletedRow?.id ?? document.lineage_id,
+        title: document.title,
+        kind: 'deleted',
+        updatedAt: deletedRow?.updatedAt ?? null,
+      });
+    }
+    return rows;
+  }, [diff, isDraftView, versionDocuments, kindByLineage, deletedDocumentByLineage]);
 
   async function handleUploadFile(file: File) {
     if (!currentDraft) return;
@@ -494,18 +538,28 @@ export function ContentTab({ api, kb, onChanged }: ContentTabProps) {
     setApplying(true);
     try {
       for (const document of reviewOutput.docs) {
-        // 写回一律用 `documentRowByLineage` 解析出的真实行 id，不用 `document.lineageId`
-        // 本身——对跨版本克隆而来的行两者并不相等（见文件头注释）；映射缺失时退回
-        // lineageId 仅作兜底（例如本草稿内新建、克隆前的极端时序），不阻塞写回。
+        const isDeletedRestore = document.kind === 'deleted' && document.restore;
+        // 写回一律用真实行 id，不用 `document.lineageId` 本身——对跨版本克隆而来的行
+        // 两者并不相等（见文件头注释）。未删除的文档从 `documentRowByLineage`
+        // （A2b `lineage_id → 文档行`）解析；已删除文档（A2b 已把它们排除，见文件头
+        // 注释）改用 `deletedDocumentByLineage`（diff 的 `target_document_id`/
+        // `target_updated_at`）。两边都缺失时退回 lineageId 仅作兜底（例如本草稿内
+        // 新建、克隆前的极端时序），不阻塞写回。
         const row = documentRowByLineage.get(document.lineageId);
-        const documentId = row?.id ?? document.lineageId;
+        const deletedRow = isDeletedRestore ? deletedDocumentByLineage.get(document.lineageId) : undefined;
+        const documentId = isDeletedRestore
+          ? deletedRow?.id ?? document.lineageId
+          : row?.id ?? document.lineageId;
         // C1：`updateDocument`/`archiveDocument` 的 `expected_updated_at` 在后端比对的是
         // **文档行**的 `updated_at`（`backend/app/api/knowledge.py:711`
         // `source_row.updated_at.isoformat()`），不是草稿**版本行**的——只有下面的
         // `recordReview` 比对版本行（`backend/app/knowledge/versioning.py:756`）。
         // 之前这三处都传 `currentDraft.updated_at`，导致每次审阅写回必然 409。
         // A2b 用同一个 `.isoformat()` 序列化该字段，这里原样透传字符串、不做任何解析。
-        const expectedUpdatedAt = row?.updated_at ?? undefined;
+        // 已删除文档从 `deletedDocumentByLineage`（diff 的 `target_updated_at`）取同一份
+        // 数据（见文件头注释）；两边映射都缺失该字段时才留空，后端对空值直接跳过乐观锁
+        // 比对。
+        const expectedUpdatedAt = (isDeletedRestore ? deletedRow?.updatedAt : row?.updated_at) ?? undefined;
         if (document.kind === 'modified') {
           await api.updateDocument(documentId, {
             contentMd: document.lines.join('\n'),
@@ -514,7 +568,7 @@ export function ContentTab({ api, kb, onChanged }: ContentTabProps) {
         } else if (document.kind === 'added' && document.restore) {
           // WholeDocumentPanel: added 文档 restore=true 表示用户拒绝了这次新增。
           await api.archiveDocument(documentId, { expectedUpdatedAt });
-        } else if (document.kind === 'deleted' && document.restore) {
+        } else if (isDeletedRestore) {
           // WholeDocumentPanel: deleted 文档 restore=true 表示用户拒绝了这次删除（恢复原文）。
           await api.updateDocument(documentId, {
             status: 'ready',
@@ -747,9 +801,12 @@ export function ContentTab({ api, kb, onChanged }: ContentTabProps) {
 
       <Dialog open={rejectOpen} onOpenChange={(next) => !rejecting && setRejectOpen(next)}>
         <DialogContent className="w-[min(440px,calc(100vw-32px))] gap-0 overflow-hidden rounded-[16px] border-0 bg-white p-0 shadow-[0px_12px_32px_rgba(0,0,0,0.16)]">
-          <DialogTitle className="px-[24px] pt-[20px] pb-[12px] text-[16px] font-semibold text-[#18181a]">
+          <DialogTitle className="px-[24px] pt-[20px] pb-[8px] text-[16px] font-semibold text-[#18181a]">
             {t('knowledgeAdmin.content.rejectDialog.title')}
           </DialogTitle>
+          <DialogDescription className="px-[24px] pb-[12px] text-[12px] text-[#858b9c]">
+            {t('knowledgeAdmin.content.rejectDialog.description')}
+          </DialogDescription>
           <div className="flex flex-col gap-[6px] px-[24px] pb-[16px]">
             <span className="text-[12px] font-medium text-[#464c5e]">{t('knowledgeAdmin.content.rejectDialog.reasonLabel')}</span>
             <Textarea
@@ -781,9 +838,12 @@ export function ContentTab({ api, kb, onChanged }: ContentTabProps) {
 
       <Dialog open={reviewOpen} onOpenChange={(next) => !applying && setReviewOpen(next)}>
         <DialogContent className="w-[min(900px,calc(100vw-32px))] gap-0 overflow-hidden rounded-[16px] border-0 bg-white p-0 shadow-[0px_12px_32px_rgba(0,0,0,0.16)]">
-          <DialogTitle className="px-[24px] pt-[20px] pb-[12px] text-[16px] font-semibold text-[#18181a]">
+          <DialogTitle className="px-[24px] pt-[20px] pb-[8px] text-[16px] font-semibold text-[#18181a]">
             {t('knowledgeAdmin.content.review.title')}
           </DialogTitle>
+          <DialogDescription className="px-[24px] pb-[12px] text-[12px] text-[#858b9c]">
+            {t('knowledgeAdmin.content.review.description')}
+          </DialogDescription>
           <div className="max-h-[70vh] overflow-y-auto px-[24px] pb-[16px]">
             <ReviewEditor documents={reviewDocuments} labels={reviewLabels} onChange={setReviewOutput} />
           </div>

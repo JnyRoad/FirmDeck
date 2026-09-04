@@ -16,7 +16,7 @@
 
 import { useEffect, useMemo, useState } from 'react';
 
-import { Dialog, DialogContent, DialogTitle, Textarea } from '@/components/ui';
+import { Dialog, DialogContent, DialogDescription, DialogTitle, Textarea } from '@/components/ui';
 import { Button } from '@/components/ui/button';
 import { useAppIntl } from '@/i18n';
 import { RawContent } from '@/i18n/RawContent';
@@ -123,9 +123,12 @@ export function MergeDialog({ open, onOpenChange, conflict, onComplete }: MergeD
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="w-[min(760px,calc(100vw-32px))] gap-0 overflow-hidden rounded-[16px] border-0 bg-white p-0 shadow-[0px_12px_32px_rgba(0,0,0,0.16)]">
-        <DialogTitle className="px-[24px] pt-[20px] pb-[12px] text-[16px] font-semibold text-[#18181a]">
+        <DialogTitle className="px-[24px] pt-[20px] pb-[8px] text-[16px] font-semibold text-[#18181a]">
           {t('knowledgeAdmin.merge.title', { title: conflict.title })}
         </DialogTitle>
+        <DialogDescription className="px-[24px] pb-[12px] text-[12px] text-[#858b9c]">
+          {t('knowledgeAdmin.merge.description')}
+        </DialogDescription>
         <div className="flex max-h-[65vh] flex-col gap-[16px] overflow-y-auto px-[24px] pb-[16px]">
           {conflict.blocks.map((block, index) => (
             <div key={index} className="flex flex-col gap-[8px] rounded-[12px] border-[0.5px] border-[#e3e7f1] bg-[#f7f8fa] px-[14px] py-[12px]">

@@ -16,7 +16,7 @@
 import { useEffect, useState } from 'react';
 
 import { Checkbox, Select, SelectContent, SelectItem, SelectTrigger, SelectValue, Textarea } from '@/components/ui';
-import { Dialog, DialogContent, DialogTitle } from '@/components/ui';
+import { Dialog, DialogContent, DialogDescription, DialogTitle } from '@/components/ui';
 import { Button } from '@/components/ui/button';
 import { useAppIntl } from '@/i18n';
 import { DIALOG_CANCEL_BUTTON_CLASS, DIALOG_FOOTER_CLASS, DIALOG_PRIMARY_BUTTON_CLASS } from '@/lib/enterprise-ui';
@@ -132,9 +132,12 @@ export function PublishDialog({
   return (
     <Dialog open={open} onOpenChange={(next) => !submitting && onOpenChange(next)}>
       <DialogContent className="w-[min(520px,calc(100vw-32px))] gap-0 overflow-hidden rounded-[16px] border-0 bg-white p-0 shadow-[0px_12px_32px_rgba(0,0,0,0.16)]">
-        <DialogTitle className="px-[24px] pt-[20px] pb-[12px] text-[16px] font-semibold text-[#18181a]">
+        <DialogTitle className="px-[24px] pt-[20px] pb-[8px] text-[16px] font-semibold text-[#18181a]">
           {t('knowledgeAdmin.dialogs.publish.title', { draft: draft.draft_name || draft.version, next: formatVersion(nextVersion) })}
         </DialogTitle>
+        <DialogDescription className="px-[24px] pb-[12px] text-[12px] text-[#858b9c]">
+          {t('knowledgeAdmin.dialogs.publish.description')}
+        </DialogDescription>
         <div className="flex flex-col gap-[16px] px-[24px] pb-[16px]">
           <div className="flex flex-col gap-[6px]">
             <span className="text-[12px] font-medium text-[#464c5e]">{t('knowledgeAdmin.dialogs.publish.levelLabel')}</span>

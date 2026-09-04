@@ -72,6 +72,8 @@ const staleDiff: VersionDiff = {
       truncated: false,
       base_document_id: null,
       target_document_id: 'doc_new_1',
+      base_updated_at: null,
+      target_updated_at: null,
     },
   ],
 };
