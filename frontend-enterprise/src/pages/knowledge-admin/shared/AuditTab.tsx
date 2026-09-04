@@ -10,7 +10,6 @@ import { createKnowledgeAdminApi } from '@/api/knowledgeAdmin';
 import { DataTable, type DataTableColumn } from '@/components/DataTable';
 import { Input, Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui';
 import { Button } from '@/components/ui/button';
-import { notify } from '@/components/ui/app-toast';
 import { useAppIntl } from '@/i18n';
 import { RawContent } from '@/i18n/RawContent';
 import { formatDateTime, OUTLINE_ACTION_BUTTON_SM_CLASS, SELECT_TRIGGER_CLASS } from '@/lib/enterprise-ui';
@@ -19,7 +18,7 @@ import type { KnowledgeBaseAuditEventRead, KnowledgeBaseRead } from '@/types';
 import type { KnowledgeAdminVersionRead } from '@/types/knowledgeAdmin';
 
 import { formatVersion } from '../knowledgeAdminModel';
-import { knowledgeAdminErrorMessage } from './errorMessage';
+import { useKnowledgeAdminToast } from './errorMessage';
 
 export type AuditTabProps = {
   api: ReturnType<typeof createKnowledgeAdminApi>;
@@ -41,6 +40,7 @@ const AUDIT_ACTIONS = [
 /** 共享库审计流水：筛选条件变化时重取第一页，「加载更多」在现有结果后追加下一页。 */
 export function AuditTab({ api, kb }: AuditTabProps) {
   const { t } = useAppIntl();
+  const toast = useKnowledgeAdminToast();
   const [items, setItems] = useState<KnowledgeBaseAuditEventRead[]>([]);
   const [total, setTotal] = useState(0);
   const [hasMore, setHasMore] = useState(false);
@@ -70,7 +70,7 @@ export function AuditTab({ api, kb }: AuditTabProps) {
       setTotal(page.total);
       setHasMore(page.has_more);
     } catch (error) {
-      notify.error(knowledgeAdminErrorMessage(error, 'knowledgeAdmin.toast.loadFailed', { t }));
+      toast.error(error, 'knowledgeAdmin.toast.loadFailed');
     } finally {
       (append ? setLoadingMore : setLoading)(false);
     }

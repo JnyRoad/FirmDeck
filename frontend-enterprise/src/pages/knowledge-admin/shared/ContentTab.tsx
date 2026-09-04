@@ -3,19 +3,22 @@
  *
  * `?view=pub|<draftVersionId>` 记录当前查看的版本；正式版视图只读，文档列表来自
  * `getVersionDiff(against='base')` 中的非删除项（`kind` 为 added/modified 的文档，
- * 即该正式版相对上一正式版新增/修改的内容）；草稿视图文档列表同样来自
- * `getVersionDiff(against='base')`，但保留全部三种 `kind` 并加「草稿新增/修改/删除」
- * 标记，删除标记可通过「恢复」撤销。
+ * 即该正式版相对上一正式版新增/修改的内容）。
  *
- * 已知限制（详见任务报告 NEEDS_CONTEXT 记录）：`getVersionDiff` 只返回与基线相比
- * 发生变化的文档，不包含未改动、原样带入的文档，也不返回文档自身的行 id，只有
- * 跨版本身份 `lineage_id`；API 层目前没有「按版本列出全部文档（含 id）」的端点。
- * 因此：(1) 正式版视图与草稿工作区列表都只能展示"已变化"的文档，无法展示未改动、
- * 原样带入的文档；(2) 本 Tab 与审阅应用（`applyReview`）在调用 `updateDocument`/
- * `archiveDocument` 时把 `lineage_id` 当作文档 id 传入——这对"本草稿内新建"的文档
- * 是准确的（新建文档的 lineage_id 就是其自身 id），但对"跨版本克隆而来的已改动
- * 文档"并不准确（克隆会分配新的行 id，只在 metadata 中保留原始 lineage_id）。
- * 后续需要后端在对比响应中补充文档 id，或提供按版本列出文档（含 id）的端点。
+ * 草稿工作区列表改用 A2b `listVersionDocuments(kb.id, currentDraft.id)`（T081，含未改动、
+ * 原样带入的文档，携带真实行 `id`）为主数据源，`getVersionDiff` 只用来给每行按
+ * `lineage_id` 配上「草稿新增/修改/删除」标记（`kindByLineage`）；未出现在本次对比里的
+ * 行标记为 `unchanged`，不显示标记但同样可删除。
+ *
+ * 写回定位（T083，修复原「已知限制」）：本 Tab 与审阅应用（`applyReview`）调用
+ * `updateDocument`/`archiveDocument` 一律用 `documentIdByLineage`（源自
+ * `listVersionDocuments` 的 `lineage_id → id` 映射）解析出的真实行 id，不再把
+ * `lineage_id` 当作文档 id 传入——`lineage_id` 对"本草稿内新建"的文档恰好等于其自身
+ * id，但对"跨版本克隆而来的已改动文档"并不准确（克隆会分配新的行 id，只在 metadata
+ * 中保留原始 lineage_id）。`listVersionDocuments` 同时包含已被删除（`status='archived'`）
+ * 的行，因此"恢复已删除文档"也能拿到真实 id——这是 `getVersionDiff` 的
+ * `target_document_id` 做不到的：对 `kind==='deleted'` 的文档它恒为 `null`（该文档在
+ * target 里已没有 ready 状态的对应行，但底层归档行本身仍在，只是不出现在 diff 里）。
  */
 
 import { useEffect, useMemo, useRef, useState } from 'react';
@@ -24,7 +27,6 @@ import { useSearchParams } from 'react-router-dom';
 import { DataTable, type DataTableColumn } from '@/components/DataTable';
 import { Dialog, DialogContent, DialogTitle, Select, SelectContent, SelectItem, SelectTrigger, SelectValue, Textarea } from '@/components/ui';
 import { Button } from '@/components/ui/button';
-import { createToastNotifier, notify } from '@/components/ui/app-toast';
 import { useAppIntl } from '@/i18n';
 import { createMessageDescriptor } from '@/i18n/descriptors';
 import { RawContent } from '@/i18n/RawContent';
@@ -38,7 +40,7 @@ import {
 import { cn } from '@/lib/utils';
 import type { KnowledgeAdminApi } from '@/api/knowledgeAdmin';
 import type { KnowledgeBaseRead } from '@/types';
-import type { DiffDocument, KnowledgeAdminVersionRead, RebaseResult, VersionDiff } from '@/types/knowledgeAdmin';
+import type { DiffDocument, KnowledgeAdminVersionRead, RebaseResult, VersionDiff, VersionDocument } from '@/types/knowledgeAdmin';
 
 import { CreateDraftDialog } from '../dialogs/CreateDraftDialog';
 import { PublishDialog, type PublishDialogSubmitInput } from '../dialogs/PublishDialog';
@@ -50,7 +52,7 @@ import {
   type ReviewEditorLabels,
   type ReviewEditorOutput,
 } from '../review/ReviewEditor';
-import { knowledgeAdminErrorMessage } from './errorMessage';
+import { useKnowledgeAdminToast } from './errorMessage';
 
 export type ContentTabProps = {
   api: KnowledgeAdminApi;
@@ -64,6 +66,18 @@ const BADGE_MESSAGE_IDS: Record<DiffDocument['kind'], 'knowledgeAdmin.content.ba
   added: 'knowledgeAdmin.content.badges.added',
   modified: 'knowledgeAdmin.content.badges.modified',
   deleted: 'knowledgeAdmin.content.badges.deleted',
+};
+
+/**
+ * 表格行的统一视图：`documentId` 一律是可直接用于写回（`updateDocument`/`archiveDocument`）
+ * 的真实行 id——正式版视图来自 diff 的 `target_document_id`（只读，不发起写回，取不到时
+ * 退回 `lineage_id` 仅作展示 key）；草稿视图来自 `listVersionDocuments` 的 `id`（见文件头
+ * 注释）。`kind==='unchanged'` 表示该文档未出现在与基线的对比里，不显示标记。
+ */
+type ContentRow = {
+  documentId: string;
+  title: string;
+  kind: DiffDocument['kind'] | 'unchanged';
 };
 
 /** 把 modified 文档的 hunks 顺序拼接还原为整篇 base/target 正文；added/deleted 无正文可还原。 */
@@ -96,16 +110,12 @@ export function ContentTab({ api, kb, onChanged }: ContentTabProps) {
   const { t } = useAppIntl();
   const [searchParams, setSearchParams] = useSearchParams();
   const fileInputRef = useRef<HTMLInputElement>(null);
-  // `notify.error` (legacy facade) only ever shows a registered stable error code's mapped
-  // text or a generic fallback — it deliberately drops arbitrary pre-localized strings (see
-  // app-toast.test.tsx "keeps registered legacy error-code compatibility"). The publish-
-  // conflict message here is a specific, contract-required string (not a backend error code),
-  // so it goes through the descriptor-based notifier instead of `notify.error(t(...))`.
-  const toastNotifier = useMemo(() => createToastNotifier({ t }), [t]);
+  const toast = useKnowledgeAdminToast();
 
   const [versions, setVersions] = useState<KnowledgeAdminVersionRead[]>([]);
   const [versionsLoaded, setVersionsLoaded] = useState(false);
   const [diff, setDiff] = useState<VersionDiff | null>(null);
+  const [versionDocuments, setVersionDocuments] = useState<VersionDocument[]>([]);
   const [loadingDiff, setLoadingDiff] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [restoringId, setRestoringId] = useState<string | null>(null);
@@ -144,7 +154,7 @@ export function ContentTab({ api, kb, onChanged }: ContentTabProps) {
       setVersions(Array.isArray(result) ? result : []);
       setVersionsLoaded(true);
     } catch (error) {
-      notify.error(knowledgeAdminErrorMessage(error, 'knowledgeAdmin.toast.loadFailed', { t }));
+      toast.error(error, 'knowledgeAdmin.toast.loadFailed');
       // `currentDraft` can never resolve if the version list failed to load — without
       // this, a pending `publish=<id>&review=1` review-intent would linger in the URL
       // forever (the intent-consuming effect below never sees a matching draft).
@@ -155,14 +165,21 @@ export function ContentTab({ api, kb, onChanged }: ContentTabProps) {
   async function loadDiff() {
     if (!targetVersionId) {
       setDiff(null);
+      setVersionDocuments([]);
       return;
     }
     setLoadingDiff(true);
     try {
-      const result = await api.getVersionDiff(kb.id, targetVersionId, { against: 'base' });
-      setDiff(result);
+      // 草稿视图额外拉取 A2b 全量文档列表（含未改动的，携带真实行 id），供写回定位与
+      // "未改动文档也展示"用；正式版视图只读、不发起写回，不需要这份数据。
+      const [diffResult, documentsResult] = await Promise.all([
+        api.getVersionDiff(kb.id, targetVersionId, { against: 'base' }),
+        isDraftView ? api.listVersionDocuments(kb.id, targetVersionId) : Promise.resolve<VersionDocument[]>([]),
+      ]);
+      setDiff(diffResult);
+      setVersionDocuments(Array.isArray(documentsResult) ? documentsResult : []);
     } catch (error) {
-      notify.error(knowledgeAdminErrorMessage(error, 'knowledgeAdmin.toast.loadFailed', { t }));
+      toast.error(error, 'knowledgeAdmin.toast.loadFailed');
     } finally {
       setLoadingDiff(false);
     }
@@ -232,13 +249,44 @@ export function ContentTab({ api, kb, onChanged }: ContentTabProps) {
     setSearchParams(params, { replace: true });
   }
 
-  const visibleDocuments = useMemo(() => {
+  // `lineage_id → kind`：仅覆盖 diff 里出现过的（已变化的）文档；草稿视图里没出现在这里
+  // 的行按 `unchanged` 处理。
+  const kindByLineage = useMemo(() => {
+    const map = new Map<string, DiffDocument['kind']>();
+    if (diff) for (const document of diff.documents) map.set(document.lineage_id, document.kind);
+    return map;
+  }, [diff]);
+
+  // `lineage_id → 真实行 id`：草稿视图写回定位的唯一来源，见文件头注释。
+  const documentIdByLineage = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const row of versionDocuments) {
+      if (row.lineage_id) map.set(row.lineage_id, row.id);
+    }
+    return map;
+  }, [versionDocuments]);
+
+  const visibleDocuments: ContentRow[] = useMemo(() => {
     if (!diff) return [];
-    if (isDraftView) return diff.documents;
-    // 正式版视图：仅展示该正式版相对上一正式版新增/修改的内容，且始终只读；
-    // 因为这里对比的目标本身就是已发布版本，不会包含任何草稿的改动。
-    return diff.documents.filter((document) => document.kind !== 'deleted');
-  }, [diff, isDraftView]);
+    if (!isDraftView) {
+      // 正式版视图：仅展示该正式版相对上一正式版新增/修改的内容，且始终只读；
+      // 因为这里对比的目标本身就是已发布版本，不会包含任何草稿的改动。
+      return diff.documents
+        .filter((document) => document.kind !== 'deleted')
+        .map((document) => ({
+          documentId: document.target_document_id ?? document.lineage_id,
+          title: document.title,
+          kind: document.kind,
+        }));
+    }
+    // 草稿视图：以 `listVersionDocuments` 全量列表为主（含未改动、已删除的行，真实 id），
+    // 按 lineage_id 配上 diff 算出的「新增/修改/删除」标记；未变化的行标记为 unchanged。
+    return versionDocuments.map((row) => ({
+      documentId: row.id,
+      title: row.title,
+      kind: (row.lineage_id ? kindByLineage.get(row.lineage_id) : undefined) ?? 'unchanged',
+    }));
+  }, [diff, isDraftView, versionDocuments, kindByLineage]);
 
   async function handleUploadFile(file: File) {
     if (!currentDraft) return;
@@ -251,42 +299,42 @@ export function ContentTab({ api, kb, onChanged }: ContentTabProps) {
         contentBase64,
         title: file.name,
       });
-      notify.successText(t('knowledgeAdmin.toast.uploadSuccess'));
+      toast.success(createMessageDescriptor('knowledgeAdmin.toast.uploadSuccess'));
       await loadDiff();
       onChanged?.();
     } catch (error) {
-      notify.error(knowledgeAdminErrorMessage(error, 'knowledgeAdmin.toast.updateError', { t }));
+      toast.error(error, 'knowledgeAdmin.toast.updateError');
     } finally {
       setUploading(false);
       if (fileInputRef.current) fileInputRef.current.value = '';
     }
   }
 
-  async function handleDeleteDocument(document: DiffDocument) {
+  async function handleDeleteDocument(row: ContentRow) {
     if (!currentDraft) return;
-    setRestoringId(document.lineage_id);
+    setRestoringId(row.documentId);
     try {
-      await api.archiveDocument(document.lineage_id, {});
-      notify.successText(t('knowledgeAdmin.toast.archiveDocumentSuccess'));
+      await api.archiveDocument(row.documentId, {});
+      toast.success(createMessageDescriptor('knowledgeAdmin.toast.archiveDocumentSuccess'));
       await loadDiff();
       onChanged?.();
     } catch (error) {
-      notify.error(knowledgeAdminErrorMessage(error, 'knowledgeAdmin.toast.deleteError', { t }));
+      toast.error(error, 'knowledgeAdmin.toast.deleteError');
     } finally {
       setRestoringId(null);
     }
   }
 
-  async function handleRestoreDocument(document: DiffDocument) {
+  async function handleRestoreDocument(row: ContentRow) {
     if (!currentDraft) return;
-    setRestoringId(document.lineage_id);
+    setRestoringId(row.documentId);
     try {
-      await api.updateDocument(document.lineage_id, { status: 'ready' });
-      notify.successText(t('knowledgeAdmin.toast.restoreDocumentSuccess'));
+      await api.updateDocument(row.documentId, { status: 'ready' });
+      toast.success(createMessageDescriptor('knowledgeAdmin.toast.restoreDocumentSuccess'));
       await loadDiff();
       onChanged?.();
     } catch (error) {
-      notify.error(knowledgeAdminErrorMessage(error, 'knowledgeAdmin.toast.updateError', { t }));
+      toast.error(error, 'knowledgeAdmin.toast.updateError');
     } finally {
       setRestoringId(null);
     }
@@ -300,13 +348,13 @@ export function ContentTab({ api, kb, onChanged }: ContentTabProps) {
         changeReason: input.changeReason,
         expectedPublishedVersionId: kb.published_version_id ?? undefined,
       });
-      notify.successText(t('knowledgeAdmin.toast.createDraftSuccess'));
+      toast.success(createMessageDescriptor('knowledgeAdmin.toast.createDraftSuccess'));
       setCreateOpen(false);
       await loadVersions();
       setView(created.id);
       onChanged?.();
     } catch (error) {
-      notify.error(knowledgeAdminErrorMessage(error, 'knowledgeAdmin.toast.createError', { t }));
+      toast.error(error, 'knowledgeAdmin.toast.createError');
     } finally {
       setCreating(false);
     }
@@ -323,13 +371,13 @@ export function ContentTab({ api, kb, onChanged }: ContentTabProps) {
         level: input.level,
         forceOverwrite: input.forceOverwrite,
       });
-      notify.successText(t('knowledgeAdmin.toast.publishSuccess'));
+      toast.success(createMessageDescriptor('knowledgeAdmin.toast.publishSuccess'));
       setPublishOpen(false);
       setView(PUB_VIEW);
       await loadVersions();
       onChanged?.();
     } catch (error) {
-      notify.error(knowledgeAdminErrorMessage(error, 'knowledgeAdmin.toast.updateError', { t }));
+      toast.error(error, 'knowledgeAdmin.toast.updateError');
     } finally {
       setPublishing(false);
     }
@@ -358,13 +406,13 @@ export function ContentTab({ api, kb, onChanged }: ContentTabProps) {
         teamId: currentDraft.source_team_id ?? null,
         changeReason: trimmed,
       });
-      notify.successText(t('knowledgeAdmin.toast.rejectSuccess'));
+      toast.success(createMessageDescriptor('knowledgeAdmin.toast.rejectSuccess'));
       setRejectOpen(false);
       setView(PUB_VIEW);
       await loadVersions();
       onChanged?.();
     } catch (error) {
-      notify.error(knowledgeAdminErrorMessage(error, 'knowledgeAdmin.toast.updateError', { t }));
+      toast.error(error, 'knowledgeAdmin.toast.updateError');
     } finally {
       setRejecting(false);
     }
@@ -410,17 +458,21 @@ export function ContentTab({ api, kb, onChanged }: ContentTabProps) {
     setApplying(true);
     try {
       for (const document of reviewOutput.docs) {
+        // 写回一律用 `documentIdByLineage` 解析出的真实行 id，不用 `document.lineageId`
+        // 本身——对跨版本克隆而来的行两者并不相等（见文件头注释）；映射缺失时退回
+        // lineageId 仅作兜底（例如本草稿内新建、克隆前的极端时序），不阻塞写回。
+        const documentId = documentIdByLineage.get(document.lineageId) ?? document.lineageId;
         if (document.kind === 'modified') {
-          await api.updateDocument(document.lineageId, {
+          await api.updateDocument(documentId, {
             contentMd: document.lines.join('\n'),
             expectedUpdatedAt: currentDraft.updated_at,
           });
         } else if (document.kind === 'added' && document.restore) {
           // WholeDocumentPanel: added 文档 restore=true 表示用户拒绝了这次新增。
-          await api.archiveDocument(document.lineageId, { expectedUpdatedAt: currentDraft.updated_at });
+          await api.archiveDocument(documentId, { expectedUpdatedAt: currentDraft.updated_at });
         } else if (document.kind === 'deleted' && document.restore) {
           // WholeDocumentPanel: deleted 文档 restore=true 表示用户拒绝了这次删除（恢复原文）。
-          await api.updateDocument(document.lineageId, {
+          await api.updateDocument(documentId, {
             status: 'ready',
             expectedUpdatedAt: currentDraft.updated_at,
           });
@@ -432,7 +484,7 @@ export function ContentTab({ api, kb, onChanged }: ContentTabProps) {
         documentsAdjusted: reviewOutput.docs.filter((document) => document.staged.length > 0 || document.restore).length,
         expectedUpdatedAt: currentDraft.updated_at,
       });
-      notify.successText(t('knowledgeAdmin.toast.applyReviewSuccess'));
+      toast.success(createMessageDescriptor('knowledgeAdmin.toast.applyReviewSuccess'));
       setReviewOpen(false);
       await Promise.all([loadVersions(), loadDiff()]);
       onChanged?.();
@@ -440,16 +492,18 @@ export function ContentTab({ api, kb, onChanged }: ContentTabProps) {
       setReviewReturnToPublish(false);
     } catch (error) {
       if (apiErrorCode(error) === 'KNOWLEDGE_PUBLISH_CONFLICT') {
-        toastNotifier.error(createMessageDescriptor('knowledgeAdmin.content.review.applyConflict'));
+        // 这里比契约默认的 `errors.knowledge.publishConflict` 文案更具体（"应用审阅"场景专属
+        // 措辞），跳过错误码→契约映射直接显示。
+        toast.errorDescriptor(createMessageDescriptor('knowledgeAdmin.content.review.applyConflict'));
       } else {
-        notify.error(knowledgeAdminErrorMessage(error, 'knowledgeAdmin.toast.updateError', { t }));
+        toast.error(error, 'knowledgeAdmin.toast.updateError');
       }
     } finally {
       setApplying(false);
     }
   }
 
-  const columns: DataTableColumn<DiffDocument>[] = [
+  const columns: DataTableColumn<ContentRow>[] = [
     {
       key: 'title',
       title: t('knowledgeAdmin.content.table.title'),
@@ -460,7 +514,7 @@ export function ContentTab({ api, kb, onChanged }: ContentTabProps) {
       title: t('knowledgeAdmin.content.table.status'),
       width: 140,
       render: (row) =>
-        isDraftView ? (
+        isDraftView && row.kind !== 'unchanged' ? (
           <span className="rounded-full bg-[#eef2f7] px-[8px] py-[2px] text-[11px] font-medium text-[#596174]">
             {t(BADGE_MESSAGE_IDS[row.kind])}
           </span>
@@ -473,11 +527,11 @@ export function ContentTab({ api, kb, onChanged }: ContentTabProps) {
             title: t('knowledgeAdmin.content.table.actions'),
             width: 120,
             align: 'right' as const,
-            render: (row: DiffDocument) =>
+            render: (row: ContentRow) =>
               row.kind === 'deleted' ? (
                 <Button
                   variant="outline"
-                  disabled={restoringId === row.lineage_id}
+                  disabled={restoringId === row.documentId}
                   onClick={() => void handleRestoreDocument(row)}
                   className={OUTLINE_ACTION_BUTTON_SM_CLASS}
                 >
@@ -486,7 +540,7 @@ export function ContentTab({ api, kb, onChanged }: ContentTabProps) {
               ) : (
                 <Button
                   variant="outline"
-                  disabled={restoringId === row.lineage_id}
+                  disabled={restoringId === row.documentId}
                   onClick={() => void handleDeleteDocument(row)}
                   className={OUTLINE_ACTION_BUTTON_SM_CLASS}
                 >
@@ -602,7 +656,7 @@ export function ContentTab({ api, kb, onChanged }: ContentTabProps) {
       <DataTable
         columns={columns}
         data={visibleDocuments}
-        rowKey={(row) => row.lineage_id}
+        rowKey={(row) => row.documentId}
         loading={loadingDiff}
         emptyText={t('knowledgeAdmin.content.empty')}
         aria-label={t('knowledgeAdmin.detail.tabs.content')}

@@ -107,12 +107,23 @@ const draftDiff: VersionDiff = {
   ],
 };
 
+// T081/A2b draft workspace document list for `kbver_draft_1`: real row ids deliberately
+// differ from `lineage_id` (`_row` suffix) — mirrors a cross-version clone, where the
+// backend assigns a new row id and keeps the original `lineage_id` only in metadata.
+// Write-back (delete/restore) must target these real ids, not `lineage_id` (T083).
+const draftVersionDocuments = [
+  { id: 'doc_new_1_row', lineage_id: 'doc_new_1', title: '新增文档', filename: 'doc_new_1.md', status: 'ready', bucket_count: 0, chunk_count: 0, updated_at: draftVersion.updated_at },
+  { id: 'doc_mod_1_row', lineage_id: 'doc_mod_1', title: '修改文档', filename: 'doc_mod_1.md', status: 'ready', bucket_count: 0, chunk_count: 0, updated_at: draftVersion.updated_at },
+  { id: 'doc_del_1_row', lineage_id: 'doc_del_1', title: '删除文档', filename: 'doc_del_1.md', status: 'archived', bucket_count: 0, chunk_count: 0, updated_at: draftVersion.updated_at },
+];
+
 function createMockApi() {
   return {
     listVersions: vi.fn().mockResolvedValue([draftVersion]),
     getVersionDiff: vi.fn().mockImplementation((_kbId: string, versionId: string) =>
       Promise.resolve(versionId === 'kbver_draft_1' ? draftDiff : pubDiff),
     ),
+    listVersionDocuments: vi.fn().mockResolvedValue(draftVersionDocuments),
     uploadDocument: vi.fn().mockResolvedValue({ id: 'job_1', status: 'pending' }),
     updateDocument: vi.fn().mockResolvedValue({ id: 'doc_1' }),
     archiveDocument: vi.fn().mockResolvedValue({ id: 'doc_1' }),
@@ -234,10 +245,33 @@ describe('ContentTab', () => {
     await screen.findByText('新增文档');
     const deleteButtons = screen.getAllByRole('button', { name: '删除' });
     await user.click(deleteButtons[0]);
-    await waitFor(() => expect(api.archiveDocument).toHaveBeenCalledWith('doc_new_1', expect.anything()));
+    // Real row id (`doc_new_1_row`), not `lineage_id` (`doc_new_1`) — T083 regression
+    // coverage: write-back must resolve through `listVersionDocuments`.
+    await waitFor(() => expect(api.archiveDocument).toHaveBeenCalledWith('doc_new_1_row', expect.anything()));
+    expect(api.archiveDocument).not.toHaveBeenCalledWith('doc_new_1', expect.anything());
 
     await user.click(screen.getByRole('button', { name: '恢复' }));
-    await waitFor(() => expect(api.updateDocument).toHaveBeenCalledWith('doc_del_1', expect.objectContaining({ status: 'ready' })));
+    await waitFor(() => expect(api.updateDocument).toHaveBeenCalledWith('doc_del_1_row', expect.objectContaining({ status: 'ready' })));
+    expect(api.updateDocument).not.toHaveBeenCalledWith('doc_del_1', expect.anything());
+  });
+
+  it('shows unchanged documents in the draft workspace alongside added/modified/deleted ones', async () => {
+    const user = userEvent.setup();
+    const api = createMockApi();
+    api.listVersionDocuments.mockResolvedValue([
+      ...draftVersionDocuments,
+      { id: 'doc_unchanged_1', lineage_id: 'doc_unchanged_1', title: '未改动文档', filename: 'doc_unchanged_1.md', status: 'ready', bucket_count: 0, chunk_count: 0, updated_at: draftVersion.updated_at },
+    ]);
+    renderContentTab(api, '/kb?view=kbver_draft_1');
+
+    await screen.findByText('新增文档');
+    const unchangedRow = await screen.findByText('未改动文档');
+    expect(unchangedRow).toBeTruthy();
+    // No draft badge for an unchanged document...
+    expect(screen.queryByText('草稿新增')).not.toBeNull(); // sanity: other badges still render
+    // ...but it still gets a delete action, same as added/modified rows.
+    expect(screen.getAllByRole('button', { name: '删除' }).length).toBe(3);
+    void user;
   });
 
   // Regression for the fix-round-1 race: on a fresh mount with `?view=<draftId>` already

@@ -8,13 +8,13 @@ import { useEffect, useState } from 'react';
 import { CapabilityScopeControl, normalizeCapabilityScope } from '@/components/CapabilityScopeControl';
 import { Input, Textarea } from '@/components/ui';
 import { Button } from '@/components/ui/button';
-import { notify } from '@/components/ui/app-toast';
 import { useAppIntl } from '@/i18n';
+import { createMessageDescriptor } from '@/i18n/descriptors';
 import type { KnowledgeAdminApi } from '@/api/knowledgeAdmin';
 import type { CapabilityScope, KnowledgeBaseRead } from '@/types';
 
 import { DeleteDialog } from '../dialogs/DeleteDialog';
-import { knowledgeAdminErrorMessage } from './errorMessage';
+import { useKnowledgeAdminToast } from './errorMessage';
 
 export type SettingsTabProps = {
   api: KnowledgeAdminApi;
@@ -34,6 +34,7 @@ const CARD_CLASS = 'rounded-[14px] border-[0.5px] border-[#e3e7f1] bg-white p-[2
 /** 基本信息 / 上线状态 / 危险区三张卡片；每张卡片内部各自管理保存态，互不阻塞。 */
 export function SettingsTab({ api, kb, draftCount, draftCountUnknown = false, onUpdated, onDeleted }: SettingsTabProps) {
   const { t } = useAppIntl();
+  const toast = useKnowledgeAdminToast();
   const [name, setName] = useState(kb.name);
   const [description, setDescription] = useState(kb.description || '');
   const [capabilityScope, setCapabilityScope] = useState<CapabilityScope>(normalizeCapabilityScope(kb.capability_scope));
@@ -63,10 +64,10 @@ export function SettingsTab({ api, kb, draftCount, draftCountUnknown = false, on
         description: description.trim(),
         capabilityScope,
       });
-      notify.successText(t('knowledgeAdmin.toast.updateSuccess'));
+      toast.success(createMessageDescriptor('knowledgeAdmin.toast.updateSuccess'));
       onUpdated(updated);
     } catch (error) {
-      notify.error(knowledgeAdminErrorMessage(error, 'knowledgeAdmin.toast.updateError', { t }));
+      toast.error(error, 'knowledgeAdmin.toast.updateError');
     } finally {
       setSaving(false);
     }
@@ -77,10 +78,10 @@ export function SettingsTab({ api, kb, draftCount, draftCountUnknown = false, on
     setStatusSaving(true);
     try {
       const updated = await api.updateKnowledgeBase(kb.id, { status: nextStatus });
-      notify.successText(t('knowledgeAdmin.toast.updateSuccess'));
+      toast.success(createMessageDescriptor('knowledgeAdmin.toast.updateSuccess'));
       onUpdated(updated);
     } catch (error) {
-      notify.error(knowledgeAdminErrorMessage(error, 'knowledgeAdmin.toast.updateError', { t }));
+      toast.error(error, 'knowledgeAdmin.toast.updateError');
     } finally {
       setStatusSaving(false);
     }
@@ -90,11 +91,11 @@ export function SettingsTab({ api, kb, draftCount, draftCountUnknown = false, on
     setDeleting(true);
     try {
       await api.deleteKnowledgeBase(kb.id);
-      notify.successText(t('knowledgeAdmin.toast.deleteSuccess'));
+      toast.success(createMessageDescriptor('knowledgeAdmin.toast.deleteSuccess'));
       setDeleteOpen(false);
       onDeleted();
     } catch (error) {
-      notify.error(knowledgeAdminErrorMessage(error, 'knowledgeAdmin.toast.deleteError', { t }));
+      toast.error(error, 'knowledgeAdmin.toast.deleteError');
     } finally {
       setDeleting(false);
     }

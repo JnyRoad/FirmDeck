@@ -80,6 +80,11 @@ function createMockApi(draft: KnowledgeAdminVersionRead) {
   return {
     listVersions: vi.fn().mockResolvedValue([draft]),
     getVersionDiff: vi.fn().mockResolvedValue(staleDiff),
+    // Draft workspace source of truth (T081/A2b): mirrors `staleDiff`'s single added
+    // document so it still renders once ContentTab merges the two lists.
+    listVersionDocuments: vi.fn().mockResolvedValue([
+      { id: 'doc_new_1', lineage_id: 'doc_new_1', title: '新增文档', filename: 'doc_new_1.md', status: 'ready', bucket_count: 0, chunk_count: 0, updated_at: '2026-08-20T00:00:00Z' },
+    ]),
     uploadDocument: vi.fn(),
     updateDocument: vi.fn(),
     archiveDocument: vi.fn(),

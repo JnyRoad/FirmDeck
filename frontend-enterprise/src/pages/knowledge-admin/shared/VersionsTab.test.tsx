@@ -86,6 +86,9 @@ function createMockApi() {
     updateDocument: vi.fn(),
     archiveDocument: vi.fn(),
     recordReview: vi.fn().mockResolvedValue({}),
+    // Draft workspace document list (T081/A2b); empty here since `getVersionDiff` above
+    // always returns `documents: []` for this test file's scenarios.
+    listVersionDocuments: vi.fn().mockResolvedValue([]),
   };
 }
 

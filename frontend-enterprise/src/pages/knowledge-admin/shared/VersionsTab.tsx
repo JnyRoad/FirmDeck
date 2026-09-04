@@ -11,8 +11,8 @@ import { useSearchParams } from 'react-router-dom';
 import { DataTable, type DataTableColumn } from '@/components/DataTable';
 import { Dialog, DialogContent, DialogTitle, Textarea } from '@/components/ui';
 import { Button } from '@/components/ui/button';
-import { notify } from '@/components/ui/app-toast';
 import { useAppIntl } from '@/i18n';
+import { createMessageDescriptor } from '@/i18n/descriptors';
 import { RawIdentifier } from '@/i18n/RawContent';
 import {
   DIALOG_CANCEL_BUTTON_CLASS,
@@ -31,7 +31,7 @@ import { CreateDraftDialog } from '../dialogs/CreateDraftDialog';
 import { PublishDialog, type PublishDialogSubmitInput } from '../dialogs/PublishDialog';
 import { RebaseDialog } from '../dialogs/RebaseDialog';
 import { formatVersion } from '../knowledgeAdminModel';
-import { knowledgeAdminErrorMessage } from './errorMessage';
+import { useKnowledgeAdminToast } from './errorMessage';
 
 export type VersionsTabProps = {
   api: KnowledgeAdminApi;
@@ -47,6 +47,7 @@ const STATE_LABEL_IDS: Record<string, 'knowledgeAdmin.versions.state.draft' | 'k
 
 export function VersionsTab({ api, kb, onChanged }: VersionsTabProps) {
   const { t } = useAppIntl();
+  const toast = useKnowledgeAdminToast();
   const [searchParams, setSearchParams] = useSearchParams();
   const [versions, setVersions] = useState<KnowledgeAdminVersionRead[]>([]);
   const [loading, setLoading] = useState(false);
@@ -75,7 +76,7 @@ export function VersionsTab({ api, kb, onChanged }: VersionsTabProps) {
       const result = await api.listVersions(kb.id);
       setVersions(Array.isArray(result) ? result : []);
     } catch (error) {
-      notify.error(knowledgeAdminErrorMessage(error, 'knowledgeAdmin.toast.loadFailed', { t }));
+      toast.error(error, 'knowledgeAdmin.toast.loadFailed');
     } finally {
       setLoading(false);
     }
@@ -111,12 +112,12 @@ export function VersionsTab({ api, kb, onChanged }: VersionsTabProps) {
         changeReason: input.changeReason,
         expectedPublishedVersionId: kb.published_version_id ?? undefined,
       });
-      notify.successText(t('knowledgeAdmin.toast.createDraftSuccess'));
+      toast.success(createMessageDescriptor('knowledgeAdmin.toast.createDraftSuccess'));
       setCreateOpen(false);
       await load();
       onChanged?.();
     } catch (error) {
-      notify.error(knowledgeAdminErrorMessage(error, 'knowledgeAdmin.toast.createError', { t }));
+      toast.error(error, 'knowledgeAdmin.toast.createError');
     } finally {
       setCreating(false);
     }
@@ -133,12 +134,12 @@ export function VersionsTab({ api, kb, onChanged }: VersionsTabProps) {
         level: input.level,
         forceOverwrite: input.forceOverwrite,
       });
-      notify.successText(t('knowledgeAdmin.toast.publishSuccess'));
+      toast.success(createMessageDescriptor('knowledgeAdmin.toast.publishSuccess'));
       setPublishTarget(null);
       await load();
       onChanged?.();
     } catch (error) {
-      notify.error(knowledgeAdminErrorMessage(error, 'knowledgeAdmin.toast.updateError', { t }));
+      toast.error(error, 'knowledgeAdmin.toast.updateError');
     } finally {
       setPublishing(false);
     }
@@ -166,12 +167,12 @@ export function VersionsTab({ api, kb, onChanged }: VersionsTabProps) {
         teamId: rejectTarget.source_team_id ?? null,
         changeReason: trimmed,
       });
-      notify.successText(t('knowledgeAdmin.toast.rejectSuccess'));
+      toast.success(createMessageDescriptor('knowledgeAdmin.toast.rejectSuccess'));
       setRejectTarget(null);
       await load();
       onChanged?.();
     } catch (error) {
-      notify.error(knowledgeAdminErrorMessage(error, 'knowledgeAdmin.toast.updateError', { t }));
+      toast.error(error, 'knowledgeAdmin.toast.updateError');
     } finally {
       setRejecting(false);
     }
@@ -192,12 +193,12 @@ export function VersionsTab({ api, kb, onChanged }: VersionsTabProps) {
         expectedPublishedVersionId: kb.published_version_id ?? '',
         changeReason: trimmed,
       });
-      notify.successText(t('knowledgeAdmin.toast.rollbackSuccess'));
+      toast.success(createMessageDescriptor('knowledgeAdmin.toast.rollbackSuccess'));
       setRollbackTarget(null);
       await load();
       onChanged?.();
     } catch (error) {
-      notify.error(knowledgeAdminErrorMessage(error, 'knowledgeAdmin.toast.updateError', { t }));
+      toast.error(error, 'knowledgeAdmin.toast.updateError');
     } finally {
       setRollingBack(false);
     }

@@ -120,6 +120,16 @@ function createMockApi() {
   return {
     listVersions: vi.fn().mockResolvedValue([draftVersion]),
     getVersionDiff: vi.fn().mockResolvedValue(draftDiff),
+    // T081/A2b draft workspace document list: real row ids deliberately differ from
+    // `lineage_id` (e.g. a cross-version clone gets a new row id, keeping only the
+    // original `lineage_id` in metadata) — this is the exact "known limitation"
+    // scenario T083 fixes. `applyReview` must write back with these real ids, not
+    // `document.lineageId` from the review output.
+    listVersionDocuments: vi.fn().mockResolvedValue([
+      { id: 'doc_new_1_row', lineage_id: 'doc_new_1', title: '新增文档', filename: 'doc_new_1.md', status: 'ready', bucket_count: 0, chunk_count: 0, updated_at: draftVersion.updated_at },
+      { id: 'doc_mod_1_row', lineage_id: 'doc_mod_1', title: '修改文档', filename: 'doc_mod_1.md', status: 'ready', bucket_count: 0, chunk_count: 0, updated_at: draftVersion.updated_at },
+      { id: 'doc_del_1_row', lineage_id: 'doc_del_1', title: '删除文档', filename: 'doc_del_1.md', status: 'archived', bucket_count: 0, chunk_count: 0, updated_at: draftVersion.updated_at },
+    ]),
     uploadDocument: vi.fn(),
     updateDocument: vi.fn().mockResolvedValue({ id: 'doc' }),
     archiveDocument: vi.fn().mockResolvedValue({ id: 'doc' }),
@@ -163,12 +173,16 @@ describe('ContentTab review-apply flow', () => {
     act(() => latestOnChange?.(emptyOutput));
     await user.click(screen.getByRole('button', { name: '应用到草稿' }));
 
-    await waitFor(() => expect(api.updateDocument).toHaveBeenCalledWith('doc_mod_1', {
+    // Real row id (`doc_mod_1_row`), not the review output's `lineageId` (`doc_mod_1`) —
+    // proves write-back is resolved through `listVersionDocuments`, not the diff's
+    // cross-version `lineage_id` (T083).
+    await waitFor(() => expect(api.updateDocument).toHaveBeenCalledWith('doc_mod_1_row', {
       contentMd: '新内容',
       expectedUpdatedAt: draftVersion.updated_at,
     }));
+    expect(api.updateDocument).not.toHaveBeenCalledWith('doc_mod_1', expect.anything());
     expect(api.archiveDocument).not.toHaveBeenCalled();
-    expect(api.updateDocument).not.toHaveBeenCalledWith('doc_del_1', expect.anything());
+    expect(api.updateDocument).not.toHaveBeenCalledWith('doc_del_1_row', expect.anything());
 
     await waitFor(() => expect(api.recordReview).toHaveBeenCalledWith('kb_1', 'kbver_draft_1', expect.objectContaining({
       staged: 1,
@@ -197,8 +211,10 @@ describe('ContentTab review-apply flow', () => {
     }));
     await user.click(screen.getByRole('button', { name: '应用到草稿' }));
 
-    await waitFor(() => expect(api.archiveDocument).toHaveBeenCalledWith('doc_new_1', { expectedUpdatedAt: draftVersion.updated_at }));
-    await waitFor(() => expect(api.updateDocument).toHaveBeenCalledWith('doc_del_1', {
+    // Both assertions use the real row id (`_row` suffix), not the review output's
+    // `lineageId` — same T083 regression coverage as the "modified" case above.
+    await waitFor(() => expect(api.archiveDocument).toHaveBeenCalledWith('doc_new_1_row', { expectedUpdatedAt: draftVersion.updated_at }));
+    await waitFor(() => expect(api.updateDocument).toHaveBeenCalledWith('doc_del_1_row', {
       status: 'ready',
       expectedUpdatedAt: draftVersion.updated_at,
     }));

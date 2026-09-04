@@ -17,15 +17,15 @@ import { useEffect, useState } from 'react';
 
 import { Dialog, DialogContent, DialogTitle, Textarea } from '@/components/ui';
 import { Button } from '@/components/ui/button';
-import { notify } from '@/components/ui/app-toast';
 import { useAppIntl } from '@/i18n';
+import { createMessageDescriptor } from '@/i18n/descriptors';
 import { RawContent } from '@/i18n/RawContent';
 import { apiErrorCode } from '@/lib/apiErrorMessages';
 import { DIALOG_CANCEL_BUTTON_CLASS, DIALOG_FOOTER_CLASS, DIALOG_PRIMARY_BUTTON_CLASS, OUTLINE_ACTION_BUTTON_SM_CLASS } from '@/lib/enterprise-ui';
 import type { KnowledgeAdminApi, RebaseResolution } from '@/api/knowledgeAdmin';
 import type { KnowledgeAdminVersionRead, RebaseConflictDocument, RebasePreview, RebaseResult } from '@/types/knowledgeAdmin';
 
-import { knowledgeAdminErrorMessage } from '../shared/errorMessage';
+import { useKnowledgeAdminToast } from '../shared/errorMessage';
 import { MergeDialog } from './MergeDialog';
 
 export type RebaseDialogProps = {
@@ -45,6 +45,7 @@ function isRebaseResult(value: RebasePreview | RebaseResult): value is RebaseRes
 /** 变基对话框：编排预览（A3）→ 逐篇合并（MergeDialog）→ 提交解决（A4）。 */
 export function RebaseDialog({ open, onOpenChange, api, kbId, draft, onRebased }: RebaseDialogProps) {
   const { t } = useAppIntl();
+  const toast = useKnowledgeAdminToast();
 
   const [reason, setReason] = useState('');
   const [reasonError, setReasonError] = useState(false);
@@ -73,7 +74,7 @@ export function RebaseDialog({ open, onOpenChange, api, kbId, draft, onRebased }
     try {
       const result = await api.rebaseDraft(kbId, draft!.id, { changeReason });
       if (isRebaseResult(result)) {
-        notify.successText(t('knowledgeAdmin.toast.rebaseSuccess'));
+        toast.success(createMessageDescriptor('knowledgeAdmin.toast.rebaseSuccess'));
         onRebased(result);
         onOpenChange(false);
         return;
@@ -83,7 +84,7 @@ export function RebaseDialog({ open, onOpenChange, api, kbId, draft, onRebased }
       setActiveConflict(null);
       setStaleAgain(false);
     } catch (error) {
-      notify.error(knowledgeAdminErrorMessage(error, 'knowledgeAdmin.toast.updateError', { t }));
+      toast.error(error, 'knowledgeAdmin.toast.updateError');
     } finally {
       setSubmitting(false);
     }
@@ -112,14 +113,14 @@ export function RebaseDialog({ open, onOpenChange, api, kbId, draft, onRebased }
         toBaseVersionId: preview.to_base_version_id,
         resolutions: resolutionList,
       });
-      notify.successText(t('knowledgeAdmin.toast.rebaseSuccess'));
+      toast.success(createMessageDescriptor('knowledgeAdmin.toast.rebaseSuccess'));
       onRebased(result);
       onOpenChange(false);
     } catch (error) {
       if (apiErrorCode(error) === 'KNOWLEDGE_PUBLISH_CONFLICT') {
         setStaleAgain(true);
       } else {
-        notify.error(knowledgeAdminErrorMessage(error, 'knowledgeAdmin.toast.updateError', { t }));
+        toast.error(error, 'knowledgeAdmin.toast.updateError');
       }
     } finally {
       setSubmitting(false);
