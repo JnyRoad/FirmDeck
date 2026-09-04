@@ -19,7 +19,12 @@ from app.db import get_session
 from app.db.models import KnowledgeBase, KnowledgeBaseVersion, KnowledgeDocument, User
 from app.knowledge.diff import DEFAULT_MAX_LINES, diff_versions, document_lineage_id
 from app.knowledge.errors import KnowledgeError
-from app.knowledge.listing import list_bindable_teams, list_tenant_knowledge_bases
+from app.knowledge.listing import (
+    ListedKnowledgeBase,
+    get_tenant_knowledge_base,
+    list_bindable_teams,
+    list_tenant_knowledge_bases,
+)
 from app.knowledge.management import (
     require_shared_knowledge_history_viewer,
     require_team_knowledge_manager,
@@ -61,6 +66,46 @@ router = APIRouter(
 )
 
 
+def _project_knowledge_admin_list_item(item: ListedKnowledgeBase) -> KnowledgeAdminListItem:
+    """把 `listing.py` 的聚合结果投影为 A1/A1b 共用的响应模型。
+
+    抽成独立函数供 A1（列表）与 A1b（单库详情）复用，保证两个端点返回同一套字段与
+    聚合口径（draft_count/document_count/owner_agent/bound_teams/branch），不会因为
+    各自维护一份投影逻辑而漂移。
+    """
+    return KnowledgeAdminListItem(
+        id=item.id,
+        name=item.name,
+        description=item.description,
+        mode=item.mode,
+        status=item.status,
+        capability_scope=item.capability_scope,
+        published_version=item.published_version,
+        published_version_id=item.published_version_id,
+        draft_count=item.draft_count,
+        document_count=item.document_count,
+        owner_agent=(
+            KnowledgeAdminOwnerAgentRead(id=item.owner_agent.id, name=item.owner_agent.name)
+            if item.owner_agent
+            else None
+        ),
+        bound_teams=[
+            KnowledgeAdminBoundTeamRead(id=team.id, name=team.name, is_default=team.is_default)
+            for team in item.bound_teams
+        ],
+        branch=(
+            KnowledgeAdminBranchRead(
+                base_version=item.branch.base_version,
+                head_version=item.branch.head_version,
+                sync_state=item.branch.sync_state,
+            )
+            if item.branch
+            else None
+        ),
+        updated_at=item.updated_at.isoformat(),
+    )
+
+
 @router.get("/knowledge-bases", response_model=KnowledgeAdminListResponse)
 def list_knowledge_admin_bases(
     tenant_id: str = Query(...),
@@ -89,40 +134,7 @@ def list_knowledge_admin_bases(
         limit=limit,
     )
     return KnowledgeAdminListResponse(
-        items=[
-            KnowledgeAdminListItem(
-                id=item.id,
-                name=item.name,
-                description=item.description,
-                mode=item.mode,
-                status=item.status,
-                capability_scope=item.capability_scope,
-                published_version=item.published_version,
-                published_version_id=item.published_version_id,
-                draft_count=item.draft_count,
-                document_count=item.document_count,
-                owner_agent=(
-                    KnowledgeAdminOwnerAgentRead(id=item.owner_agent.id, name=item.owner_agent.name)
-                    if item.owner_agent
-                    else None
-                ),
-                bound_teams=[
-                    KnowledgeAdminBoundTeamRead(id=team.id, name=team.name, is_default=team.is_default)
-                    for team in item.bound_teams
-                ],
-                branch=(
-                    KnowledgeAdminBranchRead(
-                        base_version=item.branch.base_version,
-                        head_version=item.branch.head_version,
-                        sync_state=item.branch.sync_state,
-                    )
-                    if item.branch
-                    else None
-                ),
-                updated_at=item.updated_at.isoformat(),
-            )
-            for item in result.items
-        ],
+        items=[_project_knowledge_admin_list_item(item) for item in result.items],
         summary=KnowledgeAdminListSummary(
             total=result.summary.total,
             shared=result.summary.shared,
@@ -134,6 +146,31 @@ def list_knowledge_admin_bases(
         limit=result.limit,
         has_more=result.has_more,
     )
+
+
+@router.get("/knowledge-bases/{kb_id}", response_model=KnowledgeAdminListItem)
+def get_knowledge_admin_base(
+    kb_id: str,
+    tenant_id: str = Query(...),
+    db: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+) -> KnowledgeAdminListItem:
+    """A1b：admin-first 单库详情，返回形状与 A1 列表项完全一致（含专用库 `branch`）。
+
+    修复缺陷 1（`.superpowers/sdd/tasks/task-T077-report.md` Defect 1）：详情页此前
+    复用员工侧 `GET /knowledge-bases/{kb_id}`，缺 `agent_id` 时该端点只对 open-gallery
+    库放行，导致管理员打开任意共享/专用库详情一律 404。这里不要求 `agent_id`，管理员
+    对租户内全部知识库可见，鉴权与存在性口径与 A1 完全一致（`ensure_tenant_admin` +
+    tenant-scoped 查找，跨租户/不存在一律 404 `KNOWLEDGE_BASE_NOT_FOUND`，不做区分）。
+    """
+    ensure_tenant_admin(tenant_id, current_user)
+    ensure_tenant(db, tenant_id)
+    item = get_tenant_knowledge_base(db, tenant_id=tenant_id, knowledge_base_id=kb_id)
+    if item is None:
+        raise domain_http_error(
+            "KNOWLEDGE_BASE_NOT_FOUND", source="knowledge_admin", status_code=404
+        )
+    return _project_knowledge_admin_list_item(item)
 
 
 @router.get("/teams", response_model=list[KnowledgeAdminTeamOption])

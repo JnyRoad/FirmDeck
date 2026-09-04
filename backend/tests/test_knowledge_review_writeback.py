@@ -18,14 +18,17 @@ from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 from test_teams_api import _test_session
 
+from app.api.knowledge import router as knowledge_router
 from app.api.knowledge_admin import review_knowledge_admin_draft
 from app.api.knowledge_admin import router as knowledge_admin_router
+from app.api.knowledge_bases import router as knowledge_bases_router
 from app.db import get_session
 from app.db.models import (
     AgentEvent,
     KnowledgeBase,
     KnowledgeBaseAuditEvent,
     KnowledgeBaseVersion,
+    KnowledgeDocument,
     Team,
     TeamKnowledgeBaseBinding,
     Tenant,
@@ -374,3 +377,125 @@ def test_review_route_persists_across_session_boundary_via_http() -> None:
             select(AgentEvent).where(AgentEvent.event_type == "knowledge.draft.reviewed")
         ).one()
         assert product_event.payload_json["params"]["staged"] == 5
+
+
+# ---------------------------------------------------------------------------
+# 回归：前端"应用审阅"完整顺序（更新草稿文档 → A5 recordReview → 发布）必须把 *文档行*
+# 的 `updated_at` 当写文档的乐观锁 token，而不是 *版本* 的 `updated_at`——旧前端把两者
+# 搞混，用版本时间戳去更新文档，导致合法编辑被 `KNOWLEDGE_DOCUMENT_CONFLICT` 拒绝（frontend
+# `getAdminKnowledgeBase`/`ContentTab` 修复轮次发现的缺陷）。这里串联真实的三个 HTTP 路由
+# （员工侧 `PUT /knowledge/documents/{id}`、admin `POST .../review`、`POST .../publish`），
+# 钉住"实体-时间戳"契约，而不是只测 A5 一个端点。
+# ---------------------------------------------------------------------------
+
+
+def test_apply_review_sequence_uses_document_updated_at_not_version_updated_at_over_http() -> None:
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as seed_db:
+        base, v1 = _seed_review_fixture(seed_db)
+        seed_db.add(
+            KnowledgeDocument(
+                id="kdoc_v1_a",
+                tenant_id="tenant_demo",
+                knowledge_base_id=base.id,
+                knowledge_base_version_id=v1.id,
+                filename="a.md",
+                file_type="md",
+                title="文档A",
+                status="ready",
+                metadata_json={"raw_text": "# 文档A\n\n原文。"},
+            )
+        )
+        seed_db.commit()
+
+        draft = _create_draft(seed_db, expected_published_version_id=v1.id, reason="待审阅草稿")
+        kb_id = base.id
+        draft_id = draft.id
+        draft_updated_at = draft.updated_at.isoformat()
+        published_version_id = v1.id
+
+        draft_document = seed_db.exec(
+            select(KnowledgeDocument).where(
+                KnowledgeDocument.tenant_id == "tenant_demo",
+                KnowledgeDocument.knowledge_base_version_id == draft_id,
+            )
+        ).one()
+        document_id = draft_document.id
+        document_updated_at = draft_document.updated_at.isoformat()
+
+    # 草稿创建（克隆文档）在版本落库之后才写入文档行，两者的 updated_at 必然不同——
+    # 这正是缺陷的根源：两个实体各自的时间戳不可互换。
+    assert document_updated_at != draft_updated_at
+
+    app = FastAPI()
+    app.include_router(knowledge_admin_router)
+    app.include_router(knowledge_router)
+    app.include_router(knowledge_bases_router)
+
+    def override_get_session():
+        with Session(engine) as request_db:
+            yield request_db
+
+    app.dependency_overrides[get_session] = override_get_session
+    app.dependency_overrides[get_current_user] = lambda: _admin_user()
+    client = TestClient(app)
+
+    # 1. 旧前端的错误行为：用*版本*的 updated_at 当文档写入的乐观锁 token → 必须 409。
+    wrong_response = client.put(
+        f"/api/enterprise/knowledge/documents/{document_id}",
+        json={
+            "tenant_id": "tenant_demo",
+            "content_md": "# 文档A\n\n审阅修改。",
+            "expected_updated_at": draft_updated_at,
+        },
+    )
+    assert wrong_response.status_code == 409, wrong_response.text
+    assert wrong_response.json()["detail"]["code"] == "KNOWLEDGE_DOCUMENT_CONFLICT"
+
+    # 2. 正确契约：用*文档行自身*的 updated_at → 必须成功。
+    ok_response = client.put(
+        f"/api/enterprise/knowledge/documents/{document_id}",
+        json={
+            "tenant_id": "tenant_demo",
+            "content_md": "# 文档A\n\n审阅修改。",
+            "expected_updated_at": document_updated_at,
+        },
+    )
+    assert ok_response.status_code == 200, ok_response.text
+    assert "审阅修改" in ok_response.json()["metadata"]["raw_text"]
+
+    # 3. A5 记录审阅：上一步只改了文档行，草稿版本本身的 updated_at 未被触碰，原始值仍然有效。
+    review_response = client.post(
+        f"/api/enterprise/knowledge-admin/knowledge-bases/{kb_id}/versions/{draft_id}/review",
+        json={
+            "tenant_id": "tenant_demo",
+            "staged": 1,
+            "pending": 0,
+            "documents_adjusted": 1,
+            "expected_updated_at": draft_updated_at,
+        },
+    )
+    assert review_response.status_code == 200, review_response.text
+    assert review_response.json()["metadata"]["review"]["staged"] == 1
+
+    # 4. 发布：整条"应用审阅"链路收尾。
+    publish_response = client.post(
+        f"/api/enterprise/knowledge-bases/{kb_id}/versions/{draft_id}/publish",
+        json={
+            "tenant_id": "tenant_demo",
+            "expected_published_version_id": published_version_id,
+            "change_reason": "应用审阅后发布",
+        },
+    )
+    assert publish_response.status_code == 200, publish_response.text
+    assert publish_response.json()["publication_state"] == "released"
+
+    with Session(engine) as verify_db:
+        published_document = verify_db.get(KnowledgeDocument, document_id)
+        assert published_document is not None
+        assert "审阅修改" in (published_document.metadata_json or {}).get("raw_text", "")

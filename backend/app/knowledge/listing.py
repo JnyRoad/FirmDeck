@@ -107,29 +107,17 @@ def _owner_agent_id(base: KnowledgeBase) -> str | None:
     return owner_id if isinstance(owner_id, str) and owner_id else None
 
 
-def list_tenant_knowledge_bases(
-    db: Session,
-    *,
-    tenant_id: str,
-    mode: str | None = None,
-    status: str | None = None,
-    owner_agent_id: str | None = None,
-    team_id: str | None = None,
-    q: str | None = None,
-    offset: int = 0,
-    limit: int = 20,
-) -> KnowledgeBaseListResult:
-    """取全租户知识库并批量聚合统计，过滤/排序/分页在内存中完成。"""
-    bases = db.exec(select(KnowledgeBase).where(KnowledgeBase.tenant_id == tenant_id)).all()
+def _fetch_listed_items(
+    db: Session, *, tenant_id: str, bases: list[KnowledgeBase]
+) -> list[ListedKnowledgeBase]:
+    """批量聚合投影：给定同租户的知识库集合，返回与输入顺序一致的 `ListedKnowledgeBase` 列表。
+
+    供 `list_tenant_knowledge_bases`（A1 全量列表）与 `get_tenant_knowledge_base`
+    （A1b 单库详情）共用，保证 draft_count/document_count/owner_agent/bound_teams/branch
+    等聚合口径在两个端点上完全一致，不会因为各自维护一份投影逻辑而漂移。
+    """
     if not bases:
-        return KnowledgeBaseListResult(
-            items=[],
-            summary=KnowledgeBaseListSummary(total=0, shared=0, dedicated=0, documents=0),
-            total=0,
-            offset=offset,
-            limit=limit,
-            has_more=False,
-        )
+        return []
 
     base_ids = [base.id for base in bases]
     shared_bases = [base for base in bases if base.mode == "shared"]
@@ -312,6 +300,35 @@ def list_tenant_knowledge_bases(
             )
         )
 
+    return items
+
+
+def list_tenant_knowledge_bases(
+    db: Session,
+    *,
+    tenant_id: str,
+    mode: str | None = None,
+    status: str | None = None,
+    owner_agent_id: str | None = None,
+    team_id: str | None = None,
+    q: str | None = None,
+    offset: int = 0,
+    limit: int = 20,
+) -> KnowledgeBaseListResult:
+    """取全租户知识库并批量聚合统计，过滤/排序/分页在内存中完成。"""
+    bases = db.exec(select(KnowledgeBase).where(KnowledgeBase.tenant_id == tenant_id)).all()
+    if not bases:
+        return KnowledgeBaseListResult(
+            items=[],
+            summary=KnowledgeBaseListSummary(total=0, shared=0, dedicated=0, documents=0),
+            total=0,
+            offset=offset,
+            limit=limit,
+            has_more=False,
+        )
+
+    items = _fetch_listed_items(db, tenant_id=tenant_id, bases=bases)
+
     summary = KnowledgeBaseListSummary(
         total=len(items),
         shared=sum(1 for item in items if item.mode == "shared"),
@@ -351,6 +368,21 @@ def list_tenant_knowledge_bases(
         limit=limit,
         has_more=has_more,
     )
+
+
+def get_tenant_knowledge_base(
+    db: Session, *, tenant_id: str, knowledge_base_id: str
+) -> ListedKnowledgeBase | None:
+    """A1b 单库聚合投影：复用 `_fetch_listed_items`，保证与 A1 列表项字段/聚合口径一致。
+
+    知识库不存在或存在但跨租户一律返回 `None`（existence-hiding）；由路由层统一
+    转换为 404 `KNOWLEDGE_BASE_NOT_FOUND`，不区分"不存在"与"属于别的租户"两种情况。
+    """
+    base = db.get(KnowledgeBase, knowledge_base_id)
+    if base is None or base.tenant_id != tenant_id:
+        return None
+    items = _fetch_listed_items(db, tenant_id=tenant_id, bases=[base])
+    return items[0] if items else None
 
 
 def list_bindable_teams(

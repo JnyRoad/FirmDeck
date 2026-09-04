@@ -78,6 +78,7 @@ def test_enterprise_read_endpoints_require_authentication() -> None:
         "/api/enterprise/knowledge/jobs?tenant_id=tenant_demo",
         "/api/enterprise/knowledge-bases?tenant_id=tenant_demo",
         "/api/enterprise/knowledge-admin/knowledge-bases?tenant_id=tenant_demo",
+        "/api/enterprise/knowledge-admin/knowledge-bases/kb_demo?tenant_id=tenant_demo",
         "/api/enterprise/knowledge-admin/teams?tenant_id=tenant_demo",
         "/api/enterprise/model-configs?tenant_id=tenant_demo",
         "/api/enterprise/persona?tenant_id=tenant_demo",

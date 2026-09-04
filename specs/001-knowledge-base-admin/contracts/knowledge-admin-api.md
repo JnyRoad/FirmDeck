@@ -36,6 +36,22 @@ Response `200`:
 ```
 Errors: `FORBIDDEN`（非 admin）。
 
+### A1b `GET /knowledge-admin/knowledge-bases/{kb_id}` — 单库详情（admin-first） **admin**
+
+Query: `tenant_id`（必填）
+
+修复缺陷 1（`.superpowers/sdd/tasks/task-T077-report.md` Defect 1）：详情页此前复用员工侧
+`GET /knowledge-bases/{kb_id}`，缺 `agent_id` 时该端点只对 open-gallery 库放行，导致管理员
+打开任意共享/专用库详情一律 404（`KNOWLEDGE_BASE_VERSION_NOT_VISIBLE`）卡在 Loading。本端点
+不要求 `agent_id`：管理员对租户内全部知识库（共享 *和* 专用）可见。
+
+Response `200`：形状与 A1 `items[]` 的单个元素完全一致（同一个 `KnowledgeAdminListItem`，见
+上）——`draft_count`/`document_count`/`owner_agent`/`bound_teams`/`branch` 的聚合口径与 A1
+共用同一份 `listing.py` 投影逻辑，保证两端点不会漂移。
+
+Errors: `KNOWLEDGE_BASE_NOT_FOUND`（404，知识库不存在**或**存在但属于别的租户——两种情况不
+区分，existence-hiding）、`PERMISSION_TENANT_ADMIN_REQUIRED`（403，非 admin）。
+
 ### A2 `GET /knowledge-admin/knowledge-bases/{kb_id}/versions/{version_id}/diff` — 版本对比 **admin 或该库 history viewer**
 
 Query: `tenant_id`、`against=base|published`（默认 `base`：对比 `parent_version_id`；`published`：对比当前正式版）、`max_lines=5000`

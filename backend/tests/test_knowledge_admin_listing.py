@@ -1,16 +1,20 @@
-"""T020：租户级知识库列表（A1）与可绑定群组候选（A6）。"""
+"""T020：租户级知识库列表（A1）与可绑定群组候选（A6）；A1b 单库详情（缺陷 1 修复）。"""
 
 from __future__ import annotations
 
 import pytest
-from fastapi import HTTPException
-from sqlmodel import Session
+from fastapi import FastAPI, HTTPException
+from fastapi.testclient import TestClient
+from sqlalchemy.pool import StaticPool
+from sqlmodel import Session, SQLModel, create_engine
 from test_teams_api import _test_session
 
 from app.api.knowledge_admin import (
     list_knowledge_admin_bases,
     list_knowledge_admin_bindable_teams,
 )
+from app.api.knowledge_admin import router as knowledge_admin_router
+from app.db import get_session
 from app.db.models import (
     AgentKnowledgeBranch,
     AgentProfile,
@@ -23,6 +27,7 @@ from app.db.models import (
     Tenant,
     User,
 )
+from app.security.auth import get_current_user
 
 
 def _admin_user() -> User:
@@ -654,3 +659,112 @@ def test_bindable_teams_non_admin_is_forbidden() -> None:
 
         assert denied.value.status_code == 403
         assert denied.value.detail["code"] == "PERMISSION_TENANT_ADMIN_REQUIRED"
+
+
+# ---------------------------------------------------------------------------
+# A1b `GET /knowledge-admin/knowledge-bases/{kb_id}` — admin-first 单库详情
+#
+# 修复缺陷 1（`.superpowers/sdd/tasks/task-T077-report.md` Defect 1）：详情页此前复用
+# 员工侧 `GET /knowledge-bases/{kb_id}`，缺 `agent_id` 时该端点只对 open-gallery 库放行，
+# 导致管理员打开任意共享/专用库详情一律 404。走真实 HTTP 请求（`TestClient`，写法与
+# `test_knowledge_rebase.py` 的 `_http_client_for` 一致）而不是直接调用路由函数，
+# 覆盖依赖注入、请求/响应序列化与鉴权 dependency 的真实链路。
+# ---------------------------------------------------------------------------
+
+
+def _new_sqlite_engine():
+    engine = create_engine(
+        "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
+    )
+    SQLModel.metadata.create_all(engine)
+    return engine
+
+
+def _http_client_for(engine, *, current_user: User) -> TestClient:
+    app = FastAPI()
+    app.include_router(knowledge_admin_router)
+
+    def override_get_session():
+        with Session(engine) as request_db:
+            yield request_db
+
+    app.dependency_overrides[get_session] = override_get_session
+    app.dependency_overrides[get_current_user] = lambda: current_user
+    return TestClient(app)
+
+
+def test_admin_detail_route_matches_a1_list_item_for_shared_and_dedicated_bases_over_http() -> None:
+    """A1b 响应必须与 A1 列表项逐字段一致：共享库（kb_shared_faq）与专用库（kb_dedicated_lin，
+    含 branch/owner_agent）各验证一次。"""
+    engine = _new_sqlite_engine()
+    with Session(engine) as db:
+        ids = _seed_tenant(db)
+
+    client = _http_client_for(engine, current_user=_admin_user())
+
+    list_response = client.get(
+        "/api/enterprise/knowledge-admin/knowledge-bases",
+        params={"tenant_id": "tenant_demo", "limit": 20},
+    )
+    assert list_response.status_code == 200, list_response.text
+    items_by_id = {item["id"]: item for item in list_response.json()["items"]}
+    assert items_by_id[ids["lin"]]["branch"] is not None
+    assert items_by_id[ids["lin"]]["owner_agent"] is not None
+
+    for kb_id in (ids["faq"], ids["lin"]):
+        detail_response = client.get(
+            f"/api/enterprise/knowledge-admin/knowledge-bases/{kb_id}",
+            params={"tenant_id": "tenant_demo"},
+        )
+        assert detail_response.status_code == 200, detail_response.text
+        assert detail_response.json() == items_by_id[kb_id]
+
+
+def test_admin_detail_route_missing_and_other_tenant_return_404_over_http() -> None:
+    """不存在的知识库与跨租户的知识库都 404 `KNOWLEDGE_BASE_NOT_FOUND`（existence-hiding，
+    不向调用方泄露"存在但不属于你"与"压根不存在"的区别）。"""
+    engine = _new_sqlite_engine()
+    with Session(engine) as db:
+        _seed_tenant(db)
+        db.add(Tenant(id="tenant_other", name="Other"))
+        db.add(
+            KnowledgeBase(
+                id="kb_other_tenant",
+                tenant_id="tenant_other",
+                name="别的租户的库",
+                mode="shared",
+                status="active",
+            )
+        )
+        db.commit()
+
+    client = _http_client_for(engine, current_user=_admin_user())
+
+    missing_response = client.get(
+        "/api/enterprise/knowledge-admin/knowledge-bases/kb_does_not_exist",
+        params={"tenant_id": "tenant_demo"},
+    )
+    assert missing_response.status_code == 404
+    assert missing_response.json()["detail"]["code"] == "KNOWLEDGE_BASE_NOT_FOUND"
+
+    other_tenant_response = client.get(
+        "/api/enterprise/knowledge-admin/knowledge-bases/kb_other_tenant",
+        params={"tenant_id": "tenant_demo"},
+    )
+    assert other_tenant_response.status_code == 404
+    assert other_tenant_response.json()["detail"]["code"] == "KNOWLEDGE_BASE_NOT_FOUND"
+
+
+def test_admin_detail_route_non_admin_is_403_over_http() -> None:
+    engine = _new_sqlite_engine()
+    with Session(engine) as db:
+        ids = _seed_tenant(db)
+
+    client = _http_client_for(engine, current_user=_member_user())
+
+    response = client.get(
+        f"/api/enterprise/knowledge-admin/knowledge-bases/{ids['faq']}",
+        params={"tenant_id": "tenant_demo"},
+    )
+    assert response.status_code == 403
+    assert response.json()["detail"]["code"] == "PERMISSION_TENANT_ADMIN_REQUIRED"
