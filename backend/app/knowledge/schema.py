@@ -505,3 +505,42 @@ class KnowledgeDiscoveryRead(BaseModel):
     updated_at: str
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class DiffHunkRead(BaseModel):
+    """A2 版本对比单个文档内的一个 hunk：equal（未变）或 change（相邻增删改合并块）。"""
+
+    type: Literal["equal", "change"]
+    base_start: int
+    base_lines: list[str] = Field(default_factory=list)
+    target_start: int
+    target_lines: list[str] = Field(default_factory=list)
+    pairs: list[list[int]] = Field(default_factory=list)
+
+
+class DiffDocumentRead(BaseModel):
+    """A2 版本对比的单篇文档条目：按 lineage（或回退 filename）配对后的增/改/删状态。"""
+
+    lineage_id: str
+    title: str
+    kind: Literal["added", "modified", "deleted"]
+    truncated: bool = False
+    hunks: list[DiffHunkRead] = Field(default_factory=list)
+
+
+class VersionDiffSummary(BaseModel):
+    """A2 响应的 summary：文档级新增/修改/删除计数。"""
+
+    added: int
+    modified: int
+    deleted: int
+
+
+class VersionDiffRead(BaseModel):
+    """A2 `GET /knowledge-admin/knowledge-bases/{kb_id}/versions/{version_id}/diff` 响应。"""
+
+    base_version_id: str | None = None
+    target_version_id: str
+    pairing: Literal["lineage", "filename"]
+    summary: VersionDiffSummary
+    documents: list[DiffDocumentRead] = Field(default_factory=list)

@@ -9,13 +9,20 @@ from __future__ import annotations
 
 from typing import Literal
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlmodel import Session
 
+from app.contracts.domain_http import domain_http_error
+from app.contracts.error_registry import ERROR_REGISTRY, ErrorVisibility
 from app.db import get_session
-from app.db.models import User
+from app.db.models import KnowledgeBaseVersion, User
+from app.knowledge.diff import DEFAULT_MAX_LINES, diff_versions
+from app.knowledge.errors import KnowledgeError
 from app.knowledge.listing import list_bindable_teams, list_tenant_knowledge_bases
+from app.knowledge.management import require_shared_knowledge_history_viewer
 from app.knowledge.schema import (
+    DiffDocumentRead,
+    DiffHunkRead,
     KnowledgeAdminBoundTeamRead,
     KnowledgeAdminBranchRead,
     KnowledgeAdminListItem,
@@ -24,6 +31,8 @@ from app.knowledge.schema import (
     KnowledgeAdminOwnerAgentRead,
     KnowledgeAdminTeamOption,
     KnowledgeBaseMode,
+    VersionDiffRead,
+    VersionDiffSummary,
 )
 from app.security.auth import get_current_user
 from app.security.permissions import ensure_tenant_admin
@@ -126,3 +135,117 @@ def list_knowledge_admin_bindable_teams(
         KnowledgeAdminTeamOption(id=option.id, name=option.name, member_count=option.member_count)
         for option in options
     ]
+
+
+def _knowledge_error_to_http(exc: KnowledgeError) -> HTTPException:
+    """把共享知识库领域错误（如 KNOWLEDGE_GRANT_REQUIRED）映射为稳定 HTTP 载荷；
+
+    未注册或非公开的 code 一律 fail-closed 到 INTERNAL_ERROR（复用 teams.py 里
+    `_knowledge_http_error` 的既有转换模式，保证 code 在静态检查下可追溯到注册表）。
+    """
+    entry = ERROR_REGISTRY.get(exc.code)
+    if entry is None or entry.visibility is not ErrorVisibility.PUBLIC:
+        entry = ERROR_REGISTRY.require("INTERNAL_ERROR")
+        params: dict[str, object] = {}
+    else:
+        params = dict(exc.to_descriptor().params)
+    return domain_http_error(
+        entry.code,
+        source="knowledge_admin",
+        status_code=exc.status_code,
+        params=params,
+        cause=exc,
+    )
+
+
+def _load_admin_diff_version(
+    db: Session, *, tenant_id: str, knowledge_base_id: str, version_id: str
+) -> KnowledgeBaseVersion:
+    """按契约 A2 解析对比版本：不存在→KNOWLEDGE_BASE_NOT_FOUND，跨租户/跨库→KNOWLEDGE_CONTEXT_MISMATCH。"""
+    version = db.get(KnowledgeBaseVersion, version_id)
+    if version is None:
+        raise domain_http_error("KNOWLEDGE_BASE_NOT_FOUND", source="knowledge_admin", status_code=404)
+    if version.tenant_id != tenant_id or version.knowledge_base_id != knowledge_base_id:
+        raise domain_http_error(
+            "KNOWLEDGE_CONTEXT_MISMATCH", source="knowledge_admin", status_code=403
+        )
+    return version
+
+
+@router.get(
+    "/knowledge-bases/{kb_id}/versions/{version_id}/diff",
+    response_model=VersionDiffRead,
+)
+def get_knowledge_admin_version_diff(
+    kb_id: str,
+    version_id: str,
+    tenant_id: str = Query(...),
+    against: Literal["base", "published"] = Query("base"),
+    max_lines: int = Query(DEFAULT_MAX_LINES, ge=1, le=50_000),
+    db: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+) -> VersionDiffRead:
+    """A2：版本对比，租户管理员或该共享库的 history viewer（团队所有者）均可访问。
+
+    `against=base`（默认）对比目标版本的 `parent_version_id`；`against=published` 对比
+    知识库当前正式版本 `published_version_id`；两者缺失时视为空文档集合，目标版本的
+    全部文档都判定为新增。鉴权、参数校验之外的聚合逻辑一律留在 `app.knowledge.diff`。
+    """
+    ensure_tenant(db, tenant_id)
+    try:
+        knowledge_base = require_shared_knowledge_history_viewer(
+            db, tenant_id=tenant_id, knowledge_base_id=kb_id, current_user=current_user
+        )
+    except KnowledgeError as exc:
+        raise _knowledge_error_to_http(exc) from exc
+
+    target_version = _load_admin_diff_version(
+        db, tenant_id=tenant_id, knowledge_base_id=kb_id, version_id=version_id
+    )
+
+    if against == "published":
+        base_version_id = knowledge_base.published_version_id
+    else:
+        base_version_id = target_version.parent_version_id
+    if base_version_id:
+        _load_admin_diff_version(
+            db, tenant_id=tenant_id, knowledge_base_id=kb_id, version_id=base_version_id
+        )
+
+    result = diff_versions(
+        db,
+        tenant_id=tenant_id,
+        base_version_id=base_version_id,
+        target_version_id=version_id,
+        max_lines=max_lines,
+    )
+    return VersionDiffRead(
+        base_version_id=result.base_version_id,
+        target_version_id=result.target_version_id,
+        pairing=result.pairing,
+        summary=VersionDiffSummary(
+            added=result.summary.added,
+            modified=result.summary.modified,
+            deleted=result.summary.deleted,
+        ),
+        documents=[
+            DiffDocumentRead(
+                lineage_id=document.lineage_id,
+                title=document.title,
+                kind=document.kind,
+                truncated=document.truncated,
+                hunks=[
+                    DiffHunkRead(
+                        type=hunk.type,
+                        base_start=hunk.base_start,
+                        base_lines=hunk.base_lines,
+                        target_start=hunk.target_start,
+                        target_lines=hunk.target_lines,
+                        pairs=[list(pair) for pair in hunk.pairs],
+                    )
+                    for hunk in document.hunks
+                ],
+            )
+            for document in result.documents
+        ],
+    )
