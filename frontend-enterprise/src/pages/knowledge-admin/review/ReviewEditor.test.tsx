@@ -34,6 +34,7 @@ const labels: ReviewEditorLabels = {
   addedDocBadge: '草稿新增',
   modifiedDocBadge: '草稿修改',
   deletedDocBadge: '草稿删除',
+  degradedDiffNotice: '本篇文档过大，无法逐行比较',
 };
 
 afterEach(() => {
@@ -396,5 +397,117 @@ describe('ReviewEditor — document kind badges', () => {
     expect(getByText(labels.addedDocBadge)).not.toBeNull();
     expect(getByText(labels.modifiedDocBadge)).not.toBeNull();
     expect(getByText(labels.deletedDocBadge)).not.toBeNull();
+  });
+});
+
+describe('ReviewEditor — 退化 diff 提示（I2）', () => {
+  it('renders the degraded notice when the line diff fell back to delete-all + insert-all', () => {
+    // 两篇内容首尾没有公共行、中段各 4001 行且完全不重叠：`(4001+1)^2 ≈ 1600 万`
+    // 刚好超过 `LCS_CELL_BUDGET`，`diffLines` 走线性兜底，`buildModel` 上报 degraded。
+    const base = Array.from({ length: 4001 }, (_, i) => `b${i}`).join('\n');
+    const current = Array.from({ length: 4001 }, (_, i) => `c${i}`).join('\n');
+    const { queryByText } = renderEditor([
+      { lineageId: 'd1', title: 'huge.md', kind: 'modified', base, current },
+    ]);
+    expect(queryByText(labels.degradedDiffNotice)).not.toBeNull();
+  });
+
+  it('does not render the degraded notice for a normal-sized document', () => {
+    const { queryByText } = renderEditor([
+      { lineageId: 'd1', title: 'doc1.md', kind: 'modified', base: 'a\nb\nc', current: 'a\nX\nc' },
+    ]);
+    expect(queryByText(labels.degradedDiffNotice)).toBeNull();
+  });
+});
+
+describe('ReviewEditor — documents 变化时的状态对账（I3）', () => {
+  it('never emits lines: [] for a document whose state has not been seeded yet', () => {
+    const onChange = vi.fn<(state: ReviewEditorOutput) => void>();
+    const { rerender } = render(
+      <ReviewEditor
+        documents={[{ lineageId: 'd1', title: 'doc1.md', kind: 'modified', base: 'a\nb', current: 'a\nb' }]}
+        labels={labels}
+        onChange={onChange}
+      />,
+    );
+    // 换成另一篇文档（写回后重新拉取对比结果的真实场景）：新 lineageId 在
+    // docStates 里还没有条目。
+    act(() => {
+      rerender(
+        <ReviewEditor
+          documents={[{ lineageId: 'd2', title: 'doc2.md', kind: 'modified', base: 'x\ny', current: 'x\nZ' }]}
+          labels={labels}
+          onChange={onChange}
+        />,
+      );
+    });
+    // 每一帧都不允许出现"有这篇文档但 lines 为空"的输出（会被写回当成清空正文）。
+    for (const [state] of onChange.mock.calls) {
+      for (const doc of state.docs) {
+        expect(doc.lines.length, `${doc.lineageId} lines`).toBeGreaterThan(0);
+      }
+    }
+    const out = lastOutput(onChange);
+    expect(out.docs.map((doc) => doc.lineageId)).toEqual(['d2']);
+    expect(out.docs[0].lines).toEqual(['x', 'Z']);
+  });
+});
+
+describe('ReviewEditor — 拖拽移动文本不走单行快路径（I4）', () => {
+  it('recomputes the whole document for an insertFromDrop input event', () => {
+    const { container, onChange } = renderEditor([
+      { lineageId: 'd1', title: 'doc1.md', kind: 'modified', base: 'a\nb\nc', current: 'a\nb\nc' },
+    ]);
+    const source = rowAt(container, 0);
+    const target = rowAt(container, 2);
+    act(() => {
+      // 拖拽移动：源行被清空、落点行被追加，浏览器只派发一个 input 事件（目标是落点行）。
+      source.textContent = '';
+      target.textContent = 'ca';
+      setCollapsedCaret(target, 2);
+      fireEvent.input(target, { bubbles: true, inputType: 'insertFromDrop' });
+    });
+    // 单行快路径只会写回落点那一行，源行的清空会被丢掉（旧行为：['a','b','ca']）。
+    expect(lastOutput(onChange).docs[0].lines).toEqual(['', 'b', 'ca']);
+  });
+
+  it('still takes the single-row fast path for a plain insertText', () => {
+    const { container, onChange } = renderEditor([
+      { lineageId: 'd1', title: 'doc1.md', kind: 'modified', base: 'a\nb\nc', current: 'a\nb\nc' },
+    ]);
+    const row = rowAt(container, 1);
+    act(() => {
+      row.textContent = 'bX';
+      setCollapsedCaret(row, 2);
+      fireEvent.input(row, { bubbles: true, inputType: 'insertText' });
+    });
+    expect(lastOutput(onChange).docs[0].lines).toEqual(['a', 'bX', 'c']);
+  });
+});
+
+describe('ReviewEditor — 纯删除块接受后可撤销（I5）', () => {
+  it('renders the staged badge and an enabled undo-accept button for an accepted pure deletion', () => {
+    const { getByText, queryByText } = renderEditor([
+      // base 比 current 多一行 'b'：唯一的变更块是纯删除（removed=['b'], added=[]）。
+      { lineageId: 'd1', title: 'doc1.md', kind: 'modified', base: 'a\nb\nc', current: 'a\nc' },
+    ]);
+    expect(queryByText(labels.stagedBadge)).toBeNull();
+    act(() => {
+      fireEvent.click(getByText(labels.acceptButton));
+    });
+    expect(queryByText(labels.stagedBadge)).not.toBeNull();
+    const undo = getByText(labels.unacceptButton) as HTMLButtonElement;
+    expect(undo.disabled).toBe(false);
+  });
+
+  it('keeps the undo-accept button reachable when the deletion is at the end of the document', () => {
+    const { getByText, queryByText } = renderEditor([
+      { lineageId: 'd1', title: 'doc1.md', kind: 'modified', base: 'a\nb\nc', current: 'a\nb' },
+    ]);
+    act(() => {
+      fireEvent.click(getByText(labels.acceptButton));
+    });
+    expect(queryByText(labels.stagedBadge)).not.toBeNull();
+    expect((getByText(labels.unacceptButton) as HTMLButtonElement).disabled).toBe(false);
   });
 });

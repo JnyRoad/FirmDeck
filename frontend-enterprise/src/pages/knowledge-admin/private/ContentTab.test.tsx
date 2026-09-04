@@ -131,6 +131,21 @@ describe('private ContentTab', () => {
     const rawOwnerNodes = Array.from(container.querySelectorAll('[data-i18n-raw-kind="identifier"]'));
     expect(rawOwnerNodes.some((node) => node.textContent === '林晓')).toBe(true);
     expect(screen.getByText('有差异')).toBeTruthy();
+    // I7：员工名与分支头版本各自是一句完整短语，不再靠前后缀拼成一句。
+    expect(screen.getByText('当前查看员工：')).toBeTruthy();
+    expect(screen.getByText('分支头版本 v3')).toBeTruthy();
+  });
+
+  it('localizes the document status enum instead of rendering the raw code', async () => {
+    const api = createMockApi();
+    const { container } = renderTab(api);
+
+    await screen.findByText('话术文档 A');
+    // I8：`ready`/`archived` 是自有枚举，必须本地化，且不再被误标为 raw 内容。
+    expect(screen.getByText('正常')).toBeTruthy();
+    expect(screen.queryByText('ready')).toBeNull();
+    const rawTexts = Array.from(container.querySelectorAll('[data-i18n-raw-kind="content"]')).map((n) => n.textContent);
+    expect(rawTexts).not.toContain('ready');
   });
 
   it('lists documents from the branch head version via listVersionDocuments', async () => {

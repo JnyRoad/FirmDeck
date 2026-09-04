@@ -69,6 +69,7 @@ const labels: ReviewEditorLabels = {
   addedDocBadge: '草稿新增',
   modifiedDocBadge: '草稿修改',
   deletedDocBadge: '草稿删除',
+  degradedDiffNotice: '本篇文档过大，无法逐行比较',
 };
 
 afterEach(() => {
@@ -121,7 +122,9 @@ function typeOneCharacter(container: HTMLElement, li: number): number {
   act(() => {
     row.textContent = nextText;
     setCollapsedCaret(row, nextText.length);
-    fireEvent.input(row, { bubbles: true });
+    // 必须带 `inputType`：单行快路径只对白名单里的原生输入类型生效（I4），
+    // 裸 `Event` 会被当作"未知输入"走整篇重算，测不到被优化的那条路径。
+    fireEvent.input(row, { bubbles: true, inputType: 'insertText' });
   });
   return performance.now() - t0;
 }

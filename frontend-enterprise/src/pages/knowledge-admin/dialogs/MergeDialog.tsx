@@ -5,8 +5,9 @@
  * `base_lines`/`ours_lines`/`theirs_lines`/`context_before`/`context_after`，见
  * data-model.md §5），按块渲染两栏对照（草稿 / 正式版）与四种选择（采用草稿 /
  * 采用正式版 / 两者都保留 / 编辑此段）；底部「合并结果」把每块的 `context_before`
- * + 该块当前解决方式对应的正文 + `context_after` 依次拼接——未解决的块保留 Git
- * 风格冲突标记（`<<<<<<< 草稿` / `=======` / `>>>>>>> 正式版`），已解决的块直接
+ * + 该块当前解决方式对应的正文 + `context_after` 依次拼接——未解决的块保留纯 Git
+ * 冲突标记（`<<<<<<<` / `=======` / `>>>>>>>`，不带本地化标签，见
+ * `composeBlockSegment` 注释），已解决的块直接
  * 给出正文；结果区始终可手动编辑（编辑后即接管展示，不再跟随按钮重算），仍有
  * 残留标记时「完成」禁用。完成时输出 `{lineageId, contentMd}`（与
  * `api/knowledgeAdmin.ts` 的 `RebaseResolution` 同形，供 `RebaseDialog` 收集后一并
@@ -54,29 +55,31 @@ export function hasConflictMarkers(text: string): boolean {
   return text.split('\n').some(isMarkerLine);
 }
 
-function composeBlockSegment(
-  block: RebaseConflictBlock,
-  resolution: BlockResolution,
-  labels: { ours: string; theirs: string },
-): string {
+/**
+ * 未解决块的占位写法：只用**纯 Git 冲突标记**，不带任何本地化标签。
+ *
+ * 这段文本会经 `onComplete` 原样进入 `resolveRebase` 的 `content_md`，是要落库的
+ * **文档正文**，不是界面文案——之前把「草稿」/「正式版」两个产品译文拼进标记行
+ * （`<<<<<<< 草稿`），等于把 UI 语言写进了知识库内容，而且后端
+ * （`backend/app/knowledge/rebase.py::_has_conflict_markers`）识别的是行首锚定的
+ * `<<<<<<<` / `=======` / `>>>>>>>` 本身。哪一侧是草稿、哪一侧是正式版由上方两栏
+ * 对照（各自带本地化列头）说明，正文里不需要再重复一遍。
+ */
+function composeBlockSegment(block: RebaseConflictBlock, resolution: BlockResolution): string {
   const oursText = block.ours_lines.join('\n');
   const theirsText = block.theirs_lines.join('\n');
   if (resolution === 'ours') return oursText;
   if (resolution === 'theirs') return theirsText;
   if (resolution === 'both') return [oursText, theirsText].filter((part) => part.length > 0).join('\n');
-  return [`${MARKER_START} ${labels.ours}`, oursText, MARKER_MID, theirsText, `${MARKER_END} ${labels.theirs}`].join('\n');
+  return [MARKER_START, oursText, MARKER_MID, theirsText, MARKER_END].join('\n');
 }
 
-function composeDocument(
-  conflict: RebaseConflictDocument,
-  resolutions: BlockResolution[],
-  labels: { ours: string; theirs: string },
-): string {
+function composeDocument(conflict: RebaseConflictDocument, resolutions: BlockResolution[]): string {
   return conflict.blocks
     .map((block, index) => {
       const segments = [
         ...block.context_before,
-        composeBlockSegment(block, resolutions[index] ?? 'unresolved', labels),
+        composeBlockSegment(block, resolutions[index] ?? 'unresolved'),
         ...block.context_after,
       ];
       return segments.join('\n');
@@ -103,10 +106,7 @@ export function MergeDialog({ open, onOpenChange, conflict, onComplete }: MergeD
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, conflict.lineage_id]);
 
-  const composed = useMemo(
-    () => composeDocument(conflict, resolutions, { ours: oursLabel, theirs: theirsLabel }),
-    [conflict, resolutions, oursLabel, theirsLabel],
-  );
+  const composed = useMemo(() => composeDocument(conflict, resolutions), [conflict, resolutions]);
   const displayText = manualText ?? composed;
   const unresolved = hasConflictMarkers(displayText);
 

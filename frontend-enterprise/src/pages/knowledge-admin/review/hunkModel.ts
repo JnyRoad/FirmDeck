@@ -7,7 +7,7 @@
  * 字符级 LCS 高亮与转义后的 HTML 片段拼装（纯字符串操作，不接触真实
  * DOM）；restorePos 计算未配对删除行插回工作区 `lines` 的位置。
  */
-import { diffLines, lcsLength, type LineDiffOp } from './lineDiff';
+import { diffLinesDetailed, lcsLength, type LineDiffOp } from './lineDiff';
 
 /** 渲染行：`=` 上下文/未改动、`-` 删除（来自 base）、`+` 新增（来自 current）。 */
 export type Row =
@@ -36,10 +36,14 @@ export type CharOp = { type: '='; text: string } | { type: '-'; text: string } |
 
 /**
  * 由 base/current 两侧行数组构建渲染用 rows 与变更块 hunks。
- * 输入：base 行数组、current 行数组；输出：`{rows, hunks}`，无副作用。
+ * 输入：base 行数组、current 行数组；输出：`{rows, hunks, degraded}`，无副作用。
+ *
+ * `degraded=true` 表示行级 diff 超出 `LCS_CELL_BUDGET` 走了线性兜底（整段变化区被
+ * 压成一个"全删 + 全插"的块，不是最优差异）。这个事实必须一路带到 UI（I2）：否则
+ * 用户看到的是一份"看起来合理"的假差异，接受全部之后在结果里也完全看不出退化。
  */
-export function buildModel(base: string[], current: string[]): { rows: Row[]; hunks: Hunk[] } {
-  const ops = diffLines(base, current);
+export function buildModel(base: string[], current: string[]): { rows: Row[]; hunks: Hunk[]; degraded: boolean } {
+  const { ops, degraded } = diffLinesDetailed(base, current);
   const rows: Row[] = [];
   const hunks: Hunk[] = [];
   let i = 0;
@@ -87,32 +91,71 @@ export function buildModel(base: string[], current: string[]): { rows: Row[]; hu
       added: addedOps.map((o) => o.text),
     });
   }
-  return { rows, hunks };
+  return { rows, hunks, degraded };
 }
+
+/**
+ * `alignHunk` 里"删除行 × 新增行"配对矩阵允许的最大格子数（跨任务评审 C2 护栏）。
+ *
+ * 背景：`lineDiff.ts` 的 `LCS_CELL_BUDGET` 只挡住了行级 DP 表的分配——超预算时它退化
+ * 为「全删旧内容 + 全插新内容」，结果是**一个**把整段变化区都装进 `removed`/`added`
+ * 的巨型 hunk。`alignHunk` 之前对它无条件建三张 `n×m` 的嵌套 `number[][]` 并跑 `n×m`
+ * 次整串 LCS（每次自身又是 O(La·Lb) 且逐行 `new Array`），在预算边界上比 `lineDiff`
+ * 拒绝建的 `Int32Array` DP 还贵若干个量级；即便在预算之内，2000×2000 的变更块也意味
+ * 着 400 万次整串相似度计算，而 `pairsByHunk` 在 `hunks` 每次按键后都是新数组、必然
+ * 重算——SC-007 的单次按键 50ms 预算被这里整个吃掉。
+ *
+ * 2,500 = 50×50 行：常见的段落级改写完全落在预算内；超过这个规模的整块替换放弃字符级
+ * 配对（`alignHunk` 返回 `[]`），调用方（`ReviewEditor.tsx:634,657`）本来就按"没有配对"
+ * 走整行纯文本渲染，只是少了字符级高亮，正确性不受影响。
+ */
+export const ALIGN_CELL_BUDGET = 2_500;
+
+/**
+ * `charOps` 字符级 LCS DP 表允许的最大格子数（跨任务评审 C2 护栏）。
+ * 250,000 ≈ 500×500 字符：超长行对（例如整段被压成一行的表格/JSON）不再建
+ * `number[][]` DP 表，直接退化为「整串删除 + 整串新增」，仍是合法的 CharOp 序列，
+ * `innerHtml` 会把整行标为变化，只是失去"哪几个字符变了"的粒度。
+ */
+export const CHAR_OPS_CELL_BUDGET = 250_000;
 
 /**
  * 两个字符串按字符级 LCS 计算相似度（difflib.SequenceMatcher.ratio 同款公式）。
  * 输入：两个字符串；输出：`2*LCS/(lenA+lenB)`，双空串视为完全相同返回 1。
+ *
+ * 长度比提前退出（C2）：`lcs ≤ min(la, lb)`，因此 ratio 的上界是
+ * `2*min/(la+lb)`；上界都够不到 `alignHunk` 的 0.5 配对阈值时，这次 O(la·lb) 的
+ * 字符级 LCS 无论算出什么都不会产生配对，直接返回 0。这对唯一的调用方
+ * （`alignHunk`）是精确的（不改变任何配对结果），只是跳过了注定无用的计算。
+ * 两行都极长时（`la*lb` 超过 `CHAR_OPS_CELL_BUDGET`）同样返回 0，视为"不相似"。
  */
 export function similarityRatio(a: string, b: string): number {
   if (a.length === 0 && b.length === 0) return 1;
   const aChars = Array.from(a);
   const bChars = Array.from(b);
+  const la = aChars.length;
+  const lb = bChars.length;
+  if (la === 0 || lb === 0) return 0;
+  if (2 * Math.min(la, lb) < 0.5 * (la + lb)) return 0;
+  if (la * lb > CHAR_OPS_CELL_BUDGET) return 0;
   const lcs = lcsLength(aChars, bChars);
-  return (2 * lcs) / (aChars.length + bChars.length);
+  return (2 * lcs) / (la + lb);
 }
 
 /**
  * 对一个变更块内的删除行与新增行做顺序保持的相似度配对（DP 最大化配对相似度之和，
  * 只在 ratio ≥ 0.5 时允许配对，否则跳过其中一侧）。
- * 输入：变更块（含 removed/added）；输出：按 ri 升序排列的配对数组，无副作用。
+ * 输入：变更块（含 removed/added）、可选的配对矩阵格子预算（默认 `ALIGN_CELL_BUDGET`，
+ * 仅供测试注入更小的值以在不分配巨型数组的前提下验证兜底路径）；
+ * 输出：按 ri 升序排列的配对数组，无副作用。超预算时返回 `[]`（不做字符级配对）。
  */
-export function alignHunk(hunk: Hunk): AlignPair[] {
+export function alignHunk(hunk: Hunk, cellBudget: number = ALIGN_CELL_BUDGET): AlignPair[] {
   const R = hunk.removed;
   const A = hunk.added;
   const n = R.length;
   const m = A.length;
   if (n === 0 || m === 0) return [];
+  if (n * m > cellBudget) return [];
   const ratios: number[][] = Array.from({ length: n }, () => new Array<number>(m).fill(0));
   for (let i = 0; i < n; i++) {
     for (let j = 0; j < m; j++) {
@@ -171,11 +214,18 @@ function toCodePoints(text: string): string[] {
  * 对两个字符串做字符级 LCS diff，产出 `=`/`-`/`+` 游程（同类型连续字符合并）。
  * 输入：base 字符串、current 字符串；输出：CharOp 数组，无副作用。
  */
-export function charOps(a: string, b: string): CharOp[] {
+export function charOps(a: string, b: string, cellBudget: number = CHAR_OPS_CELL_BUDGET): CharOp[] {
   const aChars = toCodePoints(a);
   const bChars = toCodePoints(b);
   const n = aChars.length;
   const m = bChars.length;
+  if (n * m > cellBudget) {
+    // 超预算：不建 DP 表，退化为「整串删除 + 整串新增」（见 CHAR_OPS_CELL_BUDGET 注释）。
+    const runs: CharOp[] = [];
+    if (n > 0) runs.push({ type: '-', text: a });
+    if (m > 0) runs.push({ type: '+', text: b });
+    return runs;
+  }
   const dp: number[][] = Array.from({ length: n + 1 }, () => new Array<number>(m + 1).fill(0));
   for (let i = n - 1; i >= 0; i--) {
     for (let j = m - 1; j >= 0; j--) {

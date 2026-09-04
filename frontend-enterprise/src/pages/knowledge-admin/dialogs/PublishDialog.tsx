@@ -90,9 +90,18 @@ export function PublishDialog({
   useEffect(() => {
     if (!open || !draft?.is_stale) return;
     let cancelled = false;
-    void api.getVersionDiff(kbId, draft.id, { against: 'published' }).then((result) => {
-      if (!cancelled) setStaleDiff(result);
-    });
+    void api.getVersionDiff(kbId, draft.id, { against: 'published' }).then(
+      (result) => {
+        if (!cancelled) setStaleDiff(result);
+      },
+      () => {
+        // 冲突数拉取失败不阻塞发布框本身（stale 警示与"变基/仍然覆盖发布"选项照常
+        // 展示），但必须显式吞掉——之前没有 rejection handler，一次失败就是一条
+        // unhandled rejection。`staleDiff` 保持 null，`conflictCount` 因此为 0，
+        // 属于已知的低估（见 final-fix 报告的遗留项）。
+        if (!cancelled) setStaleDiff(null);
+      },
+    );
     return () => {
       cancelled = true;
     };

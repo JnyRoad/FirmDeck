@@ -111,10 +111,12 @@ const draftDiff: VersionDiff = {
 // differ from `lineage_id` (`_row` suffix) — mirrors a cross-version clone, where the
 // backend assigns a new row id and keeps the original `lineage_id` only in metadata.
 // Write-back (delete/restore) must target these real ids, not `lineage_id` (T083).
+// 行时间戳刻意与 `draftVersion.updated_at`（版本行）不同：手工删除/恢复带的
+// `expectedUpdatedAt` 必须来自文档行本身（C1 统一三处写回的锁口径）。
 const draftVersionDocuments = [
-  { id: 'doc_new_1_row', lineage_id: 'doc_new_1', title: '新增文档', filename: 'doc_new_1.md', status: 'ready', bucket_count: 0, chunk_count: 0, updated_at: draftVersion.updated_at },
-  { id: 'doc_mod_1_row', lineage_id: 'doc_mod_1', title: '修改文档', filename: 'doc_mod_1.md', status: 'ready', bucket_count: 0, chunk_count: 0, updated_at: draftVersion.updated_at },
-  { id: 'doc_del_1_row', lineage_id: 'doc_del_1', title: '删除文档', filename: 'doc_del_1.md', status: 'archived', bucket_count: 0, chunk_count: 0, updated_at: draftVersion.updated_at },
+  { id: 'doc_new_1_row', lineage_id: 'doc_new_1', title: '新增文档', filename: 'doc_new_1.md', status: 'ready', bucket_count: 0, chunk_count: 0, updated_at: '2026-08-21T01:00:00Z' },
+  { id: 'doc_mod_1_row', lineage_id: 'doc_mod_1', title: '修改文档', filename: 'doc_mod_1.md', status: 'ready', bucket_count: 0, chunk_count: 0, updated_at: '2026-08-21T02:00:00Z' },
+  { id: 'doc_del_1_row', lineage_id: 'doc_del_1', title: '删除文档', filename: 'doc_del_1.md', status: 'archived', bucket_count: 0, chunk_count: 0, updated_at: '2026-08-21T03:00:00Z' },
 ];
 
 function createMockApi() {
@@ -247,11 +249,13 @@ describe('ContentTab', () => {
     await user.click(deleteButtons[0]);
     // Real row id (`doc_new_1_row`), not `lineage_id` (`doc_new_1`) — T083 regression
     // coverage: write-back must resolve through `listVersionDocuments`.
-    await waitFor(() => expect(api.archiveDocument).toHaveBeenCalledWith('doc_new_1_row', expect.anything()));
+    // 同时校验乐观锁：带的是**该文档行**的 `updated_at`（与草稿版本行的不同），
+    // 与 applyReview / private/ContentTab 保持同一套口径（C1）。
+    await waitFor(() => expect(api.archiveDocument).toHaveBeenCalledWith('doc_new_1_row', { expectedUpdatedAt: '2026-08-21T01:00:00Z' }));
     expect(api.archiveDocument).not.toHaveBeenCalledWith('doc_new_1', expect.anything());
 
     await user.click(screen.getByRole('button', { name: '恢复' }));
-    await waitFor(() => expect(api.updateDocument).toHaveBeenCalledWith('doc_del_1_row', expect.objectContaining({ status: 'ready' })));
+    await waitFor(() => expect(api.updateDocument).toHaveBeenCalledWith('doc_del_1_row', { status: 'ready', expectedUpdatedAt: '2026-08-21T03:00:00Z' }));
     expect(api.updateDocument).not.toHaveBeenCalledWith('doc_del_1', expect.anything());
   });
 

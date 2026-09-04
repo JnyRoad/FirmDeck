@@ -39,6 +39,7 @@ import type { KnowledgeAdminVersionRead, VersionDocument } from '@/types/knowled
 
 import { formatVersion } from '../knowledgeAdminModel';
 import { useKnowledgeAdminToast } from '../shared/errorMessage';
+import { useGuardedLoad } from '../shared/useGuardedLoad';
 import { branchSyncMessageId } from './branchStatus';
 
 export type PrivateContentTabProps = {
@@ -46,9 +47,18 @@ export type PrivateContentTabProps = {
   kb: KnowledgeBaseRead;
   /** 本私有库归属员工 id（来自 `kb.metadata.owner_agent_id`），驱动分支范围的写入/查询。 */
   ownerAgentId: string;
-  /** 归属员工展示名；横幅"当前查看员工 X"用，缺失时退回 `ownerAgentId`。 */
+  /** 归属员工展示名；横幅「员工：X」用，缺失时退回 `ownerAgentId`。 */
   ownerAgentName: string;
   onChanged?: () => void;
+};
+
+/** 文档状态枚举 → 语义消息 id（I8）。 */
+const DOCUMENT_STATUS_LABEL_IDS: Record<
+  string,
+  'knowledgeAdmin.private.content.documentStatus.ready' | 'knowledgeAdmin.private.content.documentStatus.archived'
+> = {
+  ready: 'knowledgeAdmin.private.content.documentStatus.ready',
+  archived: 'knowledgeAdmin.private.content.documentStatus.archived',
 };
 
 function stringFromMetadata(value: unknown): string {
@@ -96,6 +106,9 @@ function fileToBase64(file: File): Promise<string> {
 export function ContentTab({ api, kb, ownerAgentId, ownerAgentName, onChanged }: PrivateContentTabProps) {
   const { t } = useAppIntl();
   const toast = useKnowledgeAdminToast();
+  // 过期响应护栏（I1）：分支版本列表 + 文档列表各一条请求序号线。
+  const reloadGuard = useGuardedLoad();
+  const documentsLoad = useGuardedLoad();
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const [versions, setVersions] = useState<KnowledgeAdminVersionRead[]>([]);
@@ -120,19 +133,26 @@ export function ContentTab({ api, kb, ownerAgentId, ownerAgentName, onChanged }:
   );
 
   async function loadDocuments(headVersionId: string) {
+    const token = documentsLoad.begin();
     try {
       const rows = await api.listVersionDocuments(kb.id, headVersionId);
+      // 过期响应（切换归属员工 / 租户代际已变）整个丢弃，见 useGuardedLoad（I1）。
+      if (!documentsLoad.isCurrent(token)) return;
       setDocuments(Array.isArray(rows) ? rows : []);
     } catch (error) {
+      if (!documentsLoad.isCurrent(token)) return;
+      setDocuments([]);
       toast.error(error, 'knowledgeAdmin.toast.loadFailed');
     }
   }
 
   async function reloadAll() {
     if (!ownerAgentId) return;
+    const token = reloadGuard.begin();
     setLoading(true);
     try {
       const rows = await api.listVersions(kb.id, ownerAgentId);
+      if (!reloadGuard.isCurrent(token)) return;
       const list = Array.isArray(rows) ? rows : [];
       setVersions(list);
       const head = list.find((version) => version.is_head) || list[0] || null;
@@ -142,9 +162,10 @@ export function ContentTab({ api, kb, ownerAgentId, ownerAgentName, onChanged }:
         setDocuments([]);
       }
     } catch (error) {
+      if (!reloadGuard.isCurrent(token)) return;
       toast.error(error, 'knowledgeAdmin.toast.loadFailed');
     } finally {
-      setLoading(false);
+      if (reloadGuard.isCurrent(token)) setLoading(false);
     }
   }
 
@@ -245,11 +266,17 @@ export function ContentTab({ api, kb, ownerAgentId, ownerAgentName, onChanged }:
       key: 'status',
       title: t('knowledgeAdmin.content.table.status'),
       width: 120,
-      render: (row) => (
-        <span className="rounded-full bg-[#eef2f7] px-[8px] py-[2px] text-[11px] font-medium text-[#596174]">
-          <RawContent value={row.status} />
-        </span>
-      ),
+      // I8：`ready`/`archived` 是 StaffDeck 自己的文档状态枚举，不是用户原文——
+      // 必须本地化，且不该套 `RawContent`（那是 raw 内容边界标记）。落键模式同
+      // `VersionsTab.tsx` 的 `STATE_LABEL_IDS`；未登记的新状态原样显示码本身。
+      render: (row) => {
+        const labelId = DOCUMENT_STATUS_LABEL_IDS[row.status];
+        return (
+          <span className="rounded-full bg-[#eef2f7] px-[8px] py-[2px] text-[11px] font-medium text-[#596174]">
+            {labelId ? t(labelId) : row.status}
+          </span>
+        );
+      },
     },
     {
       key: 'updatedAt',
@@ -298,14 +325,25 @@ export function ContentTab({ api, kb, ownerAgentId, ownerAgentName, onChanged }:
   return (
     <div className="flex flex-col gap-[14px]">
       <div className="flex flex-wrap items-center justify-between gap-[10px] rounded-[12px] border-[0.5px] border-[#e3e7f1] bg-[#f7f8fa] px-[14px] py-[10px]">
-        <p className="text-[12px] text-[#464c5e]">
-          {t('knowledgeAdmin.private.content.banner.viewingPrefix')}
-          <RawIdentifier value={ownerAgentName || ownerAgentId} />
-          {t('knowledgeAdmin.private.content.banner.viewingSuffix', {
-            version: formatVersion(headVersion?.version),
-          })}
-          <span className="ml-[8px] text-[#858b9c]">{t(branchSyncMessageId(kb.branch_sync_state))}</span>
-        </p>
+        {/*
+          I7：原来是 `viewingPrefix` + 原始员工名 + `viewingSuffix` 三段拼一句话
+          （en 的后半段以属格撇号 `’s` 直接粘在后端返回的名字上），既钉死了词序也
+          让译者拿不到完整句子。这里改成两个各自完整的短语：「标签 + 原始员工名」的
+          标签-值对，和一句独立的分支头版本说明——两种语言都能各自组织语序，
+          `RawIdentifier` 仍然只包住员工名本身这个 raw 边界。
+        */}
+        <div className="flex flex-wrap items-center gap-[8px] text-[12px] text-[#464c5e]">
+          <span className="flex items-center gap-[4px]">
+            {t('knowledgeAdmin.private.content.banner.ownerLabel')}
+            <RawIdentifier value={ownerAgentName || ownerAgentId} />
+          </span>
+          <span>
+            {t('knowledgeAdmin.private.content.banner.branchHead', {
+              version: formatVersion(headVersion?.version),
+            })}
+          </span>
+          <span className="text-[#858b9c]">{t(branchSyncMessageId(kb.branch_sync_state))}</span>
+        </div>
         <div className="flex items-center gap-[8px]">
           <input
             ref={fileInputRef}

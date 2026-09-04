@@ -69,7 +69,14 @@ export function RebaseDialog({ open, onOpenChange, api, kbId, draft, onRebased }
 
   if (!draft) return null;
 
-  async function runPreview(changeReason: string) {
+  /**
+   * 拉一次变基预览。`preserveResolutions=true`（「重新预览」）时保留已经手工完成的
+   * 合并结果，只剪掉在新预览里已不再冲突的 lineage（I10）——旧实现在这里无条件
+   * `setResolutions({})`，与本文件开头的承诺相反，冲突多的变基一按「重新预览」
+   * 就把用户刚做完的全部合并丢光；`preserveResolutions=false`（「开始变基」）
+   * 才是真正的重新开始，必须清空。
+   */
+  async function runPreview(changeReason: string, options: { preserveResolutions?: boolean } = {}) {
     setSubmitting(true);
     try {
       const result = await api.rebaseDraft(kbId, draft!.id, { changeReason });
@@ -80,7 +87,15 @@ export function RebaseDialog({ open, onOpenChange, api, kbId, draft, onRebased }
         return;
       }
       setPreview(result);
-      setResolutions({});
+      setResolutions((previous) => {
+        if (!options.preserveResolutions) return {};
+        const stillConflicting = new Set(result.conflicts.map((conflict) => conflict.lineage_id));
+        const kept: Record<string, string> = {};
+        for (const [lineageId, contentMd] of Object.entries(previous)) {
+          if (stillConflicting.has(lineageId)) kept[lineageId] = contentMd;
+        }
+        return kept;
+      });
       setActiveConflict(null);
       setStaleAgain(false);
     } catch (error) {
@@ -129,7 +144,7 @@ export function RebaseDialog({ open, onOpenChange, api, kbId, draft, onRebased }
 
   function handleRetryPreview() {
     setStaleAgain(false);
-    void runPreview(reason.trim());
+    void runPreview(reason.trim(), { preserveResolutions: true });
   }
 
   const allResolved = Boolean(preview) && preview!.conflicts.every((conflict) => conflict.lineage_id in resolutions);

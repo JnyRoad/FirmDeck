@@ -5,7 +5,7 @@
  * 覆盖：按动作 / 群组 / 操作者 / 版本筛选；分页「加载更多」；操作者名、群组名、
  * 原因等自由文本字段用 `RawContent` 渲染（`data-i18n-raw-kind="content"`）。
  */
-import { cleanup, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -88,7 +88,9 @@ describe('AuditTab', () => {
 
     await waitFor(() => expect(api.listAuditEvents).toHaveBeenCalledTimes(1));
     await user.click(screen.getByRole('combobox', { name: '动作' }));
-    await user.click(await screen.findByText('published'));
+    // 筛选项显示的是本地化文案，不是后端枚举码（I8）。
+    expect(screen.queryByText('published')).toBeNull();
+    await user.click(await screen.findByText('发布'));
 
     await waitFor(() => expect(api.listAuditEvents).toHaveBeenLastCalledWith('kb_1', expect.objectContaining({
       action: 'published',
@@ -111,6 +113,47 @@ describe('AuditTab', () => {
     await waitFor(() => expect(api.listAuditEvents).toHaveBeenLastCalledWith('kb_1', expect.objectContaining({ offset: 1 })));
     expect(await screen.findByText('李四')).toBeTruthy();
     expect(screen.getByText('张三')).toBeTruthy();
+  });
+
+  it('renders the audit action code as a localized label, not the raw enum code', async () => {
+    const api = createMockApi();
+    const { container } = renderAuditTab(api);
+
+    await screen.findByText('张三');
+    expect(screen.getByText('创建草稿')).toBeTruthy();
+    expect(screen.queryByText('draft_created')).toBeNull();
+    // 自有枚举码不再被误标为"原始内容"。
+    const rawTexts = Array.from(container.querySelectorAll('[data-i18n-raw-kind="content"]')).map((n) => n.textContent);
+    expect(rawTexts).not.toContain('draft_created');
+  });
+
+  it('debounces the free-text team/actor filters into a single request', async () => {
+    vi.useFakeTimers();
+    try {
+      const api = createMockApi();
+      renderAuditTab(api);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(api.listAuditEvents).toHaveBeenCalledTimes(1);
+
+      const teamInput = screen.getByLabelText('群组 ID');
+      act(() => {
+        fireEvent.change(teamInput, { target: { value: 't' } });
+        fireEvent.change(teamInput, { target: { value: 'te' } });
+        fireEvent.change(teamInput, { target: { value: 'team_1' } });
+      });
+      // 三次按键在防抖窗口内：一次请求都不该发出。
+      expect(api.listAuditEvents).toHaveBeenCalledTimes(1);
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(300);
+      });
+      expect(api.listAuditEvents).toHaveBeenCalledTimes(2);
+      expect(api.listAuditEvents).toHaveBeenLastCalledWith('kb_1', expect.objectContaining({ teamId: 'team_1' }));
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('renders free-text fields (actor, reason) through RawContent', async () => {

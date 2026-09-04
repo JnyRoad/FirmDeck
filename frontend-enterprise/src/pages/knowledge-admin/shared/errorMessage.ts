@@ -38,7 +38,14 @@ export type KnowledgeAdminFallbackMessageId =
   | 'knowledgeAdmin.toast.deleteError'
   | 'knowledgeAdmin.toast.exportError'
   | 'knowledgeAdmin.toast.lintError'
-  | 'knowledgeAdmin.detail.loadError';
+  | 'knowledgeAdmin.detail.loadError'
+  // 「群组与权限」Tab 的四个场景化兜底键（T086/I12）：GrantsTab 迁移到本出口后，
+  // 已注册的后端错误码会先命中契约文案，未命中时才退到这些更具体的说明。
+  | 'knowledgeAdmin.grants.toast.loadFailed'
+  | 'knowledgeAdmin.grants.toast.bindFailed'
+  | 'knowledgeAdmin.grants.toast.saveFailed'
+  | 'knowledgeAdmin.grants.toast.setDefaultFailed'
+  | 'knowledgeAdmin.grants.toast.unbindFailed';
 
 /**
  * 把任意错误值投影为 `MessageDescriptor`：已注册稳定错误码命中时用契约里的语义 message id

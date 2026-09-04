@@ -84,9 +84,26 @@ export const LCS_CELL_BUDGET = 16_000_000;
  * （hunkModel.ts）无需特殊处理。
  */
 export function diffLines(base: string[], current: string[], cellBudget: number = LCS_CELL_BUDGET): LineDiffOp[] {
+  return diffLinesDetailed(base, current, cellBudget).ops;
+}
+
+/**
+ * 与 `diffLines` 同一套计算，额外把"是否走了超预算兜底"这个事实带出模块
+ * （跨任务评审 I2）：兜底路径产出的不是最优 diff（整段变化区被压成"全删 + 全插"
+ * 的单个块），调用方需要据此向用户显式提示，否则用户看到的是一份"看起来合理"的
+ * 假差异，接受全部后也无从察觉。
+ * 输入：base 行数组、current 行数组、可选 DP 表 cell 预算；
+ * 输出：`{ops, degraded}`，`degraded=true` 表示本次比较退化到了线性兜底，无副作用。
+ */
+export function diffLinesDetailed(
+  base: string[],
+  current: string[],
+  cellBudget: number = LCS_CELL_BUDGET,
+): { ops: LineDiffOp[]; degraded: boolean } {
   const n = base.length;
   const m = current.length;
-  if (n === 0 && m === 0) return [];
+  if (n === 0 && m === 0) return { ops: [], degraded: false };
+  let degraded = false;
 
   // 行内容 → 整数 id：把 DP 填表与回溯里的字符串比较全部替换成整数比较。
   const idOf = new Map<string, number>();
@@ -130,6 +147,7 @@ export function diffLines(base: string[], current: string[], cellBudget: number 
     if (cells > cellBudget) {
       // 超出内存预算：放弃在中段内求最优 LCS，退化为「全删旧内容 + 全插新内容」
       // 的线性兜底（见上方 LCS_CELL_BUDGET 注释）。
+      degraded = true;
       for (let i = 0; i < bn; i++) {
         ops.push({ type: '-', text: base[prefix + i], baseIndex: prefix + i, currentIndex: null });
       }
@@ -170,7 +188,7 @@ export function diffLines(base: string[], current: string[], cellBudget: number 
     ops.push({ type: '=', text: base[baseIndex], baseIndex, currentIndex });
   }
 
-  return ops;
+  return { ops, degraded };
 }
 
 /**

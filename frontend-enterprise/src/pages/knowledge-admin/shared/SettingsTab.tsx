@@ -15,6 +15,7 @@ import type { CapabilityScope, KnowledgeBaseRead } from '@/types';
 
 import { DeleteDialog } from '../dialogs/DeleteDialog';
 import { useKnowledgeAdminToast } from './errorMessage';
+import { useGuardedLoad } from './useGuardedLoad';
 
 export type SettingsTabProps = {
   api: KnowledgeAdminApi;
@@ -35,6 +36,10 @@ const CARD_CLASS = 'rounded-[14px] border-[0.5px] border-[#e3e7f1] bg-white p-[2
 export function SettingsTab({ api, kb, draftCount, draftCountUnknown = false, onUpdated, onDeleted }: SettingsTabProps) {
   const { t } = useAppIntl();
   const toast = useKnowledgeAdminToast();
+  // 过期响应护栏（I1）：本 Tab 没有列表加载，但两处写入都会把服务端返回的知识库
+  // 对象经 `onUpdated` 上抛给详情页——租户/知识库切换后旧响应落地同样是错误数据。
+  const saveGuard = useGuardedLoad();
+  const statusGuard = useGuardedLoad();
   const [name, setName] = useState(kb.name);
   const [description, setDescription] = useState(kb.description || '');
   const [capabilityScope, setCapabilityScope] = useState<CapabilityScope>(normalizeCapabilityScope(kb.capability_scope));
@@ -57,6 +62,7 @@ export function SettingsTab({ api, kb, draftCount, draftCountUnknown = false, on
       setNameError(true);
       return;
     }
+    const token = saveGuard.begin();
     setSaving(true);
     try {
       const updated = await api.updateKnowledgeBase(kb.id, {
@@ -64,26 +70,31 @@ export function SettingsTab({ api, kb, draftCount, draftCountUnknown = false, on
         description: description.trim(),
         capabilityScope,
       });
+      if (!saveGuard.isCurrent(token)) return;
       toast.success(createMessageDescriptor('knowledgeAdmin.toast.updateSuccess'));
       onUpdated(updated);
     } catch (error) {
+      if (!saveGuard.isCurrent(token)) return;
       toast.error(error, 'knowledgeAdmin.toast.updateError');
     } finally {
-      setSaving(false);
+      if (saveGuard.isCurrent(token)) setSaving(false);
     }
   }
 
   async function toggleStatus() {
     const nextStatus = kb.status === 'active' ? 'archived' : 'active';
+    const token = statusGuard.begin();
     setStatusSaving(true);
     try {
       const updated = await api.updateKnowledgeBase(kb.id, { status: nextStatus });
+      if (!statusGuard.isCurrent(token)) return;
       toast.success(createMessageDescriptor('knowledgeAdmin.toast.updateSuccess'));
       onUpdated(updated);
     } catch (error) {
+      if (!statusGuard.isCurrent(token)) return;
       toast.error(error, 'knowledgeAdmin.toast.updateError');
     } finally {
-      setStatusSaving(false);
+      if (statusGuard.isCurrent(token)) setStatusSaving(false);
     }
   }
 

@@ -261,4 +261,42 @@ describe('GrantsTab', () => {
       (api.listBindableTeams as ReturnType<typeof vi.fn>).mock.calls.length,
     ).toBeGreaterThan(listBindableTeamsCallsBefore));
   });
+
+  it('renders the contract message for a registered backend error code instead of the generic fallback', async () => {
+    // I12：GrantsTab 之前用裸 `catch {}` + 固定 descriptor，任何失败都显示"保存权限矩阵
+    // 失败"，把已注册错误码的具体说明整个丢掉。迁到 `useKnowledgeAdminToast().error(error, …)`
+    // 之后，注册码必须命中契约文案。
+    const user = userEvent.setup();
+    stubTeamMembersFetch();
+    const api = createMockApi({
+      saveGrants: vi.fn().mockRejectedValue({ code: 'KNOWLEDGE_GRANT_REQUIRED' }),
+    });
+    renderGrantsTab(api);
+
+    const card = await screen.findByRole('region', { name: '客服一组 的知识库绑定' });
+    await user.click(within(card).getByRole('button', { name: '保存 产品 FAQ 共享库 权限' }));
+
+    await waitFor(() => expect(sonnerSpies.custom).toHaveBeenCalled());
+    const renderer = sonnerSpies.custom.mock.calls[sonnerSpies.custom.mock.calls.length - 1]?.[0];
+    const { container } = render((renderer as () => ReactElement)());
+    expect(container.textContent).toContain('该员工没有执行此知识库操作的权限。');
+    expect(container.textContent).not.toContain('保存权限矩阵失败');
+  });
+
+  it('falls back to the scenario-specific message for an unregistered failure', async () => {
+    const user = userEvent.setup();
+    stubTeamMembersFetch();
+    const api = createMockApi({
+      saveGrants: vi.fn().mockRejectedValue(new Error('network down')),
+    });
+    renderGrantsTab(api);
+
+    const card = await screen.findByRole('region', { name: '客服一组 的知识库绑定' });
+    await user.click(within(card).getByRole('button', { name: '保存 产品 FAQ 共享库 权限' }));
+
+    await waitFor(() => expect(sonnerSpies.custom).toHaveBeenCalled());
+    const renderer = sonnerSpies.custom.mock.calls[sonnerSpies.custom.mock.calls.length - 1]?.[0];
+    const { container } = render((renderer as () => ReactElement)());
+    expect(container.textContent).toContain('保存权限矩阵失败');
+  });
 });

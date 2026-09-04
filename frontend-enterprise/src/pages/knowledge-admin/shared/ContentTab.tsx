@@ -11,14 +11,21 @@
  * 行标记为 `unchanged`，不显示标记但同样可删除。
  *
  * 写回定位（T083，修复原「已知限制」）：本 Tab 与审阅应用（`applyReview`）调用
- * `updateDocument`/`archiveDocument` 一律用 `documentIdByLineage`（源自
- * `listVersionDocuments` 的 `lineage_id → id` 映射）解析出的真实行 id，不再把
+ * `updateDocument`/`archiveDocument` 一律用 `documentRowByLineage`（源自
+ * `listVersionDocuments` 的 `lineage_id → 文档行` 映射）解析出的真实行 id，不再把
  * `lineage_id` 当作文档 id 传入——`lineage_id` 对"本草稿内新建"的文档恰好等于其自身
  * id，但对"跨版本克隆而来的已改动文档"并不准确（克隆会分配新的行 id，只在 metadata
  * 中保留原始 lineage_id）。`listVersionDocuments` 同时包含已被删除（`status='archived'`）
  * 的行，因此"恢复已删除文档"也能拿到真实 id——这是 `getVersionDiff` 的
  * `target_document_id` 做不到的：对 `kind==='deleted'` 的文档它恒为 `null`（该文档在
  * target 里已没有 ready 状态的对应行，但底层归档行本身仍在，只是不出现在 diff 里）。
+ *
+ * 乐观锁口径（C1）：`updateDocument`/`archiveDocument` 的 `expected_updated_at` 在后端
+ * 比对的是**文档行**的 `updated_at`（`backend/app/api/knowledge.py` 的
+ * `source_row.updated_at.isoformat()`），只有 A5 `recordReview` 比对的是草稿**版本行**的
+ * （`backend/app/knowledge/versioning.py`）。因此本 Tab 的手工删除/恢复与 `applyReview`
+ * 的三处写回统一从 `documentRowByLineage` / 表格行取 `updated_at` 原样透传，
+ * `recordReview` 才用 `currentDraft.updated_at`。
  */
 
 import { useEffect, useMemo, useRef, useState } from 'react';
@@ -53,6 +60,7 @@ import {
   type ReviewEditorOutput,
 } from '../review/ReviewEditor';
 import { useKnowledgeAdminToast } from './errorMessage';
+import { useGuardedLoad } from './useGuardedLoad';
 
 export type ContentTabProps = {
   api: KnowledgeAdminApi;
@@ -78,6 +86,12 @@ type ContentRow = {
   documentId: string;
   title: string;
   kind: DiffDocument['kind'] | 'unchanged';
+  /**
+   * 该文档**行**的 `updated_at`（A2b `listVersionDocuments` 原样字符串），作为
+   * `updateDocument`/`archiveDocument` 的 `expected_updated_at` 乐观锁值；正式版
+   * 只读视图没有这份数据也不发起写回，为 `null`。见 applyReview 处的说明。
+   */
+  updatedAt: string | null;
 };
 
 /** 把 modified 文档的 hunks 顺序拼接还原为整篇 base/target 正文；added/deleted 无正文可还原。 */
@@ -111,6 +125,9 @@ export function ContentTab({ api, kb, onChanged }: ContentTabProps) {
   const [searchParams, setSearchParams] = useSearchParams();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const toast = useKnowledgeAdminToast();
+  // 两条独立的过期响应护栏（I1）：版本列表与版本对比各自一条请求序号线。
+  const versionsLoad = useGuardedLoad();
+  const diffLoad = useGuardedLoad();
 
   const [versions, setVersions] = useState<KnowledgeAdminVersionRead[]>([]);
   const [versionsLoaded, setVersionsLoaded] = useState(false);
@@ -149,11 +166,14 @@ export function ContentTab({ api, kb, onChanged }: ContentTabProps) {
   const targetVersionId = isDraftView ? currentDraft!.id : kb.published_version_id || null;
 
   async function loadVersions() {
+    const token = versionsLoad.begin();
     try {
       const result = await api.listVersions(kb.id);
+      if (!versionsLoad.isCurrent(token)) return;
       setVersions(Array.isArray(result) ? result : []);
       setVersionsLoaded(true);
     } catch (error) {
+      if (!versionsLoad.isCurrent(token)) return;
       toast.error(error, 'knowledgeAdmin.toast.loadFailed');
       // `currentDraft` can never resolve if the version list failed to load — without
       // this, a pending `publish=<id>&review=1` review-intent would linger in the URL
@@ -163,11 +183,13 @@ export function ContentTab({ api, kb, onChanged }: ContentTabProps) {
   }
 
   async function loadDiff() {
-    if (!targetVersionId) {
-      setDiff(null);
-      setVersionDocuments([]);
-      return;
-    }
+    // 切换目标（含切到"无目标"）先把上一个版本的数据清掉：这两份 state 直接驱动
+    // 表格里的删除/恢复按钮所用的真实文档 id，留着旧值意味着按钮会对**上一个版本**
+    // 的文档行发起写回（I1）。
+    setDiff(null);
+    setVersionDocuments([]);
+    if (!targetVersionId) return;
+    const token = diffLoad.begin();
     setLoadingDiff(true);
     try {
       // 草稿视图额外拉取 A2b 全量文档列表（含未改动的，携带真实行 id），供写回定位与
@@ -176,12 +198,17 @@ export function ContentTab({ api, kb, onChanged }: ContentTabProps) {
         api.getVersionDiff(kb.id, targetVersionId, { against: 'base' }),
         isDraftView ? api.listVersionDocuments(kb.id, targetVersionId) : Promise.resolve<VersionDocument[]>([]),
       ]);
+      // 过期响应（视图已经切走 / 租户代际已变）整个丢弃，不写任何 state。
+      if (!diffLoad.isCurrent(token)) return;
       setDiff(diffResult);
       setVersionDocuments(Array.isArray(documentsResult) ? documentsResult : []);
     } catch (error) {
+      if (!diffLoad.isCurrent(token)) return;
+      setDiff(null);
+      setVersionDocuments([]);
       toast.error(error, 'knowledgeAdmin.toast.loadFailed');
     } finally {
-      setLoadingDiff(false);
+      if (diffLoad.isCurrent(token)) setLoadingDiff(false);
     }
   }
 
@@ -257,11 +284,12 @@ export function ContentTab({ api, kb, onChanged }: ContentTabProps) {
     return map;
   }, [diff]);
 
-  // `lineage_id → 真实行 id`：草稿视图写回定位的唯一来源，见文件头注释。
-  const documentIdByLineage = useMemo(() => {
-    const map = new Map<string, string>();
+  // `lineage_id → A2b 文档行`：草稿视图写回定位（真实行 id）与乐观锁（行 `updated_at`）
+  // 的唯一来源，见文件头注释与 applyReview 处的说明。
+  const documentRowByLineage = useMemo(() => {
+    const map = new Map<string, VersionDocument>();
     for (const row of versionDocuments) {
-      if (row.lineage_id) map.set(row.lineage_id, row.id);
+      if (row.lineage_id) map.set(row.lineage_id, row);
     }
     return map;
   }, [versionDocuments]);
@@ -277,6 +305,7 @@ export function ContentTab({ api, kb, onChanged }: ContentTabProps) {
           documentId: document.target_document_id ?? document.lineage_id,
           title: document.title,
           kind: document.kind,
+          updatedAt: null,
         }));
     }
     // 草稿视图：以 `listVersionDocuments` 全量列表为主（含未改动、已删除的行，真实 id），
@@ -285,6 +314,7 @@ export function ContentTab({ api, kb, onChanged }: ContentTabProps) {
       documentId: row.id,
       title: row.title,
       kind: (row.lineage_id ? kindByLineage.get(row.lineage_id) : undefined) ?? 'unchanged',
+      updatedAt: row.updated_at ?? null,
     }));
   }, [diff, isDraftView, versionDocuments, kindByLineage]);
 
@@ -314,7 +344,9 @@ export function ContentTab({ api, kb, onChanged }: ContentTabProps) {
     if (!currentDraft) return;
     setRestoringId(row.documentId);
     try {
-      await api.archiveDocument(row.documentId, {});
+      // 与 applyReview / private/ContentTab 同一套乐观锁口径：带**文档行**自己的
+      // `updated_at`（原样字符串），而不是草稿版本行的（C1）。
+      await api.archiveDocument(row.documentId, row.updatedAt ? { expectedUpdatedAt: row.updatedAt } : {});
       toast.success(createMessageDescriptor('knowledgeAdmin.toast.archiveDocumentSuccess'));
       await loadDiff();
       onChanged?.();
@@ -329,7 +361,10 @@ export function ContentTab({ api, kb, onChanged }: ContentTabProps) {
     if (!currentDraft) return;
     setRestoringId(row.documentId);
     try {
-      await api.updateDocument(row.documentId, { status: 'ready' });
+      await api.updateDocument(
+        row.documentId,
+        row.updatedAt ? { status: 'ready', expectedUpdatedAt: row.updatedAt } : { status: 'ready' },
+      );
       toast.success(createMessageDescriptor('knowledgeAdmin.toast.restoreDocumentSuccess'));
       await loadDiff();
       onChanged?.();
@@ -451,6 +486,7 @@ export function ContentTab({ api, kb, onChanged }: ContentTabProps) {
     addedDocBadge: t('knowledgeAdmin.content.review.labels.addedDocBadge'),
     modifiedDocBadge: t('knowledgeAdmin.content.review.labels.modifiedDocBadge'),
     deletedDocBadge: t('knowledgeAdmin.content.review.labels.deletedDocBadge'),
+    degradedDiffNotice: t('knowledgeAdmin.content.review.labels.degradedDiffNotice'),
   };
 
   async function applyReview() {
@@ -458,23 +494,31 @@ export function ContentTab({ api, kb, onChanged }: ContentTabProps) {
     setApplying(true);
     try {
       for (const document of reviewOutput.docs) {
-        // 写回一律用 `documentIdByLineage` 解析出的真实行 id，不用 `document.lineageId`
+        // 写回一律用 `documentRowByLineage` 解析出的真实行 id，不用 `document.lineageId`
         // 本身——对跨版本克隆而来的行两者并不相等（见文件头注释）；映射缺失时退回
         // lineageId 仅作兜底（例如本草稿内新建、克隆前的极端时序），不阻塞写回。
-        const documentId = documentIdByLineage.get(document.lineageId) ?? document.lineageId;
+        const row = documentRowByLineage.get(document.lineageId);
+        const documentId = row?.id ?? document.lineageId;
+        // C1：`updateDocument`/`archiveDocument` 的 `expected_updated_at` 在后端比对的是
+        // **文档行**的 `updated_at`（`backend/app/api/knowledge.py:711`
+        // `source_row.updated_at.isoformat()`），不是草稿**版本行**的——只有下面的
+        // `recordReview` 比对版本行（`backend/app/knowledge/versioning.py:756`）。
+        // 之前这三处都传 `currentDraft.updated_at`，导致每次审阅写回必然 409。
+        // A2b 用同一个 `.isoformat()` 序列化该字段，这里原样透传字符串、不做任何解析。
+        const expectedUpdatedAt = row?.updated_at ?? undefined;
         if (document.kind === 'modified') {
           await api.updateDocument(documentId, {
             contentMd: document.lines.join('\n'),
-            expectedUpdatedAt: currentDraft.updated_at,
+            expectedUpdatedAt,
           });
         } else if (document.kind === 'added' && document.restore) {
           // WholeDocumentPanel: added 文档 restore=true 表示用户拒绝了这次新增。
-          await api.archiveDocument(documentId, { expectedUpdatedAt: currentDraft.updated_at });
+          await api.archiveDocument(documentId, { expectedUpdatedAt });
         } else if (document.kind === 'deleted' && document.restore) {
           // WholeDocumentPanel: deleted 文档 restore=true 表示用户拒绝了这次删除（恢复原文）。
           await api.updateDocument(documentId, {
             status: 'ready',
-            expectedUpdatedAt: currentDraft.updated_at,
+            expectedUpdatedAt,
           });
         }
       }
@@ -491,10 +535,17 @@ export function ContentTab({ api, kb, onChanged }: ContentTabProps) {
       if (reviewReturnToPublish) setPublishOpen(true);
       setReviewReturnToPublish(false);
     } catch (error) {
-      if (apiErrorCode(error) === 'KNOWLEDGE_PUBLISH_CONFLICT') {
+      const code = apiErrorCode(error);
+      if (code === 'KNOWLEDGE_PUBLISH_CONFLICT') {
         // 这里比契约默认的 `errors.knowledge.publishConflict` 文案更具体（"应用审阅"场景专属
         // 措辞），跳过错误码→契约映射直接显示。
         toast.errorDescriptor(createMessageDescriptor('knowledgeAdmin.content.review.applyConflict'));
+      } else if (code === 'KNOWLEDGE_DOCUMENT_CONFLICT') {
+        // 文档**行**级乐观锁冲突（与上面的版本级冲突是两个不同的实体，见 applyReview 里
+        // `expectedUpdatedAt` 的说明）：循环会在冲突那一篇中断，前面已成功的写回不会回滚，
+        // 所以文案要说明"未全部应用"，并立即重新拉取，让后续重试拿到新的行时间戳。
+        toast.errorDescriptor(createMessageDescriptor('knowledgeAdmin.content.review.documentConflict'));
+        await Promise.all([loadVersions(), loadDiff()]);
       } else {
         toast.error(error, 'knowledgeAdmin.toast.updateError');
       }

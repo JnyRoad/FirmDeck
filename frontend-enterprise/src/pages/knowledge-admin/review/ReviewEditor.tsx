@@ -3,7 +3,8 @@
  *
  * 不调用 API、不使用 useAppIntl/i18n（所有文案经 `labels` props 注入，原文行
  * 内容原样渲染、不翻译）。只依赖同目录下的四个纯函数模块
- * （lineDiff/hunkModel/staging/editorDom）与 shadcn `Button`。
+ * （lineDiff/hunkModel/staging/editorDom）、shadcn `Button` 与纯展示的
+ * `RawContent`（后者只输出一个 `translate="no"` 的 span，不引入 intl 运行时）。
  *
  * 每篇文档（`kind: 'modified'`）用一个独立的 `ModifiedDocumentEditor` 子组件
  * 承载自己的 contenteditable 行编辑器：`useMemo(buildModel, [stagedBase,
@@ -24,6 +25,10 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
 } from 'react';
 import { Button } from '@/components/ui';
+// `RawContent` 只渲染一个带 `translate="no"` 的 span，不引入任何 intl 运行时，
+// 因此不违反本文件"不依赖 i18n"的约束；文档标题是用户上传的自由文本，必须与
+// 其它页面一致地标出 raw 边界（I9）。
+import { RawContent } from '@/i18n/RawContent';
 import { cn } from '@/lib/utils';
 import { splitLines } from './lineDiff';
 import {
@@ -93,6 +98,8 @@ export interface ReviewEditorLabels {
   addedDocBadge: string;
   modifiedDocBadge: string;
   deletedDocBadge: string;
+  /** 行级 diff 因规模超预算退化为「整段全删 + 全插」时，文档头部展示的警示条文案（I2）。 */
+  degradedDiffNotice: string;
 }
 
 /** 单篇文档的输出：当前工作区行、暂存记录、整篇拒绝/恢复标记。 */
@@ -146,6 +153,31 @@ export function ReviewEditor({ documents, onChange, labels }: ReviewEditorProps)
     return map;
   });
 
+  /**
+   * `docStates` 与 `documents` 的对账（I3）：初始 seed 只发生在 `useState` 初始化里，
+   * 挂载期间父组件换了一组 `documents`（例如写回后重新拉取对比结果）时，新文档在
+   * `docStates` 里没有条目——旧实现会让它在 `output` 里产出 `lines: []` 且**不**计
+   * pending，于是"应用到草稿"按钮仍然可点，`updateDocument(contentMd: '')` 会把整篇
+   * 文档清空。这里补一个对账 effect：新增的文档补 seed、已消失的文档丢弃状态；
+   * 集合没变化时返回原引用，effect 幂等、不会自触发。
+   */
+  useEffect(() => {
+    setDocStates((prev) => {
+      const next: Record<string, DocInternalState> = {};
+      let changed = Object.keys(prev).length !== documents.length;
+      for (const doc of documents) {
+        const existing = prev[doc.lineageId];
+        if (existing) {
+          next[doc.lineageId] = existing;
+        } else {
+          next[doc.lineageId] = createInitialDocState(doc);
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+  }, [documents]);
+
   const updateDoc = useCallback((lineageId: string, updater: (s: DocInternalState) => DocInternalState) => {
     setDocStates((prev) => {
       const cur = prev[lineageId];
@@ -160,33 +192,39 @@ export function ReviewEditor({ documents, onChange, labels }: ReviewEditorProps)
     let pendingCount = 0;
     let stagedCount = 0;
     let hasWork = false;
-    const docs: ReviewEditorDocOutput[] = documents.map((doc) => {
+    const docs: ReviewEditorDocOutput[] = [];
+    for (const doc of documents) {
       const st = docStates[doc.lineageId];
       if (!st) {
-        return { lineageId: doc.lineageId, kind: doc.kind, lines: [], staged: [], restore: false };
+        // 失败安全（I3）：状态还没 seed 的这一帧绝不能产出 `lines: []`——调用方会把它
+        // 当作"正文被清空"写回。跳过这篇（不出现在 docs 里）并计一次 pending，
+        // 让"应用到草稿"按钮在对账完成前保持禁用。
+        pendingCount += 1;
+        continue;
       }
       if (doc.kind === 'modified') {
         const { hunks } = buildModel(st.staging.stagedBase, st.staging.lines);
         pendingCount += hunks.length;
         stagedCount += st.staging.staged.length;
         if (stagingHasWork(st.staging)) hasWork = true;
-        return {
+        docs.push({
           lineageId: doc.lineageId,
           kind: doc.kind,
           lines: st.staging.lines,
           staged: st.staging.staged,
           restore: false,
-        };
+        });
+        continue;
       }
       if (!arraysEqual(st.staging.lines, st.staging.orig)) hasWork = true;
-      return {
+      docs.push({
         lineageId: doc.lineageId,
         kind: doc.kind,
         lines: st.staging.lines,
         staged: st.staging.staged,
         restore: st.restore,
-      };
-    });
+      });
+    }
     return { docs, pendingCount, stagedCount, hasWork };
   }, [documents, docStates]);
 
@@ -317,6 +355,20 @@ function DocKindBadge({ kind, labels }: { kind: ReviewEditorDocumentInput['kind'
   );
 }
 
+/**
+ * 允许走单行快路径的 `InputEvent.inputType` 白名单（I4）：这几种浏览器原生输入
+ * 只会改动光标所在的那一个 `.et` 行元素。白名单之外（`insertFromDrop`、
+ * `deleteByDrag`、`insertFromPaste`、`historyUndo`/`historyRedo`、以及任何未来新增
+ * 或缺失的类型）一律回退到 `syncFromDom()` 整篇重算，宁可慢也不能让 DOM 与
+ * `state.lines` 分叉。
+ */
+const SINGLE_ROW_INPUT_TYPES = new Set<string>([
+  'insertText',
+  'insertCompositionText',
+  'deleteContentBackward',
+  'deleteContentForward',
+]);
+
 interface ModifiedDocumentEditorProps {
   doc: ReviewEditorDocumentInput;
   state: StagingState;
@@ -331,7 +383,7 @@ function ModifiedDocumentEditor({ doc, state, labels, onStagingChange }: Modifie
   const pendingCaretRef = useRef<{ li: number; offset: number } | null>(null);
   const [selection, setSelection] = useState<{ startLi: number; endLi: number } | null>(null);
 
-  const { rows, hunks } = useMemo(
+  const { rows, hunks, degraded } = useMemo(
     () => buildModel(state.stagedBase, state.lines),
     [state.stagedBase, state.lines],
   );
@@ -393,10 +445,22 @@ function ModifiedDocumentEditor({ doc, state, labels, onStagingChange }: Modifie
     return true;
   }
 
-  /** `input` 事件处理：组合期忽略（不重绘）；单行原生插入走快路径，其余整篇重算。 */
+  /**
+   * `input` 事件处理：组合期忽略（不重绘）；**只有**明确只会改动事件目标那一行的
+   * `inputType` 才走单行快路径，其余一律整篇重算（I4）。
+   *
+   * 之前的实现只看事件目标是不是某个 `.et` 行，这个前提对
+   * `insertFromDrop`/`deleteByDrag` 不成立：拖拽移动文本会在**两**个行元素上产生
+   * 变化却只派发一个 `input` 事件（目标是落点那一行），源行的删除因此永远不会进入
+   * `state.lines`；又因为 `dangerouslySetInnerHTML` 比对的是 prop 字符串，那一行的
+   * DOM 也永远不会被重写回来，DOM 与状态就此长期分叉，diff / pendingCount / 写回
+   * 全部基于错误内容。`insertFromPaste`、`historyUndo`/`historyRedo` 与任何未知或
+   * 缺失的 `inputType`（含测试里手工派发的裸 `Event`）同理，一律走 `syncFromDom()`。
+   */
   function handleInput(e: ReactFormEvent<HTMLDivElement>) {
     if (composingRef.current) return;
-    if (handleSingleRowInput(e.target as HTMLElement)) return;
+    const inputType = (e.nativeEvent as Partial<InputEvent>).inputType;
+    if (inputType && SINGLE_ROW_INPUT_TYPES.has(inputType) && handleSingleRowInput(e.target as HTMLElement)) return;
     syncFromDom();
   }
 
@@ -555,7 +619,7 @@ function ModifiedDocumentEditor({ doc, state, labels, onStagingChange }: Modifie
     <div className="rounded-2xl border border-border/70 bg-white">
       <div className="flex items-center justify-between border-b px-4 py-2 text-sm">
         <span className="flex items-center gap-2">
-          <span className="font-medium">{doc.title}</span>
+          <span className="font-medium"><RawContent value={doc.title} /></span>
           <DocKindBadge kind={doc.kind} labels={labels} />
         </span>
         <div className="flex flex-wrap gap-2">
@@ -579,6 +643,11 @@ function ModifiedDocumentEditor({ doc, state, labels, onStagingChange }: Modifie
           </Button>
         </div>
       </div>
+      {degraded && (
+        <p role="alert" className="border-b border-amber-200 bg-amber-50 px-4 py-2 text-xs text-amber-800">
+          {labels.degradedDiffNotice}
+        </p>
+      )}
       <div
         ref={containerRef}
         className="review-body whitespace-pre-wrap px-1 py-2 font-mono text-sm leading-6"
@@ -612,10 +681,22 @@ function ModifiedDocumentEditor({ doc, state, labels, onStagingChange }: Modifie
           const pairs = hunk ? pairsByHunk.get(hunk.id) ?? [] : [];
 
           if (row.t === '=') {
-            const stagedRecord = state.staged.find(
-              (rec) => row.bi >= rec.pos && row.bi < rec.pos + rec.added.length,
-            );
-            const isStagedFirstRow = !!stagedRecord && row.bi === stagedRecord.pos;
+            // 纯删除块（`added.length === 0`）被接受后在 `stagedBase` 里不占任何行，
+            // 按 `[pos, pos+added.length)` 这个区间永远匹配不到行，于是 ✓ 徽章和
+            // 「撤销接受」都渲染不出来，用户只能整篇「重置」才能反悔（I5）。
+            // 这里对纯删除按位置锚定：挂到删除位置之后的第一行；删除发生在文末时
+            // 挂到最后一行，保证任何一次纯删除接受都可撤销。
+            const stagedRecord = state.staged.find((rec) => {
+              if (rec.added.length > 0) return row.bi >= rec.pos && row.bi < rec.pos + rec.added.length;
+              return rec.pos < state.stagedBase.length
+                ? row.bi === rec.pos
+                : row.bi === state.stagedBase.length - 1;
+            });
+            // 纯删除记录的锚定行可能是「删除位置的前一行」（文末删除），因此不能再用
+            // `row.bi === rec.pos` 判断"是不是该记录的首行"——上面的 find 已经保证了
+            // 一条纯删除记录最多只匹配到一行。
+            const isStagedFirstRow = !!stagedRecord
+              && (stagedRecord.added.length === 0 || row.bi === stagedRecord.pos);
             const stagedBadge: EqualRowStagedBadge | null =
               isStagedFirstRow && stagedRecord
                 ? {
@@ -700,7 +781,7 @@ function WholeDocumentPanel({ doc, state, restore, labels, onToggleRestore }: Wh
     <div className="rounded-2xl border border-border/70 bg-white">
       <div className="flex items-center justify-between border-b px-4 py-2 text-sm">
         <span className="flex items-center gap-2">
-          <span className="font-medium">{doc.title}</span>
+          <span className="font-medium"><RawContent value={doc.title} /></span>
           <DocKindBadge kind={doc.kind} labels={labels} />
         </span>
         <Button type="button" size="xs" variant="outline" aria-pressed={restore} onClick={onToggleRestore}>

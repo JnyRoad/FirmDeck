@@ -5,6 +5,8 @@
  */
 import { describe, expect, it } from 'vitest';
 import {
+  ALIGN_CELL_BUDGET,
+  CHAR_OPS_CELL_BUDGET,
   alignHunk,
   buildModel,
   charOps,
@@ -149,6 +151,56 @@ describe('alignHunk', () => {
     ]);
     expect(pairs[0].ratio).toBeGreaterThanOrEqual(0.5);
     expect(pairs[1].ratio).toBeGreaterThanOrEqual(0.5);
+  });
+});
+
+/**
+ * 规模护栏（跨任务评审 C2）：`lineDiff` 超预算时会退化成「全删 + 全插」的单个巨块，
+ * 之前 `alignHunk` 会对它无条件建三张 `n×m` 嵌套数组并跑 `n×m` 次整串 LCS，比
+ * `lineDiff` 拒绝建的 `Int32Array` DP 还贵。这里用注入的小预算验证兜底路径，
+ * 不分配任何大数组。
+ */
+describe('alignHunk — 规模护栏', () => {
+  it('exposes a default cell budget', () => {
+    expect(ALIGN_CELL_BUDGET).toBeGreaterThan(0);
+  });
+
+  it('returns no pairs at all once removed×added exceeds the cell budget', () => {
+    const hunk: Hunk = {
+      id: 0,
+      bs: 0,
+      insertAt: 0,
+      removed: ['alpha line one', 'beta line two', 'gamma line three'],
+      added: ['alpha line ONE', 'beta line TWO', 'gamma line THREE'],
+    };
+    // 3 × 3 = 9 > 8：超预算，直接放弃字符级配对（调用方按"无高亮"处理）。
+    expect(alignHunk(hunk, 8)).toEqual([]);
+    // 同一个块在预算之内时仍然正常配对，证明兜底只由预算触发。
+    expect(alignHunk(hunk, 9)).toHaveLength(3);
+  });
+
+  it('skips the character-level DP when the two lines cannot reach the 0.5 pairing threshold', () => {
+    // 2*min/(la+lb) = 2*1/101 < 0.5：无论 LCS 多长都不可能配对，直接返回 0。
+    expect(similarityRatio('a', 'a'.repeat(100))).toBe(0);
+  });
+});
+
+describe('charOps — 规模护栏', () => {
+  it('exposes a default cell budget', () => {
+    expect(CHAR_OPS_CELL_BUDGET).toBeGreaterThan(0);
+  });
+
+  it('degrades to whole-string delete + insert once the DP table exceeds the budget', () => {
+    // 4 × 4 = 16 > 15：不建 DP 表，退化为整串替换（仍是合法的 CharOp 序列）。
+    expect(charOps('abcd', 'abce', 15)).toEqual([
+      { type: '-', text: 'abcd' },
+      { type: '+', text: 'abce' },
+    ]);
+    expect(charOps('abcd', 'abce', 16)).toEqual([
+      { type: '=', text: 'abc' },
+      { type: '-', text: 'd' },
+      { type: '+', text: 'e' },
+    ]);
   });
 });
 

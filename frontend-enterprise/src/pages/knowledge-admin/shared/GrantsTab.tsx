@@ -22,7 +22,6 @@ import { createTenantClient } from '@/api/tenant-client';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
 import TeamKnowledgePermissionMatrix from '@/components/knowledge/TeamKnowledgePermissionMatrix';
 import { Button } from '@/components/ui/button';
-import { createToastNotifier } from '@/components/ui/app-toast';
 import { useTenantSession } from '@/contexts/TenantSessionContext';
 import { useAppIntl } from '@/i18n';
 import { createMessageDescriptor } from '@/i18n/descriptors';
@@ -38,6 +37,9 @@ import type {
 } from '@/types';
 import type { KnowledgeAdminTeamOption } from '@/types/knowledgeAdmin';
 
+import { useKnowledgeAdminToast } from './errorMessage';
+import { useGuardedLoad } from './useGuardedLoad';
+
 export type GrantsTabProps = {
   api: KnowledgeAdminApi;
   kb: KnowledgeBaseRead;
@@ -52,7 +54,13 @@ type BoundTeamRow = {
 
 export function GrantsTab({ api, kb }: GrantsTabProps) {
   const { t } = useAppIntl();
-  const toast = useMemo(() => createToastNotifier({ t }), [t]);
+  // 统一 toast 出口（I12）：把错误值本身交给 `toast.error(error, fallbackId)`，让已注册的
+  // 后端错误码先经 `backendErrorMessageDescriptor` 命中契约文案；之前这里直接用
+  // `createToastNotifier` + 裸 `catch {}`，错误对象被整个丢掉，所有失败都退化成同一句
+  // 泛化提示——正是 `shared/errorMessage.ts` 要消除的那种降级。
+  const toast = useKnowledgeAdminToast();
+  // 过期响应护栏（I1）：绑定卡片加载的请求序号 + 租户代际。
+  const listLoad = useGuardedLoad();
   const tenantContext = useTenantSession();
   const tenantClient = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
 
@@ -83,6 +91,7 @@ export function GrantsTab({ api, kb }: GrantsTabProps) {
 
   /** 重新加载已绑定群组卡片与可绑定候选；已绑定集合见文件头注释的差集算法。 */
   async function load() {
+    const token = listLoad.begin();
     setLoading(true);
     try {
       const [allTeams, candidates] = await Promise.all([
@@ -92,12 +101,15 @@ export function GrantsTab({ api, kb }: GrantsTabProps) {
       const candidateIds = new Set(candidates.map((team) => team.id));
       const boundTeamOptions = allTeams.filter((team) => !candidateIds.has(team.id));
       const rows = await Promise.all(boundTeamOptions.map((team) => loadBoundTeamRow(team)));
+      // 过期响应（重复刷新交错、租户代际已变）整个丢弃，见 useGuardedLoad（I1）。
+      if (!listLoad.isCurrent(token)) return;
       setBoundRows(rows.filter((row): row is BoundTeamRow => row !== null));
       setCandidateTeams(candidates);
-    } catch {
-      toast.error(createMessageDescriptor('knowledgeAdmin.grants.toast.loadFailed'));
+    } catch (error) {
+      if (!listLoad.isCurrent(token)) return;
+      toast.error(error, 'knowledgeAdmin.grants.toast.loadFailed');
     } finally {
-      setLoading(false);
+      if (listLoad.isCurrent(token)) setLoading(false);
     }
   }
 
@@ -123,7 +135,8 @@ export function GrantsTab({ api, kb }: GrantsTabProps) {
 
   /** 修订冲突时的统一处理：提示管理员刷新后重试，并重新加载最新绑定状态。 */
   async function handleRevisionConflict() {
-    toast.error(createMessageDescriptor('knowledgeAdmin.grants.toast.revisionConflict'));
+    // 修订冲突有专属措辞（比契约默认文案更贴合"刷新后重试"的操作指引），走 errorDescriptor。
+    toast.errorDescriptor(createMessageDescriptor('knowledgeAdmin.grants.toast.revisionConflict'));
     await load();
   }
 
@@ -144,7 +157,7 @@ export function GrantsTab({ api, kb }: GrantsTabProps) {
       if (apiErrorCode(error) === 'KNOWLEDGE_BINDING_REVISION_CONFLICT') {
         await handleRevisionConflict();
       } else {
-        toast.error(createMessageDescriptor('knowledgeAdmin.grants.toast.saveFailed'));
+        toast.error(error, 'knowledgeAdmin.grants.toast.saveFailed');
       }
     }
   }
@@ -161,7 +174,7 @@ export function GrantsTab({ api, kb }: GrantsTabProps) {
       if (apiErrorCode(error) === 'KNOWLEDGE_BINDING_REVISION_CONFLICT') {
         await handleRevisionConflict();
       } else {
-        toast.error(createMessageDescriptor('knowledgeAdmin.grants.toast.setDefaultFailed'));
+        toast.error(error, 'knowledgeAdmin.grants.toast.setDefaultFailed');
       }
     }
   }
@@ -181,7 +194,7 @@ export function GrantsTab({ api, kb }: GrantsTabProps) {
         setUnbindTarget(null);
         await handleRevisionConflict();
       } else {
-        toast.error(createMessageDescriptor('knowledgeAdmin.grants.toast.unbindFailed'));
+        toast.error(error, 'knowledgeAdmin.grants.toast.unbindFailed');
       }
     } finally {
       setUnbinding(false);
@@ -197,8 +210,8 @@ export function GrantsTab({ api, kb }: GrantsTabProps) {
       toast.success(createMessageDescriptor('knowledgeAdmin.grants.toast.bindSuccess'));
       setSelectedTeamId('');
       await load();
-    } catch {
-      toast.error(createMessageDescriptor('knowledgeAdmin.grants.toast.bindFailed'));
+    } catch (error) {
+      toast.error(error, 'knowledgeAdmin.grants.toast.bindFailed');
     } finally {
       setBindInProgress(false);
     }
@@ -258,7 +271,9 @@ export function GrantsTab({ api, kb }: GrantsTabProps) {
           >
             <option value="">{t('knowledgeAdmin.grants.bindSection.selectPlaceholder')}</option>
             {candidateTeams.map((team) => (
-              <option key={team.id} value={team.id}>{team.name}</option>
+              // 群组名是自由文本：`<option>` 里不能嵌 `RawIdentifier`（会破坏原生下拉），
+              // 改在元素本身上标 `translate="no"`，与其它位置的 raw 包裹口径一致（I9）。
+              <option key={team.id} value={team.id} translate="no">{team.name}</option>
             ))}
           </select>
           <Button

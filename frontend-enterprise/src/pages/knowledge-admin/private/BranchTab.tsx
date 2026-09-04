@@ -28,6 +28,7 @@ import type { KnowledgeAdminVersionRead } from '@/types/knowledgeAdmin';
 
 import { formatVersion } from '../knowledgeAdminModel';
 import { useKnowledgeAdminToast } from '../shared/errorMessage';
+import { useGuardedLoad } from '../shared/useGuardedLoad';
 import { branchSyncMessageId } from './branchStatus';
 
 export type PrivateBranchTabProps = {
@@ -42,6 +43,8 @@ export type PrivateBranchTabProps = {
 export function BranchTab({ api, kb, ownerAgentId, ownerAgentName, onChanged }: PrivateBranchTabProps) {
   const { t } = useAppIntl();
   const toast = useKnowledgeAdminToast();
+  // 过期响应护栏（I1）：分支版本列表的请求序号 + 租户代际。
+  const versionsLoad = useGuardedLoad();
   const [versions, setVersions] = useState<KnowledgeAdminVersionRead[]>([]);
   const [loading, setLoading] = useState(false);
 
@@ -57,14 +60,18 @@ export function BranchTab({ api, kb, ownerAgentId, ownerAgentName, onChanged }: 
 
   async function load() {
     if (!ownerAgentId) return;
+    const token = versionsLoad.begin();
     setLoading(true);
     try {
       const rows = await api.listVersions(kb.id, ownerAgentId);
+      // 过期响应（切换归属员工 / 租户代际已变）整个丢弃，见 useGuardedLoad（I1）。
+      if (!versionsLoad.isCurrent(token)) return;
       setVersions(Array.isArray(rows) ? rows : []);
     } catch (error) {
+      if (!versionsLoad.isCurrent(token)) return;
       toast.error(error, 'knowledgeAdmin.toast.loadFailed');
     } finally {
-      setLoading(false);
+      if (versionsLoad.isCurrent(token)) setLoading(false);
     }
   }
 

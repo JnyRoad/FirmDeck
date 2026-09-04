@@ -241,4 +241,61 @@ describe('RebaseDialog', () => {
     await user.click(screen.getByRole('button', { name: '重新预览' }));
     await waitFor(() => expect(api.rebaseDraft).toHaveBeenCalledTimes(2));
   });
+
+  it('keeps already-resolved conflicts across a re-preview (I10)', async () => {
+    const user = userEvent.setup();
+    const { api } = renderDialog();
+    const twoConflicts = makePreview({
+      conflicts: [
+        ...makePreview().conflicts,
+        {
+          lineage_id: 'kdoc_bing',
+          title: '文档丙',
+          blocks: [{ base_lines: ['原文丙'], ours_lines: ['草稿丙'], theirs_lines: ['正式丙'], context_before: [], context_after: [] }],
+        },
+      ],
+    });
+    api.rebaseDraft.mockResolvedValueOnce(twoConflicts);
+    // 重新预览时"文档丙"已不再冲突（被别人先解决了），"文档甲"仍冲突。
+    api.rebaseDraft.mockResolvedValueOnce(makePreview());
+    api.resolveRebase.mockRejectedValueOnce({ code: 'KNOWLEDGE_PUBLISH_CONFLICT' });
+
+    await user.type(screen.getByLabelText('变基原因'), '基线过期，需要变基');
+    await user.click(screen.getByRole('button', { name: '开始变基' }));
+    await screen.findByText('文档甲');
+
+    // 两篇冲突各有一个「去合并」按钮，逐个解决。
+    await user.click(screen.getAllByRole('button', { name: '去合并' })[0]);
+    await user.click(screen.getByRole('button', { name: 'stub-complete-kdoc_jia' }));
+    await user.click(screen.getByRole('button', { name: '去合并' }));
+    await user.click(screen.getByRole('button', { name: 'stub-complete-kdoc_bing' }));
+    expect(screen.getByText('已解决 2/2 篇冲突文档')).toBeTruthy();
+
+    await user.click(screen.getByRole('button', { name: '完成变基' }));
+    expect(await screen.findByText('正式版又变了，请重新预览变基。')).toBeTruthy();
+    await user.click(screen.getByRole('button', { name: '重新预览' }));
+
+    // 已完成的手工合并必须保留：新预览里仍冲突的「文档甲」直接算已解决，
+    // 「完成变基」立刻可用，不用重做一遍；不再冲突的「文档丙」被剪掉。
+    await waitFor(() => expect(screen.getByText('已解决 1/1 篇冲突文档')).toBeTruthy());
+    expect((screen.getByRole('button', { name: '完成变基' }) as HTMLButtonElement).disabled).toBe(false);
+
+    const result = makeRebaseResult();
+    api.resolveRebase.mockResolvedValueOnce(result);
+    await user.click(screen.getByRole('button', { name: '完成变基' }));
+    await waitFor(() => expect(api.resolveRebase).toHaveBeenLastCalledWith('kb_1', 'kbver_draft_b', expect.objectContaining({
+      resolutions: [{ lineageId: 'kdoc_jia', contentMd: '文档甲-resolved' }],
+    })));
+  });
+
+  it('resets resolutions on a fresh start, not only on retry (I10)', async () => {
+    const user = userEvent.setup();
+    const { api } = renderDialog();
+    api.rebaseDraft.mockResolvedValue(makePreview());
+
+    await user.type(screen.getByLabelText('变基原因'), '基线过期，需要变基');
+    await user.click(screen.getByRole('button', { name: '开始变基' }));
+    await screen.findByText('文档甲');
+    expect(screen.getByText('已解决 0/1 篇冲突文档')).toBeTruthy();
+  });
 });

@@ -69,6 +69,18 @@ const draftVersion: KnowledgeAdminVersionRead = {
   updated_at: '2026-08-20T05:00:00Z',
 };
 
+/**
+ * A2b 文档行各自的 `updated_at`：与 `draftVersion.updated_at`（版本行时间戳）不同，
+ * 因为后端 `update_document`/`archive_document` 的 `expected_updated_at` 比对的是
+ * **文档行**的 `updated_at`（`backend/app/api/knowledge.py:711`），而 `recordReview`
+ * 比对的才是草稿版本行的（`backend/app/knowledge/versioning.py:756`）。
+ */
+const DOC_UPDATED_AT = {
+  doc_new_1: '2026-08-21T01:00:00Z',
+  doc_mod_1: '2026-08-21T02:00:00Z',
+  doc_del_1: '2026-08-21T03:00:00Z',
+} as const;
+
 const draftDiff: VersionDiff = {
   base_version_id: 'kbver_pub',
   target_version_id: 'kbver_draft_1',
@@ -125,10 +137,12 @@ function createMockApi() {
     // original `lineage_id` in metadata) — this is the exact "known limitation"
     // scenario T083 fixes. `applyReview` must write back with these real ids, not
     // `document.lineageId` from the review output.
+    // 每一行的 `updated_at` 都刻意与草稿版本的 `updated_at` 不同（且行与行之间也不同），
+    // 这样"写回带的是文档行时间戳"这条断言不可能因为两者恰好相等而蒙混通过（C1）。
     listVersionDocuments: vi.fn().mockResolvedValue([
-      { id: 'doc_new_1_row', lineage_id: 'doc_new_1', title: '新增文档', filename: 'doc_new_1.md', status: 'ready', bucket_count: 0, chunk_count: 0, updated_at: draftVersion.updated_at },
-      { id: 'doc_mod_1_row', lineage_id: 'doc_mod_1', title: '修改文档', filename: 'doc_mod_1.md', status: 'ready', bucket_count: 0, chunk_count: 0, updated_at: draftVersion.updated_at },
-      { id: 'doc_del_1_row', lineage_id: 'doc_del_1', title: '删除文档', filename: 'doc_del_1.md', status: 'archived', bucket_count: 0, chunk_count: 0, updated_at: draftVersion.updated_at },
+      { id: 'doc_new_1_row', lineage_id: 'doc_new_1', title: '新增文档', filename: 'doc_new_1.md', status: 'ready', bucket_count: 0, chunk_count: 0, updated_at: DOC_UPDATED_AT.doc_new_1 },
+      { id: 'doc_mod_1_row', lineage_id: 'doc_mod_1', title: '修改文档', filename: 'doc_mod_1.md', status: 'ready', bucket_count: 0, chunk_count: 0, updated_at: DOC_UPDATED_AT.doc_mod_1 },
+      { id: 'doc_del_1_row', lineage_id: 'doc_del_1', title: '删除文档', filename: 'doc_del_1.md', status: 'archived', bucket_count: 0, chunk_count: 0, updated_at: DOC_UPDATED_AT.doc_del_1 },
     ]),
     uploadDocument: vi.fn(),
     updateDocument: vi.fn().mockResolvedValue({ id: 'doc' }),
@@ -176,9 +190,10 @@ describe('ContentTab review-apply flow', () => {
     // Real row id (`doc_mod_1_row`), not the review output's `lineageId` (`doc_mod_1`) —
     // proves write-back is resolved through `listVersionDocuments`, not the diff's
     // cross-version `lineage_id` (T083).
+    // `expectedUpdatedAt` 必须是**文档行**的时间戳，而不是草稿版本行的（C1）。
     await waitFor(() => expect(api.updateDocument).toHaveBeenCalledWith('doc_mod_1_row', {
       contentMd: '新内容',
-      expectedUpdatedAt: draftVersion.updated_at,
+      expectedUpdatedAt: DOC_UPDATED_AT.doc_mod_1,
     }));
     expect(api.updateDocument).not.toHaveBeenCalledWith('doc_mod_1', expect.anything());
     expect(api.archiveDocument).not.toHaveBeenCalled();
@@ -213,11 +228,30 @@ describe('ContentTab review-apply flow', () => {
 
     // Both assertions use the real row id (`_row` suffix), not the review output's
     // `lineageId` — same T083 regression coverage as the "modified" case above.
-    await waitFor(() => expect(api.archiveDocument).toHaveBeenCalledWith('doc_new_1_row', { expectedUpdatedAt: draftVersion.updated_at }));
+    await waitFor(() => expect(api.archiveDocument).toHaveBeenCalledWith('doc_new_1_row', { expectedUpdatedAt: DOC_UPDATED_AT.doc_new_1 }));
     await waitFor(() => expect(api.updateDocument).toHaveBeenCalledWith('doc_del_1_row', {
       status: 'ready',
-      expectedUpdatedAt: draftVersion.updated_at,
+      expectedUpdatedAt: DOC_UPDATED_AT.doc_del_1,
     }));
+  });
+
+  it('shows the document-level conflict message and reloads on KNOWLEDGE_DOCUMENT_CONFLICT', async () => {
+    const user = userEvent.setup();
+    const api = createMockApi();
+    api.updateDocument.mockRejectedValueOnce({ code: 'KNOWLEDGE_DOCUMENT_CONFLICT' });
+    renderContentTab(api);
+
+    await screen.findByText('新增文档');
+    await user.click(screen.getByRole('button', { name: '查看变更' }));
+    await screen.findByTestId('mock-review-editor');
+
+    act(() => latestOnChange?.(emptyOutput));
+    await user.click(screen.getByRole('button', { name: '应用到草稿' }));
+
+    expect(await screen.findByText('部分文档已被他人修改，本次审阅未全部应用，请刷新后重新审阅')).toBeTruthy();
+    expect(api.recordReview).not.toHaveBeenCalled();
+    // 冲突后必须重新拉取，避免继续拿着已经过期的行时间戳重试。
+    await waitFor(() => expect(api.listVersionDocuments.mock.calls.length).toBeGreaterThan(1));
   });
 
   it('shows the conflict message and stops the remaining write-back on KNOWLEDGE_PUBLISH_CONFLICT', async () => {

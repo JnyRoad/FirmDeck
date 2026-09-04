@@ -32,6 +32,7 @@ import { PublishDialog, type PublishDialogSubmitInput } from '../dialogs/Publish
 import { RebaseDialog } from '../dialogs/RebaseDialog';
 import { formatVersion } from '../knowledgeAdminModel';
 import { useKnowledgeAdminToast } from './errorMessage';
+import { useGuardedLoad } from './useGuardedLoad';
 
 export type VersionsTabProps = {
   api: KnowledgeAdminApi;
@@ -48,6 +49,8 @@ const STATE_LABEL_IDS: Record<string, 'knowledgeAdmin.versions.state.draft' | 'k
 export function VersionsTab({ api, kb, onChanged }: VersionsTabProps) {
   const { t } = useAppIntl();
   const toast = useKnowledgeAdminToast();
+  // 过期响应护栏（I1）：版本列表的请求序号 + 租户代际。
+  const versionsLoad = useGuardedLoad();
   const [searchParams, setSearchParams] = useSearchParams();
   const [versions, setVersions] = useState<KnowledgeAdminVersionRead[]>([]);
   const [loading, setLoading] = useState(false);
@@ -71,14 +74,18 @@ export function VersionsTab({ api, kb, onChanged }: VersionsTabProps) {
   const [rollingBack, setRollingBack] = useState(false);
 
   async function load() {
+    const token = versionsLoad.begin();
     setLoading(true);
     try {
       const result = await api.listVersions(kb.id);
+      // 过期响应（重复刷新交错、租户代际已变）整个丢弃，见 useGuardedLoad（I1）。
+      if (!versionsLoad.isCurrent(token)) return;
       setVersions(Array.isArray(result) ? result : []);
     } catch (error) {
+      if (!versionsLoad.isCurrent(token)) return;
       toast.error(error, 'knowledgeAdmin.toast.loadFailed');
     } finally {
-      setLoading(false);
+      if (versionsLoad.isCurrent(token)) setLoading(false);
     }
   }
 
