@@ -17,7 +17,7 @@ from app.contracts.domain_http import domain_http_error
 from app.contracts.error_registry import ERROR_REGISTRY, ErrorVisibility
 from app.db import get_session
 from app.db.models import KnowledgeBase, KnowledgeBaseVersion, KnowledgeDocument, User
-from app.knowledge.diff import DEFAULT_MAX_LINES, diff_versions
+from app.knowledge.diff import DEFAULT_MAX_LINES, diff_versions, document_lineage_id
 from app.knowledge.errors import KnowledgeError
 from app.knowledge.listing import list_bindable_teams, list_tenant_knowledge_bases
 from app.knowledge.management import (
@@ -338,7 +338,7 @@ def list_knowledge_admin_version_documents(
     return [
         VersionDocumentRead(
             id=row.id,
-            lineage_id=(row.metadata_json or {}).get("lineage_id"),
+            lineage_id=document_lineage_id(row),
             title=row.title or row.filename,
             filename=row.filename,
             status=row.status,

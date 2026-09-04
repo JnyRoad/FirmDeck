@@ -210,7 +210,177 @@ def test_lists_all_documents_with_real_ids_sorted_by_title_then_id() -> None:
 
         mmm = next(item for item in response if item.id == "doc_mmm")
         assert mmm.lineage_id is None  # 缺失 lineage_id 时回落 null，不报错
-        assert mmm.status == "processing"
+
+
+def test_lineage_id_normalizes_empty_and_non_string_values_to_null() -> None:
+    """`document_lineage_id`（diff.py，fix round 新增）在 A2b 的落地：`""` 和非字符串
+    （如误存成 int）都不是合法 lineage_id，必须与 `_load_version_documents`（A2）一致地
+    归一为 `null`，而不是把原始值透传给前端。"""
+    with _test_session() as db:
+        db.add(Tenant(id="tenant_demo", slug="tenant-demo", name="Demo", lifecycle_version=1))
+        db.add(
+            KnowledgeBase(
+                id="kb_lineage_edge",
+                tenant_id="tenant_demo",
+                name="血缘边界知识库",
+                mode="dedicated",
+                status="active",
+            )
+        )
+        db.add(
+            KnowledgeBaseVersion(
+                id="kbver_lineage_edge",
+                tenant_id="tenant_demo",
+                knowledge_base_id="kb_lineage_edge",
+                version="1.0.0",
+                name="血缘边界知识库",
+                publication_state="released",
+            )
+        )
+        db.add(
+            KnowledgeDocument(
+                id="doc_empty_lineage",
+                tenant_id="tenant_demo",
+                knowledge_base_id="kb_lineage_edge",
+                knowledge_base_version_id="kbver_lineage_edge",
+                filename="empty.md",
+                file_type="md",
+                title="空字符串血缘",
+                status="ready",
+                metadata_json={"lineage_id": ""},
+            )
+        )
+        db.add(
+            KnowledgeDocument(
+                id="doc_non_string_lineage",
+                tenant_id="tenant_demo",
+                knowledge_base_id="kb_lineage_edge",
+                knowledge_base_version_id="kbver_lineage_edge",
+                filename="non_string.md",
+                file_type="md",
+                title="非字符串血缘",
+                status="ready",
+                metadata_json={"lineage_id": 12345},
+            )
+        )
+        db.commit()
+
+        response = list_knowledge_admin_version_documents(
+            kb_id="kb_lineage_edge",
+            version_id="kbver_lineage_edge",
+            tenant_id="tenant_demo",
+            db=db,
+            current_user=_admin_user(),
+        )
+
+        by_id = {item.id: item for item in response}
+        assert by_id["doc_empty_lineage"].lineage_id is None
+        assert by_id["doc_non_string_lineage"].lineage_id is None
+
+
+def test_sort_ties_on_title_break_by_document_id() -> None:
+    """标题相同的两篇文档必须按 `id` 稳定排序打破平局，而不是保留插入/查询不确定顺序。"""
+    with _test_session() as db:
+        db.add(Tenant(id="tenant_demo", slug="tenant-demo", name="Demo", lifecycle_version=1))
+        db.add(
+            KnowledgeBase(
+                id="kb_tie_break",
+                tenant_id="tenant_demo",
+                name="同名标题知识库",
+                mode="dedicated",
+                status="active",
+            )
+        )
+        db.add(
+            KnowledgeBaseVersion(
+                id="kbver_tie_break",
+                tenant_id="tenant_demo",
+                knowledge_base_id="kb_tie_break",
+                version="1.0.0",
+                name="同名标题知识库",
+                publication_state="released",
+            )
+        )
+        # 故意先插入 id 较大的一篇，验证排序按 id 字典序而非插入顺序。
+        db.add(
+            KnowledgeDocument(
+                id="doc_tie_2",
+                tenant_id="tenant_demo",
+                knowledge_base_id="kb_tie_break",
+                knowledge_base_version_id="kbver_tie_break",
+                filename="tie_2.md",
+                file_type="md",
+                title="同名文档",
+                status="ready",
+                metadata_json={"lineage_id": "L_tie_2"},
+            )
+        )
+        db.add(
+            KnowledgeDocument(
+                id="doc_tie_1",
+                tenant_id="tenant_demo",
+                knowledge_base_id="kb_tie_break",
+                knowledge_base_version_id="kbver_tie_break",
+                filename="tie_1.md",
+                file_type="md",
+                title="同名文档",
+                status="ready",
+                metadata_json={"lineage_id": "L_tie_1"},
+            )
+        )
+        db.commit()
+
+        response = list_knowledge_admin_version_documents(
+            kb_id="kb_tie_break",
+            version_id="kbver_tie_break",
+            tenant_id="tenant_demo",
+            db=db,
+            current_user=_admin_user(),
+        )
+
+        assert [item.id for item in response] == ["doc_tie_1", "doc_tie_2"]
+
+
+def test_same_tenant_different_knowledge_base_version_is_context_mismatch() -> None:
+    """版本存在且同租户，但归属于另一个知识库时，必须是 `KNOWLEDGE_CONTEXT_MISMATCH`
+    （403）而不是把另一个库的文档数据泄漏给调用方，也不是误判为 404。"""
+    with _test_session() as db:
+        _seed_version_documents_fixture(db)
+        db.add(
+            KnowledgeBase(
+                id="kb_other",
+                tenant_id="tenant_demo",
+                name="另一个知识库",
+                mode="dedicated",
+                status="active",
+            )
+        )
+        db.add(
+            KnowledgeBaseVersion(
+                id="kbver_other_kb",
+                tenant_id="tenant_demo",
+                knowledge_base_id="kb_other",
+                version="1.0.0",
+                name="另一个知识库",
+                publication_state="released",
+            )
+        )
+        db.commit()
+
+        with pytest.raises(HTTPException) as mismatch:
+            list_knowledge_admin_version_documents(
+                kb_id="kb_shared_x",  # 用共享库的 id，但拿另一个库的 version_id
+                version_id="kbver_other_kb",
+                tenant_id="tenant_demo",
+                db=db,
+                current_user=_admin_user(),
+            )
+
+        assert mismatch.value.status_code == 403
+        assert mismatch.value.detail["code"] == "KNOWLEDGE_CONTEXT_MISMATCH"
+        # 断言错误载荷不含任何文档数据（不泄漏另一个库的内容）。
+        assert "documents" not in mismatch.value.detail
+        assert "doc_dedicated_1" not in str(mismatch.value.detail)
 
 
 # ---------------------------------------------------------------------------

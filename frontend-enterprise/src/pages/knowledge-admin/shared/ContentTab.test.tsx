@@ -59,7 +59,16 @@ const pubDiff: VersionDiff = {
   target_version_id: 'kbver_pub',
   pairing: 'lineage',
   summary: { added: 1, modified: 0, deleted: 0 },
-  documents: [{ lineage_id: 'doc_pub_1', title: '发布说明', kind: 'added', truncated: false }],
+  documents: [
+    {
+      lineage_id: 'doc_pub_1',
+      title: '发布说明',
+      kind: 'added',
+      truncated: false,
+      base_document_id: null,
+      target_document_id: 'doc_pub_1',
+    },
+  ],
 };
 
 const draftDiff: VersionDiff = {
@@ -68,17 +77,33 @@ const draftDiff: VersionDiff = {
   pairing: 'lineage',
   summary: { added: 1, modified: 1, deleted: 1 },
   documents: [
-    { lineage_id: 'doc_new_1', title: '新增文档', kind: 'added', truncated: false },
+    {
+      lineage_id: 'doc_new_1',
+      title: '新增文档',
+      kind: 'added',
+      truncated: false,
+      base_document_id: null,
+      target_document_id: 'doc_new_1',
+    },
     {
       lineage_id: 'doc_mod_1',
       title: '修改文档',
       kind: 'modified',
       truncated: false,
+      base_document_id: 'doc_mod_1_base',
+      target_document_id: 'doc_mod_1',
       hunks: [
         { type: 'change', base_start: 0, base_lines: ['旧内容'], target_start: 0, target_lines: ['新内容'], pairs: [[0, 0]] },
       ],
     },
-    { lineage_id: 'doc_del_1', title: '删除文档', kind: 'deleted', truncated: false },
+    {
+      lineage_id: 'doc_del_1',
+      title: '删除文档',
+      kind: 'deleted',
+      truncated: false,
+      base_document_id: 'doc_del_1',
+      target_document_id: null,
+    },
   ],
 };
 

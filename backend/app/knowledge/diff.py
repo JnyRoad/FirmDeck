@@ -270,6 +270,19 @@ def _document_text(document: KnowledgeDocument) -> str:
     return raw_text if isinstance(raw_text, str) else ""
 
 
+def document_lineage_id(document: KnowledgeDocument) -> str | None:
+    """从 `metadata_json.lineage_id` 取血缘 id，非字符串或空字符串一律归一为 `None`（fix round）。
+
+    供本文件的 `_load_version_documents`（A2）与
+    `app.api.knowledge_admin.list_knowledge_admin_version_documents`（A2b）共用同一套
+    容错规则，避免两处各自实现出现不一致（此前 A2b 直接读原始值，`""` 会被当作合法
+    lineage_id 而非归一为 `None`）。
+    """
+    metadata = document.metadata_json or {}
+    lineage = metadata.get("lineage_id")
+    return lineage if isinstance(lineage, str) and lineage else None
+
+
 def _load_version_documents(
     db: Session, *, tenant_id: str, version_id: str
 ) -> list[DocumentSnapshot]:
@@ -288,11 +301,9 @@ def _load_version_documents(
     ).all()
     snapshots: list[DocumentSnapshot] = []
     for row in rows:
-        metadata = row.metadata_json or {}
-        lineage = metadata.get("lineage_id")
         snapshots.append(
             DocumentSnapshot(
-                lineage_id=lineage if isinstance(lineage, str) and lineage else None,
+                lineage_id=document_lineage_id(row),
                 filename=row.filename,
                 title=row.title or row.filename,
                 lines=_document_text(row).splitlines(),

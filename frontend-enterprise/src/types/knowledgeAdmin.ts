@@ -101,9 +101,8 @@ export type DiffDocument = {
   title: string;
   kind: 'added' | 'modified' | 'deleted';
   truncated: boolean;
-  /** 可选：后端总是返回该字段，此处放宽为可选以兼容改动前构造的测试夹具（fix round）。 */
-  base_document_id?: string | null;
-  target_document_id?: string | null;
+  base_document_id: string | null;
+  target_document_id: string | null;
   hunks?: DiffHunk[];
 };
 
