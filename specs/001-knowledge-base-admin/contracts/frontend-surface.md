@@ -5,7 +5,7 @@
 | 项 | 值 |
 |---|---|
 | 枚举 | `EnterpriseRoute.KnowledgeAdmin = '/enterprise/knowledge-admin'` |
-| 路由 | `/enterprise/knowledge-admin`（列表）、`/enterprise/knowledge-admin/:kbId`（详情，`?tab=content|versions|grants|audit|settings` / 私有库 `content|branch|settings`，`?view=pub|<draftVersionId>`） |
+| 路由 | `/enterprise/knowledge-admin`（列表）、`/enterprise/knowledge-admin/:kbId`（详情，`?tab=content|versions|grants|audit|settings` / 私有库 `content|branch|settings`，`?view=pub|<draftVersionId>`；从版本 Tab 跳转「去审阅」时额外带 `?publish=<draftVersionId>&review=1` ——版本 Tab 组件卸载会丢失本地发布框状态，改由内容 Tab 消费这两个参数后自行重新打开审阅编辑器与发布框，应用完成后清除这两个参数） |
 | 守卫 | 非 `isEnterpriseAdmin` → `Navigate` 到 `EnterpriseRoute.Gallery`（与 `/enterprise/accounts` 一致） |
 | 菜单 | `AppSidebar.SYSTEM_NAV` 追加 `{route: KnowledgeAdmin, labelId: 'shell.nav.knowledgeAdmin', icon: sys-knowledge.svg}`；仅 admin 渲染 |
 | 作用域 | 页面不读 `readEmployeeScope`，不监听 agent-scope 事件 |

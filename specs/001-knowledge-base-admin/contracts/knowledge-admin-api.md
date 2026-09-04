@@ -85,12 +85,14 @@ Errors: `KNOWLEDGE_REBASE_CONFLICTS_UNRESOLVED`、`KNOWLEDGE_PUBLISH_CONFLICT`�
 
 Body: `{"tenant_id": "…", "staged": 4, "pending": 0, "documents_adjusted": 2, "expected_updated_at": "…"}`
 Response `200`: `KnowledgeBaseVersionRead`（含 `metadata.review`）。审计 `draft_reviewed`，事件 `knowledge.draft.reviewed`。
-Errors: `KNOWLEDGE_VERSION_NOT_READY`（非草稿）、`KNOWLEDGE_PUBLISH_CONFLICT`（`expected_updated_at` 不匹配）。
+Errors: `KNOWLEDGE_VERSION_NOT_READY`（非草稿）、`KNOWLEDGE_PUBLISH_CONFLICT`（`expected_updated_at` 不匹配或无法解析）。
+`expected_updated_at` 语义：调用方必须原样透传打开草稿时拿到的 `KnowledgeBaseVersionRead.updated_at` 字符串（不得重新格式化/裁剪精度），服务端按微秒精度精确相等比较（非容差匹配）；解析失败（格式非法）与数值不相等一样统一折叠为 `KNOWLEDGE_PUBLISH_CONFLICT`（409），不返回 400，避免向调用方泄漏校验细节。
 
 ### A6 `GET /knowledge-admin/teams` — 可绑定群组候选 **admin**
 
 Query: `tenant_id`、`exclude_bound_to=kb_id`（可选）。Response: `[{id, name, member_count}]`。
 （供"绑定新群组"下拉；替代当前恒为空的共享库候选逻辑。）
+无独立的"查询某库已绑定群组"端点；`GrantsTab` 用本端点两次（一次不带 `exclude_bound_to` 取全部活跃群组、一次带 `exclude_bound_to=kb_id` 取未绑定候选）做差集得到已绑定群组 id 集合，再逐个调用既有 `listTeamBindings(team_id)` 取该群组在本库的绑定记录（修订号、矩阵）。
 
 ## B. 变更端点
 
