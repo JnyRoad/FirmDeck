@@ -5,12 +5,17 @@
  * `next_version_preview` 显示结果号；展示 `metadata.review` 审阅状态。非 stale
  * 只有一个确认按钮；stale（`is_stale`）时改用 `against=published` 的版本对比
  * 摘要作为「冲突数」提示，并给出变基（推荐，`onRebase` 回调，变基本身属于
- * US3 范围）/ 仍然覆盖发布（`force_overwrite=true`）/ 取消三个按钮。
+ * US3 范围）/ 仍然覆盖发布 / 取消三个按钮。
+ *
+ * T085（FR-050 二次确认）：点击「仍然覆盖发布」不直接提交，先切换到内联的
+ * `overwriteStep` 二次确认视图，说明将丢弃自草稿基线以来其他人已发布的变更；
+ * 只有勾选「已了解」（`overwriteAck`）后点击「确认覆盖」才真正发送
+ * `force_overwrite=true`；「返回」放弃二次确认、回到 stale 选择视图。
  */
 
 import { useEffect, useState } from 'react';
 
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue, Textarea } from '@/components/ui';
+import { Checkbox, Select, SelectContent, SelectItem, SelectTrigger, SelectValue, Textarea } from '@/components/ui';
 import { Dialog, DialogContent, DialogTitle } from '@/components/ui';
 import { Button } from '@/components/ui/button';
 import { useAppIntl } from '@/i18n';
@@ -33,6 +38,8 @@ export type PublishDialogProps = {
   api: KnowledgeAdminApi;
   kbId: string;
   draft: KnowledgeAdminVersionRead | null;
+  /** 当前正式版本号（`kb.published_version`）；stale 二次确认文案用于说明将丢弃哪个已发布版本的变更。 */
+  publishedVersion?: string | null;
   submitting?: boolean;
   onSubmit: (input: PublishDialogSubmitInput) => void;
   /** stale 分支「变基」按钮回调；变基对话框本身属于 US3，这里只负责转发。 */
@@ -46,13 +53,14 @@ function reviewCounts(draft: KnowledgeAdminVersionRead | null): { staged: number
   return { staged: review?.staged ?? 0, pending: review?.pending ?? 0 };
 }
 
-/** 发布确认框：非 stale 单按钮确认；stale 时展示冲突数与变基/强制覆盖/取消三个按钮。 */
+/** 发布确认框：非 stale 单按钮确认；stale 时展示冲突数与变基/仍然覆盖发布/取消三个按钮，「仍然覆盖发布」需内联二次确认后才真正提交。 */
 export function PublishDialog({
   open,
   onOpenChange,
   api,
   kbId,
   draft,
+  publishedVersion,
   submitting = false,
   onSubmit,
   onRebase,
@@ -63,6 +71,10 @@ export function PublishDialog({
   const [reason, setReason] = useState('');
   const [reasonError, setReasonError] = useState(false);
   const [staleDiff, setStaleDiff] = useState<VersionDiff | null>(null);
+  /** T085：是否已进入「仍然覆盖发布」的内联二次确认视图。 */
+  const [overwriteStep, setOverwriteStep] = useState(false);
+  /** T085：二次确认勾选框「已了解将丢弃这些变更」的选中状态。 */
+  const [overwriteAck, setOverwriteAck] = useState(false);
 
   useEffect(() => {
     if (open) {
@@ -70,6 +82,8 @@ export function PublishDialog({
       setReason('');
       setReasonError(false);
       setStaleDiff(null);
+      setOverwriteStep(false);
+      setOverwriteAck(false);
     }
   }, [open, draft?.id]);
 
@@ -98,6 +112,12 @@ export function PublishDialog({
       return;
     }
     onSubmit({ level, changeReason: trimmed, forceOverwrite });
+  }
+
+  /** T085：放弃二次确认，回到 stale 选择视图（变基 / 仍然覆盖发布 / 取消）。 */
+  function handleOverwriteBack() {
+    setOverwriteStep(false);
+    setOverwriteAck(false);
   }
 
   return (
@@ -159,33 +179,71 @@ export function PublishDialog({
               {t('knowledgeAdmin.dialogs.publish.staleNotice', { count: conflictCount })}
             </p>
           )}
+
+          {draft.is_stale && overwriteStep && (
+            <div className="flex flex-col gap-[10px] rounded-[10px] border border-[#f3b4b4] bg-[#fef4f4] px-[12px] py-[10px]">
+              <p className="text-[12px] text-[#d20b0b]">
+                {t('knowledgeAdmin.dialogs.publish.overwriteConfirmDescription', {
+                  published: formatVersion(publishedVersion),
+                  base: formatVersion(draft.base_version),
+                  count: conflictCount,
+                })}
+              </p>
+              <label className="flex items-center gap-[8px] text-[12px] text-[#18181a]">
+                <Checkbox
+                  aria-label={t('knowledgeAdmin.dialogs.publish.overwriteConfirmCheckbox')}
+                  checked={overwriteAck}
+                  disabled={submitting}
+                  onCheckedChange={(checked) => setOverwriteAck(checked === true)}
+                />
+                {t('knowledgeAdmin.dialogs.publish.overwriteConfirmCheckbox')}
+              </label>
+            </div>
+          )}
         </div>
         <div className={DIALOG_FOOTER_CLASS}>
-          <Button variant="outline" disabled={submitting} onClick={() => onOpenChange(false)} className={DIALOG_CANCEL_BUTTON_CLASS}>
-            {t('knowledgeAdmin.dialogs.publish.cancel')}
-          </Button>
-          {draft.is_stale ? (
+          {draft.is_stale && overwriteStep ? (
             <>
-              <Button
-                variant="outline"
-                disabled={submitting}
-                onClick={() => onRebase?.(draft.id)}
-                className={DIALOG_CANCEL_BUTTON_CLASS}
-              >
-                {t('knowledgeAdmin.dialogs.publish.rebase')}
+              <Button variant="outline" disabled={submitting} onClick={handleOverwriteBack} className={DIALOG_CANCEL_BUTTON_CLASS}>
+                {t('knowledgeAdmin.dialogs.publish.back')}
               </Button>
               <Button
-                disabled={submitting}
+                disabled={submitting || !overwriteAck}
                 onClick={() => handleConfirm(true)}
                 className="h-[32px] min-w-[80px] rounded-[10px] bg-[#d20b0b] px-[12px] text-[14px] font-normal text-white hover:bg-[#b80909]"
               >
-                {t('knowledgeAdmin.dialogs.publish.forceOverwrite')}
+                {t('knowledgeAdmin.dialogs.publish.overwriteConfirmButton')}
               </Button>
             </>
           ) : (
-            <Button disabled={submitting} onClick={() => handleConfirm(false)} className={DIALOG_PRIMARY_BUTTON_CLASS}>
-              {t('knowledgeAdmin.dialogs.publish.confirm')}
-            </Button>
+            <>
+              <Button variant="outline" disabled={submitting} onClick={() => onOpenChange(false)} className={DIALOG_CANCEL_BUTTON_CLASS}>
+                {t('knowledgeAdmin.dialogs.publish.cancel')}
+              </Button>
+              {draft.is_stale ? (
+                <>
+                  <Button
+                    variant="outline"
+                    disabled={submitting}
+                    onClick={() => onRebase?.(draft.id)}
+                    className={DIALOG_CANCEL_BUTTON_CLASS}
+                  >
+                    {t('knowledgeAdmin.dialogs.publish.rebase')}
+                  </Button>
+                  <Button
+                    disabled={submitting}
+                    onClick={() => setOverwriteStep(true)}
+                    className="h-[32px] min-w-[80px] rounded-[10px] bg-[#d20b0b] px-[12px] text-[14px] font-normal text-white hover:bg-[#b80909]"
+                  >
+                    {t('knowledgeAdmin.dialogs.publish.forceOverwrite')}
+                  </Button>
+                </>
+              ) : (
+                <Button disabled={submitting} onClick={() => handleConfirm(false)} className={DIALOG_PRIMARY_BUTTON_CLASS}>
+                  {t('knowledgeAdmin.dialogs.publish.confirm')}
+                </Button>
+              )}
+            </>
           )}
         </div>
       </DialogContent>

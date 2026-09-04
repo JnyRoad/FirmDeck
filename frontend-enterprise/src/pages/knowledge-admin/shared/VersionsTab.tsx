@@ -320,6 +320,7 @@ export function VersionsTab({ api, kb, onChanged }: VersionsTabProps) {
         api={api}
         kbId={kb.id}
         draft={publishTarget}
+        publishedVersion={kb.published_version}
         submitting={publishing}
         onSubmit={(input) => void handlePublish(input)}
         onRebase={(versionId) => setRebaseTarget(versions.find((version) => version.id === versionId) ?? publishTarget)}

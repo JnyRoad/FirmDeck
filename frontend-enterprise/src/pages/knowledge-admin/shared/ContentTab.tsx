@@ -675,6 +675,7 @@ export function ContentTab({ api, kb, onChanged }: ContentTabProps) {
         api={api}
         kbId={kb.id}
         draft={currentDraft}
+        publishedVersion={kb.published_version}
         submitting={publishing}
         onSubmit={(input) => void handlePublish(input)}
         onRebase={(versionId) => {

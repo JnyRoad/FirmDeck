@@ -1,10 +1,12 @@
 // @vitest-environment jsdom
 
 /**
- * PublishDialog 测试（T043）。
+ * PublishDialog 测试（T043、T085）。
  * 覆盖：标题显示 `draft → next`；level 下拉切换更新结果号；审阅状态展示；
- * 非 stale 单按钮确认；stale 时展示冲突数与三按钮（变基/仍然覆盖发布/取消），
- * 覆盖发布调用 `force_overwrite=true`。
+ * 非 stale 单按钮确认；stale 时展示冲突数与三按钮（变基/仍然覆盖发布/取消）；
+ * 覆盖发布二次确认（T085，Ruling：FR-050 的「二次确认」保留）：点击「仍然覆盖
+ * 发布」先展示内联确认（不发请求），未勾选「已了解」时「确认覆盖」禁用，
+ * 勾选后点击才发送 `force_overwrite=true`；「返回」可恢复到 stale 选择视图。
  */
 import type { ComponentProps } from 'react';
 import { cleanup, render, screen, waitFor } from '@testing-library/react';
@@ -61,6 +63,7 @@ function renderDialog(props: Partial<ComponentProps<typeof PublishDialog>> = {})
         api={api as unknown as ComponentProps<typeof PublishDialog>['api']}
         kbId="kb_1"
         draft={makeDraft()}
+        publishedVersion="1.0.1"
         onSubmit={onSubmit}
         {...props}
       />
@@ -108,7 +111,7 @@ describe('PublishDialog', () => {
     expect(onSubmit).toHaveBeenCalledWith({ level: 'patch', changeReason: '本次修订说明', forceOverwrite: false });
   });
 
-  it('stale draft: shows a conflict count and rebase/force-overwrite/cancel buttons; force overwrite submits forceOverwrite=true', async () => {
+  it('stale draft: shows a conflict count and rebase/force-overwrite/cancel buttons; rebase forwards immediately', async () => {
     const user = userEvent.setup();
     const onRebase = vi.fn();
     const { onSubmit, api } = renderDialog({ draft: makeDraft({ is_stale: true }), onRebase });
@@ -118,15 +121,47 @@ describe('PublishDialog', () => {
     expect((await screen.findByRole('alert')).textContent).toContain('3');
 
     expect(screen.getByRole('button', { name: '变基（推荐）' })).toBeTruthy();
-    const forceButton = screen.getByRole('button', { name: '仍然覆盖发布' });
-    expect(forceButton).toBeTruthy();
+    expect(screen.getByRole('button', { name: '仍然覆盖发布' })).toBeTruthy();
     expect(screen.queryByRole('button', { name: '确认发布' })).toBeNull();
 
     await user.click(screen.getByRole('button', { name: '变基（推荐）' }));
     expect(onRebase).toHaveBeenCalledWith('kbver_draft_1');
+    expect(onSubmit).not.toHaveBeenCalled();
+  });
 
+  it('stale draft: force overwrite requires an inline second confirmation before force_overwrite=true is sent', async () => {
+    const user = userEvent.setup();
+    const { onSubmit, api } = renderDialog({ draft: makeDraft({ is_stale: true }) });
+
+    await waitFor(() => expect(api.getVersionDiff).toHaveBeenCalledWith('kb_1', 'kbver_draft_1', { against: 'published' }));
+    await screen.findByRole('alert');
     await user.type(screen.getByLabelText('变更原因'), '强制覆盖发布');
-    await user.click(forceButton);
+
+    // 单击「仍然覆盖发布」只展示内联二次确认，不直接发请求。
+    await user.click(screen.getByRole('button', { name: '仍然覆盖发布' }));
+    expect(onSubmit).not.toHaveBeenCalled();
+    expect(screen.queryByRole('button', { name: '仍然覆盖发布' })).toBeNull();
+
+    // 内联说明需点名已发布版本与草稿基线版本。
+    expect(screen.getByText(/对方已发布的 v1\.0\.1/).textContent).toContain('v1.0.0');
+
+    // 未勾选「已了解」时「确认覆盖」保持禁用（jest-dom 的 toBeDisabled 未启用，直接读原生属性）。
+    const confirmButton = screen.getByRole('button', { name: '确认覆盖' }) as HTMLButtonElement;
+    expect(confirmButton.disabled).toBe(true);
+    await user.click(confirmButton);
+    expect(onSubmit).not.toHaveBeenCalled();
+
+    // 「返回」恢复 stale 选择视图。
+    await user.click(screen.getByRole('button', { name: '返回' }));
+    expect(screen.getByRole('button', { name: '仍然覆盖发布' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: '确认覆盖' })).toBeNull();
+
+    // 重新进入内联确认、勾选后点击才真正发送 force_overwrite=true。
+    await user.click(screen.getByRole('button', { name: '仍然覆盖发布' }));
+    await user.click(screen.getByRole('checkbox', { name: '我已了解将丢弃这些变更' }));
+    await user.click(screen.getByRole('button', { name: '确认覆盖' }));
+
     expect(onSubmit).toHaveBeenCalledWith({ level: 'patch', changeReason: '强制覆盖发布', forceOverwrite: true });
+    expect(onSubmit).toHaveBeenCalledTimes(1);
   });
 });
