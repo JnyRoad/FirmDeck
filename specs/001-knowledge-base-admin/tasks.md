@@ -77,15 +77,15 @@
 
 ### Tests for User Story 1
 
-- [ ] T030 [P] [US1] [测试] 在 frontend-enterprise/src/pages/knowledge-admin/knowledgeAdminModel.test.ts 编写失败测试：排序、筛选谓词、统计、版本状态徽章文案选择、`nextVersionLabel(level)` 纯函数
-- [ ] T031 [P] [US1] [测试] 在 frontend-enterprise/src/pages/knowledge-admin/KnowledgeAdminListPage.test.tsx 编写失败测试：统计卡、类型页签、四类筛选与搜索、未绑定提示、行点击跳转、`⋯` 菜单项按 mode 差异、新建对话框（私有未选员工阻止）、下线/删除二次确认（展示 `draft_count`）
-- [ ] T032 [P] [US1] [测试] 在 frontend-enterprise/src/pages/knowledge-admin/KnowledgeAdminDetailPage.test.tsx 编写失败测试：按 mode 渲染 Tab 集、`?tab=` 与 URL 同步、面包屑返回、设置 Tab 保存名称/描述/能力范围、上线/下线、删除
+- [X] T030 [P] [US1] [测试] 在 frontend-enterprise/src/pages/knowledge-admin/knowledgeAdminModel.test.ts 编写失败测试：排序、筛选谓词、统计、版本状态徽章文案选择、`nextVersionLabel(level)` 纯函数
+- [X] T031 [P] [US1] [测试] 在 frontend-enterprise/src/pages/knowledge-admin/KnowledgeAdminListPage.test.tsx 编写失败测试：统计卡、类型页签、四类筛选与搜索、未绑定提示、行点击跳转、`⋯` 菜单项按 mode 差异、新建对话框（私有未选员工阻止）、下线/删除二次确认（展示 `draft_count`）
+- [X] T032 [P] [US1] [测试] 在 frontend-enterprise/src/pages/knowledge-admin/KnowledgeAdminDetailPage.test.tsx 编写失败测试：按 mode 渲染 Tab 集、`?tab=` 与 URL 同步、面包屑返回、设置 Tab 保存名称/描述/能力范围、上线/下线、删除
 
 ### Implementation for User Story 1
 
-- [ ] T033 [US1] 实现 frontend-enterprise/src/pages/knowledge-admin/knowledgeAdminModel.ts
-- [ ] T034 [US1] 实现 frontend-enterprise/src/pages/knowledge-admin/KnowledgeAdminListPage.tsx 与 dialogs/CreateKnowledgeBaseDialog.tsx、dialogs/DeleteDialog.tsx（复用 `KnowledgeTypeBadge`、shadcn 组件、`RawContent`；行菜单「导出备份」「图谱检查」复用现有 `GET …/okf/export` 与 `POST …/okf/lint` 端点）
-- [ ] T035 [US1] 实现 frontend-enterprise/src/pages/knowledge-admin/KnowledgeAdminDetailPage.tsx 与 shared/SettingsTab.tsx（其余 Tab 先占位），替换 T012 的占位组件
+- [X] T033 [US1] 实现 frontend-enterprise/src/pages/knowledge-admin/knowledgeAdminModel.ts
+- [X] T034 [US1] 实现 frontend-enterprise/src/pages/knowledge-admin/KnowledgeAdminListPage.tsx 与 dialogs/CreateKnowledgeBaseDialog.tsx、dialogs/DeleteDialog.tsx（复用 `KnowledgeTypeBadge`、shadcn 组件、`RawContent`；行菜单「导出备份」「图谱检查」复用现有 `GET …/okf/export` 与 `POST …/okf/lint` 端点）
+- [X] T035 [US1] 实现 frontend-enterprise/src/pages/knowledge-admin/KnowledgeAdminDetailPage.tsx 与 shared/SettingsTab.tsx（其余 Tab 先占位），替换 T012 的占位组件
 
 **Checkpoint**: US1 可独立演示（列表 + 详情设置）
 
