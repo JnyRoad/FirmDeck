@@ -374,6 +374,35 @@ describe('KnowledgeAdminListPage', () => {
     expect(screen.getByText('客服话术库')).toBeTruthy();
   });
 
+  // T077 rerun Defect D5b: the "整体智能体"（is_overall）system agent is a resource pool,
+  // not a real employee a private knowledge base can be owned by — it must not show up in
+  // either the list page's owner filter or the create-dialog owner picker (both consume the
+  // same `agents` state). Under en-US this was especially visible: `agent.name` is business
+  // data (rendered via `RawContent`), so the system placeholder never got translated.
+  it('excludes the "整体智能体" system agent from the owner filter and the create-dialog owner picker', async () => {
+    const user = userEvent.setup();
+    mockListKnowledgeBases();
+    mockApi.listAgents.mockResolvedValue([
+      ...agents,
+      { id: 'ag_overall', tenant_id: 'tenant_demo', name: '整体智能体', is_overall: true, status: 'active', metadata: {}, resources: [], created_at: '2026-08-01T00:00:00Z', updated_at: '2026-08-01T00:00:00Z' },
+    ]);
+    mockApi.listBindableTeams.mockResolvedValue([]);
+    renderPage();
+    await screen.findByText('产品 FAQ 共享库');
+
+    await user.click(screen.getByRole('combobox', { name: '归属' }));
+    expect(screen.getByRole('option', { name: '林晓' })).toBeTruthy();
+    expect(screen.queryByRole('option', { name: '整体智能体' })).toBeNull();
+    await user.keyboard('{Escape}');
+
+    await user.click(screen.getByRole('button', { name: /新建知识库/ }));
+    await user.click(screen.getByRole('combobox', { name: '类型' }));
+    await user.click(screen.getByRole('option', { name: '专用' }));
+    await user.click(screen.getByRole('combobox', { name: '归属员工' }));
+    expect(screen.getByRole('option', { name: '林晓' })).toBeTruthy();
+    expect(screen.queryByRole('option', { name: '整体智能体' })).toBeNull();
+  });
+
   it('re-fetches with the team filter in the query params', async () => {
     const user = userEvent.setup();
     primeDefaultMocks();

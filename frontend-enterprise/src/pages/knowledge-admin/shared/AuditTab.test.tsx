@@ -89,11 +89,11 @@ describe('AuditTab', () => {
     await waitFor(() => expect(api.listAuditEvents).toHaveBeenCalledTimes(1));
     await user.click(screen.getByRole('combobox', { name: '动作' }));
     // 筛选项显示的是本地化文案，不是后端枚举码（I8）。
-    expect(screen.queryByText('published')).toBeNull();
-    await user.click(await screen.findByText('发布'));
+    expect(screen.queryByText('version_published')).toBeNull();
+    await user.click(await screen.findByText('发布版本'));
 
     await waitFor(() => expect(api.listAuditEvents).toHaveBeenLastCalledWith('kb_1', expect.objectContaining({
-      action: 'published',
+      action: 'version_published',
       offset: 0,
       limit: 20,
     })));
@@ -125,6 +125,30 @@ describe('AuditTab', () => {
     // 自有枚举码不再被误标为"原始内容"。
     const rawTexts = Array.from(container.querySelectorAll('[data-i18n-raw-kind="content"]')).map((n) => n.textContent);
     expect(rawTexts).not.toContain('draft_created');
+  });
+
+  // T077 rerun Defect D5a: `version_published` (S2.7 发布) and `shared_created`（建库）
+  // used to fall through `AUDIT_ACTION_LABEL_IDS` entirely (missing / mis-keyed as
+  // `published`, which never matched the backend's actual `version_published` code) and
+  // render as the raw snake_case code in both locales.
+  it('renders version_published and shared_created action codes as localized labels', async () => {
+    const api = createMockApi();
+    api.listAuditEvents.mockResolvedValue({
+      items: [
+        makeEvent({ id: 'evt_pub', action: 'version_published', actor_name: '王芳' }),
+        makeEvent({ id: 'evt_created', action: 'shared_created', actor_name: '林晓' }),
+      ],
+      total: 2,
+      offset: 0,
+      limit: 20,
+      has_more: false,
+    });
+    renderAuditTab(api);
+
+    expect(await screen.findByText('发布版本')).toBeTruthy();
+    expect(await screen.findByText('创建共享知识库')).toBeTruthy();
+    expect(screen.queryByText('version_published')).toBeNull();
+    expect(screen.queryByText('shared_created')).toBeNull();
   });
 
   it('debounces the free-text team/actor filters into a single request', async () => {

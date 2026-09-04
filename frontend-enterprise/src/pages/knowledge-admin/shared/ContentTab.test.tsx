@@ -136,13 +136,26 @@ const draftVersionDocuments = [
   { id: 'doc_mod_1_row', lineage_id: 'doc_mod_1', title: '修改文档', filename: 'doc_mod_1.md', status: 'ready', bucket_count: 0, chunk_count: 0, updated_at: '2026-08-21T02:00:00Z' },
 ];
 
+// T077 rerun Defect B regression fixture: `kbver_pub`'s full A2b document list. `doc_pub_1`
+// ("发布说明") matches `pubDiff`'s one `added` entry (by `lineage_id`) and must get the
+// release-context badge; `doc_pub_2` ("未变更文档") is NOT in `pubDiff` at all — it's a
+// document that has been live and unchanged since before the prior release — and must
+// still render (with no badge). Before the fix, the published view was driven entirely by
+// `pubDiff.documents`, so `doc_pub_2` would have been silently dropped from the list.
+const pubVersionDocuments = [
+  { id: 'doc_pub_1', lineage_id: 'doc_pub_1', title: '发布说明', filename: 'doc_pub_1.md', status: 'ready', bucket_count: 0, chunk_count: 0, updated_at: '2026-08-15T00:00:00Z' },
+  { id: 'doc_pub_2', lineage_id: 'doc_pub_2', title: '未变更文档', filename: 'doc_pub_2.md', status: 'ready', bucket_count: 0, chunk_count: 0, updated_at: '2026-08-10T00:00:00Z' },
+];
+
 function createMockApi() {
   return {
     listVersions: vi.fn().mockResolvedValue([draftVersion]),
     getVersionDiff: vi.fn().mockImplementation((_kbId: string, versionId: string) =>
       Promise.resolve(versionId === 'kbver_draft_1' ? draftDiff : pubDiff),
     ),
-    listVersionDocuments: vi.fn().mockResolvedValue(draftVersionDocuments),
+    listVersionDocuments: vi.fn().mockImplementation((_kbId: string, versionId: string) =>
+      Promise.resolve(versionId === 'kbver_draft_1' ? draftVersionDocuments : pubVersionDocuments),
+    ),
     uploadDocument: vi.fn().mockResolvedValue({ id: 'job_1', status: 'pending' }),
     updateDocument: vi.fn().mockResolvedValue({ id: 'doc_1' }),
     archiveDocument: vi.fn().mockResolvedValue({ id: 'doc_1' }),
@@ -200,6 +213,31 @@ describe('ContentTab', () => {
     expect(screen.queryByRole('button', { name: '上传文档' })).toBeNull();
     expect(screen.queryByRole('button', { name: '删除' })).toBeNull();
     expect(screen.getByRole('button', { name: '创建草稿' })).toBeTruthy();
+  });
+
+  // T077 rerun Defect B: the published view's document list must come from A2b
+  // (`listVersionDocuments`) in full, not be filtered down to only what the diff against
+  // the prior release happens to mention. `doc_pub_2` ("未变更文档") is absent from
+  // `pubDiff.documents` entirely, yet it's still a live document in `kbver_pub` per A2b and
+  // must render; `doc_pub_1` ("发布说明") IS in the diff (kind `added`) and must get a
+  // release-context badge — badges decorate, they never filter.
+  it('published view lists every A2b document, including ones absent from the diff, and badges the ones the diff covers', async () => {
+    const api = createMockApi();
+    renderContentTab(api);
+
+    await screen.findByText('发布说明');
+    expect(await screen.findByText('未变更文档')).toBeTruthy();
+    expect(api.listVersionDocuments).toHaveBeenCalledWith('kb_1', 'kbver_pub');
+
+    // The changed document gets the release-context badge ("新增", not "草稿新增" — the
+    // published view has no draft concept)...
+    expect(screen.getByText('新增')).toBeTruthy();
+    expect(screen.queryByText('草稿新增')).toBeNull();
+    // ...the unchanged document gets no badge at all.
+    const unchangedRow = screen.getByText('未变更文档').closest('tr');
+    expect(unchangedRow).toBeTruthy();
+    expect(within(unchangedRow as HTMLElement).queryByText('新增')).toBeNull();
+    expect(within(unchangedRow as HTMLElement).queryByText('修改')).toBeNull();
   });
 
   // 回归覆盖（backend commit ab58668）：A2b `listVersionDocuments` mock（`draftVersionDocuments`）

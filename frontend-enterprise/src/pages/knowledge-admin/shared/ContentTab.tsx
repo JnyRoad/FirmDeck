@@ -10,6 +10,15 @@
  * `lineage_id` 配上「草稿新增/修改/删除」标记（`kindByLineage`）；未出现在本次对比里的
  * 行标记为 `unchanged`，不显示标记但同样可删除。
  *
+ * 正式版视图（T077 rerun Defect B 修复）：不再用 `getVersionDiff` 的非删除项当作"该正式版
+ * 的完整文档列表"——那份 diff 只包含相对上一正式版新增/修改的文档，未变化但仍然在线的
+ * 文档会被整个漏掉。现在正式版（含通过 `?view=` 打开的历史 released/rejected 版本）与
+ * 草稿视图共用同一条主数据源：A2b `listVersionDocuments(kb.id, targetVersionId)` 的全量
+ * 结果；`getVersionDiff` 只用来按 `lineage_id` 给每行配上「新增/修改」徽章
+ * （`kindByLineage`），未出现在对比里的行按 `unchanged` 处理、不显示徽章，但仍然展示。
+ * 正式版视图仍然只读，不发起任何写回，也不需要并入 diff 的 `kind==='deleted'` 条目——
+ * A2b 对目标版本的查询本就不会返回该版本内已不存在（archived）的行。
+ *
  * 已删除文档（backend commit ab58668 之后）：A2b `listVersionDocuments` 现在按
  * data-model §3 把 `status='archived'` 的行视为"该版本内不存在"，一并从列表里排除
  * （行本身仍在，只是对消费方不可见）——因此已删除文档不会出现在上面的 A2b 主列表里，
@@ -55,6 +64,7 @@ import {
   SELECT_TRIGGER_CLASS,
 } from '@/lib/enterprise-ui';
 import { cn } from '@/lib/utils';
+import { PublicationState } from '@/enums/knowledge';
 import type { KnowledgeAdminApi } from '@/api/knowledgeAdmin';
 import type { KnowledgeBaseRead } from '@/types';
 import type { DiffDocument, KnowledgeAdminVersionRead, RebaseResult, VersionDiff, VersionDocument } from '@/types/knowledgeAdmin';
@@ -84,6 +94,17 @@ const BADGE_MESSAGE_IDS: Record<DiffDocument['kind'], 'knowledgeAdmin.content.ba
   added: 'knowledgeAdmin.content.badges.added',
   modified: 'knowledgeAdmin.content.badges.modified',
   deleted: 'knowledgeAdmin.content.badges.deleted',
+};
+
+/**
+ * 正式版（非草稿）只读视图专用的徽章文案（T077 rerun Defect B 修复）：与草稿视图的
+ * `BADGE_MESSAGE_IDS` 用词不同（后者明确写「草稿新增/修改」），这里没有"草稿"这个概念——
+ * 只是在说"该文档相对上一正式版新增/修改"。只需要 added/modified 两种：正式版视图的行
+ * 全部来自 A2b（该版本仍然存在的文档），已删除文档不会出现在这里。
+ */
+const RELEASE_BADGE_MESSAGE_IDS: Partial<Record<DiffDocument['kind'], 'knowledgeAdmin.content.badges.releaseAdded' | 'knowledgeAdmin.content.badges.releaseModified'>> = {
+  added: 'knowledgeAdmin.content.badges.releaseAdded',
+  modified: 'knowledgeAdmin.content.badges.releaseModified',
 };
 
 /**
@@ -171,9 +192,15 @@ export function ContentTab({ api, kb, onChanged }: ContentTabProps) {
     () => versions.filter((version) => version.publication_state === 'draft'),
     [versions],
   );
-  const currentDraft = view === PUB_VIEW ? null : versions.find((version) => version.id === view) || null;
-  const isDraftView = view !== PUB_VIEW && Boolean(currentDraft);
-  const targetVersionId = isDraftView ? currentDraft!.id : kb.published_version_id || null;
+  // `?view=` 可以指向一个草稿，也可以指向一个具体的 released/rejected 历史版本（T077
+  // rerun Defect B 修复前，这里只按"是不是 PUB_VIEW"判断，一旦 `view` 指向历史正式版就
+  // 会被误当成草稿工作区，展示上传/删除/发布等写回入口——按发布状态判断才对：只有
+  // `publication_state==='draft'` 的目标才是可写的草稿工作区，正式版本身（当前发布版，
+  // 或任何通过 `?view=` 选中的历史 released/rejected 版本）一律只读。
+  const selectedVersion = view === PUB_VIEW ? null : versions.find((version) => version.id === view) || null;
+  const isDraftView = selectedVersion?.publication_state === PublicationState.Draft;
+  const currentDraft = isDraftView ? selectedVersion : null;
+  const targetVersionId = isDraftView ? currentDraft!.id : selectedVersion?.id ?? kb.published_version_id ?? null;
 
   async function loadVersions() {
     const token = versionsLoad.begin();
@@ -202,11 +229,11 @@ export function ContentTab({ api, kb, onChanged }: ContentTabProps) {
     const token = diffLoad.begin();
     setLoadingDiff(true);
     try {
-      // 草稿视图额外拉取 A2b 全量文档列表（含未改动的，携带真实行 id），供写回定位与
-      // "未改动文档也展示"用；正式版视图只读、不发起写回，不需要这份数据。
+      // A2b 全量文档列表现在对草稿视图和正式版（含历史 released/rejected）视图都要拉取——
+      // 两者都用它当行列表的主数据源（T077 rerun Defect B 修复），diff 只用来配徽章。
       const [diffResult, documentsResult] = await Promise.all([
         api.getVersionDiff(kb.id, targetVersionId, { against: 'base' }),
-        isDraftView ? api.listVersionDocuments(kb.id, targetVersionId) : Promise.resolve<VersionDocument[]>([]),
+        api.listVersionDocuments(kb.id, targetVersionId),
       ]);
       // 过期响应（视图已经切走 / 租户代际已变）整个丢弃，不写任何 state。
       if (!diffLoad.isCurrent(token)) return;
@@ -325,30 +352,27 @@ export function ContentTab({ api, kb, onChanged }: ContentTabProps) {
 
   const visibleDocuments: ContentRow[] = useMemo(() => {
     if (!diff) return [];
-    if (!isDraftView) {
-      // 正式版视图：仅展示该正式版相对上一正式版新增/修改的内容，且始终只读；
-      // 因为这里对比的目标本身就是已发布版本，不会包含任何草稿的改动。
-      return diff.documents
-        .filter((document) => document.kind !== 'deleted')
-        .map((document) => ({
-          documentId: document.target_document_id ?? document.lineage_id,
-          title: document.title,
-          kind: document.kind,
-          updatedAt: null,
-        }));
-    }
-    // 草稿视图：以 `listVersionDocuments` 全量列表为主（含未改动的行，真实 id），按
-    // lineage_id 配上 diff 算出的「新增/修改」标记；未变化的行标记为 unchanged。
+    // 两种视图现在共用同一条主数据源：A2b `listVersionDocuments` 的全量结果（含未改动的
+    // 行，真实 id），按 lineage_id 配上 diff 算出的「新增/修改」标记；未出现在对比里的行
+    // 标记为 unchanged（不显示徽章，但仍然展示——这正是 Defect B 的修复点：diff 只用来
+    // 装饰，绝不能用来过滤行）。
     const rows: ContentRow[] = versionDocuments.map((row) => ({
       documentId: row.id,
       title: row.title,
       kind: (row.lineage_id ? kindByLineage.get(row.lineage_id) : undefined) ?? 'unchanged',
       updatedAt: row.updated_at ?? null,
     }));
-    // 已删除文档单独从 diff 并入（见文件头注释）：A2b 现在把 `status='archived'` 的行
-    // 整个排除，`versionDocuments` 里不会再出现它们，删除标记与「恢复」操作只能靠
-    // `getVersionDiff` 的 `kind==='deleted'` 条目展示，真实行 id 与 `updated_at` 都从
-    // `deletedDocumentByLineage`（diff 的 `target_document_id`/`target_updated_at`）取。
+    if (!isDraftView) {
+      // 正式版（含历史 released/rejected）只读视图：A2b 对目标版本的查询本就不会返回该
+      // 版本内已不存在（archived）的行，所以不需要、也不应该像草稿视图那样从 diff 里再并入
+      // `kind==='deleted'` 的条目。
+      return rows;
+    }
+    // 草稿视图独有：已删除文档单独从 diff 并入（见文件头注释）：A2b 现在把
+    // `status='archived'` 的行整个排除，`versionDocuments` 里不会再出现它们，删除标记与
+    // 「恢复」操作只能靠 `getVersionDiff` 的 `kind==='deleted'` 条目展示，真实行 id 与
+    // `updated_at` 都从 `deletedDocumentByLineage`（diff 的
+    // `target_document_id`/`target_updated_at`）取。
     for (const document of diff.documents) {
       if (document.kind !== 'deleted') continue;
       const deletedRow = deletedDocumentByLineage.get(document.lineage_id);
@@ -618,12 +642,21 @@ export function ContentTab({ api, kb, onChanged }: ContentTabProps) {
       key: 'status',
       title: t('knowledgeAdmin.content.table.status'),
       width: 140,
-      render: (row) =>
-        isDraftView && row.kind !== 'unchanged' ? (
+      render: (row) => {
+        if (row.kind === 'unchanged') return null;
+        // 草稿视图用「草稿新增/修改/删除」措辞（`BADGE_MESSAGE_IDS`）；正式版（含历史
+        // released/rejected）只读视图没有"草稿"这个概念，改用 `RELEASE_BADGE_MESSAGE_IDS`
+        // （只有 added/modified 两种——正式版视图的行都来自 A2b，已删除文档不会出现在
+        // 这里，见 `visibleDocuments`）。徽章始终按 diff 是否覆盖该行来决定是否显示，
+        // 从不再依赖"是不是草稿视图"（T077 rerun Defect B 修复）。
+        const labelId = isDraftView ? BADGE_MESSAGE_IDS[row.kind] : RELEASE_BADGE_MESSAGE_IDS[row.kind];
+        if (!labelId) return null;
+        return (
           <span className="rounded-full bg-[#eef2f7] px-[8px] py-[2px] text-[11px] font-medium text-[#596174]">
-            {t(BADGE_MESSAGE_IDS[row.kind])}
+            {t(labelId)}
           </span>
-        ) : null,
+        );
+      },
     },
     ...(isDraftView
       ? [

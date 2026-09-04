@@ -195,7 +195,17 @@ export default function KnowledgeAdminListPage({ currentUser, onLogout }: Knowle
     }
   }
 
-  /** 归属员工 / 可绑定群组候选与当前筛选无关，只需要在挂载与手动刷新时拉取一次。 */
+  /**
+   * 归属员工 / 可绑定群组候选与当前筛选无关，只需要在挂载与手动刷新时拉取一次。
+   *
+   * T077 rerun Defect D5b 修复：`is_overall` 的"整体智能体"是系统资源池（开放广场载体），
+   * 不是能被指定为私有知识库归属方的真实数字员工——这里排除它，与 `AgentsPage.tsx`、
+   * `ChannelsPage.tsx`、`TeamDetailPage.tsx` 等页面对同一份 `listAgents()` 结果的既有过滤
+   * 约定（`!agent.is_overall`）保持一致。此前遗漏这条过滤，"归属员工"筛选下拉与
+   * `CreateKnowledgeBaseDialog` 的归属选择器（两者共用这份 `agents` state）都会连带带出
+   * "整体智能体"这一行；en-US 下尤其显眼，因为它是业务数据（agent.name，经 `RawContent`
+   * 逐字展示），本身从不参与产品文案翻译。
+   */
   async function loadFilterOptions() {
     const context = tenantContext;
     const generation = context?.generation;
@@ -203,7 +213,7 @@ export default function KnowledgeAdminListPage({ currentUser, onLogout }: Knowle
     try {
       const [agentsResult, teamsResult] = await Promise.all([api.listAgents(), api.listBindableTeams({})]);
       if (!context.isCurrentGeneration(generation)) return;
-      setAgents(Array.isArray(agentsResult) ? agentsResult : []);
+      setAgents(Array.isArray(agentsResult) ? agentsResult.filter((agent) => !agent.is_overall) : []);
       setTeams(Array.isArray(teamsResult) ? teamsResult : []);
     } catch (error) {
       if (!context.isCurrentGeneration(generation)) return;

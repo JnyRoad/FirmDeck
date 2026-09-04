@@ -37,22 +37,49 @@ const FILTER_DEBOUNCE_MS = 300;
  * 原始内容，必须本地化；旧实现把码本身当作筛选项标签与表格单元格文案直接显示，还
  * 用 `RawContent` 包了一层——那是"逐字保留用户/第三方原文"的标记，用在自有枚举上
  * 属于误用。落键模式抄 `VersionsTab.tsx` 的 `STATE_LABEL_IDS`。
+ *
+ * T077 rerun Defect D5a 修复：这份表之前只对上了 3 个码（`draft_created`/
+ * `draft_reviewed`/`draft_rebased`），另外 3 个键（`published`/`rejected`/`rolled_back`）
+ * 与后端实际写入的码（`version_published`/`draft_rejected`/`version_rolled_back`，见
+ * `backend/app/knowledge/versioning.py`）拼写不一致，从未命中过，连同 `shared_created`
+ * （`backend/app/api/knowledge_bases.py`、`backend/app/teams/service.py`）等键完全缺失，
+ * 一起在审计表里原样显示成 snake_case 码。现在按 `backend/app` 里 `append_event(` 调用
+ * 实际写入的 `action=` 逐一核对补全（`backend/app/knowledge/{versioning,rebase,
+ * conversion}.py`、`backend/app/teams/service.py`、`backend/app/api/knowledge_bases.py`）。
  */
 const AUDIT_ACTION_LABEL_IDS: Record<
   string,
   | 'knowledgeAdmin.audit.actions.draftCreated'
+  | 'knowledgeAdmin.audit.actions.draftUpdated'
   | 'knowledgeAdmin.audit.actions.draftReviewed'
   | 'knowledgeAdmin.audit.actions.draftRebased'
-  | 'knowledgeAdmin.audit.actions.published'
-  | 'knowledgeAdmin.audit.actions.rejected'
-  | 'knowledgeAdmin.audit.actions.rolledBack'
+  | 'knowledgeAdmin.audit.actions.draftRejected'
+  | 'knowledgeAdmin.audit.actions.versionPublished'
+  | 'knowledgeAdmin.audit.actions.versionRolledBack'
+  | 'knowledgeAdmin.audit.actions.dedicatedConverted'
+  | 'knowledgeAdmin.audit.actions.sharedCreated'
+  | 'knowledgeAdmin.audit.actions.defaultChanged'
+  | 'knowledgeAdmin.audit.actions.bindingCreated'
+  | 'knowledgeAdmin.audit.actions.bindingRevoked'
+  | 'knowledgeAdmin.audit.actions.grantCreated'
+  | 'knowledgeAdmin.audit.actions.grantChanged'
+  | 'knowledgeAdmin.audit.actions.grantRevoked'
 > = {
   draft_created: 'knowledgeAdmin.audit.actions.draftCreated',
+  draft_updated: 'knowledgeAdmin.audit.actions.draftUpdated',
   draft_reviewed: 'knowledgeAdmin.audit.actions.draftReviewed',
   draft_rebased: 'knowledgeAdmin.audit.actions.draftRebased',
-  published: 'knowledgeAdmin.audit.actions.published',
-  rejected: 'knowledgeAdmin.audit.actions.rejected',
-  rolled_back: 'knowledgeAdmin.audit.actions.rolledBack',
+  draft_rejected: 'knowledgeAdmin.audit.actions.draftRejected',
+  version_published: 'knowledgeAdmin.audit.actions.versionPublished',
+  version_rolled_back: 'knowledgeAdmin.audit.actions.versionRolledBack',
+  dedicated_converted: 'knowledgeAdmin.audit.actions.dedicatedConverted',
+  shared_created: 'knowledgeAdmin.audit.actions.sharedCreated',
+  default_changed: 'knowledgeAdmin.audit.actions.defaultChanged',
+  binding_created: 'knowledgeAdmin.audit.actions.bindingCreated',
+  binding_revoked: 'knowledgeAdmin.audit.actions.bindingRevoked',
+  grant_created: 'knowledgeAdmin.audit.actions.grantCreated',
+  grant_changed: 'knowledgeAdmin.audit.actions.grantChanged',
+  grant_revoked: 'knowledgeAdmin.audit.actions.grantRevoked',
 };
 
 const AUDIT_ACTIONS = Object.keys(AUDIT_ACTION_LABEL_IDS);

@@ -162,7 +162,15 @@ describe('ContentTab — 视图切换的过期响应护栏', () => {
           ? Promise.resolve(diffFor('kbver_pub', '正式版本文档'))
           : Promise.reject(new Error('boom')),
       ),
-      listVersionDocuments: vi.fn().mockResolvedValue([]),
+      // A2b is now the published view's row source too (Defect B fix) — the row for
+      // `kbver_pub` must come from here, matched to the diff above by `lineage_id`.
+      listVersionDocuments: vi.fn((_kbId: string, versionId: string) =>
+        Promise.resolve(
+          versionId === 'kbver_pub'
+            ? [{ id: 'pub_row_1', lineage_id: 'kbver_pub_lineage', title: '正式版本文档', filename: 'a.md', status: 'ready', bucket_count: 0, chunk_count: 0, updated_at: '2026-08-15T00:00:00Z' }]
+            : [],
+        ),
+      ),
       uploadDocument: vi.fn(),
       updateDocument: vi.fn(),
       archiveDocument: vi.fn(),
@@ -188,7 +196,11 @@ describe('ContentTab — 租户代际护栏', () => {
     const api = {
       listVersions: vi.fn().mockResolvedValue([draftVersion]),
       getVersionDiff: vi.fn().mockResolvedValue(diffFor('kbver_pub', '正式版本文档')),
-      listVersionDocuments: vi.fn().mockResolvedValue([]),
+      // A2b is now the published view's row source too (Defect B fix) — matched to the
+      // diff above by `lineage_id`.
+      listVersionDocuments: vi.fn().mockResolvedValue([
+        { id: 'pub_row_1', lineage_id: 'kbver_pub_lineage', title: '正式版本文档', filename: 'a.md', status: 'ready', bucket_count: 0, chunk_count: 0, updated_at: '2026-08-15T00:00:00Z' },
+      ]),
       uploadDocument: vi.fn(),
       updateDocument: vi.fn(),
       archiveDocument: vi.fn(),
