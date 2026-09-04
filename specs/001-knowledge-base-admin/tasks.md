@@ -99,10 +99,10 @@
 
 ### Tests for User Story 2
 
-- [ ] T036 [P] [US2] [测试] 在 frontend-enterprise/src/pages/knowledge-admin/review/lineDiff.test.ts 编写失败测试：LCS 行 diff、`splitLines('')=[]`、空/相同/全变输入
-- [ ] T037 [P] [US2] [测试] 在 frontend-enterprise/src/pages/knowledge-admin/review/hunkModel.test.ts 编写失败测试：rows/hunks 构建（`insertAt`/`bs`/`bi`）、相似度配对 `alignHunk`、字符级 `charOps`/`innerHtml`、`restorePos`
-- [ ] T038 [P] [US2] [测试] 在 frontend-enterprise/src/pages/knowledge-admin/review/staging.test.ts 编写失败测试：`stage` 更新暂存基线与后续记录偏移、`unstage` 精确校验与偏移回退、接受全部按降序、拒绝、重置、`pending`/`hasWork`
-- [ ] T039 [US2] [测试] 在 frontend-enterprise/src/pages/knowledge-admin/review/ReviewEditor.test.tsx 编写失败测试：输入后整篇重算与光标保持；Enter 拆行/Backspace 合并/Delete；跨行选区 Backspace、insertText、粘贴多行；composition 期间不重绘、结束后同步；块接受折叠为 ✓ 行 + 撤销接受；红行 ↩ 恢复（配对替换 / 未配对插回）；绿行 ✕；选区撤销按钮启用与执行；新增文档整篇拒绝、删除文档拒绝恢复；顶部计数与 apply 可用性
+- [X] T036 [P] [US2] [测试] 在 frontend-enterprise/src/pages/knowledge-admin/review/lineDiff.test.ts 编写失败测试：LCS 行 diff、`splitLines('')=[]`、空/相同/全变输入
+- [X] T037 [P] [US2] [测试] 在 frontend-enterprise/src/pages/knowledge-admin/review/hunkModel.test.ts 编写失败测试：rows/hunks 构建（`insertAt`/`bs`/`bi`）、相似度配对 `alignHunk`、字符级 `charOps`/`innerHtml`、`restorePos`
+- [X] T038 [P] [US2] [测试] 在 frontend-enterprise/src/pages/knowledge-admin/review/staging.test.ts 编写失败测试：`stage` 更新暂存基线与后续记录偏移、`unstage` 精确校验与偏移回退、接受全部按降序、拒绝、重置、`pending`/`hasWork`
+- [X] T039 [US2] [测试] 在 frontend-enterprise/src/pages/knowledge-admin/review/ReviewEditor.test.tsx 编写失败测试：输入后整篇重算与光标保持；Enter 拆行/Backspace 合并/Delete；跨行选区 Backspace、insertText、粘贴多行；composition 期间不重绘、结束后同步；块接受折叠为 ✓ 行 + 撤销接受；红行 ↩ 恢复（配对替换 / 未配对插回）；绿行 ✕；选区撤销按钮启用与执行；新增文档整篇拒绝、删除文档拒绝恢复；顶部计数与 apply 可用性
 - [ ] T040 [P] [US2] [测试] 在 frontend-enterprise/src/pages/knowledge-admin/shared/ContentTab.test.tsx 编写失败测试：视图切换器；正式视图只读且隐藏草稿新增；草稿视图新增/修改/删除标记与恢复；横幅信息（创建者、来源、基线、发布后版本号预览、原因）与按钮；上传/编辑/删除请求携带草稿 `knowledge_base_version_id`
 - [ ] T041 [P] [US2] [测试] 在 frontend-enterprise/src/pages/knowledge-admin/shared/ContentTab.reviewApply.test.tsx 编写失败测试：「应用到草稿」按审阅结果调用文档更新（`content_md`+`expected_updated_at`）、新增拒绝归档、删除拒绝恢复，最后调用 review 端点；成功后 toast 与刷新；从发布框进入时应用后返回发布框；文档更新或 review 返回 `KNOWLEDGE_PUBLISH_CONFLICT` 时提示"草稿已被他人修改，请刷新后重新审阅"且不提交剩余写回
 - [ ] T042 [P] [US2] [测试] 在 frontend-enterprise/src/pages/knowledge-admin/shared/VersionsTab.test.tsx 编写失败测试：服务端顺序原样展示、草稿行 查看变更/发布/驳回、released 行回滚、当前正式版标记、创建草稿对话框（原因必填、来源上下文含"管理员直连"）
@@ -111,10 +111,10 @@
 
 ### Implementation for User Story 2
 
-- [ ] T045 [P] [US2] 实现 frontend-enterprise/src/pages/knowledge-admin/review/lineDiff.ts
-- [ ] T046 [P] [US2] 实现 frontend-enterprise/src/pages/knowledge-admin/review/hunkModel.ts
-- [ ] T047 [P] [US2] 实现 frontend-enterprise/src/pages/knowledge-admin/review/staging.ts
-- [ ] T048 [US2] 实现 frontend-enterprise/src/pages/knowledge-admin/review/editorDom.ts（光标定位、行读取、选区映射）与 review/ReviewEditor.tsx（contenteditable 行编辑器、事件处理、暂存折叠渲染、行级/选区操作；文案由 props 注入）
+- [X] T045 [P] [US2] 实现 frontend-enterprise/src/pages/knowledge-admin/review/lineDiff.ts
+- [X] T046 [P] [US2] 实现 frontend-enterprise/src/pages/knowledge-admin/review/hunkModel.ts
+- [X] T047 [P] [US2] 实现 frontend-enterprise/src/pages/knowledge-admin/review/staging.ts
+- [X] T048 [US2] 实现 frontend-enterprise/src/pages/knowledge-admin/review/editorDom.ts（光标定位、行读取、选区映射）与 review/ReviewEditor.tsx（contenteditable 行编辑器、事件处理、暂存折叠渲染、行级/选区操作；文案由 props 注入）
 - [ ] T049 [US2] 实现 frontend-enterprise/src/pages/knowledge-admin/shared/ContentTab.tsx（含审阅打开与写回、复用现有文档编辑对话框）
 - [ ] T050 [US2] 实现 frontend-enterprise/src/pages/knowledge-admin/shared/VersionsTab.tsx 与 dialogs/CreateDraftDialog.tsx
 - [ ] T051 [US2] 实现 frontend-enterprise/src/pages/knowledge-admin/dialogs/PublishDialog.tsx（stale 分支通过 `onRebase` 回调交给 US3）
