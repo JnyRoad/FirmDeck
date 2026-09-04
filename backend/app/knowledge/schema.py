@@ -141,6 +141,76 @@ class KnowledgeBaseVersionRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class KnowledgeAdminOwnerAgentRead(BaseModel):
+    """A1 列表项的 owner_agent：私有库归属员工。"""
+
+    id: str
+    name: str
+
+
+class KnowledgeAdminBoundTeamRead(BaseModel):
+    """A1 列表项 bound_teams 的一条团队绑定，is_default 标记团队默认库。"""
+
+    id: str
+    name: str
+    is_default: bool
+
+
+class KnowledgeAdminBranchRead(BaseModel):
+    """A1 列表项的 branch：仅私有库存在，取 owner 员工分支的基线/头版本与同步状态。"""
+
+    base_version: str
+    head_version: str
+    sync_state: str
+
+
+class KnowledgeAdminListItem(BaseModel):
+    """A1 `GET /knowledge-admin/knowledge-bases` 的 items[] 元素。"""
+
+    id: str
+    name: str
+    description: str | None = None
+    mode: KnowledgeBaseMode
+    status: Literal["active", "archived"]
+    capability_scope: CapabilityScope
+    published_version: str | None = None
+    published_version_id: str | None = None
+    draft_count: int = 0
+    document_count: int = 0
+    owner_agent: KnowledgeAdminOwnerAgentRead | None = None
+    bound_teams: list[KnowledgeAdminBoundTeamRead] = Field(default_factory=list)
+    branch: KnowledgeAdminBranchRead | None = None
+    updated_at: str
+
+
+class KnowledgeAdminListSummary(BaseModel):
+    """A1 响应的 summary：全租户统计，不受过滤参数影响。"""
+
+    total: int
+    shared: int
+    dedicated: int
+    documents: int
+
+
+class KnowledgeAdminListResponse(BaseModel):
+    """A1 分页响应：`GET /knowledge-admin/knowledge-bases`。"""
+
+    items: list[KnowledgeAdminListItem] = Field(default_factory=list)
+    summary: KnowledgeAdminListSummary
+    total: int
+    offset: int
+    limit: int
+    has_more: bool
+
+
+class KnowledgeAdminTeamOption(BaseModel):
+    """A6 `GET /knowledge-admin/teams` 的候选团队条目。"""
+
+    id: str
+    name: str
+    member_count: int
+
+
 class KnowledgeBaseAuditEventRead(BaseModel):
     id: str
     knowledge_base_id: str
