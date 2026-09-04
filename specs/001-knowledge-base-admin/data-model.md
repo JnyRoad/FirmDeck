@@ -71,8 +71,8 @@ VersionDiff
     ├── lineage_id, title, kind ("added" | "modified" | "deleted"), truncated
     └── hunks[]  (kind="modified" 时)
         ├── type ("equal" | "change")
-        ├── base_start, base_lines[], target_start, target_lines[]
-        └── pairs[]  # change 块内 [base_idx, target_idx] 的相似行配对，供字符级高亮
+        ├── base_start, base_lines[], target_start, target_lines[]   # 行号 0-based
+        └── pairs[]  # change 块内 [base_idx, target_idx] 的相似行配对（按顺序位置对齐，非编辑距离对齐），供字符级高亮
 ```
 
 ## 5. 变基结果（响应模型，不落库）
