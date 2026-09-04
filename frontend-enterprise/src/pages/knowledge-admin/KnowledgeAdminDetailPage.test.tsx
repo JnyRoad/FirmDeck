@@ -63,6 +63,12 @@ const mockApi = vi.hoisted(() => ({
   rollbackVersion: vi.fn(),
   recordReview: vi.fn(),
   listAuditEvents: vi.fn(),
+  listBindableTeams: vi.fn(),
+  listTeamBindings: vi.fn(),
+  bindTeam: vi.fn(),
+  unbindTeam: vi.fn(),
+  setDefaultBinding: vi.fn(),
+  saveGrants: vi.fn(),
 }));
 
 vi.mock('../../api/knowledgeAdmin', () => ({
@@ -168,6 +174,7 @@ beforeEach(() => {
     documents: [],
   });
   mockApi.listAuditEvents.mockResolvedValue({ items: [], total: 0, offset: 0, limit: 20, has_more: false });
+  mockApi.listBindableTeams.mockResolvedValue([]);
 });
 
 afterEach(() => {
@@ -232,11 +239,16 @@ describe('KnowledgeAdminDetailPage', () => {
     expect((await screen.findByTestId('location')).textContent).toBe('/enterprise/knowledge-admin');
   });
 
-  it('shows placeholder content for tabs not yet implemented (grants)', async () => {
+  it('mounts the real grants tab (US4), not the placeholder, for a shared knowledge base', async () => {
     mockApi.getKnowledgeBase.mockResolvedValue(sharedKb);
     renderDetail('/enterprise/knowledge-admin/kb_shared_1?tab=grants');
 
-    expect(await screen.findByText('该 Tab 暂未实现。')).toBeTruthy();
+    expect(await screen.findByText('已绑定群组')).toBeTruthy();
+    expect(screen.getByText('绑定新群组')).toBeTruthy();
+    expect(screen.queryByText('该 Tab 暂未实现。')).toBeNull();
+    await waitFor(() => expect(mockApi.listBindableTeams).toHaveBeenCalledWith(
+      expect.objectContaining({ excludeBoundTo: 'kb_shared_1' }),
+    ));
   });
 
   it('saves name/description/capability scope from the settings tab', async () => {
