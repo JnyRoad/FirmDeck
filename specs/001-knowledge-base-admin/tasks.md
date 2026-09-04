@@ -133,17 +133,17 @@
 
 ### Tests for User Story 3
 
-- [ ] T054 [P] [US3] [测试] 在 frontend-enterprise/src/pages/knowledge-admin/dialogs/RebaseDialog.test.tsx 编写失败测试：预览列出自动合并与冲突文档；无冲突直接完成并刷新；有冲突逐篇进入合并；全部解决后调用 `rebase/resolve`；服务端 `KNOWLEDGE_PUBLISH_CONFLICT` 时提示重新预览
-- [ ] T055 [P] [US3] [测试] 在 frontend-enterprise/src/pages/knowledge-admin/dialogs/MergeDialog.test.tsx 编写失败测试：非冲突段直接合并；冲突块两栏对照与四种选择（采用草稿/采用正式版/两者都保留/编辑此段）；结果区带 Git 标记可手动编辑；残留标记时「完成」禁用；输出 `{lineage_id, content_md}`
-- [ ] T056 [P] [US3] [测试] 在 frontend-enterprise/src/pages/knowledge-admin/shared/ContentTab.stale.test.tsx 编写失败测试：`is_stale` 草稿横幅显示"正式版已更新为 vX，本草稿基于 vY"，版本 Tab 同步标记
-- [ ] T057 [P] [US3] [测试] 在 backend/tests/test_knowledge_rebase_flow.py 编写端到端失败测试（HTTP 级）：A、B 基于 1.0.0；A 改甲发布 1.0.1；B 改甲、乙发布 → `KNOWLEDGE_BASELINE_STALE`；rebase 返回甲冲突、乙自动；resolve 后发布 B → 1.0.2 且正式版含双方保留内容；审计链完整
+- [X] T054 [P] [US3] [测试] 在 frontend-enterprise/src/pages/knowledge-admin/dialogs/RebaseDialog.test.tsx 编写失败测试：预览列出自动合并与冲突文档；无冲突直接完成并刷新；有冲突逐篇进入合并；全部解决后调用 `rebase/resolve`；服务端 `KNOWLEDGE_PUBLISH_CONFLICT` 时提示重新预览
+- [X] T055 [P] [US3] [测试] 在 frontend-enterprise/src/pages/knowledge-admin/dialogs/MergeDialog.test.tsx 编写失败测试：非冲突段直接合并；冲突块两栏对照与四种选择（采用草稿/采用正式版/两者都保留/编辑此段）；结果区带 Git 标记可手动编辑；残留标记时「完成」禁用；输出 `{lineage_id, content_md}`
+- [X] T056 [P] [US3] [测试] 在 frontend-enterprise/src/pages/knowledge-admin/shared/ContentTab.stale.test.tsx 编写失败测试：`is_stale` 草稿横幅显示"正式版已更新为 vX，本草稿基于 vY"，版本 Tab 同步标记
+- [X] T057 [P] [US3] [测试] 在 backend/tests/test_knowledge_rebase_flow.py 编写端到端失败测试（HTTP 级）：A、B 基于 1.0.0；A 改甲发布 1.0.1；B 改甲、乙发布 → `KNOWLEDGE_BASELINE_STALE`；rebase 返回甲冲突、乙自动；resolve 后发布 B → 1.0.2 且正式版含双方保留内容；审计链完整
 
 ### Implementation for User Story 3
 
-- [ ] T058 [P] [US3] 实现 frontend-enterprise/src/pages/knowledge-admin/dialogs/MergeDialog.tsx（纯组件，不调 API）
-- [ ] T059 [US3] 实现 frontend-enterprise/src/pages/knowledge-admin/dialogs/RebaseDialog.tsx 并接入 PublishDialog 的 `onRebase`
-- [ ] T060 [US3] 在 frontend-enterprise/src/pages/knowledge-admin/shared/ContentTab.tsx 与 shared/VersionsTab.tsx 接入 stale 横幅与标记
-- [ ] T061 [US3] 使 T057 端到端测试通过：按需修正 backend/app/knowledge/rebase.py 与 backend/app/knowledge/versioning.py（不新增行为，仅修复集成缺口）
+- [X] T058 [P] [US3] 实现 frontend-enterprise/src/pages/knowledge-admin/dialogs/MergeDialog.tsx（纯组件，不调 API）
+- [X] T059 [US3] 实现 frontend-enterprise/src/pages/knowledge-admin/dialogs/RebaseDialog.tsx 并接入 PublishDialog 的 `onRebase`
+- [X] T060 [US3] 在 frontend-enterprise/src/pages/knowledge-admin/shared/ContentTab.tsx 与 shared/VersionsTab.tsx 接入 stale 横幅与标记
+- [X] T061 [US3] 使 T057 端到端测试通过：按需修正 backend/app/knowledge/rebase.py 与 backend/app/knowledge/versioning.py（不新增行为，仅修复集成缺口）
 
 **Checkpoint**: P0（US1–US3）完整可交付（quickstart S1–S3）
 
