@@ -10,14 +10,18 @@
 from __future__ import annotations
 
 import pytest
-from fastapi import HTTPException
-from sqlmodel import Session, select
+from fastapi import FastAPI, HTTPException
+from fastapi.testclient import TestClient
+from sqlalchemy.pool import StaticPool
+from sqlmodel import Session, SQLModel, create_engine, select
 from test_teams_api import _test_session
 
 from app.api.knowledge_admin import (
     rebase_knowledge_admin_draft,
     resolve_knowledge_admin_rebase,
 )
+from app.api.knowledge_admin import router as knowledge_admin_router
+from app.db import get_session
 from app.db.models import (
     AgentEvent,
     KnowledgeBase,
@@ -46,6 +50,7 @@ from app.knowledge.schema import (
     KnowledgeRebaseResolveRequest,
 )
 from app.knowledge.versioning import SharedKnowledgeVersionService
+from app.security.auth import get_current_user
 
 # ---------------------------------------------------------------------------
 # 纯函数：merge_document_sets 的三方分类（仅 ours / 仅 theirs / 不交叠自动合并 / 交叠冲突）
@@ -399,6 +404,38 @@ def test_rebase_route_rejects_non_stale_draft() -> None:
         assert not_ready.value.detail["code"] == KNOWLEDGE_VERSION_NOT_READY
 
 
+def _build_conflict_free_stale_draft(
+    db: Session,
+) -> tuple[KnowledgeBase, KnowledgeBaseVersion, KnowledgeBaseVersion]:
+    """构造无冲突、可直接落库的变基场景：ours 只改 L_OURS，theirs 只改 L_THEIRS。"""
+    base, v1 = _seed_rebase_fixture(db)
+    draft_ours = _create_draft(db, expected_published_version_id=v1.id, reason="ours 编辑")
+    db.commit()
+    _update_document(db, version_id=draft_ours.id, lineage_id="L_OURS", lines=["only1-ours", "only2"])
+    db.commit()
+
+    draft_theirs = _create_draft(db, expected_published_version_id=v1.id, reason="theirs 编辑")
+    db.commit()
+    _update_document(
+        db, version_id=draft_theirs.id, lineage_id="L_THEIRS", lines=["theirs1-theirs", "theirs2"]
+    )
+    db.commit()
+    published_theirs = SharedKnowledgeVersionService(db).publish_draft(
+        tenant_id="tenant_demo",
+        knowledge_base_id=base.id,
+        draft_version_id=draft_theirs.id,
+        expected_published_version_id=v1.id,
+        actor_type="user",
+        actor_id="user_admin",
+        source_team_id="team_content",
+        change_reason="发布 theirs",
+    )
+    db.commit()
+    db.refresh(base)
+    db.refresh(draft_ours)
+    return base, draft_ours, published_theirs
+
+
 def test_rebase_route_team_owner_succeeds_and_non_owner_is_denied() -> None:
     with _test_session() as db:
         base, v1 = _seed_rebase_fixture(db)
@@ -710,3 +747,229 @@ def test_publish_stale_draft_with_force_overwrite_succeeds_and_audits() -> None:
         assert product_event.payload_json["params"]["knowledge_base_id"] == base.id
         assert product_event.payload_json["params"]["version"] == published.version
         assert isinstance(product_event.payload_json["params"]["stale_draft_count"], int)
+
+
+# ---------------------------------------------------------------------------
+# 修复轮次 1：路由必须自行 db.commit()——`get_session` 不自动提交，`apply_rebase`
+# 只 flush。之前的路由/服务层测试都在同一个长生命周期会话内自行 commit，掩盖了这个
+# 问题；这里改用真实 HTTP 请求 + 独立验证会话证明写回跨请求持久化。
+# ---------------------------------------------------------------------------
+
+
+def _http_client_for(engine) -> TestClient:
+    app = FastAPI()
+    app.include_router(knowledge_admin_router)
+
+    def override_get_session():
+        with Session(engine) as request_db:
+            yield request_db
+
+    app.dependency_overrides[get_session] = override_get_session
+    app.dependency_overrides[get_current_user] = lambda: _admin_user()
+    return TestClient(app)
+
+
+def test_rebase_route_persists_across_session_boundary_via_http() -> None:
+    """A3 无冲突直接落库路径：路由处理请求的会话不由测试提交，仍必须跨请求持久化。"""
+    engine = create_engine(
+        "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
+    )
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as seed_db:
+        base, draft_ours, published_theirs = _build_conflict_free_stale_draft(seed_db)
+        kb_id = base.id
+        draft_id = draft_ours.id
+        published_theirs_id = published_theirs.id
+
+    client = _http_client_for(engine)
+    response = client.post(
+        f"/api/enterprise/knowledge-admin/knowledge-bases/{kb_id}/versions/{draft_id}/rebase",
+        json={
+            "tenant_id": "tenant_demo",
+            "team_id": "team_content",
+            "change_reason": "HTTP 变基持久化验证",
+        },
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["status"] == "applied"
+    new_version_id = body["new_version"]["id"]
+
+    # 独立新会话读取（既不是处理请求的会话，也未由本测试提交），证明数据已跨请求持久化。
+    with Session(engine) as verify_db:
+        new_version = verify_db.get(KnowledgeBaseVersion, new_version_id)
+        assert new_version is not None
+        assert new_version.publication_state == "draft"
+        assert new_version.parent_version_id == published_theirs_id
+
+        archived_draft = verify_db.get(KnowledgeBaseVersion, draft_id)
+        assert archived_draft is not None
+        assert archived_draft.status == "archived"
+        assert archived_draft.metadata_json["superseded_by"] == new_version_id
+
+        audit_row = verify_db.exec(
+            select(KnowledgeBaseAuditEvent).where(
+                KnowledgeBaseAuditEvent.action == "draft_rebased",
+            )
+        ).one()
+        assert audit_row.knowledge_base_version_id == new_version_id
+
+        product_event = verify_db.exec(
+            select(AgentEvent).where(AgentEvent.event_type == "knowledge.draft.rebased")
+        ).one()
+        assert product_event.payload_json["params"]["knowledge_base_id"] == kb_id
+
+
+def test_resolve_route_persists_across_session_boundary_via_http() -> None:
+    """A4 提交冲突解决路径：同样必须自行提交，写回才会跨请求持久化。"""
+    engine = create_engine(
+        "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
+    )
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as seed_db:
+        base, draft_ours, published_theirs = _build_stale_ours_draft_and_published_theirs(seed_db)
+        kb_id = base.id
+        draft_id = draft_ours.id
+        to_base_version_id = published_theirs.id
+
+    client = _http_client_for(engine)
+    response = client.post(
+        f"/api/enterprise/knowledge-admin/knowledge-bases/{kb_id}/versions/{draft_id}/rebase/resolve",
+        json={
+            "tenant_id": "tenant_demo",
+            "team_id": "team_content",
+            "change_reason": "HTTP resolve 持久化验证",
+            "to_base_version_id": to_base_version_id,
+            "resolutions": [{"lineage_id": "L_CONFLICT", "content_md": "alpha\nbeta-merged\ngamma"}],
+        },
+    )
+    assert response.status_code == 200, response.text
+    new_version_id = response.json()["new_version"]["id"]
+
+    with Session(engine) as verify_db:
+        new_version = verify_db.get(KnowledgeBaseVersion, new_version_id)
+        assert new_version is not None
+        merged_doc = next(
+            doc
+            for doc in verify_db.exec(
+                select(KnowledgeDocument).where(
+                    KnowledgeDocument.knowledge_base_version_id == new_version_id
+                )
+            ).all()
+            if (doc.metadata_json or {}).get("lineage_id") == "L_CONFLICT"
+        )
+        assert merged_doc.metadata_json["raw_text"] == "alpha\nbeta-merged\ngamma"
+
+        archived_draft = verify_db.get(KnowledgeBaseVersion, draft_id)
+        assert archived_draft is not None
+        assert archived_draft.status == "archived"
+
+
+# ---------------------------------------------------------------------------
+# 修复轮次 1：新快照必须继承旧草稿的原始 metadata（provenance/draft_change_reason 等），
+# 而不是只剩 draft_name/rebased_from。
+# ---------------------------------------------------------------------------
+
+
+def test_apply_rebase_preserves_original_draft_metadata_provenance() -> None:
+    with _test_session() as db:
+        base, draft_ours, _published_theirs = _build_conflict_free_stale_draft(db)
+        original_provenance = dict(draft_ours.metadata_json.get("provenance") or {})
+        original_draft_change_reason = draft_ours.metadata_json.get("draft_change_reason")
+        assert original_draft_change_reason == "ours 编辑"
+
+        result = rebase_knowledge_admin_draft(
+            base.id,
+            draft_ours.id,
+            KnowledgeRebaseRequest(
+                tenant_id="tenant_demo", team_id="team_content", change_reason="变基保留来源"
+            ),
+            db=db,
+            current_user=_admin_user(),
+        )
+        db.commit()
+
+        assert result.status == "applied"
+        assert result.new_version.metadata["provenance"] == original_provenance
+        assert result.new_version.metadata["draft_change_reason"] == original_draft_change_reason
+        # change_reason 列本身是这次变基自己的原因，不是继承自旧草稿。
+        assert result.new_version.change_reason == "变基保留来源"
+
+
+# ---------------------------------------------------------------------------
+# 修复轮次 1：多步写入必须整体回滚——撞唯一约束时不留半途状态，并映射为可重试的
+# KNOWLEDGE_PUBLISH_CONFLICT。
+# ---------------------------------------------------------------------------
+
+
+def test_apply_rebase_rolls_back_and_maps_integrity_error_to_publish_conflict() -> None:
+    """预占旧草稿即将改写成的 superseded 标签，模拟并发写入撞唯一约束。
+
+    两个并发的 `apply_rebase` 调用作用于同一个 stale 草稿时，都会为旧快照计算出
+    完全相同的 `-superseded-<id 后缀>` 标签（该标签只由草稿自身 id/version 决定）；
+    这里预先插入一行占用该标签，复现"写入序列中途撞约束"的场景，验证整个多步写入
+    会通过 SAVEPOINT 整体回滚——旧草稿保持未改写、没有新草稿/审计半途落库——而不是
+    把部分写入残留在数据库里。
+    """
+    with _test_session() as db:
+        base, draft_ours, _published_theirs = _build_conflict_free_stale_draft(db)
+        original_version = draft_ours.version
+        version_count_before = len(db.exec(select(KnowledgeBaseVersion)).all())
+
+        collision_label = f"{draft_ours.version}-superseded-{draft_ours.id.rsplit('_', 1)[-1][-8:]}"
+        db.add(
+            KnowledgeBaseVersion(
+                id="kbver_collision",
+                tenant_id="tenant_demo",
+                knowledge_base_id=base.id,
+                version=collision_label,
+                name="占位冲突行",
+                publication_state="rejected",
+            )
+        )
+        db.commit()
+
+        with pytest.raises(HTTPException) as conflict:
+            rebase_knowledge_admin_draft(
+                base.id,
+                draft_ours.id,
+                KnowledgeRebaseRequest(
+                    tenant_id="tenant_demo", team_id="team_content", change_reason="并发撞车"
+                ),
+                db=db,
+                current_user=_admin_user(),
+            )
+
+        assert conflict.value.status_code == 409
+        assert conflict.value.detail["code"] == KNOWLEDGE_PUBLISH_CONFLICT
+
+        db.refresh(draft_ours)
+        assert draft_ours.status == "active"
+        assert draft_ours.publication_state == "draft"
+        assert draft_ours.version == original_version  # 未被半途改写为 superseded 标签
+
+        # 版本表只多了我们主动插入的占位行，没有半途落地的新草稿。
+        assert len(db.exec(select(KnowledgeBaseVersion)).all()) == version_count_before + 1
+        assert (
+            db.exec(
+                select(KnowledgeBaseAuditEvent).where(
+                    KnowledgeBaseAuditEvent.action == "draft_rebased"
+                )
+            ).first()
+            is None
+        )
+
+        # 撞车行清理后，正常变基仍应成功——证明会话在失败后依然可用、未被留在坏事务里。
+        db.delete(db.get(KnowledgeBaseVersion, "kbver_collision"))
+        db.commit()
+        retry_result = rebase_knowledge_admin_draft(
+            base.id,
+            draft_ours.id,
+            KnowledgeRebaseRequest(
+                tenant_id="tenant_demo", team_id="team_content", change_reason="撞车解除后重试"
+            ),
+            db=db,
+            current_user=_admin_user(),
+        )
+        db.commit()
+        assert retry_result.status == "applied"

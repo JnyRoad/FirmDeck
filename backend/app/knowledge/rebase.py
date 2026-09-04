@@ -20,6 +20,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from app.agents.branching import clone_knowledge_version_assets
@@ -56,7 +57,6 @@ from app.observability.product_events import record_product_event
 
 MergeSource = Literal["ours", "theirs", "merged"]
 DocumentAction = Literal["add", "update", "delete", "noop"]
-_CONFLICT_MARKERS = ("<<<<<<<", "=======", ">>>>>>>")
 _CONTEXT_SPAN = 2
 
 
@@ -504,7 +504,16 @@ def count_stale_conflicts(
 
 
 def _has_conflict_markers(content: str) -> bool:
-    return any(marker in content for marker in _CONFLICT_MARKERS)
+    """按行锚定检查残留冲突标记，避免把正文中偶然出现的等号/尖括号行误判为标记。"""
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped == "=======":
+            return True
+        if stripped == "<<<<<<<" or stripped.startswith("<<<<<<< "):
+            return True
+        if stripped == ">>>>>>>" or stripped.startswith(">>>>>>> "):
+            return True
+    return False
 
 
 def _apply_merge_results(
@@ -626,92 +635,113 @@ def apply_rebase(
     draft_name = draft.version
     from_base_version_id = draft.parent_version_id
     new_draft_id = new_id("kbver")
-
-    # 草稿名（version 唯一约束键）在新旧快照之间只能有一份持有；先把旧快照的 version
-    # 改写为带 superseded 后缀的历史标签腾出位置，再插入沿用原草稿名的新快照，
-    # 避免 (tenant_id, knowledge_base_id, version) 唯一约束冲突。
     previous_version_id = draft.id
-    draft.status = "archived"
-    draft.version = f"{draft_name}-superseded-{previous_version_id.rsplit('_', 1)[-1][-8:]}"
-    draft.metadata_json = {**dict(draft.metadata_json or {}), "superseded_by": new_draft_id}
-    draft.updated_at = now
-    db.add(draft)
-    db.flush()
+    # 捕获旧草稿的原始 metadata（provenance/draft_change_reason 等）——必须在下面改写
+    # draft.metadata_json（打 superseded_by 标记）之前取一次快照，新快照据此继承来源信息，
+    # 而不是像归档前那样只剩 draft_name/rebased_from。
+    previous_metadata = dict(draft.metadata_json or {})
 
-    new_draft = KnowledgeBaseVersion(
-        id=new_draft_id,
-        tenant_id=tenant_id,
-        knowledge_base_id=knowledge_base_id,
-        version=draft_name,
-        name=draft.name,
-        description=draft.description,
-        status="active",
-        parent_version_id=kb.published_version_id,
-        publication_state="draft",
-        source_team_id=draft.source_team_id,
-        created_by_agent_id=draft.created_by_agent_id,
-        created_by_user_id=draft.created_by_user_id,
-        change_reason=change_reason,
-        capability_scope=draft.capability_scope,
-        metadata_json={
-            "draft_name": draft_name,
-            "rebased_from": {
-                "previous_version_id": previous_version_id,
-                "from_base_version_id": from_base_version_id,
-                "to_base_version_id": kb.published_version_id,
+    try:
+        # 落库的多步写入（改写旧快照 → 插入新快照 → 克隆资产 → 套用合并结果 → 审计）
+        # 包在同一个 SAVEPOINT 内：任一步撞唯一约束等完整性错误时整体回滚，不留半途状态，
+        # 对外统一映射为可重试的 KNOWLEDGE_PUBLISH_CONFLICT（与 versioning.publish_draft
+        # 处理并发标签冲突的方式一致）。
+        with db.begin_nested():
+            # 草稿名（version 唯一约束键）在新旧快照之间只能有一份持有；先把旧快照的
+            # version 改写为带 superseded 后缀的历史标签腾出位置，再插入沿用原草稿名的
+            # 新快照，避免 (tenant_id, knowledge_base_id, version) 唯一约束冲突。
+            draft.status = "archived"
+            draft.version = f"{draft_name}-superseded-{previous_version_id.rsplit('_', 1)[-1][-8:]}"
+            draft.metadata_json = {**previous_metadata, "superseded_by": new_draft_id}
+            draft.updated_at = now
+            db.add(draft)
+            db.flush()
+
+            new_draft = KnowledgeBaseVersion(
+                id=new_draft_id,
+                tenant_id=tenant_id,
+                knowledge_base_id=knowledge_base_id,
+                version=draft_name,
+                name=draft.name,
+                description=draft.description,
+                status="active",
+                parent_version_id=kb.published_version_id,
+                publication_state="draft",
+                source_team_id=draft.source_team_id,
+                created_by_agent_id=draft.created_by_agent_id,
+                created_by_user_id=draft.created_by_user_id,
+                change_reason=change_reason,
+                capability_scope=draft.capability_scope,
+                metadata_json={
+                    **previous_metadata,
+                    "draft_name": draft_name,
+                    "rebased_from": {
+                        "previous_version_id": previous_version_id,
+                        "from_base_version_id": from_base_version_id,
+                        "to_base_version_id": kb.published_version_id,
+                    },
+                },
+                created_at=now,
+                updated_at=now,
+            )
+            db.add(new_draft)
+            db.flush()
+
+            clone_knowledge_version_assets(
+                db, tenant_id, knowledge_base_id, kb.published_version_id, new_draft.id
+            )
+            _apply_merge_results(
+                db,
+                tenant_id=tenant_id,
+                knowledge_base_id=knowledge_base_id,
+                version_id=new_draft.id,
+                auto_merged=auto_merged,
+                conflicts_by_lineage=conflicts_by_lineage,
+                resolutions=resolutions,
+            )
+
+            to_base_row = db.get(KnowledgeBaseVersion, kb.published_version_id)
+            from_base_row = (
+                db.get(KnowledgeBaseVersion, from_base_version_id)
+                if from_base_version_id
+                else None
+            )
+            to_base_label = to_base_row.version if to_base_row else kb.published_version_id
+            from_base_label = from_base_row.version if from_base_row else None
+
+            audit = KnowledgeAuditService(db)
+            audit.append_event(
+                tenant_id=tenant_id,
+                knowledge_base_id=knowledge_base_id,
+                team_id=source_team_id,
+                knowledge_base_version_id=new_draft.id,
+                actor_type=actor_type,
+                actor_id=actor_id,
+                action="draft_rebased",
+                reason=change_reason,
+                details={
+                    "from_base_version": from_base_label,
+                    "to_base_version": to_base_label,
+                    "auto_merged_count": len(auto_merged),
+                    "resolved_conflict_count": len(conflict_lineage_ids),
+                    "actor_context": "team" if source_team_id else "tenant_admin",
+                },
+                idempotency_key=idempotency_key,
+                request_payload=request_payload,
+                durable_result={
+                    "knowledge_base_id": knowledge_base_id,
+                    "new_draft_version_id": new_draft.id,
+                    "superseded_version_id": previous_version_id,
+                },
+            )
+    except IntegrityError as exc:
+        raise knowledge_error(
+            KNOWLEDGE_PUBLISH_CONFLICT,
+            details={
+                "expected_published_version_id": to_base_version_id,
+                "current_published_version_id": kb.published_version_id,
             },
-        },
-        created_at=now,
-        updated_at=now,
-    )
-    db.add(new_draft)
-    db.flush()
-
-    clone_knowledge_version_assets(
-        db, tenant_id, knowledge_base_id, kb.published_version_id, new_draft.id
-    )
-    _apply_merge_results(
-        db,
-        tenant_id=tenant_id,
-        knowledge_base_id=knowledge_base_id,
-        version_id=new_draft.id,
-        auto_merged=auto_merged,
-        conflicts_by_lineage=conflicts_by_lineage,
-        resolutions=resolutions,
-    )
-
-    to_base_row = db.get(KnowledgeBaseVersion, kb.published_version_id)
-    from_base_row = (
-        db.get(KnowledgeBaseVersion, from_base_version_id) if from_base_version_id else None
-    )
-    to_base_label = to_base_row.version if to_base_row else kb.published_version_id
-    from_base_label = from_base_row.version if from_base_row else None
-
-    audit = KnowledgeAuditService(db)
-    audit.append_event(
-        tenant_id=tenant_id,
-        knowledge_base_id=knowledge_base_id,
-        team_id=source_team_id,
-        knowledge_base_version_id=new_draft.id,
-        actor_type=actor_type,
-        actor_id=actor_id,
-        action="draft_rebased",
-        reason=change_reason,
-        details={
-            "from_base_version": from_base_label,
-            "to_base_version": to_base_label,
-            "auto_merged_count": len(auto_merged),
-            "resolved_conflict_count": len(conflict_lineage_ids),
-            "actor_context": "team" if source_team_id else "tenant_admin",
-        },
-        idempotency_key=idempotency_key,
-        request_payload=request_payload,
-        durable_result={
-            "knowledge_base_id": knowledge_base_id,
-            "new_draft_version_id": new_draft.id,
-            "superseded_version_id": previous_version_id,
-        },
-    )
+        ) from exc
 
     record_product_event(
         EventLog(db),

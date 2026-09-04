@@ -36,6 +36,8 @@ from app.knowledge.schema import (
     KnowledgeAdminOwnerAgentRead,
     KnowledgeAdminTeamOption,
     KnowledgeBaseMode,
+    KnowledgeBaseVersionRead,
+    KnowledgeDraftReviewRequest,
     KnowledgeRebaseAutoMergedRead,
     KnowledgeRebaseConflictBlockRead,
     KnowledgeRebaseConflictRead,
@@ -46,6 +48,7 @@ from app.knowledge.schema import (
     VersionDiffRead,
     VersionDiffSummary,
 )
+from app.knowledge.versioning import SharedKnowledgeVersionService
 from app.security.auth import get_current_user
 from app.security.permissions import ensure_tenant_admin, is_admin_user
 from app.security.tenant import ensure_tenant
@@ -389,6 +392,7 @@ def rebase_knowledge_admin_draft(
         )
     except KnowledgeError as exc:
         raise _knowledge_error_to_http(exc) from exc
+    db.commit()
     return _rebase_result_read(
         db, tenant_id=request.tenant_id, knowledge_base_id=kb_id, result=result
     )
@@ -432,6 +436,64 @@ def resolve_knowledge_admin_rebase(
         )
     except KnowledgeError as exc:
         raise _knowledge_error_to_http(exc) from exc
+    db.commit()
     return _rebase_result_read(
         db, tenant_id=request.tenant_id, knowledge_base_id=kb_id, result=result
+    )
+
+
+@router.post(
+    "/knowledge-bases/{kb_id}/versions/{version_id}/review",
+    response_model=KnowledgeBaseVersionRead,
+)
+def review_knowledge_admin_draft(
+    kb_id: str,
+    version_id: str,
+    request: KnowledgeDraftReviewRequest,
+    db: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+) -> KnowledgeBaseVersionRead:
+    """A5：把审阅编辑器的暂存/待处理统计写入草稿 `metadata_json.review`，admin 或团队 manager 均可。
+
+    鉴权与 A3/A4 一致复用 `require_team_knowledge_manager`；乐观锁校验、审计
+    `draft_reviewed` 与事件 `knowledge.draft.reviewed` 都在 `SharedKnowledgeVersionService.
+    record_review` 内完成，本路由只负责鉴权与响应投影。
+    """
+    ensure_tenant(db, request.tenant_id)
+    try:
+        context = require_team_knowledge_manager(
+            db,
+            tenant_id=request.tenant_id,
+            team_id=request.team_id,
+            knowledge_base_id=kb_id,
+            current_user=current_user,
+        )
+        draft = SharedKnowledgeVersionService(db).record_review(
+            tenant_id=request.tenant_id,
+            knowledge_base_id=kb_id,
+            draft_version_id=version_id,
+            staged=request.staged,
+            pending=request.pending,
+            documents_adjusted=request.documents_adjusted,
+            expected_updated_at=request.expected_updated_at,
+            actor_type="user",
+            actor_id=current_user.id,
+            source_team_id=context.team.id if context.team else None,
+        )
+    except KnowledgeError as exc:
+        raise _knowledge_error_to_http(exc) from exc
+    # `get_session` 不自动提交（`with Session(engine) as session: yield session`），
+    # 与 knowledge_bases.py 里所有写路由一致：service 层只 flush，路由必须显式提交
+    # 才能让审阅写回跨请求持久化，而不是在响应返回后随会话关闭被丢弃。
+    db.commit()
+    kb = db.get(KnowledgeBase, kb_id)
+    label_by_id, released_labels, all_labels = _shared_version_lookup(
+        db, tenant_id=request.tenant_id, knowledge_base_id=kb_id
+    )
+    return _shared_version_read(
+        draft,
+        published_version_id=kb.published_version_id if kb else None,
+        version_label_by_id=label_by_id,
+        released_labels=released_labels,
+        all_labels=all_labels,
     )
