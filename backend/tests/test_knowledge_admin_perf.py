@@ -245,6 +245,13 @@ def test_list_endpoint_p95_latency_under_threshold() -> None:
         samples.append(t1 - t0)
 
     p95 = _p95(samples)
+    # T079 修复回合 1（Minor 1）：无论断言是否失败都打印一次数值表，配合
+    # `pytest -s` 即可复现结果，不需要每次都临时插桩。
+    print(
+        f"[T079 perf] A1 list endpoint: p95={p95 * 1000:.1f}ms over {len(samples)} "
+        f"requests (threshold={LIST_P95_THRESHOLD_SECONDS * 1000:.0f}ms); "
+        f"samples(ms)={[round(s * 1000, 1) for s in samples]}"
+    )
     assert p95 <= LIST_P95_THRESHOLD_SECONDS, (
         f"A1 list endpoint p95={p95 * 1000:.1f}ms over {len(samples)} requests "
         f"exceeds SC-007 threshold {LIST_P95_THRESHOLD_SECONDS * 1000:.0f}ms; "
@@ -280,6 +287,12 @@ def test_diff_endpoint_single_run_under_threshold() -> None:
     # equal 块（含末尾的一段未变行），共 400 个 hunk（equal+change）。
     assert len(modified_doc["hunks"]) == (DIFF_TOTAL_LINES // DIFF_CHANGED_EVERY) * 2
 
+    # T079 修复回合 1（Minor 1）：无论断言是否失败都打印一次数值，配合
+    # `pytest -s` 即可复现结果，不需要每次都临时插桩。
+    print(
+        f"[T079 perf] A2 diff endpoint: elapsed={elapsed * 1000:.1f}ms "
+        f"(threshold={DIFF_THRESHOLD_SECONDS * 1000:.0f}ms)"
+    )
     assert elapsed <= DIFF_THRESHOLD_SECONDS, (
         f"A2 diff endpoint single-run latency={elapsed * 1000:.1f}ms exceeds SC-007 "
         f"threshold {DIFF_THRESHOLD_SECONDS * 1000:.0f}ms"

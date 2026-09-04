@@ -5,7 +5,14 @@
  * 行级差异，改动分散在全篇而非集中在首尾，避免共同前后缀裁剪掩盖真实成本），用与
  * `ReviewEditor.test.tsx` 相同的"改 `.et` 的 `textContent` 后派发 `input` 事件"手法
  * 模拟一次按键（jsdom 不实现真实 contenteditable 原生编辑，见该文件顶部注释），
- * 在 `act()` 完成后用 `performance.now()` 断言单次重绘耗时 ≤ 50ms（SC-007）。
+ * 在 `act()` 完成后用 `performance.now()` 测量单次重绘耗时。
+ *
+ * T079 修复回合 1（Ruling）：jsdom 的 wall-clock 计时会被宿主机负载干扰（复核时
+ * 在负载 17 的机器上观测到 72-137ms 的样本），固定 50ms 断言在繁忙机器/CI 上会
+ * flaky。真正的「单次按键重绘 ≤50ms」（SC-007）验收标准由 T077 在真实浏览器中
+ * 验证；jsdom 计时仅作 advisory 参考。因此默认只做 ≤500ms 的灾难性回归哨兵断言并
+ * 无条件打印样本；只有显式设置环境变量 `PERF_STRICT=1` 时才按 SC-007 的 50ms 预算
+ * 严格断言（见下方 `PERF_STRICT`/`logAndAssertBudget`）。
  *
  * 每次测量都是一次真实的"单次按键"（一次 `act()` 内派发一次 `input`），但取
  * 3 次预热 + 5 次计时后的中位数而非单个样本：jsdom 测试进程会受 GC 停顿/CI
@@ -141,6 +148,33 @@ function measureKeystrokeMedianMs(container: HTMLElement, li: number): { medianM
 // SC-007 硬性阈值：单次按键重绘（diff 重算 + React 提交）≤ 50ms。
 const KEYSTROKE_THRESHOLD_MS = 50;
 
+// T079 修复回合 1（Ruling finding #3）：jsdom 下的 wall-clock 计时会被宿主机负载
+// 干扰——复核时在负载 17 的机器上观测到 72-137ms 的样本，若把 50ms 当硬性阈值在
+// CI/繁忙开发机上会持续 flaky。真正的「单次按键重绘 ≤50ms」验收标准由 T077 在
+// 真实浏览器里验证；这里的 jsdom 计时只是 advisory（仅用于在本地/剖析阶段快速
+// 发现回归量级，不代表真实浏览器 layout/paint 耗时）。
+//
+// 因此默认（未设置 PERF_STRICT=1）只做一个很宽松的「灾难性回归」哨兵断言
+// （≤500ms，约为预算的 10 倍），并且无条件打印样本，方便任何人本地复现真实数值；
+// 只有显式设置 `PERF_STRICT=1`（例如 `PERF_STRICT=1 vitest run
+// ReviewEditor.perf.test.tsx`）时才按 SC-007 的 50ms 预算严格断言。
+const PERF_STRICT = process.env.PERF_STRICT === '1';
+const SANITY_CEILING_MS = 500;
+
+function logAndAssertBudget(label: string, medianMs: number, samplesMs: number[]) {
+  const samplesText = samplesMs.map((v) => v.toFixed(2)).join(', ');
+  // eslint-disable-next-line no-console -- 有意的、无条件的性能样本输出（Minor 1）。
+  console.log(
+    `[T079 perf][${label}] jsdom median=${medianMs.toFixed(2)}ms samples(ms)=${samplesText} ` +
+      `(strict=${PERF_STRICT}, strict threshold=${KEYSTROKE_THRESHOLD_MS}ms, sanity ceiling=${SANITY_CEILING_MS}ms)`,
+  );
+  if (PERF_STRICT) {
+    expect(medianMs, `samples(ms)=${samplesText}`).toBeLessThanOrEqual(KEYSTROKE_THRESHOLD_MS);
+  } else {
+    expect(medianMs, `samples(ms)=${samplesText}`).toBeLessThanOrEqual(SANITY_CEILING_MS);
+  }
+}
+
 describe('ReviewEditor perf — SC-007 2000-line single keystroke redraw', () => {
   it('recomputes and commits a single keystroke on an unchanged row within budget', () => {
     const { base, current } = buildLargeDocPair();
@@ -160,9 +194,7 @@ describe('ReviewEditor perf — SC-007 2000-line single keystroke redraw', () =>
 
     const { medianMs, samplesMs } = measureKeystrokeMedianMs(container, unchangedLi);
 
-    expect(medianMs, `samples(ms)=${samplesMs.map((v) => v.toFixed(2)).join(', ')}`).toBeLessThanOrEqual(
-      KEYSTROKE_THRESHOLD_MS,
-    );
+    logAndAssertBudget('li=1004', medianMs, samplesMs);
   });
 
   it('stays within budget for a second, independent row', () => {
@@ -181,8 +213,6 @@ describe('ReviewEditor perf — SC-007 2000-line single keystroke redraw', () =>
 
     const { medianMs, samplesMs } = measureKeystrokeMedianMs(container, unchangedLi);
 
-    expect(medianMs, `samples(ms)=${samplesMs.map((v) => v.toFixed(2)).join(', ')}`).toBeLessThanOrEqual(
-      KEYSTROKE_THRESHOLD_MS,
-    );
+    logAndAssertBudget('li=1506', medianMs, samplesMs);
   });
 });

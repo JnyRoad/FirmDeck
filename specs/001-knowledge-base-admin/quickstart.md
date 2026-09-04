@@ -21,6 +21,9 @@ backend/.venv/bin/ruff check backend
 npm --prefix frontend-enterprise run i18n:check
 npm --prefix frontend-enterprise test -- knowledge-admin
 npm --prefix frontend-enterprise run build
+# T079 SC-007 严格性能门禁（≤50ms 单次按键重绘）：jsdom 计时受宿主机负载影响，
+# 默认门禁只跑宽松哨兵断言；要按 SC-007 阈值严格校验，显式加 PERF_STRICT=1：
+PERF_STRICT=1 npm --prefix frontend-enterprise test -- src/pages/knowledge-admin/review/ReviewEditor.perf.test.tsx
 ```
 
 ## 端到端场景（按 spec 用户故事，`zh-CN` 与 `en-US` 各跑一遍）
