@@ -286,6 +286,24 @@ describe('KnowledgeAdminDetailPage', () => {
     expect(await screen.findByText(/2 个进行中的草稿/)).toBeTruthy();
   });
 
+  it('keeps the page usable and shows an "unknown draft count" warning when listVersions fails', async () => {
+    const user = userEvent.setup();
+    mockApi.getKnowledgeBase.mockResolvedValue(sharedKb);
+    mockApi.listVersions.mockRejectedValue(new Error('network error'));
+    renderDetail('/enterprise/knowledge-admin/kb_shared_1?tab=settings');
+
+    // The page itself still renders fully — a listVersions failure must not look like a
+    // whole-page load failure (no generic "failed to load" toast/state takes over).
+    await screen.findByText('基本信息');
+    await screen.findByText('危险区');
+    await waitFor(() => expect(mockApi.listVersions).toHaveBeenCalledWith('kb_shared_1'));
+
+    await user.click(screen.getByRole('button', { name: '删除' }));
+
+    expect(await screen.findByText(/未能确认该知识库是否还有进行中的草稿/)).toBeTruthy();
+    expect(screen.queryByText(/个进行中的草稿/)).toBeNull();
+  });
+
   it('does not fetch versions or show a draft warning for a dedicated kb', async () => {
     const user = userEvent.setup();
     mockApi.getKnowledgeBase.mockResolvedValue(dedicatedKb);

@@ -21,6 +21,8 @@ export type SettingsTabProps = {
   kb: KnowledgeBaseRead;
   /** 进行中草稿数，透传给删除确认对话框；私有库分支恒为 0。 */
   draftCount: number;
+  /** 草稿数未能成功获取（`listVersions` 单独失败）；透传给删除确认对话框，展示"无法确认"。 */
+  draftCountUnknown?: boolean;
   /** 名称/描述/能力范围保存或上线状态切换成功后回调，携带后端返回的最新知识库。 */
   onUpdated: (kb: KnowledgeBaseRead) => void;
   /** 删除成功后回调，由详情页负责跳回列表。 */
@@ -30,7 +32,7 @@ export type SettingsTabProps = {
 const CARD_CLASS = 'rounded-[14px] border-[0.5px] border-[#e3e7f1] bg-white p-[20px]';
 
 /** 基本信息 / 上线状态 / 危险区三张卡片；每张卡片内部各自管理保存态，互不阻塞。 */
-export function SettingsTab({ api, kb, draftCount, onUpdated, onDeleted }: SettingsTabProps) {
+export function SettingsTab({ api, kb, draftCount, draftCountUnknown = false, onUpdated, onDeleted }: SettingsTabProps) {
   const { t } = useAppIntl();
   const [name, setName] = useState(kb.name);
   const [description, setDescription] = useState(kb.description || '');
@@ -183,6 +185,7 @@ export function SettingsTab({ api, kb, draftCount, onUpdated, onDeleted }: Setti
         onOpenChange={setDeleteOpen}
         name={kb.name}
         draftCount={draftCount}
+        draftCountUnknown={draftCountUnknown}
         loading={deleting}
         onConfirm={() => void confirmDelete()}
       />

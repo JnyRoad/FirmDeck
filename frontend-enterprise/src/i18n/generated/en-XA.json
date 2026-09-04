@@ -2443,6 +2443,7 @@
   "knowledgeAdmin.dialogs.delete.cancel": "⟦Çååñçééŀ⟧",
   "knowledgeAdmin.dialogs.delete.confirm": "⟦Ðééŀééŧéé⟧",
   "knowledgeAdmin.dialogs.delete.description": "⟦Ŧħîîš ååçŧîîööñ çååññööŧ ƀéé ûûñðööñéé. ÅÅŀŀ ðööçûûṁééñŧš ååñð ṽééŕšîîööñš îîñ ŧħîîš ķñööŵŀééðĝéé ƀååšéé ŵîîŀŀ ƀéé þééŕṁååñééñŧŀý ŕééṁööṽééð.⟧",
+  "knowledgeAdmin.dialogs.delete.draftCountUnknown": "⟦Ŵéé çööûûŀð ñööŧ çööñƒîîŕṁ ŵħééŧħééŕ ŧħîîš ķñööŵŀééðĝéé ƀååšéé ħååš ðŕååƒŧš îîñ þŕööĝŕééšš. Þŕööçééééð ŵîîŧħ çååûûŧîîööñ.⟧",
   "knowledgeAdmin.dialogs.delete.draftWarning": "⟦Ŧħîîš ķñööŵŀééðĝéé ƀååšéé ħååš {count} ðŕååƒŧ(š) îîñ þŕööĝŕééšš. Ŧħééý ŵîîŀŀ ååŀšöö ƀéé ðééŀééŧééð.⟧",
   "knowledgeAdmin.dialogs.delete.title": "⟦Ðééŀééŧéé ķñööŵŀééðĝéé ƀååšéé “{name}”?⟧",
   "knowledgeAdmin.list.actions.create": "⟦Ñééŵ ķñööŵŀééðĝéé ƀååšéé⟧",

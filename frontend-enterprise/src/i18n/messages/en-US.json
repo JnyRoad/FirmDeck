@@ -2443,6 +2443,7 @@
   "knowledgeAdmin.dialogs.delete.cancel": "Cancel",
   "knowledgeAdmin.dialogs.delete.confirm": "Delete",
   "knowledgeAdmin.dialogs.delete.description": "This action cannot be undone. All documents and versions in this knowledge base will be permanently removed.",
+  "knowledgeAdmin.dialogs.delete.draftCountUnknown": "We could not confirm whether this knowledge base has drafts in progress. Proceed with caution.",
   "knowledgeAdmin.dialogs.delete.draftWarning": "This knowledge base has {count} draft(s) in progress. They will also be deleted.",
   "knowledgeAdmin.dialogs.delete.title": "Delete knowledge base “{name}”?",
   "knowledgeAdmin.list.actions.create": "New knowledge base",

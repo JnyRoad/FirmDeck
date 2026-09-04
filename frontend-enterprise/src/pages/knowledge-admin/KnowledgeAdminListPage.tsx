@@ -6,7 +6,7 @@
  * `api/knowledgeAdmin.ts`。
  */
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 
 import { createKnowledgeAdminApi } from '@/api/knowledgeAdmin';
@@ -104,6 +104,12 @@ export default function KnowledgeAdminListPage({ currentUser, onLogout }: Knowle
   const [deleting, setDeleting] = useState(false);
   const [conversionState, setConversionState] = useState<{ kb: KnowledgeBaseRead; agentId: string } | null>(null);
 
+  // 每类请求各自的递增序号；只有仍是"当前最新一次"的响应才会落到 state 上，防止筛选/页签快速
+  // 切换时旧请求晚于新请求返回，把已经过期的数据覆盖回去（`isCurrentGeneration` 只保护跨租户/
+  // 跨登录会话的场景，不感知同一会话内筛选态的变化，所以需要单独加这层）。
+  const listRequestSeqRef = useRef(0);
+  const summaryRequestSeqRef = useRef(0);
+
   function updateFilter<K extends keyof KnowledgeAdminListFilters>(key: K, value: KnowledgeAdminListFilters[K]) {
     setFilters((prev) => ({ ...prev, [key]: value }));
   }
@@ -120,6 +126,7 @@ export default function KnowledgeAdminListPage({ currentUser, onLogout }: Knowle
     const context = tenantContext;
     const generation = context?.generation;
     if (!context || generation === undefined) return;
+    const seq = ++listRequestSeqRef.current;
     setLoading(true);
     try {
       const listResult = await api.listKnowledgeBases({
@@ -130,13 +137,13 @@ export default function KnowledgeAdminListPage({ currentUser, onLogout }: Knowle
         q: filters.q,
         limit: 20,
       });
-      if (!context.isCurrentGeneration(generation)) return;
+      if (!context.isCurrentGeneration(generation) || listRequestSeqRef.current !== seq) return;
       setItems(sortKnowledgeAdminListItems(Array.isArray(listResult?.items) ? listResult.items : []));
     } catch (error) {
-      if (!context.isCurrentGeneration(generation)) return;
+      if (!context.isCurrentGeneration(generation) || listRequestSeqRef.current !== seq) return;
       notify.error(knowledgeAdminErrorMessage(error, 'knowledgeAdmin.toast.loadFailed', { t }));
     } finally {
-      if (context.isCurrentGeneration(generation)) setLoading(false);
+      if (context.isCurrentGeneration(generation) && listRequestSeqRef.current === seq) setLoading(false);
     }
   }
 
@@ -148,6 +155,7 @@ export default function KnowledgeAdminListPage({ currentUser, onLogout }: Knowle
     const context = tenantContext;
     const generation = context?.generation;
     if (!context || generation === undefined) return;
+    const seq = ++summaryRequestSeqRef.current;
     try {
       const result = await api.listKnowledgeBases({
         status: toApiFilterValue(filters.status) as 'active' | 'archived' | undefined,
@@ -156,10 +164,10 @@ export default function KnowledgeAdminListPage({ currentUser, onLogout }: Knowle
         q: filters.q,
         limit: 1,
       });
-      if (!context.isCurrentGeneration(generation)) return;
+      if (!context.isCurrentGeneration(generation) || summaryRequestSeqRef.current !== seq) return;
       setSummary(result?.summary ?? EMPTY_SUMMARY);
     } catch (error) {
-      if (!context.isCurrentGeneration(generation)) return;
+      if (!context.isCurrentGeneration(generation) || summaryRequestSeqRef.current !== seq) return;
       notify.error(knowledgeAdminErrorMessage(error, 'knowledgeAdmin.toast.loadFailed', { t }));
     }
   }

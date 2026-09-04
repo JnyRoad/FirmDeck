@@ -197,6 +197,15 @@ function mockListKnowledgeBases(items: KnowledgeAdminListItem[] = ALL_ITEMS) {
   });
 }
 
+/** Externally-resolvable promise; lets a test control exactly when a mocked request settles. */
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((res) => {
+    resolve = res;
+  });
+  return { promise, resolve };
+}
+
 function primeDefaultMocks(items: KnowledgeAdminListItem[] = ALL_ITEMS) {
   mockListKnowledgeBases(items);
   mockApi.listAgents.mockResolvedValue(agents);
@@ -280,6 +289,66 @@ describe('KnowledgeAdminListPage', () => {
     // so the "shared" tab keeps showing 2 even while the "dedicated" tab is active.
     expect(screen.getByRole('tab', { name: /^共享/ }).textContent).toContain('2');
     expect(screen.getByRole('tab', { name: /^全部/ }).textContent).toContain('3');
+  });
+
+  it('discards a stale loadList response that resolves after a newer one (race protection)', async () => {
+    const user = userEvent.setup();
+    mockApi.listAgents.mockResolvedValue(agents);
+    mockApi.listBindableTeams.mockResolvedValue([{ id: 'team_1', name: '客服一组', member_count: 5 }]);
+
+    const tableCalls: Array<{ params: MockListParams; response: ReturnType<typeof deferred<KnowledgeAdminListResponse>> }> = [];
+    mockApi.listKnowledgeBases.mockImplementation(async (params: MockListParams = {}) => {
+      // Summary requests (limit=1) are irrelevant to this race and resolve immediately so they
+      // never block the assertions below.
+      if (params.limit === 1) {
+        return {
+          items: [],
+          summary: summarize(ALL_ITEMS),
+          total: 0,
+          offset: 0,
+          limit: 1,
+          has_more: false,
+        } satisfies KnowledgeAdminListResponse;
+      }
+      const entry = { params, response: deferred<KnowledgeAdminListResponse>() };
+      tableCalls.push(entry);
+      return entry.response.promise;
+    });
+
+    renderPage();
+    await waitFor(() => expect(tableCalls.length).toBe(1)); // initial mount table request, still pending
+
+    await user.click(screen.getByRole('tab', { name: /^专用/ }));
+    await waitFor(() => expect(tableCalls.length).toBe(2)); // tab switch fires a second, newer table request
+
+    // Resolve the NEWER (second) request first, as if the older one is simply slower.
+    tableCalls[1].response.resolve({
+      items: [dedicated],
+      summary: summarize([dedicated]),
+      total: 1,
+      offset: 0,
+      limit: 20,
+      has_more: false,
+    });
+    await waitFor(() => expect(screen.getByText('客服话术库')).toBeTruthy());
+    expect(screen.queryByText('产品 FAQ 共享库')).toBeNull();
+
+    // Now resolve the OLDER (first, now-stale) request — without the sequence guard this would
+    // silently overwrite the table with the pre-filter (all-modes) rows.
+    tableCalls[0].response.resolve({
+      items: [sharedBound, sharedUnbound, dedicated],
+      summary: summarize([sharedBound, sharedUnbound, dedicated]),
+      total: 3,
+      offset: 0,
+      limit: 20,
+      has_more: false,
+    });
+
+    // Give the stale resolution a tick to (wrongly) apply if the guard were missing, then assert
+    // the dedicated-only view from the newer request is still what's shown.
+    await new Promise((resolve) => { setTimeout(resolve, 50); });
+    expect(screen.queryByText('产品 FAQ 共享库')).toBeNull();
+    expect(screen.getByText('客服话术库')).toBeTruthy();
   });
 
   it('re-fetches with the owner filter in the query params', async () => {

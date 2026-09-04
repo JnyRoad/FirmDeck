@@ -55,6 +55,8 @@ export default function KnowledgeAdminDetailPage({ currentUser, onLogout }: Know
   const [loading, setLoading] = useState(false);
   /** 设置 Tab 删除确认展示的进行中草稿数；私有库分支没有独立草稿概念，恒为 0。 */
   const [draftCount, setDraftCount] = useState(0);
+  /** 草稿数是否未知（`listVersions` 单独失败）；与 `draftCount` 分开，避免把失败悄悄当成 0。 */
+  const [draftCountUnknown, setDraftCountUnknown] = useState(false);
 
   async function load() {
     const context = tenantContext;
@@ -66,12 +68,22 @@ export default function KnowledgeAdminDetailPage({ currentUser, onLogout }: Know
       if (!context.isCurrentGeneration(generation)) return;
       setKb(result);
       if (result.mode === 'shared') {
-        // 版本 Tab（占位中）本来就需要这份数据；这里顺带算出未发布草稿数供设置 Tab 的删除确认使用。
-        const versions = await api.listVersions(kbId);
-        if (!context.isCurrentGeneration(generation)) return;
-        setDraftCount(versions.filter((version) => version.publication_state === PublicationState.Draft).length);
+        // 版本 Tab（占位中）本来就需要这份数据；这里顺带算出未发布草稿数供设置 Tab 的删除确认
+        // 使用。单独包一层 try/catch：这一步失败不应触发上面 `detail.loadError` 那条"详情加载
+        // 失败"的提示（详情本身已经加载成功、页面仍可用），也不应悄悄把草稿数按 0 处理——只标
+        // 成"未知"，交给删除确认对话框自己的文案说明。
+        try {
+          const versions = await api.listVersions(kbId);
+          if (!context.isCurrentGeneration(generation)) return;
+          setDraftCount(versions.filter((version) => version.publication_state === PublicationState.Draft).length);
+          setDraftCountUnknown(false);
+        } catch {
+          if (!context.isCurrentGeneration(generation)) return;
+          setDraftCountUnknown(true);
+        }
       } else {
         setDraftCount(0);
+        setDraftCountUnknown(false);
       }
     } catch (error) {
       if (!context.isCurrentGeneration(generation)) return;
@@ -165,7 +177,14 @@ export default function KnowledgeAdminDetailPage({ currentUser, onLogout }: Know
             {tabs.map((tabKey) => (
               <TabsContent key={tabKey} value={tabKey} className="mt-[16px]">
                 {tabKey === 'settings' ? (
-                  <SettingsTab api={api} kb={kb} draftCount={draftCount} onUpdated={handleUpdated} onDeleted={handleDeleted} />
+                  <SettingsTab
+                    api={api}
+                    kb={kb}
+                    draftCount={draftCount}
+                    draftCountUnknown={draftCountUnknown}
+                    onUpdated={handleUpdated}
+                    onDeleted={handleDeleted}
+                  />
                 ) : (
                   <PlaceholderTab />
                 )}

@@ -2443,6 +2443,7 @@
   "knowledgeAdmin.dialogs.delete.cancel": "取消",
   "knowledgeAdmin.dialogs.delete.confirm": "删除",
   "knowledgeAdmin.dialogs.delete.description": "此操作不可撤销，该知识库的全部文档与版本都将被永久删除。",
+  "knowledgeAdmin.dialogs.delete.draftCountUnknown": "未能确认该知识库是否还有进行中的草稿，请谨慎操作。",
   "knowledgeAdmin.dialogs.delete.draftWarning": "该知识库还有 {count} 个进行中的草稿，将一并删除。",
   "knowledgeAdmin.dialogs.delete.title": "删除知识库「{name}」？",
   "knowledgeAdmin.list.actions.create": "新建知识库",
