@@ -12,6 +12,7 @@
  * 编辑（FR-044 只要求整篇拒绝/恢复，不要求这两类文档本身可编辑）。
  */
 import {
+  memo,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -19,6 +20,7 @@ import {
   useRef,
   useState,
   type ClipboardEvent as ReactClipboardEvent,
+  type FormEvent as ReactFormEvent,
   type KeyboardEvent as ReactKeyboardEvent,
 } from 'react';
 import { Button } from '@/components/ui';
@@ -245,6 +247,61 @@ function plainHtml(text: string): string {
   return innerHtml([{ type: '=', text }], '-');
 }
 
+interface EqualRowStagedBadge {
+  canUnstage: boolean;
+  onUnstage: () => void;
+  stagedLabel: string;
+  unacceptLabel: string;
+}
+
+interface EqualRowProps {
+  li: number;
+  text: string;
+  stagedBadge: EqualRowStagedBadge | null;
+}
+
+/**
+ * T079 性能优化：未改动的上下文行（`=`）单独抽成 `React.memo` 组件。
+ *
+ * 一篇 2000 行文档里，绝大多数行（本任务的 2000 行/约 10% 差异 fixture 下约
+ * 90%）是未改动的 `=` 行；此前它们和 `-`/`+` 行一起内联在
+ * `ModifiedDocumentEditor` 的单个 `.map()` 里，每次按键都会为全部行重新创建
+ * React element 并走一遍 reconcile（哪怕最终因为 `dangerouslySetInnerHTML` 的
+ * `__html` 字符串值相等而跳过真正的 DOM 写入，创建 element/走 reconcile 本身
+ * 在 2000+ 行规模下已经是主要耗时来源之一，见 task-T079-report.md 的剖析记录）。
+ * 未暂存（`stagedBadge` 为 `null`，键入过程中的常态）时全部 props 都是原始值
+ * （`li`/`text`/`null`），`memo` 默认浅比较即可在内容不变时整行跳过、连组件函数
+ * 都不再调用；已暂存的行仍会每次重建一个新的 `stagedBadge` 对象，退化为不走
+ * 快路径但正确性不受影响——只是那部分（占比很小）行拿不到这份优化。
+ */
+const EqualRow = memo(function EqualRow({ li, text, stagedBadge }: EqualRowProps) {
+  return (
+    <div className={cn('er flex items-start gap-2 px-3 py-0.5', stagedBadge && 'bg-emerald-50/60')}>
+      <div
+        className="et flex-1 whitespace-pre-wrap outline-none"
+        contentEditable
+        suppressContentEditableWarning
+        data-li={li}
+        dangerouslySetInnerHTML={{ __html: plainHtml(text) }}
+      />
+      {stagedBadge && (
+        <span className="flex shrink-0 items-center gap-1 text-xs text-emerald-600">
+          <span aria-hidden="true">{stagedBadge.stagedLabel}</span>
+          <button
+            type="button"
+            contentEditable={false}
+            className="underline"
+            disabled={!stagedBadge.canUnstage}
+            onClick={stagedBadge.onUnstage}
+          >
+            {stagedBadge.unacceptLabel}
+          </button>
+        </span>
+      )}
+    </div>
+  );
+});
+
 const DOC_KIND_BADGE_CLASS: Record<ReviewEditorDocumentInput['kind'], string> = {
   added: 'bg-amber-100 text-amber-800',
   modified: 'bg-blue-100 text-blue-700',
@@ -309,9 +366,37 @@ function ModifiedDocumentEditor({ doc, state, labels, onStagingChange }: Modifie
     onStagingChange((s) => ({ ...s, lines }));
   }
 
-  /** `input` 事件处理：组合期忽略（不重绘），否则整篇重算。 */
-  function handleInput() {
+  /**
+   * `input` 事件的单行快路径：浏览器原生 contenteditable 插入永远只改动事件目标
+   * 那一个 `.et` 行元素（此时其它行的 DOM textContent 必然仍与 `state.lines`
+   * 一致，因为它们上一次提交后就没再被用户编辑过），所以不需要
+   * `readAllLines()` 用 `querySelectorAll` 重新扫描并读出全部行——那是 T079
+   * 性能剖析定位到的主要瓶颈之一（2000 行文档下单次约 40-65ms，见
+   * task-T079-report.md），直接拖满 SC-007 的单次按键 50ms 预算。只替换事件目标
+   * 那一行、其余 `lines` 原样复用，等价于整篇重算的结果，但省掉了对其余
+   * 1900+ 行的 DOM 读取。跨行操作（Enter 拆行、Backspace/Delete 合并、跨行选区
+   * 替换、粘贴）已经在 keydown/paste 阶段被 `insertTextAtRange`/`mergeWith*`
+   * 接管、不会走到这里；这里只覆盖"单行内浏览器原生插入"这一种输入来源。
+   * 任何不满足前提（事件目标不是本容器内某一行 `.et` 元素）的情况一律回退到
+   * `syncFromDom()` 整篇重算，行为与优化前完全一致。
+   */
+  function handleSingleRowInput(target: HTMLElement): boolean {
+    if (!target.classList.contains('et') || target.dataset.li === undefined) return false;
+    const li = Number(target.dataset.li);
+    if (!Number.isInteger(li) || li < 0 || li >= state.lines.length) return false;
+    const container = containerRef.current;
+    if (!container) return false;
+    const newLines = state.lines.slice();
+    newLines[li] = target.textContent ?? '';
+    const caret = getCaretPosition(container);
+    applyLines(newLines, caret ?? undefined);
+    return true;
+  }
+
+  /** `input` 事件处理：组合期忽略（不重绘）；单行原生插入走快路径，其余整篇重算。 */
+  function handleInput(e: ReactFormEvent<HTMLDivElement>) {
     if (composingRef.current) return;
+    if (handleSingleRowInput(e.target as HTMLElement)) return;
     syncFromDom();
   }
 
@@ -531,31 +616,16 @@ function ModifiedDocumentEditor({ doc, state, labels, onStagingChange }: Modifie
               (rec) => row.bi >= rec.pos && row.bi < rec.pos + rec.added.length,
             );
             const isStagedFirstRow = !!stagedRecord && row.bi === stagedRecord.pos;
-            return (
-              <div key={index} className={cn('er flex items-start gap-2 px-3 py-0.5', stagedRecord && 'bg-emerald-50/60')}>
-                <div
-                  className="et flex-1 whitespace-pre-wrap outline-none"
-                  contentEditable
-                  suppressContentEditableWarning
-                  data-li={row.li}
-                  dangerouslySetInnerHTML={{ __html: plainHtml(row.text) }}
-                />
-                {isStagedFirstRow && stagedRecord && (
-                  <span className="flex shrink-0 items-center gap-1 text-xs text-emerald-600">
-                    <span aria-hidden="true">{labels.stagedBadge}</span>
-                    <button
-                      type="button"
-                      contentEditable={false}
-                      className="underline"
-                      disabled={!canUnstage(state, stagedRecord.id)}
-                      onClick={() => handleUnstageRecord(stagedRecord.id)}
-                    >
-                      {labels.unacceptButton}
-                    </button>
-                  </span>
-                )}
-              </div>
-            );
+            const stagedBadge: EqualRowStagedBadge | null =
+              isStagedFirstRow && stagedRecord
+                ? {
+                    canUnstage: canUnstage(state, stagedRecord.id),
+                    onUnstage: () => handleUnstageRecord(stagedRecord.id),
+                    stagedLabel: labels.stagedBadge,
+                    unacceptLabel: labels.unacceptButton,
+                  }
+                : null;
+            return <EqualRow key={index} li={row.li} text={row.text} stagedBadge={stagedBadge} />;
           }
 
           if (row.t === '-') {
