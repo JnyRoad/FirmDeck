@@ -174,14 +174,16 @@ class SharedKnowledgeTeamRead(BaseModel):
 
 class SharedKnowledgeDraftCreateRequest(BaseModel):
     tenant_id: str
-    team_id: str
+    # team_id 为空时要求调用者是租户管理员（require_team_knowledge_manager 旁路），
+    # 用于治理未绑定任何团队的共享库。
+    team_id: str | None = None
     change_reason: NonEmptyText
     expected_published_version_id: str | None = None
 
 
 class SharedKnowledgePublishRequest(BaseModel):
     tenant_id: str
-    team_id: str
+    team_id: str | None = None
     expected_published_version_id: NonEmptyText
     change_reason: NonEmptyText
     # 保持 str 而非 Literal：非法值必须经由领域校验映射为
@@ -194,14 +196,14 @@ class SharedKnowledgePublishRequest(BaseModel):
 
 class SharedKnowledgeRejectRequest(BaseModel):
     tenant_id: str
-    team_id: str
+    team_id: str | None = None
     change_reason: NonEmptyText
     idempotency_key: str | None = None
 
 
 class SharedKnowledgeRollbackRequest(BaseModel):
     tenant_id: str
-    team_id: str
+    team_id: str | None = None
     target_version_id: NonEmptyText
     expected_published_version_id: NonEmptyText
     change_reason: NonEmptyText

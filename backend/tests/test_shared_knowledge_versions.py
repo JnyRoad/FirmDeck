@@ -515,6 +515,9 @@ def test_reject_preserves_draft_and_rollback_only_moves_global_pointer() -> None
         assert rollback_event.details_json == {
             "previous_published_version_id": accepted.id,
             "target_version_id": original.id,
+            # T019：审计新增 actor_context，区分租户管理员旁路（tenant_admin）与
+            # 团队路径（team）；此处 source_team_id 为 "team_content"，因此是 team。
+            "actor_context": "team",
         }
 
 

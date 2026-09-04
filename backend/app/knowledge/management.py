@@ -23,24 +23,56 @@ from app.security.permissions import is_admin_user
 
 @dataclass(frozen=True)
 class SharedKnowledgeManagementContext:
-    """已校验的人类团队、共享知识库及绑定组合。"""
+    """已校验的人类团队、共享知识库及绑定组合；管理员旁路下 team/binding 均为空。"""
 
-    team: Team
+    team: Team | None
     knowledge_base: KnowledgeBase
-    binding: TeamKnowledgeBaseBinding
+    binding: TeamKnowledgeBaseBinding | None
+
+
+def _require_shared_base(
+    db: Session, *, tenant_id: str, knowledge_base_id: str
+) -> KnowledgeBase:
+    """校验共享知识库存在、属于该租户且处于活跃可写状态。"""
+    base = db.get(KnowledgeBase, knowledge_base_id)
+    if base is None or base.tenant_id != tenant_id or base.status != "active":
+        raise knowledge_error(KNOWLEDGE_CONTEXT_MISMATCH)
+    if base.mode != "shared":
+        raise knowledge_error(KNOWLEDGE_MODE_INVALID)
+    return base
 
 
 def require_team_knowledge_manager(
     db: Session,
     *,
     tenant_id: str,
-    team_id: str,
+    team_id: str | None,
     knowledge_base_id: str,
     current_user: User,
 ) -> SharedKnowledgeManagementContext:
-    """要求同租户团队所有者或管理员通过活动绑定管理共享知识。"""
+    """要求同租户团队所有者/管理员通过活动绑定管理共享知识；
+
+    未传 team_id 时，仅租户管理员可直接治理未绑定任何团队的共享库
+    （管理员本就是团队所有者权限的超集，见 management.py 内 is_admin_user 用法）。
+    """
     if current_user.tenant_id != tenant_id:
         raise knowledge_error(KNOWLEDGE_CONTEXT_MISMATCH)
+
+    if team_id is None:
+        if not is_admin_user(current_user):
+            raise knowledge_error(
+                KNOWLEDGE_GRANT_REQUIRED,
+                message="未指定团队时，只有租户管理员可以管理共享知识库。",
+            )
+        base = _require_shared_base(
+            db, tenant_id=tenant_id, knowledge_base_id=knowledge_base_id
+        )
+        return SharedKnowledgeManagementContext(
+            team=None,
+            knowledge_base=base,
+            binding=None,
+        )
+
     team = db.get(Team, team_id)
     if team is None or team.tenant_id != tenant_id or team.status != "active":
         raise knowledge_error(KNOWLEDGE_CONTEXT_MISMATCH)
@@ -49,11 +81,7 @@ def require_team_knowledge_manager(
             KNOWLEDGE_GRANT_REQUIRED,
             message="只有团队所有者或管理员可以维护团队共享知识库。",
         )
-    base = db.get(KnowledgeBase, knowledge_base_id)
-    if base is None or base.tenant_id != tenant_id or base.status != "active":
-        raise knowledge_error(KNOWLEDGE_CONTEXT_MISMATCH)
-    if base.mode != "shared":
-        raise knowledge_error(KNOWLEDGE_MODE_INVALID)
+    base = _require_shared_base(db, tenant_id=tenant_id, knowledge_base_id=knowledge_base_id)
     binding = db.exec(
         select(TeamKnowledgeBaseBinding).where(
             TeamKnowledgeBaseBinding.tenant_id == tenant_id,

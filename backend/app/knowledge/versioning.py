@@ -33,6 +33,11 @@ VersionLevel = Literal["patch", "minor", "major"]
 _VERSION_LEVELS: tuple[str, ...] = ("patch", "minor", "major")
 
 
+def _actor_context(source_team_id: str | None) -> str:
+    """审计口径：来源团队为空即为租户管理员旁路，否则为团队路径。"""
+    return "team" if source_team_id else "tenant_admin"
+
+
 def _required_reason(value: str | None) -> str:
     """返回非空变更原因，避免无说明的共享知识生命周期变更。"""
     reason = str(value or "").strip()
@@ -225,6 +230,7 @@ class SharedKnowledgeVersionService:
                 "parent_version_id": parent.id,
                 "version": draft.version,
                 "provenance": provenance,
+                "actor_context": _actor_context(source_team_id),
             },
             idempotency_key=idempotency_key,
             request_payload=request_payload,
@@ -489,6 +495,7 @@ class SharedKnowledgeVersionService:
                 "published_version_id": draft.id,
                 "draft_name": draft_name,
                 "version_level": level,
+                "actor_context": _actor_context(source_team_id),
             },
             idempotency_key=idempotency_key,
             request_payload=request_payload,
@@ -536,7 +543,10 @@ class SharedKnowledgeVersionService:
             actor_id=actor_id,
             action="draft_rejected",
             reason=reason,
-            details={"draft_version_id": draft.id},
+            details={
+                "draft_version_id": draft.id,
+                "actor_context": _actor_context(source_team_id),
+            },
             idempotency_key=idempotency_key,
             request_payload=request_payload,
             durable_result={
@@ -604,6 +614,7 @@ class SharedKnowledgeVersionService:
             details={
                 "previous_published_version_id": expected_published_version_id,
                 "target_version_id": target.id,
+                "actor_context": _actor_context(source_team_id),
             },
             idempotency_key=idempotency_key,
             request_payload=request_payload,
