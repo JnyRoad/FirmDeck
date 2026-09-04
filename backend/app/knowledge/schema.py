@@ -616,3 +616,14 @@ class KnowledgeRebaseResultRead(BaseModel):
     status: Literal["applied"] = "applied"
     new_version: KnowledgeBaseVersionRead
     superseded_version_id: str
+
+
+class KnowledgeDraftReviewRequest(BaseModel):
+    """A5 `POST .../versions/{version_id}/review` 请求体：写入草稿审阅状态。"""
+
+    tenant_id: str
+    team_id: str | None = None
+    staged: int = Field(ge=0)
+    pending: int = Field(ge=0)
+    documents_adjusted: int = Field(ge=0)
+    expected_updated_at: NonEmptyText

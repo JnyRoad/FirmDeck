@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 from collections.abc import Sequence
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 from sqlalchemy.exc import IntegrityError
@@ -145,6 +146,27 @@ def _safe_source_filename(value: str | None) -> str:
             message="filename 必须是安全的单层文件名。",
         )
     return filename
+
+
+def _parse_expected_updated_at(value: str) -> datetime:
+    """把请求体里的 ISO 时间字符串解析为可比较的 naive UTC 时间，容忍 `Z` 或显式偏移写法。
+
+    与 `KnowledgeBaseVersion.updated_at`（`utc_now()` 产出的 naive UTC）保持同一口径，
+    解析失败一律视为版本已变化（`KNOWLEDGE_PUBLISH_CONFLICT`），而不是泄漏校验细节。
+    """
+    normalized = str(value or "").strip()
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise knowledge_error(
+            KNOWLEDGE_PUBLISH_CONFLICT,
+            message="审阅版本标识无效，请刷新后重试。",
+        ) from exc
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(UTC).replace(tzinfo=None)
+    return parsed
 
 
 class SharedKnowledgeVersionService:
@@ -697,6 +719,100 @@ class SharedKnowledgeVersionService:
             },
         )
         return target
+
+    def record_review(
+        self,
+        *,
+        tenant_id: str,
+        knowledge_base_id: str,
+        draft_version_id: str,
+        staged: int,
+        pending: int,
+        documents_adjusted: int,
+        expected_updated_at: str,
+        actor_type: str,
+        actor_id: str,
+        source_team_id: str | None,
+        idempotency_key: str | None = None,
+        request_payload: Any = None,
+        language_context: LanguageContext | None = None,
+    ) -> KnowledgeBaseVersion:
+        """把审阅编辑器的暂存/待处理统计写入草稿 `metadata_json.review`（A5）。
+
+        `expected_updated_at` 是审阅编辑器打开草稿时看到的 `updated_at` 快照，与草稿
+        当前值不一致（他人并发改动）即拒绝为 `KNOWLEDGE_PUBLISH_CONFLICT`；非草稿状态
+        按 A5 契约抛出 `KNOWLEDGE_VERSION_NOT_READY`（不同于 `require_writable_draft`
+        默认的 `KNOWLEDGE_MODE_INVALID`，此处需要单独判断以匹配契约错误码）。写入本身
+        只整体重新赋值 `metadata_json`（JSON 列需要整体替换才能持久化），并同步推进
+        `updated_at`，使该次写入成为下一次审阅写回的新乐观锁基线。
+        """
+        self._shared_base(tenant_id, knowledge_base_id)
+        draft = self._version(tenant_id, knowledge_base_id, draft_version_id)
+        if draft.publication_state != "draft":
+            raise knowledge_error(
+                KNOWLEDGE_VERSION_NOT_READY,
+                details={"knowledge_base_version_id": draft.id},
+            )
+        expected = _parse_expected_updated_at(expected_updated_at)
+        if expected != draft.updated_at:
+            raise knowledge_error(
+                KNOWLEDGE_PUBLISH_CONFLICT,
+                details={
+                    "knowledge_base_version_id": draft.id,
+                },
+            )
+        now = utc_now()
+        review = {
+            "staged": staged,
+            "pending": pending,
+            "documents_adjusted": documents_adjusted,
+            "reviewed_at": now.isoformat(),
+            "reviewed_by_user_id": actor_id,
+        }
+        draft.metadata_json = {
+            **dict(draft.metadata_json or {}),
+            "review": review,
+        }
+        draft.updated_at = now
+        self.db.add(draft)
+        self.audit.append_event(
+            tenant_id=tenant_id,
+            knowledge_base_id=knowledge_base_id,
+            team_id=source_team_id,
+            knowledge_base_version_id=draft.id,
+            actor_type=actor_type,
+            actor_id=actor_id,
+            action="draft_reviewed",
+            details={
+                "staged": staged,
+                "pending": pending,
+                "documents_adjusted": documents_adjusted,
+                "actor_context": _actor_context(source_team_id),
+            },
+            idempotency_key=idempotency_key,
+            request_payload=request_payload,
+            durable_result={
+                "knowledge_base_id": knowledge_base_id,
+                "draft_version_id": draft.id,
+                "staged": staged,
+                "pending": pending,
+            },
+        )
+        record_product_event(
+            EventLog(self.db),
+            event_code="knowledge.draft.reviewed",
+            tenant_id=tenant_id,
+            aggregate_type="knowledge_base_version",
+            aggregate_id=draft.id,
+            params={
+                "knowledge_base_id": knowledge_base_id,
+                "draft_name": draft.version,
+                "staged": staged,
+                "pending": pending,
+            },
+            language_context=language_context or _default_language_context(),
+        )
+        return draft
 
     def _shared_base(self, tenant_id: str, knowledge_base_id: str) -> KnowledgeBase:
         """读取同租户活动共享库，并隐藏跨租户资源存在性。"""
