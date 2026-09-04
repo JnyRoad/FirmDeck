@@ -38,10 +38,11 @@ import {
 import { cn } from '@/lib/utils';
 import type { KnowledgeAdminApi } from '@/api/knowledgeAdmin';
 import type { KnowledgeBaseRead } from '@/types';
-import type { DiffDocument, KnowledgeAdminVersionRead, VersionDiff } from '@/types/knowledgeAdmin';
+import type { DiffDocument, KnowledgeAdminVersionRead, RebaseResult, VersionDiff } from '@/types/knowledgeAdmin';
 
 import { CreateDraftDialog } from '../dialogs/CreateDraftDialog';
 import { PublishDialog, type PublishDialogSubmitInput } from '../dialogs/PublishDialog';
+import { RebaseDialog } from '../dialogs/RebaseDialog';
 import { formatVersion } from '../knowledgeAdminModel';
 import {
   ReviewEditor,
@@ -114,6 +115,9 @@ export function ContentTab({ api, kb, onChanged }: ContentTabProps) {
 
   const [publishOpen, setPublishOpen] = useState(false);
   const [publishing, setPublishing] = useState(false);
+
+  const [rebaseOpen, setRebaseOpen] = useState(false);
+  const [rebaseTarget, setRebaseTarget] = useState<KnowledgeAdminVersionRead | null>(null);
 
   const [rejectOpen, setRejectOpen] = useState(false);
   const [rejectReason, setRejectReason] = useState('');
@@ -331,6 +335,16 @@ export function ContentTab({ api, kb, onChanged }: ContentTabProps) {
     }
   }
 
+  // 变基落库（无冲突直接落库，或解决冲突后落库）后：旧草稿快照已被 `superseded_by` 替换，
+  // 关掉发布框与变基框，把视图切到新草稿快照，并重新拉取版本列表（新快照才会出现在其中）。
+  function handleRebased(result: RebaseResult) {
+    setRebaseOpen(false);
+    setPublishOpen(false);
+    setView(result.new_version.id);
+    void loadVersions();
+    onChanged?.();
+  }
+
   async function handleReject() {
     if (!currentDraft) return;
     const trimmed = rejectReason.trim();
@@ -533,6 +547,14 @@ export function ContentTab({ api, kb, onChanged }: ContentTabProps) {
               </span>
             )}
           </div>
+          {currentDraft.is_stale && (
+            <p className="text-[12px] text-[#d20b0b]">
+              {t('knowledgeAdmin.content.banner.staleNotice', {
+                published: formatVersion(kb.published_version),
+                base: formatVersion(currentDraft.base_version),
+              })}
+            </p>
+          )}
           {currentDraft.change_reason && (
             <p className="text-[12px] text-[#858b9c]">
               {t('knowledgeAdmin.content.banner.reason', { reason: currentDraft.change_reason })}
@@ -601,8 +623,20 @@ export function ContentTab({ api, kb, onChanged }: ContentTabProps) {
         draft={currentDraft}
         submitting={publishing}
         onSubmit={(input) => void handlePublish(input)}
-        onRebase={() => toastNotifier.error(createMessageDescriptor('knowledgeAdmin.dialogs.publish.rebaseNotAvailable'))}
+        onRebase={(versionId) => {
+          setRebaseTarget(versions.find((version) => version.id === versionId) ?? currentDraft);
+          setRebaseOpen(true);
+        }}
         onReview={() => openReview(true)}
+      />
+
+      <RebaseDialog
+        open={rebaseOpen}
+        onOpenChange={setRebaseOpen}
+        api={api}
+        kbId={kb.id}
+        draft={rebaseTarget}
+        onRebased={handleRebased}
       />
 
       <Dialog open={rejectOpen} onOpenChange={(next) => !rejecting && setRejectOpen(next)}>

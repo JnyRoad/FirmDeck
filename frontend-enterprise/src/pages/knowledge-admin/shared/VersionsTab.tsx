@@ -5,15 +5,14 @@
  * released 行（非当前正式版）提供「回滚到此版本」；顶部「创建草稿」。
  */
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 
 import { DataTable, type DataTableColumn } from '@/components/DataTable';
 import { Dialog, DialogContent, DialogTitle, Textarea } from '@/components/ui';
 import { Button } from '@/components/ui/button';
-import { createToastNotifier, notify } from '@/components/ui/app-toast';
+import { notify } from '@/components/ui/app-toast';
 import { useAppIntl } from '@/i18n';
-import { createMessageDescriptor } from '@/i18n/descriptors';
 import { RawIdentifier } from '@/i18n/RawContent';
 import {
   DIALOG_CANCEL_BUTTON_CLASS,
@@ -26,10 +25,11 @@ import { cn } from '@/lib/utils';
 import { PublicationState, VersionLevel } from '@/enums/knowledge';
 import type { KnowledgeAdminApi } from '@/api/knowledgeAdmin';
 import type { KnowledgeBaseRead } from '@/types';
-import type { KnowledgeAdminVersionRead } from '@/types/knowledgeAdmin';
+import type { KnowledgeAdminVersionRead, RebaseResult } from '@/types/knowledgeAdmin';
 
 import { CreateDraftDialog } from '../dialogs/CreateDraftDialog';
 import { PublishDialog, type PublishDialogSubmitInput } from '../dialogs/PublishDialog';
+import { RebaseDialog } from '../dialogs/RebaseDialog';
 import { formatVersion } from '../knowledgeAdminModel';
 import { knowledgeAdminErrorMessage } from './errorMessage';
 
@@ -48,9 +48,6 @@ const STATE_LABEL_IDS: Record<string, 'knowledgeAdmin.versions.state.draft' | 'k
 export function VersionsTab({ api, kb, onChanged }: VersionsTabProps) {
   const { t } = useAppIntl();
   const [searchParams, setSearchParams] = useSearchParams();
-  // 见 ContentTab.tsx 顶部注释：`notify.error` 只显示已注册的稳定错误码文案或通用兜底，
-  // 会丢弃任意预本地化字符串，因此"变基即将上线"这类非错误码的固定提示走 descriptor 版。
-  const toastNotifier = useMemo(() => createToastNotifier({ t }), [t]);
   const [versions, setVersions] = useState<KnowledgeAdminVersionRead[]>([]);
   const [loading, setLoading] = useState(false);
 
@@ -59,6 +56,8 @@ export function VersionsTab({ api, kb, onChanged }: VersionsTabProps) {
 
   const [publishTarget, setPublishTarget] = useState<KnowledgeAdminVersionRead | null>(null);
   const [publishing, setPublishing] = useState(false);
+
+  const [rebaseTarget, setRebaseTarget] = useState<KnowledgeAdminVersionRead | null>(null);
 
   const [rejectTarget, setRejectTarget] = useState<KnowledgeAdminVersionRead | null>(null);
   const [rejectReason, setRejectReason] = useState('');
@@ -143,6 +142,15 @@ export function VersionsTab({ api, kb, onChanged }: VersionsTabProps) {
     } finally {
       setPublishing(false);
     }
+  }
+
+  // 变基落库后：旧草稿快照已被 `superseded_by` 替换，关掉发布框与变基框，重新拉取版本列表
+  // （新快照才会出现在其中；本 Tab 不像内容 Tab 需要切换 `view`，行随列表刷新自然更新）。
+  function handleRebased(_result: RebaseResult) {
+    setRebaseTarget(null);
+    setPublishTarget(null);
+    void load();
+    onChanged?.();
   }
 
   async function handleReject() {
@@ -257,7 +265,13 @@ export function VersionsTab({ api, kb, onChanged }: VersionsTabProps) {
             </span>
           )}
           {row.is_stale && (
-            <span className="rounded-full bg-[#fce7e7] px-[8px] py-[2px] text-[11px] font-medium text-[#d20b0b]">
+            <span
+              title={t('knowledgeAdmin.content.banner.staleNotice', {
+                published: formatVersion(kb.published_version),
+                base: formatVersion(row.base_version),
+              })}
+              className="rounded-full bg-[#fce7e7] px-[8px] py-[2px] text-[11px] font-medium text-[#d20b0b]"
+            >
               {t('knowledgeAdmin.detail.badges.stale')}
             </span>
           )}
@@ -307,8 +321,17 @@ export function VersionsTab({ api, kb, onChanged }: VersionsTabProps) {
         draft={publishTarget}
         submitting={publishing}
         onSubmit={(input) => void handlePublish(input)}
-        onRebase={() => toastNotifier.error(createMessageDescriptor('knowledgeAdmin.dialogs.publish.rebaseNotAvailable'))}
+        onRebase={(versionId) => setRebaseTarget(versions.find((version) => version.id === versionId) ?? publishTarget)}
         onReview={publishTarget ? () => openDraftContent(publishTarget.id, { reviewIntent: true }) : undefined}
+      />
+
+      <RebaseDialog
+        open={Boolean(rebaseTarget)}
+        onOpenChange={(next) => !next && setRebaseTarget(null)}
+        api={api}
+        kbId={kb.id}
+        draft={rebaseTarget}
+        onRebased={handleRebased}
       />
 
       <Dialog open={Boolean(rejectTarget)} onOpenChange={(next) => !rejecting && !next && setRejectTarget(null)}>
