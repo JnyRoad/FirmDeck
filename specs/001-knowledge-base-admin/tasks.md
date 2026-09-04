@@ -201,6 +201,10 @@
 - [ ] T077 按 quickstart.md S1–S5 在 `zh-CN` 与 `en-US` 各做一遍真实浏览器验收（含中文输入法、跨行选区、粘贴），记录结果与截图到 PR；未能运行的项标 `UNVERIFIED`
 - [ ] T078 [P] 校对 specs/001-knowledge-base-admin/{spec,plan,contracts}/ 与实现的偏差，先改 artifact 再改代码；更新本文件 Notes 中的外部依赖结论
 - [ ] T079 [P] 性能验证（SC-007）：在 backend/tests/test_knowledge_admin_perf.py 用 200 个知识库 fixture 断言列表端点 p95 ≤ 2s、2000 行文档 diff 端点 ≤ 1s；在 frontend-enterprise/src/pages/knowledge-admin/review/ReviewEditor.perf.test.tsx 断言 2000 行文档单次按键重绘 ≤ 50ms；结果写入 PR，未达标视为阻塞
+- [ ] T080 [P] [测试] 在 backend/tests/test_knowledge_version_documents.py 编写失败测试：`GET /api/enterprise/knowledge-admin/knowledge-bases/{kb_id}/versions/{version_id}/documents` 返回该版本全部文档（id、lineage_id、title、filename、status、bucket_count、updated_at，含未改动文档），admin 或 history viewer 可访问，非法版本 404/403；diff 响应的每篇文档增加 `base_document_id` / `target_document_id`
+- [ ] T081 实现版本文档列表端点与 diff 响应的文档 id：backend/app/api/knowledge_admin.py（A2b 路由）、backend/app/knowledge/diff.py（DocumentSnapshot 携带 document_id 并投影）、backend/app/knowledge/schema.py；同步 contracts/knowledge-admin-api.md（A2b）与 frontend-enterprise/src/api/knowledgeAdmin.ts（`listVersionDocuments`）+ types
+- [ ] T082 [测试] 在 frontend-enterprise/src/pages/knowledge-admin/shared/toast.test.tsx 编写失败测试：知识库管理页的错误提示（SettingsTab 保存失败、ListPage 删除失败、ContentTab 写回冲突）必须真正弹出本地化文案（legacy `notify.error(text)` 会静默丢弃预本地化字符串）
+- [ ] T083 统一知识库管理页的 toast 出口：shared/errorMessage.ts 改为基于 `createToastNotifier` 的 descriptor 通知（或复用 US2-b 的做法），替换 SettingsTab.tsx / KnowledgeAdminListPage.tsx / ContentTab.tsx 中的 legacy `notify` 调用；ContentTab 改用 T081 的版本文档列表展示未改动文档并用 document_id 写回
 
 ---
 
@@ -295,6 +299,8 @@ Task: "T040 shared/ContentTab.test.tsx" / "T042 shared/VersionsTab.test.tsx" / "
 | FR-071 | T001–T003, T032, T035 |
 | FR-080 / FR-081 / FR-082 | T066–T072 |
 | SC-007 | T079 |
+| FR-020/FR-021 补缺（版本文档列表、文档 id） | T080, T081, T083 |
+| 错误提示可见性（US1/US2 toast） | T082, T083 |
 | SC-008 | T016, T018, T024, T026 |
 | 契约 A1–A6 | T020/T021, T022/T023, T024/T025, T026/T027 |
 | 契约 B1–B4 | T016–T019, T014/T015, T001–T003 |
