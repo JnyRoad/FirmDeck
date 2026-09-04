@@ -571,11 +571,16 @@ class VersionDocumentRead(BaseModel):
 
 
 class KnowledgeRebaseRequest(BaseModel):
-    """A3 `POST .../versions/{version_id}/rebase` 请求体：变基预览/执行。"""
+    """A3 `POST .../versions/{version_id}/rebase` 请求体：变基预览/执行。
+
+    `expected_updated_at` 可选：给出时按 A5 相同语义（原样透传的 `updated_at` 字符串、
+    微秒精度精确相等）做乐观锁校验，用于防住双击/重试与并发写入；不给出则不校验。
+    """
 
     tenant_id: str
     team_id: str | None = None
     change_reason: NonEmptyText
+    expected_updated_at: str | None = None
     idempotency_key: str | None = None
 
 
@@ -587,11 +592,15 @@ class KnowledgeRebaseResolutionInput(BaseModel):
 
 
 class KnowledgeRebaseResolveRequest(BaseModel):
-    """A4 `POST .../rebase/resolve` 请求体：提交冲突解决并完成变基。"""
+    """A4 `POST .../rebase/resolve` 请求体：提交冲突解决并完成变基。
+
+    `expected_updated_at` 与 A3 同义，可选；`to_base_version_id` 仍是必填的正式版乐观锁。
+    """
 
     tenant_id: str
     team_id: str | None = None
     change_reason: NonEmptyText
+    expected_updated_at: str | None = None
     idempotency_key: str | None = None
     to_base_version_id: NonEmptyText
     resolutions: list[KnowledgeRebaseResolutionInput] = Field(default_factory=list)

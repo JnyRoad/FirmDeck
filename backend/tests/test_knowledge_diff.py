@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import pytest
 from fastapi import HTTPException
+from sqlmodel import select
 from test_teams_api import _test_session
 
 from app.api.knowledge_admin import get_knowledge_admin_version_diff
@@ -747,3 +748,124 @@ def test_route_cross_tenant_version_is_context_mismatch() -> None:
 
         assert mismatch.value.status_code == 403
         assert mismatch.value.detail["code"] == "KNOWLEDGE_CONTEXT_MISMATCH"
+
+
+# ---------------------------------------------------------------------------
+# 修复轮次 I3：A2 的"不存在 / 跨上下文"四象限必须用同一套策略
+# （知识库或版本压根不存在 → 404 KNOWLEDGE_BASE_NOT_FOUND；
+#   跨租户 / 跨库 → 403 KNOWLEDGE_CONTEXT_MISMATCH）
+# ---------------------------------------------------------------------------
+
+
+def _diff(kb_id: str, version_id: str, db, *, tenant_id: str = "tenant_demo"):
+    return get_knowledge_admin_version_diff(
+        kb_id=kb_id,
+        version_id=version_id,
+        tenant_id=tenant_id,
+        against="base",
+        max_lines=5000,
+        db=db,
+        current_user=_admin_user(),
+    )
+
+
+def test_route_missing_knowledge_base_is_not_found() -> None:
+    """知识库不存在：与"版本不存在"同为 404，而不是用 403 掩盖存在性判断的差异。"""
+    with _test_session() as db:
+        _seed_diff_fixture(db)
+
+        with pytest.raises(HTTPException) as missing:
+            _diff("kb_does_not_exist", "kbver_v2", db)
+
+        assert missing.value.status_code == 404
+        assert missing.value.detail["code"] == "KNOWLEDGE_BASE_NOT_FOUND"
+
+
+def test_route_cross_tenant_knowledge_base_is_context_mismatch() -> None:
+    """知识库存在但属于另一个租户：403，隐藏该库对本租户的可见性。"""
+    with _test_session() as db:
+        _seed_diff_fixture(db)
+        db.add(Tenant(id="tenant_other", slug="tenant-other", name="Other", lifecycle_version=1))
+        db.add(
+            KnowledgeBase(
+                id="kb_other_tenant",
+                tenant_id="tenant_other",
+                name="他租户知识库",
+                mode="shared",
+                status="active",
+            )
+        )
+        db.commit()
+
+        with pytest.raises(HTTPException) as mismatch:
+            _diff("kb_other_tenant", "kbver_v2", db)
+
+        assert mismatch.value.status_code == 403
+        assert mismatch.value.detail["code"] == "KNOWLEDGE_CONTEXT_MISMATCH"
+
+
+def test_route_version_of_another_knowledge_base_is_context_mismatch() -> None:
+    """版本存在、同租户，但属于另一个知识库：403（跨库），不是 404。"""
+    with _test_session() as db:
+        _seed_diff_fixture(db)
+        db.add(
+            KnowledgeBase(
+                id="kb_other",
+                tenant_id="tenant_demo",
+                name="另一个知识库",
+                mode="dedicated",
+                status="active",
+            )
+        )
+        db.add(
+            KnowledgeBaseVersion(
+                id="kbver_other_kb",
+                tenant_id="tenant_demo",
+                knowledge_base_id="kb_other",
+                version="1.0.0",
+                name="另一个知识库",
+                publication_state="released",
+            )
+        )
+        db.commit()
+
+        with pytest.raises(HTTPException) as mismatch:
+            _diff("kb_shared_x", "kbver_other_kb", db)
+
+        assert mismatch.value.status_code == 403
+        assert mismatch.value.detail["code"] == "KNOWLEDGE_CONTEXT_MISMATCH"
+
+
+def test_deleted_document_exposes_archived_row_id_in_target_version() -> None:
+    """草稿内软删除的文档：`deleted` 条目必须带回该草稿内归档行的真实 id。
+
+    A2b 不再返回归档行（与 A2 同口径视为已删除），前端"恢复"按钮因此需要从对比结果里
+    拿到可写回的行 id；base 侧的 id 属于基线版本，写回它会改到别的版本上。
+    """
+    with _test_session() as db:
+        _seed_diff_fixture(db)
+        target = next(
+            row
+            for row in db.exec(
+                select(KnowledgeDocument).where(
+                    KnowledgeDocument.knowledge_base_version_id == "kbver_v2"
+                )
+            ).all()
+            if (row.metadata_json or {}).get("lineage_id") == "L_same"
+        )
+        target.status = "archived"
+        db.add(target)
+        db.commit()
+
+        result = diff_versions(
+            db,
+            tenant_id="tenant_demo",
+            base_version_id="kbver_v1",
+            target_version_id="kbver_v2",
+        )
+        deleted = next(
+            item for item in result.documents if item.kind == "deleted" and item.lineage_id == "L_same"
+        )
+        assert deleted.target_document_id == target.id
+        assert deleted.base_document_id is not None
+        assert deleted.base_document_id != target.id

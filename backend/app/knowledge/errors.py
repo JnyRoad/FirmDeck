@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
+from datetime import UTC, datetime
 from typing import Any
 
 from app.contracts.error_registry import (
@@ -201,3 +202,27 @@ def knowledge_error(
         request_id=request_id,
         trace_id=trace_id,
     )
+
+
+def parse_expected_updated_at(value: str) -> datetime:
+    """把请求体里的 ISO 时间字符串解析为可比较的 naive UTC 时间，容忍 `Z` 或显式偏移写法。
+
+    与 `KnowledgeBaseVersion.updated_at`（`utc_now()` 产出的 naive UTC）保持同一口径，
+    解析失败一律视为版本已变化（`KNOWLEDGE_PUBLISH_CONFLICT`），而不是泄漏校验细节。
+
+    放在 errors.py 这个叶子模块，供 `versioning.record_review`（A5）与 `rebase`（A3/A4）
+    共用同一套乐观锁语义——`versioning` 依赖 `rebase`，两者无法互相 import。
+    """
+    normalized = str(value or "").strip()
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise knowledge_error(
+            KNOWLEDGE_PUBLISH_CONFLICT,
+            message="版本标识无效，请刷新后重试。",
+        ) from exc
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(UTC).replace(tzinfo=None)
+    return parsed

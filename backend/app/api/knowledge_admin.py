@@ -182,9 +182,17 @@ def _load_admin_diff_base(
     `require_shared_knowledge_history_viewer` 会先校验 `mode == "shared"` 才判定 admin/
     owner 权限，导致 dedicated 库上连管理员都被 409 拒绝；A2 契约要求"admin 或该库
     history viewer"两者任一放行，因此 admin 分支必须绕开共享库专属的 mode 校验。
+
+    错误口径与 `_load_admin_diff_version` 统一（I3 修复轮次）：资源压根不存在→404
+    `KNOWLEDGE_BASE_NOT_FOUND`；存在但跨租户/跨库→403 `KNOWLEDGE_CONTEXT_MISMATCH`。
+    此前知识库缺失返回 403、版本缺失返回 404，前端无法一致映射同一类"找不到"。
     """
     base = db.get(KnowledgeBase, knowledge_base_id)
-    if base is None or base.tenant_id != tenant_id:
+    if base is None:
+        raise domain_http_error(
+            "KNOWLEDGE_BASE_NOT_FOUND", source="knowledge_admin", status_code=404
+        )
+    if base.tenant_id != tenant_id:
         raise domain_http_error(
             "KNOWLEDGE_CONTEXT_MISMATCH", source="knowledge_admin", status_code=403
         )
@@ -194,7 +202,8 @@ def _load_admin_diff_base(
 def _load_admin_diff_version(
     db: Session, *, tenant_id: str, knowledge_base_id: str, version_id: str
 ) -> KnowledgeBaseVersion:
-    """按契约 A2 解析对比版本：不存在→KNOWLEDGE_BASE_NOT_FOUND，跨租户/跨库→KNOWLEDGE_CONTEXT_MISMATCH。"""
+    """按契约 A2 解析对比版本：不存在→KNOWLEDGE_BASE_NOT_FOUND（404），跨租户/跨库→
+    KNOWLEDGE_CONTEXT_MISMATCH（403）；与 `_load_admin_diff_base` 同一套存在性策略。"""
     version = db.get(KnowledgeBaseVersion, version_id)
     if version is None:
         raise domain_http_error("KNOWLEDGE_BASE_NOT_FOUND", source="knowledge_admin", status_code=404)
@@ -227,6 +236,10 @@ def get_knowledge_admin_version_diff(
     `against=base`（默认）对比目标版本的 `parent_version_id`；`against=published` 对比
     知识库当前正式版本 `published_version_id`；两者缺失时视为空文档集合，目标版本的
     全部文档都判定为新增。鉴权、参数校验之外的聚合逻辑一律留在 `app.knowledge.diff`。
+
+    错误口径：知识库或版本不存在→404 `KNOWLEDGE_BASE_NOT_FOUND`；存在但跨租户/跨库→
+    403 `KNOWLEDGE_CONTEXT_MISMATCH`。`status='archived'` 的文档按 data-model §3 视为
+    该版本内已删除，会被判定为 `deleted` 而不是原样比对。
     """
     ensure_tenant(db, tenant_id)
     if current_user.tenant_id == tenant_id and is_admin_user(current_user):
@@ -308,9 +321,12 @@ def list_knowledge_admin_version_documents(
     只在指向源文档时才准确的 `lineage_id`（草稿文档是克隆行）。
 
     鉴权与错误语义与 A2 完全一致：租户管理员走 `_load_admin_diff_base` 旁路（不限制
-    mode），非管理员一律走 `require_shared_knowledge_history_viewer`；版本不存在→
+    mode），非管理员一律走 `require_shared_knowledge_history_viewer`；知识库或版本不存在→
     `KNOWLEDGE_BASE_NOT_FOUND`，跨租户/跨库→`KNOWLEDGE_CONTEXT_MISMATCH`。结果按
     `title` 再 `id` 稳定排序，与插入顺序、id 生成顺序无关。
+
+    `status='archived'` 的文档按 data-model §3 表示"草稿内已删除"，与 A2 对比口径一致地
+    排除在列表之外（行本身保留，仅对消费方不可见）。
     """
     ensure_tenant(db, tenant_id)
     if current_user.tenant_id == tenant_id and is_admin_user(current_user):
@@ -332,6 +348,7 @@ def list_knowledge_admin_version_documents(
         .where(
             KnowledgeDocument.tenant_id == tenant_id,
             KnowledgeDocument.knowledge_base_version_id == version_id,
+            KnowledgeDocument.status != "archived",
         )
         .order_by(KnowledgeDocument.title, KnowledgeDocument.id)
     ).all()
@@ -433,6 +450,7 @@ def rebase_knowledge_admin_draft(
             tenant_id=request.tenant_id,
             knowledge_base_id=kb_id,
             draft_version_id=version_id,
+            expected_updated_at=request.expected_updated_at,
         )
         if preview.conflicts:
             return _rebase_preview_read(preview)
@@ -447,10 +465,14 @@ def rebase_knowledge_admin_draft(
             actor_id=current_user.id,
             source_team_id=context.team.id if context.team else None,
             change_reason=request.change_reason,
+            expected_updated_at=request.expected_updated_at,
             idempotency_key=request.idempotency_key,
             request_payload=request.model_dump(),
         )
     except KnowledgeError as exc:
+        # 与 knowledge_bases.py 的写路由一致：失败时显式回滚，不把半途的 flush 结果
+        # 留在会话里等待连接关闭时被动回滚。
+        db.rollback()
         raise _knowledge_error_to_http(exc) from exc
     db.commit()
     return _rebase_result_read(
@@ -491,10 +513,12 @@ def resolve_knowledge_admin_rebase(
             actor_id=current_user.id,
             source_team_id=context.team.id if context.team else None,
             change_reason=request.change_reason,
+            expected_updated_at=request.expected_updated_at,
             idempotency_key=request.idempotency_key,
             request_payload=request.model_dump(),
         )
     except KnowledgeError as exc:
+        db.rollback()
         raise _knowledge_error_to_http(exc) from exc
     db.commit()
     return _rebase_result_read(
@@ -541,6 +565,7 @@ def review_knowledge_admin_draft(
             source_team_id=context.team.id if context.team else None,
         )
     except KnowledgeError as exc:
+        db.rollback()
         raise _knowledge_error_to_http(exc) from exc
     # `get_session` 不自动提交（`with Session(engine) as session: yield session`），
     # 与 knowledge_bases.py 里所有写路由一致：service 层只 flush，路由必须显式提交

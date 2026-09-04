@@ -20,6 +20,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from sqlalchemy import delete as sa_delete
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
@@ -27,6 +28,10 @@ from app.agents.branching import clone_knowledge_version_assets
 from app.db.models import (
     KnowledgeBase,
     KnowledgeBaseVersion,
+    KnowledgeBucket,
+    KnowledgeChunk,
+    KnowledgeConcept,
+    KnowledgeDiscoverySuggestion,
     KnowledgeDocument,
     new_id,
     utc_now,
@@ -51,7 +56,9 @@ from app.knowledge.errors import (
     KNOWLEDGE_REBASE_CONFLICTS_UNRESOLVED,
     KNOWLEDGE_VERSION_NOT_READY,
     knowledge_error,
+    parse_expected_updated_at,
 )
+from app.knowledge.service import KnowledgeService
 from app.observability.event_log import EventLog
 from app.observability.product_events import record_product_event
 
@@ -425,10 +432,27 @@ def _shared_base(db: Session, tenant_id: str, knowledge_base_id: str) -> Knowled
     return base
 
 
+def is_superseded_draft_snapshot(version: KnowledgeBaseVersion) -> bool:
+    """判断一个草稿快照是否已被变基替换（data-model §2：archived + `superseded_by`）。
+
+    变基不会改写 `publication_state`（仍是 `draft`），只把旧快照 `status` 置为
+    `archived` 并写入 `metadata.superseded_by`。只看 `publication_state` 的守卫会把
+    这类已作废快照当作可写、可发布、可再次变基的活动草稿（I1 修复轮次），因此
+    `rebase` 与 `versioning` 共用这一个判定。
+    """
+    if version.status != "active":
+        return True
+    return bool((version.metadata_json or {}).get("superseded_by"))
+
+
 def _draft_version(
     db: Session, tenant_id: str, knowledge_base_id: str, version_id: str
 ) -> KnowledgeBaseVersion:
-    """读取同租户同知识库的版本行，跨租户/跨库一律隐藏为上下文不匹配。"""
+    """读取同租户同知识库的**活动**版本行，跨租户/跨库一律隐藏为上下文不匹配。
+
+    已被变基替换的快照按 A3/A4 契约折叠为 `KNOWLEDGE_VERSION_NOT_READY`，使双击/重试
+    同一个 `version_id` 不会再造出第二份草稿。
+    """
     version = db.get(KnowledgeBaseVersion, version_id)
     if (
         version is None
@@ -436,14 +460,41 @@ def _draft_version(
         or version.knowledge_base_id != knowledge_base_id
     ):
         raise knowledge_error(KNOWLEDGE_CONTEXT_MISMATCH)
+    if is_superseded_draft_snapshot(version):
+        raise knowledge_error(
+            KNOWLEDGE_VERSION_NOT_READY,
+            details={"knowledge_base_version_id": version.id},
+        )
     return version
 
 
 def _require_stale_draft(draft: KnowledgeBaseVersion, published_version_id: str | None) -> None:
-    """变基目标必须是草稿，且其基线已落后于知识库当前正式版本。"""
-    if draft.publication_state != "draft" or draft.parent_version_id == published_version_id:
+    """变基目标必须是**活动**草稿，且其基线已落后于知识库当前正式版本。"""
+    if (
+        draft.publication_state != "draft"
+        or is_superseded_draft_snapshot(draft)
+        or draft.parent_version_id == published_version_id
+    ):
         raise knowledge_error(
             KNOWLEDGE_VERSION_NOT_READY,
+            details={"knowledge_base_version_id": draft.id},
+        )
+
+
+def _require_expected_updated_at(
+    draft: KnowledgeBaseVersion, expected_updated_at: str | None
+) -> None:
+    """A3/A4 可选乐观锁：调用方原样回传打开草稿时看到的 `updated_at` 才允许变基。
+
+    语义与 A5（`versioning.record_review`）完全一致：按微秒精度精确相等比较，未提供时
+    不校验（additive，老客户端不受影响），不匹配或无法解析统一折叠为
+    `KNOWLEDGE_PUBLISH_CONFLICT`。
+    """
+    if expected_updated_at is None:
+        return
+    if parse_expected_updated_at(expected_updated_at) != draft.updated_at:
+        raise knowledge_error(
+            KNOWLEDGE_PUBLISH_CONFLICT,
             details={"knowledge_base_version_id": draft.id},
         )
 
@@ -472,11 +523,13 @@ def preview_rebase(
     tenant_id: str,
     knowledge_base_id: str,
     draft_version_id: str,
+    expected_updated_at: str | None = None,
 ) -> RebasePreview:
-    """A3：校验草稿为 stale 草稿后计算三方合并预览（不落库）。"""
+    """A3：校验草稿为活动 stale 草稿（可选乐观锁）后计算三方合并预览（不落库）。"""
     kb = _shared_base(db, tenant_id, knowledge_base_id)
     draft = _draft_version(db, tenant_id, knowledge_base_id, draft_version_id)
     _require_stale_draft(draft, kb.published_version_id)
+    _require_expected_updated_at(draft, expected_updated_at)
     auto_merged, conflicts = _compute_merge(
         db, tenant_id=tenant_id, draft=draft, published_version_id=kb.published_version_id
     )
@@ -540,35 +593,80 @@ def _apply_merge_results(
         if isinstance(lineage, str) and lineage:
             row_by_lineage[lineage] = row
 
+    service = KnowledgeService(db)
+
+    def _purge_derived_rows(document_id: str) -> None:
+        """清掉该文档在本版本内的派生行（克隆自正式版的那份），避免孤儿 bucket/chunk。
+
+        与 `KnowledgeService._build_buckets` 重建前的清理集合保持一致；这里的行都是
+        `clone_knowledge_version_assets` 复制到新草稿的副本，删除不影响正式版。
+        """
+        for model in (
+            KnowledgeDiscoverySuggestion,
+            KnowledgeConcept,
+            KnowledgeChunk,
+            KnowledgeBucket,
+        ):
+            db.exec(sa_delete(model).where(model.document_id == document_id))
+
     def _write(lineage_id: str, filename: str, title: str, content: str, action: str) -> None:
         if action == "noop":
             return
-        if action == "delete":
-            row = row_by_lineage.get(lineage_id)
-            if row is not None:
-                db.delete(row)
-            return
         row = row_by_lineage.get(lineage_id)
-        if row is not None:
+        if action == "delete":
+            # data-model §3：草稿内删除是软删除——保留行并置为 archived，让对比/列表/
+            # 发布统一按"不存在"处理；同时清掉克隆进来的派生行，否则已删除文档的 chunk
+            # 会继续在这个版本里被检索到。
+            if row is not None:
+                _purge_derived_rows(row.id)
+                row.status = "archived"
+                row.bucket_count = 0
+                row.chunk_count = 0
+                row.updated_at = utc_now()
+                db.add(row)
+            return
+        if row is None:
+            row = KnowledgeDocument(
+                tenant_id=tenant_id,
+                knowledge_base_id=knowledge_base_id,
+                knowledge_base_version_id=version_id,
+                filename=filename or f"{lineage_id}.md",
+                file_type="md",
+                title=title or filename or lineage_id,
+                status="ready",
+                metadata_json={"lineage_id": lineage_id},
+            )
+            db.add(row)
+            db.flush()
+            row_by_lineage[lineage_id] = row
+        else:
             metadata = dict(row.metadata_json or {})
-            metadata["raw_text"] = content
             metadata["lineage_id"] = lineage_id
             row.metadata_json = metadata
+            db.add(row)
+        if not content.strip():
+            # 合并结果为空正文：解析器拒绝空文档，退回"只写 raw_text + 清空派生层"，
+            # 避免把可恢复的空文档变成 500。
+            _purge_derived_rows(row.id)
+            metadata = dict(row.metadata_json or {})
+            metadata["raw_text"] = content
+            row.metadata_json = metadata
+            row.status = "ready"
+            row.bucket_count = 0
+            row.chunk_count = 0
             row.updated_at = utc_now()
             db.add(row)
-        else:
-            db.add(
-                KnowledgeDocument(
-                    tenant_id=tenant_id,
-                    knowledge_base_id=knowledge_base_id,
-                    knowledge_base_version_id=version_id,
-                    filename=filename or f"{lineage_id}.md",
-                    file_type="md",
-                    title=title or filename or lineage_id,
-                    status="ready",
-                    metadata_json={"lineage_id": lineage_id, "raw_text": content},
-                )
-            )
+            db.flush()
+            return
+        # 与在线编辑（`PUT /knowledge/documents/{id}`）同一条重建路径：正文、document_card、
+        # section_tree、buckets/chunks/discovery 与 bucket_count/chunk_count 一并刷新，
+        # 只是不提交——变基的多步写入必须整体留在同一个 SAVEPOINT 内。
+        service.rebuild_document_content_in_transaction(
+            row,
+            content,
+            title=title or row.title,
+            status="ready",
+        )
 
     for merged in auto_merged:
         _write(merged.lineage_id, merged.filename, merged.title, "\n".join(merged.lines), merged.action)
@@ -592,6 +690,7 @@ def apply_rebase(
     actor_id: str,
     source_team_id: str | None,
     change_reason: str,
+    expected_updated_at: str | None = None,
     idempotency_key: str | None = None,
     request_payload: Any = None,
     language_context: LanguageContext | None = None,
@@ -604,6 +703,7 @@ def apply_rebase(
     kb = _shared_base(db, tenant_id, knowledge_base_id)
     draft = _draft_version(db, tenant_id, knowledge_base_id, draft_version_id)
     _require_stale_draft(draft, kb.published_version_id)
+    _require_expected_updated_at(draft, expected_updated_at)
     if kb.published_version_id != to_base_version_id:
         raise knowledge_error(
             KNOWLEDGE_PUBLISH_CONFLICT,
@@ -640,6 +740,9 @@ def apply_rebase(
     # draft.metadata_json（打 superseded_by 标记）之前取一次快照，新快照据此继承来源信息，
     # 而不是像归档前那样只剩 draft_name/rebased_from。
     previous_metadata = dict(draft.metadata_json or {})
+    # A5 的 `review` 统计只描述旧快照当时的暂存/待处理数量；原样继承会让刚变基出来的
+    # 草稿显示过期的审阅进度，因此克隆时丢弃（旧快照自身仍保留该记录）。
+    inherited_metadata = {key: value for key, value in previous_metadata.items() if key != "review"}
 
     try:
         # 落库的多步写入（改写旧快照 → 插入新快照 → 克隆资产 → 套用合并结果 → 审计）
@@ -673,7 +776,7 @@ def apply_rebase(
                 change_reason=change_reason,
                 capability_scope=draft.capability_scope,
                 metadata_json={
-                    **previous_metadata,
+                    **inherited_metadata,
                     "draft_name": draft_name,
                     "rebased_from": {
                         "previous_version_id": previous_version_id,

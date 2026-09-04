@@ -13,7 +13,10 @@ import pytest
 from fastapi import HTTPException
 from test_teams_api import _test_session
 
-from app.api.knowledge_admin import list_knowledge_admin_version_documents
+from app.api.knowledge_admin import (
+    get_knowledge_admin_version_diff,
+    list_knowledge_admin_version_documents,
+)
 from app.db.models import (
     KnowledgeBase,
     KnowledgeBaseVersion,
@@ -341,31 +344,54 @@ def test_sort_ties_on_title_break_by_document_id() -> None:
         assert [item.id for item in response] == ["doc_tie_1", "doc_tie_2"]
 
 
+def _seed_other_base_with_document(db) -> None:
+    """在同租户的另一个知识库 B 里放一篇**真实存在**的文档，用于跨库泄漏断言。"""
+    db.add(
+        KnowledgeBase(
+            id="kb_other",
+            tenant_id="tenant_demo",
+            name="另一个知识库",
+            mode="dedicated",
+            status="active",
+        )
+    )
+    db.add(
+        KnowledgeBaseVersion(
+            id="kbver_other_kb",
+            tenant_id="tenant_demo",
+            knowledge_base_id="kb_other",
+            version="1.0.0",
+            name="另一个知识库",
+            publication_state="released",
+        )
+    )
+    db.add(
+        KnowledgeDocument(
+            id="doc_other_base_secret",
+            tenant_id="tenant_demo",
+            knowledge_base_id="kb_other",
+            knowledge_base_version_id="kbver_other_kb",
+            filename="secret.md",
+            file_type="md",
+            title="另一个库的机密文档",
+            status="ready",
+            metadata_json={"lineage_id": "L_OTHER_SECRET", "raw_text": "另一个库的机密正文"},
+        )
+    )
+    db.commit()
+
+
 def test_same_tenant_different_knowledge_base_version_is_context_mismatch() -> None:
     """版本存在且同租户，但归属于另一个知识库时，必须是 `KNOWLEDGE_CONTEXT_MISMATCH`
-    （403）而不是把另一个库的文档数据泄漏给调用方，也不是误判为 404。"""
+    （403）而不是把另一个库的文档数据泄漏给调用方，也不是误判为 404。
+
+    修复轮次：此前这里断言的是一个从未 seed 过的文档 id（`doc_dedicated_1`），因此即便
+    真的发生泄漏也照样通过。现在库 B 里放的是一篇真实文档，断言它既不出现在错误载荷里，
+    也不出现在库 A 的 A2b/A2 正常响应里。
+    """
     with _test_session() as db:
         _seed_version_documents_fixture(db)
-        db.add(
-            KnowledgeBase(
-                id="kb_other",
-                tenant_id="tenant_demo",
-                name="另一个知识库",
-                mode="dedicated",
-                status="active",
-            )
-        )
-        db.add(
-            KnowledgeBaseVersion(
-                id="kbver_other_kb",
-                tenant_id="tenant_demo",
-                knowledge_base_id="kb_other",
-                version="1.0.0",
-                name="另一个知识库",
-                publication_state="released",
-            )
-        )
-        db.commit()
+        _seed_other_base_with_document(db)
 
         with pytest.raises(HTTPException) as mismatch:
             list_knowledge_admin_version_documents(
@@ -378,9 +404,42 @@ def test_same_tenant_different_knowledge_base_version_is_context_mismatch() -> N
 
         assert mismatch.value.status_code == 403
         assert mismatch.value.detail["code"] == "KNOWLEDGE_CONTEXT_MISMATCH"
-        # 断言错误载荷不含任何文档数据（不泄漏另一个库的内容）。
+        # 错误载荷不含任何文档数据（真实存在的那篇也不得泄漏）。
         assert "documents" not in mismatch.value.detail
-        assert "doc_dedicated_1" not in str(mismatch.value.detail)
+        assert "doc_other_base_secret" not in str(mismatch.value.detail)
+        assert "另一个库的机密" not in str(mismatch.value.detail)
+
+
+def test_other_knowledge_base_document_is_absent_from_this_base_documents_and_diff() -> None:
+    """库 B 的真实文档不得出现在库 A 的 A2b 文档列表与 A2 对比结果中。"""
+    with _test_session() as db:
+        _seed_version_documents_fixture(db)
+        _seed_other_base_with_document(db)
+
+        documents = list_knowledge_admin_version_documents(
+            kb_id="kb_shared_x",
+            version_id="kbver_v2",
+            tenant_id="tenant_demo",
+            db=db,
+            current_user=_admin_user(),
+        )
+        assert "doc_other_base_secret" not in {item.id for item in documents}
+        assert "L_OTHER_SECRET" not in {item.lineage_id for item in documents}
+        assert "另一个库的机密文档" not in {item.title for item in documents}
+
+        diff = get_knowledge_admin_version_diff(
+            kb_id="kb_shared_x",
+            version_id="kbver_v2",
+            tenant_id="tenant_demo",
+            against="base",
+            max_lines=5000,
+            db=db,
+            current_user=_admin_user(),
+        )
+        diff_payload = diff.model_dump_json()
+        assert "doc_other_base_secret" not in diff_payload
+        assert "L_OTHER_SECRET" not in diff_payload
+        assert "另一个库的机密" not in diff_payload
 
 
 # ---------------------------------------------------------------------------

@@ -41,8 +41,11 @@ Errors: `FORBIDDEN`（非 admin）。
 Query: `tenant_id`、`against=base|published`（默认 `base`：对比 `parent_version_id`；`published`：对比当前正式版）、`max_lines=5000`
 
 Response `200`: 见 data-model §4（`VersionDiff`）。超过 `max_lines` 的文档 `truncated=true` 且不含 `hunks`。
-每篇文档新增 `base_document_id` / `target_document_id`（T080）：分别是该文档在 base/target 各自版本内的真实行 id，对应侧不存在（added 无 base、deleted 无 target）时为 `null`；供写回定位真实行，区别于可能指向源文档的 `lineage_id`（草稿文档是克隆行）。
-Errors: `KNOWLEDGE_BASE_NOT_FOUND`、`KNOWLEDGE_CONTEXT_MISMATCH`。
+每篇文档新增 `base_document_id` / `target_document_id`（T080）：分别是该文档在 base/target 各自版本内的真实行 id，对应侧不存在（added 无 base）时为 `null`；供写回定位真实行，区别于可能指向源文档的 `lineage_id`（草稿文档是克隆行）。
+`kind="deleted"` 时的 `target_document_id`：草稿内删除是软删除，目标版本里那一行仍在（`status='archived'`），返回其真实行 id 供"恢复"写回定位；只有目标版本内确实没有对应行时才为 `null`。
+`status='archived'` 的文档按 data-model §3 表示"该版本内已删除"，base/target 两侧一律视为**不存在**：草稿里归档一篇文档 → `kind="deleted"` 且计入 `summary.deleted`；草稿里恢复一篇基线中已归档的文档 → `kind="added"`。
+Errors: `KNOWLEDGE_BASE_NOT_FOUND`（404，知识库或版本**不存在**）、`KNOWLEDGE_CONTEXT_MISMATCH`（403，资源存在但跨租户/跨库）。两个查找（知识库、版本）用同一套存在性策略，不再一个 403、一个 404。
+管理员旁路（`_load_admin_diff_base`）不校验 `mode`，因此 A2/A2b 对 dedicated 库也可用；A3/A4/A5 相反，一律经 `_shared_base` 拒绝 dedicated 库（`KNOWLEDGE_MODE_INVALID`，409），前端不应在专用库详情页提供变基/审阅入口。
 
 ### A2b `GET /knowledge-admin/knowledge-bases/{kb_id}/versions/{version_id}/documents` — 版本文档全量列表 **admin 或该库 history viewer**
 
@@ -56,37 +59,43 @@ Query: `tenant_id`
 }]
 ```
 结果按 `title` 再 `id` 稳定排序。`lineage_id` 缺失（数据质量问题）时为 `null`，不报错。
-Errors: `KNOWLEDGE_BASE_NOT_FOUND`、`KNOWLEDGE_CONTEXT_MISMATCH`。
+`status='archived'` 的文档（草稿内已删除，data-model §3）与 A2 同口径排除在列表之外——行本身保留，只是对消费方不可见；因此本列表不会返回 `status="archived"` 的项。
+Errors: 与 A2 完全一致——`KNOWLEDGE_BASE_NOT_FOUND`（404，不存在）、`KNOWLEDGE_CONTEXT_MISMATCH`（403，跨租户/跨库）。
 
 ### A3 `POST /knowledge-admin/knowledge-bases/{kb_id}/versions/{version_id}/rebase` — 变基预览 / 执行 **admin 或团队 manager**
 
 Body:
 ```json
-{"tenant_id": "…", "change_reason": "…", "idempotency_key": "…"}
+{"tenant_id": "…", "change_reason": "…", "expected_updated_at": "…", "idempotency_key": "…"}
 ```
-行为：目标必须是 `draft` 且 `is_stale`。无冲突 → 直接落库并返回 `RebaseResult`；有冲突 → `200` 返回 `RebasePreview`（`conflicts` 非空，不落库）。
-Errors: `KNOWLEDGE_VERSION_NOT_READY`（非草稿或未过期）、`KNOWLEDGE_PUBLISH_CONFLICT`（期间正式版再次变化）。
+行为：目标必须是 `draft`、`status='active'`（未被此前的变基替换）且 `is_stale`。无冲突 → 直接落库并返回 `RebaseResult`；有冲突 → `200` 返回 `RebasePreview`（`conflicts` 非空，不落库）。
+`expected_updated_at`（可选，additive）：语义与 A5 完全一致——原样透传打开草稿时拿到的 `KnowledgeBaseVersionRead.updated_at`，按微秒精度精确相等比较；不给出则不校验，给出且不匹配（或无法解析）→ `KNOWLEDGE_PUBLISH_CONFLICT`。
+仅共享库可用：dedicated 库 → `KNOWLEDGE_MODE_INVALID`（409）。
+Errors: `KNOWLEDGE_VERSION_NOT_READY`（非草稿、未过期，或该快照已被变基替换——重复提交同一个 `version_id` 不会造出第二份草稿）、`KNOWLEDGE_PUBLISH_CONFLICT`（期间正式版再次变化，或 `expected_updated_at` 不匹配）、`KNOWLEDGE_MODE_INVALID`。
 
 ### A4 `POST /knowledge-admin/knowledge-bases/{kb_id}/versions/{version_id}/rebase/resolve` — 提交冲突解决并完成变基
 
 Body:
 ```json
 {
-  "tenant_id": "…", "change_reason": "…", "idempotency_key": "…",
+  "tenant_id": "…", "change_reason": "…", "expected_updated_at": "…", "idempotency_key": "…",
   "to_base_version_id": "kbver_…",
   "resolutions": [{"lineage_id": "kdoc_…", "content_md": "…完整合并结果…"}]
 }
 ```
-校验：`to_base_version_id` 仍是当前正式版；每篇冲突文档都有 resolution；内容不含 `<<<<<<<` / `=======` / `>>>>>>>` 标记。
-Response `200`: `RebaseResult`。
-Errors: `KNOWLEDGE_REBASE_CONFLICTS_UNRESOLVED`、`KNOWLEDGE_PUBLISH_CONFLICT`、`KNOWLEDGE_DOCUMENT_LINEAGE_MISMATCH`。
+校验：目标仍是活动草稿（未被替换）；`to_base_version_id` 仍是当前正式版；`expected_updated_at`（可选）语义同 A3；每篇冲突文档都有 resolution；内容不含 `<<<<<<<` / `=======` / `>>>>>>>` 标记。
+落库时每篇被写入的文档都走与在线编辑同一条重建路径（`document_card`/`section_tree`/buckets/chunks/discovery 与 `bucket_count`/`chunk_count` 一并刷新）；`delete` 动作按 data-model §3 软删除（`status='archived'`）并清理该版本内的派生行。
+Response `200`: `RebaseResult`。新草稿的 `metadata` 继承旧快照的来源信息，但**不**继承 A5 的 `review` 块（旧快照的审阅统计对新草稿已失效）。
+仅共享库可用：dedicated 库 → `KNOWLEDGE_MODE_INVALID`（409）。
+Errors: `KNOWLEDGE_REBASE_CONFLICTS_UNRESOLVED`、`KNOWLEDGE_PUBLISH_CONFLICT`、`KNOWLEDGE_DOCUMENT_LINEAGE_MISMATCH`、`KNOWLEDGE_VERSION_NOT_READY`、`KNOWLEDGE_MODE_INVALID`。
 
 ### A5 `POST /knowledge-admin/knowledge-bases/{kb_id}/versions/{version_id}/review` — 写入审阅状态 **admin 或团队 manager**
 
 Body: `{"tenant_id": "…", "staged": 4, "pending": 0, "documents_adjusted": 2, "expected_updated_at": "…"}`
 Response `200`: `KnowledgeBaseVersionRead`（含 `metadata.review`）。审计 `draft_reviewed`，事件 `knowledge.draft.reviewed`。
 Errors: `KNOWLEDGE_VERSION_NOT_READY`（非草稿）、`KNOWLEDGE_PUBLISH_CONFLICT`（`expected_updated_at` 不匹配或无法解析）。
-`expected_updated_at` 语义：调用方必须原样透传打开草稿时拿到的 `KnowledgeBaseVersionRead.updated_at` 字符串（不得重新格式化/裁剪精度），服务端按微秒精度精确相等比较（非容差匹配）；解析失败（格式非法）与数值不相等一样统一折叠为 `KNOWLEDGE_PUBLISH_CONFLICT`（409），不返回 400，避免向调用方泄漏校验细节。
+`expected_updated_at` 语义：调用方必须原样透传打开草稿时拿到的 `KnowledgeBaseVersionRead.updated_at` 字符串（不得重新格式化/裁剪精度），服务端按微秒精度精确相等比较（非容差匹配）；解析失败（格式非法）与数值不相等一样统一折叠为 `KNOWLEDGE_PUBLISH_CONFLICT`（409），不返回 400，避免向调用方泄漏校验细节。A3/A4 复用同一套语义，区别只是那里为可选字段。
+仅共享库可用：dedicated 库 → `KNOWLEDGE_MODE_INVALID`（409）；与 A2/A2b 的管理员旁路不同，前端不应在专用库详情页提供审阅入口。
 
 ### A6 `GET /knowledge-admin/teams` — 可绑定群组候选 **admin**
 
@@ -107,6 +116,7 @@ Query: `tenant_id`、`exclude_bound_to=kb_id`（可选）。Response: `[{id, nam
 
 - 每项新增：`is_stale: bool`、`base_version: string|null`、`draft_name: string|null`、`next_version_preview: {"patch": "…", "minor": "…", "major": "…"}`（仅草稿）。
 - 排序由服务端保证：进行中草稿（新在前）→ released 按 semver 降序 → rejected 按时间降序。
+- 不返回 `status='archived'` 的行：变基替换掉的旧草稿快照（`metadata.superseded_by`）不是一份可操作的草稿。A1 的 `draft_count`、本列表的草稿条目数、`knowledge.version.published` 事件的 `stale_draft_count` 三者同口径，任何时刻都应一致。
 
 ### B3 `POST /knowledge/documents`（上传）、`PUT /knowledge/documents/{id}`、`DELETE`（归档）
 
@@ -129,7 +139,7 @@ Query: `tenant_id`、`exclude_bound_to=kb_id`（可选）。Response: `[{id, nam
 | 创建草稿 | `expected_published_version_id`（可选） | — |
 | 发布 / 回滚 | `expected_published_version_id`（必填） | `idempotency_key` |
 | 驳回 | — | `idempotency_key` |
-| 变基 / 解决 | `to_base_version_id` 必须仍为当前正式版 | `idempotency_key` |
+| 变基 / 解决 | `to_base_version_id` 必须仍为当前正式版；`expected_updated_at`（可选，语义同 A5） | `idempotency_key` |
 | 审阅写回 | `expected_updated_at` | — |
 | 文档更新 | `expected_updated_at` | — |
 | 权限矩阵 | `expected_revision` | — |

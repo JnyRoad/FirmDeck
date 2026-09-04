@@ -336,3 +336,100 @@ def test_two_drafts_concurrent_edit_rebase_resolve_and_publish_end_to_end_over_h
             "1.0.1",
             "1.0.2",
         }
+
+
+def test_draft_counts_agree_across_list_version_list_and_published_event_after_rebase() -> None:
+    """修复轮次 I2：被变基替换的旧快照不得作为"草稿"重复出现在任何一处计数里。
+
+    A1 的 `draft_count`（`listing.py`）已排除 `status='archived'`；版本列表
+    （`versioning.list_versions`）与 `knowledge.version.published` 事件的
+    `stale_draft_count` 此前没有同样的过滤，导致同一个知识库在列表页、详情页与通知里
+    报出三个不同的草稿数。本用例让三者在同一场景下互相印证。
+    """
+    engine = create_engine(
+        "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
+    )
+    SQLModel.metadata.create_all(engine)
+    _seed_base(engine)
+    client = _http_client_for(engine)
+
+    def _post(path: str, json: dict[str, Any]) -> dict[str, Any]:
+        response = client.post(path, json=json)
+        assert response.status_code == 200, response.text
+        return response.json()
+
+    def _new_draft(reason: str) -> dict[str, Any]:
+        return _post(
+            f"/api/enterprise/knowledge-bases/{BASE_ID}/drafts",
+            {
+                "tenant_id": "tenant_demo",
+                "team_id": "team_content",
+                "change_reason": reason,
+                "expected_published_version_id": V1_ID,
+            },
+        )
+
+    draft_a = _new_draft("A：先发布")
+    draft_b = _new_draft("B：需要变基")
+    _new_draft("D：始终停留在旧基线")
+
+    _set_document_text(engine, version_id=draft_a["id"], lineage_id="L_JIA", text="甲-A改")
+    published_a = _post(
+        f"/api/enterprise/knowledge-bases/{BASE_ID}/versions/{draft_a['id']}/publish",
+        {
+            "tenant_id": "tenant_demo",
+            "team_id": "team_content",
+            "expected_published_version_id": V1_ID,
+            "change_reason": "发布 A",
+        },
+    )
+
+    _set_document_text(engine, version_id=draft_b["id"], lineage_id="L_YI", text="乙-B改")
+    rebased = _post(
+        f"/api/enterprise/knowledge-admin/knowledge-bases/{BASE_ID}"
+        f"/versions/{draft_b['id']}/rebase",
+        {"tenant_id": "tenant_demo", "team_id": "team_content", "change_reason": "B 变基"},
+    )
+    assert rebased["status"] == "applied", rebased
+    rebased_b_id = rebased["new_version"]["id"]
+
+    published_b = _post(
+        f"/api/enterprise/knowledge-bases/{BASE_ID}/versions/{rebased_b_id}/publish",
+        {
+            "tenant_id": "tenant_demo",
+            "team_id": "team_content",
+            "expected_published_version_id": published_a["id"],
+            "change_reason": "发布变基后的 B",
+        },
+    )
+    assert published_b["version"] == "1.0.2"
+
+    # 1) A1 列表的 draft_count。
+    list_response = client.get(
+        "/api/enterprise/knowledge-admin/knowledge-bases", params={"tenant_id": "tenant_demo"}
+    )
+    assert list_response.status_code == 200, list_response.text
+    item = next(row for row in list_response.json()["items"] if row["id"] == BASE_ID)
+    assert item["draft_count"] == 1, "只剩 D 一个进行中草稿"
+
+    # 2) 版本列表里的草稿数（被替换的旧快照不得作为重复草稿出现）。
+    versions_response = client.get(
+        f"/api/enterprise/knowledge-bases/{BASE_ID}/versions", params={"tenant_id": "tenant_demo"}
+    )
+    assert versions_response.status_code == 200, versions_response.text
+    versions = versions_response.json()
+    draft_rows = [row for row in versions if row["publication_state"] == "draft"]
+    assert len(draft_rows) == 1
+    assert draft_b["id"] not in {row["id"] for row in versions}
+
+    # 3) 发布事件的 stale_draft_count。
+    with Session(engine) as verify_db:
+        events = verify_db.exec(
+            select(AgentEvent).where(AgentEvent.event_type == "knowledge.version.published")
+        ).all()
+        latest = next(
+            event for event in events if event.payload_json["params"]["version"] == "1.0.2"
+        )
+        assert latest.payload_json["params"]["stale_draft_count"] == 1
+
+    assert item["draft_count"] == len(draft_rows) == 1

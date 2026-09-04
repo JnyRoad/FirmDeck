@@ -15,7 +15,7 @@ change 块内按位置顺序对齐，仅保留相似度 `SequenceMatcher.ratio()
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from difflib import SequenceMatcher
 
 from sqlmodel import Session, select
@@ -63,7 +63,11 @@ class DiffDocument:
     """文档级对比条目；`hunks` 仅在 `kind == "modified"` 且未截断时非空。
 
     `base_document_id`/`target_document_id`（T080 新增）是该篇文档在 base/target 各自
-    版本内的真实行 id；对应侧不存在（added 无 base、deleted 无 target）时为 `None`。
+    版本内的真实行 id；对应侧不存在（added 无 base）时为 `None`。
+
+    `deleted` 的 `target_document_id`（C1 修复轮次）：草稿内的"删除"是软删除，目标版本里
+    那一行仍然存在（`status='archived'`），此时返回该归档行的真实 id，供"恢复"写回定位；
+    文档在目标版本内根本没有对应行时才为 `None`。
     """
 
     lineage_id: str
@@ -286,16 +290,22 @@ def document_lineage_id(document: KnowledgeDocument) -> str | None:
 def _load_version_documents(
     db: Session, *, tenant_id: str, version_id: str
 ) -> list[DocumentSnapshot]:
-    """薄加载层：按版本取该租户下全部文档正文快照，唯一接触 DB 的入口。
+    """薄加载层：按版本取该租户下全部**未归档**文档正文快照，唯一接触 DB 的入口。
 
     `order_by(KnowledgeDocument.id)`（T080 新增）让同 key（同 lineage/filename）在
     某一侧重复出现时，`pair_documents` 的按位置配对结果与 id 顺序一致、可复现。
+
+    `status != "archived"`（C1 修复轮次）：data-model §3 把"草稿内删除文档"定义为该草稿
+    版本内的行 `status='archived'`、行本身保留。对比与变基必须把归档行视为**不存在**，
+    base/ours/theirs 三侧一律套用同一规则——base 侧同样过滤，才能让"草稿里恢复了一篇
+    基线中已归档的文档"被正确判定为新增而不是未变。
     """
     rows = db.exec(
         select(KnowledgeDocument)
         .where(
             KnowledgeDocument.tenant_id == tenant_id,
             KnowledgeDocument.knowledge_base_version_id == version_id,
+            KnowledgeDocument.status != "archived",
         )
         .order_by(KnowledgeDocument.id)
     ).all()
@@ -313,6 +323,36 @@ def _load_version_documents(
     return snapshots
 
 
+def _archived_document_ids(
+    db: Session, *, tenant_id: str, version_id: str
+) -> tuple[dict[str, str], dict[str, str]]:
+    """取该版本内已归档（草稿内已删除）文档的真实行 id，分别按 lineage_id 与 filename 索引。
+
+    归档行被 `_load_version_documents` 过滤掉，因此对比结果里这篇文档表现为 `deleted`。
+    但"恢复"写回必须落到**目标版本内**那一行（base 侧的 id 属于另一个版本），所以这里把
+    它单独取出来回填到 `DiffDocument.target_document_id`。同 key 重复时保留 id 最小的一行，
+    与 `_load_version_documents` 的 `order_by(id)` 口径一致、可复现。
+    """
+    rows = db.exec(
+        select(KnowledgeDocument)
+        .where(
+            KnowledgeDocument.tenant_id == tenant_id,
+            KnowledgeDocument.knowledge_base_version_id == version_id,
+            KnowledgeDocument.status == "archived",
+        )
+        .order_by(KnowledgeDocument.id)
+    ).all()
+    by_lineage: dict[str, str] = {}
+    by_filename: dict[str, str] = {}
+    for row in rows:
+        lineage = document_lineage_id(row)
+        if lineage and lineage not in by_lineage:
+            by_lineage[lineage] = row.id
+        if row.filename not in by_filename:
+            by_filename[row.filename] = row.id
+    return by_lineage, by_filename
+
+
 def diff_versions(
     db: Session,
     *,
@@ -325,6 +365,9 @@ def diff_versions(
 
     `base_version_id` 为空（例如目标版本没有父版本，或知识库尚未发布过）时视为空文档
     集合，target 中的全部文档都会被判定为 added。
+
+    最后一步回填软删除行的 `target_document_id`：目标版本内确有该文档但已归档时，返回那
+    一行的真实 id，供调用方定位"恢复"写回的目标；文档在目标版本内根本不存在时仍为 None。
     """
     target_docs = _load_version_documents(db, tenant_id=tenant_id, version_id=target_version_id)
     base_docs = (
@@ -332,10 +375,27 @@ def diff_versions(
         if base_version_id
         else []
     )
-    return diff_document_sets(
+    result = diff_document_sets(
         base_docs,
         target_docs,
         base_version_id=base_version_id,
         target_version_id=target_version_id,
         max_lines=max_lines,
     )
+    if not any(document.kind == "deleted" for document in result.documents):
+        return result
+    by_lineage, by_filename = _archived_document_ids(
+        db, tenant_id=tenant_id, version_id=target_version_id
+    )
+    lookup = by_lineage if result.pairing == "lineage" else by_filename
+    documents = [
+        (
+            replace(document, target_document_id=lookup[document.lineage_id])
+            if document.kind == "deleted"
+            and document.target_document_id is None
+            and document.lineage_id in lookup
+            else document
+        )
+        for document in result.documents
+    ]
+    return replace(result, documents=documents)

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import base64
 from collections.abc import Sequence
-from datetime import UTC, datetime
 from typing import Any, Literal
 
 from sqlalchemy.exc import IntegrityError
@@ -34,8 +33,12 @@ from app.knowledge.errors import (
     KNOWLEDGE_VERSION_NOT_READY,
     KnowledgeError,
     knowledge_error,
+    parse_expected_updated_at,
 )
-from app.knowledge.rebase import count_stale_conflicts
+from app.knowledge.rebase import (
+    count_stale_conflicts,
+    is_superseded_draft_snapshot,
+)
 from app.observability.event_log import EventLog
 from app.observability.product_events import record_product_event
 
@@ -146,27 +149,6 @@ def _safe_source_filename(value: str | None) -> str:
             message="filename 必须是安全的单层文件名。",
         )
     return filename
-
-
-def _parse_expected_updated_at(value: str) -> datetime:
-    """把请求体里的 ISO 时间字符串解析为可比较的 naive UTC 时间，容忍 `Z` 或显式偏移写法。
-
-    与 `KnowledgeBaseVersion.updated_at`（`utc_now()` 产出的 naive UTC）保持同一口径，
-    解析失败一律视为版本已变化（`KNOWLEDGE_PUBLISH_CONFLICT`），而不是泄漏校验细节。
-    """
-    normalized = str(value or "").strip()
-    if normalized.endswith("Z"):
-        normalized = normalized[:-1] + "+00:00"
-    try:
-        parsed = datetime.fromisoformat(normalized)
-    except ValueError as exc:
-        raise knowledge_error(
-            KNOWLEDGE_PUBLISH_CONFLICT,
-            message="审阅版本标识无效，请刷新后重试。",
-        ) from exc
-    if parsed.tzinfo is not None:
-        parsed = parsed.astimezone(UTC).replace(tzinfo=None)
-    return parsed
 
 
 class SharedKnowledgeVersionService:
@@ -286,11 +268,18 @@ class SharedKnowledgeVersionService:
         knowledge_base_id: str,
         publication_state: str | None = None,
     ) -> list[KnowledgeBaseVersion]:
-        """按创建时间倒序列出共享版本，可选生命周期状态过滤。"""
+        """按创建时间倒序列出共享版本，可选生命周期状态过滤。
+
+        排除 `status='archived'` 的行：变基会把旧草稿快照归档并写入 `superseded_by`
+        （data-model §2），它们仍是 `publication_state='draft'`，不过滤就会在版本列表
+        顶部堆出一串与活动草稿同名的重复"草稿"，且与 A1 的 `draft_count`
+        （`listing.py` 已排除归档）对不上（I2 修复轮次）。
+        """
         self._shared_base(tenant_id, knowledge_base_id)
         statement = select(KnowledgeBaseVersion).where(
             KnowledgeBaseVersion.tenant_id == tenant_id,
             KnowledgeBaseVersion.knowledge_base_id == knowledge_base_id,
+            KnowledgeBaseVersion.status != "archived",
         )
         if publication_state:
             statement = statement.where(
@@ -309,7 +298,13 @@ class SharedKnowledgeVersionService:
         knowledge_base_id: str,
         version_id: str,
     ) -> KnowledgeBaseVersion:
-        """只返回同库草稿，正式或已驳回快照一律拒绝写入。"""
+        """只返回同库的**活动**草稿，正式、已驳回或已被变基替换的快照一律拒绝写入。
+
+        变基会把旧草稿快照置为 `status='archived'` 并写入 `metadata.superseded_by`
+        （data-model §2）。这类快照仍然是 `publication_state='draft'`，若不额外判断
+        生命周期，过期的浏览器页签就能继续往已作废的草稿里写文档、驳回甚至强制发布
+        （I1 修复轮次）。
+        """
         self._shared_base(tenant_id, knowledge_base_id)
         version = self._version(tenant_id, knowledge_base_id, version_id)
         if version.publication_state != "draft":
@@ -317,16 +312,26 @@ class SharedKnowledgeVersionService:
                 KNOWLEDGE_MODE_INVALID,
                 message="共享知识库正式版本或已驳回版本不可修改。",
             )
+        if is_superseded_draft_snapshot(version):
+            raise knowledge_error(
+                KNOWLEDGE_MODE_INVALID,
+                message="该草稿已被变基替换，请打开最新的草稿快照。",
+            )
         return version
 
     def ensure_ready(self, version: KnowledgeBaseVersion) -> None:
-        """确认草稿内文档全部就绪，且没有未成功的摄取任务。"""
+        """确认草稿内文档全部就绪，且没有未成功的摄取任务。
+
+        `status='archived'` 表示"该草稿内已删除这篇文档"（data-model §3，行保留），
+        不是一篇尚未就绪的文档；不排除它会让任何删除过文档的草稿永远卡在
+        `KNOWLEDGE_VERSION_NOT_READY`（C1 修复轮次）。
+        """
         blocking_document = self.db.exec(
             select(KnowledgeDocument.id).where(
                 KnowledgeDocument.tenant_id == version.tenant_id,
                 KnowledgeDocument.knowledge_base_id == version.knowledge_base_id,
                 KnowledgeDocument.knowledge_base_version_id == version.id,
-                KnowledgeDocument.status != "ready",
+                KnowledgeDocument.status.not_in(("ready", "archived")),
             )
         ).first()
         blocking_job = self.db.exec(
@@ -481,7 +486,12 @@ class SharedKnowledgeVersionService:
             raise knowledge_error(
                 KNOWLEDGE_BASELINE_STALE,
                 details={
-                    "base_version": base_version_row.version if base_version_row else None,
+                    # 注册表把 base_version 声明为 string，`errors.knowledge.baselineStale`
+                    # 也会直接插值它；草稿没有父基线（历史数据）时回退为草稿自身标签，
+                    # 绝不回传 null 让目录消息渲染出空洞的占位符。
+                    "base_version": (
+                        base_version_row.version if base_version_row else draft.version
+                    ),
                     "published_version": published_version_row.version,
                     "conflict_count": conflict_count,
                 },
@@ -578,12 +588,15 @@ class SharedKnowledgeVersionService:
             },
         )
 
-        # stale_draft_count：新正式版落地后，其余仍以旧正式版为基线的草稿数（须变基才能再发布）。
+        # stale_draft_count：新正式版落地后，其余仍以旧正式版为基线的**活动**草稿数
+        # （须变基才能再发布）。与 A1 的 draft_count、版本列表同口径排除已被变基替换的
+        # 归档快照，避免三处报出不同的草稿数（I2 修复轮次）。
         other_draft_bases = self.db.exec(
             select(KnowledgeBaseVersion.parent_version_id).where(
                 KnowledgeBaseVersion.tenant_id == tenant_id,
                 KnowledgeBaseVersion.knowledge_base_id == knowledge_base_id,
                 KnowledgeBaseVersion.publication_state == "draft",
+                KnowledgeBaseVersion.status != "archived",
                 KnowledgeBaseVersion.id != draft.id,
             )
         ).all()
@@ -753,7 +766,7 @@ class SharedKnowledgeVersionService:
                 KNOWLEDGE_VERSION_NOT_READY,
                 details={"knowledge_base_version_id": draft.id},
             )
-        expected = _parse_expected_updated_at(expected_updated_at)
+        expected = parse_expected_updated_at(expected_updated_at)
         if expected != draft.updated_at:
             raise knowledge_error(
                 KNOWLEDGE_PUBLISH_CONFLICT,

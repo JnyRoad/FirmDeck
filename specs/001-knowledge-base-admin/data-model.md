@@ -24,10 +24,14 @@
 | `metadata_json.published_from_draft` | — | 发布后 `true` |
 | `metadata_json.version_level` | — | 发布时的递进级别 `patch` / `minor` / `major` |
 | `metadata_json.review` | — | `{staged:int, pending:int, reviewed_at:iso, reviewed_by_user_id}` |
-| `metadata_json.superseded_by` | — | 变基后旧快照指向新快照 id（旧快照 `status='archived'`） |
-| `metadata_json.rebased_from` | — | 新快照记录 `{previous_version_id, from_base_version_id, to_base_version_id}` |
+| `metadata_json.superseded_by` | — | 变基后旧快照指向新快照 id（旧快照 `status='archived'`）。被替换的快照**不可再写入、发布、驳回或再次变基**（写入守卫同时检查 `status=='active'` 与该键），且不出现在版本列表与任何草稿计数中 |
+| `metadata_json.rebased_from` | — | 新快照记录 `{previous_version_id, from_base_version_id, to_base_version_id}`；新快照继承旧快照的来源信息但**丢弃 `review`**（旧快照的审阅统计对新草稿已失效） |
 
 **派生字段（不落库，读时计算）**：`is_stale = publication_state=='draft' and parent_version_id != kb.published_version_id`；`base_version = parent.version`；`next_version_preview[level]`。
+
+**草稿计数口径（单一定义）**：`publication_state=='draft' and status!='archived'`。A1 的 `draft_count`、
+`GET /knowledge-bases/{id}/versions` 的草稿条目、`knowledge.version.published` 事件的 `stale_draft_count`
+必须全部使用该口径。
 
 ### 草稿状态机
 
@@ -56,12 +60,28 @@
 |---|---|
 | `knowledge_base_version_id` | 共享库写入必须指向 `draft` 版本 |
 | `metadata_json.lineage_id` | 跨版本文档身份：克隆时继承，首次出现时 = 源文档 id；对比与变基按它配对 |
-| `status` | 复用现有；草稿内"删除"= 该草稿版本内的文档 `status='archived'`（正式版对应文档不受影响） |
+| `status` | 复用现有；草稿内"删除"= 该草稿版本内的文档 `status='archived'`（行保留，正式版对应文档不受影响） |
 
 **草稿覆盖层（前端概念，服务端由版本级文档集合表达）**：草稿版本拥有自己的完整文档集合；相对基线的
 "新增 / 修改 / 删除"由 `diff` 端点按 lineage 计算，不单独存储。
 
+### 归档文档的统一口径（软删除是唯一表示）
+
+`status='archived'` 是"该版本内已删除这篇文档"的**唯一**表示；行永远保留（可恢复），但所有消费方一律把它
+当作**不存在**：
+
+| 消费方 | 行为 |
+|---|---|
+| A2 对比（`diff._load_version_documents`） | base/target 两侧都过滤归档行。草稿内归档 → `kind="deleted"`；草稿内恢复基线中已归档的文档 → `kind="added"` |
+| A2b 文档列表（`knowledge_admin`） | 不返回归档行 |
+| 发布（`versioning.ensure_ready`） | 归档行不算"未就绪文档"，不阻塞发布 |
+| 变基分类（`rebase._classify_lineage`） | 归档的 ours 行等同"ours 已删除"：theirs 未改动 → 自动采纳删除；theirs 有改动 → delete/edit 冲突，人工裁决 |
+| 变基落库（`rebase._apply_merge_results`） | `delete` 动作**置 `status='archived'`**（绝不 `db.delete`），并清理该文档在本版本内克隆来的 `KnowledgeBucket` / `KnowledgeChunk` / `KnowledgeConcept` / `KnowledgeDiscoverySuggestion`，同时把 `bucket_count`/`chunk_count` 归零 |
+| 变基落库的 `add`/`update` | 走与在线编辑同一条重建路径（`KnowledgeService` 的正文重建：`document_card`、`section_tree`、`char_count`、buckets/chunks/discovery 与 `bucket_count`/`chunk_count`），只 flush 不 commit，整段写入留在同一个 SAVEPOINT 内 |
+
 ## 4. 对比结果（响应模型，不落库）
+
+（归档文档按上表视为不存在：不会作为 `unchanged` 被跳过，而是出现在 `deleted` 里。）
 
 ```text
 VersionDiff
@@ -70,6 +90,7 @@ VersionDiff
 └── documents[]
     ├── lineage_id, title, kind ("added" | "modified" | "deleted"), truncated
     ├── base_document_id, target_document_id   # T080：各侧真实行 id，对应侧不存在为 null
+    │                                          # kind=deleted 时 target_document_id = 目标版本内那一行的归档行 id（供"恢复"写回）
     └── hunks[]  (kind="modified" 时)
         ├── type ("equal" | "change")
         ├── base_start, base_lines[], target_start, target_lines[]   # 行号 0-based
@@ -79,7 +100,7 @@ VersionDiff
 ### 4b. 版本文档全量列表（响应模型，不落库，T080 A2b）
 
 ```text
-VersionDocument[]  # 按 title 再 id 稳定排序，含未改动文档
+VersionDocument[]  # 按 title 再 id 稳定排序，含未改动文档，不含已归档（草稿内已删除）文档
 └── id, lineage_id, title, filename, status, bucket_count, chunk_count, updated_at
 ```
 

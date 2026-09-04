@@ -27,6 +27,8 @@ from app.db.models import (
     KnowledgeBase,
     KnowledgeBaseAuditEvent,
     KnowledgeBaseVersion,
+    KnowledgeBucket,
+    KnowledgeChunk,
     KnowledgeDocument,
     Team,
     TeamKnowledgeBaseBinding,
@@ -38,6 +40,7 @@ from app.knowledge.errors import (
     KNOWLEDGE_BASELINE_STALE,
     KNOWLEDGE_DOCUMENT_LINEAGE_MISMATCH,
     KNOWLEDGE_GRANT_REQUIRED,
+    KNOWLEDGE_MODE_INVALID,
     KNOWLEDGE_PUBLISH_CONFLICT,
     KNOWLEDGE_REBASE_CONFLICTS_UNRESOLVED,
     KNOWLEDGE_VERSION_NOT_READY,
@@ -973,3 +976,416 @@ def test_apply_rebase_rolls_back_and_maps_integrity_error_to_publish_conflict() 
         )
         db.commit()
         assert retry_result.status == "applied"
+
+
+# ---------------------------------------------------------------------------
+# 修复轮次 C2：变基落库必须重建派生层（document_card/section_tree/buckets/chunks），
+# 删除动作必须软归档并清理该版本内的派生行，而不是硬删文档留下孤儿 chunk。
+# ---------------------------------------------------------------------------
+
+
+def _seed_derived_assets(db: Session, *, version_id: str, lineage_id: str) -> str:
+    """给某版本内的一篇文档补上 bucket/chunk（模拟真实摄取产物，克隆时会一并带入新草稿）。"""
+    document = next(
+        row
+        for row in db.exec(
+            select(KnowledgeDocument).where(
+                KnowledgeDocument.knowledge_base_version_id == version_id
+            )
+        ).all()
+        if (row.metadata_json or {}).get("lineage_id") == lineage_id
+    )
+    bucket = KnowledgeBucket(
+        tenant_id=document.tenant_id,
+        knowledge_base_id=document.knowledge_base_id,
+        knowledge_base_version_id=version_id,
+        document_id=document.id,
+        bucket_key="bucket_1",
+        title="旧主题",
+        summary="旧摘要",
+        token_estimate=1,
+        metadata_json={"content": "seeded"},
+    )
+    db.add(bucket)
+    db.flush()
+    db.add(
+        KnowledgeChunk(
+            tenant_id=document.tenant_id,
+            knowledge_base_id=document.knowledge_base_id,
+            knowledge_base_version_id=version_id,
+            document_id=document.id,
+            bucket_id=bucket.id,
+            chunk_index=0,
+            content="旧正文片段",
+            summary="旧摘要",
+            source_ref="seed",
+        )
+    )
+    document.bucket_count = 1
+    document.chunk_count = 1
+    db.add(document)
+    db.commit()
+    return document.id
+
+
+def _document_in_version(db: Session, *, version_id: str, lineage_id: str) -> KnowledgeDocument:
+    return next(
+        row
+        for row in db.exec(
+            select(KnowledgeDocument).where(
+                KnowledgeDocument.knowledge_base_version_id == version_id
+            )
+        ).all()
+        if (row.metadata_json or {}).get("lineage_id") == lineage_id
+    )
+
+
+def test_rebase_update_rebuilds_document_chunks_from_merged_content() -> None:
+    """自动合并的 update：新快照里的文档必须重建 chunk，内容与合并后的 raw_text 一致。"""
+    with _test_session() as db:
+        base, draft_ours, published_theirs = _build_conflict_free_stale_draft(db)
+        _seed_derived_assets(db, version_id=published_theirs.id, lineage_id="L_OURS")
+
+        result = rebase_knowledge_admin_draft(
+            base.id,
+            draft_ours.id,
+            KnowledgeRebaseRequest(
+                tenant_id="tenant_demo", team_id="team_content", change_reason="变基并重建派生层"
+            ),
+            db=db,
+            current_user=_admin_user(),
+        )
+        db.commit()
+        new_version_id = result.new_version.id
+
+        merged = _document_in_version(db, version_id=new_version_id, lineage_id="L_OURS")
+        assert (merged.metadata_json or {})["raw_text"] == "only1-ours\nonly2"
+        assert merged.chunk_count > 0
+        assert merged.bucket_count > 0
+        assert (merged.metadata_json or {}).get("document_card"), "必须重建 document_card"
+        assert (merged.metadata_json or {}).get("section_tree") is not None
+
+        chunks = db.exec(
+            select(KnowledgeChunk).where(KnowledgeChunk.document_id == merged.id)
+        ).all()
+        assert chunks, "合并后的文档必须有 chunk，否则检索侧看不到这次修改"
+        assert any("only1-ours" in chunk.content for chunk in chunks)
+        assert all(chunk.knowledge_base_version_id == new_version_id for chunk in chunks)
+        assert all("旧正文片段" != chunk.content for chunk in chunks), "旧 chunk 必须被替换"
+
+
+def test_rebase_add_creates_document_with_chunks() -> None:
+    """ours 新增文档：变基后新建的行必须带 bucket/chunk，否则检索侧完全看不到它。"""
+    with _test_session() as db:
+        base, draft_ours, _published = _build_conflict_free_stale_draft(db)
+        _add_document(
+            db,
+            version_id=draft_ours.id,
+            lineage_id="L_NEW",
+            filename="new.md",
+            lines=["新增第一行", "新增第二行"],
+        )
+        db.commit()
+
+        result = rebase_knowledge_admin_draft(
+            base.id,
+            draft_ours.id,
+            KnowledgeRebaseRequest(
+                tenant_id="tenant_demo", team_id="team_content", change_reason="变基并新增文档"
+            ),
+            db=db,
+            current_user=_admin_user(),
+        )
+        db.commit()
+
+        created = _document_in_version(db, version_id=result.new_version.id, lineage_id="L_NEW")
+        assert created.status == "ready"
+        assert created.chunk_count > 0
+        assert created.bucket_count > 0
+        chunks = db.exec(
+            select(KnowledgeChunk).where(KnowledgeChunk.document_id == created.id)
+        ).all()
+        assert any("新增第一行" in chunk.content for chunk in chunks)
+
+
+def test_rebase_delete_archives_document_and_purges_its_derived_rows() -> None:
+    """ours 删除文档：新快照里该行必须是归档态，且该版本内不再有它的 bucket/chunk。"""
+    with _test_session() as db:
+        base, draft_ours, published_theirs = _build_conflict_free_stale_draft(db)
+        _seed_derived_assets(db, version_id=published_theirs.id, lineage_id="L_SAME")
+        # ours 在自己的草稿里删除 L_SAME（软删除 = status='archived'）。
+        ours_same = _document_in_version(db, version_id=draft_ours.id, lineage_id="L_SAME")
+        ours_same.status = "archived"
+        db.add(ours_same)
+        db.commit()
+
+        result = rebase_knowledge_admin_draft(
+            base.id,
+            draft_ours.id,
+            KnowledgeRebaseRequest(
+                tenant_id="tenant_demo", team_id="team_content", change_reason="变基并保留删除"
+            ),
+            db=db,
+            current_user=_admin_user(),
+        )
+        db.commit()
+        new_version_id = result.new_version.id
+
+        deleted = _document_in_version(db, version_id=new_version_id, lineage_id="L_SAME")
+        assert deleted.status == "archived", "删除是软删除，行必须保留"
+        assert deleted.chunk_count == 0
+        assert deleted.bucket_count == 0
+        assert (
+            db.exec(
+                select(KnowledgeChunk).where(KnowledgeChunk.document_id == deleted.id)
+            ).all()
+            == []
+        ), "已删除文档不得在该版本内继续被检索到"
+        assert (
+            db.exec(
+                select(KnowledgeBucket).where(KnowledgeBucket.document_id == deleted.id)
+            ).all()
+            == []
+        )
+        # 正式版内的原始派生行不受影响（只清理克隆到新草稿里的那份）。
+        published_doc = _document_in_version(
+            db, version_id=published_theirs.id, lineage_id="L_SAME"
+        )
+        assert db.exec(
+            select(KnowledgeChunk).where(KnowledgeChunk.document_id == published_doc.id)
+        ).all()
+
+
+# ---------------------------------------------------------------------------
+# 修复轮次 C1/T024：`_classify_lineage` 的 add/add 与 edit/delete 分支单测
+# ---------------------------------------------------------------------------
+
+
+def test_merge_document_sets_add_add_same_content_is_noop() -> None:
+    """base 无、双方各自新增且内容相同：视为已合并，无需再写（克隆已带入 theirs 的行）。"""
+    ours = [DocumentSnapshot(lineage_id="L1", filename="a.md", title="A", lines=["x"])]
+    theirs = [DocumentSnapshot(lineage_id="L1", filename="a.md", title="A", lines=["x"])]
+
+    auto_merged, conflicts = merge_document_sets([], ours, theirs)
+
+    assert conflicts == []
+    assert len(auto_merged) == 1
+    assert auto_merged[0].source == "merged"
+    assert auto_merged[0].action == "noop"
+
+
+def test_merge_document_sets_add_add_different_content_conflicts() -> None:
+    """base 无、双方各自新增且内容不同：整篇冲突，`action='add'`，base_lines 为空。"""
+    ours = [DocumentSnapshot(lineage_id="L1", filename="a.md", title="Ours", lines=["ours"])]
+    theirs = [DocumentSnapshot(lineage_id="L1", filename="a.md", title="Theirs", lines=["theirs"])]
+
+    auto_merged, conflicts = merge_document_sets([], ours, theirs)
+
+    assert auto_merged == []
+    assert len(conflicts) == 1
+    conflict = conflicts[0]
+    assert conflict.action == "add"
+    assert conflict.title == "Ours"
+    assert len(conflict.blocks) == 1
+    assert conflict.blocks[0].base_lines == []
+    assert conflict.blocks[0].ours_lines == ["ours"]
+    assert conflict.blocks[0].theirs_lines == ["theirs"]
+
+
+def test_merge_document_sets_ours_deleted_theirs_unchanged_is_auto_delete() -> None:
+    """ours 删除、theirs 未动：自动采纳删除（`action='delete'`）。"""
+    base = [DocumentSnapshot(lineage_id="L1", filename="a.md", title="A", lines=["x"])]
+    theirs = [DocumentSnapshot(lineage_id="L1", filename="a.md", title="A", lines=["x"])]
+
+    auto_merged, conflicts = merge_document_sets(base, [], theirs)
+
+    assert conflicts == []
+    assert len(auto_merged) == 1
+    assert auto_merged[0].source == "ours"
+    assert auto_merged[0].action == "delete"
+
+
+def test_merge_document_sets_ours_deleted_theirs_edited_is_conflict() -> None:
+    """ours 删除、theirs 修改：delete/edit 冲突，需人工裁决（`ours_lines` 为空表示删除）。"""
+    base = [DocumentSnapshot(lineage_id="L1", filename="a.md", title="A", lines=["x"])]
+    theirs = [DocumentSnapshot(lineage_id="L1", filename="a.md", title="A", lines=["x-theirs"])]
+
+    auto_merged, conflicts = merge_document_sets(base, [], theirs)
+
+    assert auto_merged == []
+    assert len(conflicts) == 1
+    conflict = conflicts[0]
+    assert conflict.action == "update"
+    assert conflict.blocks[0].ours_lines == []
+    assert conflict.blocks[0].theirs_lines == ["x-theirs"]
+    assert conflict.blocks[0].base_lines == ["x"]
+
+
+def test_merge_document_sets_archived_ours_row_is_treated_as_deleted() -> None:
+    """`_load_version_documents` 已过滤归档行，因此软删除在合并期表现为 ours 缺席。"""
+    base = [DocumentSnapshot(lineage_id="L1", filename="a.md", title="A", lines=["x"])]
+    theirs = [DocumentSnapshot(lineage_id="L1", filename="a.md", title="A", lines=["x-theirs"])]
+
+    _auto_merged, conflicts = merge_document_sets(base, [], theirs)
+
+    assert [conflict.lineage_id for conflict in conflicts] == ["L1"]
+
+
+# ---------------------------------------------------------------------------
+# 修复轮次 I1：被替换（superseded）的草稿快照不可再写、不可再发布、不可再变基
+# ---------------------------------------------------------------------------
+
+
+def test_repeated_rebase_on_superseded_draft_is_rejected_and_creates_no_second_draft() -> None:
+    with _test_session() as db:
+        base, draft_ours, _published = _build_conflict_free_stale_draft(db)
+
+        first = rebase_knowledge_admin_draft(
+            base.id,
+            draft_ours.id,
+            KnowledgeRebaseRequest(
+                tenant_id="tenant_demo", team_id="team_content", change_reason="首次变基"
+            ),
+            db=db,
+            current_user=_admin_user(),
+        )
+        db.commit()
+        assert first.status == "applied"
+        version_count_after_first = len(db.exec(select(KnowledgeBaseVersion)).all())
+
+        with pytest.raises(HTTPException) as repeated:
+            rebase_knowledge_admin_draft(
+                base.id,
+                draft_ours.id,  # 同一个（已被替换的）版本 id：双击/重试
+                KnowledgeRebaseRequest(
+                    tenant_id="tenant_demo", team_id="team_content", change_reason="重复变基"
+                ),
+                db=db,
+                current_user=_admin_user(),
+            )
+
+        assert repeated.value.status_code == 409
+        assert repeated.value.detail["code"] == KNOWLEDGE_VERSION_NOT_READY
+        assert len(db.exec(select(KnowledgeBaseVersion)).all()) == version_count_after_first
+
+
+def test_superseded_draft_is_not_writable() -> None:
+    """`require_writable_draft` 必须拒绝被替换的快照，否则过期页签仍能写入已作废的草稿。"""
+    with _test_session() as db:
+        base, draft_ours, _published = _build_conflict_free_stale_draft(db)
+        rebase_knowledge_admin_draft(
+            base.id,
+            draft_ours.id,
+            KnowledgeRebaseRequest(
+                tenant_id="tenant_demo", team_id="team_content", change_reason="变基"
+            ),
+            db=db,
+            current_user=_admin_user(),
+        )
+        db.commit()
+
+        with pytest.raises(KnowledgeError) as rejected:
+            SharedKnowledgeVersionService(db).require_writable_draft(
+                tenant_id="tenant_demo",
+                knowledge_base_id=base.id,
+                version_id=draft_ours.id,
+            )
+        assert rejected.value.code == KNOWLEDGE_MODE_INVALID
+
+
+def test_rebase_expected_updated_at_mismatch_is_publish_conflict() -> None:
+    """A3 可选乐观锁：`expected_updated_at` 与草稿当前值不符时拒绝，且不落库。"""
+    with _test_session() as db:
+        base, draft_ours, _published = _build_conflict_free_stale_draft(db)
+        version_count_before = len(db.exec(select(KnowledgeBaseVersion)).all())
+
+        with pytest.raises(HTTPException) as conflict:
+            rebase_knowledge_admin_draft(
+                base.id,
+                draft_ours.id,
+                KnowledgeRebaseRequest(
+                    tenant_id="tenant_demo",
+                    team_id="team_content",
+                    change_reason="并发写入后重试",
+                    expected_updated_at="2020-01-01T00:00:00",
+                ),
+                db=db,
+                current_user=_admin_user(),
+            )
+
+        assert conflict.value.status_code == 409
+        assert conflict.value.detail["code"] == KNOWLEDGE_PUBLISH_CONFLICT
+        assert len(db.exec(select(KnowledgeBaseVersion)).all()) == version_count_before
+
+
+def test_rebase_expected_updated_at_match_is_accepted() -> None:
+    with _test_session() as db:
+        base, draft_ours, _published = _build_conflict_free_stale_draft(db)
+
+        result = rebase_knowledge_admin_draft(
+            base.id,
+            draft_ours.id,
+            KnowledgeRebaseRequest(
+                tenant_id="tenant_demo",
+                team_id="team_content",
+                change_reason="带乐观锁的变基",
+                expected_updated_at=draft_ours.updated_at.isoformat(),
+            ),
+            db=db,
+            current_user=_admin_user(),
+        )
+        db.commit()
+        assert result.status == "applied"
+
+
+def test_rebased_snapshot_drops_stale_review_block() -> None:
+    """A5 的 `review` 统计属于旧快照，克隆到新草稿会显示过期的暂存/待处理数。"""
+    with _test_session() as db:
+        base, draft_ours, _published = _build_conflict_free_stale_draft(db)
+        draft_ours.metadata_json = {
+            **dict(draft_ours.metadata_json or {}),
+            "review": {"staged": 4, "pending": 2, "reviewed_at": "2026-01-01T00:00:00"},
+        }
+        db.add(draft_ours)
+        db.commit()
+
+        result = rebase_knowledge_admin_draft(
+            base.id,
+            draft_ours.id,
+            KnowledgeRebaseRequest(
+                tenant_id="tenant_demo", team_id="team_content", change_reason="变基"
+            ),
+            db=db,
+            current_user=_admin_user(),
+        )
+        db.commit()
+
+        new_version = db.get(KnowledgeBaseVersion, result.new_version.id)
+        assert "review" not in (new_version.metadata_json or {})
+        # 其余来源信息（provenance/draft_name）仍然继承。
+        assert (new_version.metadata_json or {}).get("draft_name")
+
+
+def test_publish_stale_draft_without_parent_reports_string_base_version() -> None:
+    """`KNOWLEDGE_BASELINE_STALE` 的 `base_version` 已注册为 string，不能回传 null。"""
+    with _test_session() as db:
+        base, draft_ours, published_theirs = _build_conflict_free_stale_draft(db)
+        draft_ours.parent_version_id = None  # 无基线的历史草稿
+        db.add(draft_ours)
+        db.commit()
+
+        with pytest.raises(KnowledgeError) as stale:
+            SharedKnowledgeVersionService(db).publish_draft(
+                tenant_id="tenant_demo",
+                knowledge_base_id=base.id,
+                draft_version_id=draft_ours.id,
+                expected_published_version_id=published_theirs.id,
+                actor_type="user",
+                actor_id="user_admin",
+                source_team_id="team_content",
+                change_reason="尝试发布无基线草稿",
+            )
+
+        assert stale.value.code == KNOWLEDGE_BASELINE_STALE
+        assert isinstance(stale.value.details["base_version"], str)
+        assert stale.value.details["base_version"]

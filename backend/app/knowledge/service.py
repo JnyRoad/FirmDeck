@@ -324,6 +324,45 @@ class KnowledgeService:
         status: str | None = None,
     ) -> KnowledgeDocument:
         """Replace editable source text and rebuild every derived knowledge layer."""
+        return self._write_document_content(
+            document, content_md, title=title, status=status, commit=True
+        )
+
+    def rebuild_document_content_in_transaction(
+        self,
+        document: KnowledgeDocument,
+        content_md: str,
+        *,
+        title: str | None = None,
+        status: str | None = None,
+    ) -> KnowledgeDocument:
+        """在调用方事务内重写正文并重建派生层，只 flush 不 commit。
+
+        供变基落库（`app.knowledge.rebase._apply_merge_results`）使用：那里的多步写入包在
+        一个 SAVEPOINT 内，任何 `commit()` 都会把外层事务一并提交、破坏整体回滚语义，
+        因此需要与 `replace_document_content` 完全相同的重建流程但不提交的版本。
+        """
+        return self._write_document_content(
+            document, content_md, title=title, status=status, commit=False
+        )
+
+    def _persist(self, commit: bool) -> None:
+        """提交或仅 flush：让重建流程既能独立成事务，也能嵌进调用方的 SAVEPOINT。"""
+        if commit:
+            self.db.commit()
+        else:
+            self.db.flush()
+
+    def _write_document_content(
+        self,
+        document: KnowledgeDocument,
+        content_md: str,
+        *,
+        title: str | None,
+        status: str | None,
+        commit: bool,
+    ) -> KnowledgeDocument:
+        """正文替换与派生层（card/section_tree/buckets/chunks/concepts）重建的唯一实现。"""
         normalized_text = _normalize_text(content_md)
         if not normalized_text:
             raise KnowledgeParseError("文档正文不能为空。")
@@ -358,7 +397,7 @@ class KnowledgeService:
         document.metadata_json = metadata
         document.updated_at = utc_now()
         self.db.add(document)
-        self.db.commit()
+        self._persist(commit)
         self.db.refresh(document)
 
         buckets = self._build_buckets(
@@ -370,6 +409,7 @@ class KnowledgeService:
             document_card,
             None,
             use_llm=False,
+            commit=commit,
         )
         chunk_count = self._build_chunks(
             document.tenant_id,
@@ -378,6 +418,7 @@ class KnowledgeService:
             buckets,
             section_nodes,
             None,
+            commit=commit,
         )
         self.db.exec(
             delete(KnowledgeConcept).where(
@@ -388,13 +429,14 @@ class KnowledgeService:
                 KnowledgeConcept.document_id == document.id,
             )
         )
-        self.db.commit()
+        self._persist(commit)
         concept_rows = upsert_concepts(
             self.db,
             document.tenant_id,
             document.knowledge_base_id,
             document.knowledge_base_version_id,
             build_okf_for_document(document, section_nodes, buckets),
+            commit=commit,
         )
 
         document.bucket_count = len(buckets)
@@ -423,7 +465,7 @@ class KnowledgeService:
         }
         document.updated_at = utc_now()
         self.db.add(document)
-        self.db.commit()
+        self._persist(commit)
         self.db.refresh(document)
         return document
 
@@ -1349,6 +1391,7 @@ class KnowledgeService:
         job: KnowledgeIngestJob | None,
         *,
         use_llm: bool = True,
+        commit: bool = True,
     ) -> list[KnowledgeBucket]:
         if job is not None and self._execution_owner is not None:
             self._require_ingest_execution_fence(job)
@@ -1410,7 +1453,7 @@ class KnowledgeService:
         if job is not None and self._execution_owner is not None:
             self._commit_ingest_fenced(job)
         else:
-            self.db.commit()
+            self._persist(commit)
         for row in rows:
             self.db.refresh(row)
         return rows
@@ -1423,6 +1466,8 @@ class KnowledgeService:
         buckets: list[KnowledgeBucket],
         section_nodes: list[dict[str, Any]],
         job: KnowledgeIngestJob | None,
+        *,
+        commit: bool = True,
     ) -> int:
         if job is not None and self._execution_owner is not None:
             self._require_ingest_execution_fence(job)
@@ -1536,7 +1581,7 @@ class KnowledgeService:
         if job is not None and self._execution_owner is not None:
             self._commit_ingest_fenced(job)
         else:
-            self.db.commit()
+            self._persist(commit)
         return count
 
     def _discover_from_document(
