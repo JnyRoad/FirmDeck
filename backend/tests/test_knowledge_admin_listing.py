@@ -27,6 +27,7 @@ from app.db.models import (
     Tenant,
     User,
 )
+from app.knowledge.listing import get_tenant_knowledge_base
 from app.security.auth import get_current_user
 
 
@@ -374,6 +375,69 @@ def test_shared_base_summary_fields() -> None:
         assert unbound.draft_count == 0
         assert unbound.document_count == 2
         assert unbound.published_version == "1.0.0"
+
+
+def test_document_count_excludes_archived_documents_in_published_version() -> None:
+    """回归：正式版本内 `status='archived'` 的文档（草稿内已删除，data-model §3，行保留）
+    不计入 `document_count`/`summary.documents`，口径与 A2b 文档列表一致。"""
+    with _test_session() as db:
+        db.add(Tenant(id="tenant_demo", name="Demo"))
+        base = KnowledgeBase(
+            id="kb_shared_with_archived_doc",
+            tenant_id="tenant_demo",
+            name="含归档文档的共享库",
+            mode="shared",
+            status="active",
+            published_version_id="kbver_archived_doc_100",
+        )
+        db.add(base)
+        db.add(
+            KnowledgeBaseVersion(
+                id="kbver_archived_doc_100",
+                tenant_id="tenant_demo",
+                knowledge_base_id="kb_shared_with_archived_doc",
+                version="1.0.0",
+                name="含归档文档的共享库",
+                publication_state="released",
+            )
+        )
+        for i in range(2):
+            db.add(
+                KnowledgeDocument(
+                    id=f"kdoc_archived_doc_ready_{i}",
+                    tenant_id="tenant_demo",
+                    knowledge_base_id="kb_shared_with_archived_doc",
+                    knowledge_base_version_id="kbver_archived_doc_100",
+                    filename=f"ready_{i}.md",
+                    file_type="md",
+                    status="ready",
+                )
+            )
+        db.add(
+            KnowledgeDocument(
+                id="kdoc_archived_doc_deleted",
+                tenant_id="tenant_demo",
+                knowledge_base_id="kb_shared_with_archived_doc",
+                knowledge_base_version_id="kbver_archived_doc_100",
+                filename="deleted.md",
+                file_type="md",
+                status="archived",
+            )
+        )
+        db.commit()
+
+        result = _call_list(db, _admin_user())
+        by_id = {item.id: item for item in result.items}
+        item = by_id["kb_shared_with_archived_doc"]
+
+        assert item.document_count == 2
+        assert result.summary.documents == 2
+
+        detail = get_tenant_knowledge_base(
+            db, tenant_id="tenant_demo", knowledge_base_id="kb_shared_with_archived_doc"
+        )
+        assert detail is not None
+        assert detail.document_count == 2
 
 
 def test_dedicated_base_owner_and_branch_fields() -> None:

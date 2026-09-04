@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Any
 
 from sqlalchemy import func
 from sqlmodel import Session, select
@@ -107,6 +108,17 @@ def _owner_agent_id(base: KnowledgeBase) -> str | None:
     return owner_id if isinstance(owner_id, str) and owner_id else None
 
 
+def active_document_status_filter() -> Any:
+    """已归档文档（`status='archived'`）在计数/列表口径中一律视为不存在。
+
+    data-model §3："草稿内删除"的唯一表示是该文档行 `status='archived'`（行保留，
+    不删库存行）；所有消费方必须一致把它当作不存在，否则不同端点会报出不同的数字。
+    本谓词是唯一权威定义，供本文件的 `document_count`/`summary.documents`（A1/A1b）与
+    `knowledge_admin.list_knowledge_admin_version_documents`（A2b）共用。
+    """
+    return KnowledgeDocument.status != "archived"
+
+
 def _fetch_listed_items(
     db: Session, *, tenant_id: str, bases: list[KnowledgeBase]
 ) -> list[ListedKnowledgeBase]:
@@ -184,6 +196,8 @@ def _fetch_listed_items(
         published_version_label_by_id = dict(rows)
 
     # 文档数：共享库取正式版本、专用库取 owner 分支头版本，合并成一次分组查询。
+    # 归档行（草稿内已删除，data-model §3）一律排除，口径与 A2b（knowledge_admin.py）共用
+    # `active_document_status_filter`，否则发布一份删过文档的草稿后 A1 会比 A1b/A2b 多算。
     relevant_version_ids = set(published_version_ids) | set(head_version_id_by_base.values())
     document_count_by_version: dict[str, int] = {}
     if relevant_version_ids:
@@ -195,6 +209,7 @@ def _fetch_listed_items(
             .where(
                 KnowledgeDocument.tenant_id == tenant_id,
                 KnowledgeDocument.knowledge_base_version_id.in_(relevant_version_ids),
+                active_document_status_filter(),
             )
             .group_by(KnowledgeDocument.knowledge_base_version_id)
         ).all()

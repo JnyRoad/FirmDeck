@@ -61,6 +61,8 @@ Response `200`: 见 data-model §4（`VersionDiff`）。超过 `max_lines` 的�
 `kind="deleted"` 时的 `target_document_id`：草稿内删除是软删除，目标版本里那一行仍在（`status='archived'`），返回其真实行 id 供"恢复"写回定位；只有目标版本内确实没有对应行时才为 `null`。
 `status='archived'` 的文档按 data-model §3 表示"该版本内已删除"，base/target 两侧一律视为**不存在**：草稿里归档一篇文档 → `kind="deleted"` 且计入 `summary.deleted`；草稿里恢复一篇基线中已归档的文档 → `kind="added"`。
 Errors: `KNOWLEDGE_BASE_NOT_FOUND`（404，知识库或版本**不存在**）、`KNOWLEDGE_CONTEXT_MISMATCH`（403，资源存在但跨租户/跨库）。两个查找（知识库、版本）用同一套存在性策略，不再一个 403、一个 404。
+
+与 A1b 的口径差异（非缺陷，`_load_admin_diff_base`/`_load_admin_diff_version` 与 `get_tenant_knowledge_base` 各自独立实现）：A1b 对"不存在"与"存在但跨租户"**都**折叠为 404（existence-hiding，调用方无法区分两种情况）；A2/A2b 则用 403 `KNOWLEDGE_CONTEXT_MISMATCH` 显式区分"资源存在但跨租户/跨库"与 404 的"压根不存在"，会向调用方泄漏该 `kb_id`/`version_id` 组合是否存在。两者都只在管理员/授权调用方可达（A2/A2b 的非 admin 路径还要求 `require_shared_knowledge_history_viewer`），泄漏面有限，但前端不应假设 A1b 与 A2/A2b 对同一个不可见资源返回相同的状态码。
 管理员旁路（`_load_admin_diff_base`）不校验 `mode`，因此 A2/A2b 对 dedicated 库也可用；A3/A4/A5 相反，一律经 `_shared_base` 拒绝 dedicated 库（`KNOWLEDGE_MODE_INVALID`，409），前端不应在专用库详情页提供变基/审阅入口。
 
 ### A2b `GET /knowledge-admin/knowledge-bases/{kb_id}/versions/{version_id}/documents` — 版本文档全量列表 **admin 或该库 history viewer**
@@ -127,6 +129,7 @@ Query: `tenant_id`、`exclude_bound_to=kb_id`（可选）。Response: `[{id, nam
 - `publish` 新增 body 字段：`level: "patch" | "minor" | "major"`（默认 `patch`）、`force_overwrite: bool`（默认 `false`）。草稿基线过期且未 `force_overwrite` → `KNOWLEDGE_BASELINE_STALE`；`force_overwrite=true` 时审计 `forced_overwrite=true`。
 - `publish` 响应 `KnowledgeBaseVersionRead.version` 为新分配的 semver，`metadata.draft_name` 为来源草稿名。
 - `drafts` 响应的 `version` 为草稿名（`draft-xxxx`）。
+- `publish`/`reject` 都经 `SharedKnowledgeVersionService.require_writable_draft`：目标是已被变基替换的草稿快照（`status='archived'` 且 `metadata.superseded_by` 非空，data-model §2）时一律 `KNOWLEDGE_MODE_INVALID`（409，"该草稿已被变基替换，请打开最新的草稿快照。"），即使 `publication_state` 仍是 `draft`——防止过期页签发布或驳回一份已作废的快照。与 A3/A4/A5 把同一情形折叠为 `KNOWLEDGE_VERSION_NOT_READY` 不同：B1 复用 `require_writable_draft` 的默认错误码，未单独改写为 A5 的契约码。
 
 ### B2 `GET /knowledge-bases/{kb_id}/versions`
 

@@ -21,6 +21,7 @@ from app.knowledge.diff import DEFAULT_MAX_LINES, diff_versions, document_lineag
 from app.knowledge.errors import KnowledgeError
 from app.knowledge.listing import (
     ListedKnowledgeBase,
+    active_document_status_filter,
     get_tenant_knowledge_base,
     list_bindable_teams,
     list_tenant_knowledge_bases,
@@ -385,7 +386,7 @@ def list_knowledge_admin_version_documents(
         .where(
             KnowledgeDocument.tenant_id == tenant_id,
             KnowledgeDocument.knowledge_base_version_id == version_id,
-            KnowledgeDocument.status != "archived",
+            active_document_status_filter(),
         )
         .order_by(KnowledgeDocument.title, KnowledgeDocument.id)
     ).all()

@@ -758,10 +758,15 @@ class SharedKnowledgeVersionService:
         默认的 `KNOWLEDGE_MODE_INVALID`，此处需要单独判断以匹配契约错误码）。写入本身
         只整体重新赋值 `metadata_json`（JSON 列需要整体替换才能持久化），并同步推进
         `updated_at`，使该次写入成为下一次审阅写回的新乐观锁基线。
+
+        已被变基替换的草稿快照（`is_superseded_draft_snapshot`，data-model §2）仍是
+        `publication_state='draft'`，仅看该字段的判断会让过期页签往一份已作废的快照里
+        写审阅统计。A3/A4（`rebase._draft_version`）对超期快照统一折叠为
+        `KNOWLEDGE_VERSION_NOT_READY`，本方法与它们共用同一个错误口径与判定函数。
         """
         self._shared_base(tenant_id, knowledge_base_id)
         draft = self._version(tenant_id, knowledge_base_id, draft_version_id)
-        if draft.publication_state != "draft":
+        if draft.publication_state != "draft" or is_superseded_draft_snapshot(draft):
             raise knowledge_error(
                 KNOWLEDGE_VERSION_NOT_READY,
                 details={"knowledge_base_version_id": draft.id},

@@ -72,8 +72,9 @@
 
 | 消费方 | 行为 |
 |---|---|
+| A1/A1b 列表与详情（`listing._fetch_listed_items` 的 `document_count`、A1 的 `summary.documents`） | 共享库正式版本、专用库 owner 分支头版本的文档计数查询过滤归档行（`active_document_status_filter`），否则发布一份删过文档的草稿后本口径会比 A1b/A2b 多算 |
 | A2 对比（`diff._load_version_documents`） | base/target 两侧都过滤归档行。草稿内归档 → `kind="deleted"`；草稿内恢复基线中已归档的文档 → `kind="added"` |
-| A2b 文档列表（`knowledge_admin`） | 不返回归档行 |
+| A2b 文档列表（`knowledge_admin`，复用 `listing.active_document_status_filter`） | 不返回归档行 |
 | 发布（`versioning.ensure_ready`） | 归档行不算"未就绪文档"，不阻塞发布 |
 | 变基分类（`rebase._classify_lineage`） | 归档的 ours 行等同"ours 已删除"：theirs 未改动 → 自动采纳删除；theirs 有改动 → delete/edit 冲突，人工裁决 |
 | 变基落库（`rebase._apply_merge_results`） | `delete` 动作**置 `status='archived'`**（绝不 `db.delete`），并清理该文档在本版本内克隆来的 `KnowledgeBucket` / `KnowledgeChunk` / `KnowledgeConcept` / `KnowledgeDiscoverySuggestion`，同时把 `bucket_count`/`chunk_count` 归零 |

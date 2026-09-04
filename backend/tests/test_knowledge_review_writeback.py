@@ -258,6 +258,49 @@ def test_review_route_rejects_non_draft_version() -> None:
         assert not_ready.value.detail["code"] == KNOWLEDGE_VERSION_NOT_READY
 
 
+def test_review_route_rejects_superseded_draft_snapshot() -> None:
+    """已被变基替换的草稿快照（data-model §2：`status='archived'` + `metadata.superseded_by`）
+    仍是 `publication_state='draft'`；过期页签继续写审阅统计必须被拒绝，口径与 A3/A4
+    （`rebase._draft_version`）一致，同样折叠为 `KNOWLEDGE_VERSION_NOT_READY`。"""
+    with _test_session() as db:
+        base, v1 = _seed_review_fixture(db)
+        draft = _create_draft(db, expected_published_version_id=v1.id, reason="待审阅草稿")
+        superseding_draft = _create_draft(
+            db, expected_published_version_id=v1.id, reason="变基后的新草稿"
+        )
+        draft.status = "archived"
+        draft.metadata_json = {
+            **(draft.metadata_json or {}),
+            "superseded_by": superseding_draft.id,
+        }
+        db.add(draft)
+        db.commit()
+        db.refresh(draft)
+
+        with pytest.raises(HTTPException) as not_ready:
+            review_knowledge_admin_draft(
+                base.id,
+                draft.id,
+                KnowledgeDraftReviewRequest(
+                    tenant_id="tenant_demo",
+                    staged=1,
+                    pending=0,
+                    documents_adjusted=1,
+                    expected_updated_at=draft.updated_at.isoformat(),
+                ),
+                db=db,
+                current_user=_admin_user(),
+            )
+
+        assert not_ready.value.status_code == 409
+        assert not_ready.value.detail["code"] == KNOWLEDGE_VERSION_NOT_READY
+
+        # 拒绝时不写入：草稿 metadata 未被污染（superseded_by 标记保持不变）。
+        db.refresh(draft)
+        assert "review" not in (draft.metadata_json or {})
+        assert draft.metadata_json["superseded_by"] == superseding_draft.id
+
+
 # ---------------------------------------------------------------------------
 # 鉴权：admin 与团队 manager 均可写入；非 owner 非 admin 拒绝
 # ---------------------------------------------------------------------------
