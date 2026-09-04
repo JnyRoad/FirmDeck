@@ -195,7 +195,7 @@
 
 ## Phase 8: Polish & Cross-Cutting Concerns
 
-- [ ] T074 [P] 运行 `npm --prefix frontend-enterprise run i18n:check` 并补齐/修正 en-US 与 zh-CN 缺键、ICU 参数不一致
+- [X] T074 [P] 运行 `npm --prefix frontend-enterprise run i18n:check` 并补齐/修正 en-US 与 zh-CN 缺键、ICU 参数不一致
 - [ ] T075 [P] 运行 `backend/.venv/bin/ruff check backend`、`backend/.venv/bin/python -m pytest backend/tests`、`backend/.venv/bin/python scripts/i18n/check_python.py`，修复失败
 - [ ] T076 [P] 运行 `npm --prefix frontend-enterprise test` 与 `npm --prefix frontend-enterprise run build`，修复失败；确认 frontend-enterprise/src/pages/KnowledgePage.test.tsx 等既有员工侧知识库测试全部通过（FR-003）
 - [ ] T077 按 quickstart.md S1–S5 在 `zh-CN` 与 `en-US` 各做一遍真实浏览器验收（含中文输入法、跨行选区、粘贴），记录结果与截图到 PR；未能运行的项标 `UNVERIFIED`
