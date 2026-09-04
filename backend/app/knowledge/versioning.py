@@ -18,8 +18,14 @@ from app.db.models import (
     new_id,
     utc_now,
 )
+from app.i18n.language_context import (
+    LanguageContext,
+    LanguageContextInputs,
+    resolve_language_context,
+)
 from app.knowledge.audit import KnowledgeAuditService
 from app.knowledge.errors import (
+    KNOWLEDGE_BASELINE_STALE,
     KNOWLEDGE_CONTEXT_MISMATCH,
     KNOWLEDGE_MODE_INVALID,
     KNOWLEDGE_PUBLISH_CONFLICT,
@@ -28,6 +34,9 @@ from app.knowledge.errors import (
     KnowledgeError,
     knowledge_error,
 )
+from app.knowledge.rebase import count_stale_conflicts
+from app.observability.event_log import EventLog
+from app.observability.product_events import record_product_event
 
 VersionLevel = Literal["patch", "minor", "major"]
 _VERSION_LEVELS: tuple[str, ...] = ("patch", "minor", "major")
@@ -36,6 +45,11 @@ _VERSION_LEVELS: tuple[str, ...] = ("patch", "minor", "major")
 def _actor_context(source_team_id: str | None) -> str:
     """审计口径：来源团队为空即为租户管理员旁路，否则为团队路径。"""
     return "team" if source_team_id else "tenant_admin"
+
+
+def _default_language_context() -> LanguageContext:
+    """HTTP 路由未显式提供语言快照时，退回稳定的合规默认值。"""
+    return resolve_language_context(LanguageContextInputs())
 
 
 def _required_reason(value: str | None) -> str:
@@ -400,10 +414,18 @@ class SharedKnowledgeVersionService:
         source_team_id: str | None,
         change_reason: str,
         level: VersionLevel = "patch",
+        force_overwrite: bool = False,
         idempotency_key: str | None = None,
         request_payload: Any = None,
+        language_context: LanguageContext | None = None,
     ) -> KnowledgeBaseVersion:
-        """校验草稿后按发布级别分配语义版本号，并以 CAS 原子替换全局正式指针。"""
+        """校验草稿后按发布级别分配语义版本号，并以 CAS 原子替换全局正式指针。
+
+        草稿基线（`parent_version_id`）落后于知识库当前正式版本时视为 stale：
+        默认拒绝发布（`KNOWLEDGE_BASELINE_STALE`，附带按变基预览算出的冲突文档数），
+        避免语义覆盖其间已发布的其他修改；调用方明确 `force_overwrite=true` 时放行，
+        并在审计详情中留痕 `forced_overwrite`。
+        """
         if level not in _VERSION_LEVELS:
             raise knowledge_error(
                 KNOWLEDGE_VERSION_LEVEL_INVALID,
@@ -416,8 +438,32 @@ class SharedKnowledgeVersionService:
             version_id=draft_version_id,
         )
         reason = _required_reason(change_reason)
-        if draft.parent_version_id != expected_published_version_id:
+        if expected_published_version_id != base.published_version_id:
             raise self._publish_conflict(base, expected_published_version_id)
+        is_stale = draft.parent_version_id != base.published_version_id
+        if is_stale and not force_overwrite:
+            conflict_count = count_stale_conflicts(
+                self.db,
+                tenant_id=tenant_id,
+                draft=draft,
+                published_version_id=base.published_version_id,
+            )
+            base_version_row = (
+                self._version(tenant_id, knowledge_base_id, draft.parent_version_id)
+                if draft.parent_version_id
+                else None
+            )
+            published_version_row = self._version(
+                tenant_id, knowledge_base_id, base.published_version_id
+            )
+            raise knowledge_error(
+                KNOWLEDGE_BASELINE_STALE,
+                details={
+                    "base_version": base_version_row.version if base_version_row else None,
+                    "published_version": published_version_row.version,
+                    "conflict_count": conflict_count,
+                },
+            )
         self.ensure_ready(draft)
 
         # 草稿名在发布前即为当前 version 值；语义版本号在发布这一刻按 level 分配，
@@ -496,6 +542,7 @@ class SharedKnowledgeVersionService:
                 "draft_name": draft_name,
                 "version_level": level,
                 "actor_context": _actor_context(source_team_id),
+                "forced_overwrite": bool(force_overwrite and is_stale),
             },
             idempotency_key=idempotency_key,
             request_payload=request_payload,
@@ -507,6 +554,30 @@ class SharedKnowledgeVersionService:
                 "published_at": now.isoformat(),
                 "global_scope_notice": "该版本将供所有已绑定且有权的团队在下一轮使用。",
             },
+        )
+
+        # stale_draft_count：新正式版落地后，其余仍以旧正式版为基线的草稿数（须变基才能再发布）。
+        other_draft_bases = self.db.exec(
+            select(KnowledgeBaseVersion.parent_version_id).where(
+                KnowledgeBaseVersion.tenant_id == tenant_id,
+                KnowledgeBaseVersion.knowledge_base_id == knowledge_base_id,
+                KnowledgeBaseVersion.publication_state == "draft",
+                KnowledgeBaseVersion.id != draft.id,
+            )
+        ).all()
+        stale_draft_count = sum(1 for parent_id in other_draft_bases if parent_id != draft.id)
+        record_product_event(
+            EventLog(self.db),
+            event_code="knowledge.version.published",
+            tenant_id=tenant_id,
+            aggregate_type="knowledge_base_version",
+            aggregate_id=draft.id,
+            params={
+                "knowledge_base_id": knowledge_base_id,
+                "version": draft.version,
+                "stale_draft_count": stale_draft_count,
+            },
+            language_context=language_context or _default_language_context(),
         )
         return draft
 

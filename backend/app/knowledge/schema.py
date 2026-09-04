@@ -544,3 +544,75 @@ class VersionDiffRead(BaseModel):
     pairing: Literal["lineage", "filename"]
     summary: VersionDiffSummary
     documents: list[DiffDocumentRead] = Field(default_factory=list)
+
+
+class KnowledgeRebaseRequest(BaseModel):
+    """A3 `POST .../versions/{version_id}/rebase` 请求体：变基预览/执行。"""
+
+    tenant_id: str
+    team_id: str | None = None
+    change_reason: NonEmptyText
+    idempotency_key: str | None = None
+
+
+class KnowledgeRebaseResolutionInput(BaseModel):
+    """A4 请求体中单篇冲突文档的最终合并结果。"""
+
+    lineage_id: NonEmptyText
+    content_md: str
+
+
+class KnowledgeRebaseResolveRequest(BaseModel):
+    """A4 `POST .../rebase/resolve` 请求体：提交冲突解决并完成变基。"""
+
+    tenant_id: str
+    team_id: str | None = None
+    change_reason: NonEmptyText
+    idempotency_key: str | None = None
+    to_base_version_id: NonEmptyText
+    resolutions: list[KnowledgeRebaseResolutionInput] = Field(default_factory=list)
+
+
+class KnowledgeRebaseAutoMergedRead(BaseModel):
+    """变基预览中一篇自动合并（或直接采用一方）成功的文档。"""
+
+    lineage_id: str
+    title: str
+    source: Literal["ours", "theirs", "merged"]
+
+
+class KnowledgeRebaseConflictBlockRead(BaseModel):
+    """一个交叠冲突块的三方内容与前后各若干行上下文。"""
+
+    base_lines: list[str] = Field(default_factory=list)
+    ours_lines: list[str] = Field(default_factory=list)
+    theirs_lines: list[str] = Field(default_factory=list)
+    context_before: list[str] = Field(default_factory=list)
+    context_after: list[str] = Field(default_factory=list)
+
+
+class KnowledgeRebaseConflictRead(BaseModel):
+    """一篇存在交叠冲突、需要人工解决的文档。"""
+
+    lineage_id: str
+    title: str
+    blocks: list[KnowledgeRebaseConflictBlockRead] = Field(default_factory=list)
+
+
+class KnowledgeRebasePreviewRead(BaseModel):
+    """A3 有冲突时的响应：变基预览，未落库，须调用 A4 resolve 提交解决结果。"""
+
+    status: Literal["conflicts"] = "conflicts"
+    draft_version_id: str
+    from_base_version_id: str | None = None
+    to_base_version_id: str
+    auto_merged: list[KnowledgeRebaseAutoMergedRead] = Field(default_factory=list)
+    conflicts: list[KnowledgeRebaseConflictRead] = Field(default_factory=list)
+
+
+class KnowledgeRebaseResultRead(BaseModel):
+    """A3 无冲突或 A4 解决完成后的响应：新草稿快照与被替换的旧快照 id。"""
+
+    status: Literal["applied"] = "applied"
+    new_version: KnowledgeBaseVersionRead
+    superseded_version_id: str

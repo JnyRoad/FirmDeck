@@ -12,6 +12,7 @@ from typing import Literal
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlmodel import Session
 
+from app.api.knowledge_bases import _shared_version_lookup, _shared_version_read
 from app.contracts.domain_http import domain_http_error
 from app.contracts.error_registry import ERROR_REGISTRY, ErrorVisibility
 from app.db import get_session
@@ -19,7 +20,11 @@ from app.db.models import KnowledgeBase, KnowledgeBaseVersion, User
 from app.knowledge.diff import DEFAULT_MAX_LINES, diff_versions
 from app.knowledge.errors import KnowledgeError
 from app.knowledge.listing import list_bindable_teams, list_tenant_knowledge_bases
-from app.knowledge.management import require_shared_knowledge_history_viewer
+from app.knowledge.management import (
+    require_shared_knowledge_history_viewer,
+    require_team_knowledge_manager,
+)
+from app.knowledge.rebase import RebasePreview, RebaseResult, apply_rebase, preview_rebase
 from app.knowledge.schema import (
     DiffDocumentRead,
     DiffHunkRead,
@@ -31,6 +36,13 @@ from app.knowledge.schema import (
     KnowledgeAdminOwnerAgentRead,
     KnowledgeAdminTeamOption,
     KnowledgeBaseMode,
+    KnowledgeRebaseAutoMergedRead,
+    KnowledgeRebaseConflictBlockRead,
+    KnowledgeRebaseConflictRead,
+    KnowledgeRebasePreviewRead,
+    KnowledgeRebaseRequest,
+    KnowledgeRebaseResolveRequest,
+    KnowledgeRebaseResultRead,
     VersionDiffRead,
     VersionDiffSummary,
 )
@@ -272,4 +284,154 @@ def get_knowledge_admin_version_diff(
             )
             for document in result.documents
         ],
+    )
+
+
+def _rebase_conflict_block_read(block: object) -> KnowledgeRebaseConflictBlockRead:
+    """投影一个交叠冲突块（`app.knowledge.rebase.ConflictBlock`）为响应模型。"""
+    return KnowledgeRebaseConflictBlockRead(
+        base_lines=list(block.base_lines),
+        ours_lines=list(block.ours_lines),
+        theirs_lines=list(block.theirs_lines),
+        context_before=list(block.context_before),
+        context_after=list(block.context_after),
+    )
+
+
+def _rebase_preview_read(preview: RebasePreview) -> KnowledgeRebasePreviewRead:
+    """投影变基预览（有冲突、未落库）为 A3 响应模型。"""
+    return KnowledgeRebasePreviewRead(
+        draft_version_id=preview.draft_version_id,
+        from_base_version_id=preview.from_base_version_id,
+        to_base_version_id=preview.to_base_version_id,
+        auto_merged=[
+            KnowledgeRebaseAutoMergedRead(
+                lineage_id=item.lineage_id, title=item.title, source=item.source
+            )
+            for item in preview.auto_merged
+        ],
+        conflicts=[
+            KnowledgeRebaseConflictRead(
+                lineage_id=conflict.lineage_id,
+                title=conflict.title,
+                blocks=[_rebase_conflict_block_read(block) for block in conflict.blocks],
+            )
+            for conflict in preview.conflicts
+        ],
+    )
+
+
+def _rebase_result_read(
+    db: Session, *, tenant_id: str, knowledge_base_id: str, result: RebaseResult
+) -> KnowledgeRebaseResultRead:
+    """投影落库结果（新草稿快照 + 被替换旧快照 id）为 A3/A4 共用响应模型。"""
+    kb = db.get(KnowledgeBase, knowledge_base_id)
+    label_by_id, released_labels, all_labels = _shared_version_lookup(
+        db, tenant_id=tenant_id, knowledge_base_id=knowledge_base_id
+    )
+    new_version_read = _shared_version_read(
+        result.new_version,
+        published_version_id=kb.published_version_id if kb else None,
+        version_label_by_id=label_by_id,
+        released_labels=released_labels,
+        all_labels=all_labels,
+    )
+    return KnowledgeRebaseResultRead(
+        new_version=new_version_read,
+        superseded_version_id=result.superseded_version_id,
+    )
+
+
+@router.post(
+    "/knowledge-bases/{kb_id}/versions/{version_id}/rebase",
+    response_model=KnowledgeRebasePreviewRead | KnowledgeRebaseResultRead,
+)
+def rebase_knowledge_admin_draft(
+    kb_id: str,
+    version_id: str,
+    request: KnowledgeRebaseRequest,
+    db: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+) -> KnowledgeRebasePreviewRead | KnowledgeRebaseResultRead:
+    """A3：admin 或团队 manager 计算三方合并；无冲突直接落库返回 RebaseResult，
+    有冲突原样返回 RebasePreview（不落库），前端需逐块解决后调用 A4 resolve。
+    """
+    ensure_tenant(db, request.tenant_id)
+    try:
+        context = require_team_knowledge_manager(
+            db,
+            tenant_id=request.tenant_id,
+            team_id=request.team_id,
+            knowledge_base_id=kb_id,
+            current_user=current_user,
+        )
+        preview = preview_rebase(
+            db,
+            tenant_id=request.tenant_id,
+            knowledge_base_id=kb_id,
+            draft_version_id=version_id,
+        )
+        if preview.conflicts:
+            return _rebase_preview_read(preview)
+        result = apply_rebase(
+            db,
+            tenant_id=request.tenant_id,
+            knowledge_base_id=kb_id,
+            draft_version_id=version_id,
+            to_base_version_id=preview.to_base_version_id,
+            resolutions={},
+            actor_type="user",
+            actor_id=current_user.id,
+            source_team_id=context.team.id if context.team else None,
+            change_reason=request.change_reason,
+            idempotency_key=request.idempotency_key,
+            request_payload=request.model_dump(),
+        )
+    except KnowledgeError as exc:
+        raise _knowledge_error_to_http(exc) from exc
+    return _rebase_result_read(
+        db, tenant_id=request.tenant_id, knowledge_base_id=kb_id, result=result
+    )
+
+
+@router.post(
+    "/knowledge-bases/{kb_id}/versions/{version_id}/rebase/resolve",
+    response_model=KnowledgeRebaseResultRead,
+)
+def resolve_knowledge_admin_rebase(
+    kb_id: str,
+    version_id: str,
+    request: KnowledgeRebaseResolveRequest,
+    db: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+) -> KnowledgeRebaseResultRead:
+    """A4：提交每篇冲突文档的最终合并结果，校验 to_base 未变、解决完整且无残留冲突标记后落库。"""
+    ensure_tenant(db, request.tenant_id)
+    resolutions = {item.lineage_id: item.content_md for item in request.resolutions}
+    try:
+        context = require_team_knowledge_manager(
+            db,
+            tenant_id=request.tenant_id,
+            team_id=request.team_id,
+            knowledge_base_id=kb_id,
+            current_user=current_user,
+        )
+        result = apply_rebase(
+            db,
+            tenant_id=request.tenant_id,
+            knowledge_base_id=kb_id,
+            draft_version_id=version_id,
+            to_base_version_id=request.to_base_version_id,
+            resolutions=resolutions,
+            actor_type="user",
+            actor_id=current_user.id,
+            source_team_id=context.team.id if context.team else None,
+            change_reason=request.change_reason,
+            idempotency_key=request.idempotency_key,
+            request_payload=request.model_dump(),
+        )
+    except KnowledgeError as exc:
+        raise _knowledge_error_to_http(exc) from exc
+    return _rebase_result_read(
+        db, tenant_id=request.tenant_id, knowledge_base_id=kb_id, result=result
     )
