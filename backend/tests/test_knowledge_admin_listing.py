@@ -400,6 +400,117 @@ def test_dedicated_base_owner_and_branch_fields() -> None:
         assert lin_new.document_count == 0
 
 
+def test_archived_and_deleted_owner_branches_are_excluded() -> None:
+    """回归：owner 分支 status 为 archived/deleted 时视同无分支，branch=None 且不计入 document_count。
+
+    未加 status=='active' 过滤时，_seed_tenant 之外的一个陈旧（已归档/已转共享删除）分支会
+    被当作在用分支，展示过期的 base/head/sync_state 并从其旧头版本统计文档数。
+    """
+    with _test_session() as db:
+        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.add(AgentProfile(id="agent_stale", tenant_id="tenant_demo", name="旧分支员工"))
+
+        archived_base = KnowledgeBase(
+            id="kb_dedicated_archived_branch",
+            tenant_id="tenant_demo",
+            name="已归档分支的专用库",
+            mode="dedicated",
+            status="active",
+            metadata_json={"owner_agent_id": "agent_stale"},
+        )
+        db.add(archived_base)
+        db.add(
+            KnowledgeBaseVersion(
+                id="kbver_archived_2",
+                tenant_id="tenant_demo",
+                knowledge_base_id="kb_dedicated_archived_branch",
+                version="2",
+                name="已归档分支的专用库",
+                publication_state="released",
+            )
+        )
+        db.add(
+            AgentKnowledgeBranch(
+                id="agentkb_archived",
+                tenant_id="tenant_demo",
+                agent_id="agent_stale",
+                knowledge_base_id="kb_dedicated_archived_branch",
+                base_version="1",
+                head_version="2",
+                sync_state="diverged",
+                status="archived",
+            )
+        )
+        db.add(
+            KnowledgeDocument(
+                id="kdoc_archived_head_0",
+                tenant_id="tenant_demo",
+                knowledge_base_id="kb_dedicated_archived_branch",
+                knowledge_base_version_id="kbver_archived_2",
+                filename="stale_head.md",
+                file_type="md",
+                status="ready",
+            )
+        )
+
+        deleted_base = KnowledgeBase(
+            id="kb_dedicated_deleted_branch",
+            tenant_id="tenant_demo",
+            name="已删除分支的专用库",
+            mode="dedicated",
+            status="active",
+            metadata_json={"owner_agent_id": "agent_stale"},
+        )
+        db.add(deleted_base)
+        db.add(
+            KnowledgeBaseVersion(
+                id="kbver_deleted_1",
+                tenant_id="tenant_demo",
+                knowledge_base_id="kb_dedicated_deleted_branch",
+                version="1",
+                name="已删除分支的专用库",
+                publication_state="released",
+            )
+        )
+        db.add(
+            AgentKnowledgeBranch(
+                id="agentkb_deleted",
+                tenant_id="tenant_demo",
+                agent_id="agent_stale",
+                knowledge_base_id="kb_dedicated_deleted_branch",
+                base_version="1",
+                head_version="1",
+                sync_state="synced",
+                status="deleted",
+            )
+        )
+        db.add(
+            KnowledgeDocument(
+                id="kdoc_deleted_head_0",
+                tenant_id="tenant_demo",
+                knowledge_base_id="kb_dedicated_deleted_branch",
+                knowledge_base_version_id="kbver_deleted_1",
+                filename="stale_head.md",
+                file_type="md",
+                status="ready",
+            )
+        )
+        db.commit()
+
+        result = _call_list(db, _admin_user())
+        by_id = {item.id: item for item in result.items}
+
+        archived_item = by_id["kb_dedicated_archived_branch"]
+        assert archived_item.owner_agent is not None  # 归属员工独立于分支状态，仍然解析
+        assert archived_item.branch is None
+        assert archived_item.document_count == 0
+
+        deleted_item = by_id["kb_dedicated_deleted_branch"]
+        assert deleted_item.owner_agent is not None
+        assert deleted_item.branch is None
+        assert deleted_item.document_count == 0
+
+
 def test_filter_by_mode() -> None:
     with _test_session() as db:
         _seed_tenant(db)

@@ -150,6 +150,7 @@ def list_tenant_knowledge_bases(
             select(AgentKnowledgeBranch).where(
                 AgentKnowledgeBranch.tenant_id == tenant_id,
                 AgentKnowledgeBranch.knowledge_base_id.in_(dedicated_ids),
+                AgentKnowledgeBranch.status == "active",
             )
         ).all()
         branch_by_key = {(row.knowledge_base_id, row.agent_id): row for row in branch_rows}

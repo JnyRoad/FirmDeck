@@ -15,6 +15,7 @@ from app.api.agents import scope_router as agent_scope_router
 from app.api.feedback import router as feedback_router
 from app.api.general_skills import router as general_skills_router
 from app.api.knowledge import router as knowledge_router
+from app.api.knowledge_admin import router as knowledge_admin_router
 from app.api.knowledge_bases import router as knowledge_bases_router
 from app.api.memories import router as memories_router
 from app.api.model_configs import router as model_configs_router
@@ -51,6 +52,7 @@ def test_enterprise_read_endpoints_require_authentication() -> None:
     app.include_router(general_skills_router)
     app.include_router(knowledge_router)
     app.include_router(knowledge_bases_router)
+    app.include_router(knowledge_admin_router)
     app.include_router(model_configs_router)
     app.include_router(persona_router)
     app.include_router(skills_router)
@@ -75,6 +77,8 @@ def test_enterprise_read_endpoints_require_authentication() -> None:
         "/api/enterprise/general-skills?tenant_id=tenant_demo",
         "/api/enterprise/knowledge/jobs?tenant_id=tenant_demo",
         "/api/enterprise/knowledge-bases?tenant_id=tenant_demo",
+        "/api/enterprise/knowledge-admin/knowledge-bases?tenant_id=tenant_demo",
+        "/api/enterprise/knowledge-admin/teams?tenant_id=tenant_demo",
         "/api/enterprise/model-configs?tenant_id=tenant_demo",
         "/api/enterprise/persona?tenant_id=tenant_demo",
         "/api/enterprise/skills?tenant_id=tenant_demo",
