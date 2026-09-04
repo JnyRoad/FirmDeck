@@ -177,17 +177,17 @@
 
 ### Tests for User Story 5
 
-- [ ] T066 [P] [US5] [测试] 在 frontend-enterprise/src/pages/knowledge-admin/private/ContentTab.test.tsx 编写失败测试：横幅显示员工、分支头、同步状态；上传/编辑/删除后分支头 +1 且列表刷新
-- [ ] T067 [P] [US5] [测试] 在 frontend-enterprise/src/pages/knowledge-admin/private/BranchTab.test.tsx 编写失败测试：分支状态卡；从广场同步、发布到广场、回滚调用与刷新
-- [ ] T068 [P] [US5] [测试] 在 frontend-enterprise/src/pages/knowledge-admin/KnowledgeAdminDetailPage.convert.test.tsx 编写失败测试：私有库头部「转换为共享知识库」，archived 禁用；成功后跳转新库 `?tab=grants`
-- [ ] T069 [P] [US5] [测试] 在 frontend-enterprise/src/pages/knowledge-admin/KnowledgeAdminListPage.pagination.test.tsx 编写失败测试：服务端分页参数、`has_more`、切页保留筛选
+- [X] T066 [P] [US5] [测试] 在 frontend-enterprise/src/pages/knowledge-admin/private/ContentTab.test.tsx 编写失败测试：横幅显示员工、分支头、同步状态；上传/编辑/删除后分支头 +1 且列表刷新
+- [X] T067 [P] [US5] [测试] 在 frontend-enterprise/src/pages/knowledge-admin/private/BranchTab.test.tsx 编写失败测试：分支状态卡；从广场同步、发布到广场、回滚调用与刷新
+- [X] T068 [P] [US5] [测试] 在 frontend-enterprise/src/pages/knowledge-admin/KnowledgeAdminDetailPage.convert.test.tsx 编写失败测试：私有库头部「转换为共享知识库」，archived 禁用；成功后跳转新库 `?tab=grants`
+- [X] T069 [P] [US5] [测试] 在 frontend-enterprise/src/pages/knowledge-admin/KnowledgeAdminListPage.pagination.test.tsx 编写失败测试：服务端分页参数、`has_more`、切页保留筛选
 
 ### Implementation for User Story 5
 
-- [ ] T070 [P] [US5] 实现 frontend-enterprise/src/pages/knowledge-admin/private/ContentTab.tsx
-- [ ] T071 [P] [US5] 实现 frontend-enterprise/src/pages/knowledge-admin/private/BranchTab.tsx
-- [ ] T072 [US5] 在 frontend-enterprise/src/pages/knowledge-admin/KnowledgeAdminDetailPage.tsx 接入私有库 Tab 集与 `SharedKnowledgeConversionDialog`
-- [ ] T073 [US5] 在 frontend-enterprise/src/pages/knowledge-admin/KnowledgeAdminListPage.tsx 接入 `Paginator`（服务端分页）
+- [X] T070 [P] [US5] 实现 frontend-enterprise/src/pages/knowledge-admin/private/ContentTab.tsx
+- [X] T071 [P] [US5] 实现 frontend-enterprise/src/pages/knowledge-admin/private/BranchTab.tsx
+- [X] T072 [US5] 在 frontend-enterprise/src/pages/knowledge-admin/KnowledgeAdminDetailPage.tsx 接入私有库 Tab 集与 `SharedKnowledgeConversionDialog`
+- [X] T073 [US5] 在 frontend-enterprise/src/pages/knowledge-admin/KnowledgeAdminListPage.tsx 接入 `Paginator`（服务端分页）
 
 **Checkpoint**: 全部用户故事可独立演示
 
