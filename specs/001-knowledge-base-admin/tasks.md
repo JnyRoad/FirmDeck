@@ -206,7 +206,7 @@
 - [X] T082 [测试] 在 frontend-enterprise/src/pages/knowledge-admin/shared/toast.test.tsx 编写失败测试：知识库管理页的错误提示（SettingsTab 保存失败、ListPage 删除失败、ContentTab 写回冲突）必须真正弹出本地化文案（legacy `notify.error(text)` 会静默丢弃预本地化字符串）
 - [X] T083 统一知识库管理页的 toast 出口：shared/errorMessage.ts 改为基于 `createToastNotifier` 的 descriptor 通知（或复用 US2-b 的做法），替换 SettingsTab.tsx / KnowledgeAdminListPage.tsx / ContentTab.tsx 中的 legacy `notify` 调用；ContentTab 改用 T081 的版本文档列表展示未改动文档并用 document_id 写回
 - [X] T084 迁移剩余 toast 调用点到 `useKnowledgeAdminToast`：frontend-enterprise/src/pages/knowledge-admin/KnowledgeAdminListPage.tsx、KnowledgeAdminDetailPage.tsx、private/ContentTab.tsx、private/BranchTab.tsx（T083 因并行编辑未覆盖）；对应测试断言注册错误码显示具体本地化文案；完成后删除 shared/errorMessage.ts 的兼容旧导出（若无调用方）
-- [ ] T085 发布对话框覆盖发布二次确认（Ruling：FR-050 的「二次确认」保留）：frontend-enterprise/src/pages/knowledge-admin/dialogs/PublishDialog.tsx 点击「覆盖发布」后先展示内联确认（说明将丢弃对方已发布的变更、需勾选/再次点击确认）再发送 force_overwrite；dialogs/PublishDialog.test.tsx 断言单击不发请求、确认后发送 force_overwrite=true
+- [X] T085 发布对话框覆盖发布二次确认（Ruling：FR-050 的「二次确认」保留）：frontend-enterprise/src/pages/knowledge-admin/dialogs/PublishDialog.tsx 点击「覆盖发布」后先展示内联确认（说明将丢弃对方已发布的变更、需勾选/再次点击确认）再发送 force_overwrite；dialogs/PublishDialog.test.tsx 断言单击不发请求、确认后发送 force_overwrite=true
 
 ---
 
