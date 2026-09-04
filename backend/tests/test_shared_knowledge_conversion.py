@@ -382,6 +382,64 @@ def test_asset_count_mismatch_rolls_back_conversion(
         assert db.get(KnowledgeBase, fixture.source_base_id).status == "active"
 
 
+def test_audit_event_failure_after_archive_write_rolls_back_conversion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`source_base.status = "archived"` 写入之后、savepoint 退出之前失败也要整体回滚。
+
+    前面两个失败用例都在克隆/校验阶段触发，从未真正执行到归档语句，没能证明
+    `begin_nested()` 覆盖了归档写入本身。这里把失败点挪到归档之后（审计事件写入），
+    验证源库状态、来源分支和共享谱系依旧被完整回滚，并且会话在异常后仍可正常复用
+    （重试同一笔转换应当成功）。
+    """
+    module = conversion_module
+    with _session() as db:
+        fixture = _seed_dedicated_lineage(db)
+        service = module.KnowledgeConversionService(db)
+        original_append_event = service.audit.append_event
+
+        def fail_append_event(*args, **kwargs):
+            """模拟归档写入之后、savepoint 退出前发生的失败（例如审计落库异常）。"""
+            raise RuntimeError("injected audit failure")
+
+        monkeypatch.setattr(service.audit, "append_event", fail_append_event)
+
+        with pytest.raises(RuntimeError, match="injected audit failure"):
+            service.convert_to_shared(
+                tenant_id="tenant_demo",
+                source_knowledge_base_id=fixture.source_base_id,
+                source_agent_id=fixture.source_agent_id,
+                name="审计失败的共享知识",
+                change_reason="验证归档后失败回滚",
+                actor_user_id="user-admin",
+            )
+
+        assert db.get(KnowledgeBase, fixture.source_base_id).status == "active"
+        branch = db.exec(
+            select(AgentKnowledgeBranch).where(
+                AgentKnowledgeBranch.agent_id == fixture.source_agent_id,
+                AgentKnowledgeBranch.knowledge_base_id == fixture.source_base_id,
+            )
+        ).one()
+        assert branch.status == "active"
+        assert db.exec(select(KnowledgeBase).where(KnowledgeBase.mode == "shared")).all() == []
+
+        # 会话在异常后依旧可用：撤掉失败注入，同一个 session 上重试应当成功。
+        monkeypatch.setattr(service.audit, "append_event", original_append_event)
+        result = service.convert_to_shared(
+            tenant_id="tenant_demo",
+            source_knowledge_base_id=fixture.source_base_id,
+            source_agent_id=fixture.source_agent_id,
+            name="重试成功的共享知识",
+            change_reason="验证会话重试可用",
+            actor_user_id="user-admin",
+        )
+        db.commit()
+
+        assert db.get(KnowledgeBase, fixture.source_base_id).status == "archived"
+        assert db.get(KnowledgeBase, result.shared_knowledge_base_id) is not None
+
+
 def test_conversion_endpoint_returns_shared_base_release_and_archival_projection() -> None:
     """管理端点返回新共享库、首个正式版、绑定和来源归档状态。"""
     with _session() as db:

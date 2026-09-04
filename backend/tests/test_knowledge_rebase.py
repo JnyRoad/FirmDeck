@@ -205,6 +205,65 @@ def test_merge_document_sets_zero_width_insert_touching_same_start_conflicts() -
     assert block.theirs_lines == ["B"]
 
 
+def test_merge_document_sets_zero_width_insert_touching_deletion_start_conflicts() -> None:
+    """回归：ours 删除 b,c，theirs 在 b 之前零宽度插入 "X"（插入点紧贴删除区间起点）。
+
+    theirs 的插入落在 ours 删除区间的起点上，插入顺序有歧义（该插到删除内容之前还是
+    之后无法确定），必须判为冲突，不能悄悄按处理顺序拼接成 ["a", "X", "d", "e"] 之类的
+    结果。
+    """
+    base = [
+        DocumentSnapshot(
+            lineage_id="L1", filename="a.md", title="A", lines=["a", "b", "c", "d", "e"]
+        )
+    ]
+    ours = [DocumentSnapshot(lineage_id="L1", filename="a.md", title="A", lines=["a", "d", "e"])]
+    theirs = [
+        DocumentSnapshot(
+            lineage_id="L1", filename="a.md", title="A", lines=["a", "X", "b", "c", "d", "e"]
+        )
+    ]
+
+    auto_merged, conflicts = merge_document_sets(base, ours, theirs)
+
+    assert auto_merged == []
+    assert len(conflicts) == 1
+    conflict = conflicts[0]
+    assert len(conflict.blocks) == 1
+    block = conflict.blocks[0]
+    assert block.base_lines == ["b", "c"]
+    assert block.ours_lines == []
+    assert block.theirs_lines == ["X", "b", "c"]
+
+
+def test_merge_document_sets_zero_width_insert_not_touching_deletion_auto_merges() -> None:
+    """对照：ours 删除 b,c，theirs 在 d 之后零宽度插入 "X"（不贴删除区间起点）不冲突。
+
+    与上一个用例的唯一差异是插入点不再挨着 ours 的删除起点，两处改动互不相干，
+    应当照常自动合并。
+    """
+    base = [
+        DocumentSnapshot(
+            lineage_id="L1", filename="a.md", title="A", lines=["a", "b", "c", "d", "e"]
+        )
+    ]
+    ours = [DocumentSnapshot(lineage_id="L1", filename="a.md", title="A", lines=["a", "d", "e"])]
+    theirs = [
+        DocumentSnapshot(
+            lineage_id="L1", filename="a.md", title="A", lines=["a", "b", "c", "d", "X", "e"]
+        )
+    ]
+
+    auto_merged, conflicts = merge_document_sets(base, ours, theirs)
+
+    assert conflicts == []
+    assert len(auto_merged) == 1
+    merged = auto_merged[0]
+    assert merged.source == "merged"
+    assert merged.action == "update"
+    assert merged.lines == ["a", "d", "X", "e"]
+
+
 # ---------------------------------------------------------------------------
 # DB + 路由 fixture：1 个共享库 + v1(released) <- draft_ours(stale) 与
 # v1 <- draft_theirs -> 发布为 v2，构造仅 ours/仅 theirs/双方不交叠/双方交叠 四种文档。

@@ -184,6 +184,9 @@ def _merge_line_ranges(
                 # 冲突）。零宽度 hunk 碰到另一方在同一起点开始的 hunk（无论对方是不是零宽度）
                 # 同样是插入顺序有歧义，也必须算冲突，不能悄悄先套一个再套另一个。
                 last_start, last_end = cluster["items"][-1][0], cluster["items"][-1][1]
+                # 这里是刻意的保守选择：零宽度插入紧贴另一方非空 hunk 的起点时按冲突处理，
+                # 不悄悄自动合并——即便两者理论上互不覆盖内容。Git 的 diff3 合并策略对紧邻
+                # （adjacent）改动同样判为冲突而非自动合并，安全优先于合并率。
                 if start == last_start and (start == end or last_start == last_end):
                     joins_last_cluster = True
         if joins_last_cluster:
