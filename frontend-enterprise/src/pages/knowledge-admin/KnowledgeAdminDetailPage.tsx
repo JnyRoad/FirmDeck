@@ -2,6 +2,10 @@
  * 知识库管理 · 详情页：面包屑返回、标题（名称 + 类型/状态徽章）、描述，
  * 按 `mode` 渲染不同 Tab 集（共享：content/versions/grants/audit/settings；
  * 私有：content/branch/settings），`?tab=` 与 URL 同步、刷新后保持（FR-002）。
+ * 私有库标题栏额外提供「转换为共享知识库」入口（US5，FR-082），archived 时禁用，
+ * 打开既有 `SharedKnowledgeConversionDialog`（内部实现不动）；成功后跳转到新共享库
+ * 的「群组与权限」页。私有库详情本身需要归属员工 id/展示名（`kb.metadata.owner_agent_id`
+ * + `listAgents()`）驱动内容/分支 Tab 与向导的分支范围调用。
  * 页面不读取 `readEmployeeScope`，也不监听 agent-scope 事件。
  */
 
@@ -11,6 +15,7 @@ import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
 
 import { createKnowledgeAdminApi } from '@/api/knowledgeAdmin';
 import AppHeader from '@/components/AppHeader';
+import { SharedKnowledgeConversionDialog } from '@/components/knowledge/SharedKnowledgeConversionDialog';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui';
 import { Button } from '@/components/ui/button';
 import { notify } from '@/components/ui/app-toast';
@@ -19,9 +24,11 @@ import { PublicationState } from '@/enums/knowledge';
 import { EnterpriseRoute } from '@/enums/routes';
 import { useAppIntl, type MessageId } from '@/i18n';
 import { RawContent } from '@/i18n/RawContent';
-import type { KnowledgeBaseRead } from '@/types';
+import type { KnowledgeBaseConversionRead, KnowledgeBaseRead } from '@/types';
 
 import type { EnterpriseAuthUser } from '../../auth';
+import { BranchTab as PrivateBranchTab } from './private/BranchTab';
+import { ContentTab as PrivateContentTab } from './private/ContentTab';
 import { AuditTab } from './shared/AuditTab';
 import { ContentTab } from './shared/ContentTab';
 import { knowledgeAdminErrorMessage } from './shared/errorMessage';
@@ -29,6 +36,12 @@ import { GrantsTab } from './shared/GrantsTab';
 import { PlaceholderTab } from './shared/PlaceholderTab';
 import { SettingsTab } from './shared/SettingsTab';
 import { VersionsTab } from './shared/VersionsTab';
+
+/** `kb.metadata.owner_agent_id` 是私有库唯一归属员工的存放位置（见 `app/agents/branching.py`）。 */
+function ownerAgentIdOf(kb: KnowledgeBaseRead): string {
+  const value = kb.metadata?.owner_agent_id;
+  return typeof value === 'string' ? value : '';
+}
 
 const SHARED_TABS = ['content', 'versions', 'grants', 'audit', 'settings'] as const;
 const DEDICATED_TABS = ['content', 'branch', 'settings'] as const;
@@ -61,6 +74,9 @@ export default function KnowledgeAdminDetailPage({ currentUser, onLogout }: Know
   const [draftCount, setDraftCount] = useState(0);
   /** 草稿数是否未知（`listVersions` 单独失败）；与 `draftCount` 分开，避免把失败悄悄当成 0。 */
   const [draftCountUnknown, setDraftCountUnknown] = useState(false);
+  /** 私有库归属员工 id/展示名；私有 Tab 集（内容/分支）与转共享向导都靠它驱动分支范围调用。 */
+  const [ownerAgentName, setOwnerAgentName] = useState('');
+  const [conversionOpen, setConversionOpen] = useState(false);
 
   async function load() {
     const context = tenantContext;
@@ -68,8 +84,36 @@ export default function KnowledgeAdminDetailPage({ currentUser, onLogout }: Know
     if (!context || generation === undefined || !kbId) return;
     setLoading(true);
     try {
-      const result = await api.getKnowledgeBase(kbId);
+      let result = await api.getKnowledgeBase(kbId);
       if (!context.isCurrentGeneration(generation)) return;
+      if (result.mode === 'dedicated') {
+        // 不带 `agent_id` 的 GET 不会填充 `branch_*` 字段（后端 `_knowledge_branch_meta`
+        // 只在拿到具体 agent 时才查询该员工的分支记录）；私有库详情必须展示分支头/基线/
+        // 同步状态，这里用刚拿到的归属员工 id 重新查询一次换取这三个字段。查询失败时保留
+        // 第一次拿到的 `result`（页面仍可用，只是分支徽章会缺失），不整体判为加载失败。
+        const ownerId = ownerAgentIdOf(result);
+        if (ownerId) {
+          try {
+            const scoped = await api.getKnowledgeBase(kbId, ownerId);
+            if (!context.isCurrentGeneration(generation)) return;
+            result = scoped;
+          } catch {
+            if (!context.isCurrentGeneration(generation)) return;
+          }
+          try {
+            const agents = await api.listAgents();
+            if (!context.isCurrentGeneration(generation)) return;
+            setOwnerAgentName(agents.find((agent) => agent.id === ownerId)?.name || '');
+          } catch {
+            if (!context.isCurrentGeneration(generation)) return;
+            setOwnerAgentName('');
+          }
+        } else {
+          setOwnerAgentName('');
+        }
+      } else {
+        setOwnerAgentName('');
+      }
       setKb(result);
       if (result.mode === 'shared') {
         // 版本 Tab（占位中）本来就需要这份数据；这里顺带算出未发布草稿数供设置 Tab 的删除确认
@@ -121,6 +165,15 @@ export default function KnowledgeAdminDetailPage({ currentUser, onLogout }: Know
     navigate(EnterpriseRoute.KnowledgeAdmin);
   }
 
+  const ownerAgentId = kb ? ownerAgentIdOf(kb) : '';
+
+  /** 转共享成功：源库已归档、新共享库带首个正式版落地，跳到新库的「群组与权限」页。 */
+  async function handleConverted(result: KnowledgeBaseConversionRead) {
+    notify.successText(t('knowledgeAdmin.toast.convertSuccess'));
+    setConversionOpen(false);
+    navigate(`${EnterpriseRoute.KnowledgeAdmin}/${result.new_knowledge_base.id}?tab=grants`, { replace: true });
+  }
+
   return (
     <div className="min-h-full box-border px-[48px] pt-[32px] pb-[43px] max-[900px]:px-[16px]" aria-busy={loading}>
       <AppHeader onLogout={onLogout} userName={currentUser?.username} title={t('knowledgeAdmin.nav.title')} />
@@ -141,28 +194,40 @@ export default function KnowledgeAdminDetailPage({ currentUser, onLogout }: Know
         <p className="mt-[24px] text-[13px] text-[#858b9c]">{t('knowledgeAdmin.detail.loading')}</p>
       ) : (
         <>
-          <div className="mt-[20px] flex flex-wrap items-center gap-[10px]">
-            <h1 className="text-[20px] font-semibold text-[#18181a]">
-              <RawContent value={kb.name} />
-            </h1>
-            <span
-              className={
-                kb.mode === 'dedicated'
-                  ? 'inline-flex items-center rounded-full bg-[#eef2f7] px-[9px] py-[3px] text-[11px] font-medium text-[#596174]'
-                  : 'inline-flex items-center rounded-full bg-[#ede9fe] px-[9px] py-[3px] text-[11px] font-medium text-[#6d28d9]'
-              }
-            >
-              {t(kb.mode === 'dedicated' ? 'knowledgeAdmin.detail.badges.dedicated' : 'knowledgeAdmin.detail.badges.shared')}
-            </span>
-            <span
-              className={
-                kb.status === 'active'
-                  ? 'inline-flex items-center rounded-full bg-[#e9f7ef] px-[9px] py-[3px] text-[11px] font-medium text-[#2cb360]'
-                  : 'inline-flex items-center rounded-full bg-[#f2f3f7] px-[9px] py-[3px] text-[11px] font-medium text-[#757f9c]'
-              }
-            >
-              {t(kb.status === 'active' ? 'knowledgeAdmin.detail.badges.active' : 'knowledgeAdmin.detail.badges.archived')}
-            </span>
+          <div className="mt-[20px] flex flex-wrap items-center justify-between gap-[10px]">
+            <div className="flex flex-wrap items-center gap-[10px]">
+              <h1 className="text-[20px] font-semibold text-[#18181a]">
+                <RawContent value={kb.name} />
+              </h1>
+              <span
+                className={
+                  kb.mode === 'dedicated'
+                    ? 'inline-flex items-center rounded-full bg-[#eef2f7] px-[9px] py-[3px] text-[11px] font-medium text-[#596174]'
+                    : 'inline-flex items-center rounded-full bg-[#ede9fe] px-[9px] py-[3px] text-[11px] font-medium text-[#6d28d9]'
+                }
+              >
+                {t(kb.mode === 'dedicated' ? 'knowledgeAdmin.detail.badges.dedicated' : 'knowledgeAdmin.detail.badges.shared')}
+              </span>
+              <span
+                className={
+                  kb.status === 'active'
+                    ? 'inline-flex items-center rounded-full bg-[#e9f7ef] px-[9px] py-[3px] text-[11px] font-medium text-[#2cb360]'
+                    : 'inline-flex items-center rounded-full bg-[#f2f3f7] px-[9px] py-[3px] text-[11px] font-medium text-[#757f9c]'
+                }
+              >
+                {t(kb.status === 'active' ? 'knowledgeAdmin.detail.badges.active' : 'knowledgeAdmin.detail.badges.archived')}
+              </span>
+            </div>
+            {kb.mode === 'dedicated' && (
+              <Button
+                type="button"
+                disabled={kb.status === 'archived' || !ownerAgentId}
+                onClick={() => setConversionOpen(true)}
+                className="h-[32px] rounded-[10px] bg-[#18181a] px-[14px] text-[12px] font-normal text-white hover:bg-[#303030] disabled:opacity-50"
+              >
+                {t('knowledgeAdmin.detail.actions.convertToShared')}
+              </Button>
+            )}
           </div>
           {kb.description && (
             <p className="mt-[6px] text-[13px] text-[#858b9c]">
@@ -191,6 +256,22 @@ export default function KnowledgeAdminDetailPage({ currentUser, onLogout }: Know
                   />
                 ) : tabKey === 'content' && kb.mode === 'shared' ? (
                   <ContentTab api={api} kb={kb} onChanged={() => void load()} />
+                ) : tabKey === 'content' && kb.mode === 'dedicated' ? (
+                  <PrivateContentTab
+                    api={api}
+                    kb={kb}
+                    ownerAgentId={ownerAgentId}
+                    ownerAgentName={ownerAgentName}
+                    onChanged={() => void load()}
+                  />
+                ) : tabKey === 'branch' ? (
+                  <PrivateBranchTab
+                    api={api}
+                    kb={kb}
+                    ownerAgentId={ownerAgentId}
+                    ownerAgentName={ownerAgentName}
+                    onChanged={() => void load()}
+                  />
                 ) : tabKey === 'versions' ? (
                   <VersionsTab api={api} kb={kb} onChanged={() => void load()} />
                 ) : tabKey === 'audit' ? (
@@ -204,6 +285,16 @@ export default function KnowledgeAdminDetailPage({ currentUser, onLogout }: Know
             ))}
           </Tabs>
         </>
+      )}
+
+      {kb && kb.mode === 'dedicated' && (
+        <SharedKnowledgeConversionDialog
+          open={conversionOpen}
+          knowledgeBase={kb}
+          agentId={ownerAgentId}
+          onClose={() => setConversionOpen(false)}
+          onConverted={handleConverted}
+        />
       )}
     </div>
   );

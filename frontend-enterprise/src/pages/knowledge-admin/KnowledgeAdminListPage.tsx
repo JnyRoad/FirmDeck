@@ -2,6 +2,9 @@
  * 知识库管理 · 列表页：租户管理员总览全部共享库与私有库（US1）。
  * 统计卡（总数/共享/私有/文档数）、类型页签、四类筛选 + 搜索、新建、
  * 行 `⋯` 菜单（按 mode 差异）、上线/下线与删除二次确认。
+ * 表格分页走服务端 offset/limit（US5，T073）：`Paginator` 只切 `page`，不改任何
+ * 筛选条件；筛选/类型页签变化会把 `page` 重置回第 1 页并带着新筛选重新请求。
+ * `pageCount` 以 A1 响应 `total` 为准，`has_more=true` 时至少多留一页兜底。
  * 页面不读取 `readEmployeeScope`，也不监听 agent-scope 事件；数据只经
  * `api/knowledgeAdmin.ts`。
  */
@@ -14,6 +17,7 @@ import AppHeader from '@/components/AppHeader';
 import { DataTable, type DataTableColumn } from '@/components/DataTable';
 import { KnowledgeTypeBadge } from '@/components/knowledge/KnowledgeTypeBadge';
 import { SharedKnowledgeConversionDialog } from '@/components/knowledge/SharedKnowledgeConversionDialog';
+import { Paginator } from '@/components/Paginator';
 import { StatCard } from '@/components/StatCard';
 import {
   DropdownMenu,
@@ -72,6 +76,9 @@ import {
 /** 搜索输入防抖时长；避免每次按键都触发一次服务端请求。 */
 const SEARCH_DEBOUNCE_MS = 300;
 
+/** A1 每页条数；`Paginator` 按 `Math.ceil(total / LIST_PAGE_SIZE)` 算总页数。 */
+const LIST_PAGE_SIZE = 20;
+
 /** 把筛选态里的 `'all'` 哨兵值折叠为 `undefined`，交给 `appendQuery` 从请求里整体省略该参数。 */
 function toApiFilterValue(value: string): string | undefined {
   return value === ALL_FILTER_VALUE ? undefined : value;
@@ -104,6 +111,16 @@ export default function KnowledgeAdminListPage({ currentUser, onLogout }: Knowle
   const [deleting, setDeleting] = useState(false);
   const [conversionState, setConversionState] = useState<{ kb: KnowledgeBaseRead; agentId: string } | null>(null);
 
+  // 服务端 offset/limit 分页：`page` 是 1-based 当前页，`total`/`hasMore` 取自 A1 响应，
+  // 供 `Paginator` 算总页数与"是否还有更多"判断用；筛选变化时重置回第 1 页（见下方
+  // effect），翻页不改变任何筛选条件（仅带着当前筛选换 `offset`）。
+  const [page, setPage] = useState(1);
+  const [total, setTotal] = useState(0);
+  const [hasMore, setHasMore] = useState(false);
+  // 优先信任 `total`；但如果服务端 `has_more=true` 而 `total` 暂时算不出足够页数
+  // （例如响应字段不一致），至少多留一页，不让"下一页"按钮被误禁用。
+  const pageCount = Math.max(1, Math.ceil(total / LIST_PAGE_SIZE), hasMore ? page + 1 : page);
+
   // 每类请求各自的递增序号；只有仍是"当前最新一次"的响应才会落到 state 上，防止筛选/页签快速
   // 切换时旧请求晚于新请求返回，把已经过期的数据覆盖回去（`isCurrentGeneration` 只保护跨租户/
   // 跨登录会话的场景，不感知同一会话内筛选态的变化，所以需要单独加这层）。
@@ -121,7 +138,10 @@ export default function KnowledgeAdminListPage({ currentUser, onLogout }: Knowle
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [searchInput]);
 
-  /** 按当前全部筛选（含类型）向 A1 请求首页表格行；类型页签切换也会触发重新请求。 */
+  /**
+   * 按当前全部筛选（含类型）+ 当前页向 A1 请求表格行；类型页签/筛选切换会触发重新请求
+   * （并在下面的 effect 里先把 `page` 重置为 1），翻页只改变 `offset`。
+   */
   async function loadList() {
     const context = tenantContext;
     const generation = context?.generation;
@@ -135,10 +155,13 @@ export default function KnowledgeAdminListPage({ currentUser, onLogout }: Knowle
         ownerAgentId: toApiFilterValue(filters.ownerAgentId),
         teamId: toApiFilterValue(filters.teamId),
         q: filters.q,
-        limit: 20,
+        offset: (page - 1) * LIST_PAGE_SIZE,
+        limit: LIST_PAGE_SIZE,
       });
       if (!context.isCurrentGeneration(generation) || listRequestSeqRef.current !== seq) return;
       setItems(sortKnowledgeAdminListItems(Array.isArray(listResult?.items) ? listResult.items : []));
+      setTotal(listResult?.total ?? 0);
+      setHasMore(Boolean(listResult?.has_more));
     } catch (error) {
       if (!context.isCurrentGeneration(generation) || listRequestSeqRef.current !== seq) return;
       notify.error(knowledgeAdminErrorMessage(error, 'knowledgeAdmin.toast.loadFailed', { t }));
@@ -198,10 +221,17 @@ export default function KnowledgeAdminListPage({ currentUser, onLogout }: Knowle
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [api]);
 
+  // 筛选（含类型页签）变化时回到第 1 页；`page` 本身不在这个 effect 的依赖里，
+  // 避免"筛选变化 -> 重置页码"和"翻页"互相触发对方。
+  useEffect(() => {
+    setPage(1);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [api, filters.mode, filters.status, filters.ownerAgentId, filters.teamId, filters.q]);
+
   useEffect(() => {
     void loadList();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [api, filters.mode, filters.status, filters.ownerAgentId, filters.teamId, filters.q]);
+  }, [api, filters.mode, filters.status, filters.ownerAgentId, filters.teamId, filters.q, page]);
 
   useEffect(() => {
     void loadSummary();
@@ -511,6 +541,14 @@ export default function KnowledgeAdminListPage({ currentUser, onLogout }: Knowle
           onRowClick={(row) => navigate(`${EnterpriseRoute.KnowledgeAdmin}/${row.id}`)}
           aria-label={t('knowledgeAdmin.list.title')}
         />
+        {pageCount > 1 && (
+          <Paginator
+            page={page}
+            pageCount={pageCount}
+            onChange={setPage}
+            aria-label={t('knowledgeAdmin.list.pagination.ariaLabel')}
+          />
+        )}
       </div>
 
       <CreateKnowledgeBaseDialog

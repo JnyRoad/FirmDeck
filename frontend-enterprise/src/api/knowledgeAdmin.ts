@@ -143,6 +143,36 @@ export type RollbackVersionResult = {
   target_version_id: string;
 };
 
+/**
+ * B1 `POST /knowledge-bases/{kb_id}/rollback` 请求体（私有库：按 `version` 回滚员工分支头，
+ * 对应后端 `KnowledgeBaseRollbackRequest`，不带 `team_id` 时判别式落到这一分支）。
+ */
+export type RollbackDedicatedBranchBody = {
+  agentId: string;
+  version: string;
+};
+
+/** 私有库 `rollback` 响应：镜像 `rollback_knowledge_base` 专用库分支的返回体。 */
+export type RollbackDedicatedBranchResult = {
+  status: string;
+  knowledge_base_id: string;
+  head_version: string;
+};
+
+/** 私有库 `sync-from-overall` / `promote-to-overall` 响应：镜像对应端点的返回体。 */
+export type SyncFromOverallResult = {
+  status: string;
+  knowledge_base_id: string;
+  head_version: string;
+};
+
+/** 见上：`promote-to-overall` 返回的是广场正式版本号，不是分支头。 */
+export type PromoteToOverallResult = {
+  status: string;
+  knowledge_base_id: string;
+  version: string;
+};
+
 /** B3 `POST /knowledge/documents` 请求体。 */
 export type UploadDocumentBody = {
   knowledgeBaseId?: string;
@@ -401,6 +431,38 @@ export function createKnowledgeAdminApi(
       return client.get(appendQuery(`/api/enterprise/knowledge-bases/${kbId}/versions`, {
         agent_id: agentId,
       }));
+    },
+
+    /** 既有端点：单篇文档详情（含 `metadata`），私有库内容 Tab 用于编辑前还原正文。 */
+    getDocument(docId: string, agentId?: string): Promise<KnowledgeDocumentRead> {
+      return client.get(appendQuery(`/api/enterprise/knowledge/documents/${docId}`, {
+        agent_id: agentId,
+      }));
+    },
+
+    /** 既有端点：私有库分支头从广场基线同步（`KnowledgePage.tsx` 内联调用同款路径）。 */
+    syncFromOverall(kbId: string, agentId: string): Promise<SyncFromOverallResult> {
+      return client.post(appendQuery(`/api/enterprise/knowledge-bases/${kbId}/sync-from-overall`, {
+        agent_id: agentId,
+      }));
+    },
+
+    /** 既有端点：把私有库分支头发布为广场模板正式版。 */
+    promoteToOverall(kbId: string, agentId: string): Promise<PromoteToOverallResult> {
+      return client.post(appendQuery(`/api/enterprise/knowledge-bases/${kbId}/promote-to-overall`, {
+        agent_id: agentId,
+      }));
+    },
+
+    /**
+     * 私有库分支头回滚到历史版本；与共享库 `rollbackVersion` 共用同一后端路由，
+     * 但请求体判别式不同（无 `team_id`，见 `RollbackDedicatedBranchBody` 注释）。
+     */
+    rollbackDedicatedBranch(kbId: string, body: RollbackDedicatedBranchBody): Promise<RollbackDedicatedBranchResult> {
+      return client.post(`/api/enterprise/knowledge-bases/${kbId}/rollback`, {
+        agent_id: body.agentId,
+        version: body.version,
+      });
     },
 
     /** B3 上传文档到专用分支或显式共享草稿（`knowledge_base_version_id` 必须为 draft）。 */
