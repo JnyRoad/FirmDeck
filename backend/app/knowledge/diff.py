@@ -150,7 +150,12 @@ def pair_documents(
     base_docs: list[DocumentSnapshot],
     target_docs: list[DocumentSnapshot],
 ) -> tuple[Pairing, list[tuple[str, DocumentSnapshot | None, DocumentSnapshot | None]]]:
-    """按 `lineage_id` 配对 base/target 文档；任一侧存在缺失 lineage 的文档则整体回退 filename。"""
+    """按 `lineage_id` 配对 base/target 文档；任一侧存在缺失 lineage 的文档则整体回退 filename。
+
+    同一配对键在某一侧重复出现时（重复 `lineage_id`，或回退模式下重复 `filename`——
+    `KnowledgeDocument.filename` 并无唯一约束），按出现顺序做位置配对（第 i 个配第 i 个），
+    数量较多一侧多出的文档各自单独判定为 added/deleted，不会因为用字典去重而被静默丢弃。
+    """
     use_lineage = all(doc.lineage_id for doc in base_docs) and all(
         doc.lineage_id for doc in target_docs
     )
@@ -159,11 +164,25 @@ def pair_documents(
     def key_of(doc: DocumentSnapshot) -> str:
         return doc.lineage_id if use_lineage and doc.lineage_id else doc.filename
 
-    base_by_key = {key_of(doc): doc for doc in base_docs}
-    target_by_key = {key_of(doc): doc for doc in target_docs}
-    ordered_keys = list(base_by_key) + [key for key in target_by_key if key not in base_by_key]
+    base_groups: dict[str, list[DocumentSnapshot]] = {}
+    for doc in base_docs:
+        base_groups.setdefault(key_of(doc), []).append(doc)
+    target_groups: dict[str, list[DocumentSnapshot]] = {}
+    for doc in target_docs:
+        target_groups.setdefault(key_of(doc), []).append(doc)
 
-    paired = [(key, base_by_key.get(key), target_by_key.get(key)) for key in ordered_keys]
+    ordered_keys = list(base_groups) + [
+        key for key in target_groups if key not in base_groups
+    ]
+
+    paired: list[tuple[str, DocumentSnapshot | None, DocumentSnapshot | None]] = []
+    for key in ordered_keys:
+        base_list = base_groups.get(key, [])
+        target_list = target_groups.get(key, [])
+        for index in range(max(len(base_list), len(target_list))):
+            base_doc = base_list[index] if index < len(base_list) else None
+            target_doc = target_list[index] if index < len(target_list) else None
+            paired.append((key, base_doc, target_doc))
     return pairing, paired
 
 

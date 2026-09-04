@@ -1,9 +1,10 @@
 """T022：知识库版本对比（A2）纯函数与路由测试，覆盖 data-model §4 与契约 A2。
 
 纯函数用例（不接触 DB）覆盖行级 hunks 区间、change 块内相似度配对、max_lines 截断、
-lineage 配对与 filename 回退；DB 用例覆盖薄加载层 `diff_versions`、`against=base|
-published` 两种对比目标解析，以及路由鉴权（admin 或 history viewer 均可访问，
-其余 403）与版本缺失/跨租户错误。
+lineage 配对与 filename 回退（含重复 key 不被字典覆盖丢弃，fix round 1）；DB 用例覆盖薄
+加载层 `diff_versions`、`against=base|published` 两种对比目标解析，以及路由鉴权（admin
+在共享库与专用库上均可访问，非 admin 走 history viewer 网关，其余 403/409）与版本缺失/
+跨租户错误。
 """
 
 from __future__ import annotations
@@ -182,6 +183,44 @@ def test_pair_documents_falls_back_to_filename_when_lineage_missing() -> None:
     assert key == "only.md"
     assert base_doc is not None
     assert target_doc is not None
+
+
+def test_pair_documents_does_not_drop_duplicate_filename_in_fallback_mode() -> None:
+    """fix round 1：`KnowledgeDocument.filename` 无唯一约束，回退模式下重复 filename
+    不能因为按 key 建字典而静默覆盖丢弃——必须按位置配对，多出的一份判给 added。"""
+    base_docs = [DocumentSnapshot(lineage_id=None, filename="dup.md", title="Dup A", lines=["a"])]
+    target_docs = [
+        DocumentSnapshot(lineage_id=None, filename="dup.md", title="Dup A2", lines=["a2"]),
+        DocumentSnapshot(lineage_id=None, filename="dup.md", title="Dup B", lines=["b"]),
+    ]
+
+    pairing, paired = pair_documents(base_docs, target_docs)
+
+    assert pairing == "filename"
+    matches = [entry for entry in paired if entry[0] == "dup.md"]
+    assert len(matches) == 2
+    first_base, first_target = matches[0][1], matches[0][2]
+    second_base, second_target = matches[1][1], matches[1][2]
+    assert first_base is not None and first_target is not None
+    assert second_base is None and second_target is not None
+    assert second_target.title == "Dup B"
+
+
+def test_pair_documents_does_not_drop_duplicate_lineage_id() -> None:
+    """同一 lineage_id 侧内重复（数据质量问题）也按位置配对，多出的一侧判给 deleted。"""
+    base_docs = [
+        DocumentSnapshot(lineage_id="L1", filename="a.md", title="A", lines=["a"]),
+        DocumentSnapshot(lineage_id="L1", filename="a2.md", title="A2", lines=["a2"]),
+    ]
+    target_docs = [DocumentSnapshot(lineage_id="L1", filename="a.md", title="A", lines=["a"])]
+
+    pairing, paired = pair_documents(base_docs, target_docs)
+
+    assert pairing == "lineage"
+    matches = [entry for entry in paired if entry[0] == "L1"]
+    assert len(matches) == 2
+    assert matches[0][1] is not None and matches[0][2] is not None
+    assert matches[1][1] is not None and matches[1][2] is None
 
 
 # ---------------------------------------------------------------------------
@@ -527,6 +566,86 @@ def test_route_non_admin_non_viewer_is_forbidden() -> None:
 
         assert denied.value.status_code == 403
         assert denied.value.detail["code"] == "KNOWLEDGE_GRANT_REQUIRED"
+
+
+def _seed_dedicated_fixture(db) -> None:
+    """构造 1 个专用（dedicated）库 + 1 个版本 + 1 篇文档，覆盖 fix round 1 的 admin 旁路。"""
+    db.add(Tenant(id="tenant_demo", slug="tenant-demo", name="Demo", lifecycle_version=1))
+    db.add(
+        KnowledgeBase(
+            id="kb_dedicated_x",
+            tenant_id="tenant_demo",
+            name="专用知识库",
+            mode="dedicated",
+            status="active",
+        )
+    )
+    db.add(
+        KnowledgeBaseVersion(
+            id="kbver_dedicated_v1",
+            tenant_id="tenant_demo",
+            knowledge_base_id="kb_dedicated_x",
+            version="1.0.0",
+            name="专用知识库",
+            publication_state="released",
+        )
+    )
+    db.add(
+        KnowledgeDocument(
+            id="doc_dedicated_1",
+            tenant_id="tenant_demo",
+            knowledge_base_id="kb_dedicated_x",
+            knowledge_base_version_id="kbver_dedicated_v1",
+            filename="only.md",
+            file_type="md",
+            title="Only",
+            status="ready",
+            metadata_json={"lineage_id": "L_only", "raw_text": "hello"},
+        )
+    )
+    db.commit()
+
+
+def test_route_admin_can_diff_dedicated_mode_base() -> None:
+    """fix round 1（critical）：`require_shared_knowledge_history_viewer` 先校验
+    `mode == "shared"` 才判定 admin/owner，导致专用库上连管理员都被 409 拒绝。管理员必须
+    走 `_load_admin_diff_base` 旁路（只查存在 + 同租户），不受 mode 限制。"""
+    with _test_session() as db:
+        _seed_dedicated_fixture(db)
+
+        response = get_knowledge_admin_version_diff(
+            kb_id="kb_dedicated_x",
+            version_id="kbver_dedicated_v1",
+            tenant_id="tenant_demo",
+            against="base",
+            max_lines=5000,
+            db=db,
+            current_user=_admin_user(),
+        )
+
+        assert response.target_version_id == "kbver_dedicated_v1"
+        assert response.base_version_id is None
+        assert response.summary.added == 1
+
+
+def test_route_non_admin_on_dedicated_base_is_still_rejected() -> None:
+    """专用库对非管理员维持既有拒绝语义（走 history viewer 网关，非共享库直接 409）。"""
+    with _test_session() as db:
+        _seed_dedicated_fixture(db)
+
+        with pytest.raises(HTTPException) as denied:
+            get_knowledge_admin_version_diff(
+                kb_id="kb_dedicated_x",
+                version_id="kbver_dedicated_v1",
+                tenant_id="tenant_demo",
+                against="base",
+                max_lines=5000,
+                db=db,
+                current_user=_member_user(),
+            )
+
+        assert denied.value.status_code == 409
+        assert denied.value.detail["code"] == "KNOWLEDGE_MODE_INVALID"
 
 
 def test_route_missing_version_is_not_found() -> None:

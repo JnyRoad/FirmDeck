@@ -15,7 +15,7 @@ from sqlmodel import Session
 from app.contracts.domain_http import domain_http_error
 from app.contracts.error_registry import ERROR_REGISTRY, ErrorVisibility
 from app.db import get_session
-from app.db.models import KnowledgeBaseVersion, User
+from app.db.models import KnowledgeBase, KnowledgeBaseVersion, User
 from app.knowledge.diff import DEFAULT_MAX_LINES, diff_versions
 from app.knowledge.errors import KnowledgeError
 from app.knowledge.listing import list_bindable_teams, list_tenant_knowledge_bases
@@ -35,7 +35,7 @@ from app.knowledge.schema import (
     VersionDiffSummary,
 )
 from app.security.auth import get_current_user
-from app.security.permissions import ensure_tenant_admin
+from app.security.permissions import ensure_tenant_admin, is_admin_user
 from app.security.tenant import ensure_tenant
 
 router = APIRouter(
@@ -158,6 +158,23 @@ def _knowledge_error_to_http(exc: KnowledgeError) -> HTTPException:
     )
 
 
+def _load_admin_diff_base(
+    db: Session, *, tenant_id: str, knowledge_base_id: str
+) -> KnowledgeBase:
+    """租户管理员旁路：只校验知识库存在且属于该租户，不限制 mode（专用库也可对比）。
+
+    `require_shared_knowledge_history_viewer` 会先校验 `mode == "shared"` 才判定 admin/
+    owner 权限，导致 dedicated 库上连管理员都被 409 拒绝；A2 契约要求"admin 或该库
+    history viewer"两者任一放行，因此 admin 分支必须绕开共享库专属的 mode 校验。
+    """
+    base = db.get(KnowledgeBase, knowledge_base_id)
+    if base is None or base.tenant_id != tenant_id:
+        raise domain_http_error(
+            "KNOWLEDGE_CONTEXT_MISMATCH", source="knowledge_admin", status_code=403
+        )
+    return base
+
+
 def _load_admin_diff_version(
     db: Session, *, tenant_id: str, knowledge_base_id: str, version_id: str
 ) -> KnowledgeBaseVersion:
@@ -185,19 +202,26 @@ def get_knowledge_admin_version_diff(
     db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ) -> VersionDiffRead:
-    """A2：版本对比，租户管理员或该共享库的 history viewer（团队所有者）均可访问。
+    """A2：版本对比，租户管理员或该库的 history viewer（共享库的团队所有者）均可访问。
+
+    管理员走 `_load_admin_diff_base` 旁路（只校验存在且同租户，不限制 mode），因此专用库
+    对管理员同样可用；非管理员一律走 `require_shared_knowledge_history_viewer`（仅共享库、
+    仅 admin 或活跃绑定团队所有者放行，专用库对非管理员维持 409 拒绝）。
 
     `against=base`（默认）对比目标版本的 `parent_version_id`；`against=published` 对比
     知识库当前正式版本 `published_version_id`；两者缺失时视为空文档集合，目标版本的
     全部文档都判定为新增。鉴权、参数校验之外的聚合逻辑一律留在 `app.knowledge.diff`。
     """
     ensure_tenant(db, tenant_id)
-    try:
-        knowledge_base = require_shared_knowledge_history_viewer(
-            db, tenant_id=tenant_id, knowledge_base_id=kb_id, current_user=current_user
-        )
-    except KnowledgeError as exc:
-        raise _knowledge_error_to_http(exc) from exc
+    if current_user.tenant_id == tenant_id and is_admin_user(current_user):
+        knowledge_base = _load_admin_diff_base(db, tenant_id=tenant_id, knowledge_base_id=kb_id)
+    else:
+        try:
+            knowledge_base = require_shared_knowledge_history_viewer(
+                db, tenant_id=tenant_id, knowledge_base_id=kb_id, current_user=current_user
+            )
+        except KnowledgeError as exc:
+            raise _knowledge_error_to_http(exc) from exc
 
     target_version = _load_admin_diff_version(
         db, tenant_id=tenant_id, knowledge_base_id=kb_id, version_id=version_id
