@@ -61,15 +61,21 @@ import { DeleteDialog } from './dialogs/DeleteDialog';
 import { knowledgeAdminErrorMessage } from './shared/errorMessage';
 import {
   ALL_FILTER_VALUE,
-  computeKnowledgeAdminListSummary,
   defaultKnowledgeAdminListFilters,
   isUnboundSharedKnowledgeBase,
   knowledgeAdminSyncStateBadge,
   knowledgeAdminVersionBadge,
-  matchesKnowledgeAdminFilters,
   sortKnowledgeAdminListItems,
   type KnowledgeAdminListFilters,
 } from './knowledgeAdminModel';
+
+/** 搜索输入防抖时长；避免每次按键都触发一次服务端请求。 */
+const SEARCH_DEBOUNCE_MS = 300;
+
+/** 把筛选态里的 `'all'` 哨兵值折叠为 `undefined`，交给 `appendQuery` 从请求里整体省略该参数。 */
+function toApiFilterValue(value: string): string | undefined {
+  return value === ALL_FILTER_VALUE ? undefined : value;
+}
 
 const EMPTY_SUMMARY: KnowledgeAdminListSummary = { total: 0, shared: 0, dedicated: 0, documents: 0 };
 
@@ -91,29 +97,41 @@ export default function KnowledgeAdminListPage({ currentUser, onLogout }: Knowle
   const [teams, setTeams] = useState<KnowledgeAdminTeamOption[]>([]);
   const [loading, setLoading] = useState(false);
   const [filters, setFilters] = useState<KnowledgeAdminListFilters>(defaultKnowledgeAdminListFilters());
+  const [searchInput, setSearchInput] = useState('');
   const [createOpen, setCreateOpen] = useState(false);
   const [creating, setCreating] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<KnowledgeAdminListItem | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [conversionState, setConversionState] = useState<{ kb: KnowledgeBaseRead; agentId: string } | null>(null);
 
-  /** 拉取列表、统计、归属员工与可绑定群组候选；单次请求失败不影响其余数据展示。 */
-  async function load() {
+  function updateFilter<K extends keyof KnowledgeAdminListFilters>(key: K, value: KnowledgeAdminListFilters[K]) {
+    setFilters((prev) => ({ ...prev, [key]: value }));
+  }
+
+  /** 搜索输入框先落到本地状态，300ms 内无新输入才折算进 `filters.q` 并触发服务端请求。 */
+  useEffect(() => {
+    const handle = window.setTimeout(() => updateFilter('q', searchInput), SEARCH_DEBOUNCE_MS);
+    return () => window.clearTimeout(handle);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchInput]);
+
+  /** 按当前全部筛选（含类型）向 A1 请求首页表格行；类型页签切换也会触发重新请求。 */
+  async function loadList() {
     const context = tenantContext;
     const generation = context?.generation;
     if (!context || generation === undefined) return;
     setLoading(true);
     try {
-      const [listResult, agentsResult, teamsResult] = await Promise.all([
-        api.listKnowledgeBases({ limit: 20 }),
-        api.listAgents(),
-        api.listBindableTeams({}),
-      ]);
+      const listResult = await api.listKnowledgeBases({
+        mode: toApiFilterValue(filters.mode) as KnowledgeBaseMode | undefined,
+        status: toApiFilterValue(filters.status) as 'active' | 'archived' | undefined,
+        ownerAgentId: toApiFilterValue(filters.ownerAgentId),
+        teamId: toApiFilterValue(filters.teamId),
+        q: filters.q,
+        limit: 20,
+      });
       if (!context.isCurrentGeneration(generation)) return;
-      setItems(Array.isArray(listResult?.items) ? listResult.items : []);
-      setSummary(listResult?.summary ?? EMPTY_SUMMARY);
-      setAgents(Array.isArray(agentsResult) ? agentsResult : []);
-      setTeams(Array.isArray(teamsResult) ? teamsResult : []);
+      setItems(sortKnowledgeAdminListItems(Array.isArray(listResult?.items) ? listResult.items : []));
     } catch (error) {
       if (!context.isCurrentGeneration(generation)) return;
       notify.error(knowledgeAdminErrorMessage(error, 'knowledgeAdmin.toast.loadFailed', { t }));
@@ -122,30 +140,72 @@ export default function KnowledgeAdminListPage({ currentUser, onLogout }: Knowle
     }
   }
 
+  /**
+   * 统计卡与类型页签计数共用同一份 `summary`：请求时刻意不带 `mode`，这样切换页签本身
+   * 不会让其它页签的计数跟着归零，三个数字始终来自服务端同一个口径、互相一致。
+   */
+  async function loadSummary() {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
+    try {
+      const result = await api.listKnowledgeBases({
+        status: toApiFilterValue(filters.status) as 'active' | 'archived' | undefined,
+        ownerAgentId: toApiFilterValue(filters.ownerAgentId),
+        teamId: toApiFilterValue(filters.teamId),
+        q: filters.q,
+        limit: 1,
+      });
+      if (!context.isCurrentGeneration(generation)) return;
+      setSummary(result?.summary ?? EMPTY_SUMMARY);
+    } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
+      notify.error(knowledgeAdminErrorMessage(error, 'knowledgeAdmin.toast.loadFailed', { t }));
+    }
+  }
+
+  /** 归属员工 / 可绑定群组候选与当前筛选无关，只需要在挂载与手动刷新时拉取一次。 */
+  async function loadFilterOptions() {
+    const context = tenantContext;
+    const generation = context?.generation;
+    if (!context || generation === undefined) return;
+    try {
+      const [agentsResult, teamsResult] = await Promise.all([api.listAgents(), api.listBindableTeams({})]);
+      if (!context.isCurrentGeneration(generation)) return;
+      setAgents(Array.isArray(agentsResult) ? agentsResult : []);
+      setTeams(Array.isArray(teamsResult) ? teamsResult : []);
+    } catch (error) {
+      if (!context.isCurrentGeneration(generation)) return;
+      notify.error(knowledgeAdminErrorMessage(error, 'knowledgeAdmin.toast.loadFailed', { t }));
+    }
+  }
+
+  /** 手动刷新按钮：同时重取列表、统计与筛选候选。 */
+  async function refreshAll() {
+    await Promise.all([loadList(), loadSummary(), loadFilterOptions()]);
+  }
+
   useEffect(() => {
-    void load();
+    void loadFilterOptions();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [api]);
 
-  /** 类型页签计数：忽略当前 mode 筛选，但保留状态/归属/群组/搜索，方便切页签时看到一致的其它维度筛选结果。 */
-  const tabCounts = useMemo(
-    () => computeKnowledgeAdminListSummary(items.filter((item) => matchesKnowledgeAdminFilters(item, { ...filters, mode: ALL_FILTER_VALUE }))),
-    [items, filters],
-  );
-  const visibleItems = useMemo(
-    () => sortKnowledgeAdminListItems(items.filter((item) => matchesKnowledgeAdminFilters(item, filters))),
-    [items, filters],
-  );
+  useEffect(() => {
+    void loadList();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [api, filters.mode, filters.status, filters.ownerAgentId, filters.teamId, filters.q]);
 
-  function updateFilter<K extends keyof KnowledgeAdminListFilters>(key: K, value: KnowledgeAdminListFilters[K]) {
-    setFilters((prev) => ({ ...prev, [key]: value }));
-  }
+  useEffect(() => {
+    void loadSummary();
+    // mode 不影响统计口径，故不在依赖里——切换类型页签不重取统计。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [api, filters.status, filters.ownerAgentId, filters.teamId, filters.q]);
 
   async function toggleStatus(row: KnowledgeAdminListItem) {
     try {
       await api.updateKnowledgeBase(row.id, { status: row.status === 'active' ? 'archived' : 'active' });
       notify.successText(t('knowledgeAdmin.toast.updateSuccess'));
-      await load();
+      await Promise.all([loadList(), loadSummary()]);
     } catch (error) {
       notify.error(knowledgeAdminErrorMessage(error, 'knowledgeAdmin.toast.updateError', { t }));
     }
@@ -187,7 +247,7 @@ export default function KnowledgeAdminListPage({ currentUser, onLogout }: Knowle
   async function handleConverted() {
     notify.successText(t('knowledgeAdmin.toast.convertSuccess'));
     setConversionState(null);
-    await load();
+    await Promise.all([loadList(), loadSummary()]);
   }
 
   async function handleCreate(draft: CreateKnowledgeBaseDraft) {
@@ -216,7 +276,7 @@ export default function KnowledgeAdminListPage({ currentUser, onLogout }: Knowle
       await api.deleteKnowledgeBase(deleteTarget.id);
       notify.successText(t('knowledgeAdmin.toast.deleteSuccess'));
       setDeleteTarget(null);
-      await load();
+      await Promise.all([loadList(), loadSummary()]);
     } catch (error) {
       notify.error(knowledgeAdminErrorMessage(error, 'knowledgeAdmin.toast.deleteError', { t }));
     } finally {
@@ -363,15 +423,15 @@ export default function KnowledgeAdminListPage({ currentUser, onLogout }: Knowle
       <div className="mt-[20px] flex flex-wrap items-center justify-between gap-[12px]">
         <Tabs value={filters.mode} onValueChange={(value) => updateFilter('mode', value as KnowledgeAdminListFilters['mode'])}>
           <TabsList variant="line" aria-label={t('knowledgeAdmin.list.tabs.ariaLabel')}>
-            <TabsTrigger value={ALL_FILTER_VALUE}>{t('knowledgeAdmin.list.tabs.all')} ({tabCounts.total})</TabsTrigger>
-            <TabsTrigger value={KnowledgeBaseMode.Shared}>{t('knowledgeAdmin.list.tabs.shared')} ({tabCounts.shared})</TabsTrigger>
-            <TabsTrigger value={KnowledgeBaseMode.Dedicated}>{t('knowledgeAdmin.list.tabs.dedicated')} ({tabCounts.dedicated})</TabsTrigger>
+            <TabsTrigger value={ALL_FILTER_VALUE}>{t('knowledgeAdmin.list.tabs.all')} ({summary.total})</TabsTrigger>
+            <TabsTrigger value={KnowledgeBaseMode.Shared}>{t('knowledgeAdmin.list.tabs.shared')} ({summary.shared})</TabsTrigger>
+            <TabsTrigger value={KnowledgeBaseMode.Dedicated}>{t('knowledgeAdmin.list.tabs.dedicated')} ({summary.dedicated})</TabsTrigger>
           </TabsList>
         </Tabs>
         <div className="flex items-center gap-[8px]">
           <Button
             variant="outline"
-            onClick={() => void load()}
+            onClick={() => void refreshAll()}
             disabled={loading}
             className={OUTLINE_ACTION_BUTTON_CLASS}
           >
@@ -426,9 +486,9 @@ export default function KnowledgeAdminListPage({ currentUser, onLogout }: Knowle
           </SelectContent>
         </Select>
         <Input
-          value={filters.q}
+          value={searchInput}
           placeholder={t('knowledgeAdmin.list.filters.searchPlaceholder')}
-          onChange={(event) => updateFilter('q', event.target.value)}
+          onChange={(event) => setSearchInput(event.target.value)}
           className="h-[34px] w-[220px] rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white text-[12px]"
         />
       </div>
@@ -436,7 +496,7 @@ export default function KnowledgeAdminListPage({ currentUser, onLogout }: Knowle
       <div className="mt-[16px]">
         <DataTable
           columns={columns}
-          data={visibleItems}
+          data={items}
           rowKey={(row) => row.id}
           loading={loading}
           emptyText={t('knowledgeAdmin.list.empty')}

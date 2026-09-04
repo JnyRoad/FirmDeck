@@ -15,6 +15,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui';
 import { Button } from '@/components/ui/button';
 import { notify } from '@/components/ui/app-toast';
 import { useTenantSession } from '@/contexts/TenantSessionContext';
+import { PublicationState } from '@/enums/knowledge';
 import { EnterpriseRoute } from '@/enums/routes';
 import { useAppIntl, type MessageId } from '@/i18n';
 import { RawContent } from '@/i18n/RawContent';
@@ -52,6 +53,8 @@ export default function KnowledgeAdminDetailPage({ currentUser, onLogout }: Know
 
   const [kb, setKb] = useState<KnowledgeBaseRead | null>(null);
   const [loading, setLoading] = useState(false);
+  /** 设置 Tab 删除确认展示的进行中草稿数；私有库分支没有独立草稿概念，恒为 0。 */
+  const [draftCount, setDraftCount] = useState(0);
 
   async function load() {
     const context = tenantContext;
@@ -62,6 +65,14 @@ export default function KnowledgeAdminDetailPage({ currentUser, onLogout }: Know
       const result = await api.getKnowledgeBase(kbId);
       if (!context.isCurrentGeneration(generation)) return;
       setKb(result);
+      if (result.mode === 'shared') {
+        // 版本 Tab（占位中）本来就需要这份数据；这里顺带算出未发布草稿数供设置 Tab 的删除确认使用。
+        const versions = await api.listVersions(kbId);
+        if (!context.isCurrentGeneration(generation)) return;
+        setDraftCount(versions.filter((version) => version.publication_state === PublicationState.Draft).length);
+      } else {
+        setDraftCount(0);
+      }
     } catch (error) {
       if (!context.isCurrentGeneration(generation)) return;
       notify.error(knowledgeAdminErrorMessage(error, 'knowledgeAdmin.detail.loadError', { t }));
@@ -154,7 +165,7 @@ export default function KnowledgeAdminDetailPage({ currentUser, onLogout }: Know
             {tabs.map((tabKey) => (
               <TabsContent key={tabKey} value={tabKey} className="mt-[16px]">
                 {tabKey === 'settings' ? (
-                  <SettingsTab api={api} kb={kb} onUpdated={handleUpdated} onDeleted={handleDeleted} />
+                  <SettingsTab api={api} kb={kb} draftCount={draftCount} onUpdated={handleUpdated} onDeleted={handleDeleted} />
                 ) : (
                   <PlaceholderTab />
                 )}

@@ -1,23 +1,22 @@
 /**
  * knowledgeAdminModel 纯函数测试（T030）。
  *
- * 覆盖范围：筛选谓词（类型/状态/归属员工/绑定群组/名称搜索）、排序（按更新时间降序，
- * 时间相同或非法时按名称兜底）、统计聚合、版本状态徽章文案选择（含同步状态）、
- * `formatVersion`、`nextVersionLabel`。全部为纯函数，不依赖 React/网络。
+ * 覆盖范围：排序（按更新时间降序，时间相同或非法时按名称兜底）、统计聚合、
+ * 版本状态徽章文案选择（含同步状态）、`formatVersion`、`nextVersionLabel`。
+ * 全部为纯函数，不依赖 React/网络。筛选已改为服务端 query 参数（见
+ * `KnowledgeAdminListPage.tsx`），不再有客户端筛选谓词可测。
  */
 import { describe, expect, it } from 'vitest';
 
-import { KnowledgeBaseMode, VersionLevel } from '@/enums/knowledge';
+import { VersionLevel } from '@/enums/knowledge';
 import type { KnowledgeAdminListItem } from '@/types/knowledgeAdmin';
 
 import {
   computeKnowledgeAdminListSummary,
-  defaultKnowledgeAdminListFilters,
   formatVersion,
   isUnboundSharedKnowledgeBase,
   knowledgeAdminSyncStateBadge,
   knowledgeAdminVersionBadge,
-  matchesKnowledgeAdminFilters,
   nextVersionLabel,
   sortKnowledgeAdminListItems,
 } from './knowledgeAdminModel';
@@ -61,57 +60,6 @@ function dedicatedItem(overrides: Partial<KnowledgeAdminListItem> = {}): Knowled
     ...overrides,
   };
 }
-
-describe('matchesKnowledgeAdminFilters', () => {
-  it('passes everything under default (all) filters', () => {
-    const filters = defaultKnowledgeAdminListFilters();
-    expect(matchesKnowledgeAdminFilters(sharedItem(), filters)).toBe(true);
-    expect(matchesKnowledgeAdminFilters(dedicatedItem(), filters)).toBe(true);
-  });
-
-  it('filters by mode', () => {
-    const filters = { ...defaultKnowledgeAdminListFilters(), mode: KnowledgeBaseMode.Shared };
-    expect(matchesKnowledgeAdminFilters(sharedItem(), filters)).toBe(true);
-    expect(matchesKnowledgeAdminFilters(dedicatedItem(), filters)).toBe(false);
-  });
-
-  it('filters by status', () => {
-    const filters = { ...defaultKnowledgeAdminListFilters(), status: 'archived' as const };
-    expect(matchesKnowledgeAdminFilters(sharedItem({ status: 'archived' }), filters)).toBe(true);
-    expect(matchesKnowledgeAdminFilters(sharedItem({ status: 'active' }), filters)).toBe(false);
-  });
-
-  it('filters by owner agent id (dedicated only)', () => {
-    const filters = { ...defaultKnowledgeAdminListFilters(), ownerAgentId: 'ag_1' };
-    expect(matchesKnowledgeAdminFilters(dedicatedItem(), filters)).toBe(true);
-    expect(matchesKnowledgeAdminFilters(dedicatedItem({ owner_agent: { id: 'ag_2', name: '小北' } }), filters)).toBe(false);
-    expect(matchesKnowledgeAdminFilters(sharedItem(), filters)).toBe(false);
-  });
-
-  it('filters by bound team id (shared only)', () => {
-    const filters = { ...defaultKnowledgeAdminListFilters(), teamId: 'team_1' };
-    expect(matchesKnowledgeAdminFilters(sharedItem(), filters)).toBe(true);
-    expect(matchesKnowledgeAdminFilters(sharedItem({ bound_teams: [] }), filters)).toBe(false);
-    expect(matchesKnowledgeAdminFilters(dedicatedItem(), filters)).toBe(false);
-  });
-
-  it('filters by case-insensitive name search', () => {
-    const filters = { ...defaultKnowledgeAdminListFilters(), q: '话术' };
-    expect(matchesKnowledgeAdminFilters(dedicatedItem(), filters)).toBe(true);
-    expect(matchesKnowledgeAdminFilters(sharedItem(), filters)).toBe(false);
-  });
-
-  it('combines multiple active filters with AND semantics', () => {
-    const filters = {
-      ...defaultKnowledgeAdminListFilters(),
-      mode: KnowledgeBaseMode.Dedicated,
-      status: 'active' as const,
-      ownerAgentId: 'ag_1',
-    };
-    expect(matchesKnowledgeAdminFilters(dedicatedItem(), filters)).toBe(true);
-    expect(matchesKnowledgeAdminFilters(dedicatedItem({ status: 'archived' }), filters)).toBe(false);
-  });
-});
 
 describe('sortKnowledgeAdminListItems', () => {
   it('sorts by updated_at descending without mutating the input', () => {

@@ -2,9 +2,10 @@
 
 /**
  * KnowledgeAdminListPage 测试（T031）。
- * 覆盖：统计卡、类型页签、四类筛选与搜索、未绑定提示、行点击跳转、`⋯` 菜单项按
- * mode 差异、新建对话框（私有未选员工阻止）、下线/删除二次确认（展示 draft_count）。
- * `api/knowledgeAdmin.ts` 整体 mock，不发真实网络请求。
+ * 覆盖：统计卡、类型页签、四类筛选与搜索（均随请求发给服务端，见下方 `mockListKnowledgeBases`
+ * 对 `params` 的过滤模拟，而不是客户端过滤已加载的一页数据）、未绑定提示、行点击跳转、
+ * `⋯` 菜单项按 mode 差异、新建对话框（私有未选员工阻止）、下线/删除二次确认
+ * （展示 draft_count）。`api/knowledgeAdmin.ts` 整体 mock，不发真实网络请求。
  */
 import type { ComponentProps } from 'react';
 import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
@@ -129,6 +130,8 @@ const dedicated: KnowledgeAdminListItem = {
   updated_at: '2026-08-18T09:00:00Z',
 };
 
+const ALL_ITEMS: KnowledgeAdminListItem[] = [sharedBound, sharedUnbound, dedicated];
+
 const agents: AgentProfileRead[] = [
   {
     id: 'ag_1',
@@ -143,24 +146,59 @@ const agents: AgentProfileRead[] = [
   },
 ];
 
-function listResponse(items: KnowledgeAdminListItem[]): KnowledgeAdminListResponse {
+/** A1 query params as the page sends them (camelCase, per `ListKnowledgeBasesParams`). */
+type MockListParams = {
+  mode?: string;
+  status?: string;
+  ownerAgentId?: string;
+  teamId?: string;
+  q?: string;
+  limit?: number;
+};
+
+/** Server-side filter emulation: mirrors what a real A1 implementation would do for each param. */
+function matchesParams(item: KnowledgeAdminListItem, params: MockListParams, { includeMode }: { includeMode: boolean }): boolean {
+  if (includeMode && params.mode && item.mode !== params.mode) return false;
+  if (params.status && item.status !== params.status) return false;
+  if (params.ownerAgentId && item.owner_agent?.id !== params.ownerAgentId) return false;
+  if (params.teamId && !item.bound_teams.some((team) => team.id === params.teamId)) return false;
+  const keyword = (params.q || '').trim().toLowerCase();
+  if (keyword && !item.name.toLowerCase().includes(keyword)) return false;
+  return true;
+}
+
+function summarize(items: KnowledgeAdminListItem[]) {
   return {
-    items,
-    summary: {
-      total: items.length,
-      shared: items.filter((item) => item.mode === 'shared').length,
-      dedicated: items.filter((item) => item.mode === 'dedicated').length,
-      documents: items.reduce((sum, item) => sum + item.document_count, 0),
-    },
     total: items.length,
-    offset: 0,
-    limit: 20,
-    has_more: false,
+    shared: items.filter((item) => item.mode === 'shared').length,
+    dedicated: items.filter((item) => item.mode === 'dedicated').length,
+    documents: items.reduce((sum, item) => sum + item.document_count, 0),
   };
 }
 
-function primeDefaultMocks(items: KnowledgeAdminListItem[] = [sharedBound, sharedUnbound, dedicated]) {
-  mockApi.listKnowledgeBases.mockResolvedValue(listResponse(items));
+/**
+ * Mocked A1: `items` obey every param including `mode`; `summary` deliberately ignores `mode`
+ * (mirrors the page's `loadSummary()`, which omits `mode` so stat cards and every tab count
+ * stay mutually consistent regardless of which type tab is currently selected).
+ */
+function mockListKnowledgeBases(items: KnowledgeAdminListItem[] = ALL_ITEMS) {
+  mockApi.listKnowledgeBases.mockImplementation(async (params: MockListParams = {}) => {
+    const rows = items.filter((item) => matchesParams(item, params, { includeMode: true }));
+    const summaryScope = items.filter((item) => matchesParams(item, params, { includeMode: false }));
+    const response: KnowledgeAdminListResponse = {
+      items: rows,
+      summary: summarize(summaryScope),
+      total: rows.length,
+      offset: 0,
+      limit: params.limit ?? 20,
+      has_more: false,
+    };
+    return response;
+  });
+}
+
+function primeDefaultMocks(items: KnowledgeAdminListItem[] = ALL_ITEMS) {
+  mockListKnowledgeBases(items);
   mockApi.listAgents.mockResolvedValue(agents);
   mockApi.listBindableTeams.mockResolvedValue([{ id: 'team_1', name: '客服一组', member_count: 5 }]);
 }
@@ -208,54 +246,92 @@ describe('KnowledgeAdminListPage', () => {
     expect(screen.getByText('未绑定群组')).toBeTruthy();
   });
 
-  it('filters by type tab', async () => {
-    const user = userEvent.setup();
+  it('requests A1 with the current filters as query params on the initial load', async () => {
     primeDefaultMocks();
     renderPage();
     await screen.findByText('产品 FAQ 共享库');
 
-    await user.click(screen.getByRole('tab', { name: /^专用/ }));
-    expect(screen.queryByText('产品 FAQ 共享库')).toBeNull();
-    expect(screen.getByText('客服话术库')).toBeTruthy();
+    // Table-row request: no mode/status/owner/team filters yet, page-1 limit=20.
+    expect(mockApi.listKnowledgeBases).toHaveBeenCalledWith(
+      expect.objectContaining({ mode: undefined, status: undefined, ownerAgentId: undefined, teamId: undefined, limit: 20 }),
+    );
+    // Summary request never carries `mode`.
+    expect(mockApi.listKnowledgeBases).toHaveBeenCalledWith(
+      expect.not.objectContaining({ mode: expect.anything() }),
+    );
   });
 
-  it('filters by owner agent', async () => {
+  it('re-fetches with mode in the query params when a type tab is selected, without disturbing the other tabs\' counts', async () => {
     const user = userEvent.setup();
     primeDefaultMocks();
     renderPage();
     await screen.findByText('产品 FAQ 共享库');
+    mockApi.listKnowledgeBases.mockClear();
+
+    await user.click(screen.getByRole('tab', { name: /^专用/ }));
+
+    await waitFor(() => expect(mockApi.listKnowledgeBases).toHaveBeenCalledWith(
+      expect.objectContaining({ mode: 'dedicated', limit: 20 }),
+    ));
+    await waitFor(() => expect(screen.queryByText('产品 FAQ 共享库')).toBeNull());
+    expect(screen.getByText('客服话术库')).toBeTruthy();
+
+    // Tab counts still read total/shared/dedicated from the server summary (mode-independent),
+    // so the "shared" tab keeps showing 2 even while the "dedicated" tab is active.
+    expect(screen.getByRole('tab', { name: /^共享/ }).textContent).toContain('2');
+    expect(screen.getByRole('tab', { name: /^全部/ }).textContent).toContain('3');
+  });
+
+  it('re-fetches with the owner filter in the query params', async () => {
+    const user = userEvent.setup();
+    primeDefaultMocks();
+    renderPage();
+    await screen.findByText('产品 FAQ 共享库');
+    mockApi.listKnowledgeBases.mockClear();
 
     const ownerSelect = screen.getByRole('combobox', { name: '归属' });
     await user.click(ownerSelect);
     await user.click(screen.getByRole('option', { name: '林晓' }));
 
-    expect(screen.queryByText('产品 FAQ 共享库')).toBeNull();
+    await waitFor(() => expect(mockApi.listKnowledgeBases).toHaveBeenCalledWith(
+      expect.objectContaining({ ownerAgentId: 'ag_1' }),
+    ));
+    await waitFor(() => expect(screen.queryByText('产品 FAQ 共享库')).toBeNull());
     expect(screen.getByText('客服话术库')).toBeTruthy();
   });
 
-  it('filters by bound team', async () => {
+  it('re-fetches with the team filter in the query params', async () => {
     const user = userEvent.setup();
     primeDefaultMocks();
     renderPage();
     await screen.findByText('产品 FAQ 共享库');
+    mockApi.listKnowledgeBases.mockClear();
 
     const teamSelect = screen.getByRole('combobox', { name: '群组' });
     await user.click(teamSelect);
     await user.click(screen.getByRole('option', { name: '客服一组' }));
 
+    await waitFor(() => expect(mockApi.listKnowledgeBases).toHaveBeenCalledWith(
+      expect.objectContaining({ teamId: 'team_1' }),
+    ));
+    await waitFor(() => expect(screen.queryByText('内部政策库')).toBeNull());
     expect(screen.getByText('产品 FAQ 共享库')).toBeTruthy();
-    expect(screen.queryByText('内部政策库')).toBeNull();
     expect(screen.queryByText('客服话术库')).toBeNull();
   });
 
-  it('filters by name search', async () => {
+  it('debounces the search input ~300ms before re-fetching with q in the query params', async () => {
     const user = userEvent.setup();
     primeDefaultMocks();
     renderPage();
     await screen.findByText('产品 FAQ 共享库');
+    mockApi.listKnowledgeBases.mockClear();
 
     await user.type(screen.getByPlaceholderText('按名称搜索'), '话术');
-    expect(screen.queryByText('产品 FAQ 共享库')).toBeNull();
+
+    await waitFor(() => expect(mockApi.listKnowledgeBases).toHaveBeenCalledWith(
+      expect.objectContaining({ q: '话术' }),
+    ));
+    await waitFor(() => expect(screen.queryByText('产品 FAQ 共享库')).toBeNull());
     expect(screen.getByText('客服话术库')).toBeTruthy();
   });
 

@@ -1,9 +1,13 @@
 /**
  * 知识库管理端（knowledge-admin）纯函数视图模型。
  *
- * 只做数据投影/筛选/排序/文案键选择，不含 React、网络或 i18n 运行时依赖；
+ * 只做数据投影/排序/文案键选择，不含 React、网络或 i18n 运行时依赖；
  * `KnowledgeAdminListPage`/`KnowledgeAdminDetailPage` 据此渲染，`MessageId` 的
  * 实际翻译交由调用方的 `useAppIntl().t(...)` 完成。
+ *
+ * 筛选（类型/状态/归属/群组/搜索）已改为随 `listKnowledgeBases` 的 query 参数交给
+ * 服务端处理（见 `KnowledgeAdminListPage.tsx`），不再有客户端筛选谓词——避免筛选/页签
+ * 计数只在已加载的一页数据里生效、超过 `limit` 时结果不完整。
  */
 import { KnowledgeBaseMode, VersionLevel } from '@/enums/knowledge';
 import type { MessageId } from '@/i18n/types';
@@ -29,22 +33,6 @@ export function defaultKnowledgeAdminListFilters(): KnowledgeAdminListFilters {
   return { mode: ALL_FILTER_VALUE, status: ALL_FILTER_VALUE, ownerAgentId: ALL_FILTER_VALUE, teamId: ALL_FILTER_VALUE, q: '' };
 }
 
-/** 判断一条列表项是否满足当前筛选条件；条件之间为 AND 语义。 */
-export function matchesKnowledgeAdminFilters(
-  item: KnowledgeAdminListItem,
-  filters: KnowledgeAdminListFilters,
-): boolean {
-  if (filters.mode !== ALL_FILTER_VALUE && item.mode !== filters.mode) return false;
-  if (filters.status !== ALL_FILTER_VALUE && item.status !== filters.status) return false;
-  if (filters.ownerAgentId !== ALL_FILTER_VALUE && item.owner_agent?.id !== filters.ownerAgentId) return false;
-  if (filters.teamId !== ALL_FILTER_VALUE && !item.bound_teams.some((team) => team.id === filters.teamId)) {
-    return false;
-  }
-  const keyword = filters.q.trim().toLowerCase();
-  if (keyword && !item.name.toLowerCase().includes(keyword)) return false;
-  return true;
-}
-
 /** 按更新时间降序排列；非法/相同时间戳按名称兜底，保证结果确定且不改变入参数组。 */
 export function sortKnowledgeAdminListItems(items: KnowledgeAdminListItem[]): KnowledgeAdminListItem[] {
   return [...items].sort((a, b) => {
@@ -58,7 +46,11 @@ export function sortKnowledgeAdminListItems(items: KnowledgeAdminListItem[]): Kn
   });
 }
 
-/** 汇总总数 / 共享数 / 私有数 / 文档总数；用于统计卡与类型页签计数。 */
+/**
+ * 汇总总数 / 共享数 / 私有数 / 文档总数。列表页统计卡与类型页签计数现在直接读取 A1
+ * 响应自带的 `summary` 字段（服务端口径，随筛选变化，见 `KnowledgeAdminListPage.tsx`），
+ * 不再调用本函数；保留为可独立测试的通用聚合工具（T030 明确要求的"统计"纯函数）。
+ */
 export function computeKnowledgeAdminListSummary(items: KnowledgeAdminListItem[]): KnowledgeAdminListSummary {
   return items.reduce<KnowledgeAdminListSummary>(
     (summary, item) => ({

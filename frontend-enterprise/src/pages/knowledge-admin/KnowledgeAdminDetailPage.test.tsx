@@ -9,10 +9,11 @@ import type { ComponentProps } from 'react';
 import { cleanup, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { TooltipProvider } from '@/components/ui/tooltip';
 import { I18nProvider } from '@/i18n';
+import type { KnowledgeAdminVersionRead } from '@/types/knowledgeAdmin';
 import type { KnowledgeBaseRead } from '@/types';
 
 const tenantContextMock = vi.hoisted(() => {
@@ -51,6 +52,7 @@ const mockApi = vi.hoisted(() => ({
   getKnowledgeBase: vi.fn(),
   updateKnowledgeBase: vi.fn(),
   deleteKnowledgeBase: vi.fn(),
+  listVersions: vi.fn(),
 }));
 
 vi.mock('../../api/knowledgeAdmin', () => ({
@@ -107,6 +109,25 @@ const dedicatedKb: KnowledgeBaseRead = {
   updated_at: '2026-08-18T09:00:00Z',
 };
 
+function versionFixture(overrides: Partial<KnowledgeAdminVersionRead> = {}): KnowledgeAdminVersionRead {
+  return {
+    id: 'kbver_1',
+    tenant_id: 'tenant_demo',
+    knowledge_base_id: 'kb_shared_1',
+    version: '1.1.0',
+    name: 'v1.1.0',
+    status: 'active',
+    publication_state: 'released',
+    is_stale: false,
+    base_version: null,
+    draft_name: null,
+    next_version_preview: null,
+    created_at: '2026-08-01T00:00:00Z',
+    updated_at: '2026-08-01T00:00:00Z',
+    ...overrides,
+  };
+}
+
 function LocationEcho() {
   const location = useLocation();
   return <div data-testid="location">{`${location.pathname}${location.search}`}</div>;
@@ -126,6 +147,10 @@ function renderDetail(initialEntry: string) {
     </I18nProvider>,
   );
 }
+
+beforeEach(() => {
+  mockApi.listVersions.mockResolvedValue([]);
+});
 
 afterEach(() => {
   cleanup();
@@ -242,5 +267,35 @@ describe('KnowledgeAdminDetailPage', () => {
 
     await waitFor(() => expect(mockApi.deleteKnowledgeBase).toHaveBeenCalledWith('kb_shared_1'));
     expect((await screen.findByTestId('location')).textContent).toBe('/enterprise/knowledge-admin');
+  });
+
+  it('shows the draft count on the settings-tab delete confirmation for a shared kb with drafts', async () => {
+    const user = userEvent.setup();
+    mockApi.getKnowledgeBase.mockResolvedValue(sharedKb);
+    mockApi.listVersions.mockResolvedValue([
+      versionFixture({ id: 'kbver_draft_1', publication_state: 'draft', draft_name: 'draft-1' }),
+      versionFixture({ id: 'kbver_draft_2', publication_state: 'draft', draft_name: 'draft-2' }),
+      versionFixture({ id: 'kbver_released_1', publication_state: 'released' }),
+    ]);
+    renderDetail('/enterprise/knowledge-admin/kb_shared_1?tab=settings');
+
+    await screen.findByText('危险区');
+    await waitFor(() => expect(mockApi.listVersions).toHaveBeenCalledWith('kb_shared_1'));
+    await user.click(screen.getByRole('button', { name: '删除' }));
+
+    expect(await screen.findByText(/2 个进行中的草稿/)).toBeTruthy();
+  });
+
+  it('does not fetch versions or show a draft warning for a dedicated kb', async () => {
+    const user = userEvent.setup();
+    mockApi.getKnowledgeBase.mockResolvedValue(dedicatedKb);
+    renderDetail('/enterprise/knowledge-admin/kb_dedicated_1?tab=settings');
+
+    await screen.findByText('危险区');
+    await user.click(screen.getByRole('button', { name: '删除' }));
+
+    expect(await screen.findByRole('button', { name: '删除' })).toBeTruthy();
+    expect(screen.queryByText(/个进行中的草稿/)).toBeNull();
+    expect(mockApi.listVersions).not.toHaveBeenCalled();
   });
 });
