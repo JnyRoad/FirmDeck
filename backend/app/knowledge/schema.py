@@ -524,6 +524,12 @@ class DiffDocumentRead(BaseModel):
     `base_document_id`/`target_document_id`（T080 新增）是该篇文档在 base/target 各自
     版本内的真实行 id，供前端写回（编辑/归档/恢复）时定位到当前版本内的克隆行，而不是
     误用指向源文档的 `lineage_id`；对应侧不存在时为 `None`。
+
+    `base_updated_at`/`target_updated_at`（乐观锁字段补全轮次新增）分别是
+    `base_document_id`/`target_document_id` 那一行 `updated_at.isoformat()`，格式与
+    `PUT /knowledge/documents/{id}` 的 `expected_updated_at` 完全一致，供前端直接原样
+    回传做乐观锁；对应侧 document_id 为 `None` 时同样为 `None`。`deleted` 的
+    `target_updated_at` 来自草稿内归档行（该行仍存在，只是 A2b 不返回）。
     """
 
     lineage_id: str
@@ -533,6 +539,8 @@ class DiffDocumentRead(BaseModel):
     hunks: list[DiffHunkRead] = Field(default_factory=list)
     base_document_id: str | None = None
     target_document_id: str | None = None
+    base_updated_at: str | None = None
+    target_updated_at: str | None = None
 
 
 class VersionDiffSummary(BaseModel):

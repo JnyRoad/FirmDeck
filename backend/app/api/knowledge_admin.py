@@ -327,6 +327,8 @@ def get_knowledge_admin_version_diff(
                 truncated=document.truncated,
                 base_document_id=document.base_document_id,
                 target_document_id=document.target_document_id,
+                base_updated_at=document.base_updated_at,
+                target_updated_at=document.target_updated_at,
                 hunks=[
                     DiffHunkRead(
                         type=hunk.type,

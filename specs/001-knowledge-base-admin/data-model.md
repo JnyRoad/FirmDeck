@@ -92,6 +92,9 @@ VersionDiff
     ├── lineage_id, title, kind ("added" | "modified" | "deleted"), truncated
     ├── base_document_id, target_document_id   # T080：各侧真实行 id，对应侧不存在为 null
     │                                          # kind=deleted 时 target_document_id = 目标版本内那一行的归档行 id（供"恢复"写回）
+    ├── base_updated_at, target_updated_at     # 乐观锁字段补全轮次：对应 document_id 那一行 updated_at.isoformat()，
+    │                                          # 与 PUT /knowledge/documents/{id} 的 expected_updated_at 同一格式；document_id 为 null 时同为 null
+    │                                          # kind=deleted 时 target_updated_at 与 target_document_id 同源（草稿内归档行，A2b 不返回该行）
     └── hunks[]  (kind="modified" 时)
         ├── type ("equal" | "change")
         ├── base_start, base_lines[], target_start, target_lines[]   # 行号 0-based

@@ -59,6 +59,7 @@ Query: `tenant_id`、`against=base|published`（默认 `base`：对比 `parent_v
 Response `200`: 见 data-model §4（`VersionDiff`）。超过 `max_lines` 的文档 `truncated=true` 且不含 `hunks`。
 每篇文档新增 `base_document_id` / `target_document_id`（T080）：分别是该文档在 base/target 各自版本内的真实行 id，对应侧不存在（added 无 base）时为 `null`；供写回定位真实行，区别于可能指向源文档的 `lineage_id`（草稿文档是克隆行）。
 `kind="deleted"` 时的 `target_document_id`：草稿内删除是软删除，目标版本里那一行仍在（`status='archived'`），返回其真实行 id 供"恢复"写回定位；只有目标版本内确实没有对应行时才为 `null`。
+每篇文档同时新增 `base_updated_at` / `target_updated_at`（乐观锁字段补全轮次）：分别是 `base_document_id` / `target_document_id` 那一行 `updated_at.isoformat()`，与 `PUT /knowledge/documents/{id}` 的 `expected_updated_at` 完全同一格式，对应侧 document_id 为 `null` 时同样为 `null`；供前端写回（尤其"恢复"归档行——该行被 A2b 隐藏，前端拿不到它的 `updated_at`）时原样回传做乐观锁，不必再发额外请求获取该行的 `updated_at`。`kind="deleted"` 的 `target_updated_at` 与 `target_document_id` 同源，来自草稿内归档行。
 `status='archived'` 的文档按 data-model §3 表示"该版本内已删除"，base/target 两侧一律视为**不存在**：草稿里归档一篇文档 → `kind="deleted"` 且计入 `summary.deleted`；草稿里恢复一篇基线中已归档的文档 → `kind="added"`。
 Errors: `KNOWLEDGE_BASE_NOT_FOUND`（404，知识库或版本**不存在**）、`KNOWLEDGE_CONTEXT_MISMATCH`（403，资源存在但跨租户/跨库）。两个查找（知识库、版本）用同一套存在性策略，不再一个 403、一个 404。
 

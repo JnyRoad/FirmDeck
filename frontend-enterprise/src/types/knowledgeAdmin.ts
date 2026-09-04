@@ -95,6 +95,18 @@ export type DiffHunk = {
  * `kind==='modified'` 时含 `hunks`；`truncated===true`（超过 `max_lines`）时不含 `hunks`。
  * `base_document_id`/`target_document_id`（T080）是该篇文档在 base/target 各自版本内的
  * 真实行 id，供写回定位当前版本内的克隆行；对应侧不存在时为 `null`。
+ *
+ * `kind==='deleted'` 的 `target_document_id`（backend commit ab58668 起）不再恒为
+ * `null`：草稿内的"删除"是软删除，目标版本里那一行仍然存在（`status='archived'`），
+ * 此时该字段回填那个归档行的真实 id，供"恢复已删除文档"写回定位——只有目标版本内
+ * 根本没有对应行时才是 `null`。
+ *
+ * `base_updated_at`/`target_updated_at`（乐观锁字段补全轮次新增）分别是
+ * `base_document_id`/`target_document_id` 那一行 `updated_at.isoformat()`，与
+ * `PUT /api/enterprise/knowledge/documents/{id}` 的 `expected_updated_at` 同一格式；
+ * 对应侧 document_id 为 `null` 时同样为 `null`。用于"恢复已删除文档"等写回场景直接
+ * 原样回传做乐观锁——A2b（版本文档全量列表）不返回已归档行，前端拿不到它的
+ * `updated_at`，这里补上。
  */
 export type DiffDocument = {
   lineage_id: string;
@@ -103,6 +115,8 @@ export type DiffDocument = {
   truncated: boolean;
   base_document_id: string | null;
   target_document_id: string | null;
+  base_updated_at: string | null;
+  target_updated_at: string | null;
   hunks?: DiffHunk[];
 };
 

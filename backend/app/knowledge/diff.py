@@ -37,6 +37,11 @@ class DocumentSnapshot:
     `document_id`（T080 新增）是该文档在当前版本内的真实行 id——草稿版本里的文档是
     克隆行，`lineage_id` 指向源文档而非当前行，写回（编辑/归档/恢复）必须落到
     `document_id` 才能定位对；默认 `None` 以兼容不关心此字段的既有纯函数测试构造。
+
+    `updated_at`（乐观锁字段补全轮次新增）是该行 `KnowledgeDocument.updated_at` 的
+    `isoformat()` 字符串，与 `PUT /knowledge/documents/{id}` 的
+    `expected_updated_at` 锁定同一字段、同一格式，供 `DiffDocument` 透传给前端做写回
+    乐观锁；默认 `None`。
     """
 
     lineage_id: str | None
@@ -44,6 +49,7 @@ class DocumentSnapshot:
     title: str
     lines: list[str]
     document_id: str | None = None
+    updated_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -68,6 +74,12 @@ class DiffDocument:
     `deleted` 的 `target_document_id`（C1 修复轮次）：草稿内的"删除"是软删除，目标版本里
     那一行仍然存在（`status='archived'`），此时返回该归档行的真实 id，供"恢复"写回定位；
     文档在目标版本内根本没有对应行时才为 `None`。
+
+    `base_updated_at`/`target_updated_at`（乐观锁字段补全轮次新增）分别是
+    `base_document_id`/`target_document_id` 那一行 `updated_at.isoformat()`，与
+    `PUT /knowledge/documents/{id}` 的 `expected_updated_at` 同一格式，供前端"恢复"
+    等写回场景直接取用做乐观锁；对应侧的 document_id 为 `None` 时同样为 `None`。
+    `deleted` 的 `target_updated_at` 与 `target_document_id` 同源，来自草稿内归档行。
     """
 
     lineage_id: str
@@ -77,6 +89,8 @@ class DiffDocument:
     hunks: list[DiffHunk] = field(default_factory=list)
     base_document_id: str | None = None
     target_document_id: str | None = None
+    base_updated_at: str | None = None
+    target_updated_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -227,6 +241,7 @@ def diff_document_sets(
                     title=target_doc.title,
                     kind="added",
                     target_document_id=target_doc.document_id,
+                    target_updated_at=target_doc.updated_at,
                 )
             )
         elif base_doc is not None and target_doc is None:
@@ -237,6 +252,7 @@ def diff_document_sets(
                     title=base_doc.title,
                     kind="deleted",
                     base_document_id=base_doc.document_id,
+                    base_updated_at=base_doc.updated_at,
                 )
             )
         elif base_doc is not None and target_doc is not None:
@@ -255,6 +271,8 @@ def diff_document_sets(
                     hunks=hunks,
                     base_document_id=base_doc.document_id,
                     target_document_id=target_doc.document_id,
+                    base_updated_at=base_doc.updated_at,
+                    target_updated_at=target_doc.updated_at,
                 )
             )
 
@@ -318,6 +336,7 @@ def _load_version_documents(
                 title=row.title or row.filename,
                 lines=_document_text(row).splitlines(),
                 document_id=row.id,
+                updated_at=row.updated_at.isoformat(),
             )
         )
     return snapshots
@@ -325,13 +344,16 @@ def _load_version_documents(
 
 def _archived_document_ids(
     db: Session, *, tenant_id: str, version_id: str
-) -> tuple[dict[str, str], dict[str, str]]:
-    """取该版本内已归档（草稿内已删除）文档的真实行 id，分别按 lineage_id 与 filename 索引。
+) -> tuple[dict[str, tuple[str, str]], dict[str, tuple[str, str]]]:
+    """取该版本内已归档（草稿内已删除）文档的真实行 id 与 `updated_at`，分别按
+    lineage_id 与 filename 索引，值为 `(document_id, updated_at.isoformat())`。
 
     归档行被 `_load_version_documents` 过滤掉，因此对比结果里这篇文档表现为 `deleted`。
     但"恢复"写回必须落到**目标版本内**那一行（base 侧的 id 属于另一个版本），所以这里把
-    它单独取出来回填到 `DiffDocument.target_document_id`。同 key 重复时保留 id 最小的一行，
-    与 `_load_version_documents` 的 `order_by(id)` 口径一致、可复现。
+    它单独取出来回填到 `DiffDocument.target_document_id`/`target_updated_at`（后者供
+    写回时携带乐观锁，与 `PUT /knowledge/documents/{id}` 的 `expected_updated_at` 同一
+    格式）。同 key 重复时保留 id 最小的一行，与 `_load_version_documents` 的
+    `order_by(id)` 口径一致、可复现。
     """
     rows = db.exec(
         select(KnowledgeDocument)
@@ -342,14 +364,15 @@ def _archived_document_ids(
         )
         .order_by(KnowledgeDocument.id)
     ).all()
-    by_lineage: dict[str, str] = {}
-    by_filename: dict[str, str] = {}
+    by_lineage: dict[str, tuple[str, str]] = {}
+    by_filename: dict[str, tuple[str, str]] = {}
     for row in rows:
         lineage = document_lineage_id(row)
+        entry = (row.id, row.updated_at.isoformat())
         if lineage and lineage not in by_lineage:
-            by_lineage[lineage] = row.id
+            by_lineage[lineage] = entry
         if row.filename not in by_filename:
-            by_filename[row.filename] = row.id
+            by_filename[row.filename] = entry
     return by_lineage, by_filename
 
 
@@ -366,8 +389,9 @@ def diff_versions(
     `base_version_id` 为空（例如目标版本没有父版本，或知识库尚未发布过）时视为空文档
     集合，target 中的全部文档都会被判定为 added。
 
-    最后一步回填软删除行的 `target_document_id`：目标版本内确有该文档但已归档时，返回那
-    一行的真实 id，供调用方定位"恢复"写回的目标；文档在目标版本内根本不存在时仍为 None。
+    最后一步回填软删除行的 `target_document_id`/`target_updated_at`：目标版本内确有该
+    文档但已归档时，返回那一行的真实 id 与 `updated_at.isoformat()`，供调用方定位并加锁
+    "恢复"写回的目标；文档在目标版本内根本不存在时两者仍为 None。
     """
     target_docs = _load_version_documents(db, tenant_id=tenant_id, version_id=target_version_id)
     base_docs = (
@@ -390,7 +414,11 @@ def diff_versions(
     lookup = by_lineage if result.pairing == "lineage" else by_filename
     documents = [
         (
-            replace(document, target_document_id=lookup[document.lineage_id])
+            replace(
+                document,
+                target_document_id=lookup[document.lineage_id][0],
+                target_updated_at=lookup[document.lineage_id][1],
+            )
             if document.kind == "deleted"
             and document.target_document_id is None
             and document.lineage_id in lookup

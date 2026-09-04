@@ -309,6 +309,65 @@ def test_diff_document_sets_carries_base_and_target_document_ids() -> None:
     assert by_lineage["L_add"].target_document_id == "doc_target_add"
 
 
+def test_diff_document_sets_carries_base_and_target_updated_at() -> None:
+    """乐观锁字段补全轮次：DiffDocument 携带各侧真实 `updated_at`（缺失一侧为 None），
+    与 `document_id` 同源，格式与 `PUT /knowledge/documents/{id}` 的
+    `expected_updated_at` 一致，供前端写回（尤其"恢复"归档行）时直接原样回传。
+    """
+    base_docs = [
+        DocumentSnapshot(
+            lineage_id="L_mod",
+            filename="mod.md",
+            title="Mod",
+            lines=["a"],
+            document_id="doc_base_mod",
+            updated_at="2026-01-01T00:00:00",
+        ),
+        DocumentSnapshot(
+            lineage_id="L_del",
+            filename="del.md",
+            title="Del",
+            lines=["x"],
+            document_id="doc_base_del",
+            updated_at="2026-01-02T00:00:00",
+        ),
+    ]
+    target_docs = [
+        DocumentSnapshot(
+            lineage_id="L_mod",
+            filename="mod.md",
+            title="Mod",
+            lines=["a2"],
+            document_id="doc_target_mod",
+            updated_at="2026-01-03T00:00:00",
+        ),
+        DocumentSnapshot(
+            lineage_id="L_add",
+            filename="add.md",
+            title="Add",
+            lines=["y"],
+            document_id="doc_target_add",
+            updated_at="2026-01-04T00:00:00",
+        ),
+    ]
+
+    result = diff_document_sets(
+        base_docs,
+        target_docs,
+        base_version_id="kbver_base",
+        target_version_id="kbver_target",
+        max_lines=100,
+    )
+
+    by_lineage = {doc.lineage_id: doc for doc in result.documents}
+    assert by_lineage["L_mod"].base_updated_at == "2026-01-01T00:00:00"
+    assert by_lineage["L_mod"].target_updated_at == "2026-01-03T00:00:00"
+    assert by_lineage["L_del"].base_updated_at == "2026-01-02T00:00:00"
+    assert by_lineage["L_del"].target_updated_at is None
+    assert by_lineage["L_add"].base_updated_at is None
+    assert by_lineage["L_add"].target_updated_at == "2026-01-04T00:00:00"
+
+
 # ---------------------------------------------------------------------------
 # DB 用例：薄加载层 diff_versions 与 against=base|published 解析
 # ---------------------------------------------------------------------------
@@ -507,6 +566,22 @@ def test_diff_versions_loads_texts_and_pairs_by_lineage() -> None:
         deleted_doc = next(doc for doc in result.documents if doc.lineage_id == "L_del")
         assert deleted_doc.base_document_id == "doc_v1_del"
         assert deleted_doc.target_document_id is None
+
+        # 乐观锁字段补全轮次：`updated_at` 与各侧 `document_id` 同源，格式与
+        # `PUT /knowledge/documents/{id}` 的 `expected_updated_at` 一致（`isoformat()`）。
+        row_v1_mod = db.get(KnowledgeDocument, "doc_v1_mod")
+        row_v2_mod = db.get(KnowledgeDocument, "doc_v2_mod")
+        row_v2_add = db.get(KnowledgeDocument, "doc_v2_add")
+        row_v1_del = db.get(KnowledgeDocument, "doc_v1_del")
+        assert modified_doc.base_updated_at == row_v1_mod.updated_at.isoformat()
+        assert modified_doc.target_updated_at == row_v2_mod.updated_at.isoformat()
+        assert added_doc.base_updated_at is None
+        assert added_doc.target_updated_at == row_v2_add.updated_at.isoformat()
+        assert deleted_doc.base_updated_at == row_v1_del.updated_at.isoformat()
+        assert deleted_doc.target_updated_at is None
+
+        # 未变文档（L_same）双侧内容相同，不进入 documents[]；确认新增字段不影响该口径。
+        assert not any(doc.lineage_id == "L_same" for doc in result.documents)
 
 
 def test_diff_versions_with_no_base_version_treats_all_target_docs_as_added() -> None:
@@ -868,4 +943,8 @@ def test_deleted_document_exposes_archived_row_id_in_target_version() -> None:
         )
         assert deleted.target_document_id == target.id
         assert deleted.base_document_id is not None
+        # 乐观锁字段补全轮次：归档行的 `updated_at` 随 `target_document_id` 一并回填，
+        # 供前端"恢复"写回时携带乐观锁（与 `PUT .../documents/{id}` 的
+        # `expected_updated_at` 同一格式）。
+        assert deleted.target_updated_at == target.updated_at.isoformat()
         assert deleted.base_document_id != target.id
