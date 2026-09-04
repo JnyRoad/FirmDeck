@@ -114,6 +114,19 @@ describe('createKnowledgeAdminApi', () => {
     expect([...search.keys()]).toEqual([]);
   });
 
+  // ---- Admin-first single-kb detail (defect1 fix: employee-side GET 404s for admin without agent_id) ----
+  it('getAdminKnowledgeBase: GET knowledge-admin/knowledge-bases/{kb_id} with no agent_id required', async () => {
+    const { createKnowledgeAdminApi } = await loadKnowledgeAdmin();
+    const api = createKnowledgeAdminApi(null, fakeClient as never);
+
+    await api.getAdminKnowledgeBase('kb_1');
+
+    expect(getMock).toHaveBeenCalledTimes(1);
+    const { pathname, search } = parsePath(getMock.mock.calls[0][0]);
+    expect(pathname).toBe('/api/enterprise/knowledge-admin/knowledge-bases/kb_1');
+    expect([...search.keys()]).toEqual([]);
+  });
+
   // ---- A6 ----
   it('A6 listBindableTeams: GET knowledge-admin/teams with exclude_bound_to', async () => {
     const { createKnowledgeAdminApi } = await loadKnowledgeAdmin();

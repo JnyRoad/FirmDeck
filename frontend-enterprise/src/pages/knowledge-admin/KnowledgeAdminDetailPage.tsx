@@ -7,6 +7,11 @@
  * 的「群组与权限」页。私有库详情本身需要归属员工 id/展示名（`kb.metadata.owner_agent_id`
  * + `listAgents()`）驱动内容/分支 Tab 与向导的分支范围调用。
  * 页面不读取 `readEmployeeScope`，也不监听 agent-scope 事件。
+ * `load()` 用 admin-first 的 `getAdminKnowledgeBase(kbId)`（不需要 `agent_id`）作为详情的
+ * 主数据源——员工侧 `getKnowledgeBase` 不带 `agent_id` 只暴露开放广场库，管理员打开共享/
+ * 专用库会 404 卡在 Loading（T077 缺陷 1）。专用库额外用换来的归属员工 id 补一次员工侧
+ * `getKnowledgeBase(kbId, ownerId)`，取 admin 列表项没有的 `bucket_count`/`chunk_count`/
+ * 真实 `branch_*` 字段；该次补拉失败时退回 admin 映射结果，页面仍可渲染。
  */
 
 import { useEffect, useMemo, useState } from 'react';
@@ -25,6 +30,7 @@ import { useAppIntl, type MessageId } from '@/i18n';
 import { createMessageDescriptor } from '@/i18n/descriptors';
 import { RawContent } from '@/i18n/RawContent';
 import type { KnowledgeBaseConversionRead, KnowledgeBaseRead } from '@/types';
+import type { KnowledgeAdminListItem } from '@/types/knowledgeAdmin';
 
 import type { EnterpriseAuthUser } from '../../auth';
 import { BranchTab as PrivateBranchTab } from './private/BranchTab';
@@ -41,6 +47,38 @@ import { VersionsTab } from './shared/VersionsTab';
 function ownerAgentIdOf(kb: KnowledgeBaseRead): string {
   const value = kb.metadata?.owner_agent_id;
   return typeof value === 'string' ? value : '';
+}
+
+/**
+ * 把 admin-first 详情（`KnowledgeAdminListItem`，见 A1 列表项契约）映射成页面/子 Tab
+ * 消费的 `KnowledgeBaseRead` 形状。用于：(1) 共享库——admin 端点即最终数据源，不再
+ * 走员工侧 `getKnowledgeBase`；(2) 专用库——作为员工侧按归属员工重新查询之前/失败时的
+ * 兜底（此时页面仍可渲染，只是 `bucket_count`/`chunk_count` 等 admin 列表项没有的字段
+ * 取不到真实值，退化为 0）。
+ */
+function mapAdminItemToKb(item: KnowledgeAdminListItem, tenantId: string): KnowledgeBaseRead {
+  return {
+    id: item.id,
+    tenant_id: tenantId,
+    name: item.name,
+    description: item.description ?? undefined,
+    capability_scope: item.capability_scope,
+    status: item.status,
+    mode: item.mode,
+    published_version_id: item.published_version_id,
+    published_version: item.published_version,
+    bound_team_count: item.bound_teams.length,
+    version: item.published_version ?? undefined,
+    branch_sync_state: item.branch?.sync_state,
+    branch_base_version: item.branch?.base_version,
+    branch_head_version: item.branch?.head_version,
+    metadata: item.owner_agent ? { owner_agent_id: item.owner_agent.id } : undefined,
+    document_count: item.document_count,
+    bucket_count: 0,
+    chunk_count: 0,
+    created_at: item.updated_at,
+    updated_at: item.updated_at,
+  };
 }
 
 const SHARED_TABS = ['content', 'versions', 'grants', 'audit', 'settings'] as const;
@@ -85,14 +123,19 @@ export default function KnowledgeAdminDetailPage({ currentUser, onLogout }: Know
     if (!context || generation === undefined || !kbId) return;
     setLoading(true);
     try {
-      let result = await api.getKnowledgeBase(kbId);
+      // Admin-first：员工侧 `GET /knowledge-bases/{id}` 不带 `agent_id` 时只暴露"开放广场"
+      // 库，管理员打开共享/专用库详情会 404（`KNOWLEDGE_BASE_VERSION_NOT_VISIBLE`），页面
+      // 卡在 Loading（T077 缺陷 1）。改用 admin 端点作为首次也是共享库唯一一次拉取，
+      // 对共享/专用库都不需要 `agent_id` 即可读取。
+      const adminItem = await api.getAdminKnowledgeBase(kbId);
       if (!context.isCurrentGeneration(generation)) return;
-      if (result.mode === 'dedicated') {
-        // 不带 `agent_id` 的 GET 不会填充 `branch_*` 字段（后端 `_knowledge_branch_meta`
-        // 只在拿到具体 agent 时才查询该员工的分支记录）；私有库详情必须展示分支头/基线/
-        // 同步状态，这里用刚拿到的归属员工 id 重新查询一次换取这三个字段。查询失败时保留
-        // 第一次拿到的 `result`（页面仍可用，只是分支徽章会缺失），不整体判为加载失败。
-        const ownerId = ownerAgentIdOf(result);
+      let result: KnowledgeBaseRead = mapAdminItemToKb(adminItem, context.tenantId);
+      if (adminItem.mode === 'dedicated') {
+        // admin 列表项没有 `bucket_count`/`chunk_count`，且 `branch_*` 由后端在拿到具体
+        // agent 时才查询（`_knowledge_branch_meta`）；私有库详情/转共享向导需要这些真实
+        // 字段，这里用刚拿到的归属员工 id 换取一次员工侧详情。查询失败时保留上面 admin
+        // 映射出的 `result`（页面仍可用，只是这些字段会缺失/退化为 0），不整体判为加载失败。
+        const ownerId = adminItem.owner_agent?.id || '';
         if (ownerId) {
           try {
             const scoped = await api.getKnowledgeBase(kbId, ownerId);

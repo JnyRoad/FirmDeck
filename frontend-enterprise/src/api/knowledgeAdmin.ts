@@ -25,6 +25,7 @@ import type {
   TeamKnowledgeGrantInput,
 } from '@/types';
 import type {
+  KnowledgeAdminListItem,
   KnowledgeAdminListResponse,
   KnowledgeAdminTeamOption,
   KnowledgeAdminVersionRead,
@@ -289,6 +290,18 @@ export function createKnowledgeAdminApi(
         offset: params.offset,
         limit: params.limit,
       }));
+    },
+
+    /**
+     * Admin-first 单个知识库详情：`GET /knowledge-admin/knowledge-bases/{kb_id}`。
+     * 与员工侧既有端点 `getKnowledgeBase` 不同，不需要 `agent_id` 即可读取共享 *和*
+     * 专用知识库（管理员对租户内全部库可见），返回形状与 A1 列表项一致
+     * （`KnowledgeAdminListItem`）。详情页 `load()` 用它替换原先的员工侧首次拉取，
+     * 修复管理员打开共享/专用库详情因缺 `agent_id` 而 404（`KNOWLEDGE_BASE_VERSION_NOT_VISIBLE`）
+     * 卡在 Loading 的缺陷。
+     */
+    getAdminKnowledgeBase(kbId: string): Promise<KnowledgeAdminListItem> {
+      return client.get(`/api/enterprise/knowledge-admin/knowledge-bases/${kbId}`);
     },
 
     /** A6 可绑定群组候选（admin），供"绑定新群组"下拉使用。 */

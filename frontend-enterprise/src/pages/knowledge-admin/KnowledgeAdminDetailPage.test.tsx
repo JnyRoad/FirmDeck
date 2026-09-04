@@ -13,7 +13,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { TooltipProvider } from '@/components/ui/tooltip';
 import { I18nProvider } from '@/i18n';
-import type { KnowledgeAdminVersionRead } from '@/types/knowledgeAdmin';
+import type { KnowledgeAdminListItem, KnowledgeAdminVersionRead } from '@/types/knowledgeAdmin';
 import type { KnowledgeBaseRead } from '@/types';
 
 const tenantContextMock = vi.hoisted(() => {
@@ -49,7 +49,9 @@ vi.mock('../../contexts/TenantSessionContext', () => ({
 }));
 
 const mockApi = vi.hoisted(() => ({
+  getAdminKnowledgeBase: vi.fn(),
   getKnowledgeBase: vi.fn(),
+  listAgents: vi.fn(),
   updateKnowledgeBase: vi.fn(),
   deleteKnowledgeBase: vi.fn(),
   listVersions: vi.fn(),
@@ -130,6 +132,44 @@ const dedicatedKb: KnowledgeBaseRead = {
   updated_at: '2026-08-18T09:00:00Z',
 };
 
+// Admin-first 详情端点（`getAdminKnowledgeBase`）的响应形状——不需要 `agent_id` 即可读取
+// 共享 *和* 专用库，是 load() 现在的主数据源（defect1：员工侧 `getKnowledgeBase` 不带
+// `agent_id` 对管理员来说会 404）。字段与上面的 `sharedKb`/`dedicatedKb` 保持一致，供
+// 断言复用同一批展示文案。
+const sharedAdminItem: KnowledgeAdminListItem = {
+  id: 'kb_shared_1',
+  name: '产品 FAQ 共享库',
+  description: '常见问题',
+  mode: 'shared',
+  status: 'active',
+  capability_scope: 'general',
+  published_version: '1.1.0',
+  published_version_id: 'kbver_1',
+  draft_count: 0,
+  document_count: 4,
+  owner_agent: null,
+  bound_teams: [],
+  branch: null,
+  updated_at: '2026-08-20T10:00:00Z',
+};
+
+const dedicatedAdminItem: KnowledgeAdminListItem = {
+  id: 'kb_dedicated_1',
+  name: '客服话术库',
+  description: '',
+  mode: 'dedicated',
+  status: 'active',
+  capability_scope: 'general',
+  published_version: null,
+  published_version_id: null,
+  draft_count: 0,
+  document_count: 2,
+  owner_agent: null,
+  bound_teams: [],
+  branch: { base_version: '3', head_version: '5', sync_state: 'diverged' },
+  updated_at: '2026-08-18T09:00:00Z',
+};
+
 function versionFixture(overrides: Partial<KnowledgeAdminVersionRead> = {}): KnowledgeAdminVersionRead {
   return {
     id: 'kbver_1',
@@ -170,6 +210,14 @@ function renderDetail(initialEntry: string) {
 }
 
 beforeEach(() => {
+  // load() 现在先打 admin-first 端点；默认按 kbId 路由到对应 fixture，个别测试按需覆盖
+  // （例如 RED 用例要断言员工侧 `getKnowledgeBase` 404 时页面仍能靠这个端点渲染）。
+  mockApi.getAdminKnowledgeBase.mockImplementation((id: string) => {
+    if (id === sharedKb.id) return Promise.resolve(sharedAdminItem);
+    if (id === dedicatedKb.id) return Promise.resolve(dedicatedAdminItem);
+    return Promise.reject(new Error(`unexpected kbId ${id}`));
+  });
+  mockApi.listAgents.mockResolvedValue([]);
   mockApi.listVersions.mockResolvedValue([]);
   mockApi.getVersionDiff.mockResolvedValue({
     base_version_id: null,
@@ -353,7 +401,7 @@ describe('KnowledgeAdminDetailPage', () => {
   });
 
   it('shows the registered error code\'s specific localized text (not the generic fallback) when the detail fails to load', async () => {
-    mockApi.getKnowledgeBase.mockRejectedValue({ code: 'KNOWLEDGE_BASE_NOT_FOUND' });
+    mockApi.getAdminKnowledgeBase.mockRejectedValue({ code: 'KNOWLEDGE_BASE_NOT_FOUND' });
     renderDetail('/enterprise/knowledge-admin/kb_shared_1');
 
     await waitFor(() => expect(sonnerSpies.custom).toHaveBeenCalled());
@@ -361,5 +409,34 @@ describe('KnowledgeAdminDetailPage', () => {
     const { container } = render((renderer as () => ReactElement)());
     expect(container.textContent).toMatch(/未找到请求的资源/);
     expect(container.textContent).not.toMatch(/操作失败，请稍后重试/);
+  });
+
+  // 缺陷回归（T077 缺陷 1）：员工侧 `GET /knowledge-bases/{id}` 不带 `agent_id` 只暴露开放
+  // 广场库，管理员打开共享/专用库的详情页此前会 404（`KNOWLEDGE_BASE_VERSION_NOT_VISIBLE`）
+  // 卡在 Loading。现在 admin-first 端点是主数据源，即便员工侧调用失败页面也要能渲染。
+  it('renders a shared kb even though the employee-side getKnowledgeBase 404s (admin-first fetch)', async () => {
+    mockApi.getKnowledgeBase.mockRejectedValue({ code: 'KNOWLEDGE_BASE_VERSION_NOT_VISIBLE' });
+    mockApi.getAdminKnowledgeBase.mockResolvedValue(sharedAdminItem);
+    renderDetail('/enterprise/knowledge-admin/kb_shared_1');
+
+    await screen.findByText('产品 FAQ 共享库');
+    expect(screen.getByRole('tab', { name: '内容' })).toBeTruthy();
+    // 共享库详情不该再走员工侧端点。
+    expect(mockApi.getKnowledgeBase).not.toHaveBeenCalled();
+  });
+
+  it('renders a dedicated kb even though the owner-scoped getKnowledgeBase 404s (admin-first fetch)', async () => {
+    mockApi.getKnowledgeBase.mockRejectedValue({ code: 'KNOWLEDGE_BASE_VERSION_NOT_VISIBLE' });
+    mockApi.getAdminKnowledgeBase.mockResolvedValue({
+      ...dedicatedAdminItem,
+      owner_agent: { id: 'ag_1', name: '林晓' },
+    });
+    renderDetail('/enterprise/knowledge-admin/kb_dedicated_1');
+
+    await screen.findByText('客服话术库');
+    expect(screen.getByRole('tab', { name: '分支' })).toBeTruthy();
+    // 专用库仍尝试按归属员工补一次员工侧详情（拿 branch/bucket/chunk 真实字段），
+    // 该次调用失败也不应让整页停在 Loading。
+    expect(mockApi.getKnowledgeBase).toHaveBeenCalledWith('kb_dedicated_1', 'ag_1');
   });
 });

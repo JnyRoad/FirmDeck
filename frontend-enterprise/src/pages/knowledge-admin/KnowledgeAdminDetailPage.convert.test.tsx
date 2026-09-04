@@ -14,6 +14,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vite
 
 import { I18nProvider } from '@/i18n';
 import type { KnowledgeBaseRead } from '@/types';
+import type { KnowledgeAdminListItem } from '@/types/knowledgeAdmin';
 
 const tenantContextMock = vi.hoisted(() => {
   const controller = new AbortController();
@@ -48,6 +49,7 @@ vi.mock('../../contexts/TenantSessionContext', () => ({
 }));
 
 const mockApi = vi.hoisted(() => ({
+  getAdminKnowledgeBase: vi.fn(),
   getKnowledgeBase: vi.fn(),
   listAgents: vi.fn(),
   listVersions: vi.fn(),
@@ -80,6 +82,32 @@ const privateKb: KnowledgeBaseRead = {
 };
 
 const archivedPrivateKb: KnowledgeBaseRead = { ...privateKb, id: 'kb_dedicated_archived', status: 'archived' };
+
+// Admin-first 详情端点响应；load() 用它换出归属员工 id，再用 `getKnowledgeBase(kbId, ownerId)`
+// 补一次员工侧详情（拿真实 branch/bucket/chunk 字段），下面沿用既有的 `privateKb`/`archivedPrivateKb`
+// mock 作为那次补拉的返回值。
+const privateAdminItem: KnowledgeAdminListItem = {
+  id: 'kb_dedicated_1',
+  name: '林晓的私有库',
+  description: '',
+  mode: 'dedicated',
+  status: 'active',
+  capability_scope: 'general',
+  published_version: null,
+  published_version_id: null,
+  draft_count: 0,
+  document_count: 2,
+  owner_agent: { id: 'ag_1', name: '林晓' },
+  bound_teams: [],
+  branch: { base_version: '2', head_version: '3', sync_state: 'synced' },
+  updated_at: '2026-08-18T09:00:00Z',
+};
+
+const archivedPrivateAdminItem: KnowledgeAdminListItem = {
+  ...privateAdminItem,
+  id: 'kb_dedicated_archived',
+  status: 'archived',
+};
 
 const sourceVersions = [
   {
@@ -176,6 +204,7 @@ afterEach(() => {
 
 describe('KnowledgeAdminDetailPage conversion entry', () => {
   it('shows the "convert to shared" button on a dedicated kb header', async () => {
+    mockApi.getAdminKnowledgeBase.mockResolvedValue(privateAdminItem);
     mockApi.getKnowledgeBase.mockResolvedValue(privateKb);
     renderDetail('/enterprise/knowledge-admin/kb_dedicated_1');
 
@@ -184,6 +213,7 @@ describe('KnowledgeAdminDetailPage conversion entry', () => {
   });
 
   it('disables the conversion entry when the private kb is archived', async () => {
+    mockApi.getAdminKnowledgeBase.mockResolvedValue(archivedPrivateAdminItem);
     mockApi.getKnowledgeBase.mockResolvedValue(archivedPrivateKb);
     renderDetail('/enterprise/knowledge-admin/kb_dedicated_archived');
 
@@ -193,6 +223,7 @@ describe('KnowledgeAdminDetailPage conversion entry', () => {
 
   it('completes a conversion and navigates to the new shared kb\'s grants tab', async () => {
     const user = userEvent.setup();
+    mockApi.getAdminKnowledgeBase.mockResolvedValue(privateAdminItem);
     mockApi.getKnowledgeBase.mockResolvedValue(privateKb);
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
