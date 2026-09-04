@@ -198,7 +198,7 @@
 - [X] T074 [P] 运行 `npm --prefix frontend-enterprise run i18n:check` 并补齐/修正 en-US 与 zh-CN 缺键、ICU 参数不一致
 - [X] T075 [P] 运行 `backend/.venv/bin/ruff check backend`、`backend/.venv/bin/python -m pytest backend/tests`、`backend/.venv/bin/python scripts/i18n/check_python.py`，修复失败
 - [X] T076 [P] 运行 `npm --prefix frontend-enterprise test` 与 `npm --prefix frontend-enterprise run build`，修复失败；确认 frontend-enterprise/src/pages/KnowledgePage.test.tsx 等既有员工侧知识库测试全部通过（FR-003）
-- [ ] T077 按 quickstart.md S1–S5 在 `zh-CN` 与 `en-US` 各做一遍真实浏览器验收（含中文输入法、跨行选区、粘贴），记录结果与截图到 PR；未能运行的项标 `UNVERIFIED`
+- [X] T077 按 quickstart.md S1–S5 在 `zh-CN` 与 `en-US` 各做一遍真实浏览器验收（含中文输入法、跨行选区、粘贴），记录结果与截图到 PR；未能运行的项标 `UNVERIFIED`
 - [X] T078 [P] 校对 specs/001-knowledge-base-admin/{spec,plan,contracts}/ 与实现的偏差，先改 artifact 再改代码；更新本文件 Notes 中的外部依赖结论
 - [X] T079 [P] 性能验证（SC-007）：在 backend/tests/test_knowledge_admin_perf.py 用 200 个知识库 fixture 断言列表端点 p95 ≤ 2s、2000 行文档 diff 端点 ≤ 1s；在 frontend-enterprise/src/pages/knowledge-admin/review/ReviewEditor.perf.test.tsx 断言 2000 行文档单次按键重绘 ≤ 50ms；结果写入 PR，未达标视为阻塞
 - [X] T080 [P] [测试] 【P0 发布阻塞：US2-b 写回依赖真实文档 id】在 backend/tests/test_knowledge_version_documents.py 编写失败测试：`GET /api/enterprise/knowledge-admin/knowledge-bases/{kb_id}/versions/{version_id}/documents` 返回该版本全部文档（id、lineage_id、title、filename、status、bucket_count、updated_at，含未改动文档），admin 或 history viewer 可访问，非法版本 404/403；diff 响应的每篇文档增加 `base_document_id` / `target_document_id`
