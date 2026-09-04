@@ -7,7 +7,7 @@
  * 字符级 LCS 高亮与转义后的 HTML 片段拼装（纯字符串操作，不接触真实
  * DOM）；restorePos 计算未配对删除行插回工作区 `lines` 的位置。
  */
-import { diffLines, type LineDiffOp } from './lineDiff';
+import { diffLines, lcsLength, type LineDiffOp } from './lineDiff';
 
 /** 渲染行：`=` 上下文/未改动、`-` 删除（来自 base）、`+` 新增（来自 current）。 */
 export type Row =
@@ -98,24 +98,8 @@ export function similarityRatio(a: string, b: string): number {
   if (a.length === 0 && b.length === 0) return 1;
   const aChars = Array.from(a);
   const bChars = Array.from(b);
-  const lcs = charLcsLength(aChars, bChars);
+  const lcs = lcsLength(aChars, bChars);
   return (2 * lcs) / (aChars.length + bChars.length);
-}
-
-/** 字符数组的 LCS 长度（自底向上滚动数组实现，无副作用）。 */
-function charLcsLength(a: string[], b: string[]): number {
-  const n = a.length;
-  const m = b.length;
-  if (n === 0 || m === 0) return 0;
-  let prev = new Array<number>(m + 1).fill(0);
-  for (let i = n - 1; i >= 0; i--) {
-    const cur = new Array<number>(m + 1).fill(0);
-    for (let j = m - 1; j >= 0; j--) {
-      cur[j] = a[i] === b[j] ? prev[j + 1] + 1 : Math.max(prev[j], cur[j + 1]);
-    }
-    prev = cur;
-  }
-  return prev[0];
 }
 
 /**
@@ -239,8 +223,20 @@ function escapeHtml(text: string): string {
 }
 
 /**
+ * 己方类型游程的高亮样式：直接用 Tailwind 工具类内联，不依赖全仓库任何自定义
+ * CSS 类名（`diff-char-del`/`diff-char-add` 不是 Tailwind 工具类，本身没有样式，
+ * 之前会导致字符级高亮在页面上不可见）。红/绿字符块比行级红/绿底色更深一档，
+ * 形成"整行浅色 + 变化字符再加深"的层次。
+ */
+const CHAR_HIGHLIGHT_CLASS: Record<'-' | '+', string> = {
+  '-': 'bg-red-200/70 rounded-sm',
+  '+': 'bg-emerald-200/70 rounded-sm',
+};
+
+/**
  * 把字符级 diff 游程渲染为一侧（删除侧 `-` 或新增侧 `+`）的 HTML 片段：
- * 相同游程原样转义输出，己方类型游程包一层高亮 span，对方类型游程整体跳过。
+ * 相同游程原样转义输出，己方类型游程包一层 Tailwind 高亮 span，对方类型游程
+ * 整体跳过。
  * 输入：CharOp 数组、渲染侧；输出：HTML 字符串，无副作用、不接触真实 DOM。
  */
 export function innerHtml(ops: CharOp[], side: '-' | '+'): string {
@@ -249,8 +245,7 @@ export function innerHtml(ops: CharOp[], side: '-' | '+'): string {
     if (op.type === '=') {
       html += escapeHtml(op.text);
     } else if (op.type === side) {
-      const cls = side === '-' ? 'diff-char-del' : 'diff-char-add';
-      html += `<span class="${cls}">${escapeHtml(op.text)}</span>`;
+      html += `<span class="${CHAR_HIGHLIGHT_CLASS[side]}">${escapeHtml(op.text)}</span>`;
     }
   }
   return html;

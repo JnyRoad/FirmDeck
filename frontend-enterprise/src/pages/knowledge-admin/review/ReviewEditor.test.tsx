@@ -22,6 +22,8 @@ const labels: ReviewEditorLabels = {
   acceptButton: '接受',
   unacceptButton: '撤销接受',
   rejectButton: '拒绝',
+  acceptAllButton: '接受全部',
+  rejectAllButton: '拒绝全部',
   resetButton: '重置',
   restoreLineAria: '恢复此行原文',
   deleteLineAria: '删除此新增行',
@@ -197,30 +199,43 @@ describe('ReviewEditor — IME composition does not redraw mid-composition', () 
 });
 
 describe('ReviewEditor — accepting a hunk folds it to a staged (✓) row', () => {
-  it('accept collapses the block to a plain row with no red/green and increments stagedCount', () => {
-    const { container, getAllByText, onChange } = renderEditor([
-      { lineageId: 'd1', title: 'doc1.md', kind: 'modified', base: 'a\nb\nc', current: 'a\nX\nc' },
+  it('renders visible Tailwind char-highlight spans for a paired change before accept, and removes them after', () => {
+    const { container, getByText, onChange } = renderEditor([
+      {
+        lineageId: 'd1',
+        title: 'doc1.md',
+        kind: 'modified',
+        base: 'the quick brown fox',
+        current: 'the quick brown fax',
+      },
     ]);
     expect(lastOutput(onChange).pendingCount).toBe(1);
-    // index 0 is the per-document "accept all" header button; index 1 is the
-    // per-hunk toolbar accept button rendered right above the change block.
-    const acceptButton = getAllByText(labels.acceptButton)[1];
+    // The paired red/green lines are similar enough to be char-aligned, so the
+    // char-level highlight spans (Tailwind bg-red-200/70 / bg-emerald-200/70,
+    // not the old unstyled diff-char-* classes) should already be present.
+    expect(container.querySelector('span[class*="bg-red-200"]')).not.toBeNull();
+    expect(container.querySelector('span[class*="bg-emerald-200"]')).not.toBeNull();
+    // The document header now says acceptAllButton ("接受全部"), which no
+    // longer collides with the per-hunk toolbar's acceptButton ("接受"), so
+    // this is unambiguous.
+    const acceptButton = getByText(labels.acceptButton);
     act(() => {
       fireEvent.click(acceptButton);
     });
     const out = lastOutput(onChange);
     expect(out.pendingCount).toBe(0);
     expect(out.stagedCount).toBe(1);
-    expect(container.querySelectorAll('.diff-char-del, .diff-char-add').length).toBe(0);
+    expect(container.querySelector('span[class*="bg-red-200"]')).toBeNull();
+    expect(container.querySelector('span[class*="bg-emerald-200"]')).toBeNull();
     expect(container.textContent).toContain(labels.unacceptButton);
   });
 
   it('unaccept (undo accept) restores the block to a pending change', () => {
-    const { getAllByText, getByText, onChange } = renderEditor([
+    const { getByText, onChange } = renderEditor([
       { lineageId: 'd1', title: 'doc1.md', kind: 'modified', base: 'a\nb\nc', current: 'a\nX\nc' },
     ]);
     act(() => {
-      fireEvent.click(getAllByText(labels.acceptButton)[1]);
+      fireEvent.click(getByText(labels.acceptButton));
     });
     expect(lastOutput(onChange).stagedCount).toBe(1);
     act(() => {
@@ -337,7 +352,7 @@ describe('ReviewEditor — whole-document reject/restore', () => {
 
 describe('ReviewEditor — header counts and hasWork', () => {
   it('reports pendingCount/stagedCount/hasWork across documents and updates as they change', () => {
-    const { getAllByText, onChange } = renderEditor([
+    const { getByText, onChange } = renderEditor([
       { lineageId: 'd1', title: 'doc1.md', kind: 'modified', base: 'a\nb', current: 'a\nX' },
       { lineageId: 'd2', title: 'doc2.md', kind: 'modified', base: 'p\nq', current: 'p\nq' },
     ]);
@@ -348,9 +363,11 @@ describe('ReviewEditor — header counts and hasWork', () => {
     // tracks session activity (staged or hand-edited), not the mere existence
     // of a pre-existing pending hunk between base and the draft's current text.
     expect(out.hasWork).toBe(false);
-    const acceptButtons = getAllByText(labels.acceptButton);
+    // Only doc1 has a pending hunk, so its toolbar accept button ("接受") is
+    // the sole match now that the document-level "接受全部" uses a distinct label.
+    const acceptButton = getByText(labels.acceptButton);
     act(() => {
-      fireEvent.click(acceptButtons[0]);
+      fireEvent.click(acceptButton);
     });
     out = lastOutput(onChange);
     expect(out.pendingCount).toBe(0);
@@ -366,5 +383,18 @@ describe('ReviewEditor — header counts and hasWork', () => {
     expect(out.pendingCount).toBe(0);
     expect(out.stagedCount).toBe(0);
     expect(out.hasWork).toBe(false);
+  });
+});
+
+describe('ReviewEditor — document kind badges', () => {
+  it('renders the addedDocBadge/modifiedDocBadge/deletedDocBadge label next to each document title', () => {
+    const { getByText } = renderEditor([
+      { lineageId: 'd1', title: 'new.md', kind: 'added', base: '', current: 'brand new content' },
+      { lineageId: 'd2', title: 'doc1.md', kind: 'modified', base: 'a\nb', current: 'a\nX' },
+      { lineageId: 'd3', title: 'gone.md', kind: 'deleted', base: 'old content here', current: '' },
+    ]);
+    expect(getByText(labels.addedDocBadge)).not.toBeNull();
+    expect(getByText(labels.modifiedDocBadge)).not.toBeNull();
+    expect(getByText(labels.deletedDocBadge)).not.toBeNull();
   });
 });

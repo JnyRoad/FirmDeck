@@ -187,22 +187,27 @@ describe('charOps', () => {
 });
 
 describe('innerHtml', () => {
-  it('renders the delete side with del spans and drops insert-only runs', () => {
+  it('renders the delete side wrapping the changed run in a visible Tailwind highlight class, dropping insert-only runs', () => {
     const ops = charOps('the fox jumps', 'the cat jumps');
     const html = innerHtml(ops, '-');
-    expect(html).toBe('the <span class="diff-char-del">fox</span> jumps');
+    expect(html).toBe('the <span class="bg-red-200/70 rounded-sm">fox</span> jumps');
+    // Guard against the regression this fixes: the wrapping span must carry an
+    // actual Tailwind utility class, not a bespoke class name with no CSS
+    // definition anywhere in the repo (which rendered invisibly).
+    expect(html).toMatch(/class="[^"]*bg-red-200\/70[^"]*"/);
   });
 
-  it('renders the add side with add spans and drops delete-only runs', () => {
+  it('renders the add side wrapping the changed run in a visible Tailwind highlight class, dropping delete-only runs', () => {
     const ops = charOps('the fox jumps', 'the cat jumps');
     const html = innerHtml(ops, '+');
-    expect(html).toBe('the <span class="diff-char-add">cat</span> jumps');
+    expect(html).toBe('the <span class="bg-emerald-200/70 rounded-sm">cat</span> jumps');
+    expect(html).toMatch(/class="[^"]*bg-emerald-200\/70[^"]*"/);
   });
 
   it('escapes HTML-sensitive characters in the rendered text', () => {
     const ops = charOps('<a> & b', '<a> & c');
-    expect(innerHtml(ops, '-')).toContain('&lt;a&gt; &amp; <span class="diff-char-del">b</span>');
-    expect(innerHtml(ops, '+')).toContain('&lt;a&gt; &amp; <span class="diff-char-add">c</span>');
+    expect(innerHtml(ops, '-')).toContain('&lt;a&gt; &amp; <span class="bg-red-200/70 rounded-sm">b</span>');
+    expect(innerHtml(ops, '+')).toContain('&lt;a&gt; &amp; <span class="bg-emerald-200/70 rounded-sm">c</span>');
   });
 });
 

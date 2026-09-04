@@ -72,9 +72,15 @@ export interface ReviewEditorLabels {
   pendingLabel: string;
   stagedLabel: string;
   allReviewedLabel: string;
+  /** 单个变更块工具条上的「接受」（区别于文档级的 acceptAllButton）。 */
   acceptButton: string;
   unacceptButton: string;
+  /** 单个变更块工具条上的「拒绝」（区别于文档级的 rejectAllButton）。 */
   rejectButton: string;
+  /** 文档头部的「接受全部」（作用于该篇文档全部待审阅块）。 */
+  acceptAllButton: string;
+  /** 文档头部的「拒绝全部」（作用于该篇文档全部待审阅块）。 */
+  rejectAllButton: string;
   resetButton: string;
   restoreLineAria: string;
   deleteLineAria: string;
@@ -237,6 +243,21 @@ export function ReviewEditor({ documents, onChange, labels }: ReviewEditorProps)
 /** 转义为纯文本 HTML 片段（复用 hunkModel.innerHtml 的转义逻辑，避免重复实现）。 */
 function plainHtml(text: string): string {
   return innerHtml([{ type: '=', text }], '-');
+}
+
+const DOC_KIND_BADGE_CLASS: Record<ReviewEditorDocumentInput['kind'], string> = {
+  added: 'bg-amber-100 text-amber-800',
+  modified: 'bg-blue-100 text-blue-700',
+  deleted: 'bg-red-100 text-red-700',
+};
+
+/** 文档种类小徽章（草稿新增/草稿修改/草稿删除），文案经 labels 注入，颜色语义固定。 */
+function DocKindBadge({ kind, labels }: { kind: ReviewEditorDocumentInput['kind']; labels: ReviewEditorLabels }) {
+  const text =
+    kind === 'added' ? labels.addedDocBadge : kind === 'deleted' ? labels.deletedDocBadge : labels.modifiedDocBadge;
+  return (
+    <span className={cn('rounded-full px-2 py-0.5 text-xs font-medium', DOC_KIND_BADGE_CLASS[kind])}>{text}</span>
+  );
 }
 
 interface ModifiedDocumentEditorProps {
@@ -448,13 +469,16 @@ function ModifiedDocumentEditor({ doc, state, labels, onStagingChange }: Modifie
   return (
     <div className="rounded-2xl border border-border/70 bg-white">
       <div className="flex items-center justify-between border-b px-4 py-2 text-sm">
-        <span className="font-medium">{doc.title}</span>
+        <span className="flex items-center gap-2">
+          <span className="font-medium">{doc.title}</span>
+          <DocKindBadge kind={doc.kind} labels={labels} />
+        </span>
         <div className="flex flex-wrap gap-2">
           <Button type="button" size="xs" variant="outline" onClick={() => onStagingChange((s) => acceptAll(s, hunks))}>
-            {labels.acceptButton}
+            {labels.acceptAllButton}
           </Button>
           <Button type="button" size="xs" variant="ghost" onClick={() => onStagingChange((s) => rejectAll(s, hunks))}>
-            {labels.rejectButton}
+            {labels.rejectAllButton}
           </Button>
           <Button type="button" size="xs" variant="ghost" onClick={() => onStagingChange((s) => reset(s))}>
             {labels.resetButton}
@@ -605,7 +629,10 @@ function WholeDocumentPanel({ doc, state, restore, labels, onToggleRestore }: Wh
   return (
     <div className="rounded-2xl border border-border/70 bg-white">
       <div className="flex items-center justify-between border-b px-4 py-2 text-sm">
-        <span className="font-medium">{doc.title}</span>
+        <span className="flex items-center gap-2">
+          <span className="font-medium">{doc.title}</span>
+          <DocKindBadge kind={doc.kind} labels={labels} />
+        </span>
         <Button type="button" size="xs" variant="outline" aria-pressed={restore} onClick={onToggleRestore}>
           {buttonLabel}
         </Button>
