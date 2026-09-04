@@ -53,6 +53,16 @@ const mockApi = vi.hoisted(() => ({
   updateKnowledgeBase: vi.fn(),
   deleteKnowledgeBase: vi.fn(),
   listVersions: vi.fn(),
+  getVersionDiff: vi.fn(),
+  uploadDocument: vi.fn(),
+  updateDocument: vi.fn(),
+  archiveDocument: vi.fn(),
+  createDraft: vi.fn(),
+  publishDraft: vi.fn(),
+  rejectDraft: vi.fn(),
+  rollbackVersion: vi.fn(),
+  recordReview: vi.fn(),
+  listAuditEvents: vi.fn(),
 }));
 
 vi.mock('../../api/knowledgeAdmin', () => ({
@@ -150,6 +160,14 @@ function renderDetail(initialEntry: string) {
 
 beforeEach(() => {
   mockApi.listVersions.mockResolvedValue([]);
+  mockApi.getVersionDiff.mockResolvedValue({
+    base_version_id: null,
+    target_version_id: 'kbver_1',
+    pairing: 'lineage',
+    summary: { added: 0, modified: 0, deleted: 0 },
+    documents: [],
+  });
+  mockApi.listAuditEvents.mockResolvedValue({ items: [], total: 0, offset: 0, limit: 20, has_more: false });
 });
 
 afterEach(() => {
@@ -214,9 +232,9 @@ describe('KnowledgeAdminDetailPage', () => {
     expect((await screen.findByTestId('location')).textContent).toBe('/enterprise/knowledge-admin');
   });
 
-  it('shows placeholder content for tabs other than settings', async () => {
+  it('shows placeholder content for tabs not yet implemented (grants)', async () => {
     mockApi.getKnowledgeBase.mockResolvedValue(sharedKb);
-    renderDetail('/enterprise/knowledge-admin/kb_shared_1?tab=versions');
+    renderDetail('/enterprise/knowledge-admin/kb_shared_1?tab=grants');
 
     expect(await screen.findByText('该 Tab 暂未实现。')).toBeTruthy();
   });

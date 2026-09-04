@@ -22,9 +22,12 @@ import { RawContent } from '@/i18n/RawContent';
 import type { KnowledgeBaseRead } from '@/types';
 
 import type { EnterpriseAuthUser } from '../../auth';
+import { AuditTab } from './shared/AuditTab';
+import { ContentTab } from './shared/ContentTab';
 import { knowledgeAdminErrorMessage } from './shared/errorMessage';
 import { PlaceholderTab } from './shared/PlaceholderTab';
 import { SettingsTab } from './shared/SettingsTab';
+import { VersionsTab } from './shared/VersionsTab';
 
 const SHARED_TABS = ['content', 'versions', 'grants', 'audit', 'settings'] as const;
 const DEDICATED_TABS = ['content', 'branch', 'settings'] as const;
@@ -185,6 +188,12 @@ export default function KnowledgeAdminDetailPage({ currentUser, onLogout }: Know
                     onUpdated={handleUpdated}
                     onDeleted={handleDeleted}
                   />
+                ) : tabKey === 'content' && kb.mode === 'shared' ? (
+                  <ContentTab api={api} kb={kb} onChanged={() => void load()} />
+                ) : tabKey === 'versions' ? (
+                  <VersionsTab api={api} kb={kb} onChanged={() => void load()} />
+                ) : tabKey === 'audit' ? (
+                  <AuditTab api={api} kb={kb} />
                 ) : (
                   <PlaceholderTab />
                 )}
