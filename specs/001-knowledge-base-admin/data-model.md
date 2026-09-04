@@ -9,8 +9,14 @@
 |---|---|
 | `mode` | `shared` / `dedicated` |
 | `published_version_id` | 共享库唯一正式指针（读取侧只读它） |
-| `status` | `active`（上线）/ `archived`（下线） |
-| `metadata_json.owner_agent_id` | 私有库归属员工（列表用于"归属"列与过滤；P1 评估提升为列） |
+| `status` | `active`（上线）/ `archived`（下线）。**对外状态不直接读这一列**：见下方"对外状态的单一派生口径" |
+| `metadata_json.owner_agent_id` | 私有库归属员工（列表用于"归属"列与过滤；P1 评估提升为列）。**"发布到广场为模板"（`promote-to-overall`）必须保留这一键**——那次操作只是把分支内容额外发布为广场模板版本，知识库行本身仍归属该员工；抹掉后 A1/A1b 的 `owner_agent`/`branch` 变空、回滚请求带空 `agent_id` 而 404（T077 缺陷 C） |
+
+**对外状态的单一派生口径**：`listing.effective_knowledge_base_status(base_status, branch_status)` 是唯一定义，
+A1/A1b（`listing._fetch_listed_items`）与员工侧详情（`api.knowledge_bases.knowledge_base_read`）共用。规则：
+`KnowledgeBase.status` 与归属员工分支（`AgentKnowledgeBranch`，`status='deleted'` 的不参与）**任一侧不在用即
+`archived`**，两侧都 `active` 才是 `active`。理由：转换为共享库与"下线专用库"只改分支行、不动知识库行，只读
+`KnowledgeBase.status` 会让列表报 `active` 而详情页报"已下线"（T077 缺陷 D）。
 
 ## 2. KnowledgeBaseVersion（`knowledge_base_versions`，语义扩展）
 
@@ -60,6 +66,7 @@
 |---|---|
 | `knowledge_base_version_id` | 共享库写入必须指向 `draft` 版本 |
 | `metadata_json.lineage_id` | 跨版本文档身份：克隆时继承，首次出现时 = 源文档 id；对比与变基按它配对 |
+| `metadata_json.raw_text` | 文档正文的**唯一权威存放位置**，上传入库（`service._run_ingest_job`）与在线编辑（`PUT /knowledge/documents/{id}` → `_write_document_content`）写同一个键、同一套 `_normalize_text` 归一化。A2 对比与变基三路合并只读它（`diff._document_text`）；缺失时按 `content` → `section_tree` 重建（历史数据兜底，与前端 `documentSourceMarkdown` 同序），三路都取不到才视为空正文 |
 | `status` | 复用现有；草稿内"删除"= 该草稿版本内的文档 `status='archived'`（行保留，正式版对应文档不受影响） |
 
 **草稿覆盖层（前端概念，服务端由版本级文档集合表达）**：草稿版本拥有自己的完整文档集合；相对基线的

@@ -119,6 +119,28 @@ def active_document_status_filter() -> Any:
     return KnowledgeDocument.status != "archived"
 
 
+def effective_knowledge_base_status(base_status: str, branch_status: str | None) -> str:
+    """知识库对外状态的唯一口径：知识库行与归属员工分支都在用才算 `active`。
+
+    `base_status` 是 `KnowledgeBase.status`，`branch_status` 是该库归属员工分支的
+    `AgentKnowledgeBranch.status`（无分支、或分支已 `deleted` 被调用方过滤掉时传 `None`）。
+    返回值只有 `"active"` / `"archived"` 两种，与 `KnowledgeAdminListItem.status` 和
+    `KnowledgeBaseRead.status` 的字面量约束一致。
+
+    任一侧不在用就降级为 `archived`：一是"转换为共享知识库"（`conversion.py`）与"下线专用
+    库"只把分支行改成 `archived` / `inactive`、不动知识库行，只看 `KnowledgeBase.status`
+    会让 A1 列表继续报 `active`，与详情页的"已下线"矛盾（T077 缺陷 D）；二是知识库行本身
+    已归档时，一条仍是 `active` 的分支不应把它重新报成在用。本函数是该派生规则的唯一定义，
+    供 A1/A1b（`_fetch_listed_items`）与员工侧详情投影
+    （`app.api.knowledge_bases.knowledge_base_read`）共用。
+    """
+    if base_status != "active":
+        return "archived"
+    if branch_status and branch_status != "active":
+        return "archived"
+    return "active"
+
+
 def _fetch_listed_items(
     db: Session, *, tenant_id: str, bases: list[KnowledgeBase]
 ) -> list[ListedKnowledgeBase]:
@@ -143,23 +165,40 @@ def _fetch_listed_items(
     }
 
     # 专用库：owner 分支（一次分组查询取全部候选分支，再按 (kb_id, agent_id) 精确匹配）。
+    # 取 `status != 'deleted'` 的全部分支，拆成两个用途不同的映射：
+    # - `owner_branch_status_by_base` 只驱动对外状态派生（`effective_knowledge_base_status`），
+    #   必须看到 archived/inactive 分支，否则"转换为共享后源库仍显示已上线"（T077 缺陷 D）。
+    # - `owner_branch_by_base` 只收 active 分支，驱动 branch 明细与 document_count；陈旧分支
+    #   的 base/head/sync_state 与旧头版本文档数不应展示（既有约定，见
+    #   `test_archived_and_deleted_owner_branches_are_excluded`）。
+    # `deleted` 分支两处都不参与，与员工侧 `_knowledge_branch_meta` 的过滤口径一致。
     owner_branch_by_base: dict[str, AgentKnowledgeBranch] = {}
+    owner_branch_status_by_base: dict[str, str] = {}
     if dedicated_bases:
         dedicated_ids = [base.id for base in dedicated_bases]
         branch_rows = db.exec(
             select(AgentKnowledgeBranch).where(
                 AgentKnowledgeBranch.tenant_id == tenant_id,
                 AgentKnowledgeBranch.knowledge_base_id.in_(dedicated_ids),
-                AgentKnowledgeBranch.status == "active",
+                AgentKnowledgeBranch.status != "deleted",
             )
         ).all()
-        branch_by_key = {(row.knowledge_base_id, row.agent_id): row for row in branch_rows}
+        branch_by_key: dict[tuple[str, str], AgentKnowledgeBranch] = {}
+        for row in branch_rows:
+            key = (row.knowledge_base_id, row.agent_id)
+            # 同一 (库, 员工) 出现多行时以 active 的那行为准，结果不随查询顺序漂移。
+            existing = branch_by_key.get(key)
+            if existing is None or (existing.status != "active" and row.status == "active"):
+                branch_by_key[key] = row
         for base in dedicated_bases:
             owner_id = _owner_agent_id(base)
             if owner_id is None:
                 continue
             branch = branch_by_key.get((base.id, owner_id))
-            if branch is not None:
+            if branch is None:
+                continue
+            owner_branch_status_by_base[base.id] = branch.status
+            if branch.status == "active":
                 owner_branch_by_base[base.id] = branch
 
     # 专用库头版本 id 解析：(knowledge_base_id, version 标签) → 版本行 id。
@@ -302,7 +341,9 @@ def _fetch_listed_items(
                 name=base.name,
                 description=base.description,
                 mode=base.mode,
-                status=base.status,
+                status=effective_knowledge_base_status(
+                    base.status, owner_branch_status_by_base.get(base.id)
+                ),
                 capability_scope=normalize_capability_scope(base.capability_scope),
                 published_version=published_version,
                 published_version_id=published_version_id,

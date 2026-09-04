@@ -57,6 +57,7 @@ from app.knowledge.conversion import (
     KnowledgeConversionService,
 )
 from app.knowledge.errors import KNOWLEDGE_MODE_INVALID, KnowledgeError, knowledge_error
+from app.knowledge.listing import effective_knowledge_base_status
 from app.knowledge.management import (
     require_shared_knowledge_history_viewer,
     require_team_knowledge_manager,
@@ -1437,16 +1438,15 @@ def knowledge_base_read(
     branch_meta: dict[str, str] | None = None,
     management_context: dict[str, object] | None = None,
 ) -> KnowledgeBaseRead:
-    """统一投影专用分支和共享正式指针，同时保持旧字段兼容。"""
-    branch_status = (branch_meta or {}).get("status")
-    if branch_status == "inactive":
-        effective_status = "archived"
-    elif branch_status == "active":
-        effective_status = "active"
-    elif branch_status:
-        effective_status = branch_status
-    else:
-        effective_status = row.status
+    """统一投影专用分支和共享正式指针，同时保持旧字段兼容。
+
+    对外状态用 `effective_knowledge_base_status` 派生，与 A1/A1b 列表
+    （`app.knowledge.listing._fetch_listed_items`）共用同一份规则，避免两处各自实现导致
+    同一个库在列表里是"已上线"、在详情页是"已下线"（T077 缺陷 D）。
+    """
+    effective_status = effective_knowledge_base_status(
+        row.status, (branch_meta or {}).get("status")
+    )
     return KnowledgeBaseRead(
         id=row.id,
         tenant_id=row.tenant_id,

@@ -34,6 +34,10 @@ Response `200`:
   "total": 6, "offset": 0, "limit": 20, "has_more": false
 }
 ```
+`status` 不是 `KnowledgeBase.status` 的原样透传：按 data-model §1 的"对外状态的单一派生口径"，
+知识库行与归属员工分支任一侧不在用即 `archived`。因此转换为共享库、下线专用库之后，A1 与 A1b
+和详情页三处一致地报 `archived`（T077 缺陷 D）。`status` 过滤参数作用在派生后的值上。
+
 Errors: `FORBIDDEN`（非 admin）。
 
 ### A1b `GET /knowledge-admin/knowledge-bases/{kb_id}` — 单库详情（admin-first） **admin**
@@ -61,6 +65,7 @@ Response `200`: 见 data-model §4（`VersionDiff`）。超过 `max_lines` 的�
 `kind="deleted"` 时的 `target_document_id`：草稿内删除是软删除，目标版本里那一行仍在（`status='archived'`），返回其真实行 id 供"恢复"写回定位；只有目标版本内确实没有对应行时才为 `null`。
 每篇文档同时新增 `base_updated_at` / `target_updated_at`（乐观锁字段补全轮次）：分别是 `base_document_id` / `target_document_id` 那一行 `updated_at.isoformat()`，与 `PUT /knowledge/documents/{id}` 的 `expected_updated_at` 完全同一格式，对应侧 document_id 为 `null` 时同样为 `null`；供前端写回（尤其"恢复"归档行——该行被 A2b 隐藏，前端拿不到它的 `updated_at`）时原样回传做乐观锁，不必再发额外请求获取该行的 `updated_at`。`kind="deleted"` 的 `target_updated_at` 与 `target_document_id` 同源，来自草稿内归档行。
 `status='archived'` 的文档按 data-model §3 表示"该版本内已删除"，base/target 两侧一律视为**不存在**：草稿里归档一篇文档 → `kind="deleted"` 且计入 `summary.deleted`；草稿里恢复一篇基线中已归档的文档 → `kind="added"`。
+逐篇正文取 `metadata_json.raw_text`（data-model §3）：上传入库与在线编辑写同一个键，因此"只上传过、从未编辑过"的文档同样有真实基线，首次编辑得到的是带红/绿双侧的 `modified`，而不是整篇 `added`（T077 缺陷 A）。历史数据缺 `raw_text` 时按 `content` → `section_tree` 重建；两侧都拼不出正文才判为未变。同一口径同时作用于 A3/A4 变基的三路合并——base 侧正文为空会让双方改动落在同一个零宽区间、不判交叠，退化成两侧正文拼接且不报冲突。
 Errors: `KNOWLEDGE_BASE_NOT_FOUND`（404，知识库或版本**不存在**）、`KNOWLEDGE_CONTEXT_MISMATCH`（403，资源存在但跨租户/跨库）。两个查找（知识库、版本）用同一套存在性策略，不再一个 403、一个 404。
 
 与 A1b 的口径差异（非缺陷，`_load_admin_diff_base`/`_load_admin_diff_version` 与 `get_tenant_knowledge_base` 各自独立实现）：A1b 对"不存在"与"存在但跨租户"**都**折叠为 404（existence-hiding，调用方无法区分两种情况）；A2/A2b 则用 403 `KNOWLEDGE_CONTEXT_MISMATCH` 显式区分"资源存在但跨租户/跨库"与 404 的"压根不存在"，会向调用方泄漏该 `kb_id`/`version_id` 组合是否存在。两者都只在管理员/授权调用方可达（A2/A2b 的非 admin 路径还要求 `require_shared_knowledge_history_viewer`），泄漏面有限，但前端不应假设 A1b 与 A2/A2b 对同一个不可见资源返回相同的状态码。

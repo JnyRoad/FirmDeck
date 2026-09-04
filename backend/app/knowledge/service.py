@@ -837,6 +837,11 @@ class KnowledgeService:
                 metadata_json={
                     **(metadata.get("metadata") if isinstance(metadata.get("metadata"), dict) else {}),
                     "ingest_schema_version": KNOWLEDGE_INGEST_SCHEMA_VERSION,
+                    # 正文原文与在线编辑（`_write_document_content`）写回同一个键、同一套
+                    # `_normalize_text` 归一化：A2 对比与变基三路合并（diff.py 的
+                    # `_document_text`）只认 `raw_text`，上传后不写就会让首次对比拿到空
+                    # base，整篇误判为新增、变基退化成两侧正文拼接（T077 缺陷 A）。
+                    "raw_text": normalized_text,
                     "char_count": len(normalized_text),
                     "document_card": document_card,
                     "section_tree": section_nodes,

@@ -9,8 +9,10 @@ change 块内按位置顺序对齐，仅保留相似度 `SequenceMatcher.ratio()
 
 除 `diff_versions`（薄加载层：从会话按版本取文档正文快照）外，其余函数均为纯函数——
 只接受已加载好的文本/文档列表，不接触 DB，可独立单测。文档正文取
-`metadata_json.raw_text`，与 `PUT /knowledge/documents/{id}` 写回 `content_md` 时的
-存储位置同源（见 `KnowledgeService.replace_document_content`）。
+`metadata_json.raw_text`，与上传 ingest（`KnowledgeService._run_ingest_job`）和
+`PUT /knowledge/documents/{id}` 写回 `content_md`（`_write_document_content`）的存储
+位置同源；历史数据缺 `raw_text` 时按 `content` → `section_tree` 重建（见
+`_document_text`）。
 """
 
 from __future__ import annotations
@@ -286,10 +288,57 @@ def diff_document_sets(
 
 
 def _document_text(document: KnowledgeDocument) -> str:
-    """取文档正文：与 `PUT /knowledge/documents/{id}` 写回 content_md 同源的 raw_text。"""
+    """取文档正文，按 `raw_text` → `content` → `section_tree` 重建的顺序兜底。
+
+    `raw_text` 是 ingest（`KnowledgeService._run_ingest_job`）与在线编辑
+    （`PUT /knowledge/documents/{id}` → `_write_document_content`）共同的正文写入位置，
+    正常数据一律走第一路。
+
+    历史数据（T077 缺陷 A 修复之前上传、且从未在线编辑过的文档行）没有 `raw_text`，
+    只有 ingest 产出的 `section_tree`。这类行如果按空正文参与对比，首次编辑会整篇误判
+    为新增，变基三路合并更会因为 base 为空而把两侧正文原样拼接且不报冲突。因此这里按
+    与前端 `documentSourceMarkdown`（`frontend-enterprise/src/pages/knowledge-admin/
+    private/ContentTab.tsx`）完全相同的兜底顺序重建正文，让老数据也能得到可比的基线。
+
+    三路都拿不到内容时返回空串——此时该文档在两侧都表现为空正文，对比判定为「未变」，
+    不会伪造出一次整篇替换。
+    """
     metadata = document.metadata_json or {}
-    raw_text = metadata.get("raw_text")
-    return raw_text if isinstance(raw_text, str) else ""
+    for key in ("raw_text", "content"):
+        value = metadata.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return _text_from_section_tree(metadata.get("section_tree"))
+
+
+def _text_from_section_tree(section_tree: object) -> str:
+    """把 ingest 产出的大纲节点拼回 markdown 正文，节点顺序即正文顺序。
+
+    每个节点优先取 `content`（ingest 写入的是该小节的原始段落，含标题行本身）；
+    缺失时退回 `## 标题 + 摘要`，再退回标题或摘要单独一项。节点间以空行分隔，与
+    `_build_section_nodes` 内部 `"\\n\\n".join(...)` 的拼接口径一致。
+
+    入参不是列表、或所有节点都拼不出内容时返回空串，不抛异常——调用方（对比加载层）
+    对任何一篇文档的解析失败都必须降级为空正文而不是整次对比失败。
+    """
+    if not isinstance(section_tree, list):
+        return ""
+    blocks: list[str] = []
+    for node in section_tree:
+        if not isinstance(node, dict):
+            continue
+        content = node.get("content")
+        if isinstance(content, str) and content.strip():
+            blocks.append(content.strip())
+            continue
+        title = node.get("title") if isinstance(node.get("title"), str) else ""
+        summary = node.get("summary") if isinstance(node.get("summary"), str) else ""
+        title, summary = title.strip(), summary.strip()
+        if title and summary:
+            blocks.append(f"## {title}\n\n{summary}")
+        elif title or summary:
+            blocks.append(title or summary)
+    return "\n\n".join(blocks)
 
 
 def document_lineage_id(document: KnowledgeDocument) -> str | None:
