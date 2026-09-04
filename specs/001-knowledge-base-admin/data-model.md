@@ -10,13 +10,15 @@
 | `mode` | `shared` / `dedicated` |
 | `published_version_id` | 共享库唯一正式指针（读取侧只读它） |
 | `status` | `active`（上线）/ `archived`（下线）。**对外状态不直接读这一列**：见下方"对外状态的单一派生口径" |
-| `metadata_json.owner_agent_id` | 私有库归属员工（列表用于"归属"列与过滤；P1 评估提升为列）。**"发布到广场为模板"（`promote-to-overall`）必须保留这一键**——那次操作只是把分支内容额外发布为广场模板版本，知识库行本身仍归属该员工；抹掉后 A1/A1b 的 `owner_agent`/`branch` 变空、回滚请求带空 `agent_id` 而 404（T077 缺陷 C） |
+| `metadata_json.owner_agent_id` | 私有库归属员工（列表用于"归属"列与过滤；P1 评估提升为列）。**"发布到广场为模板"（`promote-to-overall`）必须保留这一键**——那次操作只是把分支内容额外发布为广场模板版本，知识库行本身仍归属该员工；抹掉后 A1/A1b 的 `owner_agent`/`branch` 变空、回滚请求带空 `agent_id` 而 404（T077 缺陷 C）。归属既然保留，`_ensure_open_gallery_knowledge_admin`（网关全部广场写端点共用的鉴权）在 promote 之后继续解析成 owner-or-admin，不会退化成 admin-only：分支所有者本人和租户管理员都能继续写这个专用库，这是裁定生效的既定语义，不是遗留漏洞（自 4bda2ed 起；回归测试见 `backend/tests/test_knowledge_dedicated_promote_and_status.py::test_promote_to_overall_dedicated_base_stays_owner_or_admin_writable`） |
 
 **对外状态的单一派生口径**：`listing.effective_knowledge_base_status(base_status, branch_status)` 是唯一定义，
 A1/A1b（`listing._fetch_listed_items`）与员工侧详情（`api.knowledge_bases.knowledge_base_read`）共用。规则：
 `KnowledgeBase.status` 与归属员工分支（`AgentKnowledgeBranch`，`status='deleted'` 的不参与）**任一侧不在用即
-`archived`**，两侧都 `active` 才是 `active`。理由：转换为共享库与"下线专用库"只改分支行、不动知识库行，只读
-`KnowledgeBase.status` 会让列表报 `active` 而详情页报"已下线"（T077 缺陷 D）。
+`archived`**，两侧都 `active` 才是 `active`。`KnowledgeConversionService.convert_to_shared`（FR-082）现在于同一个
+savepoint 内把源专用库的 `KnowledgeBase.status` 和归属分支一起标记为 `archived`——两列双写，不是只信一列；
+本函数仍是唯一权威派生口径，防的是任何未来只改了分支行、忘记同步知识库行的写路径（历史上正是这样：转换
+早期版本只改分支行、不动知识库行，导致列表报 `active` 而详情页报"已下线"，T077 缺陷 D）。
 
 ## 2. KnowledgeBaseVersion（`knowledge_base_versions`，语义扩展）
 

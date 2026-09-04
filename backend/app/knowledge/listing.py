@@ -124,13 +124,16 @@ def effective_knowledge_base_status(base_status: str, branch_status: str | None)
 
     `base_status` 是 `KnowledgeBase.status`，`branch_status` 是该库归属员工分支的
     `AgentKnowledgeBranch.status`（无分支、或分支已 `deleted` 被调用方过滤掉时传 `None`）。
-    返回值只有 `"active"` / `"archived"` 两种，与 `KnowledgeAdminListItem.status` 和
-    `KnowledgeBaseRead.status` 的字面量约束一致。
+    返回值只有 `"active"` / `"archived"` 两种，与 `KnowledgeAdminListItem.status`（声明为
+    `Literal["active", "archived"]`）的字面量约束一致；`KnowledgeBaseRead.status` 只是普通
+    `str` 字段，没有静态字面量约束，这里靠调用方（`knowledge_base_read`）只传本函数的返回
+    值来维持同一份取值约定，不是类型系统强制的。
 
-    任一侧不在用就降级为 `archived`：一是"转换为共享知识库"（`conversion.py`）与"下线专用
-    库"只把分支行改成 `archived` / `inactive`、不动知识库行，只看 `KnowledgeBase.status`
-    会让 A1 列表继续报 `active`，与详情页的"已下线"矛盾（T077 缺陷 D）；二是知识库行本身
-    已归档时，一条仍是 `active` 的分支不应把它重新报成在用。本函数是该派生规则的唯一定义，
+    任一侧不在用就降级为 `archived`：一是知识库行本身已归档时，一条仍是 `active` 的分支不
+    应把它重新报成在用；二是防御性兜底——`conversion.py` 转换为共享库时现在会在同一个
+    savepoint 里把分支和知识库行一起标记为 `archived`（FR-082），但任何未来只改了分支行、
+    忘记同步知识库行的写路径（历史上正是这样：早期只改分支、不动知识库行，导致 A1 列表报
+    `active` 与详情页"已下线"矛盾，T077 缺陷 D）仍会被这条规则兜住。本函数是该派生规则的唯一定义，
     供 A1/A1b（`_fetch_listed_items`）与员工侧详情投影
     （`app.api.knowledge_bases.knowledge_base_read`）共用。
     """
@@ -186,7 +189,12 @@ def _fetch_listed_items(
         branch_by_key: dict[tuple[str, str], AgentKnowledgeBranch] = {}
         for row in branch_rows:
             key = (row.knowledge_base_id, row.agent_id)
-            # 同一 (库, 员工) 出现多行时以 active 的那行为准，结果不随查询顺序漂移。
+            # 防御性去重，当前不可达：`AgentKnowledgeBranch` 在 (tenant_id, agent_id,
+            # knowledge_base_id) 上有 `uq_agent_knowledge_branch` 唯一约束
+            # （见 `app/db/models.py`），同一个 (库, 员工) 永远只有一行，下面的 `existing`
+            # 分支不会命中。保留这段"以 active 的那行为准"的合并逻辑是故意的：万一约束将来
+            # 被放宽为允许多行（例如引入软删除历史行），这里不会静默丢冲突数据，而是确定性地
+            # 优先 active 行，结果不随查询返回顺序漂移。
             existing = branch_by_key.get(key)
             if existing is None or (existing.status != "active" and row.status == "active"):
                 branch_by_key[key] = row

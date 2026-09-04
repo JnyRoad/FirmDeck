@@ -267,6 +267,12 @@ class KnowledgeConversionService:
                 converted_to_knowledge_base_id=shared_base.id,
                 converted_to_version_id=released.id,
             )
+            # FR-082：源专用库本身也要标为已下线，不能只归档分支。留在同一个
+            # savepoint 里——克隆/校验失败整体回滚时源库必须原样保持 active
+            # （"failure leaves source unchanged"），只有转换真正成功才连带下线。
+            source_base.status = "archived"
+            source_base.updated_at = utc_now()
+            self.db.add(source_base)
             event = self.audit.append_event(
                 tenant_id=tenant_id,
                 knowledge_base_id=shared_base.id,

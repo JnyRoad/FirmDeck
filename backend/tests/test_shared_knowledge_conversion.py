@@ -282,7 +282,10 @@ def test_conversion_copies_assets_binds_team_and_archives_only_selected_source()
         assert selected_binding.status == "archived"
         assert sibling_branch is not None and sibling_branch.status == "active"
         assert sibling_binding is not None and sibling_binding.status == "active"
-        assert db.get(KnowledgeBase, fixture.source_base_id).status == "active"
+        # FR-082：源专用库本身也要下线，不能只归档分支——否则员工侧写路径（例如
+        # `_resolve_upload_knowledge_base` 里 `status == "archived"` 那道闸）永远看不到
+        # 已转换的事实，仍会当作活跃库放行写入。
+        assert db.get(KnowledgeBase, fixture.source_base_id).status == "archived"
         assert team_binding.status == "active"
         assert team is not None and team.default_knowledge_base_id == shared.id
         assert audit is not None and audit.action == "dedicated_converted"
@@ -328,6 +331,8 @@ def test_clone_failure_preserves_source_and_removes_partial_shared_lineage(
         assert branch.status == "active"
         assert binding.status == "active"
         assert shared == []
+        # 失败必须整体回滚：源库行也不能被提前标记为下线（savepoint 保证）。
+        assert db.get(KnowledgeBase, fixture.source_base_id).status == "active"
 
 
 def test_asset_count_mismatch_rolls_back_conversion(
@@ -374,6 +379,7 @@ def test_asset_count_mismatch_rolls_back_conversion(
         ).one()
         assert branch.status == "active"
         assert db.exec(select(KnowledgeBase).where(KnowledgeBase.mode == "shared")).all() == []
+        assert db.get(KnowledgeBase, fixture.source_base_id).status == "active"
 
 
 def test_conversion_endpoint_returns_shared_base_release_and_archival_projection() -> None:
@@ -444,6 +450,7 @@ def test_conversion_endpoint_rejects_cross_tenant_team_without_archiving_source(
         assert exc_info.value.status_code == 404
         assert branch.status == "active"
         assert db.exec(select(KnowledgeBase).where(KnowledgeBase.mode == "shared")).all() == []
+        assert db.get(KnowledgeBase, fixture.source_base_id).status == "active"
 
 
 def test_conversion_endpoint_rejects_a_bound_shared_base_as_reverse_conversion() -> None:
@@ -477,3 +484,63 @@ def test_conversion_endpoint_rejects_a_bound_shared_base_as_reverse_conversion()
 
         assert exc_info.value.status_code == 409
         assert exc_info.value.detail["code"] == "KNOWLEDGE_MODE_INVALID"
+
+
+def test_archived_source_base_rejects_employee_document_upload() -> None:
+    """FR-082 落地验证：转换后旧的 `knowledge_base_id`（书签/缓存）写入统一 404。
+
+    A1/A1b 已经通过 `effective_knowledge_base_status` 把源库显示成"已下线"（T077 缺陷
+    D），但员工侧写路径（`app.api.knowledge.upload_document` →
+    `_resolve_upload_knowledge_base`）读的是 `KnowledgeBase.status` 原始列，不经过那层
+    派生。源库行不落 `archived` 时，这道闸形同虚设，仍会放行写入。
+    """
+    import base64
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from app.api.knowledge import router as knowledge_router
+    from app.db import get_session
+    from app.security.auth import get_current_user
+
+    engine = create_engine(
+        "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
+    )
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as db:
+        fixture = _seed_dedicated_lineage(db)
+        conversion_module.KnowledgeConversionService(db).convert_to_shared(
+            tenant_id="tenant_demo",
+            source_knowledge_base_id=fixture.source_base_id,
+            source_agent_id=fixture.source_agent_id,
+            name="端点归档验证共享知识",
+            change_reason="验证员工写路径统一 404",
+            team_ids=[fixture.team_id],
+            actor_user_id="user-admin",
+        )
+        db.commit()
+        assert db.get(KnowledgeBase, fixture.source_base_id).status == "archived"
+
+    app = FastAPI()
+    app.include_router(knowledge_router)
+
+    def override_get_session():
+        with Session(engine) as request_db:
+            yield request_db
+
+    app.dependency_overrides[get_session] = override_get_session
+    app.dependency_overrides[get_current_user] = _admin_user
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/enterprise/knowledge/documents",
+        json={
+            "tenant_id": "tenant_demo",
+            "knowledge_base_id": fixture.source_base_id,
+            "filename": "late-upload.md",
+            "content_base64": base64.b64encode(b"late content").decode("ascii"),
+        },
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"]["code"] == "KNOWLEDGE_BASE_NOT_FOUND"

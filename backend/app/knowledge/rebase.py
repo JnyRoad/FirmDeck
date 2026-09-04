@@ -172,8 +172,21 @@ def _merge_line_ranges(
 
     clusters: list[dict[str, Any]] = []
     for start, end, side, hunk in events:
-        if clusters and start < clusters[-1]["end"]:
+        joins_last_cluster = False
+        if clusters:
             cluster = clusters[-1]
+            if start < cluster["end"]:
+                joins_last_cluster = True
+            else:
+                # `start < end` 只能抓到真正交叠的区间：两个零宽度插入（纯插入 hunk，
+                # `base_lines` 为空）落在同一基线位置时 start == end == 前一事件的 end，
+                # 谁都不会小于谁，会被当成互不相干、按处理顺序直接拼接（悄悄丢内容而不是
+                # 冲突）。零宽度 hunk 碰到另一方在同一起点开始的 hunk（无论对方是不是零宽度）
+                # 同样是插入顺序有歧义，也必须算冲突，不能悄悄先套一个再套另一个。
+                last_start, last_end = cluster["items"][-1][0], cluster["items"][-1][1]
+                if start == last_start and (start == end or last_start == last_end):
+                    joins_last_cluster = True
+        if joins_last_cluster:
             cluster["end"] = max(cluster["end"], end)
             cluster["items"].append((start, end, side, hunk))
         else:

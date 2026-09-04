@@ -11,6 +11,12 @@
 继续报 `active`，与详情页显示的"已下线"矛盾。修复后两处共用
 `listing.effective_knowledge_base_status` 这一份派生规则。
 
+FR-082 补充（本轮）：只靠派生规则让"列表看起来下线"还不够——员工侧写路径
+（`app.api.knowledge.upload_document` 等）直接读 `KnowledgeBase.status` 原始列，不经过
+`effective_knowledge_base_status`。`conversion.py::convert_to_shared` 现在于同一个
+savepoint 内把源库行也标记为 `status='archived'`，保证转换成功后源库处处一致地"已下线"，
+失败回滚时源库仍保持 `active`（见 `test_shared_knowledge_conversion.py` 的转换与回滚用例）。
+
 链路通过 `fastapi.testclient.TestClient` 驱动真实端点，验证阶段用独立 `Session(engine)` 读取。
 """
 
@@ -18,11 +24,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import FastAPI
+import pytest
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
+from app.api.knowledge import update_document
 from app.api.knowledge_admin import router as knowledge_admin_router
 from app.api.knowledge_bases import router as knowledge_bases_router
 from app.db import get_session
@@ -37,16 +45,36 @@ from app.db.models import (
     User,
 )
 from app.knowledge.conversion import KnowledgeConversionService
+from app.knowledge.schema import KnowledgeDocumentUpdateRequest
 from app.security.auth import get_current_user
 
 TENANT_ID = "tenant_demo"
 OWNER_AGENT_ID = "agent_owner"
 BASE_ID = "kb_dedicated_promote"
+OWNER_USER_ID = "user_owner_lin"
 
 
 def _admin_user() -> User:
     return User(
         id="user_admin", tenant_id=TENANT_ID, username="admin", role="admin", password_hash="x"
+    )
+
+
+def _owner_user() -> User:
+    """`agent_owner` 分支的所有者：非管理员，靠 `metadata.owner_user_id` 匹配鉴权。"""
+    return User(
+        id=OWNER_USER_ID, tenant_id=TENANT_ID, username="lin", role="member", password_hash="x"
+    )
+
+
+def _other_member_user() -> User:
+    """既不是 `agent_owner` 的所有者也不是管理员的普通用户。"""
+    return User(
+        id="user_other_member",
+        tenant_id=TENANT_ID,
+        username="other",
+        role="member",
+        password_hash="x",
     )
 
 
@@ -83,7 +111,14 @@ def _seed_dedicated_base(engine: Any) -> None:
     with Session(engine) as db:
         db.add(Tenant(id=TENANT_ID, slug="tenant-demo", name="Demo", lifecycle_version=1))
         db.add(AgentProfile(id="agent_overall", tenant_id=TENANT_ID, name="整体", is_overall=True))
-        db.add(AgentProfile(id=OWNER_AGENT_ID, tenant_id=TENANT_ID, name="林晓"))
+        db.add(
+            AgentProfile(
+                id=OWNER_AGENT_ID,
+                tenant_id=TENANT_ID,
+                name="林晓",
+                metadata_json={"owner_user_id": OWNER_USER_ID},
+            )
+        )
         db.add(
             KnowledgeBase(
                 id=BASE_ID,
@@ -228,7 +263,11 @@ def test_admin_list_reports_archived_after_convert_to_shared() -> None:
         )
         db.commit()
 
-    # 前置事实：转换只归档了分支，知识库行本身仍是 active——状态必须由分支派生出来。
+    # FR-082：转换同时归档分支与知识库行本身——源库不能只在派生状态里"看起来"下线，
+    # 员工侧写路径直接读的 `KnowledgeBase.status` 原始列也必须一致，否则旧的
+    # `knowledge_base_id` 仍能写穿一个 A1 已经报"已下线"的库（见
+    # `test_shared_knowledge_conversion.py::
+    # test_archived_source_base_rejects_employee_document_upload`）。
     with Session(engine) as verify_db:
         branch = verify_db.exec(
             select(AgentKnowledgeBranch).where(
@@ -239,8 +278,88 @@ def test_admin_list_reports_archived_after_convert_to_shared() -> None:
         assert branch.status == "archived"
         assert branch.sync_state == "converted"
         source = verify_db.get(KnowledgeBase, BASE_ID)
-        assert source is not None and source.status == "active"
+        assert source is not None and source.status == "archived"
 
     item = _admin_list_item(client, BASE_ID)
     assert item["status"] == "archived"
     assert _admin_detail(client, BASE_ID)["status"] == "archived"
+
+
+def test_promote_to_overall_dedicated_base_stays_owner_or_admin_writable() -> None:
+    """裁定（4bda2ed 起生效）：发布到广场为模板后，专用库仍是"员工自己的专用库"——
+    `promote_knowledge_branch_to_overall` 保留 `owner_agent_id`，模板拷贝是另一份独立
+    资产。因此 `_ensure_open_gallery_knowledge_admin`（`knowledge.py` 网关写端点共用）
+    在 promote 之后应继续解析成 owner-or-admin，而不是退化成 admin-only：
+    分支所有者本人仍可写，非所有者的普通用户仍被拒绝，租户管理员始终可写。
+    """
+    engine = _engine()
+    _seed_dedicated_base(engine)
+    client = _http_client_for(engine)
+
+    promote = client.post(
+        f"/api/enterprise/knowledge-bases/{BASE_ID}/promote-to-overall",
+        params={"tenant_id": TENANT_ID, "agent_id": OWNER_AGENT_ID},
+    )
+    assert promote.status_code == 200, promote.text
+
+    with Session(engine) as db:
+        base = db.get(KnowledgeBase, BASE_ID)
+        assert base is not None
+        assert (base.metadata_json or {}).get("owner_agent_id") == OWNER_AGENT_ID
+
+    # 分支所有者本人（非管理员）：仍可替换专用库文档内容。
+    with Session(engine) as db:
+        document = db.get(KnowledgeDocument, "kdoc_promote_0")
+        assert document is not None
+        original_title = document.title
+        updated = update_document(
+            document.id,
+            KnowledgeDocumentUpdateRequest(
+                tenant_id=TENANT_ID,
+                content_md="话术第一条（所有者更新）",
+            ),
+            db=db,
+            current_user=_owner_user(),
+            agent_id=None,
+        )
+        assert updated.title == original_title  # 内容替换不动标题
+        assert updated.metadata.get("raw_text") == "话术第一条（所有者更新）"
+
+    # 既非所有者也非管理员的普通用户：沿用既有权限错误码被拒绝。
+    with Session(engine) as db:
+        document = db.get(KnowledgeDocument, "kdoc_promote_0")
+        assert document is not None
+        with pytest.raises(HTTPException) as denied:
+            update_document(
+                document.id,
+                KnowledgeDocumentUpdateRequest(
+                    tenant_id=TENANT_ID,
+                    content_md="话术第一条（越权尝试）",
+                ),
+                db=db,
+                current_user=_other_member_user(),
+                agent_id=None,
+            )
+        assert denied.value.status_code == 403
+        assert denied.value.detail["code"] == "PERMISSION_AGENT_OWNER_OR_ADMIN_REQUIRED"
+
+    # 租户管理员：无论是否为分支所有者都能写。
+    with Session(engine) as db:
+        document = db.get(KnowledgeDocument, "kdoc_promote_0")
+        assert document is not None
+        updated = update_document(
+            document.id,
+            KnowledgeDocumentUpdateRequest(
+                tenant_id=TENANT_ID,
+                content_md="话术第一条（管理员更新）",
+            ),
+            db=db,
+            current_user=_admin_user(),
+            agent_id=None,
+        )
+        assert updated is not None
+
+    with Session(engine) as verify_db:
+        document = verify_db.get(KnowledgeDocument, "kdoc_promote_0")
+        assert document is not None
+        assert document.metadata_json.get("raw_text") == "话术第一条（管理员更新）"

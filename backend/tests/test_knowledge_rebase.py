@@ -161,6 +161,50 @@ def test_merge_document_sets_produces_conflict_for_overlapping_changes() -> None
     assert block.context_after == ["gamma"]
 
 
+def test_merge_document_sets_same_position_zero_width_inserts_conflict() -> None:
+    """回归：base 为空，ours/theirs 各自整篇新增内容，两个零宽度插入落在同一基线位置(0,0)。
+
+    `_merge_line_ranges` 按 `start < clusters[-1]["end"]` 聚簇时，两个零宽度事件谁都不比
+    谁大，永远进不了同一个簇，会被当成互不相干、按处理顺序直接拼接——`ours_lines=["A"]`
+    紧跟 `theirs_lines=["B"]` 悄悄变成 `["A", "B"]`，而不是产出冲突让人工判断先后顺序。
+    """
+    base = [DocumentSnapshot(lineage_id="L1", filename="a.md", title="A", lines=[])]
+    ours = [DocumentSnapshot(lineage_id="L1", filename="a.md", title="A", lines=["A"])]
+    theirs = [DocumentSnapshot(lineage_id="L1", filename="a.md", title="A", lines=["B"])]
+
+    auto_merged, conflicts = merge_document_sets(base, ours, theirs)
+
+    assert auto_merged == []
+    assert len(conflicts) == 1
+    conflict = conflicts[0]
+    assert conflict.lineage_id == "L1"
+    assert len(conflict.blocks) == 1
+    block = conflict.blocks[0]
+    assert block.base_lines == []
+    assert block.ours_lines == ["A"]
+    assert block.theirs_lines == ["B"]
+
+
+def test_merge_document_sets_zero_width_insert_touching_same_start_conflicts() -> None:
+    """回归：base 非空，ours/theirs 都在第 0 行之前插入内容（同一起点，不同零宽度 hunk）。
+
+    同上一个用例的边界变体：base 有内容时依旧要能识别"同一插入点"的歧义，
+    不能因为 base 非空就漏判。
+    """
+    base = [DocumentSnapshot(lineage_id="L1", filename="a.md", title="A", lines=["x"])]
+    ours = [DocumentSnapshot(lineage_id="L1", filename="a.md", title="A", lines=["A", "x"])]
+    theirs = [DocumentSnapshot(lineage_id="L1", filename="a.md", title="A", lines=["B", "x"])]
+
+    auto_merged, conflicts = merge_document_sets(base, ours, theirs)
+
+    assert auto_merged == []
+    assert len(conflicts) == 1
+    block = conflicts[0].blocks[0]
+    assert block.base_lines == []
+    assert block.ours_lines == ["A"]
+    assert block.theirs_lines == ["B"]
+
+
 # ---------------------------------------------------------------------------
 # DB + 路由 fixture：1 个共享库 + v1(released) <- draft_ours(stale) 与
 # v1 <- draft_theirs -> 发布为 v2，构造仅 ours/仅 theirs/双方不交叠/双方交叠 四种文档。
