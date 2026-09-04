@@ -32,12 +32,18 @@ Pairing = str  # "lineage" | "filename"
 
 @dataclass(frozen=True)
 class DocumentSnapshot:
-    """一篇文档在某个版本内的最小对比输入：身份键（lineage/filename）与正文行。"""
+    """一篇文档在某个版本内的最小对比输入：身份键（lineage/filename）与正文行。
+
+    `document_id`（T080 新增）是该文档在当前版本内的真实行 id——草稿版本里的文档是
+    克隆行，`lineage_id` 指向源文档而非当前行，写回（编辑/归档/恢复）必须落到
+    `document_id` 才能定位对；默认 `None` 以兼容不关心此字段的既有纯函数测试构造。
+    """
 
     lineage_id: str | None
     filename: str
     title: str
     lines: list[str]
+    document_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -54,13 +60,19 @@ class DiffHunk:
 
 @dataclass(frozen=True)
 class DiffDocument:
-    """文档级对比条目；`hunks` 仅在 `kind == "modified"` 且未截断时非空。"""
+    """文档级对比条目；`hunks` 仅在 `kind == "modified"` 且未截断时非空。
+
+    `base_document_id`/`target_document_id`（T080 新增）是该篇文档在 base/target 各自
+    版本内的真实行 id；对应侧不存在（added 无 base、deleted 无 target）时为 `None`。
+    """
 
     lineage_id: str
     title: str
     kind: DocumentKind
     truncated: bool = False
     hunks: list[DiffHunk] = field(default_factory=list)
+    base_document_id: str | None = None
+    target_document_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -206,12 +218,22 @@ def diff_document_sets(
         if base_doc is None and target_doc is not None:
             added += 1
             documents.append(
-                DiffDocument(lineage_id=key, title=target_doc.title, kind="added")
+                DiffDocument(
+                    lineage_id=key,
+                    title=target_doc.title,
+                    kind="added",
+                    target_document_id=target_doc.document_id,
+                )
             )
         elif base_doc is not None and target_doc is None:
             deleted += 1
             documents.append(
-                DiffDocument(lineage_id=key, title=base_doc.title, kind="deleted")
+                DiffDocument(
+                    lineage_id=key,
+                    title=base_doc.title,
+                    kind="deleted",
+                    base_document_id=base_doc.document_id,
+                )
             )
         elif base_doc is not None and target_doc is not None:
             if base_doc.lines == target_doc.lines:
@@ -227,6 +249,8 @@ def diff_document_sets(
                     kind="modified",
                     truncated=truncated,
                     hunks=hunks,
+                    base_document_id=base_doc.document_id,
+                    target_document_id=target_doc.document_id,
                 )
             )
 
@@ -249,12 +273,18 @@ def _document_text(document: KnowledgeDocument) -> str:
 def _load_version_documents(
     db: Session, *, tenant_id: str, version_id: str
 ) -> list[DocumentSnapshot]:
-    """薄加载层：按版本取该租户下全部文档正文快照，唯一接触 DB 的入口。"""
+    """薄加载层：按版本取该租户下全部文档正文快照，唯一接触 DB 的入口。
+
+    `order_by(KnowledgeDocument.id)`（T080 新增）让同 key（同 lineage/filename）在
+    某一侧重复出现时，`pair_documents` 的按位置配对结果与 id 顺序一致、可复现。
+    """
     rows = db.exec(
-        select(KnowledgeDocument).where(
+        select(KnowledgeDocument)
+        .where(
             KnowledgeDocument.tenant_id == tenant_id,
             KnowledgeDocument.knowledge_base_version_id == version_id,
         )
+        .order_by(KnowledgeDocument.id)
     ).all()
     snapshots: list[DocumentSnapshot] = []
     for row in rows:
@@ -266,6 +296,7 @@ def _load_version_documents(
                 filename=row.filename,
                 title=row.title or row.filename,
                 lines=_document_text(row).splitlines(),
+                document_id=row.id,
             )
         )
     return snapshots

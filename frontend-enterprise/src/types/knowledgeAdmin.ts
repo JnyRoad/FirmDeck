@@ -93,12 +93,17 @@ export type DiffHunk = {
 /**
  * A2 对比结果单篇文档：按 `lineage_id` 配对基线与目标版本后的差异摘要。
  * `kind==='modified'` 时含 `hunks`；`truncated===true`（超过 `max_lines`）时不含 `hunks`。
+ * `base_document_id`/`target_document_id`（T080）是该篇文档在 base/target 各自版本内的
+ * 真实行 id，供写回定位当前版本内的克隆行；对应侧不存在时为 `null`。
  */
 export type DiffDocument = {
   lineage_id: string;
   title: string;
   kind: 'added' | 'modified' | 'deleted';
   truncated: boolean;
+  /** 可选：后端总是返回该字段，此处放宽为可选以兼容改动前构造的测试夹具（fix round）。 */
+  base_document_id?: string | null;
+  target_document_id?: string | null;
   hunks?: DiffHunk[];
 };
 
@@ -116,6 +121,22 @@ export type VersionDiff = {
     deleted: number;
   };
   documents: DiffDocument[];
+};
+
+/**
+ * A2b 响应元素：`GET .../versions/{version_id}/documents` 返回该版本全部文档
+ * （含未改动的，区别于 A2 只返回有变化的），携带真实行 `id`。
+ * `lineage_id` 缺失（数据质量问题）时为 `null`。
+ */
+export type VersionDocument = {
+  id: string;
+  lineage_id: string | null;
+  title: string;
+  filename: string;
+  status: string;
+  bucket_count: number;
+  chunk_count: number;
+  updated_at: string;
 };
 
 /** A3 变基预览中单篇文档的自动合并结果来源：采用草稿 / 采用正式版 / 双方合并。 */

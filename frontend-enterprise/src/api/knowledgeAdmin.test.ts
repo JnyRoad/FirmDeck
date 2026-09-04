@@ -139,6 +139,19 @@ describe('createKnowledgeAdminApi', () => {
     expect(search.get('max_lines')).toBe('2000');
   });
 
+  // ---- A2b ----
+  it('A2b listVersionDocuments: GET version documents by kbId/versionId', async () => {
+    const { createKnowledgeAdminApi } = await loadKnowledgeAdmin();
+    const api = createKnowledgeAdminApi(null, fakeClient as never);
+
+    await api.listVersionDocuments('kb_1', 'kbver_2');
+
+    expect(getMock).toHaveBeenCalledTimes(1);
+    const { pathname, search } = parsePath(getMock.mock.calls[0][0]);
+    expect(pathname).toBe('/api/enterprise/knowledge-admin/knowledge-bases/kb_1/versions/kbver_2/documents');
+    expect(Array.from(search.keys())).toEqual([]);
+  });
+
   // ---- A3 ----
   it('A3 rebaseDraft: POST rebase with change_reason/idempotency_key', async () => {
     const { createKnowledgeAdminApi } = await loadKnowledgeAdmin();

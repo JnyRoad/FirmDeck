@@ -268,6 +268,46 @@ def test_diff_document_sets_added_modified_deleted_and_excludes_unchanged() -> N
     assert modified_doc.truncated is False
 
 
+def test_diff_document_sets_carries_base_and_target_document_ids() -> None:
+    """T080：DiffDocument 携带各侧真实 `document_id`（缺失一侧为 None），供写回定位真实行。"""
+    base_docs = [
+        DocumentSnapshot(
+            lineage_id="L_mod", filename="mod.md", title="Mod", lines=["a"], document_id="doc_base_mod"
+        ),
+        DocumentSnapshot(
+            lineage_id="L_del", filename="del.md", title="Del", lines=["x"], document_id="doc_base_del"
+        ),
+    ]
+    target_docs = [
+        DocumentSnapshot(
+            lineage_id="L_mod",
+            filename="mod.md",
+            title="Mod",
+            lines=["a2"],
+            document_id="doc_target_mod",
+        ),
+        DocumentSnapshot(
+            lineage_id="L_add", filename="add.md", title="Add", lines=["y"], document_id="doc_target_add"
+        ),
+    ]
+
+    result = diff_document_sets(
+        base_docs,
+        target_docs,
+        base_version_id="kbver_base",
+        target_version_id="kbver_target",
+        max_lines=100,
+    )
+
+    by_lineage = {doc.lineage_id: doc for doc in result.documents}
+    assert by_lineage["L_mod"].base_document_id == "doc_base_mod"
+    assert by_lineage["L_mod"].target_document_id == "doc_target_mod"
+    assert by_lineage["L_del"].base_document_id == "doc_base_del"
+    assert by_lineage["L_del"].target_document_id is None
+    assert by_lineage["L_add"].base_document_id is None
+    assert by_lineage["L_add"].target_document_id == "doc_target_add"
+
+
 # ---------------------------------------------------------------------------
 # DB 用例：薄加载层 diff_versions 与 against=base|published 解析
 # ---------------------------------------------------------------------------
@@ -456,6 +496,16 @@ def test_diff_versions_loads_texts_and_pairs_by_lineage() -> None:
         assert change_hunks[0].base_lines == ["beta"]
         assert change_hunks[0].target_lines == ["beta value"]
         assert change_hunks[0].pairs == [(0, 0)]  # "beta" 与 "beta value" 足够相似
+
+        # T080：真实行 id 来自各版本内的 KnowledgeDocument.id（草稿是克隆行，id 不同于 base）。
+        assert modified_doc.base_document_id == "doc_v1_mod"
+        assert modified_doc.target_document_id == "doc_v2_mod"
+        added_doc = next(doc for doc in result.documents if doc.lineage_id == "L_add")
+        assert added_doc.base_document_id is None
+        assert added_doc.target_document_id == "doc_v2_add"
+        deleted_doc = next(doc for doc in result.documents if doc.lineage_id == "L_del")
+        assert deleted_doc.base_document_id == "doc_v1_del"
+        assert deleted_doc.target_document_id is None
 
 
 def test_diff_versions_with_no_base_version_treats_all_target_docs_as_added() -> None:

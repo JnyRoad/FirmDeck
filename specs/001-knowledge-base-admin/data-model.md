@@ -69,11 +69,22 @@ VersionDiff
 ├── summary { added, modified, deleted }
 └── documents[]
     ├── lineage_id, title, kind ("added" | "modified" | "deleted"), truncated
+    ├── base_document_id, target_document_id   # T080：各侧真实行 id，对应侧不存在为 null
     └── hunks[]  (kind="modified" 时)
         ├── type ("equal" | "change")
         ├── base_start, base_lines[], target_start, target_lines[]   # 行号 0-based
         └── pairs[]  # change 块内 [base_idx, target_idx] 的相似行配对（按顺序位置对齐，非编辑距离对齐），供字符级高亮
 ```
+
+### 4b. 版本文档全量列表（响应模型，不落库，T080 A2b）
+
+```text
+VersionDocument[]  # 按 title 再 id 稳定排序，含未改动文档
+└── id, lineage_id, title, filename, status, bucket_count, chunk_count, updated_at
+```
+
+区别于 §4 的 `VersionDiff.documents[]`（只含相对基线有变化的文档、`lineage_id` 在草稿克隆行上可能指向源文档），
+本列表返回该版本内全部文档、真实行 `id`，供写回（编辑/归档/恢复）定位当前版本内的正确行。
 
 ## 5. 变基结果（响应模型，不落库）
 

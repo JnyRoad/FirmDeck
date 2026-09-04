@@ -10,13 +10,13 @@ from __future__ import annotations
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlmodel import Session
+from sqlmodel import Session, select
 
 from app.api.knowledge_bases import _shared_version_lookup, _shared_version_read
 from app.contracts.domain_http import domain_http_error
 from app.contracts.error_registry import ERROR_REGISTRY, ErrorVisibility
 from app.db import get_session
-from app.db.models import KnowledgeBase, KnowledgeBaseVersion, User
+from app.db.models import KnowledgeBase, KnowledgeBaseVersion, KnowledgeDocument, User
 from app.knowledge.diff import DEFAULT_MAX_LINES, diff_versions
 from app.knowledge.errors import KnowledgeError
 from app.knowledge.listing import list_bindable_teams, list_tenant_knowledge_bases
@@ -47,6 +47,7 @@ from app.knowledge.schema import (
     KnowledgeRebaseResultRead,
     VersionDiffRead,
     VersionDiffSummary,
+    VersionDocumentRead,
 )
 from app.knowledge.versioning import SharedKnowledgeVersionService
 from app.security.auth import get_current_user
@@ -273,6 +274,8 @@ def get_knowledge_admin_version_diff(
                 title=document.title,
                 kind=document.kind,
                 truncated=document.truncated,
+                base_document_id=document.base_document_id,
+                target_document_id=document.target_document_id,
                 hunks=[
                     DiffHunkRead(
                         type=hunk.type,
@@ -288,6 +291,63 @@ def get_knowledge_admin_version_diff(
             for document in result.documents
         ],
     )
+
+
+@router.get(
+    "/knowledge-bases/{kb_id}/versions/{version_id}/documents",
+    response_model=list[VersionDocumentRead],
+)
+def list_knowledge_admin_version_documents(
+    kb_id: str,
+    version_id: str,
+    tenant_id: str = Query(...),
+    db: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+) -> list[VersionDocumentRead]:
+    """A2b：该版本全部文档（含未改动），供 US2-b 写回按真实行 `id` 定位，而不是误用
+    只在指向源文档时才准确的 `lineage_id`（草稿文档是克隆行）。
+
+    鉴权与错误语义与 A2 完全一致：租户管理员走 `_load_admin_diff_base` 旁路（不限制
+    mode），非管理员一律走 `require_shared_knowledge_history_viewer`；版本不存在→
+    `KNOWLEDGE_BASE_NOT_FOUND`，跨租户/跨库→`KNOWLEDGE_CONTEXT_MISMATCH`。结果按
+    `title` 再 `id` 稳定排序，与插入顺序、id 生成顺序无关。
+    """
+    ensure_tenant(db, tenant_id)
+    if current_user.tenant_id == tenant_id and is_admin_user(current_user):
+        _load_admin_diff_base(db, tenant_id=tenant_id, knowledge_base_id=kb_id)
+    else:
+        try:
+            require_shared_knowledge_history_viewer(
+                db, tenant_id=tenant_id, knowledge_base_id=kb_id, current_user=current_user
+            )
+        except KnowledgeError as exc:
+            raise _knowledge_error_to_http(exc) from exc
+
+    _load_admin_diff_version(
+        db, tenant_id=tenant_id, knowledge_base_id=kb_id, version_id=version_id
+    )
+
+    rows = db.exec(
+        select(KnowledgeDocument)
+        .where(
+            KnowledgeDocument.tenant_id == tenant_id,
+            KnowledgeDocument.knowledge_base_version_id == version_id,
+        )
+        .order_by(KnowledgeDocument.title, KnowledgeDocument.id)
+    ).all()
+    return [
+        VersionDocumentRead(
+            id=row.id,
+            lineage_id=(row.metadata_json or {}).get("lineage_id"),
+            title=row.title or row.filename,
+            filename=row.filename,
+            status=row.status,
+            bucket_count=row.bucket_count,
+            chunk_count=row.chunk_count,
+            updated_at=row.updated_at.isoformat(),
+        )
+        for row in rows
+    ]
 
 
 def _rebase_conflict_block_read(block: object) -> KnowledgeRebaseConflictBlockRead:

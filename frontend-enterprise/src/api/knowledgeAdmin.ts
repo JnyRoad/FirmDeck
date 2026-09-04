@@ -31,6 +31,7 @@ import type {
   RebasePreview,
   RebaseResult,
   VersionDiff,
+  VersionDocument,
 } from '@/types/knowledgeAdmin';
 import { createTenantClient, type TenantClient } from './tenant-client';
 
@@ -282,6 +283,16 @@ export function createKnowledgeAdminApi(
         `/api/enterprise/knowledge-admin/knowledge-bases/${kbId}/versions/${versionId}/diff`,
         { against: options.against, max_lines: options.maxLines },
       ));
+    },
+
+    /**
+     * A2b 版本文档全量列表（含未改动文档，真实行 `id`）：供写回（编辑/归档/恢复）
+     * 定位当前版本内的正确行，而不是误用可能指向源文档的 `lineage_id`。
+     */
+    listVersionDocuments(kbId: string, versionId: string): Promise<VersionDocument[]> {
+      return client.get(
+        `/api/enterprise/knowledge-admin/knowledge-bases/${kbId}/versions/${versionId}/documents`,
+      );
     },
 
     /** A3 变基预览 / 执行：无冲突直接落库返回 `RebaseResult`，有冲突返回 `RebasePreview` 不落库。 */

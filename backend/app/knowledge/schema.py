@@ -519,13 +519,20 @@ class DiffHunkRead(BaseModel):
 
 
 class DiffDocumentRead(BaseModel):
-    """A2 版本对比的单篇文档条目：按 lineage（或回退 filename）配对后的增/改/删状态。"""
+    """A2 版本对比的单篇文档条目：按 lineage（或回退 filename）配对后的增/改/删状态。
+
+    `base_document_id`/`target_document_id`（T080 新增）是该篇文档在 base/target 各自
+    版本内的真实行 id，供前端写回（编辑/归档/恢复）时定位到当前版本内的克隆行，而不是
+    误用指向源文档的 `lineage_id`；对应侧不存在时为 `None`。
+    """
 
     lineage_id: str
     title: str
     kind: Literal["added", "modified", "deleted"]
     truncated: bool = False
     hunks: list[DiffHunkRead] = Field(default_factory=list)
+    base_document_id: str | None = None
+    target_document_id: str | None = None
 
 
 class VersionDiffSummary(BaseModel):
@@ -544,6 +551,23 @@ class VersionDiffRead(BaseModel):
     pairing: Literal["lineage", "filename"]
     summary: VersionDiffSummary
     documents: list[DiffDocumentRead] = Field(default_factory=list)
+
+
+class VersionDocumentRead(BaseModel):
+    """A2b `GET .../versions/{version_id}/documents` 响应的单篇文档条目。
+
+    返回该版本内全部文档（含未改动的），携带真实行 `id`（区别于 A2 diff 响应里
+    只出现有变化文档、且草稿克隆行会让 `lineage_id` 指向源文档的问题）。
+    """
+
+    id: str
+    lineage_id: str | None = None
+    title: str
+    filename: str
+    status: str
+    bucket_count: int
+    chunk_count: int
+    updated_at: str
 
 
 class KnowledgeRebaseRequest(BaseModel):
