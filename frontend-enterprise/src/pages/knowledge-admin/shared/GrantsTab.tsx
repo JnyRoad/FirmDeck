@@ -100,11 +100,19 @@ export function GrantsTab({ api, kb }: GrantsTabProps) {
       ]);
       const candidateIds = new Set(candidates.map((team) => team.id));
       const boundTeamOptions = allTeams.filter((team) => !candidateIds.has(team.id));
-      const rows = await Promise.all(boundTeamOptions.map((team) => loadBoundTeamRow(team)));
+      // `allSettled` 而不是 `all`：单个群组的绑定/名册查询失败（成员接口 500、群组刚被
+      // 删掉）不该把整个「群组与权限」页打成加载失败——其余群组的权限矩阵照常可用。
+      // 失败的那些只是不出现在列表里，并统一提示一次。
+      const settled = await Promise.allSettled(boundTeamOptions.map((team) => loadBoundTeamRow(team)));
       // 过期响应（重复刷新交错、租户代际已变）整个丢弃，见 useGuardedLoad（I1）。
       if (!listLoad.isCurrent(token)) return;
-      setBoundRows(rows.filter((row): row is BoundTeamRow => row !== null));
+      setBoundRows(settled.flatMap((result) => (
+        result.status === 'fulfilled' && result.value !== null ? [result.value] : []
+      )));
       setCandidateTeams(candidates);
+      if (settled.some((result) => result.status === 'rejected')) {
+        toast.errorDescriptor(createMessageDescriptor('knowledgeAdmin.grants.toast.partialLoadFailed'));
+      }
     } catch (error) {
       if (!listLoad.isCurrent(token)) return;
       toast.error(error, 'knowledgeAdmin.grants.toast.loadFailed');

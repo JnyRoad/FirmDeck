@@ -38,6 +38,7 @@ import { ContentTab as PrivateContentTab } from './private/ContentTab';
 import { AuditTab } from './shared/AuditTab';
 import { ContentTab } from './shared/ContentTab';
 import { useKnowledgeAdminToast } from './shared/errorMessage';
+import { useGuardedLoad } from './shared/useGuardedLoad';
 import { GrantsTab } from './shared/GrantsTab';
 import { PlaceholderTab } from './shared/PlaceholderTab';
 import { SettingsTab } from './shared/SettingsTab';
@@ -120,11 +121,19 @@ export default function KnowledgeAdminDetailPage({ currentUser, onLogout }: Know
   /** 私有库归属员工 id/展示名；私有 Tab 集（内容/分支）与转共享向导都靠它驱动分支范围调用。 */
   const [ownerAgentName, setOwnerAgentName] = useState('');
   const [conversionOpen, setConversionOpen] = useState(false);
+  /**
+   * 过期响应护栏（I1）：`load()` 串了 4 个 await（admin 详情 → 员工侧详情 → 员工列表 →
+   * 版本列表），而 effect 的依赖里有 `kbId`——在两个知识库之间来回跳转时，先发出的那一
+   * 轮完全可能后返回，把上一个库的名称/模式/归属员工/草稿数整套盖到当前页面上。
+   * 租户代际检查（原本只有这一道）拦不住同租户内的换库。用序号线一并覆盖两种情况。
+   */
+  const detailLoad = useGuardedLoad();
 
   async function load() {
     const context = tenantContext;
     const generation = context?.generation;
     if (!context || generation === undefined || !kbId) return;
+    const token = detailLoad.begin();
     setLoading(true);
     setLoadFailed(false);
     try {
@@ -133,7 +142,7 @@ export default function KnowledgeAdminDetailPage({ currentUser, onLogout }: Know
       // 卡在 Loading（T077 缺陷 1）。改用 admin 端点作为首次也是共享库唯一一次拉取，
       // 对共享/专用库都不需要 `agent_id` 即可读取。
       const adminItem = await api.getAdminKnowledgeBase(kbId);
-      if (!context.isCurrentGeneration(generation)) return;
+      if (!detailLoad.isCurrent(token)) return;
       let result: KnowledgeBaseRead = mapAdminItemToKb(adminItem, context.tenantId);
       if (adminItem.mode === 'dedicated') {
         // admin 列表项没有 `bucket_count`/`chunk_count`，且 `branch_*` 由后端在拿到具体
@@ -144,17 +153,17 @@ export default function KnowledgeAdminDetailPage({ currentUser, onLogout }: Know
         if (ownerId) {
           try {
             const scoped = await api.getKnowledgeBase(kbId, ownerId);
-            if (!context.isCurrentGeneration(generation)) return;
+            if (!detailLoad.isCurrent(token)) return;
             result = scoped;
           } catch {
-            if (!context.isCurrentGeneration(generation)) return;
+            if (!detailLoad.isCurrent(token)) return;
           }
           try {
             const agents = await api.listAgents();
-            if (!context.isCurrentGeneration(generation)) return;
+            if (!detailLoad.isCurrent(token)) return;
             setOwnerAgentName(agents.find((agent) => agent.id === ownerId)?.name || '');
           } catch {
-            if (!context.isCurrentGeneration(generation)) return;
+            if (!detailLoad.isCurrent(token)) return;
             setOwnerAgentName('');
           }
         } else {
@@ -171,11 +180,11 @@ export default function KnowledgeAdminDetailPage({ currentUser, onLogout }: Know
         // 成"未知"，交给删除确认对话框自己的文案说明。
         try {
           const versions = await api.listVersions(kbId);
-          if (!context.isCurrentGeneration(generation)) return;
+          if (!detailLoad.isCurrent(token)) return;
           setDraftCount(versions.filter((version) => version.publication_state === PublicationState.Draft).length);
           setDraftCountUnknown(false);
         } catch {
-          if (!context.isCurrentGeneration(generation)) return;
+          if (!detailLoad.isCurrent(token)) return;
           setDraftCountUnknown(true);
         }
       } else {
@@ -183,11 +192,11 @@ export default function KnowledgeAdminDetailPage({ currentUser, onLogout }: Know
         setDraftCountUnknown(false);
       }
     } catch (error) {
-      if (!context.isCurrentGeneration(generation)) return;
+      if (!detailLoad.isCurrent(token)) return;
       toast.error(error, 'knowledgeAdmin.detail.loadError');
       setLoadFailed(true);
     } finally {
-      if (context.isCurrentGeneration(generation)) setLoading(false);
+      if (detailLoad.isCurrent(token)) setLoading(false);
     }
   }
 

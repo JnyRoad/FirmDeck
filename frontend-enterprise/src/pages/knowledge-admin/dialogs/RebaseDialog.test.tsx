@@ -93,6 +93,7 @@ function makePreview(overrides: Partial<RebasePreview> = {}): RebasePreview {
             context_after: [],
           },
         ],
+        merged_text: ['<<<<<<< ours', '草稿版', '=======', '正式版', '>>>>>>> theirs'].join('\n'),
       },
     ],
     ...overrides,
@@ -118,7 +119,7 @@ function renderDialog(props: Partial<ComponentProps<typeof RebaseDialog>> = {}) 
   const api = createMockApi();
   const onOpenChange = vi.fn();
   const onRebased = vi.fn();
-  const utils = render(
+  const element = (extra: Partial<ComponentProps<typeof RebaseDialog>> = {}) => (
     <I18nProvider>
       <RebaseDialog
         open
@@ -128,10 +129,16 @@ function renderDialog(props: Partial<ComponentProps<typeof RebaseDialog>> = {}) 
         draft={makeDraft()}
         onRebased={onRebased}
         {...props}
+        {...extra}
       />
-    </I18nProvider>,
+    </I18nProvider>
   );
-  return { ...utils, api, onOpenChange, onRebased };
+  const utils = render(element());
+  /** 以同一份 props 重渲染，只覆盖传入的字段（用于开/关对话框而不重新挂载组件）。 */
+  const rerenderDialog = (extra: Partial<ComponentProps<typeof RebaseDialog>> = {}) => {
+    utils.rerender(element(extra));
+  };
+  return { ...utils, api, onOpenChange, onRebased, rerenderDialog };
 }
 
 afterEach(() => {
@@ -270,6 +277,7 @@ describe('RebaseDialog', () => {
           lineage_id: 'kdoc_bing',
           title: '文档丙',
           blocks: [{ base_lines: ['原文丙'], ours_lines: ['草稿丙'], theirs_lines: ['正式丙'], context_before: [], context_after: [] }],
+          merged_text: ['<<<<<<< ours', '草稿丙', '=======', '正式丙', '>>>>>>> theirs'].join('\n'),
         },
       ],
     });
@@ -308,12 +316,28 @@ describe('RebaseDialog', () => {
 
   it('resets resolutions on a fresh start, not only on retry (I10)', async () => {
     const user = userEvent.setup();
-    const { api } = renderDialog();
+    const { api, rerenderDialog } = renderDialog();
     api.rebaseDraft.mockResolvedValue(makePreview());
 
+    // 第一轮：预览 → 真的把「文档甲」合并掉，进度变成 1/1。
     await user.type(screen.getByLabelText('变基原因'), '基线过期，需要变基');
     await user.click(screen.getByRole('button', { name: '开始变基' }));
     await screen.findByText('文档甲');
+    await user.click(screen.getByRole('button', { name: '去合并' }));
+    await user.click(screen.getByRole('button', { name: 'stub-complete-kdoc_jia' }));
+    expect(screen.getByText('已解决 1/1 篇冲突文档')).toBeTruthy();
+
+    // 关闭再打开＝回到「填写变基原因」这一步（对话框没有独立的返回按钮，重新打开
+    // 就是唯一的"重新开始"入口）。
+    rerenderDialog({ open: false });
+    rerenderDialog({ open: true });
+    expect(screen.getByLabelText('变基原因')).toBeTruthy();
+
+    // 第二轮：同一份预览重新到手时，上一轮的合并结果必须被清空，而不是被当成"已解决"。
+    await user.type(screen.getByLabelText('变基原因'), '再来一次');
+    await user.click(screen.getByRole('button', { name: '开始变基' }));
+    await screen.findByText('文档甲');
     expect(screen.getByText('已解决 0/1 篇冲突文档')).toBeTruthy();
+    expect((screen.getByRole('button', { name: '完成变基' }) as HTMLButtonElement).disabled).toBe(true);
   });
 });

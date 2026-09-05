@@ -222,9 +222,9 @@ function LocationEcho() {
   return <div data-testid="location">{`${location.pathname}${location.search}`}</div>;
 }
 
-function renderPage() {
+function renderPage(options: { locale?: 'zh-CN' | 'en-US' } = {}) {
   return render(
-    <I18nProvider>
+    <I18nProvider locale={options.locale}>
       <MemoryRouter initialEntries={['/enterprise/knowledge-admin']}>
         <Routes>
           <Route path="/enterprise/knowledge-admin" element={<KnowledgeAdminListPage />} />
@@ -241,6 +241,40 @@ afterEach(() => {
 });
 
 describe('KnowledgeAdminListPage', () => {
+  // 已绑定群组名的连接符是界面文案，不是数据的一部分：中文顿号硬编码后，英文界面里
+  // 也会出现「Support、Sales」。用 `Intl.ListFormat` 跟随当前 locale。
+  it('joins bound team names with the locale list separator (en-US uses ", ")', async () => {
+    const multiTeam: KnowledgeAdminListItem = {
+      ...sharedBound,
+      id: 'kb_shared_multi',
+      name: 'Support playbook',
+      bound_teams: [
+        { id: 'team_1', name: 'Support', is_default: true },
+        { id: 'team_2', name: 'Sales', is_default: false },
+      ],
+    };
+    primeDefaultMocks([multiTeam]);
+    renderPage({ locale: 'en-US' });
+
+    expect(await screen.findByText('Support, Sales')).toBeTruthy();
+    expect(screen.queryByText('Support、Sales')).toBeNull();
+  });
+
+  it('joins bound team names with the Chinese enumeration comma under zh-CN', async () => {
+    const multiTeam: KnowledgeAdminListItem = {
+      ...sharedBound,
+      id: 'kb_shared_multi',
+      bound_teams: [
+        { id: 'team_1', name: '客服一组', is_default: true },
+        { id: 'team_2', name: '销售二组', is_default: false },
+      ],
+    };
+    primeDefaultMocks([multiTeam]);
+    renderPage({ locale: 'zh-CN' });
+
+    expect(await screen.findByText('客服一组、销售二组')).toBeTruthy();
+  });
+
   it('shows stat cards and rows for shared and dedicated knowledge bases, with an unbound hint', async () => {
     primeDefaultMocks();
     renderPage();

@@ -164,4 +164,45 @@ describe('PublishDialog', () => {
     expect(onSubmit).toHaveBeenCalledWith({ level: 'patch', changeReason: '强制覆盖发布', forceOverwrite: true });
     expect(onSubmit).toHaveBeenCalledTimes(1);
   });
+
+  // 冲突数未知（对比还在飞 / 已失败）时不能白纸黑字写「0 处」——那正好把最需要警惕的
+  // 一刻粉饰成最安全的读数。改成不带数字的文案。
+  it('stale draft: while the diff is still loading, the notice does not claim a conflict count', async () => {
+    let resolveDiff: ((value: unknown) => void) | undefined;
+    const api = {
+      getVersionDiff: vi.fn().mockReturnValue(new Promise((resolve) => {
+        resolveDiff = resolve;
+      })),
+    };
+    renderDialog({ draft: makeDraft({ is_stale: true }), api: api as unknown as ComponentProps<typeof PublishDialog>['api'] });
+
+    const notice = await screen.findByRole('alert');
+    expect(notice.textContent).toBe('基线已变化，冲突文档数暂不可用。');
+    expect(notice.textContent).not.toContain('0');
+
+    resolveDiff?.({
+      base_version_id: 'kbver_new_pub',
+      target_version_id: 'kbver_draft_1',
+      pairing: 'lineage',
+      summary: { added: 1, modified: 2, deleted: 0 },
+      documents: [],
+    });
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toContain('3'));
+  });
+
+  it('stale draft: a failed diff keeps both the notice and the overwrite confirmation count-free', async () => {
+    const user = userEvent.setup();
+    const api = { getVersionDiff: vi.fn().mockRejectedValue(new Error('boom')) };
+    renderDialog({ draft: makeDraft({ is_stale: true }), api: api as unknown as ComponentProps<typeof PublishDialog>['api'] });
+
+    await waitFor(() => expect(api.getVersionDiff).toHaveBeenCalled());
+    await waitFor(() => {
+      expect(screen.getByRole('alert').textContent).toBe('基线已变化，冲突文档数暂不可用。');
+    });
+
+    await user.click(screen.getByRole('button', { name: '仍然覆盖发布' }));
+    const confirmText = screen.getByText(/对方已发布的 v1\.0\.1/).textContent ?? '';
+    expect(confirmText).toContain('数量未知');
+    expect(confirmText).not.toContain('0 处');
+  });
 });

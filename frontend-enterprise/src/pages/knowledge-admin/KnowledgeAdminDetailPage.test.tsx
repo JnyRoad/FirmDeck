@@ -6,9 +6,9 @@
  * 名称/描述/能力范围、上线/下线、删除。`api/knowledgeAdmin.ts` 整体 mock。
  */
 import type { ComponentProps, ReactElement } from 'react';
-import { cleanup, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
+import { MemoryRouter, Route, Routes, useLocation, useNavigate } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { TooltipProvider } from '@/components/ui/tooltip';
@@ -194,6 +194,32 @@ function LocationEcho() {
   return <div data-testid="location">{`${location.pathname}${location.search}`}</div>;
 }
 
+/** 在同一个 MemoryRouter 内切换 `:kbId`——组件实例被复用，`load()` 会重跑一次。 */
+function KbSwitchButton({ to, label }: { to: string; label: string }) {
+  const navigate = useNavigate();
+  return (
+    <button type="button" onClick={() => navigate(to)}>
+      {label}
+    </button>
+  );
+}
+
+function renderDetailWithSwitch(initialEntry: string, switchTo: string) {
+  return render(
+    <I18nProvider>
+      <TooltipProvider>
+        <MemoryRouter initialEntries={[initialEntry]}>
+          <KbSwitchButton to={switchTo} label="switch-kb" />
+          <Routes>
+            <Route path="/enterprise/knowledge-admin/:kbId" element={<KnowledgeAdminDetailPage />} />
+            <Route path="/enterprise/knowledge-admin" element={<LocationEcho />} />
+          </Routes>
+        </MemoryRouter>
+      </TooltipProvider>
+    </I18nProvider>,
+  );
+}
+
 function renderDetail(initialEntry: string) {
   return render(
     <I18nProvider>
@@ -236,6 +262,42 @@ afterEach(() => {
 });
 
 describe('KnowledgeAdminDetailPage', () => {
+  // `load()` 串了 4 个 await，而 effect 依赖里有 `kbId`：在两个库之间跳转时，先发出的
+  // 那一轮完全可能后返回。租户代际检查（同租户内代际不变）拦不住它，只有请求序号能。
+  it('discards a stale load() response after navigating to another knowledge base', async () => {
+    const user = userEvent.setup();
+    let resolveShared: ((value: KnowledgeAdminListItem) => void) | undefined;
+    const sharedPending = new Promise<KnowledgeAdminListItem>((resolve) => {
+      resolveShared = resolve;
+    });
+    mockApi.getAdminKnowledgeBase.mockImplementation((id: string) => {
+      if (id === sharedKb.id) return sharedPending;
+      if (id === dedicatedKb.id) return Promise.resolve(dedicatedAdminItem);
+      return Promise.reject(new Error(`unexpected kbId ${id}`));
+    });
+    mockApi.getKnowledgeBase.mockResolvedValue(dedicatedKb);
+
+    renderDetailWithSwitch(
+      `/enterprise/knowledge-admin/${sharedKb.id}`,
+      `/enterprise/knowledge-admin/${dedicatedKb.id}`,
+    );
+
+    // 第一轮还挂着，切到第二个库，它先返回并渲染。
+    await user.click(screen.getByRole('button', { name: 'switch-kb' }));
+    await screen.findByText('客服话术库');
+
+    // 第一轮这时才返回：必须被整个丢弃，不能把上一个库盖回来。
+    await act(async () => {
+      resolveShared?.(sharedAdminItem);
+      await sharedPending;
+    });
+
+    expect(screen.queryByText('产品 FAQ 共享库')).toBeNull();
+    expect(screen.getByText('客服话术库')).toBeTruthy();
+    expect(screen.getByRole('tab', { name: '分支' })).toBeTruthy();
+    expect(screen.queryByRole('tab', { name: '版本管理' })).toBeNull();
+  });
+
   it('renders the shared tab set (content/versions/grants/audit/settings)', async () => {
     mockApi.getKnowledgeBase.mockResolvedValue(sharedKb);
     renderDetail('/enterprise/knowledge-admin/kb_shared_1');

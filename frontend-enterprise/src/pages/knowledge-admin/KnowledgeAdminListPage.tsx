@@ -92,11 +92,20 @@ export type KnowledgeAdminListPageProps = {
 
 export default function KnowledgeAdminListPage({ currentUser, onLogout }: KnowledgeAdminListPageProps = {}) {
   const navigate = useNavigate();
-  const { t } = useAppIntl();
+  const { t, locale } = useAppIntl();
   const toast = useKnowledgeAdminToast();
   const tenantContext = useTenantSession();
   const api = useMemo(() => createKnowledgeAdminApi(tenantContext), [tenantContext]);
   const uiSinks = useMemo(() => createUiSinks({ t }), [t]);
+  /**
+   * 已绑定群组名的连接方式必须跟随界面语言：中文的顿号「、」在英文里应当是 `, `。
+   * `type: 'conjunction' + style: 'narrow'` 是唯一同时给出 zh 顿号和 en 逗号的组合
+   * （`type: 'unit'` 在 zh 下退化成完全没有分隔符）。
+   */
+  const teamNameListFormat = useMemo(
+    () => new Intl.ListFormat(locale, { type: 'conjunction', style: 'narrow' }),
+    [locale],
+  );
 
   const [items, setItems] = useState<KnowledgeAdminListItem[]>([]);
   const [summary, setSummary] = useState<KnowledgeAdminListSummary>(EMPTY_SUMMARY);
@@ -351,7 +360,7 @@ export default function KnowledgeAdminListPage({ currentUser, onLogout }: Knowle
     if (isUnboundSharedKnowledgeBase(row)) {
       return <span className="text-[#c65f00]">{t('knowledgeAdmin.list.unbound')}</span>;
     }
-    return <RawContent value={row.bound_teams.map((team) => team.name).join('、')} />;
+    return <RawContent value={teamNameListFormat.format(row.bound_teams.map((team) => team.name))} />;
   }
 
   function renderVersionStatus(row: KnowledgeAdminListItem) {

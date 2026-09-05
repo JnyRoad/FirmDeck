@@ -451,6 +451,65 @@ describe('ReviewEditor — documents 变化时的状态对账（I3）', () => {
     expect(out.docs.map((doc) => doc.lineageId)).toEqual(['d2']);
     expect(out.docs[0].lines).toEqual(['x', 'Z']);
   });
+
+  // 同一个 lineageId 的正文也会变（写回草稿后重新拉对比、别人并发改了同一篇）。
+  // 只按 id 对账会留着旧状态，编辑器继续显示上一版正文，"应用到草稿"会把它写回去。
+  it('re-seeds a document whose incoming base/current content changed under the same lineageId', () => {
+    const onChange = vi.fn<(state: ReviewEditorOutput) => void>();
+    const { rerender } = render(
+      <ReviewEditor
+        documents={[{ lineageId: 'd1', title: 'doc1.md', kind: 'modified', base: 'a\nb', current: 'a\nB' }]}
+        labels={labels}
+        onChange={onChange}
+      />,
+    );
+    expect(lastOutput(onChange).docs[0].lines).toEqual(['a', 'B']);
+
+    act(() => {
+      rerender(
+        <ReviewEditor
+          documents={[{ lineageId: 'd1', title: 'doc1.md', kind: 'modified', base: 'a\nb', current: 'a\nC\nd' }]}
+          labels={labels}
+          onChange={onChange}
+        />,
+      );
+    });
+
+    const out = lastOutput(onChange);
+    expect(out.docs.map((doc) => doc.lineageId)).toEqual(['d1']);
+    expect(out.docs[0].lines).toEqual(['a', 'C', 'd']);
+  });
+
+  it('keeps in-progress edits when the same ids arrive with identical base/current content', () => {
+    const documents = [{ lineageId: 'd1', title: 'doc1.md', kind: 'modified' as const, base: 'a\nb\nc', current: 'a\nX\nc' }];
+    const onChange = vi.fn<(state: ReviewEditorOutput) => void>();
+    const { container, rerender } = render(
+      <ReviewEditor documents={documents} labels={labels} onChange={onChange} />,
+    );
+
+    // 接受这一处变更，产生一条暂存记录。
+    act(() => {
+      container.querySelectorAll<HTMLElement>('button')
+        .forEach((button) => {
+          if (button.textContent === labels.acceptButton) button.click();
+        });
+    });
+    const staged = lastOutput(onChange).stagedCount;
+    expect(staged).toBeGreaterThan(0);
+
+    // 同样的 id、同样的 base/current，只是父组件重建了数组引用：编辑不能被清掉。
+    act(() => {
+      rerender(
+        <ReviewEditor
+          documents={documents.map((doc) => ({ ...doc }))}
+          labels={labels}
+          onChange={onChange}
+        />,
+      );
+    });
+
+    expect(lastOutput(onChange).stagedCount).toBe(staged);
+  });
 });
 
 describe('ReviewEditor — 拖拽移动文本不走单行快路径（I4）', () => {

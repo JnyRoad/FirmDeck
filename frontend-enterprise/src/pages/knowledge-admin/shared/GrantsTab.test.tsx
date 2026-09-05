@@ -262,6 +262,36 @@ describe('GrantsTab', () => {
     ).toBeGreaterThan(listBindableTeamsCallsBefore));
   });
 
+  // 单个群组的绑定/名册查询失败不该把整个「群组与权限」页打成加载失败：`Promise.all`
+  // 会让第一个 reject 冒到外层 catch，其余群组的权限矩阵一起消失。
+  it('renders the bound teams that did load and warns once when some of them failed', async () => {
+    stubTeamMembersFetch();
+    const failingTeamOption: KnowledgeAdminTeamOption = { id: 'team-3', name: '故障三组', member_count: 1 };
+    const api = createMockApi({
+      listBindableTeams: vi.fn().mockImplementation((params: { excludeBoundTo?: string } = {}) => (
+        params.excludeBoundTo
+          ? Promise.resolve([candidateTeamOption])
+          : Promise.resolve([boundTeamOption, failingTeamOption, candidateTeamOption])
+      )),
+      listTeamBindings: vi.fn().mockImplementation((teamId: string) => (
+        teamId === 'team-1' ? Promise.resolve([makeBinding()]) : Promise.reject(new Error('boom'))
+      )),
+    } as unknown as Partial<KnowledgeAdminApi>);
+    renderGrantsTab(api);
+
+    // 成功的那个群组照常渲染出完整的权限矩阵。
+    const card = await screen.findByRole('region', { name: '客服一组 的知识库绑定' });
+    expect(within(card).getByText('小艾')).toBeTruthy();
+    expect(screen.queryByRole('region', { name: '故障三组 的知识库绑定' })).toBeNull();
+
+    // 失败的那些只提示一次。
+    await waitFor(() => expect(sonnerSpies.custom).toHaveBeenCalledTimes(1));
+    const renderer = sonnerSpies.custom.mock.calls[0]?.[0];
+    const { container } = render((renderer as () => ReactElement)());
+    expect(container.textContent).toContain('部分群组的绑定信息加载失败，列表可能不完整。');
+    expect(container.textContent).not.toContain('加载群组绑定失败');
+  });
+
   it('renders the contract message for a registered backend error code instead of the generic fallback', async () => {
     // I12：GrantsTab 之前用裸 `catch {}` + 固定 descriptor，任何失败都显示"保存权限矩阵
     // 失败"，把已注册错误码的具体说明整个丢掉。迁到 `useKnowledgeAdminToast().error(error, …)`

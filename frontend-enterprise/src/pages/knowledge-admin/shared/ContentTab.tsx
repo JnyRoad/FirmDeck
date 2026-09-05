@@ -705,6 +705,17 @@ export function ContentTab({ api, kb, onChanged }: ContentTabProps) {
                 {t('knowledgeAdmin.content.viewSwitcher.draftOption', { name: version.draft_name || version.version })}
               </SelectItem>
             ))}
+            {/*
+              `?view=` 也可以指向一个具体的 released/rejected 历史版本（版本 Tab 的
+              「查看内容」就是这么跳过来的），而下拉里只有「正式版本」+ 各个草稿——
+              选中值找不到对应 `SelectItem` 时 Radix 的 `SelectValue` 只能显示空白，
+              管理员看到的是一个没有当前值的下拉框。为选中的非草稿版本补一个选项。
+            */}
+            {selectedVersion && !isDraftView && (
+              <SelectItem value={selectedVersion.id}>
+                {t('knowledgeAdmin.content.viewSwitcher.versionOption', { version: formatVersion(selectedVersion.version) })}
+              </SelectItem>
+            )}
           </SelectContent>
         </Select>
       </div>

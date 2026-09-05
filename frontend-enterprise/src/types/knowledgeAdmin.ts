@@ -168,11 +168,20 @@ export type RebaseConflictBlock = {
   context_after: string[];
 };
 
-/** A3/A4 变基冲突单篇文档：包含一到多个冲突区块。 */
+/**
+ * A3/A4 变基冲突单篇文档：包含一到多个冲突区块。
+ *
+ * `merged_text` 是这篇文档的**完整三方合并结果**：无冲突的 hunk 已经就地合并好，
+ * 每一处冲突原样保留成一个行锚定的 Git 冲突区（`<<<<<<< ours` / `=======` /
+ * `>>>>>>> theirs`，行之间以 `\n` 连接）。第 i 个冲突区与 `blocks[i]` 一一对应。
+ * 前端合并界面必须以它为底稿逐区替换（见 `dialogs/MergeDialog.tsx`）——只拼
+ * `blocks[]` 的 `context_before`/`context_after` 会丢掉冲突区之外的所有正文。
+ */
 export type RebaseConflictDocument = {
   lineage_id: string;
   title: string;
   blocks: RebaseConflictBlock[];
+  merged_text: string;
 };
 
 /**

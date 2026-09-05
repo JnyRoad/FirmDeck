@@ -128,11 +128,17 @@ export interface ReviewEditorProps {
 interface DocInternalState {
   staging: StagingState;
   restore: boolean;
+  /** 这份状态是用哪一版 `base`/`current` 播种的；入参内容变了就必须重新播种（见下方对账 effect）。 */
+  seededFrom: { base: string; current: string };
 }
 
 /** 用文档输入初始化一份暂存状态：stagedBase 从 base 起步，lines 从 current 起步。 */
 function createInitialDocState(doc: ReviewEditorDocumentInput): DocInternalState {
-  return { staging: createState(splitLines(doc.base), splitLines(doc.current)), restore: false };
+  return {
+    staging: createState(splitLines(doc.base), splitLines(doc.current)),
+    restore: false,
+    seededFrom: { base: doc.base, current: doc.current },
+  };
 }
 
 /** 字符串数组浅比较，用于判断整篇文档是否仍等于初始内容。 */
@@ -160,6 +166,13 @@ export function ReviewEditor({ documents, onChange, labels }: ReviewEditorProps)
    * pending，于是"应用到草稿"按钮仍然可点，`updateDocument(contentMd: '')` 会把整篇
    * 文档清空。这里补一个对账 effect：新增的文档补 seed、已消失的文档丢弃状态；
    * 集合没变化时返回原引用，effect 幂等、不会自触发。
+   *
+   * 只按 lineageId 对账还不够：**同一个 lineageId 的 `base`/`current` 内容也会变**
+   * （写回草稿后重新拉对比、别人并发改了同一篇）。那种情况下继续留着旧状态，编辑器里
+   * 显示的就是上一版正文与上一版 hunk 划分，而"应用到草稿"会把这份陈旧正文写回去。
+   * 因此改成按「id 相同**且**播种用的 base/current 都没变」才保留用户编辑，
+   * 内容一变就整篇重新播种（用户在这一篇上的暂存被丢弃，这是正确的：它依据的底稿
+   * 已经不存在了）。
    */
   useEffect(() => {
     setDocStates((prev) => {
@@ -167,7 +180,7 @@ export function ReviewEditor({ documents, onChange, labels }: ReviewEditorProps)
       let changed = Object.keys(prev).length !== documents.length;
       for (const doc of documents) {
         const existing = prev[doc.lineageId];
-        if (existing) {
+        if (existing && existing.seededFrom.base === doc.base && existing.seededFrom.current === doc.current) {
           next[doc.lineageId] = existing;
         } else {
           next[doc.lineageId] = createInitialDocState(doc);

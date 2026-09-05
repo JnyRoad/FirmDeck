@@ -7,7 +7,7 @@
  * （`listVersions` 重新拉取返回新的 head）且列表随之刷新，`onChanged` 被调用。
  */
 import type { ReactElement } from 'react';
-import { cleanup, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -104,6 +104,15 @@ function createMockApi() {
     updateDocument: vi.fn().mockResolvedValue({ id: 'doc_a' }),
     archiveDocument: vi.fn().mockResolvedValue({ id: 'doc_a' }),
   };
+}
+
+/** 外部可控的 Promise：让测试精确决定某个请求何时返回。 */
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((res) => {
+    resolve = res;
+  });
+  return { promise, resolve };
 }
 
 function renderTab(mockApi: ReturnType<typeof createMockApi>, onChanged = vi.fn()) {
@@ -256,6 +265,68 @@ describe('private ContentTab', () => {
     await waitFor(() => expect((contentBox as HTMLTextAreaElement).value).toBe('已有正文'));
     expect(screen.queryByRole('alert')).toBeNull();
     expect((screen.getByRole('button', { name: '保存' }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  // 私有库每次写入都让分支头 +1：版本列表一开始重拉，旧头版本的文档就已经过期了。
+  // 它们的 id 拿去删除/恢复会打到不属于新头版本的对象，所以必须立刻清空并禁用行级操作。
+  it('clears the document table and its row actions while a version reload is in flight', async () => {
+    const user = userEvent.setup();
+    const api = createMockApi();
+    renderTab(api);
+
+    await screen.findByText('话术文档 A');
+
+    api.listVersions.mockResolvedValueOnce([headVersionV4, headVersionV3, baseVersionV2]);
+    const pendingDocs = deferred<VersionDocument[]>();
+    api.listVersionDocuments.mockReturnValueOnce(pendingDocs.promise);
+
+    await user.click(screen.getByRole('button', { name: '删除' }));
+
+    // 新头版本的文档还没到手：旧头版本的行和它们的操作按钮都不能留在页面上。
+    await waitFor(() => expect(api.listVersionDocuments).toHaveBeenLastCalledWith('kb_1', 'kbver_4'));
+    expect(screen.queryByText('话术文档 A')).toBeNull();
+    expect(screen.queryByRole('button', { name: '删除' })).toBeNull();
+    expect(screen.queryByRole('button', { name: '编辑' })).toBeNull();
+
+    pendingDocs.resolve([docB]);
+    expect(await screen.findByText('新上传文档')).toBeTruthy();
+    expect(screen.getByRole('button', { name: '删除' })).toBeTruthy();
+  });
+
+  // `openEdit` 里的 `getDocument` 是异步的：为 A 发出的响应迟到时，绝不能灌进为 B 打开的
+  // 编辑框——保存下去就是拿 A 的正文覆盖 B。
+  it('ignores a late getDocument response for a document whose edit dialog was already replaced', async () => {
+    const user = userEvent.setup();
+    const api = createMockApi();
+    api.listVersionDocuments.mockResolvedValue([docA, docB]);
+    const pendingA = deferred<{ id: string; metadata: Record<string, unknown> }>();
+    api.getDocument.mockImplementation((id: string) => (
+      id === 'doc_a'
+        ? pendingA.promise
+        : Promise.resolve({ id: 'doc_b', metadata: { raw_text: 'B 的正文' } })
+    ));
+    renderTab(api);
+
+    await screen.findByText('话术文档 A');
+
+    // 先点开 A（正文请求挂起），关掉，再点开 B。
+    await user.click(screen.getAllByRole('button', { name: '编辑' })[0]);
+    await screen.findByRole('dialog');
+    await user.click(screen.getByRole('button', { name: '取消' }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+
+    await user.click(screen.getAllByRole('button', { name: '编辑' })[1]);
+    const contentBox = await screen.findByLabelText('正文');
+    await waitFor(() => expect((contentBox as HTMLTextAreaElement).value).toBe('B 的正文'));
+
+    // A 的响应这时才回来：必须被整个丢弃。
+    await act(async () => {
+      pendingA.resolve({ id: 'doc_a', metadata: { raw_text: 'A 的正文' } });
+      await pendingA.promise;
+    });
+
+    expect((screen.getByLabelText('正文') as HTMLTextAreaElement).value).toBe('B 的正文');
+    expect((screen.getByLabelText('标题') as HTMLInputElement).value).toBe('新上传文档');
   });
 
   it('shows the registered error code\'s specific localized text (not the generic fallback) when saving an edit conflicts', async () => {

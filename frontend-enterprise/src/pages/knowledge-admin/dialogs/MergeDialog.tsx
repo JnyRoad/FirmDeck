@@ -1,14 +1,22 @@
 /**
  * 知识库管理 · 变基逐篇合并对话框（US3，T058）：纯组件，不调用任何 API。
  *
- * 输入单篇文档的变基冲突 `RebaseConflictDocument`（`blocks[]`，每块含
- * `base_lines`/`ours_lines`/`theirs_lines`/`context_before`/`context_after`，见
- * data-model.md §5），按块渲染两栏对照（草稿 / 正式版）与四种选择（采用草稿 /
- * 采用正式版 / 两者都保留 / 编辑此段）；底部「合并结果」把每块的 `context_before`
- * + 该块当前解决方式对应的正文 + `context_after` 依次拼接——未解决的块保留纯 Git
- * 冲突标记（`<<<<<<<` / `=======` / `>>>>>>>`，不带本地化标签，见
- * `composeBlockSegment` 注释），已解决的块直接
- * 给出正文；结果区始终可手动编辑（编辑后即接管展示，不再跟随按钮重算），仍有
+ * 输入单篇文档的变基冲突 `RebaseConflictDocument`：`merged_text` 是后端算好的
+ * **完整三方合并文本**（无冲突的 hunk 已合并到位，每处冲突保留成行锚定的 Git 冲突区
+ * `<<<<<<< ours` / `=======` / `>>>>>>> theirs`），`blocks[i]` 与其中第 i 个冲突区
+ * 一一对应，含 `base_lines`/`ours_lines`/`theirs_lines`/`context_before`/`context_after`
+ * （见 data-model.md §5）。
+ *
+ * 上半部分按 `blocks[i]` 渲染两栏对照（草稿 / 正式版）与四种选择（采用草稿 /
+ * 采用正式版 / 两者都保留 / 编辑此段）；底部「合并结果」**始终以 `merged_text` 为底稿**，
+ * 只把第 i 个冲突区整体替换成该块所选一侧的正文，未解决的冲突区原样留着等人工编辑。
+ *
+ * 这一点是数据完整性要求，不是实现细节：旧实现按块拼
+ * `context_before + 正文 + context_after`，冲突区之外（首块之前、末块之后、相隔较远的
+ * 两块之间）的正文会被整段丢掉，相邻两块共享的上下文还会被重复写入一次，而这段文本
+ * 会原样经 `onComplete` → `resolveRebase(content_md)` 落库。
+ *
+ * 结果区始终可手动编辑（编辑的是整篇全文；编辑后即接管展示，不再跟随按钮重算），仍有
  * 残留标记时「完成」禁用。完成时输出 `{lineageId, contentMd}`（与
  * `api/knowledgeAdmin.ts` 的 `RebaseResolution` 同形，供 `RebaseDialog` 收集后一并
  * 提交 `resolveRebase`）。
@@ -56,35 +64,105 @@ export function hasConflictMarkers(text: string): boolean {
 }
 
 /**
- * 未解决块的占位写法：只用**纯 Git 冲突标记**，不带任何本地化标签。
+ * 已解决块要写回冲突区的正文行。
  *
- * 这段文本会经 `onComplete` 原样进入 `resolveRebase` 的 `content_md`，是要落库的
- * **文档正文**，不是界面文案——之前把「草稿」/「正式版」两个产品译文拼进标记行
- * （`<<<<<<< 草稿`），等于把 UI 语言写进了知识库内容，而且后端
+ * 只用**纯 Git 冲突标记**、不带任何本地化标签（`unresolved` 分支只在没有
+ * `merged_text` 的降级路径下才会被用到，正常路径直接保留后端原始冲突区）：这段文本会经
+ * `onComplete` 原样进入 `resolveRebase` 的 `content_md`，是要落库的**文档正文**，
+ * 不是界面文案——之前把「草稿」/「正式版」两个产品译文拼进标记行（`<<<<<<< 草稿`），
+ * 等于把 UI 语言写进了知识库内容，而且后端
  * （`backend/app/knowledge/rebase.py::_has_conflict_markers`）识别的是行首锚定的
  * `<<<<<<<` / `=======` / `>>>>>>>` 本身。哪一侧是草稿、哪一侧是正式版由上方两栏
  * 对照（各自带本地化列头）说明，正文里不需要再重复一遍。
  */
-function composeBlockSegment(block: RebaseConflictBlock, resolution: BlockResolution): string {
-  const oursText = block.ours_lines.join('\n');
-  const theirsText = block.theirs_lines.join('\n');
-  if (resolution === 'ours') return oursText;
-  if (resolution === 'theirs') return theirsText;
-  if (resolution === 'both') return [oursText, theirsText].filter((part) => part.length > 0).join('\n');
-  return [MARKER_START, oursText, MARKER_MID, theirsText, MARKER_END].join('\n');
+function composeBlockLines(block: RebaseConflictBlock, resolution: BlockResolution): string[] {
+  if (resolution === 'ours') return block.ours_lines;
+  if (resolution === 'theirs') return block.theirs_lines;
+  if (resolution === 'both') return [...block.ours_lines, ...block.theirs_lines];
+  return [MARKER_START, ...block.ours_lines, MARKER_MID, ...block.theirs_lines, MARKER_END];
 }
 
-function composeDocument(conflict: RebaseConflictDocument, resolutions: BlockResolution[]): string {
+/** `merged_text` 切出来的一段：普通正文，或一个完整的 Git 冲突区（含三行标记）。 */
+type MergedSegment = { kind: 'text' | 'conflict'; lines: string[] };
+
+/**
+ * 把完整合并文本按**行锚定**的冲突标记切成「正文段 / 冲突区」序列，判定规则与
+ * `isMarkerLine`（以及后端 `_has_conflict_markers`）一致。冲突区的行原样保留，
+ * 未解决时直接写回结果，保证「未解决」这一态的文本与后端产出逐字节一致。
+ * 末尾若出现未闭合的冲突区，整段仍按冲突区返回——残留标记会让「完成」保持禁用。
+ */
+export function parseMergedSegments(mergedText: string): MergedSegment[] {
+  const segments: MergedSegment[] = [];
+  let text: string[] = [];
+  let conflict: string[] | null = null;
+
+  const flushText = () => {
+    if (text.length > 0) {
+      segments.push({ kind: 'text', lines: text });
+      text = [];
+    }
+  };
+
+  for (const line of mergedText.split('\n')) {
+    const trimmed = line.trim();
+    if (conflict === null) {
+      if (trimmed === MARKER_START || trimmed.startsWith(`${MARKER_START} `)) {
+        flushText();
+        conflict = [line];
+      } else {
+        text.push(line);
+      }
+      continue;
+    }
+    conflict.push(line);
+    if (trimmed === MARKER_END || trimmed.startsWith(`${MARKER_END} `)) {
+      segments.push({ kind: 'conflict', lines: conflict });
+      conflict = null;
+    }
+  }
+  if (conflict !== null) segments.push({ kind: 'conflict', lines: conflict });
+  flushText();
+  return segments;
+}
+
+/**
+ * `merged_text` 缺失时的降级底稿（只在后端还没带上该字段的旧响应里出现）：按块拼
+ * `context_before` + 冲突区 + `context_after`。它保留了旧实现「冲突区之外的正文可能
+ * 丢失/重复」的局限，但至少让界面仍能工作；正常路径永远走 `conflict.merged_text`。
+ */
+function fallbackMergedText(conflict: RebaseConflictDocument): string {
   return conflict.blocks
-    .map((block, index) => {
-      const segments = [
-        ...block.context_before,
-        composeBlockSegment(block, resolutions[index] ?? 'unresolved'),
-        ...block.context_after,
-      ];
-      return segments.join('\n');
-    })
+    .map((block) => [
+      ...block.context_before,
+      ...composeBlockLines(block, 'unresolved'),
+      ...block.context_after,
+    ].join('\n'))
     .join('\n');
+}
+
+/**
+ * 以完整合并文本为底稿组装结果：正文段原样保留，第 i 个冲突区按 `resolutions[i]`
+ * 替换成所选一侧的正文；未解决（或没有对应 block）的冲突区原样留下。
+ */
+export function composeDocument(conflict: RebaseConflictDocument, resolutions: BlockResolution[]): string {
+  const mergedText = conflict.merged_text || fallbackMergedText(conflict);
+  const lines: string[] = [];
+  let conflictIndex = -1;
+  for (const segment of parseMergedSegments(mergedText)) {
+    if (segment.kind === 'text') {
+      lines.push(...segment.lines);
+      continue;
+    }
+    conflictIndex += 1;
+    const block = conflict.blocks[conflictIndex];
+    const resolution = resolutions[conflictIndex] ?? 'unresolved';
+    if (!block || resolution === 'unresolved') {
+      lines.push(...segment.lines);
+      continue;
+    }
+    lines.push(...composeBlockLines(block, resolution));
+  }
+  return lines.join('\n');
 }
 
 /** 变基逐篇合并对话框：不调 API，输入冲突文档、输出该篇的最终合并结果。 */

@@ -97,8 +97,8 @@ export function PublishDialog({
       () => {
         // 冲突数拉取失败不阻塞发布框本身（stale 警示与"变基/仍然覆盖发布"选项照常
         // 展示），但必须显式吞掉——之前没有 rejection handler，一次失败就是一条
-        // unhandled rejection。`staleDiff` 保持 null，`conflictCount` 因此为 0，
-        // 属于已知的低估（见 final-fix 报告的遗留项）。
+        // unhandled rejection。`staleDiff` 保持 null，冲突数因此是**未知**（不是 0），
+        // 由下面的 `conflictCount === null` 分支改用不带数字的文案。
         if (!cancelled) setStaleDiff(null);
       },
     );
@@ -112,7 +112,14 @@ export function PublishDialog({
   const preview = draft.next_version_preview;
   const nextVersion = preview ? preview[level] : nextVersionLabel(draft.base_version, level);
   const { staged, pending } = reviewCounts(draft);
-  const conflictCount = staleDiff ? staleDiff.summary.added + staleDiff.summary.modified + staleDiff.summary.deleted : 0;
+  /**
+   * 冲突数；对比还在加载中或加载失败时为 `null`＝**未知**，不是 0。
+   * 之前一律取 0，于是 stale 警示和覆盖二次确认会在数据还没到手时白纸黑字写着
+   * 「0 处文档将被丢弃」——恰恰是最需要管理员警惕的那一刻给了最安全的读数。
+   */
+  const conflictCount = staleDiff
+    ? staleDiff.summary.added + staleDiff.summary.modified + staleDiff.summary.deleted
+    : null;
 
   function handleConfirm(forceOverwrite: boolean) {
     const trimmed = reason.trim();
@@ -188,18 +195,25 @@ export function PublishDialog({
 
           {draft.is_stale && (
             <p role="alert" className="rounded-[10px] bg-[#fce7e7] px-[12px] py-[8px] text-[12px] text-[#d20b0b]">
-              {t('knowledgeAdmin.dialogs.publish.staleNotice', { count: conflictCount })}
+              {conflictCount === null
+                ? t('knowledgeAdmin.dialogs.publish.staleNoticeUnknown')
+                : t('knowledgeAdmin.dialogs.publish.staleNotice', { count: conflictCount })}
             </p>
           )}
 
           {draft.is_stale && overwriteStep && (
             <div className="flex flex-col gap-[10px] rounded-[10px] border border-[#f3b4b4] bg-[#fef4f4] px-[12px] py-[10px]">
               <p className="text-[12px] text-[#d20b0b]">
-                {t('knowledgeAdmin.dialogs.publish.overwriteConfirmDescription', {
-                  published: formatVersion(publishedVersion),
-                  base: formatVersion(draft.base_version),
-                  count: conflictCount,
-                })}
+                {conflictCount === null
+                  ? t('knowledgeAdmin.dialogs.publish.overwriteConfirmDescriptionUnknown', {
+                      published: formatVersion(publishedVersion),
+                      base: formatVersion(draft.base_version),
+                    })
+                  : t('knowledgeAdmin.dialogs.publish.overwriteConfirmDescription', {
+                      published: formatVersion(publishedVersion),
+                      base: formatVersion(draft.base_version),
+                      count: conflictCount,
+                    })}
               </p>
               <label className="flex items-center gap-[8px] text-[12px] text-[#18181a]">
                 <Checkbox

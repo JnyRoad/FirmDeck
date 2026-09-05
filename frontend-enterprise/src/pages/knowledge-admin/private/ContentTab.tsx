@@ -106,13 +106,25 @@ function fileToBase64(file: File): Promise<string> {
 export function ContentTab({ api, kb, ownerAgentId, ownerAgentName, onChanged }: PrivateContentTabProps) {
   const { t } = useAppIntl();
   const toast = useKnowledgeAdminToast();
-  // 过期响应护栏（I1）：分支版本列表 + 文档列表各一条请求序号线。
+  // 过期响应护栏（I1）：分支版本列表 + 文档列表 + 单篇编辑各一条请求序号线。
   const reloadGuard = useGuardedLoad();
   const documentsLoad = useGuardedLoad();
+  /**
+   * 编辑框的请求序号线：`openEdit` 里的 `getDocument` 是异步的，快速点开 A 再点开 B
+   * （或点开后立刻关掉）时，A 的迟到响应会把正文灌进为 B 打开的对话框——保存下去就是
+   * 拿 A 的正文覆盖 B。开与关都占用一个新序号，只有当前这次打开的响应才允许落地。
+   */
+  const editLoad = useGuardedLoad();
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const [versions, setVersions] = useState<KnowledgeAdminVersionRead[]>([]);
   const [documents, setDocuments] = useState<VersionDocument[]>([]);
+  /**
+   * 文档表是否正在（重新）加载。与 `loading`（分支版本列表）分开：版本列表回来之后
+   * 还要再打一次文档列表，这段空窗期里表格必须继续显示加载中、行级操作必须禁用，
+   * 否则管理员会对着上一个分支头的文档按删除/编辑——那些 id 已经不属于新的头版本。
+   */
+  const [documentsLoading, setDocumentsLoading] = useState(false);
   const [loading, setLoading] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
@@ -134,6 +146,7 @@ export function ContentTab({ api, kb, ownerAgentId, ownerAgentName, onChanged }:
 
   async function loadDocuments(headVersionId: string) {
     const token = documentsLoad.begin();
+    setDocumentsLoading(true);
     try {
       const rows = await api.listVersionDocuments(kb.id, headVersionId);
       // 过期响应（切换归属员工 / 租户代际已变）整个丢弃，见 useGuardedLoad（I1）。
@@ -143,12 +156,20 @@ export function ContentTab({ api, kb, ownerAgentId, ownerAgentName, onChanged }:
       if (!documentsLoad.isCurrent(token)) return;
       setDocuments([]);
       toast.error(error, 'knowledgeAdmin.toast.loadFailed');
+    } finally {
+      if (documentsLoad.isCurrent(token)) setDocumentsLoading(false);
     }
   }
 
   async function reloadAll() {
     if (!ownerAgentId) return;
     const token = reloadGuard.begin();
+    // 版本列表一开始重拉，上一轮的文档请求就已经过期了：立刻占号作废它，并清空表格。
+    // 私有库每次写入都会让分支头 +1，旧头版本的文档 id 拿去删除/恢复会打到错误的对象；
+    // 这段空窗里表格保持加载中、行级操作禁用，直到新头版本的文档到手。
+    documentsLoad.begin();
+    setDocuments([]);
+    setDocumentsLoading(true);
     setLoading(true);
     try {
       const rows = await api.listVersions(kb.id, ownerAgentId);
@@ -160,9 +181,11 @@ export function ContentTab({ api, kb, ownerAgentId, ownerAgentName, onChanged }:
         await loadDocuments(head.id);
       } else {
         setDocuments([]);
+        setDocumentsLoading(false);
       }
     } catch (error) {
       if (!reloadGuard.isCurrent(token)) return;
+      setDocumentsLoading(false);
       toast.error(error, 'knowledgeAdmin.toast.loadFailed');
     } finally {
       if (reloadGuard.isCurrent(token)) setLoading(false);
@@ -193,18 +216,27 @@ export function ContentTab({ api, kb, ownerAgentId, ownerAgentName, onChanged }:
     }
   }
 
+  /** 关闭编辑框：同时作废在途的 `getDocument`，避免它回来后往已关闭/已换目标的框里灌正文。 */
+  function closeEdit() {
+    editLoad.begin();
+    setEditTarget(null);
+  }
+
   async function openEdit(document: VersionDocument) {
+    const token = editLoad.begin();
     setEditTarget(document);
     setEditTitle(document.title);
     setEditContent('');
     setEditLoading(true);
     try {
       const full = await api.getDocument(document.id, ownerAgentId);
+      // 这次响应已经不是当前打开的那一篇（期间又点开了别的文档，或框已关闭）：整个丢弃。
+      if (!editLoad.isCurrent(token)) return;
       setEditContent(documentSourceMarkdown(full));
     } catch {
       // 单篇正文读取失败不阻塞编辑框：留空正文，管理员可以重新输入。
     } finally {
-      setEditLoading(false);
+      if (editLoad.isCurrent(token)) setEditLoading(false);
     }
   }
 
@@ -218,7 +250,7 @@ export function ContentTab({ api, kb, ownerAgentId, ownerAgentName, onChanged }:
         ownerAgentId,
       );
       toast.success(createMessageDescriptor('knowledgeAdmin.toast.updateSuccess'));
-      setEditTarget(null);
+      closeEdit();
       await reloadAll();
       onChanged?.();
     } catch (error) {
@@ -293,7 +325,7 @@ export function ContentTab({ api, kb, ownerAgentId, ownerAgentName, onChanged }:
         row.status === 'archived' ? (
           <Button
             variant="outline"
-            disabled={busyId === row.id}
+            disabled={busyId === row.id || documentsLoading}
             onClick={() => void handleRestore(row)}
             className={OUTLINE_ACTION_BUTTON_SM_CLASS}
           >
@@ -303,7 +335,7 @@ export function ContentTab({ api, kb, ownerAgentId, ownerAgentName, onChanged }:
           <div className="flex justify-end gap-[6px]">
             <Button
               variant="outline"
-              disabled={busyId === row.id}
+              disabled={busyId === row.id || documentsLoading}
               onClick={() => void openEdit(row)}
               className={OUTLINE_ACTION_BUTTON_SM_CLASS}
             >
@@ -311,7 +343,7 @@ export function ContentTab({ api, kb, ownerAgentId, ownerAgentName, onChanged }:
             </Button>
             <Button
               variant="outline"
-              disabled={busyId === row.id}
+              disabled={busyId === row.id || documentsLoading}
               onClick={() => void handleDelete(row)}
               className={OUTLINE_ACTION_BUTTON_SM_CLASS}
             >
@@ -369,12 +401,12 @@ export function ContentTab({ api, kb, ownerAgentId, ownerAgentName, onChanged }:
         columns={columns}
         data={documents}
         rowKey={(row) => row.id}
-        loading={loading}
+        loading={loading || documentsLoading}
         emptyText={t('knowledgeAdmin.content.empty')}
         aria-label={t('knowledgeAdmin.detail.tabs.content')}
       />
 
-      <Dialog open={Boolean(editTarget)} onOpenChange={(next) => !saving && !next && setEditTarget(null)}>
+      <Dialog open={Boolean(editTarget)} onOpenChange={(next) => !saving && !next && closeEdit()}>
         <DialogContent className="w-[min(640px,calc(100vw-32px))] gap-0 overflow-hidden rounded-[16px] border-0 bg-white p-0 shadow-[0px_12px_32px_rgba(0,0,0,0.16)]">
           <DialogTitle className="px-[24px] pt-[20px] pb-[12px] text-[16px] font-semibold text-[#18181a]">
             {t('knowledgeAdmin.private.content.editDialog.title')}
@@ -402,7 +434,7 @@ export function ContentTab({ api, kb, ownerAgentId, ownerAgentName, onChanged }:
             )}
           </div>
           <div className={DIALOG_FOOTER_CLASS}>
-            <Button variant="outline" disabled={saving} onClick={() => setEditTarget(null)} className={DIALOG_CANCEL_BUTTON_CLASS}>
+            <Button variant="outline" disabled={saving} onClick={closeEdit} className={DIALOG_CANCEL_BUTTON_CLASS}>
               {t('knowledgeAdmin.private.content.editDialog.cancel')}
             </Button>
             <Button

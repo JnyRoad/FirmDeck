@@ -151,7 +151,8 @@ const modelConfig = {
   enabled: true,
 };
 
-function stubAppFetch() {
+function stubAppFetch(options: { agents?: AgentProfileRead[] } = {}) {
+  const agents = options.agents ?? [agent];
   const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
     const method = (init?.method || 'GET').toUpperCase();
@@ -159,7 +160,7 @@ function stubAppFetch() {
       return jsonResponse({ session_id: 'session-tl-1' });
     }
     if (url.includes('/api/auth/me')) return jsonResponse(authUser);
-    if (url.includes('/api/enterprise/agents')) return jsonResponse([agent]);
+    if (url.includes('/api/enterprise/agents')) return jsonResponse(agents);
     if (/\/api\/enterprise\/knowledge-admin\/knowledge-bases\/kb-test-1\/versions\/[^/]+\/diff/.test(url)) {
       return jsonResponse({
         base_version_id: 'kbver-1',
@@ -289,6 +290,50 @@ describe('App knowledge base admin routes', () => {
 
     expect(await screen.findByRole('tab', { name: '设置' })).toBeTruthy();
     expect(window.location.pathname).toBe('/enterprise/knowledge-admin/kb-test-1');
+  });
+
+  // `/enterprise/knowledge-admin` used to be swallowed by the `/enterprise/knowledge`
+  // prefix in two places at once: `EMPLOYEE_SCOPED_PREFIXES` (so a tenant with no
+  // employees got `EmptyEmployeeState` instead of the admin console) and the sidebar
+  // `selected` resolution (so the "知识库" entry lit up instead of "知识库管理").
+  it('shows the empty-employee guide on a genuinely employee-scoped route (control for the case below)', async () => {
+    stubAppFetch({ agents: [] });
+    window.history.pushState({}, '', '/enterprise/knowledge');
+
+    render(<I18nProvider><App /></I18nProvider>);
+
+    expect(await screen.findByText('还没有数字员工')).toBeTruthy();
+  });
+
+  it('still renders the knowledge base admin list when the tenant has no employees', async () => {
+    stubAppFetch({ agents: [] });
+    window.history.pushState({}, '', '/enterprise/knowledge-admin');
+
+    render(<I18nProvider><App /></I18nProvider>);
+
+    // 列表页自身的统计卡（空员工引导页没有这些）证明渲染的是知识库管理，而不是空态引导。
+    expect(await screen.findByLabelText('知识库统计')).toBeTruthy();
+    // `agentsLoaded` 生效（空态判定已定型）之后统计卡仍在，才排除"抢在空态之前渲染"的假绿。
+    await waitFor(() => {
+      expect(screen.queryByText('还没有数字员工')).toBeNull();
+      expect(screen.getByLabelText('知识库统计')).toBeTruthy();
+    });
+    expect(window.location.pathname).toBe('/enterprise/knowledge-admin');
+  });
+
+  it('highlights the knowledge base admin sidebar entry, not the knowledge base one', async () => {
+    stubAppFetch();
+    window.history.pushState({}, '', '/enterprise/knowledge-admin');
+
+    render(<I18nProvider><App /></I18nProvider>);
+
+    await waitFor(() => {
+      expect(document.querySelector('[data-guide-target="route-/enterprise/knowledge-admin"]')).toBeTruthy();
+    });
+    const adminEntry = document.querySelector('[data-guide-target="route-/enterprise/knowledge-admin"]');
+    const knowledgeEntry = document.querySelector('[data-guide-target="route-/enterprise/knowledge"]');
+    expect(adminEntry?.getAttribute('data-active')).toBe('true');
+    expect(knowledgeEntry?.getAttribute('data-active')).toBe('false');
   });
 
   it('redirects a non-admin user away from the knowledge base admin list to Gallery', async () => {

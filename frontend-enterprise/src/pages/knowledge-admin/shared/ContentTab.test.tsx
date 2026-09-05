@@ -55,6 +55,24 @@ const draftVersion: KnowledgeAdminVersionRead = {
   updated_at: '2026-08-20T00:00:00Z',
 };
 
+/** 一个具体的历史正式版：`?view=` 可以直接指向它（版本 Tab 的「查看内容」就是这么跳的）。 */
+const releasedVersion: KnowledgeAdminVersionRead = {
+  id: 'kbver_pub',
+  tenant_id: 'tenant_demo',
+  knowledge_base_id: 'kb_1',
+  version: '1.0.0',
+  name: 'v1.0.0',
+  status: 'active',
+  publication_state: 'released',
+  is_stale: false,
+  base_version: null,
+  draft_name: null,
+  next_version_preview: null,
+  source_team_id: null,
+  created_at: '2026-08-15T00:00:00Z',
+  updated_at: '2026-08-15T00:00:00Z',
+};
+
 const pubDiff: VersionDiff = {
   base_version_id: '',
   target_version_id: 'kbver_pub',
@@ -200,6 +218,21 @@ describe('ContentTab', () => {
     await waitFor(() => expect(api.listVersions).toHaveBeenCalledWith('kb_1'));
     const switcher = await screen.findByRole('combobox', { name: '查看版本' });
     expect(within(switcher).getByText('正式版本')).toBeTruthy();
+  });
+
+  // `?view=` 指向一个 released/rejected 历史版本时，下拉里只有「正式版本」+ 各个草稿，
+  // 选中值找不到对应 `SelectItem`，Radix 的 `SelectValue` 只能显示空白。
+  it('renders an option for a selected non-draft version so the switcher shows its label', async () => {
+    const api = createMockApi();
+    api.listVersions.mockResolvedValue([draftVersion, releasedVersion]);
+    renderContentTab(api, '/kb?view=kbver_pub');
+
+    await waitFor(() => expect(api.listVersions).toHaveBeenCalledWith('kb_1'));
+    const switcher = await screen.findByRole('combobox', { name: '查看版本' });
+    await waitFor(() => expect(within(switcher).queryByText('版本 v1.0.0')).toBeTruthy());
+    expect(switcher.textContent).toContain('版本 v1.0.0');
+    // 仍然是只读视图（非草稿），不能冒出草稿工作区的写回入口。
+    expect(screen.queryByRole('button', { name: '上传文档' })).toBeNull();
   });
 
   it('published view is read-only: no draft badges, no upload, no delete controls', async () => {

@@ -32,6 +32,15 @@ function makeSingleBlockConflict(): RebaseConflictDocument {
         context_after: ['第三段（不变）'],
       },
     ],
+    merged_text: [
+      '第一段（不变）',
+      '<<<<<<< ours',
+      '草稿改的第二段',
+      '=======',
+      '正式版改的第二段',
+      '>>>>>>> theirs',
+      '第三段（不变）',
+    ].join('\n'),
   };
 }
 
@@ -55,7 +64,58 @@ function makeTwoBlockConflict(): RebaseConflictDocument {
         context_after: [],
       },
     ],
+    merged_text: [
+      '<<<<<<< ours',
+      '块一草稿',
+      '=======',
+      '块一正式版',
+      '>>>>>>> theirs',
+      '中间不变段',
+      '<<<<<<< ours',
+      '块二草稿',
+      '=======',
+      '块二正式版',
+      '>>>>>>> theirs',
+    ].join('\n'),
   };
+}
+
+/**
+ * 30 行文档、冲突只出现在正中间（第 15 行）：冲突区之外的 29 行正文（`ctx-01`…`ctx-29`）
+ * 都只在 `merged_text` 里，`blocks[0]` 的 `context_before`/`context_after` 只覆盖到 ±2 行。
+ * 用来钉住「合并结果必须以完整合并文本为底稿」——按 ±2 行上下文拼接会丢掉 25 行正文。
+ */
+function makeLongDocumentConflict(): RebaseConflictDocument {
+  const contextLines = Array.from({ length: 29 }, (_, index) => `ctx-${String(index + 1).padStart(2, '0')}`);
+  const before = contextLines.slice(0, 14);
+  const after = contextLines.slice(14);
+  return {
+    lineage_id: 'kdoc_long',
+    title: '长文档',
+    blocks: [
+      {
+        base_lines: ['原始中段'],
+        ours_lines: ['草稿中段'],
+        theirs_lines: ['正式版中段'],
+        context_before: before.slice(-2),
+        context_after: after.slice(0, 2),
+      },
+    ],
+    merged_text: [
+      ...before,
+      '<<<<<<< ours',
+      '草稿中段',
+      '=======',
+      '正式版中段',
+      '>>>>>>> theirs',
+      ...after,
+    ].join('\n'),
+  };
+}
+
+/** 统计一行在文本里出现的次数（整行匹配），用于「每行恰好出现一次」的断言。 */
+function countLine(text: string, line: string): number {
+  return text.split('\n').filter((item) => item === line).length;
 }
 
 /** jest-dom 的 `toBeDisabled` 未在本仓库启用，直接读取原生 `disabled` 属性。 */
@@ -197,6 +257,57 @@ describe('MergeDialog', () => {
 
     expect(onOpenChange).toHaveBeenCalledWith(false);
     expect(onComplete).not.toHaveBeenCalled();
+  });
+
+  it('composes from the full merged text: every non-conflicting line survives exactly once', async () => {
+    const user = userEvent.setup();
+    renderDialog({ conflict: makeLongDocumentConflict() });
+
+    await user.click(screen.getByRole('button', { name: '采用草稿' }));
+
+    const result = screen.getByLabelText('合并结果') as HTMLTextAreaElement;
+    for (let index = 1; index <= 29; index += 1) {
+      const line = `ctx-${String(index).padStart(2, '0')}`;
+      expect(countLine(result.value, line)).toBe(1);
+    }
+    expect(countLine(result.value, '草稿中段')).toBe(1);
+    expect(result.value).not.toContain('正式版中段');
+    expect(result.value).not.toContain('<<<<<<<');
+    // 完整文档 = 29 行正文 + 1 行被选中的正文。
+    expect(result.value.split('\n')).toHaveLength(30);
+  });
+
+  it('replaces each conflict region independently when two blocks are resolved differently', async () => {
+    const user = userEvent.setup();
+    const { onComplete } = renderDialog({ conflict: makeTwoBlockConflict() });
+
+    await user.click(screen.getAllByRole('button', { name: '采用草稿' })[0]);
+    await user.click(screen.getAllByRole('button', { name: '采用正式版' })[1]);
+    await user.click(screen.getByRole('button', { name: '完成' }));
+
+    const [result] = onComplete.mock.calls[0] as [{ contentMd: string }];
+    expect(result.contentMd.split('\n')).toEqual(['块一草稿', '中间不变段', '块二正式版']);
+    // 两块共享的 `中间不变段` 只能出现一次（旧的按块拼接会写两遍）。
+    expect(countLine(result.contentMd, '中间不变段')).toBe(1);
+  });
+
+  it('keeps an unresolved region verbatim and keeps complete disabled while it remains', async () => {
+    const user = userEvent.setup();
+    renderDialog({ conflict: makeTwoBlockConflict() });
+
+    await user.click(screen.getAllByRole('button', { name: '采用草稿' })[0]);
+
+    const result = screen.getByLabelText('合并结果') as HTMLTextAreaElement;
+    expect(result.value.split('\n')).toEqual([
+      '块一草稿',
+      '中间不变段',
+      '<<<<<<< ours',
+      '块二草稿',
+      '=======',
+      '块二正式版',
+      '>>>>>>> theirs',
+    ]);
+    expect(isDisabled(screen.getByRole('button', { name: '完成' }))).toBe(true);
   });
 
   it('requires every block resolved before complete is enabled (multi-block document)', async () => {
