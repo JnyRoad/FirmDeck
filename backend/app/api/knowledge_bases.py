@@ -57,6 +57,7 @@ from app.knowledge.conversion import (
     KnowledgeConversionService,
 )
 from app.knowledge.errors import KNOWLEDGE_MODE_INVALID, KnowledgeError, knowledge_error
+from app.knowledge.listing import effective_knowledge_base_status
 from app.knowledge.management import (
     require_shared_knowledge_history_viewer,
     require_team_knowledge_manager,
@@ -88,7 +89,11 @@ from app.knowledge.schema import (
     SharedKnowledgeRollbackRequest,
     SharedKnowledgeTeamRead,
 )
-from app.knowledge.versioning import SharedKnowledgeVersionService
+from app.knowledge.versioning import (
+    SharedKnowledgeVersionService,
+    _next_shared_version_label,
+    _semantic_version_parts,
+)
 from app.security.auth import get_current_user
 from app.security.permissions import (
     ensure_agent_scope_manager,
@@ -160,12 +165,57 @@ def _knowledge_public_error(
     )
 
 
+_VERSION_PREVIEW_LEVELS = ("patch", "minor", "major")
+
+
+def _shared_version_lookup(
+    db: Session,
+    *,
+    tenant_id: str,
+    knowledge_base_id: str,
+) -> tuple[dict[str, str], list[str], list[str]]:
+    """一次性取全部版本标签，供派生字段计算基线名称与下一版本预览。"""
+    rows = db.exec(
+        select(
+            KnowledgeBaseVersion.id,
+            KnowledgeBaseVersion.version,
+            KnowledgeBaseVersion.publication_state,
+        ).where(
+            KnowledgeBaseVersion.tenant_id == tenant_id,
+            KnowledgeBaseVersion.knowledge_base_id == knowledge_base_id,
+        )
+    ).all()
+    label_by_id = {row[0]: row[1] for row in rows}
+    released_labels = [row[1] for row in rows if row[2] == "released"]
+    all_labels = [row[1] for row in rows]
+    return label_by_id, released_labels, all_labels
+
+
 def _shared_version_read(
     version: KnowledgeBaseVersion,
     *,
     published_version_id: str | None,
+    version_label_by_id: dict[str, str] | None = None,
+    released_labels: list[str] | None = None,
+    all_labels: list[str] | None = None,
 ) -> KnowledgeBaseVersionRead:
-    """将共享版本行投影为包含来源和当前正式状态的 API 模型。"""
+    """将共享版本行投影为包含来源、当前正式状态和派生提示的 API 模型。"""
+    is_draft = version.publication_state == "draft"
+    metadata = dict(version.metadata_json or {})
+    base_version = None
+    if version.parent_version_id and version_label_by_id:
+        base_version = version_label_by_id.get(version.parent_version_id)
+    draft_name = metadata.get("draft_name") or (version.version if is_draft else None)
+    next_version_preview: dict[str, str] | None = None
+    if is_draft:
+        next_version_preview = {
+            level: _next_shared_version_label(
+                released_labels or [],
+                level,
+                occupied_versions=all_labels or [],
+            )
+            for level in _VERSION_PREVIEW_LEVELS
+        }
     return KnowledgeBaseVersionRead(
         id=version.id,
         tenant_id=version.tenant_id,
@@ -182,11 +232,27 @@ def _shared_version_read(
         change_reason=version.change_reason,
         published_at=version.published_at,
         is_published_head=version.id == published_version_id,
+        is_stale=is_draft and version.parent_version_id != published_version_id,
+        base_version=base_version,
+        draft_name=draft_name,
+        next_version_preview=next_version_preview,
         capability_scope=normalize_capability_scope(version.capability_scope),
-        metadata=dict(version.metadata_json or {}),
+        metadata=metadata,
         created_at=version.created_at,
         updated_at=version.updated_at,
     )
+
+
+def _shared_version_sort_key(
+    version: KnowledgeBaseVersion,
+) -> tuple[int, int, int, int, float]:
+    """草稿最新在前，随后正式版按语义版本降序，最后驳回版按时间降序。"""
+    if version.publication_state == "draft":
+        return (0, 0, 0, 0, -version.created_at.timestamp())
+    if version.publication_state == "released":
+        major, minor, patch = _semantic_version_parts(version.version) or (0, 0, 0)
+        return (1, -major, -minor, -patch, 0.0)
+    return (2, 0, 0, 0, -version.created_at.timestamp())
 
 
 def _agent_shared_management_versions(
@@ -772,12 +838,21 @@ def list_knowledge_base_versions(
             )
         except KnowledgeError as exc:
             raise _knowledge_http_error(exc) from exc
+        label_by_id, released_labels, all_labels = _shared_version_lookup(
+            db,
+            tenant_id=tenant_id,
+            knowledge_base_id=knowledge_base_id,
+        )
+        ordered_versions = sorted(versions, key=_shared_version_sort_key)
         return [
             _shared_version_read(
                 version,
                 published_version_id=row.published_version_id,
+                version_label_by_id=label_by_id,
+                released_labels=released_labels,
+                all_labels=all_labels,
             ).model_dump(mode="json")
-            for version in versions
+            for version in ordered_versions
         ]
     _visible_knowledge_version(db, tenant_id, knowledge_base_id, agent_id)
     agent = get_agent(db, tenant_id, agent_id)
@@ -859,9 +934,17 @@ def create_shared_knowledge_draft(
         db.commit()
         db.refresh(draft)
         base = db.get(KnowledgeBase, knowledge_base_id)
+        label_by_id, released_labels, all_labels = _shared_version_lookup(
+            db,
+            tenant_id=request.tenant_id,
+            knowledge_base_id=knowledge_base_id,
+        )
         return _shared_version_read(
             draft,
             published_version_id=base.published_version_id if base else None,
+            version_label_by_id=label_by_id,
+            released_labels=released_labels,
+            all_labels=all_labels,
         )
     except KnowledgeError as exc:
         db.rollback()
@@ -897,12 +980,21 @@ def publish_shared_knowledge_version(
             actor_id=current_user.id,
             source_team_id=request.team_id,
             change_reason=request.change_reason,
+            level=request.level,
         )
         db.commit()
         db.refresh(version)
+        label_by_id, released_labels, all_labels = _shared_version_lookup(
+            db,
+            tenant_id=request.tenant_id,
+            knowledge_base_id=knowledge_base_id,
+        )
         return _shared_version_read(
             version,
             published_version_id=version.id,
+            version_label_by_id=label_by_id,
+            released_labels=released_labels,
+            all_labels=all_labels,
         )
     except KnowledgeError as exc:
         db.rollback()
@@ -941,9 +1033,17 @@ def reject_shared_knowledge_version(
         db.commit()
         db.refresh(version)
         base = db.get(KnowledgeBase, knowledge_base_id)
+        label_by_id, released_labels, all_labels = _shared_version_lookup(
+            db,
+            tenant_id=request.tenant_id,
+            knowledge_base_id=knowledge_base_id,
+        )
         return _shared_version_read(
             version,
             published_version_id=base.published_version_id if base else None,
+            version_label_by_id=label_by_id,
+            released_labels=released_labels,
+            all_labels=all_labels,
         )
     except KnowledgeError as exc:
         db.rollback()
@@ -1338,16 +1438,15 @@ def knowledge_base_read(
     branch_meta: dict[str, str] | None = None,
     management_context: dict[str, object] | None = None,
 ) -> KnowledgeBaseRead:
-    """统一投影专用分支和共享正式指针，同时保持旧字段兼容。"""
-    branch_status = (branch_meta or {}).get("status")
-    if branch_status == "inactive":
-        effective_status = "archived"
-    elif branch_status == "active":
-        effective_status = "active"
-    elif branch_status:
-        effective_status = branch_status
-    else:
-        effective_status = row.status
+    """统一投影专用分支和共享正式指针，同时保持旧字段兼容。
+
+    对外状态用 `effective_knowledge_base_status` 派生，与 A1/A1b 列表
+    （`app.knowledge.listing._fetch_listed_items`）共用同一份规则，避免两处各自实现导致
+    同一个库在列表里是"已上线"、在详情页是"已下线"（T077 缺陷 D）。
+    """
+    effective_status = effective_knowledge_base_status(
+        row.status, (branch_meta or {}).get("status")
+    )
     return KnowledgeBaseRead(
         id=row.id,
         tenant_id=row.tenant_id,

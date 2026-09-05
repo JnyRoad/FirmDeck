@@ -65,3 +65,6 @@ target-version = "py311"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+  "perf: T079 performance verification (SC-007) — asserts wall-clock latency against spec thresholds; runs by default in CI (not skipped), thresholds intentionally carry headroom over the measured baseline documented in .superpowers/sdd/tasks/task-T079-report.md so normal machine-load variance does not flake the gate.",
+]

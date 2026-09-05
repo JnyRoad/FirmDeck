@@ -276,7 +276,7 @@ def _shared_writable_asset_version(
     version_id: str | None,
     current_user: User,
 ) -> KnowledgeBaseVersion | None:
-    """专用库沿用旧写入；共享资产只允许写入其来源团队的活动草稿。"""
+    """专用库沿用旧写入；共享资产只允许写入其来源团队（或租户管理员旁路创建）的活动草稿。"""
     base = db.get(KnowledgeBase, knowledge_base_id)
     if base is None or base.tenant_id != tenant_id:
         raise _knowledge_public_error("KNOWLEDGE_BASE_NOT_FOUND", 404)
@@ -295,11 +295,8 @@ def _shared_writable_asset_version(
             knowledge_base_id=knowledge_base_id,
             version_id=version_id,
         )
-        if not version.source_team_id:
-            raise knowledge_error(
-                KNOWLEDGE_MODE_INVALID,
-                message="共享知识草稿缺少来源团队，不能写入。",
-            )
+        # source_team_id 为空代表该草稿由租户管理员旁路创建；
+        # require_team_knowledge_manager 在 team_id=None 时会自行校验管理员身份。
         require_team_knowledge_manager(
             db,
             tenant_id=tenant_id,
@@ -451,6 +448,8 @@ def import_okf_bundle(
             "okf": {"version": "0.1", "concept_count": len(parsed_docs)},
         },
     )
+    # 首次出现的文档：lineage_id 取自身 id，作为跨版本身份的起点（R5）。
+    document.metadata_json = {**document.metadata_json, "lineage_id": document.id}
     db.add(document)
     db.flush()
     concept_rows = upsert_concepts(

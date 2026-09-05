@@ -10,6 +10,7 @@ import {
 import { I18nProvider } from '@/i18n';
 import { tenantUserStorageKey } from '@/lib/tenant-storage';
 import type { AgentProfileRead, TeamRead } from '@/types';
+import type { KnowledgeAdminListItem } from '@/types/knowledgeAdmin';
 
 import App from './App';
 
@@ -58,6 +59,26 @@ const team: TeamRead = {
   status: 'active',
   members: [],
   created_at: '2026-08-01T00:00:00Z',
+  updated_at: '2026-08-01T00:00:00Z',
+};
+
+// 详情页 load() 的首个也是主要数据源（admin-first，见 KnowledgeAdminDetailPage.tsx）。
+// 不给这条路由单独打桩时，通用 `/api/enterprise/` 兜底会回 `[]`，
+// `item.bound_teams.length` 抛错，页面落入错误态而不渲染 Tabs。
+const sharedAdminItem: KnowledgeAdminListItem = {
+  id: 'kb-test-1',
+  name: '共享知识库',
+  description: '',
+  mode: 'shared',
+  status: 'active',
+  capability_scope: 'general',
+  published_version: '1.0.0',
+  published_version_id: 'kbver-1',
+  draft_count: 0,
+  document_count: 0,
+  owner_agent: null,
+  bound_teams: [],
+  branch: null,
   updated_at: '2026-08-01T00:00:00Z',
 };
 
@@ -130,7 +151,8 @@ const modelConfig = {
   enabled: true,
 };
 
-function stubAppFetch() {
+function stubAppFetch(options: { agents?: AgentProfileRead[] } = {}) {
+  const agents = options.agents ?? [agent];
   const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
     const method = (init?.method || 'GET').toUpperCase();
@@ -138,7 +160,19 @@ function stubAppFetch() {
       return jsonResponse({ session_id: 'session-tl-1' });
     }
     if (url.includes('/api/auth/me')) return jsonResponse(authUser);
-    if (url.includes('/api/enterprise/agents')) return jsonResponse([agent]);
+    if (url.includes('/api/enterprise/agents')) return jsonResponse(agents);
+    if (/\/api\/enterprise\/knowledge-admin\/knowledge-bases\/kb-test-1\/versions\/[^/]+\/diff/.test(url)) {
+      return jsonResponse({
+        base_version_id: 'kbver-1',
+        target_version_id: 'kbver-1',
+        pairing: 'lineage',
+        summary: { added: 0, modified: 0, deleted: 0 },
+        documents: [],
+      });
+    }
+    if (url.includes('/api/enterprise/knowledge-admin/knowledge-bases/kb-test-1')) {
+      return jsonResponse(sharedAdminItem);
+    }
     if (/\/api\/enterprise\/teams\/team-1\/(tasks|blackboard|events)/.test(url)) {
       return jsonResponse([]);
     }
@@ -234,6 +268,118 @@ describe('App team scope selection', () => {
     expect(window.localStorage.getItem(
       tenantUserStorageKey('tenant_demo', 'user-1', 'selected-agent'),
     )).toBe('team:team-1');
+  });
+});
+
+describe('App knowledge base admin routes', () => {
+  it('lets an enterprise admin open the knowledge base admin list route', async () => {
+    stubAppFetch();
+    window.history.pushState({}, '', '/enterprise/knowledge-admin');
+
+    render(<I18nProvider><App /></I18nProvider>);
+
+    expect((await screen.findAllByText('知识库管理')).length).toBeGreaterThan(0);
+    expect(window.location.pathname).toBe('/enterprise/knowledge-admin');
+  });
+
+  it('lets an enterprise admin open a knowledge base admin detail route with the kbId param', async () => {
+    stubAppFetch();
+    window.history.pushState({}, '', '/enterprise/knowledge-admin/kb-test-1');
+
+    render(<I18nProvider><App /></I18nProvider>);
+
+    expect(await screen.findByRole('tab', { name: '设置' })).toBeTruthy();
+    expect(window.location.pathname).toBe('/enterprise/knowledge-admin/kb-test-1');
+  });
+
+  // `/enterprise/knowledge-admin` used to be swallowed by the `/enterprise/knowledge`
+  // prefix in two places at once: `EMPLOYEE_SCOPED_PREFIXES` (so a tenant with no
+  // employees got `EmptyEmployeeState` instead of the admin console) and the sidebar
+  // `selected` resolution (so the "知识库" entry lit up instead of "知识库管理").
+  it('shows the empty-employee guide on a genuinely employee-scoped route (control for the case below)', async () => {
+    stubAppFetch({ agents: [] });
+    window.history.pushState({}, '', '/enterprise/knowledge');
+
+    render(<I18nProvider><App /></I18nProvider>);
+
+    expect(await screen.findByText('还没有数字员工')).toBeTruthy();
+  });
+
+  it('still renders the knowledge base admin list when the tenant has no employees', async () => {
+    stubAppFetch({ agents: [] });
+    window.history.pushState({}, '', '/enterprise/knowledge-admin');
+
+    render(<I18nProvider><App /></I18nProvider>);
+
+    // 列表页自身的统计卡（空员工引导页没有这些）证明渲染的是知识库管理，而不是空态引导。
+    expect(await screen.findByLabelText('知识库统计')).toBeTruthy();
+    // `agentsLoaded` 生效（空态判定已定型）之后统计卡仍在，才排除"抢在空态之前渲染"的假绿。
+    await waitFor(() => {
+      expect(screen.queryByText('还没有数字员工')).toBeNull();
+      expect(screen.getByLabelText('知识库统计')).toBeTruthy();
+    });
+    expect(window.location.pathname).toBe('/enterprise/knowledge-admin');
+  });
+
+  it('highlights the knowledge base admin sidebar entry, not the knowledge base one', async () => {
+    stubAppFetch();
+    window.history.pushState({}, '', '/enterprise/knowledge-admin');
+
+    render(<I18nProvider><App /></I18nProvider>);
+
+    await waitFor(() => {
+      expect(document.querySelector('[data-guide-target="route-/enterprise/knowledge-admin"]')).toBeTruthy();
+    });
+    const adminEntry = document.querySelector('[data-guide-target="route-/enterprise/knowledge-admin"]');
+    const knowledgeEntry = document.querySelector('[data-guide-target="route-/enterprise/knowledge"]');
+    expect(adminEntry?.getAttribute('data-active')).toBe('true');
+    expect(knowledgeEntry?.getAttribute('data-active')).toBe('false');
+  });
+
+  it('redirects a non-admin user away from the knowledge base admin list to Gallery', async () => {
+    const memberUser = { ...authUser, role: 'member' as const };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = (init?.method || 'GET').toUpperCase();
+      if (method === 'POST' && url.includes('/tl/session')) return jsonResponse({ session_id: 'session-tl-1' });
+      if (url.includes('/api/auth/me')) return jsonResponse(memberUser);
+      if (url.includes('/api/enterprise/agents')) return jsonResponse([agent]);
+      if (url.includes('/api/enterprise/model-configs')) return jsonResponse([modelConfig]);
+      if (url.includes('/api/chat/')) return jsonResponse([]);
+      if (url.includes('/api/enterprise/')) return jsonResponse([]);
+      return jsonResponse({});
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    window.history.pushState({}, '', '/enterprise/knowledge-admin');
+
+    render(<I18nProvider><App /></I18nProvider>);
+
+    await waitFor(() => {
+      expect(window.location.pathname).toBe('/workspace/gallery');
+    });
+  });
+
+  it('redirects a non-admin user away from a knowledge base admin detail route to Gallery', async () => {
+    const memberUser = { ...authUser, role: 'member' as const };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = (init?.method || 'GET').toUpperCase();
+      if (method === 'POST' && url.includes('/tl/session')) return jsonResponse({ session_id: 'session-tl-1' });
+      if (url.includes('/api/auth/me')) return jsonResponse(memberUser);
+      if (url.includes('/api/enterprise/agents')) return jsonResponse([agent]);
+      if (url.includes('/api/enterprise/model-configs')) return jsonResponse([modelConfig]);
+      if (url.includes('/api/chat/')) return jsonResponse([]);
+      if (url.includes('/api/enterprise/')) return jsonResponse([]);
+      return jsonResponse({});
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    window.history.pushState({}, '', '/enterprise/knowledge-admin/kb-test-1');
+
+    render(<I18nProvider><App /></I18nProvider>);
+
+    await waitFor(() => {
+      expect(window.location.pathname).toBe('/workspace/gallery');
+    });
   });
 });
 

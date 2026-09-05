@@ -17,6 +17,7 @@ from app.api import (
     feedback,
     general_skills,
     knowledge,
+    knowledge_admin,
     knowledge_bases,
     mcp_oauth,
     memories,
@@ -152,6 +153,7 @@ app.include_router(agents.enterprise_router)
 app.include_router(general_skills.router)
 app.include_router(knowledge_bases.router)
 app.include_router(knowledge.router)
+app.include_router(knowledge_admin.router)
 app.include_router(skills.router)
 app.include_router(model_configs.router)
 app.include_router(memories.router)

@@ -54,6 +54,8 @@ import GeneralSkillsPage, {
   GeneralSkillNewPage,
 } from "./pages/GeneralSkillsPage";
 import KnowledgeManagePage, { KnowledgeAddPage } from "./pages/KnowledgePage";
+import KnowledgeAdminListPage from "./pages/knowledge-admin/KnowledgeAdminListPage";
+import KnowledgeAdminDetailPage from "./pages/knowledge-admin/KnowledgeAdminDetailPage";
 import LoginPage from "./pages/LoginPage";
 import ModelsPage from "./pages/ModelsPage";
 import RuntimeSettingsPage from "./pages/RuntimeSettingsPage";
@@ -112,6 +114,19 @@ import { useAppIntl } from "./i18n/useAppIntl";
 
 const ENTERPRISE_SIDEBAR_STORAGE_KEY = "ultrarag_enterprise_sidebar_expanded";
 const MODEL_CONFIGS_UPDATED_EVENT = "ultrarag-enterprise-model-configs-updated";
+
+/**
+ * Path-segment-aware prefix match.
+ *
+ * A plain `pathname.startsWith(prefix)` treats `/enterprise/knowledge-admin` as living
+ * under `/enterprise/knowledge`, which made the admin console (a) inherit the
+ * employee-scoped empty state (`EMPLOYEE_SCOPED_PREFIXES` below) and disappear whenever
+ * the tenant had no employees, and (b) highlight the "knowledge base" sidebar entry
+ * instead of its own. Matching only on a full segment boundary fixes both at the source.
+ */
+function matchesRoutePrefix(pathname: string, prefix: string): boolean {
+  return pathname === prefix || pathname.startsWith(`${prefix}/`);
+}
 
 /** 读取当前 tenant/user 的完整员工或团队作用域，不读取旧的全局存储键。 */
 function readStoredAgentScope(tenantId: string, userId: string): string {
@@ -178,24 +193,28 @@ function Shell({
   const isAdmin = isEnterpriseAdmin(auth.user);
   const accountRoleLabel = isAdmin ? t("shell.account.roleAdmin") : "";
   const isDistillRoute = location.pathname === "/enterprise/skills/distill";
+  // Ordered longest-prefix-first, and segment-anchored: `/enterprise/knowledge-admin`
+  // must resolve to its own sidebar entry, never to `/enterprise/knowledge`.
   const selected =
     location.pathname === "/enterprise"
       ? "/enterprise/dashboard"
-      : location.pathname.startsWith("/enterprise/platform")
-        ? "/enterprise/platform"
-        : location.pathname.startsWith("/enterprise/knowledge")
-          ? "/enterprise/knowledge"
-          : location.pathname.startsWith("/enterprise/general-skills")
-            ? "/enterprise/general-skills"
-            : location.pathname.startsWith("/enterprise/tools")
-              ? "/enterprise/tools"
-              : location.pathname.startsWith("/enterprise/teams")
-                ? "/enterprise/teams"
-                : location.pathname.startsWith("/enterprise/scheduled-tasks")
-                ? "/enterprise/scheduled-tasks"
-                : isDistillRoute
-                  ? "/enterprise/skills"
-                  : location.pathname;
+      : matchesRoutePrefix(location.pathname, EnterpriseRoute.Platform)
+        ? EnterpriseRoute.Platform
+        : matchesRoutePrefix(location.pathname, EnterpriseRoute.KnowledgeAdmin)
+          ? EnterpriseRoute.KnowledgeAdmin
+          : matchesRoutePrefix(location.pathname, EnterpriseRoute.Knowledge)
+            ? EnterpriseRoute.Knowledge
+            : matchesRoutePrefix(location.pathname, EnterpriseRoute.GeneralSkills)
+              ? EnterpriseRoute.GeneralSkills
+              : matchesRoutePrefix(location.pathname, EnterpriseRoute.Tools)
+                ? EnterpriseRoute.Tools
+                : matchesRoutePrefix(location.pathname, EnterpriseRoute.Teams)
+                  ? EnterpriseRoute.Teams
+                  : matchesRoutePrefix(location.pathname, EnterpriseRoute.ScheduledTasks)
+                    ? EnterpriseRoute.ScheduledTasks
+                    : isDistillRoute
+                      ? EnterpriseRoute.Skills
+                      : location.pathname;
   const isAgentRosterRoute = location.pathname.startsWith("/enterprise/agents");
   const [lastDistillSearch, setLastDistillSearch] = useState(() =>
     isDistillRoute ? location.search : "",
@@ -412,8 +431,10 @@ function Shell({
     "/enterprise/tools",
   ];
   const hasEmployees = scopeAgents.some((item) => !item.is_overall);
+  // Segment-anchored so that `/enterprise/knowledge-admin` (an admin console that is not
+  // scoped to any single employee) is not swallowed by the `/enterprise/knowledge` prefix.
   const isEmployeeScopedRoute = EMPLOYEE_SCOPED_PREFIXES.some((prefix) =>
-    location.pathname.startsWith(prefix),
+    matchesRoutePrefix(location.pathname, prefix),
   );
   const showEmployeeEmptyState =
     agentsLoaded && !hasEmployees && isEmployeeScopedRoute;
@@ -772,6 +793,26 @@ function Shell({
                 element={
                   isAdmin ? (
                     <AccountsPage currentUser={auth.user} onLogout={onLogout} />
+                  ) : (
+                    <Navigate to={EnterpriseRoute.Gallery} replace />
+                  )
+                }
+              />
+              <Route
+                path={EnterpriseRoute.KnowledgeAdmin}
+                element={
+                  isAdmin ? (
+                    <KnowledgeAdminListPage currentUser={auth.user} onLogout={onLogout} />
+                  ) : (
+                    <Navigate to={EnterpriseRoute.Gallery} replace />
+                  )
+                }
+              />
+              <Route
+                path={`${EnterpriseRoute.KnowledgeAdmin}/:kbId`}
+                element={
+                  isAdmin ? (
+                    <KnowledgeAdminDetailPage currentUser={auth.user} onLogout={onLogout} />
                   ) : (
                     <Navigate to={EnterpriseRoute.Gallery} replace />
                   )

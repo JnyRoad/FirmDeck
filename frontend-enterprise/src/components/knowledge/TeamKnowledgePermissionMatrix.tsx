@@ -18,6 +18,11 @@ type TeamKnowledgePermissionMatrixProps = {
   binding: TeamKnowledgeBindingRead;
   members: TeamMemberRead[];
   busy?: boolean;
+  /**
+   * 是否展示批量设置按钮组（全部只读 / 全部可编辑 / 全部撤销）。默认关闭，
+   * 保持 `TeamDetailPage` 既有渲染结果不变；`GrantsTab` 显式开启。
+   */
+  showBulkActions?: boolean;
   onSave: (
     binding: TeamKnowledgeBindingRead,
     grants: TeamKnowledgeGrantInput[],
@@ -31,6 +36,7 @@ export default function TeamKnowledgePermissionMatrix({
   binding,
   members,
   busy = false,
+  showBulkActions = false,
   onSave,
   onSetDefault,
   onRemove,
@@ -51,6 +57,11 @@ export default function TeamKnowledgePermissionMatrix({
       members.map((member) => [member.agent_id, activeByAgent.get(member.agent_id) || 'none']),
     ));
   }, [binding.grants, binding.revision, members]);
+
+  /** 把矩阵里全部成员的本地权限选择一次性改成同一个值；不发起保存请求，需另行点击「保存权限」。 */
+  function applyBulkPermission(choice: PermissionChoice) {
+    setPermissions(Object.fromEntries(members.map((member) => [member.agent_id, choice])));
+  }
 
   /** Convert the complete visible matrix into the atomic API payload. */
   function grantPayload(): TeamKnowledgeGrantInput[] {
@@ -114,6 +125,43 @@ export default function TeamKnowledgePermissionMatrix({
         </div>
       </div>
 
+      {showBulkActions && members.length > 0 && (
+        <div className="mt-[12px] flex flex-wrap gap-[6px]">
+          <Button
+            type="button"
+            variant="outline"
+            disabled={busy}
+            onClick={() => applyBulkPermission('reader')}
+            className="h-[28px] rounded-[8px] px-[10px] text-[12px]"
+          >
+            {t('teamKnowledgePermissionMatrix.bulk.reader')}
+          </Button>
+          <Button
+            type="button"
+            variant="outline"
+            disabled={busy}
+            onClick={() => applyBulkPermission('editor')}
+            className="h-[28px] rounded-[8px] px-[10px] text-[12px]"
+          >
+            {t('teamKnowledgePermissionMatrix.bulk.editor')}
+          </Button>
+          <Button
+            type="button"
+            variant="outline"
+            disabled={busy}
+            onClick={() => applyBulkPermission('none')}
+            className="h-[28px] rounded-[8px] px-[10px] text-[12px]"
+          >
+            {t('teamKnowledgePermissionMatrix.bulk.none')}
+          </Button>
+        </div>
+      )}
+
+      {members.length === 0 ? (
+        <p className="mt-[12px] text-[12px] text-[#a7adbb]">
+          {t('teamKnowledgePermissionMatrix.emptyMembers')}
+        </p>
+      ) : (
       <div className="mt-[12px] grid gap-[8px] sm:grid-cols-2 lg:grid-cols-3">
         {members.map((member) => (
           <label
@@ -142,6 +190,7 @@ export default function TeamKnowledgePermissionMatrix({
           </label>
         ))}
       </div>
+      )}
 
       <div className="mt-[10px] flex justify-end">
         <Button

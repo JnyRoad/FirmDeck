@@ -62,3 +62,6 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 packaging/assets/staffdeck.iconset/
+
+# superpowers SDD scratch (ledger, briefs, review packages)
+.superpowers/

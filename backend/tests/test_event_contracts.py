@@ -39,6 +39,35 @@ _T007_EXPECTED_EVENTS = {
     ),
 }
 
+# knowledge-base-admin (data-model.md §8): draft publish/rebase/review notification events.
+_KNOWLEDGE_ADMIN_EXPECTED_EVENTS = {
+    "knowledge.version.published": (
+        {
+            "knowledge_base_id": "string",
+            "version": "string",
+            "stale_draft_count": "integer",
+        },
+        "events.knowledge.versionPublished",
+    ),
+    "knowledge.draft.rebased": (
+        {
+            "knowledge_base_id": "string",
+            "draft_name": "string",
+            "to_base_version": "string",
+        },
+        "events.knowledge.draftRebased",
+    ),
+    "knowledge.draft.reviewed": (
+        {
+            "knowledge_base_id": "string",
+            "draft_name": "string",
+            "staged": "integer",
+            "pending": "integer",
+        },
+        "events.knowledge.draftReviewed",
+    ),
+}
+
 
 def build_registry() -> EventRegistry:
     """Build an isolated registry with one turn event; this has no global side effects."""
@@ -92,6 +121,22 @@ def test_t007_system_tenant_events_are_registered_with_safe_internal_contracts()
         assert entry.visibility is visibility
         assert entry.requires_language_context is requires_language_context
         assert entry.message_key is None
+        assert entry.raw_source_allowed is False
+        assert entry.legacy_event_type is None
+
+
+def test_knowledge_admin_events_are_registered_with_data_model_params() -> None:
+    """Require each knowledge-base-admin notification event to be public and parameter-exact."""
+    from app.contracts.event_registry import EVENT_REGISTRY
+
+    entries = EVENT_REGISTRY.entries()
+    assert len(entries) == len({entry.event_code for entry in entries})
+    for event_code, (params_schema, message_key) in _KNOWLEDGE_ADMIN_EXPECTED_EVENTS.items():
+        entry = EVENT_REGISTRY.require(event_code)
+        assert entry.params_schema == params_schema
+        assert entry.visibility is EventVisibility.PUBLIC
+        assert entry.message_key == message_key
+        assert entry.requires_language_context is True
         assert entry.raw_source_allowed is False
         assert entry.legacy_event_type is None
 

@@ -186,8 +186,8 @@ def test_public_job_registration_is_idempotent_and_has_no_feedback_worker_side_e
         str(entry.get("legacy_event_type") or "").startswith("feedback.analyze.")
         for entry in first["events"]
     )
-    assert len(first["events"]) == 75
-    assert sum(item["visibility"] == "public" for item in first["events"]) == 66
+    assert len(first["events"]) == 78
+    assert sum(item["visibility"] == "public" for item in first["events"]) == 69
     assert sum(item["visibility"] == "internal" for item in first["events"]) == 9
     assert {
         item["event_code"] for item in first["events"] if item["visibility"] == "internal"
@@ -205,7 +205,7 @@ def test_public_job_registration_is_idempotent_and_has_no_feedback_worker_side_e
 
     assert second == first
     assert third == first
-    assert len({entry.event_code for entry in EVENT_REGISTRY.entries()}) == 75
+    assert len({entry.event_code for entry in EVENT_REGISTRY.entries()}) == 78
 
 
 def test_test_job_registration_isolated_from_canonical_contract() -> None:
@@ -218,5 +218,5 @@ def test_test_job_registration_isolated_from_canonical_contract() -> None:
 
     after = tuple(entry.model_dump(mode="json") for entry in EVENT_REGISTRY.entries())
     assert after == before
-    assert len(EVENT_REGISTRY.entries()) == 75
+    assert len(EVENT_REGISTRY.entries()) == 78
     assert len(_TEST_JOB_EVENT_REGISTRY.entries()) == 4

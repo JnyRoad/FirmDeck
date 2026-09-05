@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
+from datetime import UTC, datetime
 from typing import Any
 
 from app.contracts.error_registry import (
@@ -28,6 +29,10 @@ KNOWLEDGE_BINDING_REVISION_CONFLICT = "KNOWLEDGE_BINDING_REVISION_CONFLICT"
 KNOWLEDGE_IDEMPOTENCY_CONFLICT = "KNOWLEDGE_IDEMPOTENCY_CONFLICT"
 KNOWLEDGE_IDEMPOTENCY_REQUIRED = "KNOWLEDGE_IDEMPOTENCY_REQUIRED"
 KNOWLEDGE_CONVERSION_VALIDATION_FAILED = "KNOWLEDGE_CONVERSION_VALIDATION_FAILED"
+KNOWLEDGE_VERSION_LEVEL_INVALID = "KNOWLEDGE_VERSION_LEVEL_INVALID"
+KNOWLEDGE_BASELINE_STALE = "KNOWLEDGE_BASELINE_STALE"
+KNOWLEDGE_REBASE_CONFLICTS_UNRESOLVED = "KNOWLEDGE_REBASE_CONFLICTS_UNRESOLVED"
+KNOWLEDGE_DOCUMENT_LINEAGE_MISMATCH = "KNOWLEDGE_DOCUMENT_LINEAGE_MISMATCH"
 
 _ERROR_DEFAULTS: dict[str, tuple[int, str]] = {
     KNOWLEDGE_CONTEXT_MISMATCH: (403, "当前会话与知识库上下文不匹配。"),
@@ -40,6 +45,10 @@ _ERROR_DEFAULTS: dict[str, tuple[int, str]] = {
     KNOWLEDGE_IDEMPOTENCY_CONFLICT: (409, "同一幂等键已用于不同的知识库操作。"),
     KNOWLEDGE_IDEMPOTENCY_REQUIRED: (400, "Agent 知识库变更必须提供幂等键。"),
     KNOWLEDGE_CONVERSION_VALIDATION_FAILED: (409, "知识库转换后的资产校验失败。"),
+    KNOWLEDGE_VERSION_LEVEL_INVALID: (400, "知识版本发布级别无效，仅支持 patch/minor/major。"),
+    KNOWLEDGE_BASELINE_STALE: (409, "共享知识库正式版本已更新，请先变基后再发布，或确认强制覆盖。"),
+    KNOWLEDGE_REBASE_CONFLICTS_UNRESOLVED: (409, "变基冲突尚未全部解决，请清除残留的冲突标记。"),
+    KNOWLEDGE_DOCUMENT_LINEAGE_MISMATCH: (409, "变基缺少部分冲突文档的解决方案。"),
 }
 
 _SAFE_PARAM_SUFFIXES = (
@@ -53,7 +62,7 @@ _SAFE_PARAM_SUFFIXES = (
     "_status",
     "_version",
 )
-_SAFE_PARAM_NAMES = {"count", "revision", "status", "version"}
+_SAFE_PARAM_NAMES = {"count", "revision", "status", "version", "level"}
 
 
 def _is_safe_param_value(value: Any) -> bool:
@@ -193,3 +202,27 @@ def knowledge_error(
         request_id=request_id,
         trace_id=trace_id,
     )
+
+
+def parse_expected_updated_at(value: str) -> datetime:
+    """把请求体里的 ISO 时间字符串解析为可比较的 naive UTC 时间，容忍 `Z` 或显式偏移写法。
+
+    与 `KnowledgeBaseVersion.updated_at`（`utc_now()` 产出的 naive UTC）保持同一口径，
+    解析失败一律视为版本已变化（`KNOWLEDGE_PUBLISH_CONFLICT`），而不是泄漏校验细节。
+
+    放在 errors.py 这个叶子模块，供 `versioning.record_review`（A5）与 `rebase`（A3/A4）
+    共用同一套乐观锁语义——`versioning` 依赖 `rebase`，两者无法互相 import。
+    """
+    normalized = str(value or "").strip()
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise knowledge_error(
+            KNOWLEDGE_PUBLISH_CONFLICT,
+            message="版本标识无效，请刷新后重试。",
+        ) from exc
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(UTC).replace(tzinfo=None)
+    return parsed

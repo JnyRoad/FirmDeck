@@ -1524,6 +1524,18 @@ export const BACKEND_ERROR_CONTRACT = {
     "status": 404,
     "visibility": "public"
   },
+  "KNOWLEDGE_BASELINE_STALE": {
+    "code": "KNOWLEDGE_BASELINE_STALE",
+    "message_key": "errors.knowledge.baselineStale",
+    "params": {
+      "base_version": "string",
+      "conflict_count": "integer",
+      "published_version": "string"
+    },
+    "retryable": false,
+    "status": 409,
+    "visibility": "public"
+  },
   "KNOWLEDGE_BASE_NOT_FOUND": {
     "code": "KNOWLEDGE_BASE_NOT_FOUND",
     "message_key": "errors.knowledge.baseNotFound",
@@ -1634,6 +1646,16 @@ export const BACKEND_ERROR_CONTRACT = {
     "code": "KNOWLEDGE_DOCUMENT_CONFLICT",
     "message_key": "errors.knowledge.documentConflict",
     "params": {},
+    "retryable": false,
+    "status": 409,
+    "visibility": "public"
+  },
+  "KNOWLEDGE_DOCUMENT_LINEAGE_MISMATCH": {
+    "code": "KNOWLEDGE_DOCUMENT_LINEAGE_MISMATCH",
+    "message_key": "errors.knowledge.documentLineageMismatch",
+    "params": {
+      "lineage_id": "string"
+    },
     "retryable": false,
     "status": 409,
     "visibility": "public"
@@ -1768,6 +1790,16 @@ export const BACKEND_ERROR_CONTRACT = {
     "status": 409,
     "visibility": "public"
   },
+  "KNOWLEDGE_REBASE_CONFLICTS_UNRESOLVED": {
+    "code": "KNOWLEDGE_REBASE_CONFLICTS_UNRESOLVED",
+    "message_key": "errors.knowledge.rebaseConflictsUnresolved",
+    "params": {
+      "document_count": "integer"
+    },
+    "retryable": false,
+    "status": 409,
+    "visibility": "public"
+  },
   "KNOWLEDGE_SCOPE_CONFLICT": {
     "code": "KNOWLEDGE_SCOPE_CONFLICT",
     "message_key": "errors.knowledge.scopeConflict",
@@ -1800,6 +1832,16 @@ export const BACKEND_ERROR_CONTRACT = {
     "params": {},
     "retryable": false,
     "status": 404,
+    "visibility": "public"
+  },
+  "KNOWLEDGE_VERSION_LEVEL_INVALID": {
+    "code": "KNOWLEDGE_VERSION_LEVEL_INVALID",
+    "message_key": "errors.knowledge.versionLevelInvalid",
+    "params": {
+      "level": "string"
+    },
+    "retryable": false,
+    "status": 400,
     "visibility": "public"
   },
   "KNOWLEDGE_VERSION_NOT_FOUND": {
@@ -3389,6 +3431,33 @@ export const BACKEND_EVENT_CONTRACT = {
     "requires_language_context": true,
     "visibility": "public"
   },
+  "knowledge.draft.rebased": {
+    "event_code": "knowledge.draft.rebased",
+    "legacy_event_type": null,
+    "message_key": "events.knowledge.draftRebased",
+    "params": {
+      "draft_name": "string",
+      "knowledge_base_id": "string",
+      "to_base_version": "string"
+    },
+    "raw_source_allowed": false,
+    "requires_language_context": true,
+    "visibility": "public"
+  },
+  "knowledge.draft.reviewed": {
+    "event_code": "knowledge.draft.reviewed",
+    "legacy_event_type": null,
+    "message_key": "events.knowledge.draftReviewed",
+    "params": {
+      "draft_name": "string",
+      "knowledge_base_id": "string",
+      "pending": "integer",
+      "staged": "integer"
+    },
+    "raw_source_allowed": false,
+    "requires_language_context": true,
+    "visibility": "public"
+  },
   "knowledge.ingest.cancelled": {
     "event_code": "knowledge.ingest.cancelled",
     "legacy_event_type": "knowledge.ingest.cancelled",
@@ -3439,6 +3508,19 @@ export const BACKEND_EVENT_CONTRACT = {
     "message_key": "events.knowledge.ingest.succeeded",
     "params": {
       "job_id": "string"
+    },
+    "raw_source_allowed": false,
+    "requires_language_context": true,
+    "visibility": "public"
+  },
+  "knowledge.version.published": {
+    "event_code": "knowledge.version.published",
+    "legacy_event_type": null,
+    "message_key": "events.knowledge.versionPublished",
+    "params": {
+      "knowledge_base_id": "string",
+      "stale_draft_count": "integer",
+      "version": "string"
     },
     "raw_source_allowed": false,
     "requires_language_context": true,

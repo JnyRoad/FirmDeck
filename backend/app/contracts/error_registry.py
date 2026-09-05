@@ -978,6 +978,17 @@ def build_default_error_registry() -> ErrorRegistry:
     knowledge_api_entries = (
         ("KNOWLEDGE_AGENT_NOT_FOUND", "errors.knowledge.agentNotFound", 404, False, {}),
         (
+            "KNOWLEDGE_BASELINE_STALE",
+            "errors.knowledge.baselineStale",
+            409,
+            False,
+            {
+                "base_version": "string",
+                "published_version": "string",
+                "conflict_count": "integer",
+            },
+        ),
+        (
             "KNOWLEDGE_BASE_VERSION_NOT_VISIBLE",
             "errors.knowledge.baseVersionNotVisible",
             404,
@@ -1013,6 +1024,13 @@ def build_default_error_registry() -> ErrorRegistry:
             409,
             False,
             {},
+        ),
+        (
+            "KNOWLEDGE_DOCUMENT_LINEAGE_MISMATCH",
+            "errors.knowledge.documentLineageMismatch",
+            409,
+            False,
+            {"lineage_id": "string"},
         ),
         (
             "KNOWLEDGE_DOCUMENT_NOT_FOUND",
@@ -1060,6 +1078,13 @@ def build_default_error_registry() -> ErrorRegistry:
             False,
             {},
         ),
+        (
+            "KNOWLEDGE_REBASE_CONFLICTS_UNRESOLVED",
+            "errors.knowledge.rebaseConflictsUnresolved",
+            409,
+            False,
+            {"document_count": "integer"},
+        ),
         ("KNOWLEDGE_SCOPE_CONFLICT", "errors.knowledge.scopeConflict", 400, False, {}),
         (
             "KNOWLEDGE_VERSION_BINDING_MISSING",
@@ -1067,6 +1092,13 @@ def build_default_error_registry() -> ErrorRegistry:
             404,
             False,
             {},
+        ),
+        (
+            "KNOWLEDGE_VERSION_LEVEL_INVALID",
+            "errors.knowledge.versionLevelInvalid",
+            400,
+            False,
+            {"level": "string"},
         ),
         (
             "KNOWLEDGE_VERSION_NOT_FOUND",

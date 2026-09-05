@@ -981,6 +981,19 @@ def promote_knowledge_branch_to_overall(
     agent_id: str,
     knowledge_base_id: str,
 ) -> KnowledgeBaseVersion:
+    """把员工分支头版本发布为该知识库的下一个广场模板版本，返回新建的正式版本行。
+
+    副作用：新建/更新目标版本行、改写知识库元数据为 open gallery 口径、写入整体智能体的
+    广场绑定、把分支基线与头版本推进到新版本号。分支不存在时抛 404
+    `AGENT_KNOWLEDGE_BRANCH_NOT_FOUND`。
+
+    元数据改写保留 `owner_agent_id`：这条知识库行本身仍然是该员工的专用库（分支照旧存在
+    且可回滚），只是内容额外对外发布为模板。`open_gallery_metadata` 面向的是纯广场资源、
+    会无条件抹掉归属标记，直接套用会让 `listing.py::_owner_agent_id` 之后再也找不到归属
+    员工，进而使列表/详情的 owner/branch/published_version 全部变空、回滚请求带空
+    `agent_id` 而 404（T077 缺陷 C）。广场可见性由整体智能体的绑定
+    （`is_open_gallery_resource`）判定，不依赖归属标记，因此保留它不影响上架。
+    """
     kb = _get_knowledge_base(db, tenant_id, knowledge_base_id)
     branch = db.exec(
         select(AgentKnowledgeBranch).where(
@@ -1006,9 +1019,13 @@ def promote_knowledge_branch_to_overall(
     kb.name = source.name
     kb.description = source.description
     kb.capability_scope = source.capability_scope
-    kb.metadata_json = open_gallery_metadata(
+    promoted_metadata = open_gallery_metadata(
         {**(kb.metadata_json or {}), "current_version": next_version}
     )
+    owner_agent_id = (kb.metadata_json or {}).get("owner_agent_id")
+    if isinstance(owner_agent_id, str) and owner_agent_id:
+        promoted_metadata["owner_agent_id"] = owner_agent_id
+    kb.metadata_json = promoted_metadata
     kb.updated_at = utc_now()
     ensure_open_gallery_binding(db, tenant_id, "knowledge_base", kb.id, "active")
     branch.base_version = next_version
@@ -1369,6 +1386,11 @@ def clone_knowledge_version_assets(
 
     if not target_has_documents:
         for document in source_documents:
+            # 继承源文档的 lineage_id；源文档缺失（历史数据）时以源文档自身 id 回填，
+            # 使跨版本对比/变基（diff.py、rebase.py）能按 lineage_id 配对同一篇文档。
+            source_lineage_id = str((document.metadata_json or {}).get("lineage_id") or document.id)
+            clone_metadata = deepcopy(document.metadata_json or {})
+            clone_metadata["lineage_id"] = source_lineage_id
             clone = KnowledgeDocument(
                 tenant_id=document.tenant_id,
                 knowledge_base_id=target_base_id,
@@ -1379,7 +1401,7 @@ def clone_knowledge_version_assets(
                 status=document.status,
                 bucket_count=document.bucket_count,
                 chunk_count=document.chunk_count,
-                metadata_json=deepcopy(document.metadata_json or {}),
+                metadata_json=clone_metadata,
                 error=document.error,
                 created_at=document.created_at,
                 updated_at=utc_now(),

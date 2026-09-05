@@ -129,12 +129,86 @@ class KnowledgeBaseVersionRead(BaseModel):
     change_reason: str | None = None
     published_at: datetime | None = None
     is_published_head: bool = False
+    is_stale: bool = False
+    base_version: str | None = None
+    draft_name: str | None = None
+    next_version_preview: dict[str, str] | None = None
     capability_scope: CapabilityScope = "general"
     metadata: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
     updated_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class KnowledgeAdminOwnerAgentRead(BaseModel):
+    """A1 列表项的 owner_agent：私有库归属员工。"""
+
+    id: str
+    name: str
+
+
+class KnowledgeAdminBoundTeamRead(BaseModel):
+    """A1 列表项 bound_teams 的一条团队绑定，is_default 标记团队默认库。"""
+
+    id: str
+    name: str
+    is_default: bool
+
+
+class KnowledgeAdminBranchRead(BaseModel):
+    """A1 列表项的 branch：仅私有库存在，取 owner 员工分支的基线/头版本与同步状态。"""
+
+    base_version: str
+    head_version: str
+    sync_state: str
+
+
+class KnowledgeAdminListItem(BaseModel):
+    """A1 `GET /knowledge-admin/knowledge-bases` 的 items[] 元素。"""
+
+    id: str
+    name: str
+    description: str | None = None
+    mode: KnowledgeBaseMode
+    status: Literal["active", "archived"]
+    capability_scope: CapabilityScope
+    published_version: str | None = None
+    published_version_id: str | None = None
+    draft_count: int = 0
+    document_count: int = 0
+    owner_agent: KnowledgeAdminOwnerAgentRead | None = None
+    bound_teams: list[KnowledgeAdminBoundTeamRead] = Field(default_factory=list)
+    branch: KnowledgeAdminBranchRead | None = None
+    updated_at: str
+
+
+class KnowledgeAdminListSummary(BaseModel):
+    """A1 响应的 summary：全租户统计，不受过滤参数影响。"""
+
+    total: int
+    shared: int
+    dedicated: int
+    documents: int
+
+
+class KnowledgeAdminListResponse(BaseModel):
+    """A1 分页响应：`GET /knowledge-admin/knowledge-bases`。"""
+
+    items: list[KnowledgeAdminListItem] = Field(default_factory=list)
+    summary: KnowledgeAdminListSummary
+    total: int
+    offset: int
+    limit: int
+    has_more: bool
+
+
+class KnowledgeAdminTeamOption(BaseModel):
+    """A6 `GET /knowledge-admin/teams` 的候选团队条目。"""
+
+    id: str
+    name: str
+    member_count: int
 
 
 class KnowledgeBaseAuditEventRead(BaseModel):
@@ -170,29 +244,36 @@ class SharedKnowledgeTeamRead(BaseModel):
 
 class SharedKnowledgeDraftCreateRequest(BaseModel):
     tenant_id: str
-    team_id: str
+    # team_id 为空时要求调用者是租户管理员（require_team_knowledge_manager 旁路），
+    # 用于治理未绑定任何团队的共享库。
+    team_id: str | None = None
     change_reason: NonEmptyText
     expected_published_version_id: str | None = None
 
 
 class SharedKnowledgePublishRequest(BaseModel):
     tenant_id: str
-    team_id: str
+    team_id: str | None = None
     expected_published_version_id: NonEmptyText
     change_reason: NonEmptyText
+    # 保持 str 而非 Literal：非法值必须经由领域校验映射为
+    # KNOWLEDGE_VERSION_LEVEL_INVALID（400, params.level），而不是被 Pydantic
+    # 在到达路由前拒绝并折叠成通用 VALIDATION_ERROR（422）。
+    level: str = "patch"
+    force_overwrite: bool = False
     idempotency_key: str | None = None
 
 
 class SharedKnowledgeRejectRequest(BaseModel):
     tenant_id: str
-    team_id: str
+    team_id: str | None = None
     change_reason: NonEmptyText
     idempotency_key: str | None = None
 
 
 class SharedKnowledgeRollbackRequest(BaseModel):
     tenant_id: str
-    team_id: str
+    team_id: str | None = None
     target_version_id: NonEmptyText
     expected_published_version_id: NonEmptyText
     change_reason: NonEmptyText
@@ -424,3 +505,173 @@ class KnowledgeDiscoveryRead(BaseModel):
     updated_at: str
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class DiffHunkRead(BaseModel):
+    """A2 版本对比单个文档内的一个 hunk：equal（未变）或 change（相邻增删改合并块）。"""
+
+    type: Literal["equal", "change"]
+    base_start: int
+    base_lines: list[str] = Field(default_factory=list)
+    target_start: int
+    target_lines: list[str] = Field(default_factory=list)
+    pairs: list[list[int]] = Field(default_factory=list)
+
+
+class DiffDocumentRead(BaseModel):
+    """A2 版本对比的单篇文档条目：按 lineage（或回退 filename）配对后的增/改/删状态。
+
+    `base_document_id`/`target_document_id`（T080 新增）是该篇文档在 base/target 各自
+    版本内的真实行 id，供前端写回（编辑/归档/恢复）时定位到当前版本内的克隆行，而不是
+    误用指向源文档的 `lineage_id`；对应侧不存在时为 `None`。
+
+    `base_updated_at`/`target_updated_at`（乐观锁字段补全轮次新增）分别是
+    `base_document_id`/`target_document_id` 那一行 `updated_at.isoformat()`，格式与
+    `PUT /knowledge/documents/{id}` 的 `expected_updated_at` 完全一致，供前端直接原样
+    回传做乐观锁；对应侧 document_id 为 `None` 时同样为 `None`。`deleted` 的
+    `target_updated_at` 来自草稿内归档行（该行仍存在，只是 A2b 不返回）。
+    """
+
+    lineage_id: str
+    title: str
+    kind: Literal["added", "modified", "deleted"]
+    truncated: bool = False
+    hunks: list[DiffHunkRead] = Field(default_factory=list)
+    base_document_id: str | None = None
+    target_document_id: str | None = None
+    base_updated_at: str | None = None
+    target_updated_at: str | None = None
+
+
+class VersionDiffSummary(BaseModel):
+    """A2 响应的 summary：文档级新增/修改/删除计数。"""
+
+    added: int
+    modified: int
+    deleted: int
+
+
+class VersionDiffRead(BaseModel):
+    """A2 `GET /knowledge-admin/knowledge-bases/{kb_id}/versions/{version_id}/diff` 响应。"""
+
+    base_version_id: str | None = None
+    target_version_id: str
+    pairing: Literal["lineage", "filename"]
+    summary: VersionDiffSummary
+    documents: list[DiffDocumentRead] = Field(default_factory=list)
+
+
+class VersionDocumentRead(BaseModel):
+    """A2b `GET .../versions/{version_id}/documents` 响应的单篇文档条目。
+
+    返回该版本内全部文档（含未改动的），携带真实行 `id`（区别于 A2 diff 响应里
+    只出现有变化文档、且草稿克隆行会让 `lineage_id` 指向源文档的问题）。
+    """
+
+    id: str
+    lineage_id: str | None = None
+    title: str
+    filename: str
+    status: str
+    bucket_count: int
+    chunk_count: int
+    updated_at: str
+
+
+class KnowledgeRebaseRequest(BaseModel):
+    """A3 `POST .../versions/{version_id}/rebase` 请求体：变基预览/执行。
+
+    `expected_updated_at` 可选：给出时按 A5 相同语义（原样透传的 `updated_at` 字符串、
+    微秒精度精确相等）做乐观锁校验，用于防住双击/重试与并发写入；不给出则不校验。
+    """
+
+    tenant_id: str
+    team_id: str | None = None
+    change_reason: NonEmptyText
+    expected_updated_at: str | None = None
+    idempotency_key: str | None = None
+
+
+class KnowledgeRebaseResolutionInput(BaseModel):
+    """A4 请求体中单篇冲突文档的最终合并结果。"""
+
+    lineage_id: NonEmptyText
+    content_md: str
+
+
+class KnowledgeRebaseResolveRequest(BaseModel):
+    """A4 `POST .../rebase/resolve` 请求体：提交冲突解决并完成变基。
+
+    `expected_updated_at` 与 A3 同义，可选；`to_base_version_id` 仍是必填的正式版乐观锁。
+    """
+
+    tenant_id: str
+    team_id: str | None = None
+    change_reason: NonEmptyText
+    expected_updated_at: str | None = None
+    idempotency_key: str | None = None
+    to_base_version_id: NonEmptyText
+    resolutions: list[KnowledgeRebaseResolutionInput] = Field(default_factory=list)
+
+
+class KnowledgeRebaseAutoMergedRead(BaseModel):
+    """变基预览中一篇自动合并（或直接采用一方）成功的文档。"""
+
+    lineage_id: str
+    title: str
+    source: Literal["ours", "theirs", "merged"]
+
+
+class KnowledgeRebaseConflictBlockRead(BaseModel):
+    """一个交叠冲突块的三方内容与前后各若干行上下文。"""
+
+    base_lines: list[str] = Field(default_factory=list)
+    ours_lines: list[str] = Field(default_factory=list)
+    theirs_lines: list[str] = Field(default_factory=list)
+    context_before: list[str] = Field(default_factory=list)
+    context_after: list[str] = Field(default_factory=list)
+
+
+class KnowledgeRebaseConflictRead(BaseModel):
+    """一篇存在交叠冲突、需要人工解决的文档。
+
+    `merged_text` 是三方合并后的**完整**文档：双方可自动合并的改动都已套用，每个冲突
+    簇渲染成 Git 风格标记段（`<<<<<<< ours` / `=======` / `>>>>>>> theirs`），第 i 段
+    对应 `blocks[i]`。前端必须基于 `merged_text` 编辑并原样提交为 A4 的 `content_md`；
+    `blocks`/`context_*` 仅用于分段展示，只拼接它们会丢掉冲突区间以外的正文。
+    """
+
+    lineage_id: str
+    title: str
+    blocks: list[KnowledgeRebaseConflictBlockRead] = Field(default_factory=list)
+    merged_text: str = ""
+
+
+class KnowledgeRebasePreviewRead(BaseModel):
+    """A3 有冲突时的响应：变基预览，未落库，须调用 A4 resolve 提交解决结果。"""
+
+    status: Literal["conflicts"] = "conflicts"
+    draft_version_id: str
+    from_base_version_id: str | None = None
+    to_base_version_id: str
+    auto_merged: list[KnowledgeRebaseAutoMergedRead] = Field(default_factory=list)
+    conflicts: list[KnowledgeRebaseConflictRead] = Field(default_factory=list)
+
+
+class KnowledgeRebaseResultRead(BaseModel):
+    """A3 无冲突或 A4 解决完成后的响应：新草稿快照与被替换的旧快照 id。"""
+
+    status: Literal["applied"] = "applied"
+    new_version: KnowledgeBaseVersionRead
+    superseded_version_id: str
+
+
+class KnowledgeDraftReviewRequest(BaseModel):
+    """A5 `POST .../versions/{version_id}/review` 请求体：写入草稿审阅状态。"""
+
+    tenant_id: str
+    team_id: str | None = None
+    staged: int = Field(ge=0)
+    pending: int = Field(ge=0)
+    documents_adjusted: int = Field(ge=0)
+    expected_updated_at: NonEmptyText

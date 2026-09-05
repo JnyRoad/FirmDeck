@@ -233,6 +233,18 @@ describe('AppSidebar semantic navigation matrix', () => {
     expect(view.container.innerHTML).not.toContain('/system/');
     expect(screen.queryByText('租户管理')).toBeNull();
   });
+
+  it('shows the knowledge base admin entry in the system group for an enterprise admin', () => {
+    renderSemanticSidebar('zh-CN');
+
+    expect(screen.getByText('知识库管理')).toBeTruthy();
+  });
+
+  it('hides the knowledge base admin entry from a non-admin sidebar', () => {
+    renderSidebar({ selectedAgentId: 'agent-1' });
+
+    expect(screen.queryByText('知识库管理')).toBeNull();
+  });
 });
 
 describe('AppSidebar chat variant group conversations', () => {
