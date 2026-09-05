@@ -616,7 +616,10 @@ function ModifiedDocumentEditor({ doc, state, labels, onStagingChange }: Modifie
     onStagingChange((s) => rejectAll(s, intersectingHunks));
   }
 
-  type RenderItem = { kind: 'toolbar'; hunk: Hunk } | { kind: 'row'; row: Row; index: number };
+  type RenderItem =
+    | { kind: 'toolbar'; hunk: Hunk }
+    | { kind: 'row'; row: Row; index: number }
+    | { kind: 'staged-only'; record: StagedRecord };
   const renderItems: RenderItem[] = [];
   const seenHunks = new Set<number>();
   rows.forEach((row, index) => {
@@ -627,6 +630,16 @@ function ModifiedDocumentEditor({ doc, state, labels, onStagingChange }: Modifie
     }
     renderItems.push({ kind: 'row', row, index });
   });
+  // 整篇文档被暂存后清空为零行（`stagedBase`/`lines` 都是空数组，如单行
+  // 「b → ''」被接受）：`rows` 里没有任何一行可挂载 ✓ 徽章/「撤销接受」，
+  // 上面按位置锚定的纯删除兜底（I5）也无行可锚。这里再兜底一层：rows 为空但
+  // `state.staged` 非空时，直接为每条暂存记录单独渲染一行徽章，保证 unstage
+  // 入口不会因为"整篇清空"而不可达。
+  if (rows.length === 0 && state.staged.length > 0) {
+    state.staged.forEach((record) => {
+      renderItems.push({ kind: 'staged-only', record });
+    });
+  }
 
   return (
     <div className="rounded-2xl border border-border/70 bg-white">
@@ -673,6 +686,28 @@ function ModifiedDocumentEditor({ doc, state, labels, onStagingChange }: Modifie
         onKeyUp={trackSelection}
       >
         {renderItems.map((item) => {
+          if (item.kind === 'staged-only') {
+            const { record } = item;
+            return (
+              <div
+                key={`staged-${record.id}`}
+                contentEditable={false}
+                className="er flex items-center gap-2 bg-emerald-50/60 px-3 py-0.5"
+              >
+                <span className="flex shrink-0 items-center gap-1 text-xs text-emerald-600">
+                  <span aria-hidden="true">{labels.stagedBadge}</span>
+                  <button
+                    type="button"
+                    className="underline"
+                    disabled={!canUnstage(state, record.id)}
+                    onClick={() => handleUnstageRecord(record.id)}
+                  >
+                    {labels.unacceptButton}
+                  </button>
+                </span>
+              </div>
+            );
+          }
           if (item.kind === 'toolbar') {
             return (
               <div

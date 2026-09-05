@@ -569,4 +569,34 @@ describe('ReviewEditor — 纯删除块接受后可撤销（I5）', () => {
     expect(queryByText(labels.stagedBadge)).not.toBeNull();
     expect((getByText(labels.unacceptButton) as HTMLButtonElement).disabled).toBe(false);
   });
+
+  it('keeps the undo-accept button reachable when accepting the deletion empties the whole document', () => {
+    const { getByText, queryByText, onChange } = renderEditor([
+      // base 'b' → current ''：唯一变更块是纯删除，接受后 stagedBase/lines
+      // 都变成空数组，`buildModel([], [])` 不产出任何行——I5 的按位置锚定
+      // 兜底也没有行可以挂载，需要 rows 为空时的专门兜底。
+      { lineageId: 'd1', title: 'doc1.md', kind: 'modified', base: 'b', current: '' },
+    ]);
+    act(() => {
+      fireEvent.click(getByText(labels.acceptButton));
+    });
+    let out = lastOutput(onChange);
+    expect(out.pendingCount).toBe(0);
+    expect(out.stagedCount).toBe(1);
+    expect(queryByText(labels.stagedBadge)).not.toBeNull();
+    const undo = getByText(labels.unacceptButton) as HTMLButtonElement;
+    expect(undo.disabled).toBe(false);
+
+    act(() => {
+      fireEvent.click(undo);
+    });
+    out = lastOutput(onChange);
+    // unstage 只回退 stagedBase，不动工作区 lines（撤销接受只是把这块变更打回
+    // 待审阅，不代表恢复原文——恢复原文要用「拒绝」）。
+    expect(out.docs[0].lines).toEqual([]);
+    expect(out.pendingCount).toBe(1);
+    expect(out.stagedCount).toBe(0);
+    expect(queryByText(labels.stagedBadge)).toBeNull();
+    expect(queryByText(labels.acceptButton)).not.toBeNull();
+  });
 });
