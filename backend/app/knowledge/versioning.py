@@ -100,10 +100,16 @@ def _next_shared_version_label(
     parsed = [
         parts for value in released_versions if (parts := _semantic_version_parts(value))
     ]
-    if not parsed:
-        return "1.0.0"
-    candidate = max(parsed)
     occupied = set(occupied_versions)
+    if parsed:
+        candidate = max(parsed)
+    else:
+        # 还没有任何 released 语义版本时默认发 1.0.0；但历史数据里可能已经存在占用
+        # `1.0.0` 的行（例如早期草稿/迁移遗留），直接返回会让发布永远撞
+        # KNOWLEDGE_PUBLISH_CONFLICT，因此同样按 level 递进直到找到空位。
+        if "1.0.0" not in occupied:
+            return "1.0.0"
+        candidate = (1, 0, 0)
     while True:
         candidate = _bump_version(candidate, level)
         label = f"{candidate[0]}.{candidate[1]}.{candidate[2]}"

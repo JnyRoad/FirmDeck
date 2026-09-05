@@ -46,7 +46,7 @@ from app.knowledge.errors import (
     KNOWLEDGE_VERSION_NOT_READY,
     KnowledgeError,
 )
-from app.knowledge.rebase import merge_document_sets
+from app.knowledge.rebase import _has_conflict_markers, merge_document_sets
 from app.knowledge.schema import (
     KnowledgeRebaseRequest,
     KnowledgeRebaseResolutionInput,
@@ -159,6 +159,142 @@ def test_merge_document_sets_produces_conflict_for_overlapping_changes() -> None
     assert block.theirs_lines == ["beta-theirs"]
     assert block.context_before == ["alpha"]
     assert block.context_after == ["gamma"]
+
+
+def _snapshot(lines: list[str]) -> list[DocumentSnapshot]:
+    return [DocumentSnapshot(lineage_id="L1", filename="a.md", title="A", lines=lines)]
+
+
+def _resolve_regions(merged_text: str, side: str) -> str:
+    """把 `merged_text` 里的每个 Git 标记段替换为指定一方的内容，模拟前端"采用某一方"。"""
+    out: list[str] = []
+    state = "body"
+    for line in merged_text.split("\n"):
+        if line == "<<<<<<< ours":
+            state = "ours"
+            continue
+        if line == "=======":
+            state = "theirs"
+            continue
+        if line == ">>>>>>> theirs":
+            state = "body"
+            continue
+        if state == "body" or state == side:
+            out.append(line)
+    return "\n".join(out)
+
+
+def test_conflict_merged_text_keeps_entire_document_and_auto_merged_hunks() -> None:
+    """回归（数据丢失）：冲突文档的 merged_text 必须是完整文档，而不是冲突块 ±2 行的拼接。
+
+    长文档（30 行）里只有第 10 行双方交叠冲突，第 5 行仅 theirs 改、第 25 行仅 ours 改
+    （两处都可自动合并）。若前端只按 `blocks[i]` 的 context_before/after 拼装正文，
+    第 0-7 行、第 13-30 行会被整段丢弃。
+    """
+    base_lines = [f"line-{index:02d}" for index in range(30)]
+    ours_lines = list(base_lines)
+    ours_lines[10] = "line-10-ours"
+    ours_lines[25] = "line-25-ours-auto"
+    theirs_lines = list(base_lines)
+    theirs_lines[5] = "line-05-theirs-auto"
+    theirs_lines[10] = "line-10-theirs"
+
+    auto_merged, conflicts = merge_document_sets(
+        _snapshot(base_lines), _snapshot(ours_lines), _snapshot(theirs_lines)
+    )
+
+    assert auto_merged == []
+    assert len(conflicts) == 1
+    conflict = conflicts[0]
+    assert len(conflict.blocks) == 1
+    assert conflict.blocks[0].ours_lines == ["line-10-ours"]
+    assert conflict.blocks[0].theirs_lines == ["line-10-theirs"]
+
+    merged_lines = conflict.merged_text.split("\n")
+    # 恰好一个标记段，且与 blocks[0] 对应。
+    assert merged_lines.count("<<<<<<< ours") == 1
+    assert merged_lines.count("=======") == 1
+    assert merged_lines.count(">>>>>>> theirs") == 1
+    marker_start = merged_lines.index("<<<<<<< ours")
+    separator = merged_lines.index("=======")
+    marker_end = merged_lines.index(">>>>>>> theirs")
+    assert merged_lines[marker_start + 1 : separator] == conflict.blocks[0].ours_lines
+    assert merged_lines[separator + 1 : marker_end] == conflict.blocks[0].theirs_lines
+
+    # 冲突区间以外的正文一行不少，且两处自动合并的改动都已套用。
+    assert merged_lines[:marker_start] == [
+        *base_lines[:5],
+        "line-05-theirs-auto",
+        *base_lines[6:10],
+    ]
+    expected_tail = [*base_lines[11:25], "line-25-ours-auto", *base_lines[26:]]
+    assert merged_lines[marker_end + 1 :] == expected_tail
+
+    # 「采用草稿 / 采用正式版」后得到的是完整文档。
+    expected_ours = list(base_lines)
+    expected_ours[5] = "line-05-theirs-auto"
+    expected_ours[10] = "line-10-ours"
+    expected_ours[25] = "line-25-ours-auto"
+    assert _resolve_regions(conflict.merged_text, "ours") == "\n".join(expected_ours)
+    expected_theirs = list(expected_ours)
+    expected_theirs[10] = "line-10-theirs"
+    assert _resolve_regions(conflict.merged_text, "theirs") == "\n".join(expected_theirs)
+
+
+def test_conflict_merged_text_emits_one_region_per_block_in_order() -> None:
+    """两处冲突 → merged_text 里按 blocks 顺序出现两个标记段。"""
+    base_lines = [f"line-{index:02d}" for index in range(30)]
+    ours_lines = list(base_lines)
+    ours_lines[8] = "line-08-ours"
+    ours_lines[20] = "line-20-ours"
+    theirs_lines = list(base_lines)
+    theirs_lines[8] = "line-08-theirs"
+    theirs_lines[20] = "line-20-theirs"
+
+    _auto_merged, conflicts = merge_document_sets(
+        _snapshot(base_lines), _snapshot(ours_lines), _snapshot(theirs_lines)
+    )
+
+    conflict = conflicts[0]
+    assert len(conflict.blocks) == 2
+    merged_lines = conflict.merged_text.split("\n")
+    assert merged_lines.count("<<<<<<< ours") == 2
+    starts = [i for i, line in enumerate(merged_lines) if line == "<<<<<<< ours"]
+    seps = [i for i, line in enumerate(merged_lines) if line == "======="]
+    ends = [i for i, line in enumerate(merged_lines) if line == ">>>>>>> theirs"]
+    for index, block in enumerate(conflict.blocks):
+        assert merged_lines[starts[index] + 1 : seps[index]] == block.ours_lines
+        assert merged_lines[seps[index] + 1 : ends[index]] == block.theirs_lines
+    assert _resolve_regions(conflict.merged_text, "ours") == "\n".join(ours_lines)
+    assert _resolve_regions(conflict.merged_text, "theirs") == "\n".join(theirs_lines)
+
+
+def test_conflict_merged_text_markers_are_rejected_by_resolve_guard() -> None:
+    """merged_text 原样提交必须被 A4 的残留标记守卫拦下（标记文本与守卫同源）。"""
+    base_lines = ["alpha", "beta", "gamma"]
+    _auto_merged, conflicts = merge_document_sets(
+        _snapshot(base_lines),
+        _snapshot(["alpha", "beta-ours", "gamma"]),
+        _snapshot(["alpha", "beta-theirs", "gamma"]),
+    )
+    assert _has_conflict_markers(conflicts[0].merged_text) is True
+    assert _has_conflict_markers(_resolve_regions(conflicts[0].merged_text, "ours")) is False
+
+
+def test_whole_document_conflicts_carry_marker_region_merged_text() -> None:
+    """整篇型冲突（双方各自新增 / 一方删除一方改）也必须带完整的标记段 merged_text。"""
+    _auto, both_added = merge_document_sets(
+        [], _snapshot(["ours-1", "ours-2"]), _snapshot(["theirs-1"])
+    )
+    assert both_added[0].merged_text == (
+        "<<<<<<< ours\nours-1\nours-2\n=======\ntheirs-1\n>>>>>>> theirs"
+    )
+
+    _auto2, ours_deleted = merge_document_sets(_snapshot(["x"]), [], _snapshot(["x-theirs"]))
+    assert ours_deleted[0].merged_text == "<<<<<<< ours\n=======\nx-theirs\n>>>>>>> theirs"
+
+    _auto3, theirs_deleted = merge_document_sets(_snapshot(["x"]), _snapshot(["x-ours"]), [])
+    assert theirs_deleted[0].merged_text == "<<<<<<< ours\nx-ours\n=======\n>>>>>>> theirs"
 
 
 def test_merge_document_sets_same_position_zero_width_inserts_conflict() -> None:

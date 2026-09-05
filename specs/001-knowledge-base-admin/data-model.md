@@ -128,11 +128,27 @@ RebasePreview
 ├── auto_merged[]  { lineage_id, title, source: "ours" | "theirs" | "merged" }
 └── conflicts[]
     ├── lineage_id, title
+    ├── merged_text  三方合并后的完整文档（见下）
     └── blocks[]  { base_lines[], ours_lines[], theirs_lines[], context_before[], context_after[] }
 RebaseResult
 ├── new_version (KnowledgeBaseVersionRead, 草稿名不变, parent = 最新正式版)
 └── superseded_version_id
 ```
+
+`conflicts[].merged_text` 是**完整**文档：双方相对 base 可自动合并的 hunk 全部已套用，
+每个冲突簇按 `blocks` 顺序原地渲染成 Git 风格标记段，行之间以 `\n` 连接、结尾不带多余标记：
+
+```text
+<<<<<<< ours
+<ours 行>
+=======
+<theirs 行>
+>>>>>>> theirs
+```
+
+第 i 段标记区对应 `blocks[i]`。`blocks`/`context_before`/`context_after` 只用于分段展示；
+消费方必须以 `merged_text` 为编辑基线，并把编辑结果原样作为 A4 的 `content_md` 提交——
+只拼接冲突块及其上下文会丢掉冲突区间以外的全部正文。
 
 ## 6. TeamKnowledgeBaseBinding / TeamKnowledgeBaseGrant（不变）
 

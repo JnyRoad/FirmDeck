@@ -26,7 +26,11 @@ from app.knowledge.schema import (
     SharedKnowledgePublishRequest,
     SharedKnowledgeRejectRequest,
 )
-from app.knowledge.versioning import SharedKnowledgeVersionService, _draft_version_label
+from app.knowledge.versioning import (
+    SharedKnowledgeVersionService,
+    _draft_version_label,
+    _next_shared_version_label,
+)
 
 
 def test_create_draft_names_branch_from_version_id_hex_and_keeps_published_parent() -> None:
@@ -119,6 +123,28 @@ def test_publish_draft_assigns_semver_by_level_above_current_max_released() -> N
         db.commit()
         db.refresh(published_major)
         assert published_major.version == "2.0.0"
+
+
+def test_next_shared_version_label_fallback_respects_occupied_versions() -> None:
+    """回归：没有任何 released 语义版本时的 `1.0.0` 兜底也必须避开已被占用的标签。
+
+    历史数据里可能已存在占用 `1.0.0` 的非 released 行（迁移/早期草稿遗留）。旧实现直接
+    `return "1.0.0"` 而不看 `occupied_versions`，唯一约束会让该库的发布永远撞
+    `KNOWLEDGE_PUBLISH_CONFLICT`，且没有任何自愈路径。
+    """
+    # 无 released、无占用 → 仍然是 1.0.0。
+    assert _next_shared_version_label([], "patch") == "1.0.0"
+
+    # 1.0.0 被占用 → 按 level 递进直到空位。
+    assert _next_shared_version_label([], "patch", occupied_versions=["1.0.0"]) == "1.0.1"
+    assert _next_shared_version_label([], "patch", occupied_versions=["1.0.0", "1.0.1"]) == "1.0.2"
+    assert _next_shared_version_label([], "minor", occupied_versions=["1.0.0"]) == "1.1.0"
+    assert _next_shared_version_label([], "major", occupied_versions=["1.0.0"]) == "2.0.0"
+
+    # 非语义版本的 released 标签（如专用分支名）不参与解析，仍走兜底分支。
+    assert (
+        _next_shared_version_label(["draft-a1b2"], "patch", occupied_versions=["1.0.0"]) == "1.0.1"
+    )
 
 
 def test_publish_draft_rejects_invalid_level() -> None:

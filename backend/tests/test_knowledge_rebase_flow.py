@@ -262,6 +262,17 @@ def test_two_drafts_concurrent_edit_rebase_resolve_and_publish_end_to_end_over_h
     conflict_blocks = preview["conflicts"][0]["blocks"]
     assert conflict_blocks, "冲突文档应带回可展示的交叠块"
     assert conflict_blocks[0]["ours_lines"] and conflict_blocks[0]["theirs_lines"]
+    # HTTP 响应体必须带回完整的三方合并文本（冲突簇为 Git 标记段），前端据此编辑，
+    # 而不是只按 blocks 的上下文拼装正文（会丢掉冲突区间以外的行）。
+    merged_text = preview["conflicts"][0]["merged_text"]
+    assert merged_text.splitlines() == [
+        "<<<<<<< ours",
+        "原文第一行-B改",
+        "=======",
+        "原文第一行-A改",
+        ">>>>>>> theirs",
+        "原文第二行",
+    ]
 
     # A4：解决甲的冲突（保留双方改动），完成变基。
     rebase_result = _post(

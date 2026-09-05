@@ -633,11 +633,18 @@ class KnowledgeRebaseConflictBlockRead(BaseModel):
 
 
 class KnowledgeRebaseConflictRead(BaseModel):
-    """一篇存在交叠冲突、需要人工解决的文档。"""
+    """一篇存在交叠冲突、需要人工解决的文档。
+
+    `merged_text` 是三方合并后的**完整**文档：双方可自动合并的改动都已套用，每个冲突
+    簇渲染成 Git 风格标记段（`<<<<<<< ours` / `=======` / `>>>>>>> theirs`），第 i 段
+    对应 `blocks[i]`。前端必须基于 `merged_text` 编辑并原样提交为 A4 的 `content_md`；
+    `blocks`/`context_*` 仅用于分段展示，只拼接它们会丢掉冲突区间以外的正文。
+    """
 
     lineage_id: str
     title: str
     blocks: list[KnowledgeRebaseConflictBlockRead] = Field(default_factory=list)
+    merged_text: str = ""
 
 
 class KnowledgeRebasePreviewRead(BaseModel):

@@ -5,7 +5,7 @@
 | 项 | 值 |
 |---|---|
 | 枚举 | `EnterpriseRoute.KnowledgeAdmin = '/enterprise/knowledge-admin'` |
-| 路由 | `/enterprise/knowledge-admin`（列表）、`/enterprise/knowledge-admin/:kbId`（详情，`?tab=content|versions|grants|audit|settings` / 私有库 `content|branch|settings`，`?view=pub|<draftVersionId>`；从版本 Tab 跳转「去审阅」时额外带 `?publish=<draftVersionId>&review=1` ——版本 Tab 组件卸载会丢失本地发布框状态，改由内容 Tab 消费这两个参数后自行重新打开审阅编辑器与发布框，应用完成后清除这两个参数） |
+| 路由 | `/enterprise/knowledge-admin`（列表）、`/enterprise/knowledge-admin/:kbId`（详情，`?tab=content\|versions\|grants\|audit\|settings` / 私有库 `content\|branch\|settings`，`?view=pub\|<draftVersionId>`；从版本 Tab 跳转「去审阅」时额外带 `?publish=<draftVersionId>&review=1` ——版本 Tab 组件卸载会丢失本地发布框状态，改由内容 Tab 消费这两个参数后自行重新打开审阅编辑器与发布框，应用完成后清除这两个参数） |
 | 守卫 | 非 `isEnterpriseAdmin` → `Navigate` 到 `EnterpriseRoute.Gallery`（与 `/enterprise/accounts` 一致） |
 | 菜单 | `AppSidebar.SYSTEM_NAV` 追加 `{route: KnowledgeAdmin, labelId: 'shell.nav.knowledgeAdmin', icon: sys-knowledge.svg}`；仅 admin 渲染 |
 | 作用域 | 页面不读 `readEmployeeScope`，不监听 agent-scope 事件 |
@@ -38,8 +38,8 @@ pages/knowledge-admin/*  ──►  api/knowledgeAdmin.ts  ──►  api/tenant
 
 - `api/knowledgeAdmin.ts` 是管理端唯一的 HTTP 调用点，函数与契约 A/B 一一对应，返回类型放在 `types/knowledgeAdmin.ts`。
 - `review/lineDiff.ts`（LCS 行 diff）、`review/hunkModel.ts`（rows/hunks/pairing/字符级 ops）、`review/staging.ts`（暂存基线、接受/拒绝/撤销、位置偏移）为纯函数，必须有 Vitest。
-- `ReviewEditor` 只接收 `{base, initialLines, staged, onChange}` 与文案 props，向上抛出 `{lines, staged, pendingCount}`；"应用到草稿"由 `ContentTab` 调 API。
-- `MergeDialog` 接收 `RebasePreview.conflicts[i]`，输出 `{lineage_id, content_md}`；不调 API。
+- `ReviewEditor` 只接收 `{documents, onChange, labels}`（`documents` 为 `ReviewEditorDocumentInput[]`），向上抛出 `ReviewEditorOutput = {docs, pendingCount, stagedCount, hasWork}`（`docs[i]` 为 `{lineageId, kind, lines, staged, restore}`）；"应用到草稿"由 `ContentTab` 调 API。
+- `MergeDialog` 接收 `RebasePreview.conflicts[i]`，以 `conflict.merged_text`（后端产出的完整合并文档，冲突簇为 Git 标记段）为编辑基线，输出 `{lineage_id, content_md}`；不得只由 `blocks[]`/`context_*` 拼装正文（会丢掉冲突区间以外的内容）。不调 API。
 
 ## 关键交互（与原型一致）
 

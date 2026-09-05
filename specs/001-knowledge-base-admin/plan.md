@@ -16,7 +16,7 @@ Git 式协作：草稿即分支（不占版本号）、编辑器式变更审阅�
 
 ## Technical Context
 
-**Language/Version**: 后端 Python 3.11+；前端 TypeScript（严格模式）/ React 19 + Vite
+**Language/Version**: 后端 Python 3.11+；前端 TypeScript（严格模式）/ React 18.3 + Vite
 
 **Primary Dependencies**: 后端 FastAPI、SQLModel/SQLAlchemy、Pydantic v2、标准库 `difflib`（行级 diff 与三方合并）；前端 react-router、shadcn/ui、Tailwind v4、`react-intl` 语义运行时（`useAppIntl`/`MessageDescriptor`）、sonner
 

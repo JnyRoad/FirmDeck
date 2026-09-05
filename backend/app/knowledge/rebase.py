@@ -66,6 +66,28 @@ MergeSource = Literal["ours", "theirs", "merged"]
 DocumentAction = Literal["add", "update", "delete", "noop"]
 _CONTEXT_SPAN = 2
 
+# Git 风格冲突标记：必须与 `_has_conflict_markers` 的按行锚定检测保持一致，
+# 前端把 `merged_text` 里的标记段整段替换掉之后，A4 resolve 才不会被判为"残留标记"。
+_MARKER_OURS = "<<<<<<< ours"
+_MARKER_SEPARATOR = "======="
+_MARKER_THEIRS = ">>>>>>> theirs"
+
+
+def _conflict_region(ours_lines: list[str], theirs_lines: list[str]) -> list[str]:
+    """把一个冲突簇渲染成 Git 风格标记段（不含尾随空行）。"""
+    return [
+        _MARKER_OURS,
+        *ours_lines,
+        _MARKER_SEPARATOR,
+        *theirs_lines,
+        _MARKER_THEIRS,
+    ]
+
+
+def _whole_document_merged_text(ours_lines: list[str], theirs_lines: list[str]) -> str:
+    """整篇文档只产出一个冲突块（新增/删除类冲突、超长截断）时的 `merged_text`。"""
+    return "\n".join(_conflict_region(list(ours_lines), list(theirs_lines)))
+
 
 @dataclass(frozen=True)
 class MergedDocument:
@@ -92,13 +114,20 @@ class ConflictBlock:
 
 @dataclass(frozen=True)
 class DocumentConflict:
-    """一篇存在交叠冲突、需要人工解决的文档；`action` 指示解决结果应 add 还是 update。"""
+    """一篇存在交叠冲突、需要人工解决的文档；`action` 指示解决结果应 add 还是 update。
+
+    `merged_text` 是三方合并后的**完整**文档：双方所有可自动合并的 hunk 都已套用，
+    每个冲突簇按 `blocks` 顺序渲染成 Git 风格标记段（第 i 段对应 `blocks[i]`）。
+    前端解决冲突时应基于它编辑，`blocks`/`context_*` 只用于展示——只拼接冲突块及其
+    上下文会丢掉冲突区间以外的全部正文（I-A3 数据丢失修复）。
+    """
 
     lineage_id: str
     title: str
     filename: str
     action: Literal["add", "update"]
     blocks: list[ConflictBlock] = field(default_factory=list)
+    merged_text: str = ""
 
 
 @dataclass(frozen=True)
@@ -143,21 +172,29 @@ def _merge_line_ranges(
     theirs_lines: list[str],
     *,
     max_lines: int,
-) -> tuple[list[str] | None, list[ConflictBlock]]:
-    """双方都相对 base 变化时的行级三方合并：不交叠区间各自套用，交叠区间产出冲突块。"""
+) -> tuple[list[str] | None, list[ConflictBlock], str]:
+    """双方都相对 base 变化时的行级三方合并：不交叠区间各自套用，交叠区间产出冲突块。
+
+    第三个返回值是完整的合并文本：无冲突时等价于 `merged_lines`，有冲突时把每个冲突簇
+    换成 Git 风格标记段、其余部分（未改动行 + 已自动合并的 hunk）原样保留。
+    """
     ours_hunks, ours_truncated = diff_document_lines(base_lines, ours_lines, max_lines=max_lines)
     theirs_hunks, theirs_truncated = diff_document_lines(
         base_lines, theirs_lines, max_lines=max_lines
     )
     if ours_truncated or theirs_truncated:
         # 文档过大无法逐行比对时，保守地整篇产出冲突而不是悄悄丢弃一方的修改。
-        return None, [
-            ConflictBlock(
-                base_lines=list(base_lines),
-                ours_lines=list(ours_lines),
-                theirs_lines=list(theirs_lines),
-            )
-        ]
+        return (
+            None,
+            [
+                ConflictBlock(
+                    base_lines=list(base_lines),
+                    ours_lines=list(ours_lines),
+                    theirs_lines=list(theirs_lines),
+                )
+            ],
+            _whole_document_merged_text(ours_lines, theirs_lines),
+        )
 
     events: list[tuple[int, int, str, Any]] = []
     for hunk in ours_hunks:
@@ -196,6 +233,7 @@ def _merge_line_ranges(
             clusters.append({"start": start, "end": end, "items": [(start, end, side, hunk)]})
 
     merged_lines: list[str] = []
+    merged_text_lines: list[str] = []
     conflict_blocks: list[ConflictBlock] = []
     cursor = 0
     has_conflict = False
@@ -203,27 +241,35 @@ def _merge_line_ranges(
         start, end, items = cluster["start"], cluster["end"], cluster["items"]
         sides = {item[2] for item in items}
         merged_lines.extend(base_lines[cursor:start])
+        merged_text_lines.extend(base_lines[cursor:start])
         if sides <= {"ours"} or sides <= {"theirs"}:
-            merged_lines.extend(_apply_side(base_lines, [item[3] for item in items], start, end))
+            applied = _apply_side(base_lines, [item[3] for item in items], start, end)
+            merged_lines.extend(applied)
+            merged_text_lines.extend(applied)
         else:
             has_conflict = True
             ours_items = [item[3] for item in items if item[2] == "ours"]
             theirs_items = [item[3] for item in items if item[2] == "theirs"]
+            ours_applied = _apply_side(base_lines, ours_items, start, end)
+            theirs_applied = _apply_side(base_lines, theirs_items, start, end)
             conflict_blocks.append(
                 ConflictBlock(
                     base_lines=list(base_lines[start:end]),
-                    ours_lines=_apply_side(base_lines, ours_items, start, end),
-                    theirs_lines=_apply_side(base_lines, theirs_items, start, end),
+                    ours_lines=ours_applied,
+                    theirs_lines=theirs_applied,
                     context_before=list(base_lines[max(0, start - _CONTEXT_SPAN) : start]),
                     context_after=list(base_lines[end : end + _CONTEXT_SPAN]),
                 )
             )
+            merged_text_lines.extend(_conflict_region(ours_applied, theirs_applied))
         cursor = end
     merged_lines.extend(base_lines[cursor:])
+    merged_text_lines.extend(base_lines[cursor:])
 
+    merged_text = "\n".join(merged_text_lines)
     if has_conflict:
-        return None, conflict_blocks
-    return merged_lines, []
+        return None, conflict_blocks, merged_text
+    return merged_lines, [], merged_text
 
 
 def _classify_lineage(
@@ -285,6 +331,7 @@ def _classify_lineage(
                                 theirs_lines=list(theirs_doc.lines),
                             )
                         ],
+                        merged_text=_whole_document_merged_text(ours_doc.lines, theirs_doc.lines),
                     )
                 )
         return
@@ -318,6 +365,7 @@ def _classify_lineage(
                             theirs_lines=list(theirs_doc.lines),
                         )
                     ],
+                    merged_text=_whole_document_merged_text([], theirs_doc.lines),
                 )
             )
         return
@@ -348,6 +396,7 @@ def _classify_lineage(
                             theirs_lines=[],
                         )
                     ],
+                    merged_text=_whole_document_merged_text(ours_doc.lines, []),
                 )
             )
         return
@@ -380,7 +429,7 @@ def _classify_lineage(
         )
         return
 
-    merged_lines, blocks = _merge_line_ranges(
+    merged_lines, blocks, merged_text = _merge_line_ranges(
         base_doc.lines, ours_doc.lines, theirs_doc.lines, max_lines=max_lines
     )
     if merged_lines is not None:
@@ -402,6 +451,7 @@ def _classify_lineage(
                 filename=theirs_doc.filename,
                 action="update",
                 blocks=blocks,
+                merged_text=merged_text,
             )
         )
 

@@ -93,6 +93,19 @@ Body:
 {"tenant_id": "…", "change_reason": "…", "expected_updated_at": "…", "idempotency_key": "…"}
 ```
 行为：目标必须是 `draft`、`status='active'`（未被此前的变基替换）且 `is_stale`。无冲突 → 直接落库并返回 `RebaseResult`；有冲突 → `200` 返回 `RebasePreview`（`conflicts` 非空，不落库）。
+冲突响应形状（每篇冲突文档）：
+```json
+{
+  "lineage_id": "kdoc_…",
+  "title": "…",
+  "merged_text": "未冲突正文…\n<<<<<<< ours\n草稿侧行\n=======\n正式版侧行\n>>>>>>> theirs\n其余正文…",
+  "blocks": [{"base_lines": [], "ours_lines": [], "theirs_lines": [], "context_before": [], "context_after": []}]
+}
+```
+`merged_text` 是三方合并后的**完整**文档：双方可自动合并的改动已套用，每个冲突簇按 `blocks`
+顺序原地渲染成 Git 风格标记段（第 i 段对应 `blocks[i]`，行以 `\n` 连接，结尾无多余标记）。
+消费方必须以 `merged_text` 为编辑基线并原样提交为 A4 的 `content_md`；`blocks`/`context_*` 仅供
+分段展示，只拼接它们会丢掉冲突区间以外的正文。
 `expected_updated_at`（可选，additive）：语义与 A5 完全一致——原样透传打开草稿时拿到的 `KnowledgeBaseVersionRead.updated_at`，按微秒精度精确相等比较；不给出则不校验，给出且不匹配（或无法解析）→ `KNOWLEDGE_PUBLISH_CONFLICT`。
 仅共享库可用：dedicated 库 → `KNOWLEDGE_MODE_INVALID`（409）。
 Errors: `KNOWLEDGE_VERSION_NOT_READY`（非草稿、未过期，或该快照已被变基替换——重复提交同一个 `version_id` 不会造出第二份草稿）、`KNOWLEDGE_PUBLISH_CONFLICT`（期间正式版再次变化，或 `expected_updated_at` 不匹配）、`KNOWLEDGE_MODE_INVALID`。

@@ -435,6 +435,7 @@ def _rebase_preview_read(preview: RebasePreview) -> KnowledgeRebasePreviewRead:
                 lineage_id=conflict.lineage_id,
                 title=conflict.title,
                 blocks=[_rebase_conflict_block_read(block) for block in conflict.blocks],
+                merged_text=conflict.merged_text,
             )
             for conflict in preview.conflicts
         ],
