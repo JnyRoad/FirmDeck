@@ -66,8 +66,7 @@ export function hasConflictMarkers(text: string): boolean {
 /**
  * 已解决块要写回冲突区的正文行。
  *
- * 只用**纯 Git 冲突标记**、不带任何本地化标签（`unresolved` 分支只在没有
- * `merged_text` 的降级路径下才会被用到，正常路径直接保留后端原始冲突区）：这段文本会经
+ * 只用**纯 Git 冲突标记**、不带任何本地化标签：这段文本会经
  * `onComplete` 原样进入 `resolveRebase` 的 `content_md`，是要落库的**文档正文**，
  * 不是界面文案——之前把「草稿」/「正式版」两个产品译文拼进标记行（`<<<<<<< 草稿`），
  * 等于把 UI 语言写进了知识库内容，而且后端
@@ -126,26 +125,16 @@ export function parseMergedSegments(mergedText: string): MergedSegment[] {
 }
 
 /**
- * `merged_text` 缺失时的降级底稿（只在后端还没带上该字段的旧响应里出现）：按块拼
- * `context_before` + 冲突区 + `context_after`。它保留了旧实现「冲突区之外的正文可能
- * 丢失/重复」的局限，但至少让界面仍能工作；正常路径永远走 `conflict.merged_text`。
- */
-function fallbackMergedText(conflict: RebaseConflictDocument): string {
-  return conflict.blocks
-    .map((block) => [
-      ...block.context_before,
-      ...composeBlockLines(block, 'unresolved'),
-      ...block.context_after,
-    ].join('\n'))
-    .join('\n');
-}
-
-/**
  * 以完整合并文本为底稿组装结果：正文段原样保留，第 i 个冲突区按 `resolutions[i]`
  * 替换成所选一侧的正文；未解决（或没有对应 block）的冲突区原样留下。
+ *
+ * `merged_text` 是 `RebaseConflictDocument` 的必填字段，调用方在合成前必须自行判断
+ * 是否为空——本函数不再提供按 `blocks[]` ±2 行上下文拼接的降级底稿：那条路径会丢弃
+ * 冲突区之外的正文（首块之前、末块之后、相隔较远的两块之间），是确认过的数据丢失
+ * 缺陷，已随本次修复整体移除。
  */
 export function composeDocument(conflict: RebaseConflictDocument, resolutions: BlockResolution[]): string {
-  const mergedText = conflict.merged_text || fallbackMergedText(conflict);
+  const mergedText = conflict.merged_text;
   const lines: string[] = [];
   let conflictIndex = -1;
   for (const segment of parseMergedSegments(mergedText)) {
@@ -184,9 +173,23 @@ export function MergeDialog({ open, onOpenChange, conflict, onComplete }: MergeD
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, conflict.lineage_id]);
 
-  const composed = useMemo(() => composeDocument(conflict, resolutions), [conflict, resolutions]);
+  // `merged_text` 是必填字段，后端应始终下发；空字符串是畸形响应，不再按 `blocks[]`
+  // ±2 行上下文拼接降级底稿（那条路径会丢正文），改为拒绝合成、提示错误并锁死「完成」。
+  const mergedTextMissing = conflict.merged_text === '';
+
+  useEffect(() => {
+    if (open && mergedTextMissing) {
+      // eslint-disable-next-line no-console
+      console.error('[MergeDialog] conflict.merged_text is empty; refusing to compose a lossy fallback', conflict.lineage_id);
+    }
+  }, [open, mergedTextMissing, conflict.lineage_id]);
+
+  const composed = useMemo(
+    () => (mergedTextMissing ? '' : composeDocument(conflict, resolutions)),
+    [conflict, resolutions, mergedTextMissing],
+  );
   const displayText = manualText ?? composed;
-  const unresolved = hasConflictMarkers(displayText);
+  const unresolved = mergedTextMissing || hasConflictMarkers(displayText);
 
   function resolveBlock(index: number, value: BlockResolution) {
     setResolutions((prev) => prev.map((item, i) => (i === index ? value : item)));
@@ -248,7 +251,12 @@ export function MergeDialog({ open, onOpenChange, conflict, onComplete }: MergeD
               className="min-h-[160px] font-mono text-[12px]"
               onChange={(event) => setManualText(event.target.value)}
             />
-            {unresolved && (
+            {mergedTextMissing && (
+              <span role="alert" className="text-[12px] text-[#d20b0b]">
+                {t('knowledgeAdmin.merge.result.mergedTextMissing')}
+              </span>
+            )}
+            {!mergedTextMissing && unresolved && (
               <span role="alert" className="text-[12px] text-[#d20b0b]">
                 {t('knowledgeAdmin.merge.result.unresolvedHint')}
               </span>

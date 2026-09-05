@@ -2761,6 +2761,7 @@
   "knowledgeAdmin.merge.actions.complete": "Complete",
   "knowledgeAdmin.merge.result.title": "Merge result",
   "knowledgeAdmin.merge.result.unresolvedHint": "There are still unresolved conflict markers; resolve them first.",
+  "knowledgeAdmin.merge.result.mergedTextMissing": "The backend returned an empty merged text, so the merge result could not be generated. Please refresh and try again.",
   "knowledgeGraph.actions.expand": "Expand graph",
   "knowledgeGraph.actions.fitCanvas": "Fit canvas",
   "knowledgeGraph.actions.fitCanvasExpanded": "Fit canvas in expanded graph",

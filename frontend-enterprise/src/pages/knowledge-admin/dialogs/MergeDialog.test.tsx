@@ -113,6 +113,58 @@ function makeLongDocumentConflict(): RebaseConflictDocument {
   };
 }
 
+/**
+ * 后端多送了一个冲突区（`merged_text` 里两处 `<<<<<<<...>>>>>>>`），但 `blocks[]`
+ * 只描述了第一个——用来钉住「区块数不一致时，多出来的冲突区原样保留、不丢行」，
+ * 以及「只要还剩一个冲突区未纳入任何块操作，`完成`就必须保持禁用」。
+ */
+function makeExtraRegionConflict(): RebaseConflictDocument {
+  return {
+    lineage_id: 'kdoc_extra',
+    title: '多出一个冲突区的文档',
+    blocks: [
+      {
+        base_lines: ['原文块一'],
+        ours_lines: ['草稿块一'],
+        theirs_lines: ['正式版块一'],
+        context_before: [],
+        context_after: ['中间不变段'],
+      },
+    ],
+    merged_text: [
+      '<<<<<<< ours',
+      '草稿块一',
+      '=======',
+      '正式版块一',
+      '>>>>>>> theirs',
+      '中间不变段',
+      '<<<<<<< ours',
+      '额外草稿行',
+      '=======',
+      '额外正式行',
+      '>>>>>>> theirs',
+    ].join('\n'),
+  };
+}
+
+/** `merged_text` 为空字符串的畸形响应：不应拼出任何降级底稿，只应提示错误并锁死「完成」。 */
+function makeMissingMergedTextConflict(): RebaseConflictDocument {
+  return {
+    lineage_id: 'kdoc_missing',
+    title: '合并文本缺失的文档',
+    blocks: [
+      {
+        base_lines: ['原文'],
+        ours_lines: ['草稿'],
+        theirs_lines: ['正式版'],
+        context_before: [],
+        context_after: [],
+      },
+    ],
+    merged_text: '',
+  };
+}
+
 /** 统计一行在文本里出现的次数（整行匹配），用于「每行恰好出现一次」的断言。 */
 function countLine(text: string, line: string): number {
   return text.split('\n').filter((item) => item === line).length;
@@ -322,5 +374,40 @@ describe('MergeDialog', () => {
 
     await user.click(adoptDraftButtons[1]);
     expect(isDisabled(screen.getByRole('button', { name: '完成' }))).toBe(false);
+  });
+
+  it('keeps an extra conflict region (more regions in merged_text than blocks) verbatim and keeps complete disabled', async () => {
+    const user = userEvent.setup();
+    renderDialog({ conflict: makeExtraRegionConflict() });
+
+    await user.click(screen.getByRole('button', { name: '采用草稿' }));
+
+    const result = screen.getByLabelText('合并结果') as HTMLTextAreaElement;
+    expect(result.value.split('\n')).toEqual([
+      '草稿块一',
+      '中间不变段',
+      '<<<<<<< ours',
+      '额外草稿行',
+      '=======',
+      '额外正式行',
+      '>>>>>>> theirs',
+    ]);
+    // 多出来的冲突区没有对应的块操作可解决，`完成` 必须保持禁用。
+    expect(isDisabled(screen.getByRole('button', { name: '完成' }))).toBe(true);
+  });
+
+  it('shows a localized notice and keeps complete disabled when merged_text is an empty string, without composing a fallback', () => {
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    renderDialog({ conflict: makeMissingMergedTextConflict() });
+
+    expect(screen.getByRole('alert').textContent).toBe('后端返回的合并文本为空，无法生成合并结果，请刷新后重试。');
+    // 不应拼出任何按 `blocks[]` 上下文组装的降级底稿，结果区必须保持空白。
+    const result = screen.getByLabelText('合并结果') as HTMLTextAreaElement;
+    expect(result.value).toBe('');
+    expect(isDisabled(screen.getByRole('button', { name: '完成' }))).toBe(true);
+    expect(consoleErrorSpy).toHaveBeenCalledTimes(1);
+    expect(consoleErrorSpy.mock.calls[0]?.[0]).toContain('[MergeDialog]');
+
+    consoleErrorSpy.mockRestore();
   });
 });

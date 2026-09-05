@@ -2660,6 +2660,7 @@
   "knowledgeAdmin.merge.columns.draft": "⟦Ðŕååƒŧ⟧",
   "knowledgeAdmin.merge.columns.published": "⟦Þûûƀŀîîšħééð⟧",
   "knowledgeAdmin.merge.description": "⟦Ŕééšööŀṽéé ééååçħ ƀŀööçķ ƀý ååðööþŧîîñĝ ŧħéé ðŕååƒŧ, ŧħéé þûûƀŀîîšħééð ṽééŕšîîööñ, ööŕ ķééééþîîñĝ ƀööŧħ; ƒîîñéé-ŧûûñéé ŧħéé ŕééšûûŀŧ ṁååñûûååŀŀý ûûñŧîîŀ ñöö çööñƒŀîîçŧ ṁååŕķééŕš ŕééṁååîîñ.⟧",
+  "knowledgeAdmin.merge.result.mergedTextMissing": "⟦Ŧħéé ƀååçķééñð ŕééŧûûŕñééð ååñ ééṁþŧý ṁééŕĝééð ŧééẋŧ, šöö ŧħéé ṁééŕĝéé ŕééšûûŀŧ çööûûŀð ñööŧ ƀéé ĝééñééŕååŧééð. Þŀééååšéé ŕééƒŕééšħ ååñð ŧŕý ååĝååîîñ.⟧",
   "knowledgeAdmin.merge.result.title": "⟦Ṁééŕĝéé ŕééšûûŀŧ⟧",
   "knowledgeAdmin.merge.result.unresolvedHint": "⟦Ŧħééŕéé ååŕéé šŧîîŀŀ ûûñŕééšööŀṽééð çööñƒŀîîçŧ ṁååŕķééŕš; ŕééšööŀṽéé ŧħééṁ ƒîîŕšŧ.⟧",
   "knowledgeAdmin.merge.title": "⟦Ṁééŕĝéé ðööçûûṁééñŧ \"{title}\"⟧",

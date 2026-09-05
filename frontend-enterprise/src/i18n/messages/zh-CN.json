@@ -2761,6 +2761,7 @@
   "knowledgeAdmin.merge.actions.complete": "完成",
   "knowledgeAdmin.merge.result.title": "合并结果",
   "knowledgeAdmin.merge.result.unresolvedHint": "仍有未解决的冲突标记，请先处理。",
+  "knowledgeAdmin.merge.result.mergedTextMissing": "后端返回的合并文本为空，无法生成合并结果，请刷新后重试。",
   "knowledgeGraph.actions.expand": "展开图谱",
   "knowledgeGraph.actions.fitCanvas": "适应画布",
   "knowledgeGraph.actions.fitCanvasExpanded": "在展开图谱中适应画布",
