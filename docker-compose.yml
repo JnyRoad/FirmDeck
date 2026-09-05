@@ -1,0 +1,19 @@
+services:
+  staffdeck:
+    build: .
+    image: staffdeck:latest
+    container_name: staffdeck
+    restart: unless-stopped
+    ports:
+      - "5173:5173"
+    env_file:
+      - ./backend/.env
+    environment:
+      # Override the .env defaults so the SQLite DB and other runtime state
+      # live on the persistent volume below instead of the ephemeral image layer.
+      DATABASE_URL: "sqlite:////data/skill_agent_loop.db"
+    volumes:
+      - staffdeck-data:/data
+
+volumes:
+  staffdeck-data:
