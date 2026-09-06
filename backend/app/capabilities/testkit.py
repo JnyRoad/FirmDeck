@@ -8,7 +8,7 @@ from app.capabilities.contracts import GeneralSkillPackage, KnowledgeSearchResul
 from app.capabilities.errors import CapabilityErrorInfo
 
 _EXTENSION_NAMESPACE = re.compile(r"^[a-z][a-z0-9_]*$")
-_RESERVED_NAMESPACES = {"core", "firmdeck"}
+_RESERVED_NAMESPACES = {"core", "firmdeck", "staffdeck"}
 
 
 class ContractViolation(AssertionError):

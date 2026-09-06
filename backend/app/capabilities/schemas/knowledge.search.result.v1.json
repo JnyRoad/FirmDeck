@@ -28,7 +28,7 @@
     },
     "extensions": {
       "type": "object",
-      "patternProperties": {"^(?!core$|firmdeck$)[a-z][a-z0-9_]*$": {"type": "object"}},
+      "patternProperties": {"^(?!core$|firmdeck$|staffdeck$)[a-z][a-z0-9_]*$": {"type": "object"}},
       "additionalProperties": false
     }
   }

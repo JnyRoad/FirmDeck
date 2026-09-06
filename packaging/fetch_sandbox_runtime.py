@@ -27,7 +27,9 @@ MANIFEST_DIR = Path(__file__).resolve().parent
 PACKAGE_JSON = MANIFEST_DIR / "sandbox-runtime-package.json"
 PACKAGE_LOCK = MANIFEST_DIR / "sandbox-runtime-package-lock.json"
 NODE_VERSION = os.environ.get("FIRMDECK_NODE_VERSION", "v22.14.0")
-PATCH_MARKER = "firmdeck-allow-all-domains-patch-v1"
+# Embedded verbatim into the patched dist files and pinned by PATCHED_SHA256 below;
+# keep this string stable across renames or the hash check breaks.
+PATCH_MARKER = "staffdeck-allow-all-domains-patch-v1"
 PATCHED_SHA256 = {
     "sandbox-config.js": "17a9bdd4cce375bb098f9c02eb564cf80806079571d4ff784e2af7d27db446bb",
     "sandbox-manager.js": "dca5176508d6ee31807e2138eea82bcbb6f6e5e40c67aff2ac9958d3bc893b4c",
