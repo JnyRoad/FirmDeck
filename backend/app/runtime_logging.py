@@ -13,14 +13,14 @@ from pathlib import Path
 from app import paths
 
 
-LOG_FILE_NAME = "staffdeck.log"
+LOG_FILE_NAME = "firmdeck.log"
 MAX_LOG_BYTES = 5 * 1024 * 1024
 LOG_BACKUP_COUNT = 5
 LOG_QUEUE_CAPACITY = 10_000
 RUNTIME_LOGGER_NAMES = (
-    "staffdeck.runtime",
-    "staffdeck.static",
-    "staffdeck.crash",
+    "firmdeck.runtime",
+    "firmdeck.static",
+    "firmdeck.crash",
 )
 
 _configured_path: Path | None = None
@@ -31,7 +31,7 @@ _atexit_registered = False
 
 
 class _RuntimeFileHandler(RotatingFileHandler):
-    """Marker subclass used to replace an existing StaffDeck file handler."""
+    """Marker subclass used to replace an existing FirmDeck file handler."""
 
 
 class _DroppingQueueHandler(QueueHandler):
@@ -128,7 +128,7 @@ def configure_runtime_logging() -> Path:
         sys.stderr = _NullTextStream()
 
     _install_exception_hooks()
-    logging.getLogger("staffdeck.runtime").info(
+    logging.getLogger("firmdeck.runtime").info(
         "Runtime started platform=%s release=%s python=%s frozen=%s pid=%s",
         platform.system(),
         platform.release(),
@@ -140,7 +140,7 @@ def configure_runtime_logging() -> Path:
 
 
 def shutdown_runtime_logging() -> None:
-    """Flush queued records and close StaffDeck-owned logging resources."""
+    """Flush queued records and close FirmDeck-owned logging resources."""
     global _configured_path, _file_handler, _listener, _queue_handler
 
     listener = _listener
@@ -167,14 +167,14 @@ def _install_exception_hooks() -> None:
         if issubclass(exc_type, KeyboardInterrupt):
             sys.__excepthook__(exc_type, exc_value, traceback)
             return
-        logging.getLogger("staffdeck.crash").critical(
+        logging.getLogger("firmdeck.crash").critical(
             "Unhandled process exception type=%s\n%s",
             exc_type.__name__,
             _format_stack(traceback),
         )
 
     def log_thread_exception(args: threading.ExceptHookArgs) -> None:
-        logging.getLogger("staffdeck.crash").critical(
+        logging.getLogger("firmdeck.crash").critical(
             "Unhandled thread exception type=%s\n%s",
             args.exc_type.__name__,
             _format_stack(args.exc_traceback),

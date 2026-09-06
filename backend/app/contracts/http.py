@@ -1,4 +1,4 @@
-"""FastAPI compatibility adapters for canonical StaffDeck product errors."""
+"""FastAPI compatibility adapters for canonical FirmDeck product errors."""
 
 from __future__ import annotations
 

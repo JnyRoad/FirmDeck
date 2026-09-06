@@ -236,7 +236,7 @@ def test_stdio_early_exit_includes_exit_code_and_stderr() -> None:
 def test_stdio_missing_command_has_actionable_error() -> None:
     with pytest.raises(MCPClientError, match="找不到命令"):
         list_mcp_tools(
-            {"transport": "stdio", "command": "staffdeck-command-that-does-not-exist"},
+            {"transport": "stdio", "command": "firmdeck-command-that-does-not-exist"},
             timeout_seconds=1,
         )
 

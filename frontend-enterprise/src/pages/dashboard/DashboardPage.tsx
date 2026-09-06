@@ -21,7 +21,7 @@ import AppHeader from '../../components/AppHeader';
 import EmployeeAvatar from '../../components/EmployeeAvatar';
 import EmployeeAvatarEditor from '../../components/EmployeeAvatarEditor';
 import EmployeeProfileEditor from '../../components/EmployeeProfileEditor';
-import StaffdeckIcon from '../../components/StaffdeckIcon';
+import FirmdeckIcon from '../../components/FirmdeckIcon';
 import {
   agentResourceCount,
   canManageEmployeeAgent,
@@ -30,7 +30,7 @@ import {
   employeeDisplayName,
   employeeProfile,
   preferredEmployeeAgent,
-  staffdeckDisplayText,
+  firmdeckDisplayText,
 } from '../../employee';
 import { EnterpriseRoute } from '../../enums/routes';
 import {
@@ -317,16 +317,16 @@ export default function DashboardPage({
           </div>
         </section>
         <div className="org-dashboard-grid">
-          <DashboardStat title={t('dashboard.page.stat.sop')} value={skills.length} icon={<StaffdeckIcon name="filter" />} />
-          <DashboardStat title={t('dashboard.page.stat.skills')} value={generalSkills.length} icon={<StaffdeckIcon name="spark" />} />
-          <DashboardStat title={t('dashboard.page.stat.knowledge')} value={visibleKnowledgeBases.length} icon={<StaffdeckIcon name="file" />} />
-          <DashboardStat title={t('dashboard.page.stat.tools')} value={tools.filter((item) => item.enabled).length} icon={<StaffdeckIcon name="tool" />} />
-          <DashboardStat title={t('dashboard.page.stat.sopCalls')} value={totalCalls} icon={<StaffdeckIcon name="chat" />} />
-          <DashboardStat title={t('dashboard.page.stat.positive')} value={positiveFeedback || feedbackSummary?.up_count || 0} icon={<StaffdeckIcon name="chat" />} />
-          <DashboardStat title={t('dashboard.page.stat.negative')} value={negativeFeedback || feedbackSummary?.down_count || 0} icon={<StaffdeckIcon name="chat" />} />
+          <DashboardStat title={t('dashboard.page.stat.sop')} value={skills.length} icon={<FirmdeckIcon name="filter" />} />
+          <DashboardStat title={t('dashboard.page.stat.skills')} value={generalSkills.length} icon={<FirmdeckIcon name="spark" />} />
+          <DashboardStat title={t('dashboard.page.stat.knowledge')} value={visibleKnowledgeBases.length} icon={<FirmdeckIcon name="file" />} />
+          <DashboardStat title={t('dashboard.page.stat.tools')} value={tools.filter((item) => item.enabled).length} icon={<FirmdeckIcon name="tool" />} />
+          <DashboardStat title={t('dashboard.page.stat.sopCalls')} value={totalCalls} icon={<FirmdeckIcon name="chat" />} />
+          <DashboardStat title={t('dashboard.page.stat.positive')} value={positiveFeedback || feedbackSummary?.up_count || 0} icon={<FirmdeckIcon name="chat" />} />
+          <DashboardStat title={t('dashboard.page.stat.negative')} value={negativeFeedback || feedbackSummary?.down_count || 0} icon={<FirmdeckIcon name="chat" />} />
           <div className="org-dashboard-card">
             <div className="ui-card-body p-[24px]">
-              <span className="org-dashboard-icon"><StaffdeckIcon name="model" /></span>
+              <span className="org-dashboard-icon"><FirmdeckIcon name="model" /></span>
               <span className="text-[13px] text-muted-foreground">{t('dashboard.page.defaultModel.label')}</span>
               <span className="text-[15px] text-foreground">
                 {defaultModel
@@ -361,7 +361,7 @@ export default function DashboardPage({
     ? selectedAgent.metadata.system_prompt_summary
     : '';
   const systemSummary = compactSummary(
-    staffdeckDisplayText(
+    firmdeckDisplayText(
       selectedAgent.persona_prompt
       || systemPromptSummary
       || selectedAgent.description

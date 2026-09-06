@@ -5,7 +5,7 @@ import { toast } from 'sonner';
 import { api } from '@/api/client';
 import { useAppIntl } from '@/i18n/useAppIntl';
 
-export const REMINDED_VERSION_KEY = 'staffdeck_update_reminded_version';
+export const REMINDED_VERSION_KEY = 'firmdeck_update_reminded_version';
 
 type AppVersion = {
   current_version: string;

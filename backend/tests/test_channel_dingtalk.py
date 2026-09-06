@@ -516,7 +516,7 @@ def test_normalize_dingtalk_richtext_extracts_attachment_and_text() -> None:
             "richText": [
                 {"type": "picture", "downloadCode": "dc_rt_1", "pictureDownloadCode": "dc_rt_1"},
                 {"text": "\n"},
-                {"text": "@staffdeck渠道接入测试机器人"},
+                {"text": "@firmdeck渠道接入测试机器人"},
             ]
         },
     )

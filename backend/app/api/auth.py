@@ -195,7 +195,7 @@ class AccountAPICredentialReveal(BaseModel):
     api_key: str
 
 
-ACCOUNT_API_CLIENT_PREFIX = "StaffDeck 账号全量 API"
+ACCOUNT_API_CLIENT_PREFIX = "FirmDeck 账号全量 API"
 
 
 @router.post("/login", response_model=LoginResponse)
@@ -437,7 +437,7 @@ def list_users(
             db.exec(
                 select(ChannelIdentity).where(
                     ChannelIdentity.tenant_id == tenant_id,
-                    ChannelIdentity.staffdeck_user_id.in_(user_ids),
+                    ChannelIdentity.firmdeck_user_id.in_(user_ids),
                     ~ChannelIdentity.external_user_id.startswith("group:"),
                 )
             ).all()
@@ -445,7 +445,7 @@ def list_users(
             else []
         )
         for ci in identities:
-            all_identities.setdefault(ci.staffdeck_user_id, []).append(ci)
+            all_identities.setdefault(ci.firmdeck_user_id, []).append(ci)
         result = []
         for row in rows:
             cis = all_identities.get(row.id)

@@ -12,7 +12,7 @@ def test_runtime_log_path_uses_platform_user_data_directory(
 ) -> None:
     monkeypatch.setenv("ULTRARAG_DATA_DIR", str(tmp_path))
 
-    assert runtime_logging.runtime_log_path() == tmp_path / "logs" / "staffdeck.log"
+    assert runtime_logging.runtime_log_path() == tmp_path / "logs" / "firmdeck.log"
 
 
 def test_runtime_log_path_does_not_follow_the_harness_workspace_root(
@@ -26,8 +26,8 @@ def test_runtime_log_path_does_not_follow_the_harness_workspace_root(
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("ULTRARAG_DATA_DIR", str(app_data))
 
-    assert runtime_logging.runtime_log_path() == app_data / "logs" / "staffdeck.log"
-    assert not (home / ".staffdeck" / "workspaces").exists()
+    assert runtime_logging.runtime_log_path() == app_data / "logs" / "firmdeck.log"
+    assert not (home / ".firmdeck" / "workspaces").exists()
 
 
 def test_runtime_queue_drops_instead_of_blocking_when_full() -> None:
@@ -49,17 +49,17 @@ def test_runtime_logging_writes_and_rotates_diagnostics(monkeypatch, tmp_path: P
 
     try:
         log_path = runtime_logging.configure_runtime_logging()
-        logger = logging.getLogger("staffdeck.runtime")
+        logger = logging.getLogger("firmdeck.runtime")
         for index in range(20):
             logger.warning("diagnostic-test-message-%s-%s", index, "x" * 40)
         logging.getLogger("app.api.chat").error("user-asset-must-not-be-persisted")
         runtime_logging.shutdown_runtime_logging()
 
         assert log_path.exists()
-        assert (log_path.parent / "staffdeck.log.1").exists()
+        assert (log_path.parent / "firmdeck.log.1").exists()
         combined_logs = "".join(
             path.read_text(encoding="utf-8")
-            for path in sorted(log_path.parent.glob("staffdeck.log*"))
+            for path in sorted(log_path.parent.glob("firmdeck.log*"))
         )
         assert "diagnostic-test-message" in combined_logs
         assert "user-asset-must-not-be-persisted" not in combined_logs

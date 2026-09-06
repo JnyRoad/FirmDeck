@@ -24,7 +24,7 @@ def _fingerprint_key(app_secret: str) -> bytes:
     return hashlib.pbkdf2_hmac(
         "sha256",
         app_secret.encode("utf-8"),
-        b"staffdeck-mcp-oauth-fingerprint-key-v1",
+        b"firmdeck-mcp-oauth-fingerprint-key-v1",
         100_000,
         dklen=32,
     )
@@ -79,9 +79,9 @@ def validate_mcp_oauth_redirect_uri(redirect_uri: str) -> str:
         or parsed.fragment
         or parsed.path != MCP_OAUTH_CALLBACK_PATH
     ):
-        raise ValueError("OAuth redirect URI must use the exact StaffDeck callback endpoint")
+        raise ValueError("OAuth redirect URI must use the exact FirmDeck callback endpoint")
 
-    public_url = get_settings().staffdeck_public_url.strip()
+    public_url = get_settings().firmdeck_public_url.strip()
     if public_url:
         public = urlsplit(public_url)
         public_hostname = (public.hostname or "").lower()
@@ -96,7 +96,7 @@ def validate_mcp_oauth_redirect_uri(redirect_uri: str) -> str:
             or (public_scheme == "http" and public_hostname not in _LOOPBACK_HOSTS)
             or _origin(parsed) != _origin(public)
         ):
-            raise ValueError("OAuth redirect URI must match STAFFDECK_PUBLIC_URL")
+            raise ValueError("OAuth redirect URI must match FIRMDECK_PUBLIC_URL")
         return normalized
 
     if hostname not in _LOOPBACK_HOSTS or parsed.scheme.lower() not in {"http", "https"}:

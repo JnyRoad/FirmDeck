@@ -1,8 +1,8 @@
 services:
-  staffdeck:
+  firmdeck:
     build: .
-    image: staffdeck:latest
-    container_name: staffdeck
+    image: firmdeck:latest
+    container_name: firmdeck
     restart: unless-stopped
     ports:
       - "5173:5173"
@@ -13,7 +13,7 @@ services:
       # live on the persistent volume below instead of the ephemeral image layer.
       DATABASE_URL: "sqlite:////data/skill_agent_loop.db"
     volumes:
-      - staffdeck-data:/data
+      - firmdeck-data:/data
 
 volumes:
-  staffdeck-data:
+  firmdeck-data:

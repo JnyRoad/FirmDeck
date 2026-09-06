@@ -53,7 +53,7 @@ async def test_flow_stores_only_state_digest_and_rejects_replay(tmp_path) -> Non
         tenant_id="tenant_1",
         server_id="server_1",
         user_id="user_1",
-        redirect_uri="https://staffdeck.example/oauth/callback",
+        redirect_uri="https://firmdeck.example/oauth/callback",
         browser_binding="browser-binding",
         operation=operation,
     )
@@ -102,7 +102,7 @@ async def test_flow_rejects_callback_after_process_restart(tmp_path) -> None:
         tenant_id="tenant_1",
         server_id="server_1",
         user_id="user_1",
-        redirect_uri="https://staffdeck.example/oauth/callback",
+        redirect_uri="https://firmdeck.example/oauth/callback",
         browser_binding="browser-binding",
         operation=operation,
     )
@@ -135,7 +135,7 @@ async def test_start_reserves_owner_before_the_sdk_emits_a_redirect(tmp_path) ->
             tenant_id="tenant_1",
             server_id="server_1",
             user_id="user_1",
-            redirect_uri="https://staffdeck.example/oauth/callback",
+            redirect_uri="https://firmdeck.example/oauth/callback",
             browser_binding="first-browser",
             operation=operation,
         )
@@ -146,7 +146,7 @@ async def test_start_reserves_owner_before_the_sdk_emits_a_redirect(tmp_path) ->
             tenant_id="tenant_1",
             server_id="server_1",
             user_id="user_1",
-            redirect_uri="https://staffdeck.example/oauth/callback",
+            redirect_uri="https://firmdeck.example/oauth/callback",
             browser_binding="second-browser",
             operation=operation,
         )
@@ -183,7 +183,7 @@ async def test_start_cancellation_cancels_the_sdk_operation(tmp_path) -> None:
             tenant_id="tenant_1",
             server_id="server_1",
             user_id="user_1",
-            redirect_uri="https://staffdeck.example/oauth/callback",
+            redirect_uri="https://firmdeck.example/oauth/callback",
             browser_binding="browser-binding",
             operation=operation,
         )
@@ -211,7 +211,7 @@ async def test_only_one_callback_can_claim_a_pending_flow(tmp_path) -> None:
         tenant_id="tenant_1",
         server_id="server_1",
         user_id="user_1",
-        redirect_uri="https://staffdeck.example/oauth/callback",
+        redirect_uri="https://firmdeck.example/oauth/callback",
         browser_binding="browser-binding",
         operation=operation,
     )
@@ -249,7 +249,7 @@ async def test_provider_denial_finishes_without_authorization_code(tmp_path) -> 
         tenant_id="tenant_1",
         server_id="server_1",
         user_id="user_1",
-        redirect_uri="https://staffdeck.example/oauth/callback",
+        redirect_uri="https://firmdeck.example/oauth/callback",
         browser_binding="browser-binding",
         operation=operation,
     )
@@ -284,7 +284,7 @@ async def test_provider_denial_survives_sdk_exception_wrapping(tmp_path) -> None
         tenant_id="tenant_1",
         server_id="server_1",
         user_id="user_1",
-        redirect_uri="https://staffdeck.example/oauth/callback",
+        redirect_uri="https://firmdeck.example/oauth/callback",
         browser_binding="browser-binding",
         operation=operation,
     )
@@ -323,7 +323,7 @@ async def test_malformed_callback_releases_the_live_flow_immediately(tmp_path) -
         tenant_id="tenant_1",
         server_id="server_1",
         user_id="user_1",
-        redirect_uri="https://staffdeck.example/oauth/callback",
+        redirect_uri="https://firmdeck.example/oauth/callback",
         browser_binding="browser-binding",
         operation=operation,
     )
@@ -343,7 +343,7 @@ async def test_malformed_callback_releases_the_live_flow_immediately(tmp_path) -
         tenant_id="tenant_1",
         server_id="server_1",
         user_id="user_1",
-        redirect_uri="https://staffdeck.example/oauth/callback",
+        redirect_uri="https://firmdeck.example/oauth/callback",
         browser_binding="browser-binding",
         operation=operation,
     )
@@ -367,7 +367,7 @@ async def test_forwarded_authorization_url_cannot_complete_in_another_browser(tm
         tenant_id="tenant_1",
         server_id="server_1",
         user_id="user_1",
-        redirect_uri="https://staffdeck.example/oauth/callback",
+        redirect_uri="https://firmdeck.example/oauth/callback",
         browser_binding="initiating-browser",
         operation=operation,
     )
@@ -406,7 +406,7 @@ async def test_flow_security_events_never_log_state_or_authorization_code(
             tenant_id="tenant_1",
             server_id="server_1",
             user_id="user_1",
-            redirect_uri="https://staffdeck.example/oauth/callback",
+            redirect_uri="https://firmdeck.example/oauth/callback",
             browser_binding="browser-binding",
             operation=operation,
         )
@@ -451,7 +451,7 @@ async def test_callback_bounds_token_exchange_by_the_persisted_flow_ttl(
         tenant_id="tenant_1",
         server_id="server_1",
         user_id="user_1",
-        redirect_uri="https://staffdeck.example/oauth/callback",
+        redirect_uri="https://firmdeck.example/oauth/callback",
         browser_binding="browser-binding",
         operation=operation,
     )
@@ -489,7 +489,7 @@ async def test_cancel_owner_releases_the_live_flow_for_immediate_reconnect(tmp_p
         tenant_id="tenant_1",
         server_id="server_1",
         user_id="user_1",
-        redirect_uri="https://staffdeck.example/oauth/callback",
+        redirect_uri="https://firmdeck.example/oauth/callback",
         browser_binding="browser-binding",
         operation=operation,
     )
@@ -502,7 +502,7 @@ async def test_cancel_owner_releases_the_live_flow_for_immediate_reconnect(tmp_p
         tenant_id="tenant_1",
         server_id="server_1",
         user_id="user_1",
-        redirect_uri="https://staffdeck.example/oauth/callback",
+        redirect_uri="https://firmdeck.example/oauth/callback",
         browser_binding="browser-binding",
         operation=operation,
     )
@@ -531,7 +531,7 @@ async def test_start_reconciles_a_flow_cancelled_by_server_configuration_change(
         tenant_id="tenant_1",
         server_id="server_1",
         user_id="user_1",
-        redirect_uri="https://staffdeck.example/oauth/callback",
+        redirect_uri="https://firmdeck.example/oauth/callback",
         browser_binding="browser-binding",
         operation=operation,
     )
@@ -552,7 +552,7 @@ async def test_start_reconciles_a_flow_cancelled_by_server_configuration_change(
         tenant_id="tenant_1",
         server_id="server_1",
         user_id="user_1",
-        redirect_uri="https://staffdeck.example/oauth/callback",
+        redirect_uri="https://firmdeck.example/oauth/callback",
         browser_binding="browser-binding",
         operation=operation,
     )
@@ -579,7 +579,7 @@ async def test_server_invalidation_cancels_a_flow_before_redirect_persistence(tm
             tenant_id="tenant_1",
             server_id="server_1",
             user_id="user_1",
-            redirect_uri="https://staffdeck.example/oauth/callback",
+            redirect_uri="https://firmdeck.example/oauth/callback",
             browser_binding="browser-binding",
             operation=operation,
         )
@@ -612,7 +612,7 @@ async def test_owner_disconnect_cancels_a_flow_before_redirect_persistence(tmp_p
             tenant_id="tenant_1",
             server_id="server_1",
             user_id="user_1",
-            redirect_uri="https://staffdeck.example/oauth/callback",
+            redirect_uri="https://firmdeck.example/oauth/callback",
             browser_binding="browser-binding",
             operation=operation,
         )
@@ -643,7 +643,7 @@ async def test_redirect_rechecks_server_generation_before_publishing(tmp_path) -
             tenant_id="tenant_1",
             server_id="server_1",
             user_id="user_1",
-            redirect_uri="https://staffdeck.example/oauth/callback",
+            redirect_uri="https://firmdeck.example/oauth/callback",
             browser_binding="browser-binding",
             operation=operation,
         )
@@ -679,7 +679,7 @@ async def test_redirect_persists_without_holding_the_registry_guard(
         tenant_id="tenant_1",
         server_id="server_1",
         user_id="user_1",
-        redirect_uri="https://staffdeck.example/oauth/callback",
+        redirect_uri="https://firmdeck.example/oauth/callback",
         browser_binding="browser-binding",
         operation=operation,
     )
@@ -705,7 +705,7 @@ async def test_durable_binding_change_cancels_a_pre_redirect_sdk_task(tmp_path) 
             tenant_id="tenant_1",
             server_id="server_1",
             user_id="user_1",
-            redirect_uri="https://staffdeck.example/oauth/callback",
+            redirect_uri="https://firmdeck.example/oauth/callback",
             browser_binding="browser-binding",
             operation=operation,
             binding_is_current=lambda: binding_current,
@@ -742,7 +742,7 @@ async def test_start_rejects_a_binding_invalidated_during_freshness_check(tmp_pa
             tenant_id="tenant_1",
             server_id="server_1",
             user_id="user_1",
-            redirect_uri="https://staffdeck.example/oauth/callback",
+            redirect_uri="https://firmdeck.example/oauth/callback",
             browser_binding="browser-binding",
             operation=operation,
             binding_is_current=invalidate_during_validation,
@@ -771,7 +771,7 @@ async def test_start_rejects_while_server_change_transaction_is_active(tmp_path)
                 tenant_id="tenant_1",
                 server_id="server_1",
                 user_id="user_1",
-                redirect_uri="https://staffdeck.example/oauth/callback",
+                redirect_uri="https://firmdeck.example/oauth/callback",
                 browser_binding="browser-binding",
                 operation=operation,
                 binding_is_current=lambda: True,
@@ -809,7 +809,7 @@ async def test_invalidation_before_first_task_step_rejects_start_promptly(
                 tenant_id="tenant_1",
                 server_id="server_1",
                 user_id="user_1",
-                redirect_uri="https://staffdeck.example/oauth/callback",
+                redirect_uri="https://firmdeck.example/oauth/callback",
                 browser_binding="browser-binding",
                 operation=lambda _redirect, _callback: asyncio.sleep(0),
             ),
@@ -841,7 +841,7 @@ async def test_disconnect_during_callback_exchange_preserves_cancelled_terminal_
         tenant_id="tenant_1",
         server_id="server_1",
         user_id="user_1",
-        redirect_uri="https://staffdeck.example/oauth/callback",
+        redirect_uri="https://firmdeck.example/oauth/callback",
         browser_binding="browser-binding",
         operation=operation,
     )

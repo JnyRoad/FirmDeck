@@ -297,7 +297,7 @@ def test_single_session_json_export_contains_complete_log_envelope() -> None:
         payload = json.loads(response.body)
         assert response.media_type == "application/json"
         assert response.headers["content-disposition"] == (
-            'attachment; filename="staffdeck-conversation-log-session_channel.json"'
+            'attachment; filename="firmdeck-conversation-log-session_channel.json"'
         )
         assert payload["schema_version"] == SESSION_LOG_EXPORT_SCHEMA
         assert payload["item"]["session"]["id"] == "session_channel"

@@ -1,11 +1,11 @@
 <div align="center">
 
-<img src="packaging/assets/staffdeck_banner_cn.png" alt="StaffDeck 标志"  />
+<img src="packaging/assets/firmdeck_banner_cn.png" alt="FirmDeck 标志"  />
 
 <p align="center">
-  <a href="https://staffdeck.openbmb.cn/"><img src="https://img.shields.io/badge/Website-staffdeck.openbmb.cn-FF6B35?style=flat-square&logo=googlechrome&logoColor=white" alt="Official Website"/></a>
+  <a href="https://firmdeck.openbmb.cn/"><img src="https://img.shields.io/badge/Website-firmdeck.openbmb.cn-FF6B35?style=flat-square&logo=googlechrome&logoColor=white" alt="Official Website"/></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-AGPL_3.0-blue.svg?style=flat-square" alt="License"/></a>
-  <a href="https://github.com/OpenBMB/StaffDeck/stargazers"><img src="https://img.shields.io/github/stars/OpenBMB/StaffDeck?style=flat-square" alt="Stars"/></a>
+  <a href="https://github.com/OpenBMB/FirmDeck/stargazers"><img src="https://img.shields.io/github/stars/OpenBMB/FirmDeck?style=flat-square" alt="Stars"/></a>
   <br/>
   <a href="#-联系我们"><img src="https://img.shields.io/badge/Discord-社群-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Discord"/></a>
   &nbsp;
@@ -25,11 +25,11 @@
 - **2026-08-18**: 我们推出v0.4.0，引入多员工智能协作与更快的调用链路。
 - **2026-08-06**: 我们推出v0.3.0，提供了更方便的SOP编辑与运行时沙箱。
 - **2026-08-03**: 我们推出v0.2.0，提供更好的harness系统和IM渠道支持。
-- **2026-07-15**：StaffDeck正式开源！欢迎大家使用反馈与Star支持。
+- **2026-07-15**：FirmDeck正式开源！欢迎大家使用反馈与Star支持。
 
-# 💡 关于StaffDeck
+# 💡 关于FirmDeck
 
-StaffDeck是一套面向企业的数字员工构建与管理平台，帮助专业员工将工作经验、业务流程和判断标准固化为可以持续工作的数字员工，接手重复性任务，并将个人能力沉淀为可复用、可迭代、可追溯的组织资产。StaffDeck由[面壁智能](https://modelbest.cn/)，[东北大学-面壁智能数据智能联合实验室](https://neuir.github.io/)，[清华大学THUNLP实验室](https://nlp.csai.tsinghua.edu.cn/)，[OpenBMB](https://www.openbmb.cn/home)与[AI9Stars](https://github.com/AI9Stars)联合研发，面向希望将 AI 从个人效率工具升级为组织生产力的企业与机构。
+FirmDeck是一套面向企业的数字员工构建与管理平台，帮助专业员工将工作经验、业务流程和判断标准固化为可以持续工作的数字员工，接手重复性任务，并将个人能力沉淀为可复用、可迭代、可追溯的组织资产。FirmDeck由[面壁智能](https://modelbest.cn/)，[东北大学-面壁智能数据智能联合实验室](https://neuir.github.io/)，[清华大学THUNLP实验室](https://nlp.csai.tsinghua.edu.cn/)，[OpenBMB](https://www.openbmb.cn/home)与[AI9Stars](https://github.com/AI9Stars)联合研发，面向希望将 AI 从个人效率工具升级为组织生产力的企业与机构。
 
 ## 核心亮点
 
@@ -40,23 +40,23 @@ StaffDeck是一套面向企业的数字员工构建与管理平台，帮助专�
 
 ## 客户端下载
 
-访问 [StaffDeck 官方网站](https://staffdeck.openbmb.cn/)，或直接下载最新桌面客户端：
+访问 [FirmDeck 官方网站](https://firmdeck.openbmb.cn/)，或直接下载最新桌面客户端：
 
 | 平台 | 架构 | 下载 |
 | --- | --- | --- |
-| macOS | Apple Silicon（arm64） | [下载 `.dmg`](https://github.com/OpenBMB/StaffDeck/releases/latest/download/StaffDeck-macos-arm64.dmg) |
-| macOS | Intel（x86_64） | [下载 `.dmg`](https://github.com/OpenBMB/StaffDeck/releases/latest/download/StaffDeck-macos-x86_64.dmg) |
-| Windows | x64 | [下载安装程序 `.exe`](https://github.com/OpenBMB/StaffDeck/releases/latest/download/StaffDeck-windows-x64-setup.exe) |
-| Linux | x86_64（Debian/Ubuntu） | [下载 `.deb`](https://github.com/OpenBMB/StaffDeck/releases/latest/download/StaffDeck-linux-x86_64.deb) |
+| macOS | Apple Silicon（arm64） | [下载 `.dmg`](https://github.com/OpenBMB/FirmDeck/releases/latest/download/FirmDeck-macos-arm64.dmg) |
+| macOS | Intel（x86_64） | [下载 `.dmg`](https://github.com/OpenBMB/FirmDeck/releases/latest/download/FirmDeck-macos-x86_64.dmg) |
+| Windows | x64 | [下载安装程序 `.exe`](https://github.com/OpenBMB/FirmDeck/releases/latest/download/FirmDeck-windows-x64-setup.exe) |
+| Linux | x86_64（Debian/Ubuntu） | [下载 `.deb`](https://github.com/OpenBMB/FirmDeck/releases/latest/download/FirmDeck-linux-x86_64.deb) |
 
 Linux 安装包默认只监听本机 `127.0.0.1`。安装后可以在终端配置监听模式和
 端口，无头服务器也适用：
 
 ```bash
-staffdeck setup
-staffdeck setup --mode local --port 5173
-staffdeck setup --mode lan --port 5173
-staffdeck setup --mode public --port 5173 --public-url https://staff.example.com
+firmdeck setup
+firmdeck setup --mode local --port 5173
+firmdeck setup --mode lan --port 5173
+firmdeck setup --mode public --port 5173 --public-url https://staff.example.com
 ```
 
 `local` 只允许本机访问；`lan` 和 `public` 监听 `0.0.0.0`。`--port` 用来
@@ -68,11 +68,11 @@ URL。配置按用户保存，并在下次启动时生效。
 ## Agent 一键部署
 
 将下面的 Prompt 粘贴给 Cursor、Claude Code 或 Codex。代码部署时，也可以用
-`ULTRARAG_HOST`、`ULTRARAG_PORT` 和 `STAFFDECK_PUBLIC_URL` 覆盖启动参数：
+`ULTRARAG_HOST`、`ULTRARAG_PORT` 和 `FIRMDECK_PUBLIC_URL` 覆盖启动参数：
 
 ```text
-阅读 https://raw.githubusercontent.com/OpenBMB/StaffDeck/main/README.zh.md。
-克隆 OpenBMB/StaffDeck 私有仓库，准备 Python 3.11 或更高版本和 Node.js 20，创建
+阅读 https://raw.githubusercontent.com/OpenBMB/FirmDeck/main/README.zh.md。
+克隆 OpenBMB/FirmDeck 私有仓库，准备 Python 3.11 或更高版本和 Node.js 20，创建
 backend/.venv，安装前后端依赖，将 backend/.env.example 复制为
 backend/.env；缺少 OpenAI 兼容模型地址或 API Key 时向我询问，并严格使用当前
 系统对应的文档命令。macOS/Linux/WSL 运行 scripts/dev_up.sh --detach，Windows
@@ -83,7 +83,7 @@ PowerShell 运行 .\scripts\dev_up.ps1 --detach；验证 /api/health 和
 
 ## 目录
 
-- [💡 关于StaffDeck](#-关于staffdeck)
+- [💡 关于FirmDeck](#-关于firmdeck)
   - [核心亮点](#核心亮点)
   - [客户端下载](#客户端下载)
   - [Agent 一键部署](#agent-一键部署)
@@ -122,8 +122,8 @@ PowerShell 运行 .\scripts\dev_up.ps1 --detach；验证 /api/health 和
 首先克隆仓库：
 
 ```bash
-git clone https://github.com/OpenBMB/StaffDeck.git
-cd StaffDeck
+git clone https://github.com/OpenBMB/FirmDeck.git
+cd FirmDeck
 ```
 
 macOS、Linux 或 WSL：
@@ -157,7 +157,7 @@ DEMO_MODEL_API_KEY="你的API-Key"
 
 API Key 用于创建初始模型配置，存入数据库前会被加密。请勿提交 `backend/.env`。
 
-也可以在服务启动后打开 **管理员 → 模型配置 → 新建模型**，选择 **ChatGPT 订阅（Codex）**，再点击 **连接 ChatGPT 订阅**。StaffDeck 会在同一台设备的默认浏览器中直接打开正常的 ChatGPT 授权页面，不要求本机安装 Codex；StaffDeck 不要求也不返回 ChatGPT OAuth code、回调地址、访问令牌或 API Key。为保持已授权订阅，它会将必要订阅凭据加密保存到本机数据库，并与模型 API Key 字段隔离。API Key 模型与订阅模型可同时存在。退出订阅会移除该本机加密凭据，并影响所有使用它的订阅模型。该流程仅支持能够打开默认浏览器并绑定 `localhost:1455` 的本机桌面安装，不支持远程或无头部署。
+也可以在服务启动后打开 **管理员 → 模型配置 → 新建模型**，选择 **ChatGPT 订阅（Codex）**，再点击 **连接 ChatGPT 订阅**。FirmDeck 会在同一台设备的默认浏览器中直接打开正常的 ChatGPT 授权页面，不要求本机安装 Codex；FirmDeck 不要求也不返回 ChatGPT OAuth code、回调地址、访问令牌或 API Key。为保持已授权订阅，它会将必要订阅凭据加密保存到本机数据库，并与模型 API Key 字段隔离。API Key 模型与订阅模型可同时存在。退出订阅会移除该本机加密凭据，并影响所有使用它的订阅模型。该流程仅支持能够打开默认浏览器并绑定 `localhost:1455` 的本机桌面安装，不支持远程或无头部署。
 
 ### 3. 启动 Web Demo
 
@@ -166,7 +166,7 @@ API Key 用于创建初始模型配置，存入数据库前会被加密。请勿
 | macOS、Linux 或 WSL | `scripts/dev_up.sh --detach` |
 | Windows PowerShell | `.\scripts\dev_up.ps1 --detach` |
 
-两套包装脚本最终都会调用同一个跨平台 Python 生命周期入口 `scripts/dev.py`。启动过程会构建 StaffDeck 前端，并由一个 FastAPI 进程在 `5173` 端口同时提供 UI、API 与 Swagger 文档。默认管理员账号为 `admin` / `admin`，请在首次登录后通过账号配置修改密码。
+两套包装脚本最终都会调用同一个跨平台 Python 生命周期入口 `scripts/dev.py`。启动过程会构建 FirmDeck 前端，并由一个 FastAPI 进程在 `5173` 端口同时提供 UI、API 与 Swagger 文档。默认管理员账号为 `admin` / `admin`，请在首次登录后通过账号配置修改密码。
 
 ### 4. 验证安装
 
@@ -217,7 +217,7 @@ curl.exe http://127.0.0.1:5173/api/health
 | 查看服务状态 | `status` |
 | 停止本地服务 | `down` |
 
-> 完整说明 → [StaffDeck 使用教程](https://staffdeck.openbmb.cn/#/docs/introduce?lang=zh)
+> 完整说明 → [FirmDeck 使用教程](https://firmdeck.openbmb.cn/#/docs/introduce?lang=zh)
 
 
 
@@ -239,7 +239,7 @@ curl.exe http://127.0.0.1:5173/api/health
 
 - 一个渠道账号挂载多个数字员工；`/员工`、`/切换 <名字>`、`/当前`、`/帮助` 指令调度；
 - 意图自动分发：按用户消息意图（LLM 分类）自动路由到最合适的员工，SOP 进行中提高切换阈值，人工接管与手动切换保护窗内保持粘性；
-- 身份合并：微信/企微用户可通过 `/绑定 <一次性码>` 把渠道身份合并到既有 StaffDeck 账号，记忆与会话统一，`/解绑` 可逆；
+- 身份合并：微信/企微用户可通过 `/绑定 <一次性码>` 把渠道身份合并到既有 FirmDeck 账号，记忆与会话统一，`/解绑` 可逆；
 - 对话记录与投递日志按天归纳分页；管理员与员工创建者可按权限查看全部渠道会话；
 - 可靠性：入站幂等去重、崩溃恢复、出站退避重试、token 失效自动告警与微信会话自愈。
 
@@ -269,9 +269,9 @@ curl.exe http://127.0.0.1:5173/api/health
 ## 项目结构
 
 ```text
-StaffDeck/
+FirmDeck/
 ├── backend/                  # FastAPI 接口、Agent 运行时、存储与任务 Worker
-├── frontend-enterprise/      # React/TypeScript StaffDeck 工作台
+├── frontend-enterprise/      # React/TypeScript FirmDeck 工作台
 ├── docs/                     # 教程、API、Schema 与示例流程
 ├── scripts/                  # 单端口服务生命周期与校验脚本
 ├── packaging/                # macOS、Linux 与 Windows 打包资源
@@ -291,7 +291,7 @@ StaffDeck/
 <details>
 <summary><strong>没有本地 GPU 可以运行吗？</strong></summary>
 
-可以。API Key 模型会调用你配置的接口，订阅模型则使用直接 ChatGPT 授权路径；两种方式都不要求 StaffDeck 自身使用 GPU。GPU 要求由你自行部署或使用的模型服务决定。
+可以。API Key 模型会调用你配置的接口，订阅模型则使用直接 ChatGPT 授权路径；两种方式都不要求 FirmDeck 自身使用 GPU。GPU 要求由你自行部署或使用的模型服务决定。
 </details>
 
 <details>
@@ -306,10 +306,10 @@ StaffDeck/
 - [x] 更多企业连接器与经过审核的广场资源（已支持微信、企业微信渠道接入）
 - [ ] 面向高风险工具动作的细粒度审批策略
 
-路线优先级由真实部署需求驱动。请通过 [Issue](https://github.com/OpenBMB/StaffDeck/issues) 提供可复现的场景和预期行为。
+路线优先级由真实部署需求驱动。请通过 [Issue](https://github.com/OpenBMB/FirmDeck/issues) 提供可复现的场景和预期行为。
 
 # 💬 联系我们
-- 关于技术问题及功能请求，请提交 [GitHub Issues](https://github.com/OpenBMB/StaffDeck/issues)。
+- 关于技术问题及功能请求，请提交 [GitHub Issues](https://github.com/OpenBMB/FirmDeck/issues)。
 - 商业授权请填写[飞书问卷](https://modelbest.feishu.cn/share/base/form/shrcnLAF6EpCi8lXhTS3VYnWc4g)
 - 为了商业合作，请联系：
   ```
@@ -352,23 +352,23 @@ StaffDeck/
 
 ## 引用
 
-在内部研究或经授权的公开材料中使用 StaffDeck 时，可引用：
+在内部研究或经授权的公开材料中使用 FirmDeck 时，可引用：
 
 ```bibtex
-@software{StaffDeck2026,
-  title  = {StaffDeck: Build, Run, and Govern Enterprise Digital Employees},
+@software{FirmDeck2026,
+  title  = {FirmDeck: Build, Run, and Govern Enterprise Digital Employees},
   author = {OpenBMB},
   year   = {2026},
-  url    = {https://github.com/OpenBMB/StaffDeck}
+  url    = {https://github.com/OpenBMB/FirmDeck}
 }
 ```
 ## Star 历史
 
-<a href="https://www.star-history.com/?repos=openbmb%2Fstaffdeck&type=date&legend=top-left">
+<a href="https://www.star-history.com/?repos=openbmb%2Ffirmdeck&type=date&legend=top-left">
  <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=openbmb/staffdeck&type=date&theme=dark&legend=top-left&sealed_token=lLohLC57bGAPh4lrzSYu2xW6Fmkavbj5r-T25GGt-jA10veIrv9OBPs0wiE5A98VIxP0NyxjbloW1t5OnPdVn6RT_L6Dmsp5EnfiWsGirs6G3Bv5_l_zUw" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=openbmb/staffdeck&type=date&legend=top-left&sealed_token=lLohLC57bGAPh4lrzSYu2xW6Fmkavbj5r-T25GGt-jA10veIrv9OBPs0wiE5A98VIxP0NyxjbloW1t5OnPdVn6RT_L6Dmsp5EnfiWsGirs6G3Bv5_l_zUw" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=openbmb/staffdeck&type=date&legend=top-left&sealed_token=lLohLC57bGAPh4lrzSYu2xW6Fmkavbj5r-T25GGt-jA10veIrv9OBPs0wiE5A98VIxP0NyxjbloW1t5OnPdVn6RT_L6Dmsp5EnfiWsGirs6G3Bv5_l_zUw" />
+      <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=openbmb/firmdeck&type=date&theme=dark&legend=top-left&sealed_token=lLohLC57bGAPh4lrzSYu2xW6Fmkavbj5r-T25GGt-jA10veIrv9OBPs0wiE5A98VIxP0NyxjbloW1t5OnPdVn6RT_L6Dmsp5EnfiWsGirs6G3Bv5_l_zUw" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=openbmb/firmdeck&type=date&legend=top-left&sealed_token=lLohLC57bGAPh4lrzSYu2xW6Fmkavbj5r-T25GGt-jA10veIrv9OBPs0wiE5A98VIxP0NyxjbloW1t5OnPdVn6RT_L6Dmsp5EnfiWsGirs6G3Bv5_l_zUw" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=openbmb/firmdeck&type=date&legend=top-left&sealed_token=lLohLC57bGAPh4lrzSYu2xW6Fmkavbj5r-T25GGt-jA10veIrv9OBPs0wiE5A98VIxP0NyxjbloW1t5OnPdVn6RT_L6Dmsp5EnfiWsGirs6G3Bv5_l_zUw" />
  </picture>
 </a>
 
@@ -378,4 +378,4 @@ StaffDeck/
 
 ## 致谢
 
-StaffDeck 由 [OpenBMB](https://www.openbmb.cn/) 生态孵化。
+FirmDeck 由 [OpenBMB](https://www.openbmb.cn/) 生态孵化。

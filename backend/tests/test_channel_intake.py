@@ -1789,7 +1789,7 @@ def test_suspended_handoff_reply_does_not_resume_the_old_turn(monkeypatch) -> No
                     channel="feishu",
                     external_account_scope=binding.identity_scope_key,
                     external_user_id="assignee-open-id",
-                    staffdeck_user_id="assignee",
+                    firmdeck_user_id="assignee",
                 ),
             ]
         )
@@ -1896,7 +1896,7 @@ def test_handoff_resume_does_not_replay_after_fast_reactivation(monkeypatch) -> 
                     channel="feishu",
                     external_account_scope=binding.identity_scope_key,
                     external_user_id="assignee-open-id",
-                    staffdeck_user_id="assignee",
+                    firmdeck_user_id="assignee",
                 ),
             ]
         )

@@ -105,54 +105,54 @@ rm -rf packaging/out packaging/build
   .venv/bin/pyinstaller ../packaging/ultrarag.spec --noconfirm \
     --distpath ../packaging/out --workpath ../packaging/build
 )
-packaging/out/staffdeck/staffdeck --packaging-smoke
-rm -rf packaging/out/staffdeck/runtime
-cp -a "$RUNTIME_DL_ROOT/python" packaging/out/staffdeck/runtime
+packaging/out/firmdeck/firmdeck --packaging-smoke
+rm -rf packaging/out/firmdeck/runtime
+cp -a "$RUNTIME_DL_ROOT/python" packaging/out/firmdeck/runtime
 echo "==> [5b/8] Bundling SRT + Node runtime"
-rm -rf packaging/sandbox_runtime packaging/out/staffdeck/sandbox
+rm -rf packaging/sandbox_runtime packaging/out/firmdeck/sandbox
 python3 packaging/fetch_sandbox_runtime.py packaging/sandbox_runtime
-cp -a packaging/sandbox_runtime packaging/out/staffdeck/sandbox
-python3 packaging/smoke_sandbox_bundle.py packaging/out/staffdeck/sandbox
+cp -a packaging/sandbox_runtime packaging/out/firmdeck/sandbox
+python3 packaging/smoke_sandbox_bundle.py packaging/out/firmdeck/sandbox
 
 echo "==> [6/8] Building Debian package"
 STAGE="packaging/out/deb"
 rm -rf "$STAGE"
 mkdir -p \
   "$STAGE/DEBIAN" \
-  "$STAGE/opt/staffdeck" \
+  "$STAGE/opt/firmdeck" \
   "$STAGE/usr/bin" \
   "$STAGE/usr/share/applications" \
   "$STAGE/usr/share/icons/hicolor/128x128/apps"
-cp -a packaging/out/staffdeck/. "$STAGE/opt/staffdeck/"
-cp packaging/assets/staffdeck.png "$STAGE/usr/share/icons/hicolor/128x128/apps/staffdeck.png"
-cat > "$STAGE/usr/bin/staffdeck" <<'SH'
+cp -a packaging/out/firmdeck/. "$STAGE/opt/firmdeck/"
+cp packaging/assets/firmdeck.png "$STAGE/usr/share/icons/hicolor/128x128/apps/firmdeck.png"
+cat > "$STAGE/usr/bin/firmdeck" <<'SH'
 #!/bin/sh
-exec /opt/staffdeck/staffdeck "$@"
+exec /opt/firmdeck/firmdeck "$@"
 SH
-chmod 0755 "$STAGE/usr/bin/staffdeck"
-cat > "$STAGE/usr/share/applications/staffdeck.desktop" <<'DESK'
+chmod 0755 "$STAGE/usr/bin/firmdeck"
+cat > "$STAGE/usr/share/applications/firmdeck.desktop" <<'DESK'
 [Desktop Entry]
-Name=StaffDeck
-Comment=StaffDeck desktop service
-Exec=staffdeck %u
-Icon=staffdeck
+Name=FirmDeck
+Comment=FirmDeck desktop service
+Exec=firmdeck %u
+Icon=firmdeck
 Terminal=false
 Type=Application
 Categories=Utility;
-MimeType=x-scheme-handler/staffdeck;
+MimeType=x-scheme-handler/firmdeck;
 StartupNotify=true
 DESK
-INSTALLED_SIZE="$(du -sk "$STAGE/opt/staffdeck" | cut -f1)"
+INSTALLED_SIZE="$(du -sk "$STAGE/opt/firmdeck" | cut -f1)"
 cat > "$STAGE/DEBIAN/control" <<EOF
-Package: staffdeck
+Package: firmdeck
 Version: $DEB_VERSION
 Section: utils
 Priority: optional
 Architecture: amd64
 Installed-Size: $INSTALLED_SIZE
 Maintainer: OpenBMB <support@openbmb.cn>
-Description: StaffDeck desktop service
- StaffDeck runs a local service and opens its interface in the default browser.
+Description: FirmDeck desktop service
+ FirmDeck runs a local service and opens its interface in the default browser.
 EOF
 cat > "$STAGE/DEBIAN/postinst" <<'SH'
 #!/bin/sh
@@ -169,28 +169,28 @@ command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -q /us
 exit 0
 SH
 chmod 0755 "$STAGE/DEBIAN/postinst" "$STAGE/DEBIAN/postrm"
-DEB_OUT="packaging/out/StaffDeck-linux-x86_64.deb"
+DEB_OUT="packaging/out/FirmDeck-linux-x86_64.deb"
 dpkg-deb --root-owner-group --build "$STAGE" "$DEB_OUT"
 
 echo "==> [7/8] Building AppImage"
-APPDIR="packaging/out/StaffDeck.AppDir"
+APPDIR="packaging/out/FirmDeck.AppDir"
 rm -rf "$APPDIR"
-mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/lib/staffdeck"
-cp -a packaging/out/staffdeck/. "$APPDIR/usr/lib/staffdeck/"
-cat > "$APPDIR/usr/bin/staffdeck" <<'SH'
+mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/lib/firmdeck"
+cp -a packaging/out/firmdeck/. "$APPDIR/usr/lib/firmdeck/"
+cat > "$APPDIR/usr/bin/firmdeck" <<'SH'
 #!/bin/sh
 HERE="$(dirname "$(readlink -f "$0")")"
-exec "$HERE/../lib/staffdeck/staffdeck" "$@"
+exec "$HERE/../lib/firmdeck/firmdeck" "$@"
 SH
-chmod 0755 "$APPDIR/usr/bin/staffdeck"
+chmod 0755 "$APPDIR/usr/bin/firmdeck"
 cat > "$APPDIR/AppRun" <<'SH'
 #!/bin/sh
 HERE="$(dirname "$(readlink -f "$0")")"
-exec "$HERE/usr/bin/staffdeck" "$@"
+exec "$HERE/usr/bin/firmdeck" "$@"
 SH
 chmod 0755 "$APPDIR/AppRun"
-cp "$STAGE/usr/share/applications/staffdeck.desktop" "$APPDIR/staffdeck.desktop"
-cp packaging/assets/staffdeck.png "$APPDIR/staffdeck.png"
+cp "$STAGE/usr/share/applications/firmdeck.desktop" "$APPDIR/firmdeck.desktop"
+cp packaging/assets/firmdeck.png "$APPDIR/firmdeck.png"
 
 APPIMAGETOOL="${APPIMAGETOOL:-$TOOLCHAIN/appimagetool-x86_64.AppImage}"
 if [[ ! -x "$APPIMAGETOOL" ]]; then
@@ -203,7 +203,7 @@ urllib.request.urlretrieve(url, sys.argv[1])
 PY
   chmod 0755 "$APPIMAGETOOL"
 fi
-APPIMAGE_OUT="packaging/out/StaffDeck-linux-x86_64.AppImage"
+APPIMAGE_OUT="packaging/out/FirmDeck-linux-x86_64.AppImage"
 ARCH=x86_64 "$APPIMAGETOOL" --appimage-extract-and-run "$APPDIR" "$APPIMAGE_OUT"
 
 echo "==> [8/8] Verifying package metadata"

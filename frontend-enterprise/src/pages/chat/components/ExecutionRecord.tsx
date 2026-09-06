@@ -1,14 +1,14 @@
 import type { ComponentType, ReactNode, SVGProps } from 'react';
 
 import CodeBlock from '@/components/CodeBlock';
-import StaffdeckIcon from '@/components/StaffdeckIcon';
-import IconCotAdvance from '@/assets/staffdeck/cot-icons/advance.svg?react';
-import IconCotExecute from '@/assets/staffdeck/cot-icons/execute.svg?react';
-import IconCotGenerated from '@/assets/staffdeck/cot-icons/generated.svg?react';
-import IconCotJudge from '@/assets/staffdeck/cot-icons/judge.svg?react';
-import IconCotLoading from '@/assets/staffdeck/cot-icons/loading.svg?react';
-import IconCotSelect from '@/assets/staffdeck/cot-icons/select.svg?react';
-import IconCotTool from '@/assets/staffdeck/cot-icons/tool.svg?react';
+import FirmdeckIcon from '@/components/FirmdeckIcon';
+import IconCotAdvance from '@/assets/firmdeck/cot-icons/advance.svg?react';
+import IconCotExecute from '@/assets/firmdeck/cot-icons/execute.svg?react';
+import IconCotGenerated from '@/assets/firmdeck/cot-icons/generated.svg?react';
+import IconCotJudge from '@/assets/firmdeck/cot-icons/judge.svg?react';
+import IconCotLoading from '@/assets/firmdeck/cot-icons/loading.svg?react';
+import IconCotSelect from '@/assets/firmdeck/cot-icons/select.svg?react';
+import IconCotTool from '@/assets/firmdeck/cot-icons/tool.svg?react';
 import { RawContent } from '@/i18n/RawContent';
 import type { MessageId } from '@/i18n/types';
 import { useAppIntl } from '@/i18n/useAppIntl';
@@ -104,7 +104,7 @@ export default function ExecutionRecord({
           {traceChromeText(summary.text, t)}
         </span>
         {details.length > 0 && (
-          <StaffdeckIcon
+          <FirmdeckIcon
             name="arrow"
             size={14}
             className={cn(CHAT_TRACE_CHEVRON_CLASS, expanded && CHAT_TRACE_CHEVRON_EXPANDED_CLASS)}

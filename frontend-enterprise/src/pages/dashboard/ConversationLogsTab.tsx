@@ -711,7 +711,7 @@ export default function ConversationLogsTab() {
         { signal: fence.signal },
       );
       if (!fence.isCurrent()) return;
-      downloadBlob(blob, `staffdeck-conversation-log-${safeFilenamePart(row.id)}.json`);
+      downloadBlob(blob, `firmdeck-conversation-log-${safeFilenamePart(row.id)}.json`);
       notify.successText(t('dashboard.conversationLogs.toast.exportSingleSuccess'));
     } catch (error) {
       if (fence.isCurrent()) {
@@ -744,7 +744,7 @@ export default function ConversationLogsTab() {
         { signal: fence.signal },
       );
       if (!fence.isCurrent()) return;
-      downloadBlob(blob, `staffdeck-conversation-logs-${filenameTimestamp()}.json`);
+      downloadBlob(blob, `firmdeck-conversation-logs-${filenameTimestamp()}.json`);
       notify.successText(t('dashboard.conversationLogs.toast.exportBatchSuccess', { count: sessionIds.length }));
     } catch (error) {
       if (fence.isCurrent()) {

@@ -2,10 +2,10 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-APP="${1:-$REPO/packaging/out/StaffDeck.app}"
-EXECUTABLE="$APP/Contents/MacOS/staffdeck"
-PORT="${STAFFDECK_SMOKE_PORT:-}"
-DATA_DIR="$(mktemp -d "${TMPDIR:-/tmp}/staffdeck-macos-smoke.XXXXXX")"
+APP="${1:-$REPO/packaging/out/FirmDeck.app}"
+EXECUTABLE="$APP/Contents/MacOS/firmdeck"
+PORT="${FIRMDECK_SMOKE_PORT:-}"
+DATA_DIR="$(mktemp -d "${TMPDIR:-/tmp}/firmdeck-macos-smoke.XXXXXX")"
 LAUNCHER_LOG="$DATA_DIR/launcher.log"
 HEALTH_RESPONSE="$DATA_DIR/health.json"
 PID=""
@@ -50,7 +50,7 @@ fi
 
 echo "==> Smoke-testing packaged macOS app ($(uname -m))"
 env \
-  STAFFDECK_HEADLESS=1 \
+  FIRMDECK_HEADLESS=1 \
   ULTRARAG_DATA_DIR="$DATA_DIR" \
   ULTRARAG_PORT="$PORT" \
   ULTRARAG_PORT_RANGE_START="$PORT" \

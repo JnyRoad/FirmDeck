@@ -1415,7 +1415,7 @@ class ChannelIdentity(SQLModel, table=True):
     # 渠道账号作用域:wechat 置空(全局 wxid);wecom 取 corp_id/bot_id/binding.id,隔离跨企业身份
     external_account_scope: str = Field(default="", index=True)
     external_user_id: str
-    staffdeck_user_id: str = Field(index=True)
+    firmdeck_user_id: str = Field(index=True)
     display_name: Optional[str] = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)

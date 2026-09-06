@@ -15,14 +15,14 @@ def test_runtime_lock_rejects_second_process_for_same_sqlite_database(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    database_path = tmp_path / "staffdeck.db"
+    database_path = tmp_path / "firmdeck.db"
     monkeypatch.setattr(
         "app.runtime_lock.get_settings",
         lambda: type("Settings", (), {"database_url": f"sqlite:///{database_path}"})(),
     )
 
     lock_path = acquire_runtime_instance_lock()
-    assert lock_path == tmp_path / "staffdeck.db.runtime.lock"
+    assert lock_path == tmp_path / "firmdeck.db.runtime.lock"
     assert lock_path.read_text(encoding="utf-8").isdigit()
 
     # Re-entry by the owning application is harmless; another open file
@@ -37,8 +37,8 @@ def test_runtime_lock_reports_existing_owner(
 ) -> None:
     import fcntl
 
-    database_path = tmp_path / "staffdeck.db"
-    lock_path = tmp_path / "staffdeck.db.runtime.lock"
+    database_path = tmp_path / "firmdeck.db"
+    lock_path = tmp_path / "firmdeck.db.runtime.lock"
     owner = lock_path.open("a+", encoding="utf-8")
     owner.write("4242")
     owner.flush()

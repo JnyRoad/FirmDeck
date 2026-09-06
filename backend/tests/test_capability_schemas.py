@@ -91,7 +91,7 @@ def test_provider_error_schema_rejects_reserved_extension_namespaces() -> None:
         "extensions": {"vendor_x": {}},
     }
     assert not list(validator.iter_errors(valid))
-    for namespace in ("core", "staffdeck"):
+    for namespace in ("core", "firmdeck", "staffdeck"):
         invalid = {**valid, "extensions": {namespace: {}}}
         assert list(validator.iter_errors(invalid))
 

@@ -34,12 +34,12 @@ const authUser = authSession.user;
 
 const shellCopy = {
   'zh-CN': {
-    title: 'StaffDeck 数字员工运营平台',
+    title: 'FirmDeck 数字员工运营平台',
     navigation: '开放广场平台',
     employeeSwitcher: '切换当前员工',
   },
   'en-US': {
-    title: 'StaffDeck Digital Employee Operations Platform',
+    title: 'FirmDeck Digital Employee Operations Platform',
     navigation: 'Open Marketplace',
     employeeSwitcher: 'Switch current employee',
   },
@@ -110,8 +110,8 @@ beforeEach(() => {
   stubBrowserApis();
   stubShellFetch();
   window.localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify(authSession));
-  window.localStorage.setItem('staffdeck_onboarding_guide_seen', '1');
-  window.localStorage.setItem('staffdeck_quick_start_guide_seen', '1');
+  window.localStorage.setItem('firmdeck_onboarding_guide_seen', '1');
+  window.localStorage.setItem('firmdeck_quick_start_guide_seen', '1');
   window.history.pushState({}, '', '/enterprise/agents');
   document.title = '';
   document.documentElement.lang = '';

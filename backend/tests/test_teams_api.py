@@ -1861,7 +1861,7 @@ def test_export_team_log_contains_raw_model_and_tool_records() -> None:
         assert invocation["arguments"] == {"query": "报销制度"}
         assert invocation["result"] == {"items": [{"content": "制度原文"}]}
         assert response.headers["content-disposition"].startswith(
-            'attachment; filename="staffdeck-team-log-'
+            'attachment; filename="firmdeck-team-log-'
         )
 
 

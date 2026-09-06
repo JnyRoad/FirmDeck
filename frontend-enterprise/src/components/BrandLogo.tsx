@@ -3,7 +3,7 @@ import { RawIdentifier } from '@/i18n/RawContent';
 import logoMark from '../assets/LOGO.svg';
 
 export type BrandLogoProps = {
-  /** Hide the "OpenBMB / StaffDeck" wordmark and only render the logo mark. */
+  /** Hide the "OpenBMB / FirmDeck" wordmark and only render the logo mark. */
   markOnly?: boolean;
   /** Size of the square logo mark in pixels. */
   markSize?: number;
@@ -12,7 +12,7 @@ export type BrandLogoProps = {
   wordmarkClassName?: string;
 };
 
-/** Brand logo lockup (logo mark + "OpenBMB" / "StaffDeck" wordmark). Figma node 504:7137. */
+/** Brand logo lockup (logo mark + "OpenBMB" / "FirmDeck" wordmark). Figma node 504:7137. */
 export default function BrandLogo({
   markOnly = false,
   markSize = 28,
@@ -33,11 +33,11 @@ export default function BrandLogo({
             OpenBMB
           </span> */}
           <strong className="text-[17px] font-semibold leading-none text-[#18181a]">
-            <RawIdentifier value="StaffDeck" />
+            <RawIdentifier value="FirmDeck" />
           </strong>
         </span>
       )}
-      {markOnly && <RawIdentifier className="sr-only" value="StaffDeck" />}
+      {markOnly && <RawIdentifier className="sr-only" value="FirmDeck" />}
     </span>
   );
 }

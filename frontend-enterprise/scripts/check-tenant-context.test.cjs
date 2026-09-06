@@ -9,7 +9,7 @@ import { scanSourceRoot } from './check-tenant-context.cjs';
 const temporaryDirectories = [];
 
 function fixtureSource(files) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'staffdeck-tenant-guard-'));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'firmdeck-tenant-guard-'));
   temporaryDirectories.push(root);
   for (const [relativePath, source] of Object.entries(files)) {
     const target = path.join(root, relativePath);

@@ -17,7 +17,7 @@
     "OPEN": "Audited candidate that still requires implementation or exact adjudication.",
     "FIXED": "Verified in source and by the named automated or browser evidence.",
     "CONFIRMED_RAW": "Verified business, user, Agent, provider, identifier, path, or diagnostic content that must remain verbatim.",
-    "THIRD_PARTY_CONSTRAINED": "Owned by an external runtime or protocol and not safely alterable by StaffDeck.",
+    "THIRD_PARTY_CONSTRAINED": "Owned by an external runtime or protocol and not safely alterable by FirmDeck.",
     "UNVERIFIED": "Not exercised against the real runtime, provider, role, platform, or integration."
   },
   "scan_scope": {
@@ -348,7 +348,7 @@
       "severity": "P2",
       "status": "THIRD_PARTY_CONSTRAINED",
       "boundary": "external protocol locale negotiation",
-      "summary": "Feishu rich-post locale envelopes and remote Channel/A2A/MCP/provider text are third-party-constrained protocol/source content, not proof of StaffDeck locale support; live locale negotiation remains UNVERIFIED.",
+      "summary": "Feishu rich-post locale envelopes and remote Channel/A2A/MCP/provider text are third-party-constrained protocol/source content, not proof of FirmDeck locale support; live locale negotiation remains UNVERIFIED.",
       "evidence": [
         "backend/app/channels/feishu_runtime.py",
         "backend/app/tools/a2a_client.py",

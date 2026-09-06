@@ -34,7 +34,7 @@ from app.api.skills import (
     update_skill,
 )
 from app.api.tools import list_tools
-from app.db import staffdeck_seed
+from app.db import firmdeck_seed
 from app.db.models import (
     AgentKnowledgeBranch,
     AgentProfile,
@@ -228,7 +228,7 @@ def test_seed_publishing_writes_explicit_admin_owner_without_backfilling_user_re
         assert custom_binding is None
         assert overall.metadata_json["owner_user_id"] == "admin"
         assert default_agent.status == "archived"
-        assert default_agent.metadata_json["hidden_from_staffdeck"] is True
+        assert default_agent.metadata_json["hidden_from_firmdeck"] is True
         assert default_agent.metadata_json["owner_user_id"] == "admin"
         assert user_agent.metadata_json == {"owner_user_id": "user_member"}
 
@@ -739,19 +739,19 @@ def test_shared_knowledge_base_cannot_be_exposed_by_stale_open_gallery_binding()
         assert visible_knowledge_base_versions(db, "tenant_demo", overall.id) == {}
 
 
-def test_staffdeck_gallery_seed_skips_shared_knowledge_bases() -> None:
+def test_firmdeck_gallery_seed_skips_shared_knowledge_bases() -> None:
     """内置开放广场种子不能把共享知识库重新发布成整体员工模板。"""
     with _test_session() as db:
-        db.add(Tenant(id=staffdeck_seed.TENANT_ID, name="StaffDeck"))
+        db.add(Tenant(id=firmdeck_seed.TENANT_ID, name="FirmDeck"))
         overall = AgentProfile(
-            id="agent_staffdeck_overall",
-            tenant_id=staffdeck_seed.TENANT_ID,
+            id="agent_firmdeck_overall",
+            tenant_id=firmdeck_seed.TENANT_ID,
             name="整体智能体",
             is_overall=True,
         )
         shared = KnowledgeBase(
             id="kb_seed_shared",
-            tenant_id=staffdeck_seed.TENANT_ID,
+            tenant_id=firmdeck_seed.TENANT_ID,
             name="共享知识库",
             mode="shared",
             status="active",
@@ -759,7 +759,7 @@ def test_staffdeck_gallery_seed_skips_shared_knowledge_bases() -> None:
         )
         dedicated = KnowledgeBase(
             id="kb_seed_dedicated",
-            tenant_id=staffdeck_seed.TENANT_ID,
+            tenant_id=firmdeck_seed.TENANT_ID,
             name="专用知识库模板",
             mode="dedicated",
             status="active",
@@ -770,7 +770,7 @@ def test_staffdeck_gallery_seed_skips_shared_knowledge_bases() -> None:
         db.add(dedicated)
         db.flush()
 
-        staffdeck_seed._publish_gallery_resources(
+        firmdeck_seed._publish_gallery_resources(
             db,
             {
                 "skill": {},

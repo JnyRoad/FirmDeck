@@ -70,7 +70,7 @@ def test_feishu_binding_credentials_activate_without_exposing_secret(monkeypatch
     monkeypatch.setattr(
         channels_api,
         "validate_feishu_credentials",
-        lambda app_id, secret: {"bot_open_id": "ou_bot", "bot_name": "StaffDeck Bot"},
+        lambda app_id, secret: {"bot_open_id": "ou_bot", "bot_name": "FirmDeck Bot"},
     )
 
     created = client.post(
@@ -91,7 +91,7 @@ def test_feishu_binding_credentials_activate_without_exposing_secret(monkeypatch
     assert payload["status"] == "active"
     assert payload["app_id"] == "cli_app"
     assert payload["bot_open_id"] == "ou_bot"
-    assert payload["bot_name"] == "StaffDeck Bot"
+    assert payload["bot_name"] == "FirmDeck Bot"
     assert payload["provider_tenant_key"] is None
     assert "secret-value" not in response.text
     with Session(engine) as db:

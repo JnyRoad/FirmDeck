@@ -206,7 +206,7 @@ const agents: AgentProfileRead[] = [
 ];
 
 const teamLog = {
-  schema_version: 'staffdeck.team-log.v1',
+  schema_version: 'firmdeck.team-conversation-log.v1',
   exported_at: '2026-08-03T00:00:00Z',
   team: { id: 'team-1', name: '增长团队' },
   summary: {

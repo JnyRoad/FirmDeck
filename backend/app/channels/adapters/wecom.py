@@ -403,7 +403,7 @@ class WeComStreamReply:
         if not event_id:
             headers = frame.get("headers") if isinstance(frame, dict) else None
             event_id = str((headers or {}).get("req_id") or "").strip()
-        base_stream_id = f"staffdeck:{binding.id}:{event_id}"
+        base_stream_id = f"firmdeck:{binding.id}:{event_id}"
         self._stream_id = f"{base_stream_id}:progress"
         self._answer_stream_id = f"{base_stream_id}:answer"
         self._is_group = bool(body.get("chatid"))
@@ -435,7 +435,7 @@ class WeComStreamReply:
         self._progress_names_lock = threading.Lock()
         self._worker = threading.Thread(
             target=self._run,
-            name=f"staffdeck-wecom-reply-{self._stream_id[-24:]}",
+            name=f"firmdeck-wecom-reply-{self._stream_id[-24:]}",
             daemon=True,
         )
         self._worker.start()
@@ -926,7 +926,7 @@ class WeComStreamManager:
         self._stopped.clear()
         self._reconcile_thread = threading.Thread(
             target=self._reconcile_loop,
-            name="staffdeck-wecom-reconcile",
+            name="firmdeck-wecom-reconcile",
             daemon=True,
         )
         self._reconcile_thread.start()
@@ -983,13 +983,13 @@ class WeComStreamManager:
             state.worker = threading.Thread(
                 target=self._run_worker,
                 args=(binding_id, state),
-                name=f"staffdeck-wecom-worker-{binding_id}",
+                name=f"firmdeck-wecom-worker-{binding_id}",
                 daemon=True,
             )
             thread = threading.Thread(
                 target=self._run_stream,
                 args=(binding_id, state),
-                name=f"staffdeck-wecom-stream-{binding_id}",
+                name=f"firmdeck-wecom-stream-{binding_id}",
                 daemon=True,
             )
             state.thread = thread

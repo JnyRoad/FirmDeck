@@ -1,4 +1,4 @@
-"""Stable StaffDeck-owned wire contracts shared by backend product boundaries."""
+"""Stable FirmDeck-owned wire contracts shared by backend product boundaries."""
 
 from app.contracts.error_registry import (
     ERROR_REGISTRY,

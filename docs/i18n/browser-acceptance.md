@@ -3,12 +3,12 @@
 状态：`COMPLETE_WITH_UNVERIFIED_BOUNDARIES`
 
 基线：`a22231d00770ba6958f2a2bf1b0d65008bd858c3`，分支 `feat/i18n-governance`。验收使用独立
-SQLite `sqlite:////private/tmp/staffdeck-i18n-browser-862a.db` 和 `127.0.0.1:5187`，未连接生产数据。
+SQLite `sqlite:////private/tmp/firmdeck-i18n-browser-862a.db` 和 `127.0.0.1:5187`，未连接生产数据。
 
 ## 真实本地应用矩阵
 
 2026-08-30 在 macOS arm64 的本地 Chrome 中验证真实前后端，结果文件为
-`/private/tmp/staffdeck-i18n-browser-results-862a.json`。
+`/private/tmp/firmdeck-i18n-browser-results-862a.json`。
 
 | 维度 | 范围 | 结果 |
 |---|---|---|

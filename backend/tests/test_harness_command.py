@@ -277,7 +277,7 @@ def test_windows_other_absolute_paths_remain_unchanged_and_are_allowed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(command_module.sys, "platform", "win32")
-    command = r"Get-Content C:\Users\staffdeck\secret.txt"
+    command = r"Get-Content C:\Users\firmdeck\secret.txt"
 
     normalized = command_module._command_for_sandbox_workspace(command, "unsandboxed")
 
@@ -506,7 +506,7 @@ def test_windows_validator_allows_absolute_paths(command: str) -> None:
     "command",
     [
         "cat /etc/hosts",
-        "printf ok > /tmp/staffdeck-result.txt",
+        "printf ok > /tmp/firmdeck-result.txt",
         "tool --output=/tmp/result.json",
         "cat ~/notes.txt",
     ],
@@ -574,7 +574,7 @@ def test_packaged_windows_shell_aliases_bundled_python(tmp_path: Path, monkeypat
     runtime.mkdir()
     (runtime / "python.exe").write_bytes(b"bundled")
     monkeypatch.setattr(command_module.sys, "platform", "win32")
-    monkeypatch.setattr(command_module.sys, "executable", str(tmp_path / "staffdeck.exe"))
+    monkeypatch.setattr(command_module.sys, "executable", str(tmp_path / "firmdeck.exe"))
 
     encoded = command_module._windows_powershell_command("python3 -c 'print(1)'").split()[-1]
     script = base64.b64decode(encoded).decode("utf-16le")

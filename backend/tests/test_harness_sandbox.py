@@ -20,7 +20,7 @@ def _make_bundle(root: Path) -> None:
 
 def test_resolve_srt_uses_explicit_bundle(monkeypatch, tmp_path: Path) -> None:
     _make_bundle(tmp_path)
-    monkeypatch.setenv("STAFFDECK_SRT_RUNTIME", str(tmp_path))
+    monkeypatch.setenv("FIRMDECK_SRT_RUNTIME", str(tmp_path))
     resolved = sandbox.resolve_srt()
     assert resolved == (
         (tmp_path / "bin" / sandbox._node_name()).resolve(),
@@ -35,7 +35,7 @@ def test_resolve_srt_prefers_source_bundle_over_global_install(
     global_bundle = tmp_path / "global"
     _make_bundle(source_bundle)
     _make_bundle(global_bundle)
-    monkeypatch.delenv("STAFFDECK_SRT_RUNTIME", raising=False)
+    monkeypatch.delenv("FIRMDECK_SRT_RUNTIME", raising=False)
     monkeypatch.setattr(sandbox, "_source_runtime_root", lambda: source_bundle)
     monkeypatch.setattr(
         sandbox.shutil,
@@ -57,8 +57,8 @@ def test_resolve_srt_ignores_global_install_without_explicit_opt_in(
 ) -> None:
     global_bundle = tmp_path / "global"
     _make_bundle(global_bundle)
-    monkeypatch.delenv("STAFFDECK_SRT_RUNTIME", raising=False)
-    monkeypatch.delenv("STAFFDECK_ALLOW_GLOBAL_SRT", raising=False)
+    monkeypatch.delenv("FIRMDECK_SRT_RUNTIME", raising=False)
+    monkeypatch.delenv("FIRMDECK_ALLOW_GLOBAL_SRT", raising=False)
     monkeypatch.setattr(sandbox, "_source_runtime_root", lambda: tmp_path / "missing")
     monkeypatch.setattr(
         sandbox.shutil,
@@ -78,8 +78,8 @@ def test_resolve_srt_allows_global_install_with_explicit_opt_in(
 ) -> None:
     global_bundle = tmp_path / "global"
     _make_bundle(global_bundle)
-    monkeypatch.delenv("STAFFDECK_SRT_RUNTIME", raising=False)
-    monkeypatch.setenv("STAFFDECK_ALLOW_GLOBAL_SRT", "true")
+    monkeypatch.delenv("FIRMDECK_SRT_RUNTIME", raising=False)
+    monkeypatch.setenv("FIRMDECK_ALLOW_GLOBAL_SRT", "true")
     monkeypatch.setattr(sandbox, "_source_runtime_root", lambda: tmp_path / "missing")
     monkeypatch.setattr(
         sandbox.shutil,
@@ -107,7 +107,7 @@ def test_network_policy_defaults_only_when_missing() -> None:
 
 
 def test_missing_bundle_does_not_report_sandbox(monkeypatch, tmp_path: Path) -> None:
-    monkeypatch.setenv("STAFFDECK_SRT_RUNTIME", str(tmp_path))
+    monkeypatch.setenv("FIRMDECK_SRT_RUNTIME", str(tmp_path))
     monkeypatch.setattr(
         sandbox,
         "_source_runtime_root",
@@ -121,7 +121,7 @@ def test_missing_bundle_does_not_report_sandbox(monkeypatch, tmp_path: Path) -> 
 
 def test_diagnostics_rejects_root_before_starting_srt(monkeypatch, tmp_path: Path) -> None:
     _make_bundle(tmp_path)
-    monkeypatch.setenv("STAFFDECK_SRT_RUNTIME", str(tmp_path))
+    monkeypatch.setenv("FIRMDECK_SRT_RUNTIME", str(tmp_path))
     monkeypatch.setattr(sandbox.sys, "platform", "linux")
     monkeypatch.setattr(sandbox.os, "geteuid", lambda: 0, raising=False)
     monkeypatch.setattr(sandbox, "available_backend", lambda: "srt")
@@ -149,7 +149,7 @@ def test_diagnostics_allows_root_for_bubblewrap_when_userns_is_available(
 
 def test_diagnostics_rejects_disabled_user_namespaces(monkeypatch, tmp_path: Path) -> None:
     _make_bundle(tmp_path)
-    monkeypatch.setenv("STAFFDECK_SRT_RUNTIME", str(tmp_path))
+    monkeypatch.setenv("FIRMDECK_SRT_RUNTIME", str(tmp_path))
     monkeypatch.setattr(sandbox.sys, "platform", "linux")
     monkeypatch.setattr(sandbox.os, "geteuid", lambda: 1001, raising=False)
     monkeypatch.setattr(sandbox, "available_backend", lambda: "srt")
@@ -166,7 +166,7 @@ def test_windows_diagnostics_requires_successful_srt_initialization(
 ) -> None:
     monkeypatch.setattr(sandbox.sys, "platform", "win32")
     _make_bundle(tmp_path)
-    monkeypatch.setenv("STAFFDECK_SRT_RUNTIME", str(tmp_path))
+    monkeypatch.setenv("FIRMDECK_SRT_RUNTIME", str(tmp_path))
     monkeypatch.setattr(sandbox, "_windows_srt_ready", lambda *_args: False)
 
     report = sandbox.diagnostics()
@@ -198,7 +198,7 @@ def test_windows_srt_probe_uses_bundle_directory(monkeypatch, tmp_path: Path) ->
 
 def test_windows_install_command_uses_bundled_node_and_cli(monkeypatch, tmp_path: Path) -> None:
     _make_bundle(tmp_path)
-    monkeypatch.setenv("STAFFDECK_SRT_RUNTIME", str(tmp_path))
+    monkeypatch.setenv("FIRMDECK_SRT_RUNTIME", str(tmp_path))
 
     command = sandbox.windows_install_command()
 

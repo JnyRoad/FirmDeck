@@ -199,7 +199,7 @@ export function createAppTranslator(localeInput: unknown): AppTranslator {
 }
 
 /**
- * 创建 StaffDeck 的受控组件外 i18n 实例；这是 createAppTranslator 的语义化公开入口。
+ * 创建 FirmDeck 的受控组件外 i18n 实例；这是 createAppTranslator 的语义化公开入口。
  */
 export function createAppIntl(localeInput: unknown): AppTranslator {
   return createAppTranslator(localeInput);

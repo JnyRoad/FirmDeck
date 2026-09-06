@@ -33,7 +33,7 @@ const ALL_VALUE = 'all';
 const FILTER_DEBOUNCE_MS = 300;
 
 /**
- * 审计动作码 → 语义消息 id（I8）。这些码是 StaffDeck 自己定义的后端枚举，不是用户
+ * 审计动作码 → 语义消息 id（I8）。这些码是 FirmDeck 自己定义的后端枚举，不是用户
  * 原始内容，必须本地化；旧实现把码本身当作筛选项标签与表格单元格文案直接显示，还
  * 用 `RawContent` 包了一层——那是"逐字保留用户/第三方原文"的标记，用在自有枚举上
  * 属于误用。落键模式抄 `VersionsTab.tsx` 的 `STATE_LABEL_IDS`。

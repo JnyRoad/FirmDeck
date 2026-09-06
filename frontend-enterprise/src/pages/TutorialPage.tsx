@@ -2,7 +2,7 @@ import { useEffect } from 'react';
 
 import { useAppIntl } from '@/i18n/useAppIntl';
 
-import StaffdeckIcon, { type StaffdeckIconName } from '../components/StaffdeckIcon';
+import FirmdeckIcon, { type FirmdeckIconName } from '../components/FirmdeckIcon';
 
 type TocGroup = {
   title: string;
@@ -13,7 +13,7 @@ type Feature = {
   title: string;
   subtitle: string;
   body: string;
-  icon: StaffdeckIconName;
+  icon: FirmdeckIconName;
   proof: string;
 };
 
@@ -440,7 +440,7 @@ function useTutorialCopy(): TutorialCopy {
   return buildTutorialCopy(t);
 }
 
-/** 渲染教程页主体，展示 StaffDeck 运行时、治理和配置路径的静态说明。 */
+/** 渲染教程页主体，展示 FirmDeck 运行时、治理和配置路径的静态说明。 */
 export default function TutorialPage() {
   const copy = useTutorialCopy();
 
@@ -489,7 +489,7 @@ export default function TutorialPage() {
           <div className="tutorial-doc-map-grid">
             {copy.features.slice(0, 6).map((feature) => (
               <span key={feature.title}>
-                <StaffdeckIcon name={feature.icon} />
+                <FirmdeckIcon name={feature.icon} />
                 <em>{feature.title}</em>
               </span>
             ))}
@@ -566,7 +566,7 @@ export default function TutorialPage() {
             <div className="tutorial-doc-feature-grid">
               {copy.features.map((feature) => (
                 <article key={feature.title} className="tutorial-doc-feature">
-                  <span><StaffdeckIcon name={feature.icon} /></span>
+                  <span><FirmdeckIcon name={feature.icon} /></span>
                   <em>{feature.subtitle}</em>
                   <strong>{feature.title}</strong>
                   <p>{feature.body}</p>
@@ -587,7 +587,7 @@ export default function TutorialPage() {
             <SectionHeading eyebrow={copy.governanceEyebrow} title={copy.governanceTitle} body={copy.governanceBody} />
             <div className="tutorial-doc-governance-grid">
               {copy.governanceItems.map((item) => (
-                <span key={item}><StaffdeckIcon name="check" />{item}</span>
+                <span key={item}><FirmdeckIcon name="check" />{item}</span>
               ))}
             </div>
           </section>

@@ -142,7 +142,7 @@ class _PublicOnlyAsyncHTTPTransport(httpx2.AsyncHTTPTransport):
 
 
 class MCPAdapterError(RuntimeError):
-    """Expose one stable StaffDeck error code without upstream OAuth response text."""
+    """Expose one stable FirmDeck error code without upstream OAuth response text."""
 
     def __init__(self, code: str) -> None:
         """Retain only the safe error code at the application boundary."""
@@ -151,7 +151,7 @@ class MCPAdapterError(RuntimeError):
 
 
 def assert_supported_sdk_version(candidate: str | None = None) -> str:
-    """Reject an SDK version that has not passed StaffDeck compatibility review."""
+    """Reject an SDK version that has not passed FirmDeck compatibility review."""
     resolved = candidate or distribution_version(mcp.__name__)
     if resolved != SUPPORTED_MCP_SDK_VERSION:
         raise RuntimeError(
@@ -261,7 +261,7 @@ class MCPSDKAdapter:
     def build_oauth_provider(self) -> _ExpiryAwareOAuthClientProvider:
         """Build the sole supported SDK provider with PKCE authorization-code metadata."""
         metadata = OAuthClientMetadata(
-            client_name="StaffDeck",
+            client_name="FirmDeck",
             redirect_uris=[self.redirect_uri],
             token_endpoint_auth_method="none",
         )
@@ -407,7 +407,7 @@ class MCPSDKAdapter:
         """List and normalize tools while retaining negotiated server metadata."""
 
         async def operation(client: Client) -> dict[str, Any]:
-            """Convert official SDK models into the existing StaffDeck discovery envelope."""
+            """Convert official SDK models into the existing FirmDeck discovery envelope."""
             result = await client.list_tools()
             tools = [
                 _normalize_tool_definition(
@@ -434,7 +434,7 @@ class MCPSDKAdapter:
         return await self._with_client(operation)
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        """Invoke one tool and preserve the existing StaffDeck result envelope."""
+        """Invoke one tool and preserve the existing FirmDeck result envelope."""
 
         async def operation(client: Client) -> dict[str, Any]:
             """Translate the official SDK result without discarding structured content."""

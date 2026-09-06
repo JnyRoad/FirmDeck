@@ -1,6 +1,6 @@
-# StaffDeck 数字员工开放 API v1
+# FirmDeck 数字员工开放 API v1
 
-本文档面向需要通过服务端调用 StaffDeck 数字员工的业务系统。开放 API 复用与对话端、自动任务相同的 AgentLoop/Harness v2 执行内核。
+本文档面向需要通过服务端调用 FirmDeck 数字员工的业务系统。开放 API 复用与对话端、自动任务相同的 AgentLoop/Harness v2 执行内核。
 
 ## 环境与接口描述
 
@@ -24,11 +24,11 @@ Content-Type: application/json
 
 ### 右上角用户菜单创建账号全量密钥
 
-登录 StaffDeck 后，在整个界面右上角打开当前用户菜单，选择“API 全量密钥”。每个用户只能为自己创建、轮换和禁用账号密钥；管理员也不能从账号管理列表代其他用户生成密钥。这里创建的密钥绑定当前登录账号，而不是绑定单个数字员工。
+登录 FirmDeck 后，在整个界面右上角打开当前用户菜单，选择“API 全量密钥”。每个用户只能为自己创建、轮换和禁用账号密钥；管理员也不能从账号管理列表代其他用户生成密钥。这里创建的密钥绑定当前登录账号，而不是绑定单个数字员工。
 
 | 类型 | 使用场景 | 权限边界 |
 | --- | --- | --- |
-| 账号全量密钥（大密钥） | 将当前 StaffDeck 账号的能力整体接入外部系统 | 可浏览和选择广场员工、创建员工、运行当前账号可访问的员工，并按账号本人权限管理自有员工的 SOP、知识、技能、工具和定时任务 |
+| 账号全量密钥（大密钥） | 将当前 FirmDeck 账号的能力整体接入外部系统 | 可浏览和选择广场员工、创建员工、运行当前账号可访问的员工，并按账号本人权限管理自有员工的 SOP、知识、技能、工具和定时任务 |
 
 权限不是创建时固化的员工 ID 列表，而是在每次请求时根据账号重新计算：
 
@@ -46,7 +46,7 @@ Content-Type: application/json
 
 员工卡片右上角的“API 密钥”入口仅创建绑定该员工的运行密钥。它可以创建会话、运行任务、读取 Trace 与产物，但不能读取完整资源配置，也不能调用其他员工。
 
-密钥明文只在创建或轮换时返回一次。StaffDeck 仅保存带服务端 pepper 的摘要和可识别前缀。
+密钥明文只在创建或轮换时返回一次。FirmDeck 仅保存带服务端 pepper 的摘要和可识别前缀。
 
 ### 服务端创建 API Client
 
@@ -83,7 +83,7 @@ curl -X POST "$BASE/api-clients/$CLIENT_ID/credentials" \
 
 ```bash
 curl -X POST "$BASE/agents/$AGENT_ID/sessions" \
-  -H "Authorization: Bearer $STAFFDECK_API_KEY" \
+  -H "Authorization: Bearer $FIRMDECK_API_KEY" \
   -H "Idempotency-Key: crm-session-10001" \
   -H "Content-Type: application/json" \
   -d '{
@@ -102,7 +102,7 @@ curl -X POST "$BASE/agents/$AGENT_ID/sessions" \
 
 ```bash
 curl -N -X POST "$BASE/agents/$AGENT_ID/runs:stream" \
-  -H "Authorization: Bearer $STAFFDECK_API_KEY" \
+  -H "Authorization: Bearer $FIRMDECK_API_KEY" \
   -H "Idempotency-Key: crm-run-10001" \
   -H "Accept: text/event-stream" \
   -H "Content-Type: application/json" \
@@ -119,7 +119,7 @@ curl -N -X POST "$BASE/agents/$AGENT_ID/runs:stream" \
 
 ```bash
 curl -X POST "$BASE/agents/$AGENT_ID/runs" \
-  -H "Authorization: Bearer $STAFFDECK_API_KEY" \
+  -H "Authorization: Bearer $FIRMDECK_API_KEY" \
   -H "Idempotency-Key: crm-run-10001" \
   -H "Content-Type: application/json" \
   -d "{
@@ -174,7 +174,7 @@ Job 状态：`queued`、`running`、`awaiting_input`、`succeeded`、`failed`、
 
 ```bash
 curl -N "$BASE/runs/$RUN_ID/events" \
-  -H "Authorization: Bearer $STAFFDECK_API_KEY" \
+  -H "Authorization: Bearer $FIRMDECK_API_KEY" \
   -H "Accept: text/event-stream"
 ```
 
@@ -218,7 +218,7 @@ POST /gallery/agents/{agent_id}:add
 
 ```bash
 curl -X POST "$BASE/gallery/agents/$AGENT_ID:add" \
-  -H "Authorization: Bearer $STAFFDECK_API_KEY" \
+  -H "Authorization: Bearer $FIRMDECK_API_KEY" \
   -H "Idempotency-Key: gallery-add-$AGENT_ID"
 ```
 
@@ -226,7 +226,7 @@ curl -X POST "$BASE/gallery/agents/$AGENT_ID:add" \
 
 ```bash
 curl -X POST "$BASE/agents" \
-  -H "Authorization: Bearer $STAFFDECK_API_KEY" \
+  -H "Authorization: Bearer $FIRMDECK_API_KEY" \
   -H "Idempotency-Key: copy-gallery-$AGENT_ID" \
   -H "Content-Type: application/json" \
   -d "{\"name\":\"我的员工副本\",\"source_mode\":\"copy\",\"copy_from_agent_id\":\"$AGENT_ID\"}"
@@ -323,7 +323,7 @@ If-Match: "当前 ETag"
 
 ```json
 {
-  "type": "urn:staffdeck:error:validation_error",
+  "type": "urn:firmdeck:error:validation_error",
   "title": "VALIDATION_ERROR",
   "status": 422,
   "code": "VALIDATION_ERROR",
@@ -333,16 +333,16 @@ If-Match: "当前 ETag"
 }
 ```
 
-客户端可以传 `X-Request-ID`；未传时 StaffDeck 自动生成，并在响应头和错误体中返回。
+客户端可以传 `X-Request-ID`；未传时 FirmDeck 自动生成，并在响应头和错误体中返回。
 
 ### Webhook 验签
 
 Webhook 请求包含：
 
 ```http
-X-StaffDeck-Event-ID: evt_xxx
-X-StaffDeck-Timestamp: 1785811200
-X-StaffDeck-Signature: v1=<hex-digest>
+X-FirmDeck-Event-ID: evt_xxx
+X-FirmDeck-Timestamp: 1785811200
+X-FirmDeck-Signature: v1=<hex-digest>
 ```
 
 签名内容为：

@@ -221,7 +221,7 @@ async function listWechatKfAccounts(
   return request(`${wechatKfBindingPath(bindingId)}/accounts?tenant_id=${encodeURIComponent(tenantId)}`);
 }
 
-/** 将一个现有 provider 客服账号绑定到当前 StaffDeck 路由。 */
+/** 将一个现有 provider 客服账号绑定到当前 FirmDeck 路由。 */
 async function selectWechatKfAccount(
   bindingId: string,
   payload: WeChatKfAccountSelectWrite,
@@ -289,7 +289,7 @@ async function createWechatKfContactWay(
   const query = new URLSearchParams({
     tenant_id: tenantId,
     open_kfid: openKfid,
-    scene: 'staffdeck',
+    scene: 'firmdeck',
   });
   return request<WeChatKfContactWayRead>(
     `${wechatKfBindingPath(bindingId)}/contact-way?${query.toString()}`,

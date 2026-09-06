@@ -103,7 +103,7 @@ const runtimeSettings = {
   context_medium_summary_prefix: '近期的历史信息总结为：',
   sandbox_enabled: false,
   harness_storage_path: '',
-  effective_harness_storage_path: '/Users/demo/.staffdeck/workspaces',
+  effective_harness_storage_path: '/Users/demo/.firmdeck/workspaces',
   restart_scheduled: false,
   sandbox_network_mode: 'all' as const,
   sandbox_allowed_domains: [],
@@ -152,12 +152,12 @@ function makeTenantContext(generation = 1): TenantSessionContextValue {
 
 const semanticRuntimeCopy = {
   'zh-CN': {
-    adminHint: '仅管理员可修改。打开或关闭后保存将自动重启 StaffDeck。默认关闭。',
+    adminHint: '仅管理员可修改。打开或关闭后保存将自动重启 FirmDeck。默认关闭。',
     heading: '运行设置',
     save: '保存设置',
   },
   'en-US': {
-    adminHint: 'Only administrators can change this setting. Saving after a change restarts StaffDeck. Disabled by default.',
+    adminHint: 'Only administrators can change this setting. Saving after a change restarts FirmDeck. Disabled by default.',
     heading: 'Runtime settings',
     save: 'Save settings',
   },
@@ -272,9 +272,9 @@ describe('Harness workspace settings', () => {
     const user = userEvent.setup();
     renderRuntimeSettings();
 
-    const input = await screen.findByPlaceholderText('/Users/demo/.staffdeck/workspaces');
+    const input = await screen.findByPlaceholderText('/Users/demo/.firmdeck/workspaces');
     expect(screen.getByText('Harness 工作区目录')).toBeTruthy();
-    expect(screen.getByText('/Users/demo/.staffdeck/workspaces')).toBeTruthy();
+    expect(screen.getByText('/Users/demo/.firmdeck/workspaces')).toBeTruthy();
     expect(screen.getByText(/仅用于 Harness 的任务文件和生成产物/)).toBeTruthy();
     expect(screen.queryByText('文件存储目录')).toBeNull();
 
@@ -296,7 +296,7 @@ describe('Harness workspace settings', () => {
   });
 
   it('localizes the effective workspace and sandbox status for en-US', async () => {
-    window.localStorage.setItem('staffdeck_locale', 'en-US');
+    window.localStorage.setItem('firmdeck_locale', 'en-US');
     mocks.get.mockImplementation((path: string) => {
       if (path.includes('/ui-config')) {
         return Promise.resolve({
@@ -313,7 +313,7 @@ describe('Harness workspace settings', () => {
     renderRuntimeSettings();
 
     expect(await screen.findByText('Current effective Harness workspace')).toBeTruthy();
-    expect(screen.getByText('/Users/demo/.staffdeck/workspaces')).toBeTruthy();
+    expect(screen.getByText('/Users/demo/.firmdeck/workspaces')).toBeTruthy();
     expect(
       screen.getByText('Sandbox status:Unavailable', { selector: '.font-medium' }),
     ).toBeTruthy();
@@ -352,17 +352,17 @@ describe('sandbox diagnostic contract', () => {
   const cases = [
     {
       locale: 'zh-CN' as const,
-      setupCopy: '需要管理员初始化 Windows 沙盒。请执行下方命令，确认 UAC 后重启 StaffDeck。',
+      setupCopy: '需要管理员初始化 Windows 沙盒。请执行下方命令，确认 UAC 后重启 FirmDeck。',
     },
     {
       locale: 'en-US' as const,
-      setupCopy: 'An administrator must initialize the Windows sandbox. Run the command below, confirm UAC, then restart StaffDeck.',
+      setupCopy: 'An administrator must initialize the Windows sandbox. Run the command below, confirm UAC, then restart FirmDeck.',
     },
   ];
 
   for (const { locale, setupCopy } of cases) {
     it(`localizes sandbox diagnostics and preserves technical values in ${locale}`, async () => {
-      const rawCommand = '/opt/staffdeck/node srt-cli.js windows-install';
+      const rawCommand = '/opt/firmdeck/node srt-cli.js windows-install';
       mocks.get.mockImplementation((path: string) => {
         if (path.includes('/ui-config')) {
           return Promise.resolve({
@@ -390,7 +390,7 @@ describe('sandbox diagnostic contract', () => {
       expect(await screen.findByText(setupCopy)).toBeTruthy();
       expect(screen.getByText(rawCommand)).toBeTruthy();
       expect(screen.getByText('srt')).toBeTruthy();
-      expect(screen.getByText('/Users/demo/.staffdeck/workspaces')).toBeTruthy();
+      expect(screen.getByText('/Users/demo/.firmdeck/workspaces')).toBeTruthy();
       expect(screen.queryByText('RAW_STATUS_TEXT_MUST_NOT_REACH_UI')).toBeNull();
       expect(screen.queryByText('RAW_REMEDIATION_TEXT_MUST_NOT_REACH_UI')).toBeNull();
       expect(screen.queryByText('RAW_SETUP_TEXT_MUST_NOT_REACH_UI')).toBeNull();

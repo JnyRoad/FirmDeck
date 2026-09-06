@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 SCRIPT = Path(__file__).resolve().parents[2] / "packaging" / "fetch_sandbox_runtime.py"
-SPEC = importlib.util.spec_from_file_location("staffdeck_fetch_sandbox_runtime", SCRIPT)
+SPEC = importlib.util.spec_from_file_location("firmdeck_fetch_sandbox_runtime", SCRIPT)
 assert SPEC and SPEC.loader
 fetch = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(fetch)

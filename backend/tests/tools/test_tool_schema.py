@@ -48,11 +48,11 @@ def test_personal_oauth_rejects_ineligible_transports(transport: str) -> None:
 
 def test_personal_oauth_accepts_one_public_client_identity() -> None:
     """Accept a pre-registered public client without accepting a client secret."""
-    request = _request(auth_mode="oauth_personal", oauth_client_id="staffdeck-public")
+    request = _request(auth_mode="oauth_personal", oauth_client_id="firmdeck-public")
 
     payload = request.model_dump()
     assert payload["auth_mode"] == "oauth_personal"
-    assert payload["oauth_client_id"] == "staffdeck-public"
+    assert payload["oauth_client_id"] == "firmdeck-public"
     assert "oauth_client_secret" not in payload
 
 
@@ -61,8 +61,8 @@ def test_personal_oauth_rejects_two_client_identification_modes() -> None:
     with pytest.raises(ValidationError, match="only one"):
         _request(
             auth_mode="oauth_personal",
-            oauth_client_id="staffdeck-public",
-            oauth_client_metadata_url="https://staffdeck.example/.well-known/mcp-client.json",
+            oauth_client_id="firmdeck-public",
+            oauth_client_metadata_url="https://firmdeck.example/.well-known/mcp-client.json",
         )
 
 
@@ -79,14 +79,14 @@ def test_personal_oauth_requires_a_redirect_uri() -> None:
     with pytest.raises(ValidationError, match="redirect URI"):
         _request(
             auth_mode="oauth_personal",
-            oauth_client_id="staffdeck-public",
+            oauth_client_id="firmdeck-public",
             oauth_redirect_uri=None,
         )
 
 
 @pytest.mark.parametrize(
     "metadata_url",
-    ["http://staffdeck.example/client.json", "https://staffdeck.example"],
+    ["http://firmdeck.example/client.json", "https://firmdeck.example"],
 )
 def test_cimd_requires_https_non_root_url(metadata_url: str) -> None:
     """Reject a CIMD identity that the official SDK will refuse at construction."""
@@ -99,7 +99,7 @@ def test_cimd_requires_https_non_root_url(metadata_url: str) -> None:
 
 @pytest.mark.parametrize(
     "redirect_uri",
-    ["http://staffdeck.example/oauth/callback", "file:///tmp/callback"],
+    ["http://firmdeck.example/oauth/callback", "file:///tmp/callback"],
 )
 def test_redirect_uri_requires_https_or_loopback_http(redirect_uri: str) -> None:
     """Reject callbacks that expose an authorization code over unsafe remote schemes."""
@@ -109,18 +109,18 @@ def test_redirect_uri_requires_https_or_loopback_http(redirect_uri: str) -> None
 
 def test_redirect_uri_requires_the_fixed_callback_path(monkeypatch) -> None:
     """Catch an authorization code being redirected to an unrelated application path."""
-    monkeypatch.setenv("STAFFDECK_PUBLIC_URL", "https://staffdeck.example")
+    monkeypatch.setenv("FIRMDECK_PUBLIC_URL", "https://firmdeck.example")
 
     with pytest.raises(ValidationError, match="redirect URI"):
         _request(
             auth_mode="oauth_personal",
-            oauth_redirect_uri="https://staffdeck.example/another/callback",
+            oauth_redirect_uri="https://firmdeck.example/another/callback",
         )
 
 
 def test_redirect_uri_requires_the_configured_public_origin(monkeypatch) -> None:
-    """Catch a remote callback being sent to a different StaffDeck deployment."""
-    monkeypatch.setenv("STAFFDECK_PUBLIC_URL", "https://staffdeck.example")
+    """Catch a remote callback being sent to a different FirmDeck deployment."""
+    monkeypatch.setenv("FIRMDECK_PUBLIC_URL", "https://firmdeck.example")
 
     with pytest.raises(ValidationError, match="redirect URI"):
         _request(
@@ -133,7 +133,7 @@ def test_redirect_uri_requires_the_configured_public_origin(monkeypatch) -> None
 
 def test_redirect_uri_rejects_loopback_when_public_origin_is_configured(monkeypatch) -> None:
     """Prevent production configuration from falling back to an unrelated loopback callback."""
-    monkeypatch.setenv("STAFFDECK_PUBLIC_URL", "https://staffdeck.example")
+    monkeypatch.setenv("FIRMDECK_PUBLIC_URL", "https://firmdeck.example")
 
     with pytest.raises(ValidationError, match="redirect URI"):
         _request(
@@ -145,9 +145,9 @@ def test_redirect_uri_rejects_loopback_when_public_origin_is_configured(monkeypa
 
 
 def test_redirect_uri_accepts_the_configured_public_callback(monkeypatch) -> None:
-    """Accept the exact callback endpoint on the configured StaffDeck origin."""
-    monkeypatch.setenv("STAFFDECK_PUBLIC_URL", "https://staffdeck.example")
-    redirect_uri = "https://staffdeck.example/api/enterprise/mcp-servers/oauth/callback"
+    """Accept the exact callback endpoint on the configured FirmDeck origin."""
+    monkeypatch.setenv("FIRMDECK_PUBLIC_URL", "https://firmdeck.example")
+    redirect_uri = "https://firmdeck.example/api/enterprise/mcp-servers/oauth/callback"
 
     request = _request(auth_mode="oauth_personal", oauth_redirect_uri=redirect_uri)
 
@@ -160,8 +160,8 @@ def test_redirect_uri_uses_public_origin_loaded_from_dotenv(tmp_path, monkeypatc
     from app.tools import mcp_oauth_policy
 
     dotenv = tmp_path / "oauth.env"
-    dotenv.write_text("STAFFDECK_PUBLIC_URL=https://dotenv.example\n", encoding="utf-8")
-    monkeypatch.delenv("STAFFDECK_PUBLIC_URL", raising=False)
+    dotenv.write_text("FIRMDECK_PUBLIC_URL=https://dotenv.example\n", encoding="utf-8")
+    monkeypatch.delenv("FIRMDECK_PUBLIC_URL", raising=False)
     settings = Settings(_env_file=dotenv)
     monkeypatch.setattr(mcp_oauth_policy, "get_settings", lambda: settings)
 

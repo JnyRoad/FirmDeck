@@ -1,25 +1,25 @@
-# StaffDeck 飞书渠道接入开发设计
+# FirmDeck 飞书渠道接入开发设计
 
 ## 1. 目标与范围
 
-在现有微信、企业微信渠道内核上新增飞书渠道，使企业自建应用通过飞书官方长连接接收消息，并将消息路由到 StaffDeck 数字员工。首版支持：
+在现有微信、企业微信渠道内核上新增飞书渠道，使企业自建应用通过飞书官方长连接接收消息，并将消息路由到 FirmDeck 数字员工。首版支持：
 
 - 飞书企业自建应用的 `App ID + App Secret` 配置与连接状态管理。
 - 单聊文本消息。
 - 群聊中明确 `@` 当前机器人的文本消息。
-- StaffDeck 身份、会话、对话日志、自动路由和多员工挂载。
+- FirmDeck 身份、会话、对话日志、自动路由和多员工挂载。
 - 文本回复、投递日志、失败重试和重启恢复。
-- 同一 StaffDeck 租户接入多个飞书应用，以及不同租户之间的身份隔离。
+- 同一 FirmDeck 租户接入多个飞书应用，以及不同租户之间的身份隔离。
 
 首版不支持图片、文件、语音、卡片、消息编辑/撤回和主动群发。这些事件必须被安全忽略，不能创建用户、会话或对话轮。文本消息持久接收后，父进程通过独立 receipt outbox 添加飞书官方 `Get` 表情，最终回复送达后异步移除；receipt 失败不得阻塞 ACK、AgentLoop 或正文回复。企业微信和微信当前没有对应的机器人 reaction API，不共享该能力。
 
 ## 2. 接入方式与依赖
 
-使用飞书长连接，不使用公网 Webhook。该方案适合 StaffDeck 桌面版和私有部署，不要求用户配置公网域名。
+使用飞书长连接，不使用公网 Webhook。该方案适合 FirmDeck 桌面版和私有部署，不要求用户配置公网域名。
 
 - 固定依赖 `lark-channel-sdk==1.2.0`，避免 SDK 生命周期和回调语义漂移。
 - 入站使用官方 SDK 的 `EventDispatcherHandler` 和 WebSocket client。
-- 出站使用官方消息 API，显式传入 StaffDeck 派生的 `uuid`。
+- 出站使用官方消息 API，显式传入 FirmDeck 派生的 `uuid`。
 - 打包配置收集 `lark_channel` 的动态子模块，并增加打包后的导入冒烟测试。
 
 不能直接使用 SDK 高层 `FeishuChannel` 的默认入站回调：它会先调度异步处理再 ACK，且用户 handler 异常不会传回飞书，无法保证“数据库提交成功后才 ACK”。
@@ -31,12 +31,12 @@
 1. 使用 `multiprocessing.get_context("spawn")` 为两个 binding 启动两个独立 connector 子进程，每个进程只持有一个 SDK client 和 event loop。
 2. 单独停止、重启其中一个进程，另一个连接不受影响。
 3. 同步 dispatcher 在数据库提交后返回成功；模拟提交失败时向飞书返回失败。
-4. 确认 SDK 不会在 StaffDeck 持久化前执行内部去重或 stale 丢弃。
+4. 确认 SDK 不会在 FirmDeck 持久化前执行内部去重或 stale 丢弃。
 5. 反复 start/stop、断网重连，无 loop 泄漏、线程残留或互相 stop。
 6. 正常数据库提交后的 wire ACK 小于 3 秒；watchdog 从收到完整 DATA frame 时 arm，直到 response frame 的 `await conn.send()` 成功后才 disarm。2.5 秒内未完成真实 wire ACK 就终止 connector 进程，覆盖数据库锁、fsync、commit 和 ACK send 卡顿。
 7. 使用生产代码同位置的 `BEFORE_COMMIT`、SQLite `COMMIT` trace、`AFTER_COMMIT_BEFORE_ACK`、`ACK_WRITTEN` 故障注入点证明回滚和重投去重，不能用固定 sleep 猜测时序。SQLite trace 仅证明进入 `commit()` 调用栈但 native commit 尚未完成，不宣称可确定暂停在 fsync 内部；native fsync 强杀留给 frozen artifact fault harness。
 8. 两个 connector 并行时，一个 binding 的慢事务只能保证另一个 binding 在 deadline 内独立 ACK 或 NACK 并完成收敛；共享 SQLite 写锁场景不承诺另一个一定 ACK success。
-9. 父进程异常退出后，子进程通过 Pipe EOF/租约检测自行退出，并由 child 持有的 per-binding OS lock 保证 StaffDeck 重启时同一 binding 最多一个 connector。
+9. 父进程异常退出后，子进程通过 Pipe EOF/租约检测自行退出，并由 child 持有的 per-binding OS lock 保证 FirmDeck 重启时同一 binding 最多一个 connector。
 10. 在真实 macOS `.app`、Windows exe/PyInstaller 产物验证 spawn、Pipe 控制、独立重启、父进程死亡和强杀回滚，不能只 monkeypatch 平台或做 import smoke。
 
 该进程隔离方案是对 SDK 1.2.0 module-global loop 的明确边界。子进程内允许一个集中、最小的固定版本 compatibility observer/subclass，只用于在真实 DATA frame 进入时 arm watchdog、在 response frame 实际写成功后 disarm，并保留 SDK 的 frame correlation；业务归一化和数据库逻辑不得复制进该层。若 spike 证明跨平台进程生命周期或这个 wire hook 无法稳定实现，则停止业务开发，改用带 per-instance loop 和正式 pre-ACK hook 的固定 fork；不能以“仅支持一个绑定”或接受 ACK 后丢消息窗口作为交付方案。
@@ -87,7 +87,7 @@ watchdog 使用双保险：子进程原生控制线程以 monotonic deadline 监
 
   `app:<app_id长度>:<app_id>:tenant:<tenant_key长度>:<tenant_key>`
 
-- 身份唯一键继续使用 `(staffdeck tenant_id, channel, external_account_scope, external_user_id)`。
+- 身份唯一键继续使用 `(firmdeck tenant_id, channel, external_account_scope, external_user_id)`。
 - `header.app_id` 或 `header.tenant_key` 与绑定已固定值不一致时拒绝事件。
 
 凭证首次保存时以 `app_id` 建立待激活配置，并把 `external_account_key` 固定为全局唯一的 `feishu:app:<app_id长度>:<app_id>`。`ChannelBinding` 增加独立、可 CAS 的 `provider_tenant_key`，不把首次观测值并发写回整个 `config_json`。CAS 成功后，`identity_scope_key` 固定为 `app:<app_id长度>:<app_id>:tenant:<tenant_key长度>:<tenant_key>`。
@@ -104,7 +104,7 @@ watchdog 使用双保险：子进程原生控制线程以 monotonic deadline 监
 | 普通群聊 | `chat_id` | 回复源 `message_id` |
 | 群话题 | `(chat_id, thread_id)` | 回复源 `message_id`，保持在原话题 |
 
-首版将每个飞书话题视为独立会话，稳定键同时编码 `chat_id + thread_id`；只有飞书明确返回 `thread_id` 时才按话题处理。`root_id` 也会出现在普通回复树中，不能用于推断话题。非话题群消息共享 `chat_id` 会话。群聊仍保留发送者 `open_id` 用于审计和显示；现有渠道内核的群会话主体语义保持不变，不在本次重构为“一群多 StaffDeck 用户”。
+首版将每个飞书话题视为独立会话，稳定键同时编码 `chat_id + thread_id`；只有飞书明确返回 `thread_id` 时才按话题处理。`root_id` 也会出现在普通回复树中，不能用于推断话题。非话题群消息共享 `chat_id` 会话。群聊仍保留发送者 `open_id` 用于审计和显示；现有渠道内核的群会话主体语义保持不变，不在本次重构为“一群多 FirmDeck 用户”。
 
 `ChannelInbound` 增加显式 `thread_id` 和可覆盖的 `external_conv_id`，避免用 `group_id` 隐式推导飞书话题会话。`ChannelInboundEvent` 增加不可变 `target_json`，stage 时固化 `receive_id_type`、`receive_id`、源 `message_id`、`chat_id` 和 `thread_id`。用户消息已有的 `metadata_json.client_turn_id` 关联到入站 `event_id`；Outbox staging 通过 `(binding_id, client_turn_id)` 查到入站事件，并把目标复制到 `ChannelDelivery.target_json`。异步回复不再从会被新消息覆盖的 `ChatSession.channel_target_json` 读取飞书目标。
 
@@ -169,7 +169,7 @@ worker 使用数据库作为事实来源，内存事件只负责降低轮询延�
 
 ### 5.1 ACK / NACK / drop 矩阵
 
-| 情况 | 对飞书结果 | StaffDeck 行为 |
+| 情况 | 对飞书结果 | FirmDeck 行为 |
 | --- | --- | --- |
 | 新合法消息，inbox commit 可见 | ACK success | 唤醒 worker |
 | 重复 `(binding_id, message_id)` | ACK success | 不创建第二个 turn |
@@ -205,7 +205,7 @@ compatibility adapter 必须暴露可测试的明确结果，而不是用普通 
 - Secret 不放入命令行或可见环境变量；父进程只向子进程传 binding ID 和不可逆的运行代次信息。
 - 子进程使用独立 `NullPool` 或单连接 staging engine，连接级 busy timeout 小于 watchdog，不复用默认 30 秒全局 engine。首版仅支持文件 SQLite；非文件 SQLite 或其他未验证数据库在激活飞书绑定时 fail fast。
 - child 在连接飞书前获取数据库路径派生、binding ID 哈希命名的 OS lock，并持有到进程退出。新 manager 只能等待 lock 释放，绝不根据存量 PID 单独强杀未知进程，避免 PID 复用误伤。
-- 同一应用的连接数受飞书 50 连接限制；StaffDeck 默认一个 binding 一个连接，并在 UI/API 对超限给出明确错误。
+- 同一应用的连接数受飞书 50 连接限制；FirmDeck 默认一个 binding 一个连接，并在 UI/API 对超限给出明确错误。
 - reconnect 在子进程内由 SDK 负责，父 manager 通过受限 IPC 健康事件把实际状态对账到 `binding.connected`。
 - 配置更新统一执行 pause spawn/reconcile -> 请求优雅断开 -> join/waitpid -> 超时 terminate/kill -> 再次确认 PID 已退出 -> update -> start。旧进程未确认退出时不得提交新凭证或 revision。
 - callback 携带启动时的 `config_revision`；旧代次 callback 即使晚到也不得落库。
@@ -238,9 +238,9 @@ send(binding, target, text, *, idempotency_key: str | None = None)
 sha256("<delivery idempotency key>:<chunk index>")[:40]
 ```
 
-该值小于飞书 50 字符限制。同一投递重试使用相同 UUID，不同分片使用不同 UUID，从而覆盖飞书一小时去重窗口内“飞书发送成功但 StaffDeck 尚未标记 delivered 就崩溃”的重复发送窗口。群话题调用 reply API 时传源 `message_id`、同一稳定 `uuid`，并显式设置 `reply_in_thread=true`。
+该值小于飞书 50 字符限制。同一投递重试使用相同 UUID，不同分片使用不同 UUID，从而覆盖飞书一小时去重窗口内“飞书发送成功但 FirmDeck 尚未标记 delivered 就崩溃”的重复发送窗口。群话题调用 reply API 时传源 `message_id`、同一稳定 `uuid`，并显式设置 `reply_in_thread=true`。
 
-发送目标必须来自已持久化的 `target_json`，不能在重试时根据当前配置重新推断。飞书 SDK 自身的业务层重试关闭或限制为单次请求，由 StaffDeck Outbox 统一控制重试和状态。
+发送目标必须来自已持久化的 `target_json`，不能在重试时根据当前配置重新推断。飞书 SDK 自身的业务层重试关闭或限制为单次请求，由 FirmDeck Outbox 统一控制重试和状态。
 
 `ChannelDelivery` 增加 `first_attempt_at`。进程恢复发现飞书 delivery 卡在 `sending` 时：
 
@@ -335,7 +335,7 @@ sha256("<delivery idempotency key>:<chunk index>")[:40]
 - 并发重复 staging 只保留一条事件。
 - 两个不同 tenant key 首次并发只能一个 CAS 成功；相同 tenant key 并发均 ACK 且按 message ID 去重。
 - tenant CAS commit 后、任何内存通知前退出，重启仍可处理。
-- StaffDeck tenant、飞书 app、飞书 tenant 三个维度的身份隔离。
+- FirmDeck tenant、飞书 app、飞书 tenant 三个维度的身份隔离。
 - 首次固定 tenant key，以及后续 scope 变化拒绝且数据不变。
 - 单聊 `open_id`、群聊 `chat_id` 的出站路由。
 - 同投递同分片 UUID 稳定，不同分片 UUID 不同。
@@ -351,10 +351,10 @@ sha256("<delivery idempotency key>:<chunk index>")[:40]
 - 用 grandparent 启动 parent + child，强杀 parent 后立即启动新 parent；本地飞书服务端观测同 binding 任意时刻连接数不超过 1。新 parent 只等待 child 持有的 binding OS lock，不按陈旧 PID 杀进程。
 - 正常 stop、自动 reconnect 睡眠期间 stop、callback 阻塞期间 stop，最终均确认 waitpid/join；无法收敛时主进程 shutdown 返回失败并保留全局 connector lock。
 - spawn 子进程不继承父 DB 连接、event loop、线程或明文 Secret 参数。
-- `Process.args`、环境、IPC、stdout/stderr、runtime log、异常 repr 和 API 快照均不含 App Secret/token；child 只接收 binding ID、revision、nonce。继承的 StaffDeck 解密根密钥不等于允许 App Secret 出现在参数或日志。
+- `Process.args`、环境、IPC、stdout/stderr、runtime log、异常 repr 和 API 快照均不含 App Secret/token；child 只接收 binding ID、revision、nonce。继承的 FirmDeck 解密根密钥不等于允许 App Secret 出现在参数或日志。
 - 连续 3 次 watchdog 超时进入 crash backoff/circuit breaker，不持续 spawn；状态和手动恢复入口可观测。
 - 真正构建并运行 macOS `.app` 与 Windows exe 的隐藏 contract 模式：`freeze_support()` 生效、worker 不递归启动 GUI/Uvicorn/浏览器、数据库/用户目录与父进程一致，两个 child 可 spawn/stop，强杀 parent 后无残留。普通 import smoke 不算通过。
-- SDK 内部去重和 stale 策略不会先于 StaffDeck durable inbox 丢弃事件。
+- SDK 内部去重和 stale 策略不会先于 FirmDeck durable inbox 丢弃事件。
 - 现有微信、企微、渠道日志和身份绑定测试全部通过。
 - 前端凭证保存、密钥不回显、连接状态和错误提示。
 - token 隔离、提前刷新、single-flight、Secret 轮换失效和 401 单次刷新。
@@ -367,11 +367,11 @@ sha256("<delivery idempotency key>:<chunk index>")[:40]
 
 使用两个测试用户、一个测试群和一个企业自建应用完成：
 
-1. 单聊发送文本，StaffDeck 回复且双方日志可见。
+1. 单聊发送文本，FirmDeck 回复且双方日志可见。
 2. 群聊不 `@` 无响应；`@bot` 有且仅有一次响应。
 3. 注入首次 stage 数据库故障使 callback NACK，观察飞书约 15 秒后以同一 `message_id` 重投；恢复后只产生一个 turn。
 4. 人工断网后恢复，连接状态恢复且消息不丢失。
-5. 回复过程中重启 StaffDeck，已 ACK 的 `received` 消息可恢复处理。
+5. 回复过程中重启 FirmDeck，已 ACK 的 `received` 消息可恢复处理。
 6. 禁用或删除绑定后不再收发消息。
 7. 使用第二个飞书应用制造相同用户场景，确认身份和会话不串。
 

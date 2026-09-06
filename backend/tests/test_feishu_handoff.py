@@ -86,7 +86,7 @@ def _feishu_binding(
 
 def _channel_identity(
     *,
-    staffdeck_user_id: str = "assignee_user",
+    firmdeck_user_id: str = "assignee_user",
     external_user_id: str = "ou_assignee",
     scope: str = "",
     channel: str = "feishu",
@@ -96,7 +96,7 @@ def _channel_identity(
         channel=channel,
         external_account_scope=scope,
         external_user_id=external_user_id,
-        staffdeck_user_id=staffdeck_user_id,
+        firmdeck_user_id=firmdeck_user_id,
     )
 
 
@@ -1550,14 +1550,14 @@ def _seed_handoff_reply_scenario(
     notice_receive_id: str = "ou_assignee",
     handoff_assignee: str = "assignee_user",
     sender_open_id: str = "ou_assignee",
-    sender_staffdeck_user_id: str = "assignee_user",
+    sender_firmdeck_user_id: str = "assignee_user",
 ) -> tuple[ChannelBinding, HumanHandoffRequest, ChannelInbound, object]:
     binding = _feishu_binding()
     db.add(binding)
     db.add(
         _channel_identity(
             external_user_id=sender_open_id,
-            staffdeck_user_id=sender_staffdeck_user_id,
+            firmdeck_user_id=sender_firmdeck_user_id,
         )
     )
     session = ChatSession(
@@ -1662,7 +1662,7 @@ def test_try_handle_feishu_handoff_reply_rejects_non_assignee_sender(monkeypatch
             db,
             notice_receive_id="ou_assignee",
             sender_open_id="ou_stranger",
-            sender_staffdeck_user_id="stranger_user",
+            sender_firmdeck_user_id="stranger_user",
         )
 
         original = intake_mod.external_account_scope
@@ -2119,7 +2119,7 @@ def test_run_handoff_reply_command_matches_by_identity(monkeypatch) -> None:
 
 
 def test_run_handoff_reply_command_rejects_without_identity() -> None:
-    """发送者无 ChannelIdentity(未绑定 StaffDeck 身份)时拒绝,不再用 contact_target 模糊匹配。"""
+    """发送者无 ChannelIdentity(未绑定 FirmDeck 身份)时拒绝,不再用 contact_target 模糊匹配。"""
     import app.channels.service_intake as intake_mod
     from app.channels.service_intake import _run_handoff_reply_command
     from app.channels.service_routing import ChannelCommand

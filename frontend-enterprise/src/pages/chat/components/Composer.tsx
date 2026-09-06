@@ -2,7 +2,7 @@ import type { FormEvent } from 'react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 
 import EmployeeAvatar from '@/components/EmployeeAvatar';
-import StaffdeckIcon from '@/components/StaffdeckIcon';
+import FirmdeckIcon from '@/components/FirmdeckIcon';
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -193,7 +193,7 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
           <div className="mb-[10px] flex flex-col items-start justify-between gap-[10px] rounded-[12px] border border-[#f3d28b] bg-[#fff8e8] px-[14px] py-[10px] text-[#6f4500] shadow-[0_8px_24px_rgba(92,62,0,0.08)] sm:flex-row sm:items-center">
             <div className="flex min-w-0 items-center gap-[9px]">
               <span className="flex size-[26px] shrink-0 items-center justify-center rounded-[8px] bg-[#ffe7ad] text-[#8a4b00]">
-                <StaffdeckIcon name="model" size={14} />
+                <FirmdeckIcon name="model" size={14} />
               </span>
               <span className="min-w-0 text-[12px] leading-[18px]">{modelSetupNoticeText}</span>
             </div>
@@ -320,7 +320,7 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
                   {attachment.kind === 'image' && attachment.data_url ? (
                     <img className={CHAT_COMPOSER_ATTACHMENT_IMG_CLASS} src={attachment.data_url} alt={attachment.filename} />
                   ) : (
-                    <StaffdeckIcon name={attachment.kind === 'pdf' ? 'file' : 'folder'} size={16} />
+                    <FirmdeckIcon name={attachment.kind === 'pdf' ? 'file' : 'folder'} size={16} />
                   )}
                   <span className={CHAT_COMPOSER_ATTACHMENT_COPY_CLASS}>
                     <span className={CHAT_COMPOSER_ATTACHMENT_NAME_CLASS}>{attachment.filename}</span>
@@ -368,7 +368,7 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
                   onClick={() => selectSlashCommand(index)}
                 >
                   <span className="inline-grid size-[30px] shrink-0 place-items-center rounded-[9px] bg-[#eef1f5] text-[#5f687b]">
-                    <StaffdeckIcon
+                    <FirmdeckIcon
                       name={command.kind === 'sop' ? 'branch' : command.kind === 'skill' ? 'spark' : 'tool'}
                       size={15}
                     />
@@ -473,16 +473,16 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
                     aria-label={t('chat.composer.add')}
                     title={t('chat.composer.add')}
                   >
-                    <StaffdeckIcon name="plus" size={16} />
+                    <FirmdeckIcon name="plus" size={16} />
                   </button>
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="start" side="top" className={cn(CHAT_MENU_CONTENT_CLASS, 'min-w-[160px]')}>
                   <DropdownMenuItem className={CHAT_MENU_ITEM_CLASS} onSelect={() => handleComposerPlusAction('upload')}>
-                    <StaffdeckIcon name="upload" size={16} />
+                    <FirmdeckIcon name="upload" size={16} />
                     <span>{t('chat.composer.uploadFile')}</span>
                   </DropdownMenuItem>
                   <DropdownMenuItem className={CHAT_MENU_ITEM_CLASS} onSelect={() => handleComposerPlusAction('scheduled_task')}>
-                    <StaffdeckIcon name="clock" size={16} />
+                    <FirmdeckIcon name="clock" size={16} />
                     <span>{t('chat.composer.scheduledTask')}</span>
                   </DropdownMenuItem>
                 </DropdownMenuContent>
@@ -504,12 +504,12 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
                     scheduleIntentHovered ? 'text-[#18181a]' : 'text-[#858b9c]',
                   )}
                   >
-                    <StaffdeckIcon
+                    <FirmdeckIcon
                       name="clock"
                       size={14}
                       className={cn('transition-opacity', scheduleIntentHovered ? 'opacity-0' : 'opacity-100')}
                     />
-                    <StaffdeckIcon
+                    <FirmdeckIcon
                       name="close"
                       size={9}
                       className={cn('absolute transition-opacity', scheduleIntentHovered ? 'opacity-100' : 'opacity-0')}
@@ -534,7 +534,7 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
                         ? <RawIdentifier value={modelDisplayName(selectedModelConfig, t)} />
                         : t('chat.composer.defaultModel')}
                     </span>
-                    <StaffdeckIcon name="arrow" size={14} style={{ transform: 'rotate(90deg)' }} />
+                    <FirmdeckIcon name="arrow" size={14} style={{ transform: 'rotate(90deg)' }} />
                   </button>
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="end" side="top" className={cn(CHAT_MENU_CONTENT_CLASS, 'max-h-[360px] min-w-[240px] overflow-y-auto')}>
@@ -557,7 +557,7 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
                           <RawIdentifier value={modelDetailText(model, t)} />
                         </span>
                         </span>
-                        {selectedModelConfig?.id === model.id && <StaffdeckIcon name="check" size={15} />}
+                        {selectedModelConfig?.id === model.id && <FirmdeckIcon name="check" size={15} />}
                       </DropdownMenuItem>
                     ))
                   )}
@@ -571,7 +571,7 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
                   aria-label={t('chat.composer.stopGeneration')}
                   title={t('chat.composer.stopGeneration')}
                 >
-                  <StaffdeckIcon name="stop" size={18} />
+                  <FirmdeckIcon name="stop" size={18} />
                 </button>
               )}
               <button
@@ -585,7 +585,7 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
                   ? t('chat.composer.queueMessage')
                   : t('chat.composer.send')}
               >
-                <StaffdeckIcon name="send" size={18} />
+                <FirmdeckIcon name="send" size={18} />
               </button>
             </div>
           </div>

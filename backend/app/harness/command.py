@@ -600,7 +600,7 @@ def _write_srt_settings(
         separators=(",", ":"),
     )
     with tempfile.NamedTemporaryFile(
-        mode="w", encoding="utf-8", prefix="staffdeck-srt-", suffix=".json", delete=False
+        mode="w", encoding="utf-8", prefix="firmdeck-srt-", suffix=".json", delete=False
     ) as handle:
         handle.write(settings)
         handle.flush()
@@ -624,7 +624,7 @@ def _srt_supports_allow_all() -> bool:
     resolved = resolve_srt()
     if resolved is None:
         return False
-    marker = "staffdeck-allow-all-domains-patch-v1"
+    marker = "firmdeck-allow-all-domains-patch-v1"
     manager_path = resolved[1].parent / "sandbox" / "sandbox-manager.js"
     config_path = resolved[1].parent / "sandbox" / "sandbox-config.js"
     try:
@@ -661,10 +661,10 @@ def _windows_powershell_command(command: str) -> str:
     if runtime is not None:
         python_path = str(runtime / "python.exe").replace("'", "''")
         runtime_alias = (
-            f"$staffdeckPython = '{python_path}'\n"
-            "function Invoke-StaffDeckPython { & $staffdeckPython @args }\n"
-            "Set-Alias -Name python -Value Invoke-StaffDeckPython\n"
-            "Set-Alias -Name python3 -Value Invoke-StaffDeckPython\n"
+            f"$firmdeckPython = '{python_path}'\n"
+            "function Invoke-FirmDeckPython { & $firmdeckPython @args }\n"
+            "Set-Alias -Name python -Value Invoke-FirmDeckPython\n"
+            "Set-Alias -Name python3 -Value Invoke-FirmDeckPython\n"
         )
     script = (
         "$OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n"

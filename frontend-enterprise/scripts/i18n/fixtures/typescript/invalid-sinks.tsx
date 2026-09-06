@@ -13,7 +13,7 @@ export function InvalidSinkFixture({ section }: InvalidSinkFixtureProps) {
   const { t } = useI18n();
   const dynamicId = `nav.${section}`;
   const clipboardNotice = (message: string) => message;
-  document.title = 'StaffDeck settings';
+  document.title = 'FirmDeck settings';
   window.alert('Saved successfully');
   window.confirm('Delete this item?');
   window.prompt('Enter a title');
@@ -34,7 +34,7 @@ export function InvalidSinkFixture({ section }: InvalidSinkFixtureProps) {
       <input placeholder="Employee name" title="Employee name" aria-label="Employee name" />
       <img src="/avatar.png" alt="Employee avatar" />
       <iframe title="Embedded tool" src="about:blank" />
-      <a download="StaffDeck-export.json" href="data:application/json,{}">
+      <a download="FirmDeck-export.json" href="data:application/json,{}">
         Export report
       </a>
       <span>{unownedIgnore}</span>

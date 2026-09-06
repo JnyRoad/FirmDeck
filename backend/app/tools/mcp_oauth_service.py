@@ -56,7 +56,7 @@ class MCPGrantTokenStorage:
         config_fingerprint: str = "",
         enforce_owner_binding: bool = False,
     ) -> None:
-        """Bind every storage operation to one tenant, server, and StaffDeck user."""
+        """Bind every storage operation to one tenant, server, and FirmDeck user."""
         self.engine = engine
         self.tenant_id = tenant_id
         self.server_id = server_id

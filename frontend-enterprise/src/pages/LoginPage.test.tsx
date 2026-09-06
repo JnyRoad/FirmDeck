@@ -37,7 +37,7 @@ const semanticLoginCopy = {
     account: '账号',
     password: '密码',
     showPassword: '显示密码',
-    previewAlt: 'StaffDeck 产品预览',
+    previewAlt: 'FirmDeck 产品预览',
   },
   'en-US': {
     hero: 'What will we build today?',
@@ -45,7 +45,7 @@ const semanticLoginCopy = {
     account: 'Account',
     password: 'Password',
     showPassword: 'Show Password',
-    previewAlt: 'StaffDeck Product Preview',
+    previewAlt: 'FirmDeck Product Preview',
   },
 } as const satisfies Record<AppLocale, Record<string, string>>;
 
@@ -167,7 +167,7 @@ describe('LoginPage', () => {
     renderLogin();
 
     expect(screen.getByText('我们来做什么？')).toBeTruthy();
-    expect(screen.getByAltText('StaffDeck 产品预览')).toBeTruthy();
+    expect(screen.getByAltText('FirmDeck 产品预览')).toBeTruthy();
     expect(screen.queryByLabelText('账号')).toBeNull();
 
     await user.click(screen.getByRole('button', { name: '登录' }));

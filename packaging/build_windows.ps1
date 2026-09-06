@@ -116,7 +116,7 @@ Push-Location backend
 .\.venv\Scripts\pyinstaller ..\packaging\ultrarag.spec --noconfirm --distpath ..\packaging\out --workpath ..\packaging\build
 Assert-NativeCommandSucceeded "PyInstaller build"
 Pop-Location
-& packaging\out\staffdeck\staffdeck.exe --packaging-smoke
+& packaging\out\firmdeck\firmdeck.exe --packaging-smoke
 Assert-NativeCommandSucceeded "Packaged Lark SDK smoke test"
 
 $signingConfigured = Test-SigningConfigured
@@ -130,22 +130,22 @@ if ($signingConfigured) {
 Write-Host "==> [4/6] Bundle the Python skill runtime"
 backend\.venv\Scripts\python packaging\fetch_runtime_python.py packaging\runtime_dl --expect-arch x86_64
 Assert-NativeCommandSucceeded "Python skill runtime download"
-if (Test-Path packaging\out\staffdeck\runtime) { Remove-Item -Recurse -Force packaging\out\staffdeck\runtime }
-Copy-Item -Recurse -Force packaging\runtime_dl\python packaging\out\staffdeck\runtime
+if (Test-Path packaging\out\firmdeck\runtime) { Remove-Item -Recurse -Force packaging\out\firmdeck\runtime }
+Copy-Item -Recurse -Force packaging\runtime_dl\python packaging\out\firmdeck\runtime
 
 Write-Host "==> [4b/6] Bundle SRT + Node runtime"
 if (Test-Path packaging\sandbox_runtime) { Remove-Item -Recurse -Force packaging\sandbox_runtime }
-if (Test-Path packaging\out\staffdeck\sandbox) { Remove-Item -Recurse -Force packaging\out\staffdeck\sandbox }
+if (Test-Path packaging\out\firmdeck\sandbox) { Remove-Item -Recurse -Force packaging\out\firmdeck\sandbox }
 & $PY.Command @($PY.PrefixArgs) packaging\fetch_sandbox_runtime.py packaging\sandbox_runtime
 Assert-NativeCommandSucceeded "SRT runtime preparation"
-Copy-Item -Recurse -Force packaging\sandbox_runtime packaging\out\staffdeck\sandbox
-& $PY.Command @($PY.PrefixArgs) packaging\smoke_sandbox_bundle.py packaging\out\staffdeck\sandbox
+Copy-Item -Recurse -Force packaging\sandbox_runtime packaging\out\firmdeck\sandbox
+& $PY.Command @($PY.PrefixArgs) packaging\smoke_sandbox_bundle.py packaging\out\firmdeck\sandbox
 Assert-NativeCommandSucceeded "Final SRT bundle smoke test"
 
 if ($signingConfigured) {
   Write-Host "Signing bundled Windows executable payload"
   $signableExtensions = @(".exe", ".dll", ".pyd", ".node")
-  $signableFiles = Get-ChildItem packaging\out\staffdeck -Recurse -File |
+  $signableFiles = Get-ChildItem packaging\out\firmdeck -Recurse -File |
     Where-Object { $signableExtensions -contains $_.Extension.ToLowerInvariant() }
   foreach ($file in $signableFiles) {
     & packaging\sign_windows.ps1 -FilePath $file.FullName
@@ -153,7 +153,7 @@ if ($signingConfigured) {
   }
 }
 
-& packaging\out\staffdeck\runtime\python.exe -c `
+& packaging\out\firmdeck\runtime\python.exe -c `
   "import ssl, sqlite3, requests, docx, openpyxl; print(sqlite3.sqlite_version)"
 Assert-NativeCommandSucceeded "Final bundled Python runtime smoke test"
 
@@ -169,14 +169,14 @@ if (-not $iscc) {
   throw "Inno Setup 6 was not found. Install it or set ISCC to the full path of ISCC.exe."
 }
 Write-Host "Using Inno Setup: $iscc"
-$unsignedInstaller = "packaging\out\StaffDeck-setup.exe"
+$unsignedInstaller = "packaging\out\FirmDeck-setup.exe"
 if (Test-Path $unsignedInstaller) {
   Remove-Item -Force $unsignedInstaller
 }
 if ($signingConfigured) {
   $signScript = (Resolve-Path packaging\sign_windows.ps1).Path
   $signCommand = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$signScript`" -FilePath `$f"
-  & "$iscc" "/Sstaffdeck=$signCommand" packaging\installer\ultrarag.iss
+  & "$iscc" "/Sfirmdeck=$signCommand" packaging\installer\ultrarag.iss
 } else {
   & "$iscc" packaging\installer\ultrarag.iss
 }
@@ -186,7 +186,7 @@ if (-not (Test-Path $unsignedInstaller)) {
 }
 
 Write-Host "==> [6/6] Name the release artifact"
-$out = "packaging\out\StaffDeck-windows-x64-setup.exe"
+$out = "packaging\out\FirmDeck-windows-x64-setup.exe"
 if (Test-Path -LiteralPath $out) { Remove-Item -LiteralPath $out -Force }
 Move-Item -LiteralPath $unsignedInstaller -Destination $out
 if ($signingConfigured) {
@@ -197,4 +197,4 @@ if ($signingConfigured) {
   Write-Host "Authenticode signature valid: $($signature.SignerCertificate.Subject)"
 }
 Write-Host "built $out"
-Get-ChildItem packaging\out\StaffDeck-windows-x64-setup.exe
+Get-ChildItem packaging\out\FirmDeck-windows-x64-setup.exe

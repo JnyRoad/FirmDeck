@@ -9,7 +9,7 @@ from app import version
 from app.api import app_updates
 
 
-def _feed(*entries: tuple[str, str], repository: str = "OpenBMB/StaffDeck") -> bytes:
+def _feed(*entries: tuple[str, str], repository: str = "OpenBMB/FirmDeck") -> bytes:
     """Build a literal GitHub Atom feed for one repository and the supplied release entries."""
     body = "".join(
         (
@@ -29,7 +29,7 @@ def _response(content: bytes) -> httpx.Response:
     return httpx.Response(
         200,
         content=content,
-        request=httpx.Request("GET", "https://github.com/OpenBMB/StaffDeck/releases.atom"),
+        request=httpx.Request("GET", "https://github.com/OpenBMB/FirmDeck/releases.atom"),
     )
 
 
@@ -94,7 +94,7 @@ def test_fetch_version_uses_validated_github_release_url(monkeypatch) -> None:
     monkeypatch.setattr(
         app_updates,
         "release_repository",
-        lambda: "OpenBMB/StaffDeck",
+        lambda: "OpenBMB/FirmDeck",
         raising=False,
     )
     monkeypatch.setattr(
@@ -144,7 +144,7 @@ def test_fetch_version_fails_silently_and_failure_is_cached(monkeypatch) -> None
     monkeypatch.setattr(
         app_updates,
         "release_repository",
-        lambda: "OpenBMB/StaffDeck",
+        lambda: "OpenBMB/FirmDeck",
         raising=False,
     )
     monkeypatch.setattr(app_updates.httpx, "get", fail)
@@ -184,7 +184,7 @@ def test_fetch_version_uses_packaged_repository_for_feed_and_release_url(monkeyp
             200,
             content=_feed(
                 ("v0.2.1", "2026-08-05T12:00:00Z"),
-                repository="JnyRoad/StaffDeck",
+                repository="JnyRoad/FirmDeck",
             ),
             request=httpx.Request("GET", url),
         )
@@ -194,16 +194,16 @@ def test_fetch_version_uses_packaged_repository_for_feed_and_release_url(monkeyp
     monkeypatch.setattr(
         app_updates,
         "release_repository",
-        lambda: "JnyRoad/StaffDeck",
+        lambda: "JnyRoad/FirmDeck",
         raising=False,
     )
     monkeypatch.setattr(app_updates.httpx, "get", fetch)
 
     result = app_updates._fetch_version()
 
-    assert requested_urls == ["https://github.com/JnyRoad/StaffDeck/releases.atom"]
-    assert result.release_repository == "JnyRoad/StaffDeck"
-    assert result.release_url == "https://github.com/JnyRoad/StaffDeck/releases/tag/v0.2.1"
+    assert requested_urls == ["https://github.com/JnyRoad/FirmDeck/releases.atom"]
+    assert result.release_repository == "JnyRoad/FirmDeck"
+    assert result.release_url == "https://github.com/JnyRoad/FirmDeck/releases/tag/v0.2.1"
     assert result.update_available is True
     assert result.check_succeeded is True
 
@@ -215,7 +215,7 @@ def test_fetch_version_rejects_release_entry_from_other_repository(monkeypatch) 
     monkeypatch.setattr(
         app_updates,
         "release_repository",
-        lambda: "JnyRoad/StaffDeck",
+        lambda: "JnyRoad/FirmDeck",
         raising=False,
     )
     monkeypatch.setattr(
@@ -230,7 +230,7 @@ def test_fetch_version_rejects_release_entry_from_other_repository(monkeypatch) 
 
     result = app_updates._fetch_version()
 
-    assert result.release_repository == "JnyRoad/StaffDeck"
+    assert result.release_repository == "JnyRoad/FirmDeck"
     assert result.release_url == ""
     assert result.update_available is False
     assert result.check_succeeded is False
@@ -256,9 +256,9 @@ def test_fetch_version_skips_network_when_distribution_identity_is_invalid(monke
 
 
 def test_app_version_priority_and_macos_resources(monkeypatch, tmp_path: Path) -> None:
-    app_root = tmp_path / "StaffDeck.app"
-    executable = app_root / "Contents" / "MacOS" / "staffdeck"
-    resource = app_root / "Contents" / "Resources" / "staffdeck-version.txt"
+    app_root = tmp_path / "FirmDeck.app"
+    executable = app_root / "Contents" / "MacOS" / "firmdeck"
+    resource = app_root / "Contents" / "Resources" / "firmdeck-version.txt"
     executable.parent.mkdir(parents=True)
     resource.parent.mkdir(parents=True)
     resource.write_text("0.2.1\n", encoding="utf-8")
@@ -267,10 +267,10 @@ def test_app_version_priority_and_macos_resources(monkeypatch, tmp_path: Path) -
     monkeypatch.setattr(version.sys, "frozen", True, raising=False)
     monkeypatch.setattr(version.sys, "platform", "darwin")
     monkeypatch.setattr(version.sys, "executable", str(executable))
-    monkeypatch.delenv("STAFFDECK_VERSION", raising=False)
+    monkeypatch.delenv("FIRMDECK_VERSION", raising=False)
 
     assert version.app_version() == "0.2.1"
-    monkeypatch.setenv("STAFFDECK_VERSION", "0.3.0")
+    monkeypatch.setenv("FIRMDECK_VERSION", "0.3.0")
     assert version.app_version() == "0.3.0"
 
 
@@ -280,8 +280,8 @@ def test_app_version_priority_and_macos_resources(monkeypatch, tmp_path: Path) -
 )
 def test_update_check_enablement(monkeypatch, configured: str, frozen: bool, expected: bool) -> None:
     if configured:
-        monkeypatch.setenv("STAFFDECK_UPDATE_CHECK", configured)
+        monkeypatch.setenv("FIRMDECK_UPDATE_CHECK", configured)
     else:
-        monkeypatch.delenv("STAFFDECK_UPDATE_CHECK", raising=False)
+        monkeypatch.delenv("FIRMDECK_UPDATE_CHECK", raising=False)
     monkeypatch.setattr(version.sys, "frozen", frozen, raising=False)
     assert version.update_check_enabled() is expected

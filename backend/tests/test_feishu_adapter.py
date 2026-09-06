@@ -918,7 +918,7 @@ def test_normalize_post_message_without_locale_wrapper() -> None:
         "content": [
             [{"tag": "img", "image_key": "img_v3_nolocale"}],
             [
-                {"tag": "at", "user_id": "@_user_1", "user_name": "StaffDeck渠道接入测试机器人"},
+                {"tag": "at", "user_id": "@_user_1", "user_name": "FirmDeck渠道接入测试机器人"},
                 {"tag": "text", "text": " 查询假期余额"},
             ],
         ],

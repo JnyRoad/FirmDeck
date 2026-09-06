@@ -1,6 +1,6 @@
 import { expect, type Page } from '@playwright/test';
 
-const LOCALE_STORAGE_KEY = 'staffdeck_locale';
+const LOCALE_STORAGE_KEY = 'firmdeck_locale';
 
 /** Open the real signed-out application after seeding one supported production locale. */
 export async function openApplicationLocale(page: Page, locale: 'zh-CN' | 'en-US') {

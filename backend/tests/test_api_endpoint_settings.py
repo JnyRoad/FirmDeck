@@ -22,7 +22,7 @@ def _client_for(user: User) -> TestClient:
 def _set_active_runtime(monkeypatch, *, mode: str = "local", port: int = 6204) -> None:
     """Provide the launcher-owned active runtime data without relying on request headers."""
     monkeypatch.setenv(
-        "STAFFDECK_RUNTIME_NETWORK",
+        "FIRMDECK_RUNTIME_NETWORK",
         json.dumps(
             {
                 "mode": mode,
@@ -73,10 +73,10 @@ def test_network_settings_read_supports_web_runtime_without_desktop_snapshot(
 ) -> None:
     """Return configured web endpoints without trusting the caller's Host header."""
     monkeypatch.setattr(desktop_launcher, "user_data_dir", lambda: tmp_path)
-    monkeypatch.delenv("STAFFDECK_RUNTIME_NETWORK", raising=False)
+    monkeypatch.delenv("FIRMDECK_RUNTIME_NETWORK", raising=False)
     monkeypatch.setenv("APP_HOST", "0.0.0.0")
     monkeypatch.setenv("APP_PORT", "6205")
-    monkeypatch.setenv("STAFFDECK_PUBLIC_URL", "https://staff.example.com")
+    monkeypatch.setenv("FIRMDECK_PUBLIC_URL", "https://staff.example.com")
 
     response = _client_for(_admin_user()).get(
         "/api/enterprise/network-settings?tenant_id=tenant_demo",
@@ -93,11 +93,11 @@ def test_network_settings_read_keeps_app_host_and_port_configuration_paired(
 ) -> None:
     """Use the APP_PORT default when APP_HOST selects the Web supervisor listener."""
     monkeypatch.setattr(desktop_launcher, "user_data_dir", lambda: tmp_path)
-    monkeypatch.delenv("STAFFDECK_RUNTIME_NETWORK", raising=False)
+    monkeypatch.delenv("FIRMDECK_RUNTIME_NETWORK", raising=False)
     monkeypatch.setenv("APP_HOST", "0.0.0.0")
     monkeypatch.delenv("APP_PORT", raising=False)
     monkeypatch.setenv("ULTRARAG_PORT", "6206")
-    monkeypatch.delenv("STAFFDECK_PUBLIC_URL", raising=False)
+    monkeypatch.delenv("FIRMDECK_PUBLIC_URL", raising=False)
 
     response = _client_for(_admin_user()).get(
         "/api/enterprise/network-settings?tenant_id=tenant_demo"

@@ -1,5 +1,5 @@
 /**
- * 从英文规范目录派生 MessageId，并把 StaffDeck locale/message 联合类型注入 FormatJS。
+ * 从英文规范目录派生 MessageId，并把 FirmDeck locale/message 联合类型注入 FormatJS。
  */
 
 import canonicalMessages from './messages/en-US.json';

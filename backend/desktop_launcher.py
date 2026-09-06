@@ -23,8 +23,8 @@ from runtime_network import (
     runtime_network_snapshot,
 )
 
-APP_NAME = "StaffDeck"
-APP_ID = "ai.staffdeck.desktop"
+APP_NAME = "FirmDeck"
+APP_ID = "ai.firmdeck.desktop"
 APP_VERSION = app_version()
 NETWORK_MODES = {"local", "lan", "public"}
 DEFAULT_PORT_RANGE_START = 5173
@@ -35,7 +35,7 @@ _MACOS_WINDOW_CLASS = None
 MACOS_DRAG_REGION_LEFT_INSET = 360
 MACOS_DRAG_REGION_RIGHT_INSET = 260
 MACOS_DRAG_REGION_HEIGHT = 32
-STAFFDECK_ICON_PNG = ("packaging", "assets", "staffdeck.png")
+FIRMDECK_ICON_PNG = ("packaging", "assets", "firmdeck.png")
 LARK_PACKAGING_SMOKE_IMPORTS = (
     ("lark_channel", "EventDispatcherHandler"),
     ("lark_channel.ws.client", "Client"),
@@ -45,7 +45,7 @@ LARK_PACKAGING_SMOKE_IMPORTS = (
 
 def build_server_config() -> dict:
     host = os.environ.get("ULTRARAG_HOST", "127.0.0.1")
-    public_url = os.environ.get("STAFFDECK_PUBLIC_URL", "").strip()
+    public_url = os.environ.get("FIRMDECK_PUBLIC_URL", "").strip()
     return {
         "app": "single_port_app:app",
         "host": host,
@@ -128,7 +128,7 @@ def _apply_network_config(argv: list[str]) -> list[str]:
         saved.get("host") or ("127.0.0.1" if mode == "local" else "0.0.0.0")
     )
     port = args.port or int(os.environ.get("ULTRARAG_PORT") or saved.get("port") or 5173)
-    public_url = args.public_url or os.environ.get("STAFFDECK_PUBLIC_URL") or str(
+    public_url = args.public_url or os.environ.get("FIRMDECK_PUBLIC_URL") or str(
         saved.get("public_url") or ""
     )
     if mode == "local":
@@ -138,12 +138,12 @@ def _apply_network_config(argv: list[str]) -> list[str]:
     os.environ["ULTRARAG_HOST"] = host
     os.environ["ULTRARAG_PORT"] = str(port)
     if public_url:
-        os.environ["STAFFDECK_PUBLIC_URL"] = public_url
+        os.environ["FIRMDECK_PUBLIC_URL"] = public_url
     return remaining
 
 
 def _setup_network(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(prog="staffdeck setup", description="配置 StaffDeck 网络访问方式")
+    parser = argparse.ArgumentParser(prog="firmdeck setup", description="配置 FirmDeck 网络访问方式")
     parser.add_argument("--mode", choices=sorted(NETWORK_MODES), help="local、lan 或 public")
     parser.add_argument("--port", type=int, default=5173)
     parser.add_argument("--public-url", default="")
@@ -151,7 +151,7 @@ def _setup_network(argv: list[str]) -> int:
     mode = args.mode
     if not mode:
         if not sys.stdin.isatty():
-            raise SystemExit("无头环境请使用 staffdeck setup --mode local|lan|public")
+            raise SystemExit("无头环境请使用 firmdeck setup --mode local|lan|public")
         print("选择网络模式：1) 本机  2) 局域网  3) 公网")
         mode = {"1": "local", "2": "lan", "3": "public"}.get(input("请选择 [1]: ").strip() or "1")
         if not mode:
@@ -208,7 +208,7 @@ def apply_runtime_env(cfg: dict | None = None) -> None:
     existing_cors = os.environ.get("CORS_ORIGINS", "")
     origins = [item for item in (existing_cors, local_origin, origin) if item]
     os.environ["CORS_ORIGINS"] = ",".join(dict.fromkeys(",".join(origins).split(",")))
-    os.environ["STAFFDECK_RUNTIME_NETWORK"] = runtime_network_snapshot(cfg)
+    os.environ["FIRMDECK_RUNTIME_NETWORK"] = runtime_network_snapshot(cfg)
 
     # frozen 态把 .env 指向用户数据目录（不存在则 pydantic 不加载），避免误加载启动 cwd 的陌生 .env
     if getattr(sys, "frozen", False):
@@ -273,8 +273,8 @@ def _resource_path(*parts: str) -> str | None:
     return None
 
 
-def _staffdeck_icon_png_path() -> str | None:
-    return _resource_path(*STAFFDECK_ICON_PNG)
+def _firmdeck_icon_png_path() -> str | None:
+    return _resource_path(*FIRMDECK_ICON_PNG)
 
 
 def _health_ok(url: str) -> bool:
@@ -341,12 +341,12 @@ def _open_browser_when_ready(url: str) -> None:
 
 
 def _open_browser(target: str) -> None:
-    """Open StaffDeck in the system browser on platforms without an embedded window."""
+    """Open FirmDeck in the system browser on platforms without an embedded window."""
     webbrowser.open(target)
 
 
 def _is_external_web_url(target: str, local_url: str) -> bool:
-    """Return whether a web URL should leave the embedded StaffDeck window."""
+    """Return whether a web URL should leave the embedded FirmDeck window."""
     target_parts = urlsplit(target)
     local_parts = urlsplit(local_url)
     if target_parts.scheme not in {"http", "https"} or not target_parts.hostname:
@@ -371,14 +371,14 @@ def _four_char_code(value: str) -> int:
 
 
 def _use_macos_dock_app() -> bool:
-    if _env_flag("STAFFDECK_HEADLESS"):
+    if _env_flag("FIRMDECK_HEADLESS"):
         return False
     # 仅 macOS 打包态用 Cocoa 壳和内嵌 WebView。
     return sys.platform == "darwin" and getattr(sys, "frozen", False)
 
 
 def _use_windows_taskbar_app() -> bool:
-    if _env_flag("STAFFDECK_HEADLESS"):
+    if _env_flag("FIRMDECK_HEADLESS"):
         return False
     return sys.platform == "win32" and getattr(sys, "frozen", False)
 
@@ -397,7 +397,7 @@ def _serve(cfg: dict) -> None:
     import uvicorn
 
     if getattr(sys, "frozen", False):
-        logging.getLogger("staffdeck.runtime").info(
+        logging.getLogger("firmdeck.runtime").info(
             "Server starting host=%s port=%s",
             cfg["host"],
             cfg["port"],
@@ -460,7 +460,7 @@ def _create_macos_webview_window(AppKit, Foundation, WebKit, target: str):
     global _MACOS_WINDOW_CLASS
     if _MACOS_WINDOW_CLASS is None:
 
-        class StaffDeckWindow(AppKit.NSWindow):
+        class FirmDeckWindow(AppKit.NSWindow):
             def sendEvent_(self, event):  # noqa: N802
                 if event.type() == AppKit.NSEventTypeLeftMouseDown:
                     location = event.locationInWindow()
@@ -477,11 +477,11 @@ def _create_macos_webview_window(AppKit, Foundation, WebKit, target: str):
                             self.performWindowDragWithEvent_(event)
                         return
                 if objc_super is not None:
-                    objc_super(StaffDeckWindow, self).sendEvent_(event)
+                    objc_super(FirmDeckWindow, self).sendEvent_(event)
                 else:
                     AppKit.NSWindow.sendEvent_(self, event)
 
-        _MACOS_WINDOW_CLASS = StaffDeckWindow
+        _MACOS_WINDOW_CLASS = FirmDeckWindow
 
     style = (
         AppKit.NSWindowStyleMaskTitled
@@ -511,7 +511,7 @@ def _create_macos_webview_window(AppKit, Foundation, WebKit, target: str):
     webview.setAutoresizingMask_(AppKit.NSViewWidthSizable | AppKit.NSViewHeightSizable)
     page_url = Foundation.NSURL.URLWithString_(target)
     if page_url is None:
-        raise RuntimeError(f"Invalid StaffDeck window URL: {target!r}")
+        raise RuntimeError(f"Invalid FirmDeck window URL: {target!r}")
     webview.loadRequest_(Foundation.NSURLRequest.requestWithURL_(page_url))
     window.setContentView_(webview)
 
@@ -556,7 +556,7 @@ def _create_macos_main_menu(AppKit, app_delegate):
     app_menu.addItem_(AppKit.NSMenuItem.separatorItem())
 
     quit_item = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-        f"退出 {APP_NAME}", "quitStaffDeck:", "q"
+        f"退出 {APP_NAME}", "quitFirmDeck:", "q"
     )
     quit_item.setTarget_(app_delegate)
     app_menu.addItem_(quit_item)
@@ -601,7 +601,7 @@ def _run_macos_dock_app(cfg: dict, url: str) -> int:
     global _MACOS_DELEGATE_REF
 
     def load_app_icon(point_size: float | None = None):
-        icon_path = _staffdeck_icon_png_path()
+        icon_path = _firmdeck_icon_png_path()
         if not icon_path:
             return None
         image = AppKit.NSImage.alloc().initWithContentsOfFile_(icon_path)
@@ -656,7 +656,7 @@ def _run_macos_dock_app(cfg: dict, url: str) -> int:
             self.dock_context_menu, self.dock_context_dock_item = self._build_control_menu()
             return self.dock_context_menu
 
-        def openStaffDeck_(self, _sender):  # noqa: N802
+        def openFirmDeck_(self, _sender):  # noqa: N802
             self.showMainWindow_(url + "/chat/")
 
         def showMainWindow_(self, target):
@@ -673,7 +673,7 @@ def _run_macos_dock_app(cfg: dict, url: str) -> int:
                 self.main_window.makeKeyAndOrderFront_(None)
             AppKit.NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
 
-        def restartStaffDeck_(self, _sender):  # noqa: N802
+        def restartFirmDeck_(self, _sender):  # noqa: N802
             os.execv(sys.executable, [sys.executable] + sys.argv[1:])
 
         def toggleDockIcon_(self, _sender):  # noqa: N802
@@ -697,7 +697,7 @@ def _run_macos_dock_app(cfg: dict, url: str) -> int:
             alert.addButtonWithTitle_("好")
             alert.runModal()
 
-        def quitStaffDeck_(self, _sender):  # noqa: N802
+        def quitFirmDeck_(self, _sender):  # noqa: N802
             AppKit.NSApplication.sharedApplication().terminate_(self)
 
         def _start_server(self) -> None:
@@ -745,13 +745,13 @@ def _run_macos_dock_app(cfg: dict, url: str) -> int:
             menu.addItem_(self._menu_item(f"版本：{APP_VERSION}", enabled=False))
             menu.addItem_(self._menu_item(f"端口：{cfg['port']}", enabled=False))
             menu.addItem_(AppKit.NSMenuItem.separatorItem())
-            menu.addItem_(self._menu_item(f"打开 {APP_NAME}", "openStaffDeck:"))
-            menu.addItem_(self._menu_item("重启服务", "restartStaffDeck:"))
+            menu.addItem_(self._menu_item(f"打开 {APP_NAME}", "openFirmDeck:"))
+            menu.addItem_(self._menu_item("重启服务", "restartFirmDeck:"))
             dock_item = self._menu_item(self._dock_toggle_title(), "toggleDockIcon:")
             menu.addItem_(dock_item)
             menu.addItem_(AppKit.NSMenuItem.separatorItem())
             menu.addItem_(self._menu_item(f"关于 {APP_NAME}", "showAbout:"))
-            menu.addItem_(self._menu_item(f"退出 {APP_NAME}", "quitStaffDeck:"))
+            menu.addItem_(self._menu_item(f"退出 {APP_NAME}", "quitFirmDeck:"))
             return menu, dock_item
 
         def _install_status_menu(self) -> None:
@@ -790,7 +790,7 @@ def _run_macos_dock_app(cfg: dict, url: str) -> int:
 
 
 def _run_windows_taskbar_app(cfg: dict, url: str) -> int:
-    """Run the server behind a native window so StaffDeck owns a taskbar icon."""
+    """Run the server behind a native window so FirmDeck owns a taskbar icon."""
     import ctypes
     from ctypes import wintypes
 
@@ -895,7 +895,7 @@ def _run_windows_taskbar_app(cfg: dict, url: str) -> int:
         return user32.DefWindowProcW(hwnd, message, wparam, lparam)
 
     instance = kernel32.GetModuleHandleW(None)
-    class_name = "StaffDeckDesktopWindow"
+    class_name = "FirmDeckDesktopWindow"
     window_class = WNDCLASSW()
     window_class.lpfnWndProc = window_proc
     window_class.hInstance = instance
@@ -990,7 +990,7 @@ def main(argv: list[str] | None = None) -> int:
     if _use_windows_taskbar_app():
         return _run_windows_taskbar_app(cfg, url)
 
-    if not _env_flag("STAFFDECK_HEADLESS"):
+    if not _env_flag("FIRMDECK_HEADLESS"):
         print(f"{APP_NAME} 启动中，就绪后将打开：{url}/chat/")
         threading.Thread(target=_open_browser_when_ready, args=(url,), daemon=True).start()
     else:

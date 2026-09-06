@@ -1,0 +1,4 @@
+interface:
+  display_name: "管理 FirmDeck SOP"
+  short_description: "通过开放 API 创建、改写、校验、发布和回滚 SOP"
+  default_prompt: "Use $firmdeck-api-manage-sops to safely update and publish a FirmDeck SOP."

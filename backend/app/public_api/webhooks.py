@@ -546,9 +546,9 @@ def deliver_webhook(delivery_id: str) -> None:
                 content=body.encode("utf-8"),
                 headers={
                     "Content-Type": "application/json",
-                    "X-StaffDeck-Event-ID": event_id,
-                    "X-StaffDeck-Timestamp": timestamp,
-                    "X-StaffDeck-Signature": f"v1={signature}",
+                    "X-FirmDeck-Event-ID": event_id,
+                    "X-FirmDeck-Timestamp": timestamp,
+                    "X-FirmDeck-Signature": f"v1={signature}",
                 },
                 timeout=get_settings().public_api_webhook_timeout_seconds,
             )

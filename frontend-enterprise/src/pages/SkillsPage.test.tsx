@@ -54,7 +54,7 @@ import SkillsPage from './SkillsPage';
 const overallAgent: AgentProfileRead = {
   id: 'agent-overall',
   tenant_id: 'tenant_demo',
-  name: 'StaffDeck overall',
+  name: 'FirmDeck overall',
   is_overall: true,
   status: 'active',
   metadata: {},

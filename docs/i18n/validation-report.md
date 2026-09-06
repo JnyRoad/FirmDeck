@@ -25,9 +25,9 @@
 
 ## Clean-environment quickstart 结果
 
-2026-08-30 使用独立 `/private/tmp/staffdeck-i18n-clean-venv-862a` Python 3.12 venv 与全新
+2026-08-30 使用独立 `/private/tmp/firmdeck-i18n-clean-venv-862a` Python 3.12 venv 与全新
 `npm ci` 执行。默认 npm cache 因历史 root-owned 文件返回 `EPERM`；改用独立
-`/private/tmp/staffdeck-npm-cache-862a` 后同一锁文件安装 574 packages 成功。
+`/private/tmp/firmdeck-npm-cache-862a` 后同一锁文件安装 574 packages 成功。
 
 | 范围 | 命令 | 结果 |
 |---|---|---|
@@ -74,7 +74,7 @@ i18n 路径的 Ruff 作为发布阻断项；本次未使用 broad ignore 掩盖�
 
 - `UNVERIFIED`：真实 LLM/provider 对非中文 Agent reply contract 的遵循度。
 - `THIRD_PARTY_CONSTRAINED` + `UNVERIFIED`：真实飞书/钉钉/企微/微信、远程 A2A/MCP/provider
-  的 locale 协商；StaffDeck 已传递快照并保留远程原文，不能代替对端能力。
+  的 locale 协商；FirmDeck 已传递快照并保留远程原文，不能代替对端能力。
 - `UNVERIFIED`：Firefox、WebKit、macOS/Windows/Linux 打包产物；当前无 `packaging/out`可启动。
 - `UNVERIFIED`：Skill stream job store 当前是进程内存实现，跨进程真实恢复需待持久化
   store 落地后再验收。

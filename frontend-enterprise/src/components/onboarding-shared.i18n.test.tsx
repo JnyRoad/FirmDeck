@@ -27,7 +27,7 @@ const copy = {
     previousPage: '上一页',
     quickStartTitle: '配置模型 API Key',
     reset: '复位',
-    welcome: '欢迎使用 StaffDeck',
+    welcome: '欢迎使用 FirmDeck',
     zoomIn: '放大',
   },
   'en-US': {
@@ -40,7 +40,7 @@ const copy = {
     previousPage: 'Previous page',
     quickStartTitle: 'Configure a model API key',
     reset: 'Reset',
-    welcome: 'Welcome to StaffDeck',
+    welcome: 'Welcome to FirmDeck',
     zoomIn: 'Zoom in',
   },
 } as const;
@@ -133,7 +133,7 @@ describe('onboarding and shared UI locale matrix', () => {
       expect(screen.getByRole('button', { name: copy[locale].previousPage })).toBeTruthy();
       expect(screen.getByRole('button', { name: copy[locale].nextPage })).toBeTruthy();
       expect(document.body.textContent).toContain(concept.title);
-      expect(document.body.textContent).toContain('StaffDeck');
+      expect(document.body.textContent).toContain('FirmDeck');
     },
   );
 

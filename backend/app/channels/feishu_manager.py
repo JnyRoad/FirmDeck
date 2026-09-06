@@ -56,7 +56,7 @@ class FeishuProcessManager:
             self._wake.clear()
             self._thread = threading.Thread(
                 target=self._reconcile_loop,
-                name="staffdeck-feishu-reconcile",
+                name="firmdeck-feishu-reconcile",
                 daemon=True,
             )
             self._thread.start()
@@ -157,7 +157,7 @@ class FeishuProcessManager:
 
         threading.Thread(
             target=stop_generation,
-            name=f"staffdeck-feishu-stop-{binding_id}",
+            name=f"firmdeck-feishu-stop-{binding_id}",
             daemon=True,
         ).start()
 

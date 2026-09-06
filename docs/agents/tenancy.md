@@ -1,6 +1,6 @@
 # 多租户
 
-StaffDeck 是多租户系统。任何新功能默认在租户上下文内开发；按单租户假设编写的代码
+FirmDeck 是多租户系统。任何新功能默认在租户上下文内开发；按单租户假设编写的代码
 （无 `tenant_id` 归属、无租户过滤、无生命周期检查）视为缺陷，不是可选优化。架构依据为
 根 `CONTEXT.md` 术语与 `docs/adr/ADR-004-system-tenant-control-plane.md`。
 

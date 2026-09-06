@@ -153,7 +153,7 @@ def _agent_access_sets(
     manageable: set[str] = set()
     for row in rows:
         metadata = row.metadata_json or {}
-        if metadata.get("hidden_from_staffdeck") is True:
+        if metadata.get("hidden_from_firmdeck") is True:
             continue
         if (
             is_admin_user(actor)
@@ -204,7 +204,7 @@ def get_public_principal(
         raise PublicAPIError(401, "NOT_AUTHENTICATED", "A Bearer API key is required.")
     token = credentials.credentials
     if not token.startswith(PUBLIC_KEY_PREFIX):
-        raise PublicAPIError(401, "API_KEY_REQUIRED", "A StaffDeck sd_* API key is required.")
+        raise PublicAPIError(401, "API_KEY_REQUIRED", "A FirmDeck sd_* API key is required.")
     principal = _api_key_principal(token, db)
     request.state.public_principal = principal
     return principal

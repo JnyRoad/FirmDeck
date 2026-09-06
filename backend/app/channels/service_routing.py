@@ -46,8 +46,8 @@ _NOTICE_TEXT: dict[str, dict[SupportedLocale, str]] = {
             "/切换 <名字> 切换到指定员工\n"
             "/当前 查看当前员工\n"
             "/回复反馈 <内容> 回复人工转接通知\n"
-            "/绑定 <绑定码> 把{channel_name}账号绑定到你的 StaffDeck 账号\n"
-            "/解绑 解除{channel_name}账号与 StaffDeck 账号的绑定\n"
+            "/绑定 <绑定码> 把{channel_name}账号绑定到你的 FirmDeck 账号\n"
+            "/解绑 解除{channel_name}账号与 FirmDeck 账号的绑定\n"
             "/帮助 查看本说明"
         ),
         SupportedLocale.EN_US: (
@@ -56,8 +56,8 @@ _NOTICE_TEXT: dict[str, dict[SupportedLocale, str]] = {
             "/switch <name> Switch to an employee\n"
             "/current Show the current employee\n"
             "/handoff_reply <text> Reply to a human handoff notice\n"
-            "/bind <code> Link this {channel_name} account to StaffDeck\n"
-            "/unbind Unlink this {channel_name} account from StaffDeck\n"
+            "/bind <code> Link this {channel_name} account to FirmDeck\n"
+            "/unbind Unlink this {channel_name} account from FirmDeck\n"
             "/help Show this help"
         ),
     },
@@ -106,8 +106,8 @@ _NOTICE_TEXT: dict[str, dict[SupportedLocale, str]] = {
         SupportedLocale.EN_US: "The team linked to this channel is inactive or no longer exists. Ask an administrator to update the channel binding.",
     },
     "team.leader_missing": {
-        SupportedLocale.ZH_CN: "团队「{team_name}」暂未设置 TL，请先在 StaffDeck 网页端设置 TL 后再试。",
-        SupportedLocale.EN_US: "Team {team_name} does not have a team lead. Set one in StaffDeck and try again.",
+        SupportedLocale.ZH_CN: "团队「{team_name}」暂未设置 TL，请先在 FirmDeck 网页端设置 TL 后再试。",
+        SupportedLocale.EN_US: "Team {team_name} does not have a team lead. Set one in FirmDeck and try again.",
     },
     "handoff.already_processed": {
         SupportedLocale.ZH_CN: "该人工转接请求已处理，无需再次回复。",
@@ -160,8 +160,8 @@ _NOTICE_TEXT: dict[str, dict[SupportedLocale, str]] = {
         SupportedLocale.EN_US: "This handoff request was not delivered to your current WeCom account.",
     },
     "handoff.identity_missing": {
-        SupportedLocale.ZH_CN: "未找到待处理的人工转接请求。或当前渠道账号未绑定到 StaffDeck 处理人身份。",
-        SupportedLocale.EN_US: "No pending human handoff request was found, or this channel account is not linked to the assigned StaffDeck user.",
+        SupportedLocale.ZH_CN: "未找到待处理的人工转接请求。或当前渠道账号未绑定到 FirmDeck 处理人身份。",
+        SupportedLocale.EN_US: "No pending human handoff request was found, or this channel account is not linked to the assigned FirmDeck user.",
     },
     "handoff.quoted_missing": {
         SupportedLocale.ZH_CN: "未找到该引用消息对应的待处理人工转接请求。",
@@ -184,32 +184,32 @@ _NOTICE_TEXT: dict[str, dict[SupportedLocale, str]] = {
         SupportedLocale.EN_US: "Account linking and unlinking are available only in direct messages.",
     },
     "binding.usage": {
-        SupportedLocale.ZH_CN: "用法：/绑定 <6位绑定码>。绑定码请在 StaffDeck 网页端生成。",
-        SupportedLocale.EN_US: "Usage: /bind <6-digit code>. Generate the code in StaffDeck.",
+        SupportedLocale.ZH_CN: "用法：/绑定 <6位绑定码>。绑定码请在 FirmDeck 网页端生成。",
+        SupportedLocale.EN_US: "Usage: /bind <6-digit code>. Generate the code in FirmDeck.",
     },
     "binding.cooldown": {
         SupportedLocale.ZH_CN: "尝试次数过多，请 10 分钟后再试。",
         SupportedLocale.EN_US: "Too many attempts. Try again in 10 minutes.",
     },
     "binding.invalid": {
-        SupportedLocale.ZH_CN: "绑定码无效或已过期，请在 StaffDeck 网页端重新生成后再试。",
-        SupportedLocale.EN_US: "The linking code is invalid or expired. Generate a new code in StaffDeck and try again.",
+        SupportedLocale.ZH_CN: "绑定码无效或已过期，请在 FirmDeck 网页端重新生成后再试。",
+        SupportedLocale.EN_US: "The linking code is invalid or expired. Generate a new code in FirmDeck and try again.",
     },
     "binding.already_bound": {
-        SupportedLocale.ZH_CN: "该{channel_name}账号已绑定到 StaffDeck 账号「{account_name}」，请先发送 /解绑 解除后再绑定。",
-        SupportedLocale.EN_US: "This {channel_name} account is already linked to StaffDeck account {account_name}. Send /unbind before linking another account.",
+        SupportedLocale.ZH_CN: "该{channel_name}账号已绑定到 FirmDeck 账号「{account_name}」，请先发送 /解绑 解除后再绑定。",
+        SupportedLocale.EN_US: "This {channel_name} account is already linked to FirmDeck account {account_name}. Send /unbind before linking another account.",
     },
     "binding.success": {
-        SupportedLocale.ZH_CN: "绑定成功，{channel_name}对话将与你的 StaffDeck 账号「{account_name}」共享记忆与对话记录。",
-        SupportedLocale.EN_US: "Linked successfully. {channel_name} conversations will share memory and history with StaffDeck account {account_name}.",
+        SupportedLocale.ZH_CN: "绑定成功，{channel_name}对话将与你的 FirmDeck 账号「{account_name}」共享记忆与对话记录。",
+        SupportedLocale.EN_US: "Linked successfully. {channel_name} conversations will share memory and history with FirmDeck account {account_name}.",
     },
     "binding.not_bound": {
-        SupportedLocale.ZH_CN: "当前{channel_name}账号未绑定 StaffDeck 账号，无需解绑。",
-        SupportedLocale.EN_US: "This {channel_name} account is not linked to StaffDeck.",
+        SupportedLocale.ZH_CN: "当前{channel_name}账号未绑定 FirmDeck 账号，无需解绑。",
+        SupportedLocale.EN_US: "This {channel_name} account is not linked to FirmDeck.",
     },
     "binding.unbound": {
-        SupportedLocale.ZH_CN: "已解绑 StaffDeck 账号「{account_name}」，后续对话将使用独立的{channel_name}访客身份。",
-        SupportedLocale.EN_US: "Unlinked StaffDeck account {account_name}. Future conversations will use an independent {channel_name} guest identity.",
+        SupportedLocale.ZH_CN: "已解绑 FirmDeck 账号「{account_name}」，后续对话将使用独立的{channel_name}访客身份。",
+        SupportedLocale.EN_US: "Unlinked FirmDeck account {account_name}. Future conversations will use an independent {channel_name} guest identity.",
     },
     "handoff.notice_assigned": {
         SupportedLocale.ZH_CN: "【人工介入转接】已转接给真人员工 {assignee_name}",

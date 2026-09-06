@@ -306,7 +306,7 @@ def validate_dingtalk_credentials(
         "clientId": client_id,
         "clientSecret": client_secret,
         "subscriptions": [{"type": "CALLBACK", "topic": "/v1.0/im/bot/messages/get"}],
-        "ua": "staffdeck",
+        "ua": "firmdeck",
     }
     try:
         with factory() as client:
@@ -629,7 +629,7 @@ class DingTalkStreamManager:
             thread = threading.Thread(
                 target=self._run_binding,
                 args=(binding_id, stop),
-                name=f"staffdeck-dingtalk-{binding_id}",
+                name=f"firmdeck-dingtalk-{binding_id}",
                 daemon=True,
             )
             self._stops[binding_id] = stop
@@ -742,7 +742,7 @@ class DingTalkStreamManager:
             self._reconcile_stop.clear()
             self._reconcile_thread = threading.Thread(
                 target=self._reconcile_loop,
-                name="staffdeck-dingtalk-reconcile",
+                name="firmdeck-dingtalk-reconcile",
                 daemon=True,
             )
             self._reconcile_thread.start()

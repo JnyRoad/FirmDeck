@@ -1,4 +1,4 @@
-# StaffDeck 项目上下文
+# FirmDeck 项目上下文
 
 本文件是仓库级上下文事实源。它定义项目术语、国际化边界和迁移期规则；领域术语与架构
 决策分别由本文件和 `docs/adr/` 维护。若代码、测试或其他文档与这里的契约冲突，应在继续
@@ -6,7 +6,7 @@
 
 ## 项目定位
 
-StaffDeck 是面向企业业务流程的数字员工运营平台。它同时包含 React/TypeScript 前端、
+FirmDeck 是面向企业业务流程的数字员工运营平台。它同时包含 React/TypeScript 前端、
 FastAPI/Python 后端、Harness/Agent 运行链路、持久化会话与任务、渠道/嵌入式边界，以及
 桌面发布产物。国际化治理必须覆盖这些边界，而不只是可见的 DOM 文本。
 
@@ -20,13 +20,13 @@ FastAPI/Python 后端、Harness/Agent 运行链路、持久化会话与任务、
 - **系统面 / 租户面**：`SystemAdmin` 控制面负责租户生命周期管理，与租户数据面双向隔离；
   系统 token 与租户 token 双向拒绝。无租户归属的安装级资源显式声明 `owner_scope=system`，
   不允许「无主」数据或伪租户。
-- **产品消息（product message）**：由 StaffDeck 开发者拥有、需要随界面语言变化的标签、
+- **产品消息（product message）**：由 FirmDeck 开发者拥有、需要随界面语言变化的标签、
   状态、动作、校验、帮助、通知、错误、事件投影、无障碍文本、页面标题、下载前缀等。
 - **语义消息 ID（MessageId）**：稳定、可读、由英文代码标识符组成的 BCP 47 无关键，例如
   `billing.invoice.itemCount`。英文或中文文案不是 ID；占位符名称也不是 ID。
 - **MessageDescriptor**：`id` 加具名 `values` 的产品消息描述。用户输入、业务数据或 Agent
   原文只能作为 `values` 或独立 raw 内容传递，不能进入 `id`。
-- **界面语言（ui locale）**：控制 StaffDeck 产品 UI、错误和事件投影的语言区域。
+- **界面语言（ui locale）**：控制 FirmDeck 产品 UI、错误和事件投影的语言区域。
 - **Agent 回复语言（agent reply locale）**：控制新生成 Agent 自然语言的语言区域，与界面语言
   独立。它不翻译用户输入、历史消息、知识原文、工具结果或 Agent 已生成的业务内容。
 - **Raw 内容**：必须逐字保留的用户输入、员工/团队名称、知识库原文、文档内容、Agent 原始

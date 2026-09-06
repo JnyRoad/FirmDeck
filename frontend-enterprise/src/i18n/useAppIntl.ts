@@ -1,5 +1,5 @@
 /**
- * 定义 StaffDeck 组件层使用的稳定 i18n facade，避免业务组件直接绑定第三方 Provider 细节。
+ * 定义 FirmDeck 组件层使用的稳定 i18n facade，避免业务组件直接绑定第三方 Provider 细节。
  */
 
 import { useContext } from 'react';
@@ -16,7 +16,7 @@ export type AppI18n = {
 };
 
 /**
- * 返回当前 React 子树的 StaffDeck i18n facade；Provider 缺失时立即抛错以暴露集成缺陷。
+ * 返回当前 React 子树的 FirmDeck i18n facade；Provider 缺失时立即抛错以暴露集成缺陷。
  */
 export function useAppIntl(): AppI18n {
   const context = useContext(AppIntlContext);

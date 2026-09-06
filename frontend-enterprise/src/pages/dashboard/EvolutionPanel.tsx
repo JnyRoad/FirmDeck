@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { Button, notify } from '@/components/ui';
-import StaffdeckIcon from '@/components/StaffdeckIcon';
+import FirmdeckIcon from '@/components/FirmdeckIcon';
 import { createTenantClient } from '@/api/tenant-client';
 import { useTenantSession } from '@/contexts/TenantSessionContext';
 import { RawContent, RawIdentifier } from '@/i18n/RawContent';
@@ -255,7 +255,7 @@ export default function EvolutionPanel({ agentId }: { agentId: string }) {
         <div>
           <div className="flex items-center gap-2">
             <span className="flex size-8 items-center justify-center rounded-xl bg-[#ecfbf5] text-[#168760]">
-              <StaffdeckIcon name="spark" />
+              <FirmdeckIcon name="spark" />
             </span>
             <h3 className="m-0 text-[16px] font-semibold text-[#202226]">
               {t('dashboard.evolution.title')}

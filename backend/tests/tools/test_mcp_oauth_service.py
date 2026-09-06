@@ -34,8 +34,8 @@ def test_oauth_config_fingerprint_tracks_static_header_rotation() -> None:
         transport="streamable_http",
         url="https://mcp.example.test/mcp",
         auth_mode="oauth_personal",
-        oauth_client_id="staffdeck-public",
-        oauth_redirect_uri="https://staffdeck.example/oauth/callback",
+        oauth_client_id="firmdeck-public",
+        oauth_redirect_uri="https://firmdeck.example/oauth/callback",
         headers_json={"X-API-Key": "header-secret"},
     )
     original = mcp_oauth_config_fingerprint(server)
@@ -83,8 +83,8 @@ async def test_grant_storage_encrypts_tokens_and_returns_non_secret_status(tmp_p
         user_id="user_1",
     )
     client_info = OAuthClientInformationFull(
-        client_id="staffdeck-public",
-        redirect_uris=["https://staffdeck.example/oauth/callback"],
+        client_id="firmdeck-public",
+        redirect_uris=["https://firmdeck.example/oauth/callback"],
         token_endpoint_auth_method="none",
         issuer="https://issuer.example",
     )
@@ -118,7 +118,7 @@ async def test_grant_storage_encrypts_tokens_and_returns_non_secret_status(tmp_p
 
 @pytest.mark.asyncio
 async def test_grant_storage_isolates_users_on_the_same_server(tmp_path) -> None:
-    """Catch a grant lookup that omits the current StaffDeck user."""
+    """Catch a grant lookup that omits the current FirmDeck user."""
     from app.tools.mcp_oauth_service import MCPGrantTokenStorage
 
     engine = _engine(tmp_path)
@@ -417,8 +417,8 @@ async def test_live_owner_validation_fences_resource_changes(tmp_path, mutation:
             transport="streamable_http",
             url="https://mcp.example.test/mcp",
             auth_mode="oauth_personal",
-            oauth_client_id="staffdeck-public",
-            oauth_redirect_uri="https://staffdeck.example/oauth/callback",
+            oauth_client_id="firmdeck-public",
+            oauth_redirect_uri="https://firmdeck.example/oauth/callback",
         )
         db.add(server)
         db.commit()

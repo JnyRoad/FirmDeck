@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 
-import StaffdeckIcon from '@/components/StaffdeckIcon';
+import FirmdeckIcon from '@/components/FirmdeckIcon';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
@@ -144,7 +144,7 @@ export default function ScheduledDraftCard({
       <div className={CHAT_DRAFT_HEADER_CLASS}>
         <div className={CHAT_DRAFT_IDENTITY_CLASS}>
           <div className={CHAT_DRAFT_ICON_CLASS}>
-            <StaffdeckIcon name={created ? 'check' : 'clock'} size={18} />
+            <FirmdeckIcon name={created ? 'check' : 'clock'} size={18} />
           </div>
           <div className="grid min-w-0 gap-[2px]">
             <div className={CHAT_DRAFT_KICKER_CLASS}>
@@ -166,7 +166,7 @@ export default function ScheduledDraftCard({
         <div className={CHAT_DRAFT_TOP_ACTIONS_CLASS}>
           {created ? (
             <span className={CHAT_DRAFT_CREATED_BADGE_CLASS}>
-              <StaffdeckIcon name="check" size={13} />
+              <FirmdeckIcon name="check" size={13} />
               {t('chat.draft.createdBadge')}
             </span>
           ) : editing ? (
@@ -186,7 +186,7 @@ export default function ScheduledDraftCard({
           ) : (
             <>
               <Button size="sm" variant="ghost" onClick={() => setEditing(true)}>
-                <StaffdeckIcon name="edit" size={14} />
+                <FirmdeckIcon name="edit" size={14} />
                 {t('chat.draft.edit')}
               </Button>
               <Button size="sm" variant="ghost" onClick={onDismiss}>{t('chat.draft.dismiss')}</Button>

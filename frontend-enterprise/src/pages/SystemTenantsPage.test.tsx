@@ -220,7 +220,7 @@ const runtimeStatus: RuntimeStatus = {
   enabled: true,
   credential_configured: true,
   command: 'codex',
-  workspace_root: '/srv/staffdeck/codex-runtime',
+  workspace_root: '/srv/firmdeck/codex-runtime',
   timeout_seconds: 45,
 };
 
@@ -1168,7 +1168,7 @@ describe('SystemTenantsPage', () => {
     const runtime = await screen.findByRole('region', { name: '系统运行时状态' });
     expect(client.getCodexA2ARuntimeStatus).toHaveBeenCalledTimes(1);
     expect(within(runtime).getByText('codex')).toBeTruthy();
-    expect(within(runtime).getByText('/srv/staffdeck/codex-runtime')).toBeTruthy();
+    expect(within(runtime).getByText('/srv/firmdeck/codex-runtime')).toBeTruthy();
     expect(within(runtime).getByText('45')).toBeTruthy();
     expect(await screen.findByText('Alpha Lab')).toBeTruthy();
     expect(screen.queryByText('Codex runtime tenant')).toBeNull();

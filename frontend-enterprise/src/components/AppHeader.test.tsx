@@ -61,7 +61,7 @@ function renderSemanticHeader(locale: AppLocale) {
       AppIntlProvider,
       {
         initialLocale: locale,
-        children: createElement(AppHeader, { title: 'StaffDeck' }),
+        children: createElement(AppHeader, { title: 'FirmDeck' }),
       },
     ),
   );
@@ -142,6 +142,6 @@ describe('AppHeader', () => {
       expect(document.documentElement.lang).toBe('en-US');
       expect(screen.getByRole('button', { name: 'Switch language' })).toBeTruthy();
     });
-    expect(window.localStorage.getItem('staffdeck_locale')).toBe('en-US');
+    expect(window.localStorage.getItem('firmdeck_locale')).toBe('en-US');
   });
 });

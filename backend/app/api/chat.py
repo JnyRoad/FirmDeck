@@ -270,7 +270,7 @@ KNOWLEDGE_TRACE_PHASES = {
     "no_documents",
     "no_buckets",
 }
-SESSION_TITLE_PROMPT = """You are StaffDeck's session title editor.
+SESSION_TITLE_PROMPT = """You are FirmDeck's session title editor.
 
 Based on the first user request and the employee reply, generate a short, readable,
 specific session title.

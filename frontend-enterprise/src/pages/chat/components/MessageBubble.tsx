@@ -2,7 +2,7 @@ import { Check, Copy } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 
 import EmployeeAvatar from '@/components/EmployeeAvatar';
-import StaffdeckIcon from '@/components/StaffdeckIcon';
+import FirmdeckIcon from '@/components/FirmdeckIcon';
 import IconThumbUp from '@/assets/icons/thumb-up.svg?react';
 import IconThumbDown from '@/assets/icons/thumb-down.svg?react';
 import { notify } from '@/components/ui/app-toast';
@@ -213,7 +213,7 @@ export default function MessageBubble({ chat, item, render }: MessageBubbleProps
               title={t('chat.message.deleteQueued')}
               onClick={() => removeQueuedTurn(item.turnId || '')}
             >
-              <StaffdeckIcon name="trash" size={14} />
+              <FirmdeckIcon name="trash" size={14} />
             </button>
           )}
           {statusOnly ? (
@@ -256,7 +256,7 @@ export default function MessageBubble({ chat, item, render }: MessageBubbleProps
               >
                 {scheduledTaskPrompt && (
                   <span className={CHAT_MESSAGE_MODE_CHIP_CLASS}>
-                    <StaffdeckIcon name="clock" size={13} />
+                    <FirmdeckIcon name="clock" size={13} />
                     {t('chat.message.scheduleMode')}
                   </span>
                 )}
@@ -302,7 +302,7 @@ export default function MessageBubble({ chat, item, render }: MessageBubbleProps
                     <img className={CHAT_ATTACHMENT_IMG_CLASS} src={attachment.data_url} alt={attachment.filename} />
                   ) : (
                     <span className={CHAT_ATTACHMENT_FILE_ICON_CLASS}>
-                      <StaffdeckIcon name={attachment.kind === 'pdf' ? 'file' : 'folder'} size={18} />
+                      <FirmdeckIcon name={attachment.kind === 'pdf' ? 'file' : 'folder'} size={18} />
                     </span>
                   )}
                   <span className={CHAT_ATTACHMENT_COPY_CLASS}>
@@ -385,7 +385,7 @@ export default function MessageBubble({ chat, item, render }: MessageBubbleProps
       {queuedMessage && (
         <div className={CHAT_QUEUED_STATUS_ROW_CLASS}>
           <span className={CHAT_QUEUED_STATUS_CLASS} role="status">
-            <StaffdeckIcon name="clock" size={12} />
+            <FirmdeckIcon name="clock" size={12} />
             {t('chat.message.queueStatus')}
           </span>
         </div>

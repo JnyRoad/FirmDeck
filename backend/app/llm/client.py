@@ -105,7 +105,7 @@ _GEMINI_MAX_LIST_PAGES = 50
 # 2.48.0"). Send an honest, identifiable UA instead of spoofing a browser: a
 # browser UA that doesn't match the connection's TLS/HTTP2 fingerprint risks
 # being flagged as suspicious by stricter WAFs.
-_OUTBOUND_USER_AGENT = "StaffDeck"
+_OUTBOUND_USER_AGENT = "FirmDeck"
 TURN_STAGE_MESSAGE_MARKER = "_agent_turn_message"
 class _CurrentStageText(str):
     pass

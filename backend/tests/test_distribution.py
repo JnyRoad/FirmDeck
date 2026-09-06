@@ -1,4 +1,4 @@
-"""Verify the trusted repository identity embedded in StaffDeck packages."""
+"""Verify the trusted repository identity embedded in FirmDeck packages."""
 
 from __future__ import annotations
 
@@ -33,7 +33,7 @@ def _git(repository: Path, *arguments: str) -> None:
 
 @pytest.mark.parametrize(
     "repository",
-    ["OpenBMB/StaffDeck", "JnyRoad/StaffDeck", "owner-1/repo_name", "a/repo.with-dots"],
+    ["OpenBMB/FirmDeck", "JnyRoad/FirmDeck", "owner-1/repo_name", "a/repo.with-dots"],
 )
 def test_validate_release_repository_accepts_canonical_identity(repository: str) -> None:
     """Catch rejection or rewriting of valid GitHub owner/repository identities."""
@@ -47,20 +47,20 @@ def test_validate_release_repository_accepts_canonical_identity(repository: str)
     [
         None,
         "",
-        " OpenBMB/StaffDeck",
-        "OpenBMB/StaffDeck ",
+        " OpenBMB/FirmDeck",
+        "OpenBMB/FirmDeck ",
         "OpenBMB",
-        "OpenBMB/StaffDeck/extra",
-        "-OpenBMB/StaffDeck",
-        "OpenBMB-/StaffDeck",
+        "OpenBMB/FirmDeck/extra",
+        "-OpenBMB/FirmDeck",
+        "OpenBMB-/FirmDeck",
         "OpenBMB/.",
         "OpenBMB/..",
-        "OpenBMB/StaffDeck.git",
+        "OpenBMB/FirmDeck.git",
         "OpenBMB/staff deck",
-        "https://github.com/OpenBMB/StaffDeck",
-        "git@github.com:OpenBMB/StaffDeck.git",
-        "OpenBMB/StaffDeck?tab=releases",
-        "OpenBMB/StaffDeck#latest",
+        "https://github.com/OpenBMB/FirmDeck",
+        "git@github.com:OpenBMB/FirmDeck.git",
+        "OpenBMB/FirmDeck?tab=releases",
+        "OpenBMB/FirmDeck#latest",
     ],
 )
 def test_validate_release_repository_rejects_noncanonical_identity(
@@ -78,21 +78,21 @@ def test_frozen_release_repository_uses_bundled_metadata_and_ignores_environment
 ) -> None:
     """Catch runtime environment overrides changing an installed package's trusted distributor."""
     distribution = _distribution_module()
-    metadata = tmp_path / "staffdeck-distribution.json"
+    metadata = tmp_path / "firmdeck-distribution.json"
     metadata.write_text(
-        json.dumps({"release_repository": "JnyRoad/StaffDeck"}),
+        json.dumps({"release_repository": "JnyRoad/FirmDeck"}),
         encoding="utf-8",
     )
     monkeypatch.setattr(distribution.sys, "frozen", True, raising=False)
     monkeypatch.setattr(distribution.sys, "_MEIPASS", str(tmp_path), raising=False)
-    monkeypatch.setenv("STAFFDECK_RELEASE_REPOSITORY", "SomeoneElse/StaffDeck")
+    monkeypatch.setenv("FIRMDECK_RELEASE_REPOSITORY", "SomeoneElse/FirmDeck")
 
-    assert distribution.release_repository() == "JnyRoad/StaffDeck"
+    assert distribution.release_repository() == "JnyRoad/FirmDeck"
 
 
 @pytest.mark.parametrize(
     "content",
-    ["", "not-json", "{}", '{"release_repository":"https://github.com/OpenBMB/StaffDeck"}'],
+    ["", "not-json", "{}", '{"release_repository":"https://github.com/OpenBMB/FirmDeck"}'],
 )
 def test_frozen_release_repository_fails_closed_for_invalid_metadata(
     monkeypatch: pytest.MonkeyPatch,
@@ -101,10 +101,10 @@ def test_frozen_release_repository_fails_closed_for_invalid_metadata(
 ) -> None:
     """Catch malformed package metadata silently falling back to an unrelated repository."""
     distribution = _distribution_module()
-    (tmp_path / "staffdeck-distribution.json").write_text(content, encoding="utf-8")
+    (tmp_path / "firmdeck-distribution.json").write_text(content, encoding="utf-8")
     monkeypatch.setattr(distribution.sys, "frozen", True, raising=False)
     monkeypatch.setattr(distribution.sys, "_MEIPASS", str(tmp_path), raising=False)
-    monkeypatch.setenv("STAFFDECK_RELEASE_REPOSITORY", "SomeoneElse/StaffDeck")
+    monkeypatch.setenv("FIRMDECK_RELEASE_REPOSITORY", "SomeoneElse/FirmDeck")
 
     assert distribution.release_repository() is None
 
@@ -117,7 +117,7 @@ def test_frozen_release_repository_fails_closed_when_metadata_is_missing(
     distribution = _distribution_module()
     monkeypatch.setattr(distribution.sys, "frozen", True, raising=False)
     monkeypatch.setattr(distribution.sys, "_MEIPASS", str(tmp_path), raising=False)
-    monkeypatch.setenv("STAFFDECK_RELEASE_REPOSITORY", "SomeoneElse/StaffDeck")
+    monkeypatch.setenv("FIRMDECK_RELEASE_REPOSITORY", "SomeoneElse/FirmDeck")
 
     assert distribution.release_repository() is None
 
@@ -125,16 +125,16 @@ def test_frozen_release_repository_fails_closed_when_metadata_is_missing(
 def test_write_distribution_metadata_emits_exact_valid_payload(tmp_path: Path) -> None:
     """Catch packaging metadata that is invalid, incomplete, or written to the wrong path."""
     distribution = _distribution_module()
-    destination = tmp_path / "build" / "staffdeck-distribution.json"
+    destination = tmp_path / "build" / "firmdeck-distribution.json"
 
     written_path = distribution.write_distribution_metadata(
         destination,
-        "JnyRoad/StaffDeck",
+        "JnyRoad/FirmDeck",
     )
 
     assert written_path == destination
     assert json.loads(destination.read_text(encoding="utf-8")) == {
-        "release_repository": "JnyRoad/StaffDeck"
+        "release_repository": "JnyRoad/FirmDeck"
     }
 
 
@@ -144,10 +144,10 @@ def test_build_repository_prefers_explicit_identity_over_github_actions(
 ) -> None:
     """Catch an explicit local build identity being ignored in favor of ambient CI state."""
     distribution = _distribution_module()
-    monkeypatch.setenv("STAFFDECK_RELEASE_REPOSITORY", "JnyRoad/StaffDeck")
-    monkeypatch.setenv("GITHUB_REPOSITORY", "OpenBMB/StaffDeck")
+    monkeypatch.setenv("FIRMDECK_RELEASE_REPOSITORY", "JnyRoad/FirmDeck")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "OpenBMB/FirmDeck")
 
-    assert distribution.resolve_build_release_repository(tmp_path) == "JnyRoad/StaffDeck"
+    assert distribution.resolve_build_release_repository(tmp_path) == "JnyRoad/FirmDeck"
 
 
 def test_build_repository_uses_github_actions_repository(
@@ -156,18 +156,18 @@ def test_build_repository_uses_github_actions_repository(
 ) -> None:
     """Catch release workflows failing to bind packages to the repository running the build."""
     distribution = _distribution_module()
-    monkeypatch.delenv("STAFFDECK_RELEASE_REPOSITORY", raising=False)
-    monkeypatch.setenv("GITHUB_REPOSITORY", "JnyRoad/StaffDeck")
+    monkeypatch.delenv("FIRMDECK_RELEASE_REPOSITORY", raising=False)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "JnyRoad/FirmDeck")
 
-    assert distribution.resolve_build_release_repository(tmp_path) == "JnyRoad/StaffDeck"
+    assert distribution.resolve_build_release_repository(tmp_path) == "JnyRoad/FirmDeck"
 
 
 @pytest.mark.parametrize(
     "remote_url",
     [
-        "https://github.com/JnyRoad/StaffDeck.git",
-        "git@github.com:JnyRoad/StaffDeck.git",
-        "ssh://git@github.com/JnyRoad/StaffDeck.git",
+        "https://github.com/JnyRoad/FirmDeck.git",
+        "git@github.com:JnyRoad/FirmDeck.git",
+        "ssh://git@github.com/JnyRoad/FirmDeck.git",
     ],
 )
 def test_build_repository_derives_valid_github_origin(
@@ -179,13 +179,13 @@ def test_build_repository_derives_valid_github_origin(
     distribution = _distribution_module()
     _git(tmp_path, "init", "-q")
     _git(tmp_path, "remote", "add", "origin", remote_url)
-    monkeypatch.delenv("STAFFDECK_RELEASE_REPOSITORY", raising=False)
+    monkeypatch.delenv("FIRMDECK_RELEASE_REPOSITORY", raising=False)
     monkeypatch.delenv("GITHUB_REPOSITORY", raising=False)
 
-    assert distribution.resolve_build_release_repository(tmp_path) == "JnyRoad/StaffDeck"
+    assert distribution.resolve_build_release_repository(tmp_path) == "JnyRoad/FirmDeck"
 
 
-@pytest.mark.parametrize("remote_url", [None, "https://gitlab.com/JnyRoad/StaffDeck.git"])
+@pytest.mark.parametrize("remote_url", [None, "https://gitlab.com/JnyRoad/FirmDeck.git"])
 def test_build_repository_uses_safe_default_without_github_origin(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -196,10 +196,10 @@ def test_build_repository_uses_safe_default_without_github_origin(
     _git(tmp_path, "init", "-q")
     if remote_url is not None:
         _git(tmp_path, "remote", "add", "origin", remote_url)
-    monkeypatch.delenv("STAFFDECK_RELEASE_REPOSITORY", raising=False)
+    monkeypatch.delenv("FIRMDECK_RELEASE_REPOSITORY", raising=False)
     monkeypatch.delenv("GITHUB_REPOSITORY", raising=False)
 
-    assert distribution.resolve_build_release_repository(tmp_path) == "OpenBMB/StaffDeck"
+    assert distribution.resolve_build_release_repository(tmp_path) == "OpenBMB/FirmDeck"
 
 
 def test_build_repository_rejects_invalid_explicit_identity(
@@ -209,12 +209,12 @@ def test_build_repository_rejects_invalid_explicit_identity(
     """Catch malformed explicit build input silently falling through to another distributor."""
     distribution = _distribution_module()
     monkeypatch.setenv(
-        "STAFFDECK_RELEASE_REPOSITORY",
-        "https://github.com/JnyRoad/StaffDeck",
+        "FIRMDECK_RELEASE_REPOSITORY",
+        "https://github.com/JnyRoad/FirmDeck",
     )
-    monkeypatch.setenv("GITHUB_REPOSITORY", "OpenBMB/StaffDeck")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "OpenBMB/FirmDeck")
 
-    with pytest.raises(ValueError, match="STAFFDECK_RELEASE_REPOSITORY"):
+    with pytest.raises(ValueError, match="FIRMDECK_RELEASE_REPOSITORY"):
         distribution.resolve_build_release_repository(tmp_path)
 
 
@@ -224,9 +224,9 @@ def test_source_release_repository_uses_valid_development_override(
     """Catch non-frozen test and development processes ignoring an explicit valid identity."""
     distribution = _distribution_module()
     monkeypatch.setattr(distribution.sys, "frozen", False, raising=False)
-    monkeypatch.setenv("STAFFDECK_RELEASE_REPOSITORY", "JnyRoad/StaffDeck")
+    monkeypatch.setenv("FIRMDECK_RELEASE_REPOSITORY", "JnyRoad/FirmDeck")
 
-    assert distribution.release_repository() == "JnyRoad/StaffDeck"
+    assert distribution.release_repository() == "JnyRoad/FirmDeck"
 
 
 def test_source_release_repository_defaults_to_upstream(
@@ -235,9 +235,9 @@ def test_source_release_repository_defaults_to_upstream(
     """Catch source update opt-in losing its existing upstream repository default."""
     distribution = _distribution_module()
     monkeypatch.setattr(distribution.sys, "frozen", False, raising=False)
-    monkeypatch.delenv("STAFFDECK_RELEASE_REPOSITORY", raising=False)
+    monkeypatch.delenv("FIRMDECK_RELEASE_REPOSITORY", raising=False)
 
-    assert distribution.release_repository() == "OpenBMB/StaffDeck"
+    assert distribution.release_repository() == "OpenBMB/FirmDeck"
 
 
 def test_source_release_repository_rejects_invalid_development_override(
@@ -246,6 +246,6 @@ def test_source_release_repository_rejects_invalid_development_override(
     """Catch malformed source overrides silently falling back to an unrelated repository."""
     distribution = _distribution_module()
     monkeypatch.setattr(distribution.sys, "frozen", False, raising=False)
-    monkeypatch.setenv("STAFFDECK_RELEASE_REPOSITORY", "OpenBMB/StaffDeck/extra")
+    monkeypatch.setenv("FIRMDECK_RELEASE_REPOSITORY", "OpenBMB/FirmDeck/extra")
 
     assert distribution.release_repository() is None

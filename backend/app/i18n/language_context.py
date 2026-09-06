@@ -11,7 +11,7 @@ from app.contracts.projections import _record_compatibility_usage
 
 
 class SupportedLocale(StrEnum):
-    """Locales that may persist in StaffDeck production records."""
+    """Locales that may persist in FirmDeck production records."""
 
     ZH_CN = "zh-CN"
     EN_US = "en-US"

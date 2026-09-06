@@ -16,7 +16,7 @@ from app import paths
 from app.main import app
 
 
-logger = logging.getLogger("staffdeck.static")
+logger = logging.getLogger("firmdeck.static")
 ROOT_DIR = paths.resource_dir()
 # frozen: dist 被收集到 _MEIPASS/frontend-enterprise/dist
 # dev:    resource_dir()==backend/，需回到仓库根找 frontend-enterprise
@@ -31,22 +31,22 @@ SPA_INDEX_HEADERS = {
     "Expires": "0",
 }
 SITE_CHAT_UPSTREAM = os.getenv(
-    "STAFFDECK_SITE_CHAT_UPSTREAM",
+    "FIRMDECK_SITE_CHAT_UPSTREAM",
     "http://127.0.0.1:10187",
 ).rstrip("/")
-PILOTDECK_UPSTREAM = os.getenv("STAFFDECK_PILOTDECK_UPSTREAM", "").rstrip("/")
-PILOTDECK_PUBLIC_URL = os.getenv("STAFFDECK_PILOTDECK_PUBLIC_URL", "").rstrip("/")
+PILOTDECK_UPSTREAM = os.getenv("FIRMDECK_PILOTDECK_UPSTREAM", "").rstrip("/")
+PILOTDECK_PUBLIC_URL = os.getenv("FIRMDECK_PILOTDECK_PUBLIC_URL", "").rstrip("/")
 PILOTDECK_PUBLIC_HOSTS = {
     item.strip().lower()
-    for item in os.getenv("STAFFDECK_PILOTDECK_PUBLIC_HOSTS", "").split(",")
+    for item in os.getenv("FIRMDECK_PILOTDECK_PUBLIC_HOSTS", "").split(",")
     if item.strip()
 }
-LLM_RELAY_UPSTREAM = os.getenv("STAFFDECK_LLM_RELAY_UPSTREAM", "").rstrip("/")
+LLM_RELAY_UPSTREAM = os.getenv("FIRMDECK_LLM_RELAY_UPSTREAM", "").rstrip("/")
 ANTHROPIC_RELAY_UPSTREAM = os.getenv(
-    "STAFFDECK_ANTHROPIC_RELAY_UPSTREAM", ""
+    "FIRMDECK_ANTHROPIC_RELAY_UPSTREAM", ""
 ).rstrip("/")
 LLM_RELAY_MAX_BODY_BYTES = int(
-    os.getenv("STAFFDECK_LLM_RELAY_MAX_BODY_BYTES", str(32 * 1024 * 1024))
+    os.getenv("FIRMDECK_LLM_RELAY_MAX_BODY_BYTES", str(32 * 1024 * 1024))
 )
 LLM_RELAY_REQUEST_HEADERS = {
     "accept",
@@ -478,7 +478,7 @@ def pilotdeck_redirect() -> RedirectResponse:
 
 @app.get("/favicon.ico", include_in_schema=False)
 @app.get("/favicon.png", include_in_schema=False)
-@app.get("/staffdeck-icon.png", include_in_schema=False)
+@app.get("/firmdeck-icon.png", include_in_schema=False)
 def brand_icon(request: Request) -> FileResponse:
     # 品牌图标：从前端 dist 根目录 serve（favicon.ico/png、apple-touch-icon）
     name = request.url.path.lstrip("/")

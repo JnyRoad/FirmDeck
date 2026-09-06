@@ -22,7 +22,7 @@ const ACTIONS = [{ key: 'export', label: 'Export report' }];
 
 /** Build a product title through a local helper so the checker must preserve its source evidence. */
 function buildPageTitle() {
-  return `${UI_COPY.pageTitle} - StaffDeck`;
+  return `${UI_COPY.pageTitle} - FirmDeck`;
 }
 
 /** Resolve a product status from a local label map without translating an external status value. */

@@ -50,24 +50,24 @@
         },
         "completed_at": "2026-09-01T14:21:55Z",
         "conclusion": "neutral",
-        "details_url": "https://github.com/JnyRoad/StaffDeck/runs/99893262054",
+        "details_url": "https://github.com/JnyRoad/FirmDeck/runs/99893262054",
         "external_id": "",
         "head_sha": "45926e25c58f8bd11dd7c8a7b3462a076638f63c",
-        "html_url": "https://github.com/JnyRoad/StaffDeck/runs/99893262054",
+        "html_url": "https://github.com/JnyRoad/FirmDeck/runs/99893262054",
         "id": 99893262054,
         "name": "CodeQL",
         "node_id": "CR_kwDOUHrDbM8AAAAXQho25g",
         "output": {
           "annotations_count": 0,
-          "annotations_url": "https://api.github.com/repos/JnyRoad/StaffDeck/check-runs/99893262054/annotations",
-          "summary": "**Warning**: Code scanning cannot determine the alerts introduced by this pull request, because 2 configurations present on `refs/heads/main` were not found:\n\n### Actions workflow (`codeql.yml`)\n\n* :question:&nbsp;&nbsp;`/language:javascript-typescript`\n* :question:&nbsp;&nbsp;`/language:python`\n\n\n[View all branch alerts](/JnyRoad/StaffDeck/security/code-scanning?query=pr%3A23+tool%3ACodeQL+is%3Aopen).",
+          "annotations_url": "https://api.github.com/repos/JnyRoad/FirmDeck/check-runs/99893262054/annotations",
+          "summary": "**Warning**: Code scanning cannot determine the alerts introduced by this pull request, because 2 configurations present on `refs/heads/main` were not found:\n\n### Actions workflow (`codeql.yml`)\n\n* :question:&nbsp;&nbsp;`/language:javascript-typescript`\n* :question:&nbsp;&nbsp;`/language:python`\n\n\n[View all branch alerts](/JnyRoad/FirmDeck/security/code-scanning?query=pr%3A23+tool%3ACodeQL+is%3Aopen).",
           "text": null,
           "title": "2 configurations not found"
         },
         "pull_requests": [],
         "started_at": "2026-09-01T14:21:51Z",
         "status": "completed",
-        "url": "https://api.github.com/repos/JnyRoad/StaffDeck/check-runs/99893262054"
+        "url": "https://api.github.com/repos/JnyRoad/FirmDeck/check-runs/99893262054"
       },
       {
         "app": {
@@ -165,16 +165,16 @@
         },
         "completed_at": "2026-09-01T14:21:57Z",
         "conclusion": "success",
-        "details_url": "https://github.com/JnyRoad/StaffDeck/actions/runs/33518963216/job/99893049908",
+        "details_url": "https://github.com/JnyRoad/FirmDeck/actions/runs/33518963216/job/99893049908",
         "external_id": "e28ba81b-4475-5e56-b656-74937d4b5d9c",
         "head_sha": "45926e25c58f8bd11dd7c8a7b3462a076638f63c",
-        "html_url": "https://github.com/JnyRoad/StaffDeck/actions/runs/33518963216/job/99893049908",
+        "html_url": "https://github.com/JnyRoad/FirmDeck/actions/runs/33518963216/job/99893049908",
         "id": 99893049908,
         "name": "Static i18n governance",
         "node_id": "CR_kwDOUHrDbM8AAAAXQhb6NA",
         "output": {
           "annotations_count": 0,
-          "annotations_url": "https://api.github.com/repos/JnyRoad/StaffDeck/check-runs/99893049908/annotations",
+          "annotations_url": "https://api.github.com/repos/JnyRoad/FirmDeck/check-runs/99893049908/annotations",
           "summary": null,
           "text": null,
           "title": null
@@ -182,7 +182,7 @@
         "pull_requests": [],
         "started_at": "2026-09-01T14:21:18Z",
         "status": "completed",
-        "url": "https://api.github.com/repos/JnyRoad/StaffDeck/check-runs/99893049908"
+        "url": "https://api.github.com/repos/JnyRoad/FirmDeck/check-runs/99893049908"
       },
       {
         "app": {
@@ -280,16 +280,16 @@
         },
         "completed_at": "2026-09-01T14:30:01Z",
         "conclusion": "success",
-        "details_url": "https://github.com/JnyRoad/StaffDeck/actions/runs/33518963216/job/99893049833",
+        "details_url": "https://github.com/JnyRoad/FirmDeck/actions/runs/33518963216/job/99893049833",
         "external_id": "ac942f4e-ece2-53da-87b2-ec116ad84609",
         "head_sha": "45926e25c58f8bd11dd7c8a7b3462a076638f63c",
-        "html_url": "https://github.com/JnyRoad/StaffDeck/actions/runs/33518963216/job/99893049833",
+        "html_url": "https://github.com/JnyRoad/FirmDeck/actions/runs/33518963216/job/99893049833",
         "id": 99893049833,
         "name": "Backend i18n governance",
         "node_id": "CR_kwDOUHrDbM8AAAAXQhb56Q",
         "output": {
           "annotations_count": 0,
-          "annotations_url": "https://api.github.com/repos/JnyRoad/StaffDeck/check-runs/99893049833/annotations",
+          "annotations_url": "https://api.github.com/repos/JnyRoad/FirmDeck/check-runs/99893049833/annotations",
           "summary": null,
           "text": null,
           "title": null
@@ -297,7 +297,7 @@
         "pull_requests": [],
         "started_at": "2026-09-01T14:21:17Z",
         "status": "completed",
-        "url": "https://api.github.com/repos/JnyRoad/StaffDeck/check-runs/99893049833"
+        "url": "https://api.github.com/repos/JnyRoad/FirmDeck/check-runs/99893049833"
       },
       {
         "app": {
@@ -395,16 +395,16 @@
         },
         "completed_at": "2026-09-01T14:22:19Z",
         "conclusion": "success",
-        "details_url": "https://github.com/JnyRoad/StaffDeck/actions/runs/33518963216/job/99893049664",
+        "details_url": "https://github.com/JnyRoad/FirmDeck/actions/runs/33518963216/job/99893049664",
         "external_id": "b732b112-e842-562a-9f8e-af61be655d4b",
         "head_sha": "45926e25c58f8bd11dd7c8a7b3462a076638f63c",
-        "html_url": "https://github.com/JnyRoad/StaffDeck/actions/runs/33518963216/job/99893049664",
+        "html_url": "https://github.com/JnyRoad/FirmDeck/actions/runs/33518963216/job/99893049664",
         "id": 99893049664,
         "name": "Browser i18n matrix",
         "node_id": "CR_kwDOUHrDbM8AAAAXQhb5QA",
         "output": {
           "annotations_count": 0,
-          "annotations_url": "https://api.github.com/repos/JnyRoad/StaffDeck/check-runs/99893049664/annotations",
+          "annotations_url": "https://api.github.com/repos/JnyRoad/FirmDeck/check-runs/99893049664/annotations",
           "summary": null,
           "text": null,
           "title": null
@@ -412,7 +412,7 @@
         "pull_requests": [],
         "started_at": "2026-09-01T14:21:18Z",
         "status": "completed",
-        "url": "https://api.github.com/repos/JnyRoad/StaffDeck/check-runs/99893049664"
+        "url": "https://api.github.com/repos/JnyRoad/FirmDeck/check-runs/99893049664"
       },
       {
         "app": {
@@ -510,16 +510,16 @@
         },
         "completed_at": "2026-09-01T14:22:20Z",
         "conclusion": "success",
-        "details_url": "https://github.com/JnyRoad/StaffDeck/actions/runs/33518963151/job/99893049569",
+        "details_url": "https://github.com/JnyRoad/FirmDeck/actions/runs/33518963151/job/99893049569",
         "external_id": "6f92f1ff-2b23-559f-b313-ce8252094cf7",
         "head_sha": "45926e25c58f8bd11dd7c8a7b3462a076638f63c",
-        "html_url": "https://github.com/JnyRoad/StaffDeck/actions/runs/33518963151/job/99893049569",
+        "html_url": "https://github.com/JnyRoad/FirmDeck/actions/runs/33518963151/job/99893049569",
         "id": 99893049569,
         "name": "Analyze (python)",
         "node_id": "CR_kwDOUHrDbM8AAAAXQhb44Q",
         "output": {
           "annotations_count": 0,
-          "annotations_url": "https://api.github.com/repos/JnyRoad/StaffDeck/check-runs/99893049569/annotations",
+          "annotations_url": "https://api.github.com/repos/JnyRoad/FirmDeck/check-runs/99893049569/annotations",
           "summary": null,
           "text": null,
           "title": null
@@ -527,7 +527,7 @@
         "pull_requests": [],
         "started_at": "2026-09-01T14:21:17Z",
         "status": "completed",
-        "url": "https://api.github.com/repos/JnyRoad/StaffDeck/check-runs/99893049569"
+        "url": "https://api.github.com/repos/JnyRoad/FirmDeck/check-runs/99893049569"
       },
       {
         "app": {
@@ -625,16 +625,16 @@
         },
         "completed_at": "2026-09-01T14:22:02Z",
         "conclusion": "success",
-        "details_url": "https://github.com/JnyRoad/StaffDeck/actions/runs/33518963151/job/99893049541",
+        "details_url": "https://github.com/JnyRoad/FirmDeck/actions/runs/33518963151/job/99893049541",
         "external_id": "7a919794-82a6-5224-8c28-9fbf561321e7",
         "head_sha": "45926e25c58f8bd11dd7c8a7b3462a076638f63c",
-        "html_url": "https://github.com/JnyRoad/StaffDeck/actions/runs/33518963151/job/99893049541",
+        "html_url": "https://github.com/JnyRoad/FirmDeck/actions/runs/33518963151/job/99893049541",
         "id": 99893049541,
         "name": "Analyze (actions)",
         "node_id": "CR_kwDOUHrDbM8AAAAXQhb4xQ",
         "output": {
           "annotations_count": 0,
-          "annotations_url": "https://api.github.com/repos/JnyRoad/StaffDeck/check-runs/99893049541/annotations",
+          "annotations_url": "https://api.github.com/repos/JnyRoad/FirmDeck/check-runs/99893049541/annotations",
           "summary": null,
           "text": null,
           "title": null
@@ -642,7 +642,7 @@
         "pull_requests": [],
         "started_at": "2026-09-01T14:21:18Z",
         "status": "completed",
-        "url": "https://api.github.com/repos/JnyRoad/StaffDeck/check-runs/99893049541"
+        "url": "https://api.github.com/repos/JnyRoad/FirmDeck/check-runs/99893049541"
       },
       {
         "app": {
@@ -740,16 +740,16 @@
         },
         "completed_at": "2026-09-01T14:23:04Z",
         "conclusion": "success",
-        "details_url": "https://github.com/JnyRoad/StaffDeck/actions/runs/33518963216/job/99893049405",
+        "details_url": "https://github.com/JnyRoad/FirmDeck/actions/runs/33518963216/job/99893049405",
         "external_id": "1efe1a18-7ea8-5ec9-a268-e4a16c23205d",
         "head_sha": "45926e25c58f8bd11dd7c8a7b3462a076638f63c",
-        "html_url": "https://github.com/JnyRoad/StaffDeck/actions/runs/33518963216/job/99893049405",
+        "html_url": "https://github.com/JnyRoad/FirmDeck/actions/runs/33518963216/job/99893049405",
         "id": 99893049405,
         "name": "Frontend tests and build",
         "node_id": "CR_kwDOUHrDbM8AAAAXQhb4PQ",
         "output": {
           "annotations_count": 0,
-          "annotations_url": "https://api.github.com/repos/JnyRoad/StaffDeck/check-runs/99893049405/annotations",
+          "annotations_url": "https://api.github.com/repos/JnyRoad/FirmDeck/check-runs/99893049405/annotations",
           "summary": null,
           "text": null,
           "title": null
@@ -757,7 +757,7 @@
         "pull_requests": [],
         "started_at": "2026-09-01T14:21:18Z",
         "status": "completed",
-        "url": "https://api.github.com/repos/JnyRoad/StaffDeck/check-runs/99893049405"
+        "url": "https://api.github.com/repos/JnyRoad/FirmDeck/check-runs/99893049405"
       },
       {
         "app": {
@@ -855,16 +855,16 @@
         },
         "completed_at": "2026-09-01T14:22:27Z",
         "conclusion": "success",
-        "details_url": "https://github.com/JnyRoad/StaffDeck/actions/runs/33518963151/job/99893049219",
+        "details_url": "https://github.com/JnyRoad/FirmDeck/actions/runs/33518963151/job/99893049219",
         "external_id": "459ea622-4ece-5160-8314-bf1736d1bcdd",
         "head_sha": "45926e25c58f8bd11dd7c8a7b3462a076638f63c",
-        "html_url": "https://github.com/JnyRoad/StaffDeck/actions/runs/33518963151/job/99893049219",
+        "html_url": "https://github.com/JnyRoad/FirmDeck/actions/runs/33518963151/job/99893049219",
         "id": 99893049219,
         "name": "Analyze (javascript-typescript)",
         "node_id": "CR_kwDOUHrDbM8AAAAXQhb3gw",
         "output": {
           "annotations_count": 0,
-          "annotations_url": "https://api.github.com/repos/JnyRoad/StaffDeck/check-runs/99893049219/annotations",
+          "annotations_url": "https://api.github.com/repos/JnyRoad/FirmDeck/check-runs/99893049219/annotations",
           "summary": null,
           "text": null,
           "title": null
@@ -872,7 +872,7 @@
         "pull_requests": [],
         "started_at": "2026-09-01T14:21:18Z",
         "status": "completed",
-        "url": "https://api.github.com/repos/JnyRoad/StaffDeck/check-runs/99893049219"
+        "url": "https://api.github.com/repos/JnyRoad/FirmDeck/check-runs/99893049219"
       }
     ],
     "total_count": 8
@@ -900,7 +900,7 @@
         "url": "https://api.github.com/users/JnyRoad",
         "user_view_type": "public"
       },
-      "comments_url": "https://api.github.com/repos/JnyRoad/StaffDeck/commits/45926e25c58f8bd11dd7c8a7b3462a076638f63c/comments",
+      "comments_url": "https://api.github.com/repos/JnyRoad/FirmDeck/commits/45926e25c58f8bd11dd7c8a7b3462a076638f63c/comments",
       "commit": {
         "author": {
           "date": "2026-09-01T14:20:54Z",
@@ -916,9 +916,9 @@
         "message": "docs(tenancy): add multi-tenant development rules\n\nTenancy previously existed only in ADR-004 and never entered the agent\nrule loading path, so feature work could silently fall back to\nsingle-tenant assumptions.\n\n- Add docs/agents/tenancy.md covering data ownership, authoritative\n  tenant principal, lifecycle admission before side effects,\n  system/tenant plane isolation, and cross-tenant test gates.\n- Route backend and frontend development tasks to tenancy.md in\n  AGENTS.md so the rules load on every feature task.\n- Add tenant, tenant principal, and system/tenant plane terms to\n  CONTEXT.md and list tenancy.md plus ADR-004 as authoritative entries.",
         "tree": {
           "sha": "4b0c223c96ddb41ba67167c09258d9d02907238a",
-          "url": "https://api.github.com/repos/JnyRoad/StaffDeck/git/trees/4b0c223c96ddb41ba67167c09258d9d02907238a"
+          "url": "https://api.github.com/repos/JnyRoad/FirmDeck/git/trees/4b0c223c96ddb41ba67167c09258d9d02907238a"
         },
-        "url": "https://api.github.com/repos/JnyRoad/StaffDeck/git/commits/45926e25c58f8bd11dd7c8a7b3462a076638f63c",
+        "url": "https://api.github.com/repos/JnyRoad/FirmDeck/git/commits/45926e25c58f8bd11dd7c8a7b3462a076638f63c",
         "verification": {
           "payload": null,
           "reason": "unsigned",
@@ -948,53 +948,53 @@
         "url": "https://api.github.com/users/JnyRoad",
         "user_view_type": "public"
       },
-      "html_url": "https://github.com/JnyRoad/StaffDeck/commit/45926e25c58f8bd11dd7c8a7b3462a076638f63c",
+      "html_url": "https://github.com/JnyRoad/FirmDeck/commit/45926e25c58f8bd11dd7c8a7b3462a076638f63c",
       "node_id": "C_kwDOUHrDbNoAKDQ1OTI2ZTI1YzU4ZjhiZDExZGQ3YzhhN2IzNDYyYTA3NjYzOGY2M2M",
       "parents": [
         {
-          "html_url": "https://github.com/JnyRoad/StaffDeck/commit/8e032b76256ca49b7f205748ca86d6e3ac567dcc",
+          "html_url": "https://github.com/JnyRoad/FirmDeck/commit/8e032b76256ca49b7f205748ca86d6e3ac567dcc",
           "sha": "8e032b76256ca49b7f205748ca86d6e3ac567dcc",
-          "url": "https://api.github.com/repos/JnyRoad/StaffDeck/commits/8e032b76256ca49b7f205748ca86d6e3ac567dcc"
+          "url": "https://api.github.com/repos/JnyRoad/FirmDeck/commits/8e032b76256ca49b7f205748ca86d6e3ac567dcc"
         }
       ],
       "sha": "45926e25c58f8bd11dd7c8a7b3462a076638f63c",
-      "url": "https://api.github.com/repos/JnyRoad/StaffDeck/commits/45926e25c58f8bd11dd7c8a7b3462a076638f63c"
+      "url": "https://api.github.com/repos/JnyRoad/FirmDeck/commits/45926e25c58f8bd11dd7c8a7b3462a076638f63c"
     }
   ],
   "files": [
     {
       "additions": 2,
-      "blob_url": "https://github.com/JnyRoad/StaffDeck/blob/45926e25c58f8bd11dd7c8a7b3462a076638f63c/AGENTS.md",
+      "blob_url": "https://github.com/JnyRoad/FirmDeck/blob/45926e25c58f8bd11dd7c8a7b3462a076638f63c/AGENTS.md",
       "changes": 4,
-      "contents_url": "https://api.github.com/repos/JnyRoad/StaffDeck/contents/AGENTS.md?ref=45926e25c58f8bd11dd7c8a7b3462a076638f63c",
+      "contents_url": "https://api.github.com/repos/JnyRoad/FirmDeck/contents/AGENTS.md?ref=45926e25c58f8bd11dd7c8a7b3462a076638f63c",
       "deletions": 2,
       "filename": "AGENTS.md",
       "patch": "@@ -5,8 +5,8 @@\n \n | 任务范围 | 读取 |\n |---|---|\n-| 读取、修改、测试或调试后端代码 | `docs/agents/domain.md` + `docs/agents/backend.md` |\n-| 读取、修改、测试或调试前端代码 | `docs/agents/domain.md` + `docs/agents/frontend.md` |\n+| 读取、修改、测试或调试后端代码 | `docs/agents/domain.md` + `docs/agents/backend.md` + `docs/agents/tenancy.md` |\n+| 读取、修改、测试或调试前端代码 | `docs/agents/domain.md` + `docs/agents/frontend.md` + `docs/agents/tenancy.md` |\n | 修改 UI 文案、本地化或语言区域行为 | `docs/agents/i18n.md`（修改前端代码时还需读取 `docs/agents/frontend.md`） |\n | 运行本地应用 | `docs/agents/local-runtime.md` |\n | 修改配置、凭据或安全敏感行为 | `docs/agents/security.md` |",
-      "raw_url": "https://github.com/JnyRoad/StaffDeck/raw/45926e25c58f8bd11dd7c8a7b3462a076638f63c/AGENTS.md",
+      "raw_url": "https://github.com/JnyRoad/FirmDeck/raw/45926e25c58f8bd11dd7c8a7b3462a076638f63c/AGENTS.md",
       "sha": "2ea2d30c83791c61a9ac35b4536067a8cf96d13a",
       "status": "modified"
     },
     {
       "additions": 11,
-      "blob_url": "https://github.com/JnyRoad/StaffDeck/blob/45926e25c58f8bd11dd7c8a7b3462a076638f63c/CONTEXT.md",
+      "blob_url": "https://github.com/JnyRoad/FirmDeck/blob/45926e25c58f8bd11dd7c8a7b3462a076638f63c/CONTEXT.md",
       "changes": 12,
-      "contents_url": "https://api.github.com/repos/JnyRoad/StaffDeck/contents/CONTEXT.md?ref=45926e25c58f8bd11dd7c8a7b3462a076638f63c",
+      "contents_url": "https://api.github.com/repos/JnyRoad/FirmDeck/contents/CONTEXT.md?ref=45926e25c58f8bd11dd7c8a7b3462a076638f63c",
       "deletions": 1,
       "filename": "CONTEXT.md",
-      "patch": "@@ -12,6 +12,14 @@ FastAPI/Python 后端、Harness/Agent 运行链路、持久化会话与任务、\n \n ## 术语\n \n+- **租户（tenant）**：企业客户的隔离边界。业务数据、会话、任务、知识与渠道默认按\n+  `tenant_id` 归属并隔离；租户生命周期为 `active/suspended`，携带单调递增\n+  `lifecycle_version`（见 `docs/adr/ADR-004-system-tenant-control-plane.md`）。\n+- **tenant principal**：服务端认证解析出的唯一权威租户上下文。前端、任务参数或调用方\n+  声称的 `tenant_id` 都不得替代它推断当前租户。\n+- **系统面 / 租户面**：`SystemAdmin` 控制面负责租户生命周期管理，与租户数据面双向隔离；\n+  系统 token 与租户 token 双向拒绝。无租户归属的安装级资源显式声明 `owner_scope=system`，\n+  不允许「无主」数据或伪租户。\n - **产品消息（product message）**：由 StaffDeck 开发者拥有、需要随界面语言变化的标签、\n   状态、动作、校验、帮助、通知、错误、事件投影、无障碍文本、页面标题、下载前缀等。\n - **语义消息 ID（MessageId）**：稳定、可读、由英文代码标识符组成的 BCP 47 无关键，例如\n@@ -99,8 +107,10 @@ source-key、自然语言错误字段和 legacy event projection 只能在已登\n - 国际化规则：`docs/agents/i18n.md`\n - 前端规则：`docs/agents/frontend.md`\n - 后端规则：`docs/agents/backend.md`\n+- 多租户规则：`docs/agents/tenancy.md`\n - 发布门禁：`docs/agents/release.md`\n - 架构决策：`docs/adr/ADR-001-i18n-runtime-and-catalog.md`、\n   `docs/adr/ADR-002-error-event-localization.md`、\n-  `docs/adr/ADR-003-agent-language-context.md`\n+  `docs/adr/ADR-003-agent-language-context.md`、\n+  `docs/adr/ADR-004-system-tenant-control-plane.md`\n - 迁移清单、契约和验收资产：`specs/001-i18n-governance/` 与 `docs/i18n/`",
-      "raw_url": "https://github.com/JnyRoad/StaffDeck/raw/45926e25c58f8bd11dd7c8a7b3462a076638f63c/CONTEXT.md",
+      "patch": "@@ -12,6 +12,14 @@ FastAPI/Python 后端、Harness/Agent 运行链路、持久化会话与任务、\n \n ## 术语\n \n+- **租户（tenant）**：企业客户的隔离边界。业务数据、会话、任务、知识与渠道默认按\n+  `tenant_id` 归属并隔离；租户生命周期为 `active/suspended`，携带单调递增\n+  `lifecycle_version`（见 `docs/adr/ADR-004-system-tenant-control-plane.md`）。\n+- **tenant principal**：服务端认证解析出的唯一权威租户上下文。前端、任务参数或调用方\n+  声称的 `tenant_id` 都不得替代它推断当前租户。\n+- **系统面 / 租户面**：`SystemAdmin` 控制面负责租户生命周期管理，与租户数据面双向隔离；\n+  系统 token 与租户 token 双向拒绝。无租户归属的安装级资源显式声明 `owner_scope=system`，\n+  不允许「无主」数据或伪租户。\n - **产品消息（product message）**：由 FirmDeck 开发者拥有、需要随界面语言变化的标签、\n   状态、动作、校验、帮助、通知、错误、事件投影、无障碍文本、页面标题、下载前缀等。\n - **语义消息 ID（MessageId）**：稳定、可读、由英文代码标识符组成的 BCP 47 无关键，例如\n@@ -99,8 +107,10 @@ source-key、自然语言错误字段和 legacy event projection 只能在已登\n - 国际化规则：`docs/agents/i18n.md`\n - 前端规则：`docs/agents/frontend.md`\n - 后端规则：`docs/agents/backend.md`\n+- 多租户规则：`docs/agents/tenancy.md`\n - 发布门禁：`docs/agents/release.md`\n - 架构决策：`docs/adr/ADR-001-i18n-runtime-and-catalog.md`、\n   `docs/adr/ADR-002-error-event-localization.md`、\n-  `docs/adr/ADR-003-agent-language-context.md`\n+  `docs/adr/ADR-003-agent-language-context.md`、\n+  `docs/adr/ADR-004-system-tenant-control-plane.md`\n - 迁移清单、契约和验收资产：`specs/001-i18n-governance/` 与 `docs/i18n/`",
+      "raw_url": "https://github.com/JnyRoad/FirmDeck/raw/45926e25c58f8bd11dd7c8a7b3462a076638f63c/CONTEXT.md",
       "sha": "fe960b56b0da99b56f0d309296a52bba7946797e",
       "status": "modified"
     },
     {
       "additions": 50,
-      "blob_url": "https://github.com/JnyRoad/StaffDeck/blob/45926e25c58f8bd11dd7c8a7b3462a076638f63c/docs%2Fagents%2Ftenancy.md",
+      "blob_url": "https://github.com/JnyRoad/FirmDeck/blob/45926e25c58f8bd11dd7c8a7b3462a076638f63c/docs%2Fagents%2Ftenancy.md",
       "changes": 50,
-      "contents_url": "https://api.github.com/repos/JnyRoad/StaffDeck/contents/docs%2Fagents%2Ftenancy.md?ref=45926e25c58f8bd11dd7c8a7b3462a076638f63c",
+      "contents_url": "https://api.github.com/repos/JnyRoad/FirmDeck/contents/docs%2Fagents%2Ftenancy.md?ref=45926e25c58f8bd11dd7c8a7b3462a076638f63c",
       "deletions": 0,
       "filename": "docs/agents/tenancy.md",
-      "patch": "@@ -0,0 +1,50 @@\n+# 多租户\n+\n+StaffDeck 是多租户系统。任何新功能默认在租户上下文内开发；按单租户假设编写的代码\n+（无 `tenant_id` 归属、无租户过滤、无生命周期检查）视为缺陷，不是可选优化。架构依据为\n+根 `CONTEXT.md` 术语与 `docs/adr/ADR-004-system-tenant-control-plane.md`。\n+\n+## 数据所有权\n+\n+- 所有业务数据模型、表、查询、API 和后台任务必须以 `tenant_id` 作用域隔离；列表/详情/\n+  更新/删除查询必须带租户过滤条件，禁止仅凭主键跨租户读写。\n+- 不属于任何租户的安装级资源必须显式声明系统面归属（如 `owner_scope=system`），二选一，\n+  不允许「无主」数据；禁止创建伪租户表达系统运行时。\n+- 租户 `slug` 创建后不可变；不提供租户硬删除。\n+\n+## 权威租户上下文\n+\n+- 服务端认证解析出的 tenant principal 是唯一权威租户上下文。后端路由通过\n+  `backend/app/security/auth.py` 的 `require_current_tenant` 等依赖校验请求租户与当前用户\n+  一致，不信任调用方声称的 `tenant_id`。\n+- 前端只能使用 `frontend-enterprise/src/contexts/TenantSessionContext.tsx` 提供的租户会话；\n+  不得从固定常量、旧 `localStorage` 或用户可编辑参数推断当前租户。\n+\n+## 生命周期与副作用前检查\n+\n+- 租户生命周期为 `active/suspended`，携带单调递增 `lifecycle_version`\n+  （`backend/app/db/models.py` 的 `Tenant`）。\n+- HTTP admission、流式输出、job/webhook、scheduled、channel、Harness/team、tenant-owned\n+  A2A 及其 recovery，必须在各自副作用前通过 `backend/app/security/tenant.py` 的\n+  `require_active_tenant` 取得 `TenantLifecycleDecision`；durable 工作必须保存 admission 时的\n+  `lifecycle_version`，恢复或续写前用 `require_matching_admission_version` 校验，旧 generation\n+  不能覆盖新 owner。\n+- 新增异步执行边界必须注册 `TenantExecutionKind`，不得绕过中央 admission 门直接查表判断。\n+- 无法安全 fence 的执行路径应暂停并返回注册的稳定错误（如 `TENANT_SUSPENDED`、\n+  `TENANT_NOT_FOUND`、`TENANT_MISMATCH`），而不是绕过 active/version/owner 检查。已开始且\n+  结果无法证明的外部调用记录 `EXTERNAL_OUTCOME_UNKNOWN`，不得自动重放。\n+\n+## 系统面与租户面隔离\n+\n+- 系统管理员控制面（`/system/*`、`backend/app/security/system_admin_auth.py`）与租户数据面\n+  双向隔离：租户 token 与系统 token 双向拒绝，功能不得跨面复用凭据、session 或 UI 状态。\n+- 系统管理员不能模拟租户用户，也不能把系统 token 转发到租户 API；租户管理员只管理其租户\n+  内数据。\n+\n+## 测试门禁\n+\n+- 新功能测试必须包含跨租户隔离用例：租户 A 的用户不可见、不可改租户 B 的数据（含列表、\n+  详情、更新、删除和后台任务路径）。\n+- 涉及异步/durable 边界时，必须补暂停租户拒绝用例和 admission version 过期拒绝用例。\n+- 无法运行真实渠道、provider 或完整生命周期链路时，报告标记 `UNVERIFIED`，不得用 mock\n+  结果宣称隔离已验证。",
-      "raw_url": "https://github.com/JnyRoad/StaffDeck/raw/45926e25c58f8bd11dd7c8a7b3462a076638f63c/docs%2Fagents%2Ftenancy.md",
+      "patch": "@@ -0,0 +1,50 @@\n+# 多租户\n+\n+FirmDeck 是多租户系统。任何新功能默认在租户上下文内开发；按单租户假设编写的代码\n+（无 `tenant_id` 归属、无租户过滤、无生命周期检查）视为缺陷，不是可选优化。架构依据为\n+根 `CONTEXT.md` 术语与 `docs/adr/ADR-004-system-tenant-control-plane.md`。\n+\n+## 数据所有权\n+\n+- 所有业务数据模型、表、查询、API 和后台任务必须以 `tenant_id` 作用域隔离；列表/详情/\n+  更新/删除查询必须带租户过滤条件，禁止仅凭主键跨租户读写。\n+- 不属于任何租户的安装级资源必须显式声明系统面归属（如 `owner_scope=system`），二选一，\n+  不允许「无主」数据；禁止创建伪租户表达系统运行时。\n+- 租户 `slug` 创建后不可变；不提供租户硬删除。\n+\n+## 权威租户上下文\n+\n+- 服务端认证解析出的 tenant principal 是唯一权威租户上下文。后端路由通过\n+  `backend/app/security/auth.py` 的 `require_current_tenant` 等依赖校验请求租户与当前用户\n+  一致，不信任调用方声称的 `tenant_id`。\n+- 前端只能使用 `frontend-enterprise/src/contexts/TenantSessionContext.tsx` 提供的租户会话；\n+  不得从固定常量、旧 `localStorage` 或用户可编辑参数推断当前租户。\n+\n+## 生命周期与副作用前检查\n+\n+- 租户生命周期为 `active/suspended`，携带单调递增 `lifecycle_version`\n+  （`backend/app/db/models.py` 的 `Tenant`）。\n+- HTTP admission、流式输出、job/webhook、scheduled、channel、Harness/team、tenant-owned\n+  A2A 及其 recovery，必须在各自副作用前通过 `backend/app/security/tenant.py` 的\n+  `require_active_tenant` 取得 `TenantLifecycleDecision`；durable 工作必须保存 admission 时的\n+  `lifecycle_version`，恢复或续写前用 `require_matching_admission_version` 校验，旧 generation\n+  不能覆盖新 owner。\n+- 新增异步执行边界必须注册 `TenantExecutionKind`，不得绕过中央 admission 门直接查表判断。\n+- 无法安全 fence 的执行路径应暂停并返回注册的稳定错误（如 `TENANT_SUSPENDED`、\n+  `TENANT_NOT_FOUND`、`TENANT_MISMATCH`），而不是绕过 active/version/owner 检查。已开始且\n+  结果无法证明的外部调用记录 `EXTERNAL_OUTCOME_UNKNOWN`，不得自动重放。\n+\n+## 系统面与租户面隔离\n+\n+- 系统管理员控制面（`/system/*`、`backend/app/security/system_admin_auth.py`）与租户数据面\n+  双向隔离：租户 token 与系统 token 双向拒绝，功能不得跨面复用凭据、session 或 UI 状态。\n+- 系统管理员不能模拟租户用户，也不能把系统 token 转发到租户 API；租户管理员只管理其租户\n+  内数据。\n+\n+## 测试门禁\n+\n+- 新功能测试必须包含跨租户隔离用例：租户 A 的用户不可见、不可改租户 B 的数据（含列表、\n+  详情、更新、删除和后台任务路径）。\n+- 涉及异步/durable 边界时，必须补暂停租户拒绝用例和 admission version 过期拒绝用例。\n+- 无法运行真实渠道、provider 或完整生命周期链路时，报告标记 `UNVERIFIED`，不得用 mock\n+  结果宣称隔离已验证。",
+      "raw_url": "https://github.com/JnyRoad/FirmDeck/raw/45926e25c58f8bd11dd7c8a7b3462a076638f63c/docs%2Fagents%2Ftenancy.md",
       "sha": "bb63add7c162ed6c37c25b5ae325b7c787cdea8b",
       "status": "added"
     }
@@ -1002,11 +1002,11 @@
   "issue_comments": [
     {
       "author_association": "NONE",
-      "body": "<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\n<!-- review_stack_entry_start -->\n\n[![Review Change Stack](https://storage.googleapis.com/coderabbit_public_assets/review-stack-in-coderabbit-ui.svg)](https://app.coderabbit.ai/change-stack/JnyRoad/StaffDeck/pull/23)\n\n<!-- review_stack_entry_end -->\n<!-- This is an auto-generated comment: failure by coderabbit.ai -->\n\n> [!CAUTION]\n> ## Review failed\n> \n> The pull request is closed.\n\n<!-- end of auto-generated comment: failure by coderabbit.ai -->\n\n<!-- recent_review_start -->\n\n<details>\n<summary>ℹ️ Recent review info</summary>\n\n<details>\n<summary>⚙️ Run configuration</summary>\n\n**Configuration used**: defaults\n\n**Review profile**: CHILL\n\n**Plan**: Team\n\n**Run ID**: `085a892b-4b45-4085-8691-c08b86b12393`\n\n</details>\n\n<details>\n<summary>📥 Commits</summary>\n\nReviewing files that changed from the base of the PR and between 8e032b76256ca49b7f205748ca86d6e3ac567dcc and 45926e25c58f8bd11dd7c8a7b3462a076638f63c.\n\n</details>\n\n<details>\n<summary>📒 Files selected for processing (3)</summary>\n\n* `AGENTS.md`\n* `CONTEXT.md`\n* `docs/agents/tenancy.md`\n\n</details>\n\n</details>\n\n---\n\n\n\n<!-- recent_review_end -->\n<!-- walkthrough_start -->\n\n<details>\n<summary>📝 Walkthrough</summary>\n\n## Walkthrough\n\n新增多租户术语和开发运行规范，覆盖数据隔离、租户上下文、生命周期校验、控制面隔离及测试门禁。前后端任务路由和权威规则入口现在读取多租户规范。\n\n### Changes\n\n**多租户规范**\n\n|Layer / File(s)|Summary|\n|---|---|\n|**多租户术语与数据归属** <br> `CONTEXT.md`, `docs/agents/tenancy.md`|新增租户上下文、数据所有权、系统资源归属和生命周期定义。|\n|**运行时隔离与验证要求** <br> `docs/agents/tenancy.md`|规定 admission 校验、生命周期版本匹配、凭据隔离和测试覆盖要求。|\n|**规则入口与任务路由接入** <br> `AGENTS.md`, `CONTEXT.md`|将多租户规范加入权威规则入口，并要求前后端任务路由读取该规范。|\n\n**Estimated code review effort:** 2 (Simple) | ~10 minutes\n\n</details>\n\n<!-- walkthrough_end -->\n<!-- finishing_touch_checkbox_start -->\n\n<details>\n<summary>✨ Finishing Touches</summary>\n\n<details>\n<summary>🧪 Generate unit tests (beta)</summary>\n\n- [ ] <!-- {\"checkboxId\": \"f47ac10b-58cc-4372-a567-0e02b2c3d479\", \"radioGroupId\": \"utg-output-choice-group-unknown_comment_id\"} -->   Create PR with unit tests\n- [ ] <!-- {\"checkboxId\": \"6ba7b810-9dad-11d1-80b4-00c04fd430c8\", \"radioGroupId\": \"utg-output-choice-group-unknown_comment_id\"} -->   Commit unit tests in branch `docs/multi-tenant-agent-rules`\n\n</details>\n\n</details>\n\n<!-- finishing_touch_checkbox_end -->\n<!-- tips_start -->\n\n---\n\n\n\n\n<sub>Comment `@coderabbitai help` to get the list of available commands.</sub>\n\n<!-- tips_end -->",
+      "body": "<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\n<!-- review_stack_entry_start -->\n\n[![Review Change Stack](https://storage.googleapis.com/coderabbit_public_assets/review-stack-in-coderabbit-ui.svg)](https://app.coderabbit.ai/change-stack/JnyRoad/FirmDeck/pull/23)\n\n<!-- review_stack_entry_end -->\n<!-- This is an auto-generated comment: failure by coderabbit.ai -->\n\n> [!CAUTION]\n> ## Review failed\n> \n> The pull request is closed.\n\n<!-- end of auto-generated comment: failure by coderabbit.ai -->\n\n<!-- recent_review_start -->\n\n<details>\n<summary>ℹ️ Recent review info</summary>\n\n<details>\n<summary>⚙️ Run configuration</summary>\n\n**Configuration used**: defaults\n\n**Review profile**: CHILL\n\n**Plan**: Team\n\n**Run ID**: `085a892b-4b45-4085-8691-c08b86b12393`\n\n</details>\n\n<details>\n<summary>📥 Commits</summary>\n\nReviewing files that changed from the base of the PR and between 8e032b76256ca49b7f205748ca86d6e3ac567dcc and 45926e25c58f8bd11dd7c8a7b3462a076638f63c.\n\n</details>\n\n<details>\n<summary>📒 Files selected for processing (3)</summary>\n\n* `AGENTS.md`\n* `CONTEXT.md`\n* `docs/agents/tenancy.md`\n\n</details>\n\n</details>\n\n---\n\n\n\n<!-- recent_review_end -->\n<!-- walkthrough_start -->\n\n<details>\n<summary>📝 Walkthrough</summary>\n\n## Walkthrough\n\n新增多租户术语和开发运行规范，覆盖数据隔离、租户上下文、生命周期校验、控制面隔离及测试门禁。前后端任务路由和权威规则入口现在读取多租户规范。\n\n### Changes\n\n**多租户规范**\n\n|Layer / File(s)|Summary|\n|---|---|\n|**多租户术语与数据归属** <br> `CONTEXT.md`, `docs/agents/tenancy.md`|新增租户上下文、数据所有权、系统资源归属和生命周期定义。|\n|**运行时隔离与验证要求** <br> `docs/agents/tenancy.md`|规定 admission 校验、生命周期版本匹配、凭据隔离和测试覆盖要求。|\n|**规则入口与任务路由接入** <br> `AGENTS.md`, `CONTEXT.md`|将多租户规范加入权威规则入口，并要求前后端任务路由读取该规范。|\n\n**Estimated code review effort:** 2 (Simple) | ~10 minutes\n\n</details>\n\n<!-- walkthrough_end -->\n<!-- finishing_touch_checkbox_start -->\n\n<details>\n<summary>✨ Finishing Touches</summary>\n\n<details>\n<summary>🧪 Generate unit tests (beta)</summary>\n\n- [ ] <!-- {\"checkboxId\": \"f47ac10b-58cc-4372-a567-0e02b2c3d479\", \"radioGroupId\": \"utg-output-choice-group-unknown_comment_id\"} -->   Create PR with unit tests\n- [ ] <!-- {\"checkboxId\": \"6ba7b810-9dad-11d1-80b4-00c04fd430c8\", \"radioGroupId\": \"utg-output-choice-group-unknown_comment_id\"} -->   Commit unit tests in branch `docs/multi-tenant-agent-rules`\n\n</details>\n\n</details>\n\n<!-- finishing_touch_checkbox_end -->\n<!-- tips_start -->\n\n---\n\n\n\n\n<sub>Comment `@coderabbitai help` to get the list of available commands.</sub>\n\n<!-- tips_end -->",
       "created_at": "2026-09-01T14:22:02Z",
-      "html_url": "https://github.com/JnyRoad/StaffDeck/pull/23#issuecomment-5495420352",
+      "html_url": "https://github.com/JnyRoad/FirmDeck/pull/23#issuecomment-5495420352",
       "id": 5495420352,
-      "issue_url": "https://api.github.com/repos/JnyRoad/StaffDeck/issues/23",
+      "issue_url": "https://api.github.com/repos/JnyRoad/FirmDeck/issues/23",
       "minimized": null,
       "node_id": "IC_kwDOUHrDbM8AAAABR411wA",
       "performed_via_github_app": {
@@ -1077,10 +1077,10 @@
         "laugh": 0,
         "rocket": 0,
         "total_count": 0,
-        "url": "https://api.github.com/repos/JnyRoad/StaffDeck/issues/comments/5495420352/reactions"
+        "url": "https://api.github.com/repos/JnyRoad/FirmDeck/issues/comments/5495420352/reactions"
       },
       "updated_at": "2026-09-01T14:23:43Z",
-      "url": "https://api.github.com/repos/JnyRoad/StaffDeck/issues/comments/5495420352",
+      "url": "https://api.github.com/repos/JnyRoad/FirmDeck/issues/comments/5495420352",
       "user": {
         "avatar_url": "https://avatars.githubusercontent.com/in/347564?v=4",
         "events_url": "https://api.github.com/users/coderabbitai%5Bbot%5D/events{/privacy}",
@@ -1107,28 +1107,28 @@
   "pull_request": {
     "_links": {
       "comments": {
-        "href": "https://api.github.com/repos/JnyRoad/StaffDeck/issues/23/comments"
+        "href": "https://api.github.com/repos/JnyRoad/FirmDeck/issues/23/comments"
       },
       "commits": {
-        "href": "https://api.github.com/repos/JnyRoad/StaffDeck/pulls/23/commits"
+        "href": "https://api.github.com/repos/JnyRoad/FirmDeck/pulls/23/commits"
       },
       "html": {
-        "href": "https://github.com/JnyRoad/StaffDeck/pull/23"
+        "href": "https://github.com/JnyRoad/FirmDeck/pull/23"
       },
       "issue": {
-        "href": "https://api.github.com/repos/JnyRoad/StaffDeck/issues/23"
+        "href": "https://api.github.com/repos/JnyRoad/FirmDeck/issues/23"
       },
       "review_comment": {
-        "href": "https://api.github.com/repos/JnyRoad/StaffDeck/pulls/comments{/number}"
+        "href": "https://api.github.com/repos/JnyRoad/FirmDeck/pulls/comments{/number}"
       },
       "review_comments": {
-        "href": "https://api.github.com/repos/JnyRoad/StaffDeck/pulls/23/comments"
+        "href": "https://api.github.com/repos/JnyRoad/FirmDeck/pulls/23/comments"
       },
       "self": {
-        "href": "https://api.github.com/repos/JnyRoad/StaffDeck/pulls/23"
+        "href": "https://api.github.com/repos/JnyRoad/FirmDeck/pulls/23"
       },
       "statuses": {
-        "href": "https://api.github.com/repos/JnyRoad/StaffDeck/statuses/45926e25c58f8bd11dd7c8a7b3462a076638f63c"
+        "href": "https://api.github.com/repos/JnyRoad/FirmDeck/statuses/45926e25c58f8bd11dd7c8a7b3462a076638f63c"
       }
     },
     "active_lock_reason": null,
@@ -1142,34 +1142,34 @@
       "ref": "main",
       "repo": {
         "allow_forking": true,
-        "archive_url": "https://api.github.com/repos/JnyRoad/StaffDeck/{archive_format}{/ref}",
+        "archive_url": "https://api.github.com/repos/JnyRoad/FirmDeck/{archive_format}{/ref}",
         "archived": false,
-        "assignees_url": "https://api.github.com/repos/JnyRoad/StaffDeck/assignees{/user}",
-        "blobs_url": "https://api.github.com/repos/JnyRoad/StaffDeck/git/blobs{/sha}",
-        "branches_url": "https://api.github.com/repos/JnyRoad/StaffDeck/branches{/branch}",
-        "clone_url": "https://github.com/JnyRoad/StaffDeck.git",
-        "collaborators_url": "https://api.github.com/repos/JnyRoad/StaffDeck/collaborators{/collaborator}",
-        "comments_url": "https://api.github.com/repos/JnyRoad/StaffDeck/comments{/number}",
-        "commits_url": "https://api.github.com/repos/JnyRoad/StaffDeck/commits{/sha}",
-        "compare_url": "https://api.github.com/repos/JnyRoad/StaffDeck/compare/{base}...{head}",
-        "contents_url": "https://api.github.com/repos/JnyRoad/StaffDeck/contents/{+path}",
-        "contributors_url": "https://api.github.com/repos/JnyRoad/StaffDeck/contributors",
+        "assignees_url": "https://api.github.com/repos/JnyRoad/FirmDeck/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/JnyRoad/FirmDeck/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/JnyRoad/FirmDeck/branches{/branch}",
+        "clone_url": "https://github.com/JnyRoad/FirmDeck.git",
+        "collaborators_url": "https://api.github.com/repos/JnyRoad/FirmDeck/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/JnyRoad/FirmDeck/comments{/number}",
+        "commits_url": "https://api.github.com/repos/JnyRoad/FirmDeck/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/JnyRoad/FirmDeck/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/JnyRoad/FirmDeck/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/JnyRoad/FirmDeck/contributors",
         "created_at": "2026-08-29T02:57:26Z",
         "default_branch": "main",
-        "deployments_url": "https://api.github.com/repos/JnyRoad/StaffDeck/deployments",
+        "deployments_url": "https://api.github.com/repos/JnyRoad/FirmDeck/deployments",
         "description": "Enterprise Digital Employee Platform",
         "disabled": false,
-        "downloads_url": "https://api.github.com/repos/JnyRoad/StaffDeck/downloads",
-        "events_url": "https://api.github.com/repos/JnyRoad/StaffDeck/events",
+        "downloads_url": "https://api.github.com/repos/JnyRoad/FirmDeck/downloads",
+        "events_url": "https://api.github.com/repos/JnyRoad/FirmDeck/events",
         "fork": true,
         "forks": 0,
         "forks_count": 0,
-        "forks_url": "https://api.github.com/repos/JnyRoad/StaffDeck/forks",
-        "full_name": "JnyRoad/StaffDeck",
-        "git_commits_url": "https://api.github.com/repos/JnyRoad/StaffDeck/git/commits{/sha}",
-        "git_refs_url": "https://api.github.com/repos/JnyRoad/StaffDeck/git/refs{/sha}",
-        "git_tags_url": "https://api.github.com/repos/JnyRoad/StaffDeck/git/tags{/sha}",
-        "git_url": "git://github.com/JnyRoad/StaffDeck.git",
+        "forks_url": "https://api.github.com/repos/JnyRoad/FirmDeck/forks",
+        "full_name": "JnyRoad/FirmDeck",
+        "git_commits_url": "https://api.github.com/repos/JnyRoad/FirmDeck/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/JnyRoad/FirmDeck/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/JnyRoad/FirmDeck/git/tags{/sha}",
+        "git_url": "git://github.com/JnyRoad/FirmDeck.git",
         "has_discussions": false,
         "has_downloads": false,
         "has_issues": false,
@@ -1177,18 +1177,18 @@
         "has_projects": true,
         "has_pull_requests": true,
         "has_wiki": false,
-        "homepage": "http://staffdeck.openbmb.cn/",
-        "hooks_url": "https://api.github.com/repos/JnyRoad/StaffDeck/hooks",
-        "html_url": "https://github.com/JnyRoad/StaffDeck",
+        "homepage": "http://firmdeck.openbmb.cn/",
+        "hooks_url": "https://api.github.com/repos/JnyRoad/FirmDeck/hooks",
+        "html_url": "https://github.com/JnyRoad/FirmDeck",
         "id": 1350222700,
         "is_template": false,
-        "issue_comment_url": "https://api.github.com/repos/JnyRoad/StaffDeck/issues/comments{/number}",
-        "issue_events_url": "https://api.github.com/repos/JnyRoad/StaffDeck/issues/events{/number}",
-        "issues_url": "https://api.github.com/repos/JnyRoad/StaffDeck/issues{/number}",
-        "keys_url": "https://api.github.com/repos/JnyRoad/StaffDeck/keys{/key_id}",
-        "labels_url": "https://api.github.com/repos/JnyRoad/StaffDeck/labels{/name}",
+        "issue_comment_url": "https://api.github.com/repos/JnyRoad/FirmDeck/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/JnyRoad/FirmDeck/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/JnyRoad/FirmDeck/issues{/number}",
+        "keys_url": "https://api.github.com/repos/JnyRoad/FirmDeck/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/JnyRoad/FirmDeck/labels{/name}",
         "language": "Python",
-        "languages_url": "https://api.github.com/repos/JnyRoad/StaffDeck/languages",
+        "languages_url": "https://api.github.com/repos/JnyRoad/FirmDeck/languages",
         "license": {
           "key": "agpl-3.0",
           "name": "GNU Affero General Public License v3.0",
@@ -1196,12 +1196,12 @@
           "spdx_id": "AGPL-3.0",
           "url": "https://api.github.com/licenses/agpl-3.0"
         },
-        "merges_url": "https://api.github.com/repos/JnyRoad/StaffDeck/merges",
-        "milestones_url": "https://api.github.com/repos/JnyRoad/StaffDeck/milestones{/number}",
+        "merges_url": "https://api.github.com/repos/JnyRoad/FirmDeck/merges",
+        "milestones_url": "https://api.github.com/repos/JnyRoad/FirmDeck/milestones{/number}",
         "mirror_url": null,
-        "name": "StaffDeck",
+        "name": "FirmDeck",
         "node_id": "R_kgDOUHrDbA",
-        "notifications_url": "https://api.github.com/repos/JnyRoad/StaffDeck/notifications{?since,all,participating}",
+        "notifications_url": "https://api.github.com/repos/JnyRoad/FirmDeck/notifications{?since,all,participating}",
         "open_issues": 0,
         "open_issues_count": 0,
         "owner": {
@@ -1227,23 +1227,23 @@
         },
         "private": false,
         "pull_request_creation_policy": "all",
-        "pulls_url": "https://api.github.com/repos/JnyRoad/StaffDeck/pulls{/number}",
+        "pulls_url": "https://api.github.com/repos/JnyRoad/FirmDeck/pulls{/number}",
         "pushed_at": "2026-09-02T03:18:45Z",
-        "releases_url": "https://api.github.com/repos/JnyRoad/StaffDeck/releases{/id}",
+        "releases_url": "https://api.github.com/repos/JnyRoad/FirmDeck/releases{/id}",
         "size": 32761,
-        "ssh_url": "git@github.com:JnyRoad/StaffDeck.git",
+        "ssh_url": "git@github.com:JnyRoad/FirmDeck.git",
         "stargazers_count": 0,
-        "stargazers_url": "https://api.github.com/repos/JnyRoad/StaffDeck/stargazers",
-        "statuses_url": "https://api.github.com/repos/JnyRoad/StaffDeck/statuses/{sha}",
-        "subscribers_url": "https://api.github.com/repos/JnyRoad/StaffDeck/subscribers",
-        "subscription_url": "https://api.github.com/repos/JnyRoad/StaffDeck/subscription",
-        "svn_url": "https://github.com/JnyRoad/StaffDeck",
-        "tags_url": "https://api.github.com/repos/JnyRoad/StaffDeck/tags",
-        "teams_url": "https://api.github.com/repos/JnyRoad/StaffDeck/teams",
+        "stargazers_url": "https://api.github.com/repos/JnyRoad/FirmDeck/stargazers",
+        "statuses_url": "https://api.github.com/repos/JnyRoad/FirmDeck/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/JnyRoad/FirmDeck/subscribers",
+        "subscription_url": "https://api.github.com/repos/JnyRoad/FirmDeck/subscription",
+        "svn_url": "https://github.com/JnyRoad/FirmDeck",
+        "tags_url": "https://api.github.com/repos/JnyRoad/FirmDeck/tags",
+        "teams_url": "https://api.github.com/repos/JnyRoad/FirmDeck/teams",
         "topics": [],
-        "trees_url": "https://api.github.com/repos/JnyRoad/StaffDeck/git/trees{/sha}",
+        "trees_url": "https://api.github.com/repos/JnyRoad/FirmDeck/git/trees{/sha}",
         "updated_at": "2026-09-02T00:41:41Z",
-        "url": "https://api.github.com/repos/JnyRoad/StaffDeck",
+        "url": "https://api.github.com/repos/JnyRoad/FirmDeck",
         "visibility": "public",
         "watchers": 0,
         "watchers_count": 0,
@@ -1276,46 +1276,46 @@
     "changed_files": 3,
     "closed_at": "2026-09-01T14:21:21Z",
     "comments": 1,
-    "comments_url": "https://api.github.com/repos/JnyRoad/StaffDeck/issues/23/comments",
+    "comments_url": "https://api.github.com/repos/JnyRoad/FirmDeck/issues/23/comments",
     "commits": 1,
-    "commits_url": "https://api.github.com/repos/JnyRoad/StaffDeck/pulls/23/commits",
+    "commits_url": "https://api.github.com/repos/JnyRoad/FirmDeck/pulls/23/commits",
     "created_at": "2026-09-01T14:21:10Z",
     "deletions": 3,
-    "diff_url": "https://github.com/JnyRoad/StaffDeck/pull/23.diff",
+    "diff_url": "https://github.com/JnyRoad/FirmDeck/pull/23.diff",
     "draft": false,
     "head": {
       "label": "JnyRoad:docs/multi-tenant-agent-rules",
       "ref": "docs/multi-tenant-agent-rules",
       "repo": {
         "allow_forking": true,
-        "archive_url": "https://api.github.com/repos/JnyRoad/StaffDeck/{archive_format}{/ref}",
+        "archive_url": "https://api.github.com/repos/JnyRoad/FirmDeck/{archive_format}{/ref}",
         "archived": false,
-        "assignees_url": "https://api.github.com/repos/JnyRoad/StaffDeck/assignees{/user}",
-        "blobs_url": "https://api.github.com/repos/JnyRoad/StaffDeck/git/blobs{/sha}",
-        "branches_url": "https://api.github.com/repos/JnyRoad/StaffDeck/branches{/branch}",
-        "clone_url": "https://github.com/JnyRoad/StaffDeck.git",
-        "collaborators_url": "https://api.github.com/repos/JnyRoad/StaffDeck/collaborators{/collaborator}",
-        "comments_url": "https://api.github.com/repos/JnyRoad/StaffDeck/comments{/number}",
-        "commits_url": "https://api.github.com/repos/JnyRoad/StaffDeck/commits{/sha}",
-        "compare_url": "https://api.github.com/repos/JnyRoad/StaffDeck/compare/{base}...{head}",
-        "contents_url": "https://api.github.com/repos/JnyRoad/StaffDeck/contents/{+path}",
-        "contributors_url": "https://api.github.com/repos/JnyRoad/StaffDeck/contributors",
+        "assignees_url": "https://api.github.com/repos/JnyRoad/FirmDeck/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/JnyRoad/FirmDeck/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/JnyRoad/FirmDeck/branches{/branch}",
+        "clone_url": "https://github.com/JnyRoad/FirmDeck.git",
+        "collaborators_url": "https://api.github.com/repos/JnyRoad/FirmDeck/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/JnyRoad/FirmDeck/comments{/number}",
+        "commits_url": "https://api.github.com/repos/JnyRoad/FirmDeck/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/JnyRoad/FirmDeck/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/JnyRoad/FirmDeck/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/JnyRoad/FirmDeck/contributors",
         "created_at": "2026-08-29T02:57:26Z",
         "default_branch": "main",
-        "deployments_url": "https://api.github.com/repos/JnyRoad/StaffDeck/deployments",
+        "deployments_url": "https://api.github.com/repos/JnyRoad/FirmDeck/deployments",
         "description": "Enterprise Digital Employee Platform",
         "disabled": false,
-        "downloads_url": "https://api.github.com/repos/JnyRoad/StaffDeck/downloads",
-        "events_url": "https://api.github.com/repos/JnyRoad/StaffDeck/events",
+        "downloads_url": "https://api.github.com/repos/JnyRoad/FirmDeck/downloads",
+        "events_url": "https://api.github.com/repos/JnyRoad/FirmDeck/events",
         "fork": true,
         "forks": 0,
         "forks_count": 0,
-        "forks_url": "https://api.github.com/repos/JnyRoad/StaffDeck/forks",
-        "full_name": "JnyRoad/StaffDeck",
-        "git_commits_url": "https://api.github.com/repos/JnyRoad/StaffDeck/git/commits{/sha}",
-        "git_refs_url": "https://api.github.com/repos/JnyRoad/StaffDeck/git/refs{/sha}",
-        "git_tags_url": "https://api.github.com/repos/JnyRoad/StaffDeck/git/tags{/sha}",
-        "git_url": "git://github.com/JnyRoad/StaffDeck.git",
+        "forks_url": "https://api.github.com/repos/JnyRoad/FirmDeck/forks",
+        "full_name": "JnyRoad/FirmDeck",
+        "git_commits_url": "https://api.github.com/repos/JnyRoad/FirmDeck/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/JnyRoad/FirmDeck/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/JnyRoad/FirmDeck/git/tags{/sha}",
+        "git_url": "git://github.com/JnyRoad/FirmDeck.git",
         "has_discussions": false,
         "has_downloads": false,
         "has_issues": false,
@@ -1323,18 +1323,18 @@
         "has_projects": true,
         "has_pull_requests": true,
         "has_wiki": false,
-        "homepage": "http://staffdeck.openbmb.cn/",
-        "hooks_url": "https://api.github.com/repos/JnyRoad/StaffDeck/hooks",
-        "html_url": "https://github.com/JnyRoad/StaffDeck",
+        "homepage": "http://firmdeck.openbmb.cn/",
+        "hooks_url": "https://api.github.com/repos/JnyRoad/FirmDeck/hooks",
+        "html_url": "https://github.com/JnyRoad/FirmDeck",
         "id": 1350222700,
         "is_template": false,
-        "issue_comment_url": "https://api.github.com/repos/JnyRoad/StaffDeck/issues/comments{/number}",
-        "issue_events_url": "https://api.github.com/repos/JnyRoad/StaffDeck/issues/events{/number}",
-        "issues_url": "https://api.github.com/repos/JnyRoad/StaffDeck/issues{/number}",
-        "keys_url": "https://api.github.com/repos/JnyRoad/StaffDeck/keys{/key_id}",
-        "labels_url": "https://api.github.com/repos/JnyRoad/StaffDeck/labels{/name}",
+        "issue_comment_url": "https://api.github.com/repos/JnyRoad/FirmDeck/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/JnyRoad/FirmDeck/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/JnyRoad/FirmDeck/issues{/number}",
+        "keys_url": "https://api.github.com/repos/JnyRoad/FirmDeck/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/JnyRoad/FirmDeck/labels{/name}",
         "language": "Python",
-        "languages_url": "https://api.github.com/repos/JnyRoad/StaffDeck/languages",
+        "languages_url": "https://api.github.com/repos/JnyRoad/FirmDeck/languages",
         "license": {
           "key": "agpl-3.0",
           "name": "GNU Affero General Public License v3.0",
@@ -1342,12 +1342,12 @@
           "spdx_id": "AGPL-3.0",
           "url": "https://api.github.com/licenses/agpl-3.0"
         },
-        "merges_url": "https://api.github.com/repos/JnyRoad/StaffDeck/merges",
-        "milestones_url": "https://api.github.com/repos/JnyRoad/StaffDeck/milestones{/number}",
+        "merges_url": "https://api.github.com/repos/JnyRoad/FirmDeck/merges",
+        "milestones_url": "https://api.github.com/repos/JnyRoad/FirmDeck/milestones{/number}",
         "mirror_url": null,
-        "name": "StaffDeck",
+        "name": "FirmDeck",
         "node_id": "R_kgDOUHrDbA",
-        "notifications_url": "https://api.github.com/repos/JnyRoad/StaffDeck/notifications{?since,all,participating}",
+        "notifications_url": "https://api.github.com/repos/JnyRoad/FirmDeck/notifications{?since,all,participating}",
         "open_issues": 0,
         "open_issues_count": 0,
         "owner": {
@@ -1373,23 +1373,23 @@
         },
         "private": false,
         "pull_request_creation_policy": "all",
-        "pulls_url": "https://api.github.com/repos/JnyRoad/StaffDeck/pulls{/number}",
+        "pulls_url": "https://api.github.com/repos/JnyRoad/FirmDeck/pulls{/number}",
         "pushed_at": "2026-09-02T03:18:45Z",
-        "releases_url": "https://api.github.com/repos/JnyRoad/StaffDeck/releases{/id}",
+        "releases_url": "https://api.github.com/repos/JnyRoad/FirmDeck/releases{/id}",
         "size": 32761,
-        "ssh_url": "git@github.com:JnyRoad/StaffDeck.git",
+        "ssh_url": "git@github.com:JnyRoad/FirmDeck.git",
         "stargazers_count": 0,
-        "stargazers_url": "https://api.github.com/repos/JnyRoad/StaffDeck/stargazers",
-        "statuses_url": "https://api.github.com/repos/JnyRoad/StaffDeck/statuses/{sha}",
-        "subscribers_url": "https://api.github.com/repos/JnyRoad/StaffDeck/subscribers",
-        "subscription_url": "https://api.github.com/repos/JnyRoad/StaffDeck/subscription",
-        "svn_url": "https://github.com/JnyRoad/StaffDeck",
-        "tags_url": "https://api.github.com/repos/JnyRoad/StaffDeck/tags",
-        "teams_url": "https://api.github.com/repos/JnyRoad/StaffDeck/teams",
+        "stargazers_url": "https://api.github.com/repos/JnyRoad/FirmDeck/stargazers",
+        "statuses_url": "https://api.github.com/repos/JnyRoad/FirmDeck/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/JnyRoad/FirmDeck/subscribers",
+        "subscription_url": "https://api.github.com/repos/JnyRoad/FirmDeck/subscription",
+        "svn_url": "https://github.com/JnyRoad/FirmDeck",
+        "tags_url": "https://api.github.com/repos/JnyRoad/FirmDeck/tags",
+        "teams_url": "https://api.github.com/repos/JnyRoad/FirmDeck/teams",
         "topics": [],
-        "trees_url": "https://api.github.com/repos/JnyRoad/StaffDeck/git/trees{/sha}",
+        "trees_url": "https://api.github.com/repos/JnyRoad/FirmDeck/git/trees{/sha}",
         "updated_at": "2026-09-02T00:41:41Z",
-        "url": "https://api.github.com/repos/JnyRoad/StaffDeck",
+        "url": "https://api.github.com/repos/JnyRoad/FirmDeck",
         "visibility": "public",
         "watchers": 0,
         "watchers_count": 0,
@@ -1418,9 +1418,9 @@
         "user_view_type": "public"
       }
     },
-    "html_url": "https://github.com/JnyRoad/StaffDeck/pull/23",
+    "html_url": "https://github.com/JnyRoad/FirmDeck/pull/23",
     "id": 4413094676,
-    "issue_url": "https://api.github.com/repos/JnyRoad/StaffDeck/issues/23",
+    "issue_url": "https://api.github.com/repos/JnyRoad/FirmDeck/issues/23",
     "labels": [],
     "locked": false,
     "maintainer_can_modify": false,
@@ -1453,18 +1453,18 @@
     "milestone": null,
     "node_id": "PR_kwDOUHrDbM8AAAABBwp7FA",
     "number": 23,
-    "patch_url": "https://github.com/JnyRoad/StaffDeck/pull/23.patch",
+    "patch_url": "https://github.com/JnyRoad/FirmDeck/pull/23.patch",
     "rebaseable": null,
     "requested_reviewers": [],
     "requested_teams": [],
-    "review_comment_url": "https://api.github.com/repos/JnyRoad/StaffDeck/pulls/comments{/number}",
+    "review_comment_url": "https://api.github.com/repos/JnyRoad/FirmDeck/pulls/comments{/number}",
     "review_comments": 0,
-    "review_comments_url": "https://api.github.com/repos/JnyRoad/StaffDeck/pulls/23/comments",
+    "review_comments_url": "https://api.github.com/repos/JnyRoad/FirmDeck/pulls/23/comments",
     "state": "closed",
-    "statuses_url": "https://api.github.com/repos/JnyRoad/StaffDeck/statuses/45926e25c58f8bd11dd7c8a7b3462a076638f63c",
+    "statuses_url": "https://api.github.com/repos/JnyRoad/FirmDeck/statuses/45926e25c58f8bd11dd7c8a7b3462a076638f63c",
     "title": "docs(tenancy): add multi-tenant development rules",
     "updated_at": "2026-09-02T03:18:46Z",
-    "url": "https://api.github.com/repos/JnyRoad/StaffDeck/pulls/23",
+    "url": "https://api.github.com/repos/JnyRoad/FirmDeck/pulls/23",
     "user": {
       "avatar_url": "https://avatars.githubusercontent.com/u/213567479?v=4",
       "events_url": "https://api.github.com/users/JnyRoad/events{/privacy}",
@@ -1489,7 +1489,7 @@
   },
   "review_comments": [],
   "reviews": [],
-  "source_repository": "JnyRoad/StaffDeck",
+  "source_repository": "JnyRoad/FirmDeck",
   "timeline": [
     {
       "author": {
@@ -1503,22 +1503,22 @@
         "name": "JnyRoad"
       },
       "event": "committed",
-      "html_url": "https://github.com/JnyRoad/StaffDeck/commit/45926e25c58f8bd11dd7c8a7b3462a076638f63c",
+      "html_url": "https://github.com/JnyRoad/FirmDeck/commit/45926e25c58f8bd11dd7c8a7b3462a076638f63c",
       "message": "docs(tenancy): add multi-tenant development rules\n\nTenancy previously existed only in ADR-004 and never entered the agent\nrule loading path, so feature work could silently fall back to\nsingle-tenant assumptions.\n\n- Add docs/agents/tenancy.md covering data ownership, authoritative\n  tenant principal, lifecycle admission before side effects,\n  system/tenant plane isolation, and cross-tenant test gates.\n- Route backend and frontend development tasks to tenancy.md in\n  AGENTS.md so the rules load on every feature task.\n- Add tenant, tenant principal, and system/tenant plane terms to\n  CONTEXT.md and list tenancy.md plus ADR-004 as authoritative entries.",
       "node_id": "C_kwDOUHrDbNoAKDQ1OTI2ZTI1YzU4ZjhiZDExZGQ3YzhhN2IzNDYyYTA3NjYzOGY2M2M",
       "parents": [
         {
-          "html_url": "https://github.com/JnyRoad/StaffDeck/commit/8e032b76256ca49b7f205748ca86d6e3ac567dcc",
+          "html_url": "https://github.com/JnyRoad/FirmDeck/commit/8e032b76256ca49b7f205748ca86d6e3ac567dcc",
           "sha": "8e032b76256ca49b7f205748ca86d6e3ac567dcc",
-          "url": "https://api.github.com/repos/JnyRoad/StaffDeck/git/commits/8e032b76256ca49b7f205748ca86d6e3ac567dcc"
+          "url": "https://api.github.com/repos/JnyRoad/FirmDeck/git/commits/8e032b76256ca49b7f205748ca86d6e3ac567dcc"
         }
       ],
       "sha": "45926e25c58f8bd11dd7c8a7b3462a076638f63c",
       "tree": {
         "sha": "4b0c223c96ddb41ba67167c09258d9d02907238a",
-        "url": "https://api.github.com/repos/JnyRoad/StaffDeck/git/trees/4b0c223c96ddb41ba67167c09258d9d02907238a"
+        "url": "https://api.github.com/repos/JnyRoad/FirmDeck/git/trees/4b0c223c96ddb41ba67167c09258d9d02907238a"
       },
-      "url": "https://api.github.com/repos/JnyRoad/StaffDeck/git/commits/45926e25c58f8bd11dd7c8a7b3462a076638f63c",
+      "url": "https://api.github.com/repos/JnyRoad/FirmDeck/git/commits/45926e25c58f8bd11dd7c8a7b3462a076638f63c",
       "verification": {
         "payload": null,
         "reason": "unsigned",
@@ -1550,13 +1550,13 @@
         "user_view_type": "public"
       },
       "commit_id": "913c0e83ec6595da3200c1b03ffa9f687e35037c",
-      "commit_url": "https://api.github.com/repos/JnyRoad/StaffDeck/commits/913c0e83ec6595da3200c1b03ffa9f687e35037c",
+      "commit_url": "https://api.github.com/repos/JnyRoad/FirmDeck/commits/913c0e83ec6595da3200c1b03ffa9f687e35037c",
       "created_at": "2026-09-01T14:21:21Z",
       "event": "merged",
       "id": 30351956146,
       "node_id": "ME_lADOUHrDbM8AAAABPK3uWM8AAAAHER4Ysg",
       "performed_via_github_app": null,
-      "url": "https://api.github.com/repos/JnyRoad/StaffDeck/issues/events/30351956146"
+      "url": "https://api.github.com/repos/JnyRoad/FirmDeck/issues/events/30351956146"
     },
     {
       "actor": {
@@ -1589,7 +1589,7 @@
       "node_id": "CE_lADOUHrDbM8AAAABPK3uWM8AAAAHER4Zdg",
       "performed_via_github_app": null,
       "state_reason": null,
-      "url": "https://api.github.com/repos/JnyRoad/StaffDeck/issues/events/30351956342"
+      "url": "https://api.github.com/repos/JnyRoad/FirmDeck/issues/events/30351956342"
     },
     {
       "actor": {
@@ -1614,12 +1614,12 @@
         "user_view_type": "public"
       },
       "author_association": "NONE",
-      "body": "<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\n<!-- review_stack_entry_start -->\n\n[![Review Change Stack](https://storage.googleapis.com/coderabbit_public_assets/review-stack-in-coderabbit-ui.svg)](https://app.coderabbit.ai/change-stack/JnyRoad/StaffDeck/pull/23)\n\n<!-- review_stack_entry_end -->\n<!-- This is an auto-generated comment: failure by coderabbit.ai -->\n\n> [!CAUTION]\n> ## Review failed\n> \n> The pull request is closed.\n\n<!-- end of auto-generated comment: failure by coderabbit.ai -->\n\n<!-- recent_review_start -->\n\n<details>\n<summary>ℹ️ Recent review info</summary>\n\n<details>\n<summary>⚙️ Run configuration</summary>\n\n**Configuration used**: defaults\n\n**Review profile**: CHILL\n\n**Plan**: Team\n\n**Run ID**: `085a892b-4b45-4085-8691-c08b86b12393`\n\n</details>\n\n<details>\n<summary>📥 Commits</summary>\n\nReviewing files that changed from the base of the PR and between 8e032b76256ca49b7f205748ca86d6e3ac567dcc and 45926e25c58f8bd11dd7c8a7b3462a076638f63c.\n\n</details>\n\n<details>\n<summary>📒 Files selected for processing (3)</summary>\n\n* `AGENTS.md`\n* `CONTEXT.md`\n* `docs/agents/tenancy.md`\n\n</details>\n\n</details>\n\n---\n\n\n\n<!-- recent_review_end -->\n<!-- walkthrough_start -->\n\n<details>\n<summary>📝 Walkthrough</summary>\n\n## Walkthrough\n\n新增多租户术语和开发运行规范，覆盖数据隔离、租户上下文、生命周期校验、控制面隔离及测试门禁。前后端任务路由和权威规则入口现在读取多租户规范。\n\n### Changes\n\n**多租户规范**\n\n|Layer / File(s)|Summary|\n|---|---|\n|**多租户术语与数据归属** <br> `CONTEXT.md`, `docs/agents/tenancy.md`|新增租户上下文、数据所有权、系统资源归属和生命周期定义。|\n|**运行时隔离与验证要求** <br> `docs/agents/tenancy.md`|规定 admission 校验、生命周期版本匹配、凭据隔离和测试覆盖要求。|\n|**规则入口与任务路由接入** <br> `AGENTS.md`, `CONTEXT.md`|将多租户规范加入权威规则入口，并要求前后端任务路由读取该规范。|\n\n**Estimated code review effort:** 2 (Simple) | ~10 minutes\n\n</details>\n\n<!-- walkthrough_end -->\n<!-- finishing_touch_checkbox_start -->\n\n<details>\n<summary>✨ Finishing Touches</summary>\n\n<details>\n<summary>🧪 Generate unit tests (beta)</summary>\n\n- [ ] <!-- {\"checkboxId\": \"f47ac10b-58cc-4372-a567-0e02b2c3d479\", \"radioGroupId\": \"utg-output-choice-group-unknown_comment_id\"} -->   Create PR with unit tests\n- [ ] <!-- {\"checkboxId\": \"6ba7b810-9dad-11d1-80b4-00c04fd430c8\", \"radioGroupId\": \"utg-output-choice-group-unknown_comment_id\"} -->   Commit unit tests in branch `docs/multi-tenant-agent-rules`\n\n</details>\n\n</details>\n\n<!-- finishing_touch_checkbox_end -->\n<!-- tips_start -->\n\n---\n\n\n\n\n<sub>Comment `@coderabbitai help` to get the list of available commands.</sub>\n\n<!-- tips_end -->",
+      "body": "<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\n<!-- review_stack_entry_start -->\n\n[![Review Change Stack](https://storage.googleapis.com/coderabbit_public_assets/review-stack-in-coderabbit-ui.svg)](https://app.coderabbit.ai/change-stack/JnyRoad/FirmDeck/pull/23)\n\n<!-- review_stack_entry_end -->\n<!-- This is an auto-generated comment: failure by coderabbit.ai -->\n\n> [!CAUTION]\n> ## Review failed\n> \n> The pull request is closed.\n\n<!-- end of auto-generated comment: failure by coderabbit.ai -->\n\n<!-- recent_review_start -->\n\n<details>\n<summary>ℹ️ Recent review info</summary>\n\n<details>\n<summary>⚙️ Run configuration</summary>\n\n**Configuration used**: defaults\n\n**Review profile**: CHILL\n\n**Plan**: Team\n\n**Run ID**: `085a892b-4b45-4085-8691-c08b86b12393`\n\n</details>\n\n<details>\n<summary>📥 Commits</summary>\n\nReviewing files that changed from the base of the PR and between 8e032b76256ca49b7f205748ca86d6e3ac567dcc and 45926e25c58f8bd11dd7c8a7b3462a076638f63c.\n\n</details>\n\n<details>\n<summary>📒 Files selected for processing (3)</summary>\n\n* `AGENTS.md`\n* `CONTEXT.md`\n* `docs/agents/tenancy.md`\n\n</details>\n\n</details>\n\n---\n\n\n\n<!-- recent_review_end -->\n<!-- walkthrough_start -->\n\n<details>\n<summary>📝 Walkthrough</summary>\n\n## Walkthrough\n\n新增多租户术语和开发运行规范，覆盖数据隔离、租户上下文、生命周期校验、控制面隔离及测试门禁。前后端任务路由和权威规则入口现在读取多租户规范。\n\n### Changes\n\n**多租户规范**\n\n|Layer / File(s)|Summary|\n|---|---|\n|**多租户术语与数据归属** <br> `CONTEXT.md`, `docs/agents/tenancy.md`|新增租户上下文、数据所有权、系统资源归属和生命周期定义。|\n|**运行时隔离与验证要求** <br> `docs/agents/tenancy.md`|规定 admission 校验、生命周期版本匹配、凭据隔离和测试覆盖要求。|\n|**规则入口与任务路由接入** <br> `AGENTS.md`, `CONTEXT.md`|将多租户规范加入权威规则入口，并要求前后端任务路由读取该规范。|\n\n**Estimated code review effort:** 2 (Simple) | ~10 minutes\n\n</details>\n\n<!-- walkthrough_end -->\n<!-- finishing_touch_checkbox_start -->\n\n<details>\n<summary>✨ Finishing Touches</summary>\n\n<details>\n<summary>🧪 Generate unit tests (beta)</summary>\n\n- [ ] <!-- {\"checkboxId\": \"f47ac10b-58cc-4372-a567-0e02b2c3d479\", \"radioGroupId\": \"utg-output-choice-group-unknown_comment_id\"} -->   Create PR with unit tests\n- [ ] <!-- {\"checkboxId\": \"6ba7b810-9dad-11d1-80b4-00c04fd430c8\", \"radioGroupId\": \"utg-output-choice-group-unknown_comment_id\"} -->   Commit unit tests in branch `docs/multi-tenant-agent-rules`\n\n</details>\n\n</details>\n\n<!-- finishing_touch_checkbox_end -->\n<!-- tips_start -->\n\n---\n\n\n\n\n<sub>Comment `@coderabbitai help` to get the list of available commands.</sub>\n\n<!-- tips_end -->",
       "created_at": "2026-09-01T14:22:02Z",
       "event": "commented",
-      "html_url": "https://github.com/JnyRoad/StaffDeck/pull/23#issuecomment-5495420352",
+      "html_url": "https://github.com/JnyRoad/FirmDeck/pull/23#issuecomment-5495420352",
       "id": 5495420352,
-      "issue_url": "https://api.github.com/repos/JnyRoad/StaffDeck/issues/23",
+      "issue_url": "https://api.github.com/repos/JnyRoad/FirmDeck/issues/23",
       "minimized": null,
       "node_id": "IC_kwDOUHrDbM8AAAABR411wA",
       "performed_via_github_app": {
@@ -1690,10 +1690,10 @@
         "laugh": 0,
         "rocket": 0,
         "total_count": 0,
-        "url": "https://api.github.com/repos/JnyRoad/StaffDeck/issues/comments/5495420352/reactions"
+        "url": "https://api.github.com/repos/JnyRoad/FirmDeck/issues/comments/5495420352/reactions"
       },
       "updated_at": "2026-09-01T14:23:43Z",
-      "url": "https://api.github.com/repos/JnyRoad/StaffDeck/issues/comments/5495420352",
+      "url": "https://api.github.com/repos/JnyRoad/FirmDeck/issues/comments/5495420352",
       "user": {
         "avatar_url": "https://avatars.githubusercontent.com/in/347564?v=4",
         "events_url": "https://api.github.com/users/coderabbitai%5Bbot%5D/events{/privacy}",
@@ -1745,7 +1745,7 @@
       "id": 30388651709,
       "node_id": "HRDE_lADOUHrDbM8AAAABPK3uWM8AAAAHE04GvQ",
       "performed_via_github_app": null,
-      "url": "https://api.github.com/repos/JnyRoad/StaffDeck/issues/events/30388651709"
+      "url": "https://api.github.com/repos/JnyRoad/FirmDeck/issues/events/30388651709"
     }
   ]
 }

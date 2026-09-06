@@ -121,7 +121,7 @@ class _LLMScheduledTaskDraft(BaseModel):
 
 
 SCHEDULE_DRAFT_PROMPT = """
-You are StaffDeck's scheduled-task configuration parser. The user has already selected
+You are FirmDeck's scheduled-task configuration parser. The user has already selected
 scheduled-task mode. Convert the source-owned user_message into one editable task draft.
 Follow language_directive for every newly generated value in title, prompt, description,
 and reason. Do not translate or rewrite user_message itself; preserve source identifiers,

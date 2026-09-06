@@ -50,24 +50,24 @@
         },
         "completed_at": "2026-08-29T06:28:05Z",
         "conclusion": "success",
-        "details_url": "https://github.com/JnyRoad/StaffDeck/runs/99063707187",
+        "details_url": "https://github.com/JnyRoad/FirmDeck/runs/99063707187",
         "external_id": "",
         "head_sha": "abfebd7b3b9fb645b0bc917dab7f9980862e0585",
-        "html_url": "https://github.com/JnyRoad/StaffDeck/runs/99063707187",
+        "html_url": "https://github.com/JnyRoad/FirmDeck/runs/99063707187",
         "id": 99063707187,
         "name": "CodeQL",
         "node_id": "CR_kwDOUHrDbM8AAAAXEKg2Mw",
         "output": {
           "annotations_count": 0,
-          "annotations_url": "https://api.github.com/repos/JnyRoad/StaffDeck/check-runs/99063707187/annotations",
-          "summary": "[View all branch alerts](/JnyRoad/StaffDeck/security/code-scanning?query=pr%3A2+tool%3ACodeQL+is%3Aopen).",
+          "annotations_url": "https://api.github.com/repos/JnyRoad/FirmDeck/check-runs/99063707187/annotations",
+          "summary": "[View all branch alerts](/JnyRoad/FirmDeck/security/code-scanning?query=pr%3A2+tool%3ACodeQL+is%3Aopen).",
           "text": null,
           "title": "No new alerts in code changed by this pull request"
         },
         "pull_requests": [],
         "started_at": "2026-08-29T06:28:03Z",
         "status": "completed",
-        "url": "https://api.github.com/repos/JnyRoad/StaffDeck/check-runs/99063707187"
+        "url": "https://api.github.com/repos/JnyRoad/FirmDeck/check-runs/99063707187"
       },
       {
         "app": {
@@ -165,16 +165,16 @@
         },
         "completed_at": "2026-08-29T06:28:51Z",
         "conclusion": "success",
-        "details_url": "https://github.com/JnyRoad/StaffDeck/actions/runs/33238506305/job/99063649543",
+        "details_url": "https://github.com/JnyRoad/FirmDeck/actions/runs/33238506305/job/99063649543",
         "external_id": "237bf1e1-0b7f-592e-81d0-0534eb0a487b",
         "head_sha": "abfebd7b3b9fb645b0bc917dab7f9980862e0585",
-        "html_url": "https://github.com/JnyRoad/StaffDeck/actions/runs/33238506305/job/99063649543",
+        "html_url": "https://github.com/JnyRoad/FirmDeck/actions/runs/33238506305/job/99063649543",
         "id": 99063649543,
         "name": "Analyze (javascript-typescript)",
         "node_id": "CR_kwDOUHrDbM8AAAAXEKdVBw",
         "output": {
           "annotations_count": 0,
-          "annotations_url": "https://api.github.com/repos/JnyRoad/StaffDeck/check-runs/99063649543/annotations",
+          "annotations_url": "https://api.github.com/repos/JnyRoad/FirmDeck/check-runs/99063649543/annotations",
           "summary": null,
           "text": null,
           "title": null
@@ -182,7 +182,7 @@
         "pull_requests": [],
         "started_at": "2026-08-29T06:27:32Z",
         "status": "completed",
-        "url": "https://api.github.com/repos/JnyRoad/StaffDeck/check-runs/99063649543"
+        "url": "https://api.github.com/repos/JnyRoad/FirmDeck/check-runs/99063649543"
       },
       {
         "app": {
@@ -280,16 +280,16 @@
         },
         "completed_at": "2026-08-29T06:29:09Z",
         "conclusion": "success",
-        "details_url": "https://github.com/JnyRoad/StaffDeck/actions/runs/33238506305/job/99063649535",
+        "details_url": "https://github.com/JnyRoad/FirmDeck/actions/runs/33238506305/job/99063649535",
         "external_id": "09963a81-cfae-5640-9eb5-9f507ddb1fe2",
         "head_sha": "abfebd7b3b9fb645b0bc917dab7f9980862e0585",
-        "html_url": "https://github.com/JnyRoad/StaffDeck/actions/runs/33238506305/job/99063649535",
+        "html_url": "https://github.com/JnyRoad/FirmDeck/actions/runs/33238506305/job/99063649535",
         "id": 99063649535,
         "name": "Analyze (python)",
         "node_id": "CR_kwDOUHrDbM8AAAAXEKdU_w",
         "output": {
           "annotations_count": 0,
-          "annotations_url": "https://api.github.com/repos/JnyRoad/StaffDeck/check-runs/99063649535/annotations",
+          "annotations_url": "https://api.github.com/repos/JnyRoad/FirmDeck/check-runs/99063649535/annotations",
           "summary": null,
           "text": null,
           "title": null
@@ -297,7 +297,7 @@
         "pull_requests": [],
         "started_at": "2026-08-29T06:27:31Z",
         "status": "completed",
-        "url": "https://api.github.com/repos/JnyRoad/StaffDeck/check-runs/99063649535"
+        "url": "https://api.github.com/repos/JnyRoad/FirmDeck/check-runs/99063649535"
       },
       {
         "app": {
@@ -395,16 +395,16 @@
         },
         "completed_at": "2026-08-29T06:28:11Z",
         "conclusion": "success",
-        "details_url": "https://github.com/JnyRoad/StaffDeck/actions/runs/33238506305/job/99063649409",
+        "details_url": "https://github.com/JnyRoad/FirmDeck/actions/runs/33238506305/job/99063649409",
         "external_id": "fad08123-80db-57c2-9ae6-979bf8d37f69",
         "head_sha": "abfebd7b3b9fb645b0bc917dab7f9980862e0585",
-        "html_url": "https://github.com/JnyRoad/StaffDeck/actions/runs/33238506305/job/99063649409",
+        "html_url": "https://github.com/JnyRoad/FirmDeck/actions/runs/33238506305/job/99063649409",
         "id": 99063649409,
         "name": "Analyze (actions)",
         "node_id": "CR_kwDOUHrDbM8AAAAXEKdUgQ",
         "output": {
           "annotations_count": 0,
-          "annotations_url": "https://api.github.com/repos/JnyRoad/StaffDeck/check-runs/99063649409/annotations",
+          "annotations_url": "https://api.github.com/repos/JnyRoad/FirmDeck/check-runs/99063649409/annotations",
           "summary": null,
           "text": null,
           "title": null
@@ -412,7 +412,7 @@
         "pull_requests": [],
         "started_at": "2026-08-29T06:27:31Z",
         "status": "completed",
-        "url": "https://api.github.com/repos/JnyRoad/StaffDeck/check-runs/99063649409"
+        "url": "https://api.github.com/repos/JnyRoad/FirmDeck/check-runs/99063649409"
       }
     ],
     "total_count": 4
@@ -440,7 +440,7 @@
         "url": "https://api.github.com/users/JnyRoad",
         "user_view_type": "public"
       },
-      "comments_url": "https://api.github.com/repos/JnyRoad/StaffDeck/commits/abfebd7b3b9fb645b0bc917dab7f9980862e0585/comments",
+      "comments_url": "https://api.github.com/repos/JnyRoad/FirmDeck/commits/abfebd7b3b9fb645b0bc917dab7f9980862e0585/comments",
       "commit": {
         "author": {
           "date": "2026-08-29T06:27:11Z",
@@ -456,9 +456,9 @@
         "message": "fix(chat): show full session title via styled tooltip on hover\n\nThe sidebar session list truncates long titles/subtitles with an\nellipsis, and the only way to read the full text was the browser's\nnative `title` attribute tooltip (unstyled, delayed), inconsistent\nwith the Radix tooltip already used for the row avatar.\n\nWrap the title/subtitle block in the same Tooltip/TooltipContent\nused elsewhere in this component so hovering shows the full title\nand subtitle. Row height, truncation and list density are unchanged.\n\nTesting:\n- tsc -b --noEmit: no errors\n- vitest run src/components/AppSidebar.test.tsx: 6 passed\n- vite build: succeeds",
         "tree": {
           "sha": "0cb7c029c22d43951b81c0d2f82160c9f323b3d8",
-          "url": "https://api.github.com/repos/JnyRoad/StaffDeck/git/trees/0cb7c029c22d43951b81c0d2f82160c9f323b3d8"
+          "url": "https://api.github.com/repos/JnyRoad/FirmDeck/git/trees/0cb7c029c22d43951b81c0d2f82160c9f323b3d8"
         },
-        "url": "https://api.github.com/repos/JnyRoad/StaffDeck/git/commits/abfebd7b3b9fb645b0bc917dab7f9980862e0585",
+        "url": "https://api.github.com/repos/JnyRoad/FirmDeck/git/commits/abfebd7b3b9fb645b0bc917dab7f9980862e0585",
         "verification": {
           "payload": null,
           "reason": "unsigned",
@@ -488,29 +488,29 @@
         "url": "https://api.github.com/users/JnyRoad",
         "user_view_type": "public"
       },
-      "html_url": "https://github.com/JnyRoad/StaffDeck/commit/abfebd7b3b9fb645b0bc917dab7f9980862e0585",
+      "html_url": "https://github.com/JnyRoad/FirmDeck/commit/abfebd7b3b9fb645b0bc917dab7f9980862e0585",
       "node_id": "C_kwDOUHrDbNoAKGFiZmViZDdiM2I5ZmI2NDViMGJjOTE3ZGFiN2Y5OTgwODYyZTA1ODU",
       "parents": [
         {
-          "html_url": "https://github.com/JnyRoad/StaffDeck/commit/540acc5c8db10d251d92b2287955fab85c267a78",
+          "html_url": "https://github.com/JnyRoad/FirmDeck/commit/540acc5c8db10d251d92b2287955fab85c267a78",
           "sha": "540acc5c8db10d251d92b2287955fab85c267a78",
-          "url": "https://api.github.com/repos/JnyRoad/StaffDeck/commits/540acc5c8db10d251d92b2287955fab85c267a78"
+          "url": "https://api.github.com/repos/JnyRoad/FirmDeck/commits/540acc5c8db10d251d92b2287955fab85c267a78"
         }
       ],
       "sha": "abfebd7b3b9fb645b0bc917dab7f9980862e0585",
-      "url": "https://api.github.com/repos/JnyRoad/StaffDeck/commits/abfebd7b3b9fb645b0bc917dab7f9980862e0585"
+      "url": "https://api.github.com/repos/JnyRoad/FirmDeck/commits/abfebd7b3b9fb645b0bc917dab7f9980862e0585"
     }
   ],
   "files": [
     {
       "additions": 25,
-      "blob_url": "https://github.com/JnyRoad/StaffDeck/blob/abfebd7b3b9fb645b0bc917dab7f9980862e0585/frontend-enterprise%2Fsrc%2Fcomponents%2FAppSidebar.tsx",
+      "blob_url": "https://github.com/JnyRoad/FirmDeck/blob/abfebd7b3b9fb645b0bc917dab7f9980862e0585/frontend-enterprise%2Fsrc%2Fcomponents%2FAppSidebar.tsx",
       "changes": 42,
-      "contents_url": "https://api.github.com/repos/JnyRoad/StaffDeck/contents/frontend-enterprise%2Fsrc%2Fcomponents%2FAppSidebar.tsx?ref=abfebd7b3b9fb645b0bc917dab7f9980862e0585",
+      "contents_url": "https://api.github.com/repos/JnyRoad/FirmDeck/contents/frontend-enterprise%2Fsrc%2Fcomponents%2FAppSidebar.tsx?ref=abfebd7b3b9fb645b0bc917dab7f9980862e0585",
       "deletions": 17,
       "filename": "frontend-enterprise/src/components/AppSidebar.tsx",
       "patch": "@@ -999,24 +999,32 @@ function ChatSessionRow({\n           </TooltipContent>\n         )}\n       </Tooltip>\n-      <span className=\"flex min-w-0 flex-1 flex-col justify-between self-stretch py-[3px]\">\n-        <span className=\"flex min-w-0 items-center gap-[4px]\">\n-          <span className=\"truncate text-[14px] leading-none text-[#464c5e] capitalize\" title={displayTitle}>\n-            {displayTitle}\n-          </span>\n-          {isTeamGroup && (\n-            <span\n-              aria-label=\"群聊\"\n-              className=\"inline-flex h-[16px] shrink-0 items-center rounded-full bg-[#e8f0ff] px-[5px] text-[10px] font-medium leading-none text-[#1a71ff]\"\n-            >\n-              群聊\n+      <Tooltip>\n+        <TooltipTrigger asChild>\n+          <span className=\"flex min-w-0 flex-1 flex-col justify-between self-stretch py-[3px]\">\n+            <span className=\"flex min-w-0 items-center gap-[4px]\">\n+              <span className=\"truncate text-[14px] leading-none text-[#464c5e] capitalize\">\n+                {displayTitle}\n+              </span>\n+              {isTeamGroup && (\n+                <span\n+                  aria-label=\"群聊\"\n+                  className=\"inline-flex h-[16px] shrink-0 items-center rounded-full bg-[#e8f0ff] px-[5px] text-[10px] font-medium leading-none text-[#1a71ff]\"\n+                >\n+                  群聊\n+                </span>\n+              )}\n             </span>\n-          )}\n-        </span>\n-        <span className=\"truncate text-[12px] leading-none text-[#757f9c]\" title={displaySubtitle}>\n-          {displaySubtitle}\n-        </span>\n-      </span>\n+            <span className=\"truncate text-[12px] leading-none text-[#757f9c]\">\n+              {displaySubtitle}\n+            </span>\n+          </span>\n+        </TooltipTrigger>\n+        <TooltipContent side=\"right\" align=\"start\" className=\"flex-col items-start gap-0.5 whitespace-normal text-left max-w-[260px]\">\n+          <span className=\"font-medium\">{displayTitle}</span>\n+          {displaySubtitle && <span className=\"text-background/70\">{displaySubtitle}</span>}\n+        </TooltipContent>\n+      </Tooltip>\n       {unread && (\n         <span className=\"ml-[2px] size-[7px] shrink-0 rounded-full bg-[#f5483b]\" aria-label=\"未读回复\" />\n       )}",
-      "raw_url": "https://github.com/JnyRoad/StaffDeck/raw/abfebd7b3b9fb645b0bc917dab7f9980862e0585/frontend-enterprise%2Fsrc%2Fcomponents%2FAppSidebar.tsx",
+      "raw_url": "https://github.com/JnyRoad/FirmDeck/raw/abfebd7b3b9fb645b0bc917dab7f9980862e0585/frontend-enterprise%2Fsrc%2Fcomponents%2FAppSidebar.tsx",
       "sha": "e79e24ea05f36bc5fd7caa38aba121bfee9a66b5",
       "status": "modified"
     }
@@ -519,28 +519,28 @@
   "pull_request": {
     "_links": {
       "comments": {
-        "href": "https://api.github.com/repos/JnyRoad/StaffDeck/issues/2/comments"
+        "href": "https://api.github.com/repos/JnyRoad/FirmDeck/issues/2/comments"
       },
       "commits": {
-        "href": "https://api.github.com/repos/JnyRoad/StaffDeck/pulls/2/commits"
+        "href": "https://api.github.com/repos/JnyRoad/FirmDeck/pulls/2/commits"
       },
       "html": {
-        "href": "https://github.com/JnyRoad/StaffDeck/pull/2"
+        "href": "https://github.com/JnyRoad/FirmDeck/pull/2"
       },
       "issue": {
-        "href": "https://api.github.com/repos/JnyRoad/StaffDeck/issues/2"
+        "href": "https://api.github.com/repos/JnyRoad/FirmDeck/issues/2"
       },
       "review_comment": {
-        "href": "https://api.github.com/repos/JnyRoad/StaffDeck/pulls/comments{/number}"
+        "href": "https://api.github.com/repos/JnyRoad/FirmDeck/pulls/comments{/number}"
       },
       "review_comments": {
-        "href": "https://api.github.com/repos/JnyRoad/StaffDeck/pulls/2/comments"
+        "href": "https://api.github.com/repos/JnyRoad/FirmDeck/pulls/2/comments"
       },
       "self": {
-        "href": "https://api.github.com/repos/JnyRoad/StaffDeck/pulls/2"
+        "href": "https://api.github.com/repos/JnyRoad/FirmDeck/pulls/2"
       },
       "statuses": {
-        "href": "https://api.github.com/repos/JnyRoad/StaffDeck/statuses/abfebd7b3b9fb645b0bc917dab7f9980862e0585"
+        "href": "https://api.github.com/repos/JnyRoad/FirmDeck/statuses/abfebd7b3b9fb645b0bc917dab7f9980862e0585"
       }
     },
     "active_lock_reason": null,
@@ -554,34 +554,34 @@
       "ref": "main",
       "repo": {
         "allow_forking": true,
-        "archive_url": "https://api.github.com/repos/JnyRoad/StaffDeck/{archive_format}{/ref}",
+        "archive_url": "https://api.github.com/repos/JnyRoad/FirmDeck/{archive_format}{/ref}",
         "archived": false,
-        "assignees_url": "https://api.github.com/repos/JnyRoad/StaffDeck/assignees{/user}",
-        "blobs_url": "https://api.github.com/repos/JnyRoad/StaffDeck/git/blobs{/sha}",
-        "branches_url": "https://api.github.com/repos/JnyRoad/StaffDeck/branches{/branch}",
-        "clone_url": "https://github.com/JnyRoad/StaffDeck.git",
-        "collaborators_url": "https://api.github.com/repos/JnyRoad/StaffDeck/collaborators{/collaborator}",
-        "comments_url": "https://api.github.com/repos/JnyRoad/StaffDeck/comments{/number}",
-        "commits_url": "https://api.github.com/repos/JnyRoad/StaffDeck/commits{/sha}",
-        "compare_url": "https://api.github.com/repos/JnyRoad/StaffDeck/compare/{base}...{head}",
-        "contents_url": "https://api.github.com/repos/JnyRoad/StaffDeck/contents/{+path}",
-        "contributors_url": "https://api.github.com/repos/JnyRoad/StaffDeck/contributors",
+        "assignees_url": "https://api.github.com/repos/JnyRoad/FirmDeck/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/JnyRoad/FirmDeck/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/JnyRoad/FirmDeck/branches{/branch}",
+        "clone_url": "https://github.com/JnyRoad/FirmDeck.git",
+        "collaborators_url": "https://api.github.com/repos/JnyRoad/FirmDeck/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/JnyRoad/FirmDeck/comments{/number}",
+        "commits_url": "https://api.github.com/repos/JnyRoad/FirmDeck/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/JnyRoad/FirmDeck/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/JnyRoad/FirmDeck/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/JnyRoad/FirmDeck/contributors",
         "created_at": "2026-08-29T02:57:26Z",
         "default_branch": "main",
-        "deployments_url": "https://api.github.com/repos/JnyRoad/StaffDeck/deployments",
+        "deployments_url": "https://api.github.com/repos/JnyRoad/FirmDeck/deployments",
         "description": "Enterprise Digital Employee Platform",
         "disabled": false,
-        "downloads_url": "https://api.github.com/repos/JnyRoad/StaffDeck/downloads",
-        "events_url": "https://api.github.com/repos/JnyRoad/StaffDeck/events",
+        "downloads_url": "https://api.github.com/repos/JnyRoad/FirmDeck/downloads",
+        "events_url": "https://api.github.com/repos/JnyRoad/FirmDeck/events",
         "fork": true,
         "forks": 0,
         "forks_count": 0,
-        "forks_url": "https://api.github.com/repos/JnyRoad/StaffDeck/forks",
-        "full_name": "JnyRoad/StaffDeck",
-        "git_commits_url": "https://api.github.com/repos/JnyRoad/StaffDeck/git/commits{/sha}",
-        "git_refs_url": "https://api.github.com/repos/JnyRoad/StaffDeck/git/refs{/sha}",
-        "git_tags_url": "https://api.github.com/repos/JnyRoad/StaffDeck/git/tags{/sha}",
-        "git_url": "git://github.com/JnyRoad/StaffDeck.git",
+        "forks_url": "https://api.github.com/repos/JnyRoad/FirmDeck/forks",
+        "full_name": "JnyRoad/FirmDeck",
+        "git_commits_url": "https://api.github.com/repos/JnyRoad/FirmDeck/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/JnyRoad/FirmDeck/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/JnyRoad/FirmDeck/git/tags{/sha}",
+        "git_url": "git://github.com/JnyRoad/FirmDeck.git",
         "has_discussions": false,
         "has_downloads": false,
         "has_issues": false,
@@ -589,18 +589,18 @@
         "has_projects": true,
         "has_pull_requests": true,
         "has_wiki": false,
-        "homepage": "http://staffdeck.openbmb.cn/",
-        "hooks_url": "https://api.github.com/repos/JnyRoad/StaffDeck/hooks",
-        "html_url": "https://github.com/JnyRoad/StaffDeck",
+        "homepage": "http://firmdeck.openbmb.cn/",
+        "hooks_url": "https://api.github.com/repos/JnyRoad/FirmDeck/hooks",
+        "html_url": "https://github.com/JnyRoad/FirmDeck",
         "id": 1350222700,
         "is_template": false,
-        "issue_comment_url": "https://api.github.com/repos/JnyRoad/StaffDeck/issues/comments{/number}",
-        "issue_events_url": "https://api.github.com/repos/JnyRoad/StaffDeck/issues/events{/number}",
-        "issues_url": "https://api.github.com/repos/JnyRoad/StaffDeck/issues{/number}",
-        "keys_url": "https://api.github.com/repos/JnyRoad/StaffDeck/keys{/key_id}",
-        "labels_url": "https://api.github.com/repos/JnyRoad/StaffDeck/labels{/name}",
+        "issue_comment_url": "https://api.github.com/repos/JnyRoad/FirmDeck/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/JnyRoad/FirmDeck/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/JnyRoad/FirmDeck/issues{/number}",
+        "keys_url": "https://api.github.com/repos/JnyRoad/FirmDeck/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/JnyRoad/FirmDeck/labels{/name}",
         "language": "Python",
-        "languages_url": "https://api.github.com/repos/JnyRoad/StaffDeck/languages",
+        "languages_url": "https://api.github.com/repos/JnyRoad/FirmDeck/languages",
         "license": {
           "key": "agpl-3.0",
           "name": "GNU Affero General Public License v3.0",
@@ -608,12 +608,12 @@
           "spdx_id": "AGPL-3.0",
           "url": "https://api.github.com/licenses/agpl-3.0"
         },
-        "merges_url": "https://api.github.com/repos/JnyRoad/StaffDeck/merges",
-        "milestones_url": "https://api.github.com/repos/JnyRoad/StaffDeck/milestones{/number}",
+        "merges_url": "https://api.github.com/repos/JnyRoad/FirmDeck/merges",
+        "milestones_url": "https://api.github.com/repos/JnyRoad/FirmDeck/milestones{/number}",
         "mirror_url": null,
-        "name": "StaffDeck",
+        "name": "FirmDeck",
         "node_id": "R_kgDOUHrDbA",
-        "notifications_url": "https://api.github.com/repos/JnyRoad/StaffDeck/notifications{?since,all,participating}",
+        "notifications_url": "https://api.github.com/repos/JnyRoad/FirmDeck/notifications{?since,all,participating}",
         "open_issues": 0,
         "open_issues_count": 0,
         "owner": {
@@ -639,23 +639,23 @@
         },
         "private": false,
         "pull_request_creation_policy": "all",
-        "pulls_url": "https://api.github.com/repos/JnyRoad/StaffDeck/pulls{/number}",
+        "pulls_url": "https://api.github.com/repos/JnyRoad/FirmDeck/pulls{/number}",
         "pushed_at": "2026-09-02T03:18:45Z",
-        "releases_url": "https://api.github.com/repos/JnyRoad/StaffDeck/releases{/id}",
+        "releases_url": "https://api.github.com/repos/JnyRoad/FirmDeck/releases{/id}",
         "size": 32761,
-        "ssh_url": "git@github.com:JnyRoad/StaffDeck.git",
+        "ssh_url": "git@github.com:JnyRoad/FirmDeck.git",
         "stargazers_count": 0,
-        "stargazers_url": "https://api.github.com/repos/JnyRoad/StaffDeck/stargazers",
-        "statuses_url": "https://api.github.com/repos/JnyRoad/StaffDeck/statuses/{sha}",
-        "subscribers_url": "https://api.github.com/repos/JnyRoad/StaffDeck/subscribers",
-        "subscription_url": "https://api.github.com/repos/JnyRoad/StaffDeck/subscription",
-        "svn_url": "https://github.com/JnyRoad/StaffDeck",
-        "tags_url": "https://api.github.com/repos/JnyRoad/StaffDeck/tags",
-        "teams_url": "https://api.github.com/repos/JnyRoad/StaffDeck/teams",
+        "stargazers_url": "https://api.github.com/repos/JnyRoad/FirmDeck/stargazers",
+        "statuses_url": "https://api.github.com/repos/JnyRoad/FirmDeck/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/JnyRoad/FirmDeck/subscribers",
+        "subscription_url": "https://api.github.com/repos/JnyRoad/FirmDeck/subscription",
+        "svn_url": "https://github.com/JnyRoad/FirmDeck",
+        "tags_url": "https://api.github.com/repos/JnyRoad/FirmDeck/tags",
+        "teams_url": "https://api.github.com/repos/JnyRoad/FirmDeck/teams",
         "topics": [],
-        "trees_url": "https://api.github.com/repos/JnyRoad/StaffDeck/git/trees{/sha}",
+        "trees_url": "https://api.github.com/repos/JnyRoad/FirmDeck/git/trees{/sha}",
         "updated_at": "2026-09-02T00:41:41Z",
-        "url": "https://api.github.com/repos/JnyRoad/StaffDeck",
+        "url": "https://api.github.com/repos/JnyRoad/FirmDeck",
         "visibility": "public",
         "watchers": 0,
         "watchers_count": 0,
@@ -688,46 +688,46 @@
     "changed_files": 1,
     "closed_at": "2026-08-29T06:29:32Z",
     "comments": 0,
-    "comments_url": "https://api.github.com/repos/JnyRoad/StaffDeck/issues/2/comments",
+    "comments_url": "https://api.github.com/repos/JnyRoad/FirmDeck/issues/2/comments",
     "commits": 1,
-    "commits_url": "https://api.github.com/repos/JnyRoad/StaffDeck/pulls/2/commits",
+    "commits_url": "https://api.github.com/repos/JnyRoad/FirmDeck/pulls/2/commits",
     "created_at": "2026-08-29T06:27:26Z",
     "deletions": 17,
-    "diff_url": "https://github.com/JnyRoad/StaffDeck/pull/2.diff",
+    "diff_url": "https://github.com/JnyRoad/FirmDeck/pull/2.diff",
     "draft": false,
     "head": {
       "label": "JnyRoad:claude/ui-optimization-design-92dde2",
       "ref": "claude/ui-optimization-design-92dde2",
       "repo": {
         "allow_forking": true,
-        "archive_url": "https://api.github.com/repos/JnyRoad/StaffDeck/{archive_format}{/ref}",
+        "archive_url": "https://api.github.com/repos/JnyRoad/FirmDeck/{archive_format}{/ref}",
         "archived": false,
-        "assignees_url": "https://api.github.com/repos/JnyRoad/StaffDeck/assignees{/user}",
-        "blobs_url": "https://api.github.com/repos/JnyRoad/StaffDeck/git/blobs{/sha}",
-        "branches_url": "https://api.github.com/repos/JnyRoad/StaffDeck/branches{/branch}",
-        "clone_url": "https://github.com/JnyRoad/StaffDeck.git",
-        "collaborators_url": "https://api.github.com/repos/JnyRoad/StaffDeck/collaborators{/collaborator}",
-        "comments_url": "https://api.github.com/repos/JnyRoad/StaffDeck/comments{/number}",
-        "commits_url": "https://api.github.com/repos/JnyRoad/StaffDeck/commits{/sha}",
-        "compare_url": "https://api.github.com/repos/JnyRoad/StaffDeck/compare/{base}...{head}",
-        "contents_url": "https://api.github.com/repos/JnyRoad/StaffDeck/contents/{+path}",
-        "contributors_url": "https://api.github.com/repos/JnyRoad/StaffDeck/contributors",
+        "assignees_url": "https://api.github.com/repos/JnyRoad/FirmDeck/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/JnyRoad/FirmDeck/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/JnyRoad/FirmDeck/branches{/branch}",
+        "clone_url": "https://github.com/JnyRoad/FirmDeck.git",
+        "collaborators_url": "https://api.github.com/repos/JnyRoad/FirmDeck/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/JnyRoad/FirmDeck/comments{/number}",
+        "commits_url": "https://api.github.com/repos/JnyRoad/FirmDeck/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/JnyRoad/FirmDeck/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/JnyRoad/FirmDeck/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/JnyRoad/FirmDeck/contributors",
         "created_at": "2026-08-29T02:57:26Z",
         "default_branch": "main",
-        "deployments_url": "https://api.github.com/repos/JnyRoad/StaffDeck/deployments",
+        "deployments_url": "https://api.github.com/repos/JnyRoad/FirmDeck/deployments",
         "description": "Enterprise Digital Employee Platform",
         "disabled": false,
-        "downloads_url": "https://api.github.com/repos/JnyRoad/StaffDeck/downloads",
-        "events_url": "https://api.github.com/repos/JnyRoad/StaffDeck/events",
+        "downloads_url": "https://api.github.com/repos/JnyRoad/FirmDeck/downloads",
+        "events_url": "https://api.github.com/repos/JnyRoad/FirmDeck/events",
         "fork": true,
         "forks": 0,
         "forks_count": 0,
-        "forks_url": "https://api.github.com/repos/JnyRoad/StaffDeck/forks",
-        "full_name": "JnyRoad/StaffDeck",
-        "git_commits_url": "https://api.github.com/repos/JnyRoad/StaffDeck/git/commits{/sha}",
-        "git_refs_url": "https://api.github.com/repos/JnyRoad/StaffDeck/git/refs{/sha}",
-        "git_tags_url": "https://api.github.com/repos/JnyRoad/StaffDeck/git/tags{/sha}",
-        "git_url": "git://github.com/JnyRoad/StaffDeck.git",
+        "forks_url": "https://api.github.com/repos/JnyRoad/FirmDeck/forks",
+        "full_name": "JnyRoad/FirmDeck",
+        "git_commits_url": "https://api.github.com/repos/JnyRoad/FirmDeck/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/JnyRoad/FirmDeck/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/JnyRoad/FirmDeck/git/tags{/sha}",
+        "git_url": "git://github.com/JnyRoad/FirmDeck.git",
         "has_discussions": false,
         "has_downloads": false,
         "has_issues": false,
@@ -735,18 +735,18 @@
         "has_projects": true,
         "has_pull_requests": true,
         "has_wiki": false,
-        "homepage": "http://staffdeck.openbmb.cn/",
-        "hooks_url": "https://api.github.com/repos/JnyRoad/StaffDeck/hooks",
-        "html_url": "https://github.com/JnyRoad/StaffDeck",
+        "homepage": "http://firmdeck.openbmb.cn/",
+        "hooks_url": "https://api.github.com/repos/JnyRoad/FirmDeck/hooks",
+        "html_url": "https://github.com/JnyRoad/FirmDeck",
         "id": 1350222700,
         "is_template": false,
-        "issue_comment_url": "https://api.github.com/repos/JnyRoad/StaffDeck/issues/comments{/number}",
-        "issue_events_url": "https://api.github.com/repos/JnyRoad/StaffDeck/issues/events{/number}",
-        "issues_url": "https://api.github.com/repos/JnyRoad/StaffDeck/issues{/number}",
-        "keys_url": "https://api.github.com/repos/JnyRoad/StaffDeck/keys{/key_id}",
-        "labels_url": "https://api.github.com/repos/JnyRoad/StaffDeck/labels{/name}",
+        "issue_comment_url": "https://api.github.com/repos/JnyRoad/FirmDeck/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/JnyRoad/FirmDeck/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/JnyRoad/FirmDeck/issues{/number}",
+        "keys_url": "https://api.github.com/repos/JnyRoad/FirmDeck/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/JnyRoad/FirmDeck/labels{/name}",
         "language": "Python",
-        "languages_url": "https://api.github.com/repos/JnyRoad/StaffDeck/languages",
+        "languages_url": "https://api.github.com/repos/JnyRoad/FirmDeck/languages",
         "license": {
           "key": "agpl-3.0",
           "name": "GNU Affero General Public License v3.0",
@@ -754,12 +754,12 @@
           "spdx_id": "AGPL-3.0",
           "url": "https://api.github.com/licenses/agpl-3.0"
         },
-        "merges_url": "https://api.github.com/repos/JnyRoad/StaffDeck/merges",
-        "milestones_url": "https://api.github.com/repos/JnyRoad/StaffDeck/milestones{/number}",
+        "merges_url": "https://api.github.com/repos/JnyRoad/FirmDeck/merges",
+        "milestones_url": "https://api.github.com/repos/JnyRoad/FirmDeck/milestones{/number}",
         "mirror_url": null,
-        "name": "StaffDeck",
+        "name": "FirmDeck",
         "node_id": "R_kgDOUHrDbA",
-        "notifications_url": "https://api.github.com/repos/JnyRoad/StaffDeck/notifications{?since,all,participating}",
+        "notifications_url": "https://api.github.com/repos/JnyRoad/FirmDeck/notifications{?since,all,participating}",
         "open_issues": 0,
         "open_issues_count": 0,
         "owner": {
@@ -785,23 +785,23 @@
         },
         "private": false,
         "pull_request_creation_policy": "all",
-        "pulls_url": "https://api.github.com/repos/JnyRoad/StaffDeck/pulls{/number}",
+        "pulls_url": "https://api.github.com/repos/JnyRoad/FirmDeck/pulls{/number}",
         "pushed_at": "2026-09-02T03:18:45Z",
-        "releases_url": "https://api.github.com/repos/JnyRoad/StaffDeck/releases{/id}",
+        "releases_url": "https://api.github.com/repos/JnyRoad/FirmDeck/releases{/id}",
         "size": 32761,
-        "ssh_url": "git@github.com:JnyRoad/StaffDeck.git",
+        "ssh_url": "git@github.com:JnyRoad/FirmDeck.git",
         "stargazers_count": 0,
-        "stargazers_url": "https://api.github.com/repos/JnyRoad/StaffDeck/stargazers",
-        "statuses_url": "https://api.github.com/repos/JnyRoad/StaffDeck/statuses/{sha}",
-        "subscribers_url": "https://api.github.com/repos/JnyRoad/StaffDeck/subscribers",
-        "subscription_url": "https://api.github.com/repos/JnyRoad/StaffDeck/subscription",
-        "svn_url": "https://github.com/JnyRoad/StaffDeck",
-        "tags_url": "https://api.github.com/repos/JnyRoad/StaffDeck/tags",
-        "teams_url": "https://api.github.com/repos/JnyRoad/StaffDeck/teams",
+        "stargazers_url": "https://api.github.com/repos/JnyRoad/FirmDeck/stargazers",
+        "statuses_url": "https://api.github.com/repos/JnyRoad/FirmDeck/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/JnyRoad/FirmDeck/subscribers",
+        "subscription_url": "https://api.github.com/repos/JnyRoad/FirmDeck/subscription",
+        "svn_url": "https://github.com/JnyRoad/FirmDeck",
+        "tags_url": "https://api.github.com/repos/JnyRoad/FirmDeck/tags",
+        "teams_url": "https://api.github.com/repos/JnyRoad/FirmDeck/teams",
         "topics": [],
-        "trees_url": "https://api.github.com/repos/JnyRoad/StaffDeck/git/trees{/sha}",
+        "trees_url": "https://api.github.com/repos/JnyRoad/FirmDeck/git/trees{/sha}",
         "updated_at": "2026-09-02T00:41:41Z",
-        "url": "https://api.github.com/repos/JnyRoad/StaffDeck",
+        "url": "https://api.github.com/repos/JnyRoad/FirmDeck",
         "visibility": "public",
         "watchers": 0,
         "watchers_count": 0,
@@ -830,9 +830,9 @@
         "user_view_type": "public"
       }
     },
-    "html_url": "https://github.com/JnyRoad/StaffDeck/pull/2",
+    "html_url": "https://github.com/JnyRoad/FirmDeck/pull/2",
     "id": 4390394084,
-    "issue_url": "https://api.github.com/repos/JnyRoad/StaffDeck/issues/2",
+    "issue_url": "https://api.github.com/repos/JnyRoad/FirmDeck/issues/2",
     "labels": [],
     "locked": false,
     "maintainer_can_modify": false,
@@ -865,18 +865,18 @@
     "milestone": null,
     "node_id": "PR_kwDOUHrDbM8AAAABBbAY5A",
     "number": 2,
-    "patch_url": "https://github.com/JnyRoad/StaffDeck/pull/2.patch",
+    "patch_url": "https://github.com/JnyRoad/FirmDeck/pull/2.patch",
     "rebaseable": null,
     "requested_reviewers": [],
     "requested_teams": [],
-    "review_comment_url": "https://api.github.com/repos/JnyRoad/StaffDeck/pulls/comments{/number}",
+    "review_comment_url": "https://api.github.com/repos/JnyRoad/FirmDeck/pulls/comments{/number}",
     "review_comments": 0,
-    "review_comments_url": "https://api.github.com/repos/JnyRoad/StaffDeck/pulls/2/comments",
+    "review_comments_url": "https://api.github.com/repos/JnyRoad/FirmDeck/pulls/2/comments",
     "state": "closed",
-    "statuses_url": "https://api.github.com/repos/JnyRoad/StaffDeck/statuses/abfebd7b3b9fb645b0bc917dab7f9980862e0585",
+    "statuses_url": "https://api.github.com/repos/JnyRoad/FirmDeck/statuses/abfebd7b3b9fb645b0bc917dab7f9980862e0585",
     "title": "fix(chat): show full session title via tooltip on hover",
     "updated_at": "2026-08-29T06:29:32Z",
-    "url": "https://api.github.com/repos/JnyRoad/StaffDeck/pulls/2",
+    "url": "https://api.github.com/repos/JnyRoad/FirmDeck/pulls/2",
     "user": {
       "avatar_url": "https://avatars.githubusercontent.com/u/213567479?v=4",
       "events_url": "https://api.github.com/users/JnyRoad/events{/privacy}",
@@ -901,7 +901,7 @@
   },
   "review_comments": [],
   "reviews": [],
-  "source_repository": "JnyRoad/StaffDeck",
+  "source_repository": "JnyRoad/FirmDeck",
   "timeline": [
     {
       "author": {
@@ -915,22 +915,22 @@
         "name": "JnyRoad"
       },
       "event": "committed",
-      "html_url": "https://github.com/JnyRoad/StaffDeck/commit/abfebd7b3b9fb645b0bc917dab7f9980862e0585",
+      "html_url": "https://github.com/JnyRoad/FirmDeck/commit/abfebd7b3b9fb645b0bc917dab7f9980862e0585",
       "message": "fix(chat): show full session title via styled tooltip on hover\n\nThe sidebar session list truncates long titles/subtitles with an\nellipsis, and the only way to read the full text was the browser's\nnative `title` attribute tooltip (unstyled, delayed), inconsistent\nwith the Radix tooltip already used for the row avatar.\n\nWrap the title/subtitle block in the same Tooltip/TooltipContent\nused elsewhere in this component so hovering shows the full title\nand subtitle. Row height, truncation and list density are unchanged.\n\nTesting:\n- tsc -b --noEmit: no errors\n- vitest run src/components/AppSidebar.test.tsx: 6 passed\n- vite build: succeeds",
       "node_id": "C_kwDOUHrDbNoAKGFiZmViZDdiM2I5ZmI2NDViMGJjOTE3ZGFiN2Y5OTgwODYyZTA1ODU",
       "parents": [
         {
-          "html_url": "https://github.com/JnyRoad/StaffDeck/commit/540acc5c8db10d251d92b2287955fab85c267a78",
+          "html_url": "https://github.com/JnyRoad/FirmDeck/commit/540acc5c8db10d251d92b2287955fab85c267a78",
           "sha": "540acc5c8db10d251d92b2287955fab85c267a78",
-          "url": "https://api.github.com/repos/JnyRoad/StaffDeck/git/commits/540acc5c8db10d251d92b2287955fab85c267a78"
+          "url": "https://api.github.com/repos/JnyRoad/FirmDeck/git/commits/540acc5c8db10d251d92b2287955fab85c267a78"
         }
       ],
       "sha": "abfebd7b3b9fb645b0bc917dab7f9980862e0585",
       "tree": {
         "sha": "0cb7c029c22d43951b81c0d2f82160c9f323b3d8",
-        "url": "https://api.github.com/repos/JnyRoad/StaffDeck/git/trees/0cb7c029c22d43951b81c0d2f82160c9f323b3d8"
+        "url": "https://api.github.com/repos/JnyRoad/FirmDeck/git/trees/0cb7c029c22d43951b81c0d2f82160c9f323b3d8"
       },
-      "url": "https://api.github.com/repos/JnyRoad/StaffDeck/git/commits/abfebd7b3b9fb645b0bc917dab7f9980862e0585",
+      "url": "https://api.github.com/repos/JnyRoad/FirmDeck/git/commits/abfebd7b3b9fb645b0bc917dab7f9980862e0585",
       "verification": {
         "payload": null,
         "reason": "unsigned",
@@ -962,13 +962,13 @@
         "user_view_type": "public"
       },
       "commit_id": "2f8c56c7888718975f2db42020c8b0e2a884f61b",
-      "commit_url": "https://api.github.com/repos/JnyRoad/StaffDeck/commits/2f8c56c7888718975f2db42020c8b0e2a884f61b",
+      "commit_url": "https://api.github.com/repos/JnyRoad/FirmDeck/commits/2f8c56c7888718975f2db42020c8b0e2a884f61b",
       "created_at": "2026-08-29T06:29:32Z",
       "event": "merged",
       "id": 30202557633,
       "node_id": "ME_lADOUHrDbM8AAAABOwPEZs8AAAAHCDZ0wQ",
       "performed_via_github_app": null,
-      "url": "https://api.github.com/repos/JnyRoad/StaffDeck/issues/events/30202557633"
+      "url": "https://api.github.com/repos/JnyRoad/FirmDeck/issues/events/30202557633"
     },
     {
       "actor": {
@@ -1001,7 +1001,7 @@
       "node_id": "CE_lADOUHrDbM8AAAABOwPEZs8AAAAHCDZ00A",
       "performed_via_github_app": null,
       "state_reason": null,
-      "url": "https://api.github.com/repos/JnyRoad/StaffDeck/issues/events/30202557648"
+      "url": "https://api.github.com/repos/JnyRoad/FirmDeck/issues/events/30202557648"
     }
   ]
 }

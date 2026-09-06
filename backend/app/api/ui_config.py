@@ -353,7 +353,7 @@ def get_chat_ui_config(
 
 def _active_runtime_network() -> dict[str, str | int]:
     """Read desktop runtime state first, then derive a trusted web-server runtime state."""
-    raw_snapshot = os.environ.get("STAFFDECK_RUNTIME_NETWORK", "")
+    raw_snapshot = os.environ.get("FIRMDECK_RUNTIME_NETWORK", "")
     if raw_snapshot:
         try:
             return parse_runtime_network_snapshot(raw_snapshot)
@@ -395,7 +395,7 @@ def _web_runtime_network() -> dict[str, str | int]:
         port = int(raw_port)
     except ValueError as exc:
         raise NetworkSettingsValidationError("Web 服务监听端口无效") from exc
-    public_url = os.environ.get("STAFFDECK_PUBLIC_URL", "").strip()
+    public_url = os.environ.get("FIRMDECK_PUBLIC_URL", "").strip()
     mode = (
         "public"
         if public_url
@@ -457,7 +457,7 @@ def _network_settings_read() -> NetworkSettingsRead:
 
 
 def _api_base_url(origin: str) -> str:
-    """Append the StaffDeck Open API root exactly once to a validated runtime origin."""
+    """Append the FirmDeck Open API root exactly once to a validated runtime origin."""
     return f"{origin.rstrip('/')}/api/v1"
 
 
@@ -513,7 +513,7 @@ _restart_scheduled = False
 
 
 def _schedule_application_restart(delay_seconds: float = 1.0) -> None:
-    """Exit after the response is flushed; the service supervisor restarts StaffDeck."""
+    """Exit after the response is flushed; the service supervisor restarts FirmDeck."""
 
     global _restart_scheduled
     with _restart_lock:

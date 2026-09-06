@@ -2180,7 +2180,7 @@ def _migrate_channel_scope_rebuild(conn, inspector, tables: set[str]) -> None:
                         channel VARCHAR,
                         external_account_scope VARCHAR NOT NULL DEFAULT '',
                         external_user_id VARCHAR NOT NULL,
-                        staffdeck_user_id VARCHAR,
+                        firmdeck_user_id VARCHAR,
                         display_name VARCHAR,
                         created_at DATETIME,
                         updated_at DATETIME,
@@ -2205,7 +2205,7 @@ def _migrate_channel_scope_rebuild(conn, inspector, tables: set[str]) -> None:
                         external_user_id = f"group:{external_user_id.removeprefix('group_')}"
                     identity_key = (
                         str(row["tenant_id"]),
-                        str(row.get("staffdeck_user_id") or ""),
+                        str(row.get("firmdeck_user_id") or ""),
                         external_user_id,
                     )
                     session_scopes = identity_session_scopes.get(identity_key, set())
@@ -2244,7 +2244,7 @@ def _migrate_channel_scope_rebuild(conn, inspector, tables: set[str]) -> None:
                         scope = next(iter(tenant_scopes)) if len(tenant_scopes) == 1 else "legacy"
                 else:
                     scope = ""
-                current_user_id = str(row.get("staffdeck_user_id") or "")
+                current_user_id = str(row.get("firmdeck_user_id") or "")
                 if user_tenant_by_id is not None and user_tenant_by_id.get(
                     current_user_id
                 ) != str(row["tenant_id"]):
@@ -2271,11 +2271,11 @@ def _migrate_channel_scope_rebuild(conn, inspector, tables: set[str]) -> None:
                         """
                         INSERT INTO channel_identities_new (
                             id, tenant_id, channel, external_account_scope, external_user_id,
-                            staffdeck_user_id, display_name, created_at, updated_at
+                            firmdeck_user_id, display_name, created_at, updated_at
                         )
                         VALUES (
                             :id, :tenant_id, :channel, :scope, :external_user_id,
-                            :staffdeck_user_id, :display_name, :created_at, :updated_at
+                            :firmdeck_user_id, :display_name, :created_at, :updated_at
                         )
                         """
                     ),
@@ -2285,7 +2285,7 @@ def _migrate_channel_scope_rebuild(conn, inspector, tables: set[str]) -> None:
                         "channel": row["channel"],
                         "scope": scope,
                         "external_user_id": external_user_id,
-                        "staffdeck_user_id": row["staffdeck_user_id"],
+                        "firmdeck_user_id": row["firmdeck_user_id"],
                         "display_name": row.get("display_name"),
                         "created_at": row.get("created_at"),
                         "updated_at": row.get("updated_at"),
@@ -2297,7 +2297,7 @@ def _migrate_channel_scope_rebuild(conn, inspector, tables: set[str]) -> None:
                 "CREATE INDEX IF NOT EXISTS ix_channel_identities_tenant_id ON channel_identities (tenant_id)",
                 "CREATE INDEX IF NOT EXISTS ix_channel_identities_channel ON channel_identities (channel)",
                 "CREATE INDEX IF NOT EXISTS ix_channel_identities_external_account_scope ON channel_identities (external_account_scope)",
-                "CREATE INDEX IF NOT EXISTS ix_channel_identities_staffdeck_user_id ON channel_identities (staffdeck_user_id)",
+                "CREATE INDEX IF NOT EXISTS ix_channel_identities_firmdeck_user_id ON channel_identities (firmdeck_user_id)",
             ):
                 conn.execute(text(index_sql))
 
@@ -4220,7 +4220,7 @@ def _archive_default_agent(conn, tenant_id: str) -> None:
     metadata.update(
         {
             "is_default_employee": True,
-            "hidden_from_staffdeck": True,
+            "hidden_from_firmdeck": True,
             "archived_by_seed": True,
             "owner_user_id": "admin",
             "owner_username": "admin",

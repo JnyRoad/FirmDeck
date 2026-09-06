@@ -9,7 +9,7 @@ import {
 import { Badge } from '@/components/ui';
 import { createTenantClient } from '@/api/tenant-client';
 import { useTenantSession } from '@/contexts/TenantSessionContext';
-import { staffdeckDisplayText } from '@/employee';
+import { firmdeckDisplayText } from '@/employee';
 import type { TeamRead } from '@/types';
 import IconEdit from '@/assets/icons/edit.svg?react';
 import IconChevronDown from '@/assets/icons/chevron-down.svg?react';
@@ -34,7 +34,7 @@ export default function ChatHeader({ chat }: { chat: UseChatSession }) {
   const tenantClient = useMemo(() => createTenantClient(tenantContext), [tenantContext]);
   const teamId = currentSession?.team_id || null;
   const rawName = currentSession?.title
-    ? staffdeckDisplayText(currentSession.title)
+    ? firmdeckDisplayText(currentSession.title)
     : currentSession?.id || t('chat.header.newConversation');
   const username = auth?.user?.username || '';
   const initial = username ? username.slice(0, 1).toUpperCase() : '--';

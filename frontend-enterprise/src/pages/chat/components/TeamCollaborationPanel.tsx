@@ -4,7 +4,7 @@ import { ChevronDown, CircleAlert, LoaderCircle, SendHorizontal } from 'lucide-r
 import { createTenantClient } from '@/api/tenant-client';
 import EmployeeAvatar from '@/components/EmployeeAvatar';
 import { useTenantSession } from '@/contexts/TenantSessionContext';
-import { staffdeckDisplayText } from '@/employee';
+import { firmdeckDisplayText } from '@/employee';
 import { RawContent, RawIdentifier } from '@/i18n/RawContent';
 import { useAppIntl } from '@/i18n/useAppIntl';
 import { cn } from '@/lib/utils';
@@ -64,7 +64,7 @@ function collaborationTrace(rows: TurnTraceRead[]): { turnId: string; trace: Tur
 
 /** 从团队会话标题中移除协议前缀；返回的标题属于业务数据，不进行翻译。 */
 function conversationTitle(conversation: TeamConversationRead): string {
-  return staffdeckDisplayText(conversation.title)
+  return firmdeckDisplayText(conversation.title)
     .replace(/^团队任务验收:/, '')
     .replace(/^团队竞标(?:打分|裁决)?:/, '')
     .replace(/^团队任务:/, '')
@@ -382,16 +382,16 @@ export default function TeamCollaborationPanel({
     const traceLineSummary = traceSnapshot
       ? traceSummary(traceSnapshot.trace, traceLines, t)
       : null;
-    const streamReply = staffdeckDisplayText(stream?.content || '');
+    const streamReply = firmdeckDisplayText(stream?.content || '');
     const showStreamReply = Boolean(
       streamReply
       && memberReplies.length === 0,
     );
-    const preview = staffdeckDisplayText(conversation.preview || '');
+    const preview = firmdeckDisplayText(conversation.preview || '');
     const taskId = conversation.task_id || '';
     const waitingForInput = Boolean(conversation.needs_input && taskId);
     const submitted = Boolean(taskId && submittedTaskIds.includes(taskId));
-    const pendingQuestion = staffdeckDisplayText(conversation.pending_question || conversation.preview || '');
+    const pendingQuestion = firmdeckDisplayText(conversation.pending_question || conversation.preview || '');
     const taskAnswer = taskId ? (answerByTaskId[taskId] || '') : '';
     const submitError = taskId ? submitErrorByTaskId[taskId] : '';
 
@@ -539,7 +539,7 @@ export default function TeamCollaborationPanel({
                       role: 'assistant',
                     };
                     const visibleContent = stripTrailingCitationSummary(
-                      staffdeckDisplayText(message.content),
+                      firmdeckDisplayText(message.content),
                     );
                     const citations = knowledgeCitations(chatMessage, visibleContent);
                     const artifacts = harnessWorkspaceArtifacts(chatMessage);

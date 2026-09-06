@@ -83,8 +83,8 @@ type MockControlPlane = {
 
 const SYSTEM_AUTH_STORAGE_KEY = 'ultrarag_system_auth';
 const ENTERPRISE_AUTH_STORAGE_KEY = 'ultrarag_auth';
-const ONBOARDING_SEEN_STORAGE_KEY = 'staffdeck_onboarding_guide_seen';
-const QUICK_START_SEEN_STORAGE_KEY = 'staffdeck_quick_start_guide_seen';
+const ONBOARDING_SEEN_STORAGE_KEY = 'firmdeck_onboarding_guide_seen';
+const QUICK_START_SEEN_STORAGE_KEY = 'firmdeck_quick_start_guide_seen';
 const ALPHA_SCOPE_KEY = 'skill_agent:tenant-user:v1:["tenant-alpha","user-alpha-admin","selected-agent"]';
 const BETA_SCOPE_KEY = 'skill_agent:tenant-user:v1:["tenant-beta","user-beta-admin","selected-agent"]';
 const SYSTEM_TOKEN = 'e2e-system-token';
@@ -504,11 +504,11 @@ async function seedStorage(
 ): Promise<void> {
   await page.addInitScript(
     ({ locale: storedLocale, systemSession, tenantSession, onboardingSeenStorageKey, quickStartSeenStorageKey }) => {
-      const seedMarker = '__staffdeck_e2e_tenant_seeded__';
+      const seedMarker = '__firmdeck_e2e_tenant_seeded__';
       if (window.sessionStorage.getItem(seedMarker) === '1') return;
       window.localStorage.clear();
       window.sessionStorage.clear();
-      window.localStorage.setItem('staffdeck_locale', storedLocale);
+      window.localStorage.setItem('firmdeck_locale', storedLocale);
       // This fixture represents a returning user so the session-replacement assertions
       // exercise tenant data isolation instead of the unrelated first-run guide.
       window.localStorage.setItem(onboardingSeenStorageKey, '1');

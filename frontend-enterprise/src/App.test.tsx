@@ -214,8 +214,8 @@ function stubBrowserApis() {
 beforeEach(() => {
   stubBrowserApis();
   window.localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify(authSession));
-  window.localStorage.setItem('staffdeck_onboarding_guide_seen', '1');
-  window.localStorage.setItem('staffdeck_quick_start_guide_seen', '1');
+  window.localStorage.setItem('firmdeck_onboarding_guide_seen', '1');
+  window.localStorage.setItem('firmdeck_quick_start_guide_seen', '1');
 });
 
 afterEach(() => {

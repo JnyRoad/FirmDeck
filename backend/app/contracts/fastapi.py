@@ -1,4 +1,4 @@
-"""FastAPI application-level adapters for StaffDeck-owned public error contracts."""
+"""FastAPI application-level adapters for FirmDeck-owned public error contracts."""
 
 from __future__ import annotations
 

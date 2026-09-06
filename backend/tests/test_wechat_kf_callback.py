@@ -653,7 +653,7 @@ def test_avatar_chunked_limit_rejects_before_multipart_parser(monkeypatch) -> No
         return await real_parse(self)
 
     monkeypatch.setattr(formparsers.MultiPartParser, "parse", record_parse)
-    boundary = "staffdeck-boundary"
+    boundary = "firmdeck-boundary"
     prefix = (
         f"--{boundary}\r\n"
         'Content-Disposition: form-data; name="file"; filename="avatar.png"\r\n'

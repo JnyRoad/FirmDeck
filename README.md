@@ -1,11 +1,11 @@
 <div align="center">
 
-<img src="packaging/assets/staffdeck_banner_en.png" alt="StaffDeck logo" />
+<img src="packaging/assets/firmdeck_banner_en.png" alt="FirmDeck logo" />
 
 <p align="center">
-  <a href="https://staffdeck.openbmb.cn/"><img src="https://img.shields.io/badge/Website-staffdeck.openbmb.cn-FF6B35?style=flat-square&logo=googlechrome&logoColor=white" alt="Official Website"/></a>
+  <a href="https://firmdeck.openbmb.cn/"><img src="https://img.shields.io/badge/Website-firmdeck.openbmb.cn-FF6B35?style=flat-square&logo=googlechrome&logoColor=white" alt="Official Website"/></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-AGPL_3.0-blue.svg?style=flat-square" alt="License"/></a>
-  <a href="https://github.com/OpenBMB/StaffDeck/stargazers"><img src="https://img.shields.io/github/stars/OpenBMB/StaffDeck?style=flat-square" alt="Stars"/></a>
+  <a href="https://github.com/OpenBMB/FirmDeck/stargazers"><img src="https://img.shields.io/github/stars/OpenBMB/FirmDeck?style=flat-square" alt="Stars"/></a>
   <br/>
   <a href="#-Community"><img src="https://img.shields.io/badge/Discord-Join_Community-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Discord"/></a>
   &nbsp;
@@ -22,11 +22,11 @@
 - **2026-08-18**: We present v0.4.0 for multi-staff cooperation and faster runing.
 - **2026-08-06**: We present  v0.3.0 for SOP editing and sandbox.
 - **2026-08-03**: We present v0.2.0 for harnessv2 and IM system.
-- **2026-07-15**: StaffDeck is now open source! We welcome your feedback and support with a Star.
+- **2026-07-15**: FirmDeck is now open source! We welcome your feedback and support with a Star.
 
-# 💡 About StaffDeck
+# 💡 About FirmDeck
 
-StaffDeck is an enterprise platform for building and managing digital employees. It helps professionals turn their work experience, business processes, and decision criteria into digital employees that can operate continuously, take over repetitive tasks, and preserve individual expertise as reusable, evolvable, and traceable organizational assets. StaffDeck is jointly developed by the [ModelBest](https://modelbest.cn/), [NEU-ModelBest Data Intelligence Joint Lab](https://neuir.github.io/), [THUNLP](https://nlp.csai.tsinghua.edu.cn/), [OpenBMB](https://www.openbmb.cn/home), and [AI9Stars](https://github.com/AI9Stars) for enterprises and institutions seeking to advance AI from a personal productivity tool to an organizational capability.
+FirmDeck is an enterprise platform for building and managing digital employees. It helps professionals turn their work experience, business processes, and decision criteria into digital employees that can operate continuously, take over repetitive tasks, and preserve individual expertise as reusable, evolvable, and traceable organizational assets. FirmDeck is jointly developed by the [ModelBest](https://modelbest.cn/), [NEU-ModelBest Data Intelligence Joint Lab](https://neuir.github.io/), [THUNLP](https://nlp.csai.tsinghua.edu.cn/), [OpenBMB](https://www.openbmb.cn/home), and [AI9Stars](https://github.com/AI9Stars) for enterprises and institutions seeking to advance AI from a personal productivity tool to an organizational capability.
 
 ## Core Features
 
@@ -37,23 +37,23 @@ StaffDeck is an enterprise platform for building and managing digital employees.
 
 ## Desktop Downloads
 
-Visit the [StaffDeck official website](https://staffdeck.openbmb.cn/) or download the latest desktop release directly:
+Visit the [FirmDeck official website](https://firmdeck.openbmb.cn/) or download the latest desktop release directly:
 
 | Platform | Architecture | Download |
 | --- | --- | --- |
-| macOS | Apple Silicon (arm64) | [Download `.dmg`](https://github.com/OpenBMB/StaffDeck/releases/latest/download/StaffDeck-macos-arm64.dmg) |
-| macOS | Intel (x86_64) | [Download `.dmg`](https://github.com/OpenBMB/StaffDeck/releases/latest/download/StaffDeck-macos-x86_64.dmg) |
-| Windows | x64 | [Download installer `.exe`](https://github.com/OpenBMB/StaffDeck/releases/latest/download/StaffDeck-windows-x64-setup.exe) |
-| Linux | x86_64 (Debian/Ubuntu) | [Download `.deb`](https://github.com/OpenBMB/StaffDeck/releases/latest/download/StaffDeck-linux-x86_64.deb) |
+| macOS | Apple Silicon (arm64) | [Download `.dmg`](https://github.com/OpenBMB/FirmDeck/releases/latest/download/FirmDeck-macos-arm64.dmg) |
+| macOS | Intel (x86_64) | [Download `.dmg`](https://github.com/OpenBMB/FirmDeck/releases/latest/download/FirmDeck-macos-x86_64.dmg) |
+| Windows | x64 | [Download installer `.exe`](https://github.com/OpenBMB/FirmDeck/releases/latest/download/FirmDeck-windows-x64-setup.exe) |
+| Linux | x86_64 (Debian/Ubuntu) | [Download `.deb`](https://github.com/OpenBMB/FirmDeck/releases/latest/download/FirmDeck-linux-x86_64.deb) |
 
-Linux packages listen on `127.0.0.1` by default. Use `staffdeck setup` from a
+Linux packages listen on `127.0.0.1` by default. Use `firmdeck setup` from a
 terminal to choose the listening mode and port, including on a headless host:
 
 ```bash
-staffdeck setup
-staffdeck setup --mode local --port 5173
-staffdeck setup --mode lan --port 5173
-staffdeck setup --mode public --port 5173 --public-url https://staff.example.com
+firmdeck setup
+firmdeck setup --mode local --port 5173
+firmdeck setup --mode lan --port 5173
+firmdeck setup --mode public --port 5173 --public-url https://staff.example.com
 ```
 
 `local` listens only on the machine; `lan` and `public` listen on `0.0.0.0`.
@@ -67,11 +67,11 @@ setup is saved per user and applied on the next launch.
 
 Paste the prompt below into Cursor, Claude Code, or Codex. For code-based
 deployments, you can also override the launch at runtime with
-`ULTRARAG_HOST`, `ULTRARAG_PORT`, and `STAFFDECK_PUBLIC_URL`:
+`ULTRARAG_HOST`, `ULTRARAG_PORT`, and `FIRMDECK_PUBLIC_URL`:
 
 ```text
-Read https://raw.githubusercontent.com/OpenBMB/StaffDeck/main/README.md.
-Clone the OpenBMB/StaffDeck repository, prepare Python 3.11 or newer and Node.js 20,
+Read https://raw.githubusercontent.com/OpenBMB/FirmDeck/main/README.md.
+Clone the OpenBMB/FirmDeck repository, prepare Python 3.11 or newer and Node.js 20,
 create backend/.venv, install the backend and frontend dependencies, copy
 backend/.env.example to backend/.env, ask me for the OpenAI-compatible model
 endpoint and API key if they are missing, and use the commands documented for
@@ -83,7 +83,7 @@ plus /workspace/gallery before reporting success.
 
 ## Table of Contents
 
-- [💡 About StaffDeck](#-about-staffdeck)
+- [💡 About FirmDeck](#-about-firmdeck)
   - [Core Features](#core-features)
   - [Desktop Downloads](#desktop-downloads)
   - [Agent-Friendly Quick Deploy](#agent-friendly-quick-deploy)
@@ -124,8 +124,8 @@ plus /workspace/gallery before reporting success.
 Clone the repository first:
 
 ```bash
-git clone https://github.com/OpenBMB/StaffDeck.git
-cd StaffDeck
+git clone https://github.com/OpenBMB/FirmDeck.git
+cd FirmDeck
 ```
 
 On macOS, Linux, or WSL:
@@ -159,11 +159,11 @@ DEMO_MODEL_API_KEY="your-api-key"
 
 The API key is used to create the initial model configuration and is encrypted before being stored in the database. Do not commit `backend/.env`.
 
-Alternatively, start StaffDeck, open **Admin → Model Configuration → New Model**, select
-**ChatGPT subscription (Codex)**, and choose **Connect ChatGPT subscription**. StaffDeck opens the
+Alternatively, start FirmDeck, open **Admin → Model Configuration → New Model**, select
+**ChatGPT subscription (Codex)**, and choose **Connect ChatGPT subscription**. FirmDeck opens the
 Codex-managed ChatGPT login page in the default browser on the same machine. The configured
 `CODEX_SUBSCRIPTION_COMMAND` defaults to `codex` and is resolved from `PATH` at runtime, so the
-actual installed Codex CLI is used. StaffDeck does not ask for, return, or store a ChatGPT OAuth
+actual installed Codex CLI is used. FirmDeck does not ask for, return, or store a ChatGPT OAuth
 code, callback, access token, refresh token, or subscription credential. API Key and subscription
 models can coexist. Signing out signs the local Codex CLI out of ChatGPT, affecting every
 subscription model and potentially other applications on the same computer that share that Codex
@@ -177,7 +177,7 @@ remote or headless deployments.
 | macOS, Linux, or WSL | `scripts/dev_up.sh --detach` |
 | Windows PowerShell | `.\scripts\dev_up.ps1 --detach` |
 
-Both wrappers call the same cross-platform Python lifecycle entry, `scripts/dev.py`. The startup process builds the StaffDeck frontend and serves the UI, API, and Swagger documentation from one FastAPI process on port `5173`.
+Both wrappers call the same cross-platform Python lifecycle entry, `scripts/dev.py`. The startup process builds the FirmDeck frontend and serves the UI, API, and Swagger documentation from one FastAPI process on port `5173`.
 
 Initial demo-tenant credentials: tenant slug `demo`, username `admin`, password `admin`. Please change the password after first login.
 
@@ -256,7 +256,7 @@ Codex A2A is installation-owned (`system_runtime_key=codex_a2a`), not a tenant a
 desktop application itself. Enabling it requires both `CODEX_A2A_ENABLED=true` and a dedicated,
 non-empty `CODEX_A2A_TOKEN`. New development databases use the explicit owner schema; a development
 database containing the old `a2a_codex` pseudo-tenant/schema must be rebuilt only after its exact path
-is confirmed. StaffDeck does not add a runtime compatibility branch or automatically delete that data.
+is confirmed. FirmDeck does not add a runtime compatibility branch or automatically delete that data.
 
 ### Useful Commands
 
@@ -285,11 +285,11 @@ Replace `up --detach` with another lifecycle argument when needed:
 | Inspect service status | `status` |
 | Stop the local service | `down` |
 
-> Full guide → [StaffDeck Tutorial](https://staffdeck.openbmb.cn/#/docs/introduce?lang=en)
+> Full guide → [FirmDeck Tutorial](https://firmdeck.openbmb.cn/#/docs/introduce?lang=en)
 
 ## MCP OAuth 2.1 + PKCE
 
-Saved Streamable HTTP MCP servers can opt in to per-user OAuth from the MCP server editor. StaffDeck
+Saved Streamable HTTP MCP servers can opt in to per-user OAuth from the MCP server editor. FirmDeck
 uses the pinned official Python MCP SDK for protected discovery and invocation while preserving the
 existing client for no-auth, stdio, builtin, and legacy SSE connections.
 
@@ -300,7 +300,7 @@ existing client for no-auth, stdio, builtin, and legacy SSE connections.
   encrypted at rest and are never returned by server/status APIs.
 - The configured redirect URI must use the exact
   `/api/enterprise/mcp-servers/oauth/callback` path. In deployed environments its HTTPS origin must
-  match `STAFFDECK_PUBLIC_URL`; loopback HTTP is allowed only for local development.
+  match `FIRMDECK_PUBLIC_URL`; loopback HTTP is allowed only for local development.
 - The callback is accepted only from the same browser flow that started authorization, using a
   short-lived HttpOnly, SameSite cookie scoped to the callback path.
 - Every SDK HTTP target is restricted to HTTPS and public addresses. DNS is resolved and validated
@@ -315,10 +315,10 @@ existing client for no-auth, stdio, builtin, and legacy SSE connections.
 - Frozen builds collect the `mcp` package modules and distribution metadata because the adapter checks
   the reviewed SDK version at runtime.
 
-Provider registration remains external: the provider must accept the StaffDeck redirect URI and the
+Provider registration remains external: the provider must accept the FirmDeck redirect URI and the
 configured public client identity, CIMD document, or SDK-supported dynamic registration. Live-provider
 interoperability is not implied by the controlled tests and must be validated separately with an
-approved StaffDeck client registration.
+approved FirmDeck client registration.
 
 
 
@@ -340,7 +340,7 @@ Digital employees can serve users directly over IM channels: users chat with emp
 
 - Mount multiple digital employees on one channel account; dispatch with `/员工`, `/切换 <name>`, `/当前`, `/帮助`;
 - Intent auto-routing: each message is classified by an LLM and routed to the best-matching employee (stricter threshold during SOPs; sticky during human handoff and after manual switches);
-- Identity merge: channel users run `/绑定 <one-time code>` to merge their channel identity into an existing StaffDeck account (memory and sessions unified; `/解绑` to revert);
+- Identity merge: channel users run `/绑定 <one-time code>` to merge their channel identity into an existing FirmDeck account (memory and sessions unified; `/解绑` to revert);
 - Conversation history and delivery logs grouped by day with pagination; admins and employee creators can review all channel conversations per permission;
 - Reliability: inbound idempotency, crash recovery, outbound retry with backoff, token-expiry alerts, and WeChat session self-healing.
 
@@ -366,9 +366,9 @@ Digital employees can serve users directly over IM channels: users chat with emp
 ## Project Structure
 
 ```text
-StaffDeck/
+FirmDeck/
 ├── backend/                  # FastAPI APIs, agent runtime, storage, and task workers
-├── frontend-enterprise/      # React/TypeScript StaffDeck workspace
+├── frontend-enterprise/      # React/TypeScript FirmDeck workspace
 ├── docs/                     # Tutorials, APIs, schemas, and example flows
 ├── scripts/                  # Single-port service lifecycle and validation scripts
 ├── packaging/                # macOS, Linux, and Windows packaging assets
@@ -389,10 +389,10 @@ for the error code.
 </details>
 
 <details>
-<summary><strong>Can StaffDeck run without a local GPU?</strong></summary>
+<summary><strong>Can FirmDeck run without a local GPU?</strong></summary>
 
 Yes. API Key models call the endpoint you configure, while subscription models use the local Codex
-runtime; neither path requires a GPU for StaffDeck itself. GPU requirements depend on the model
+runtime; neither path requires a GPU for FirmDeck itself. GPU requirements depend on the model
 service you deploy or use.
 </details>
 
@@ -408,10 +408,10 @@ Marketplace resources are reusable templates. Regular users can copy or bind aut
 - [x] More enterprise connectors and reviewed marketplace resources (WeChat and WeCom channel integration shipped)
 - [ ] Fine-grained approval policies for high-risk tool actions
 
-Roadmap priorities are driven by real deployment needs. Please open an [Issue](https://github.com/OpenBMB/StaffDeck/issues) with a reproducible scenario and expected behavior.
+Roadmap priorities are driven by real deployment needs. Please open an [Issue](https://github.com/OpenBMB/FirmDeck/issues) with a reproducible scenario and expected behavior.
 
 # 💬 Community
-- For bugs and feature requests, please open a [GitHub Issues](https://github.com/OpenBMB/StaffDeck/issues)。
+- For bugs and feature requests, please open a [GitHub Issues](https://github.com/OpenBMB/FirmDeck/issues)。
 - For business corporation, please contact:
   ```
   agentverse@modelbest.cn
@@ -455,23 +455,23 @@ Keep unrelated worktree changes intact, add tests proportional to the affected b
 
 ## Citation
 
-When using StaffDeck in internal research or authorized public materials, cite:
+When using FirmDeck in internal research or authorized public materials, cite:
 
 ```bibtex
-@software{StaffDeck2026,
-  title  = {StaffDeck: Build, Run, and Govern Enterprise Digital Employees},
+@software{FirmDeck2026,
+  title  = {FirmDeck: Build, Run, and Govern Enterprise Digital Employees},
   author = {OpenBMB},
   year   = {2026},
-  url    = {https://github.com/OpenBMB/StaffDeck}
+  url    = {https://github.com/OpenBMB/FirmDeck}
 }
 ```
 ## Star History
 
-<a href="https://www.star-history.com/?repos=openbmb%2Fstaffdeck&type=date&legend=top-left">
+<a href="https://www.star-history.com/?repos=openbmb%2Ffirmdeck&type=date&legend=top-left">
  <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=openbmb/staffdeck&type=date&theme=dark&legend=top-left&sealed_token=lLohLC57bGAPh4lrzSYu2xW6Fmkavbj5r-T25GGt-jA10veIrv9OBPs0wiE5A98VIxP0NyxjbloW1t5OnPdVn6RT_L6Dmsp5EnfiWsGirs6G3Bv5_l_zUw" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=openbmb/staffdeck&type=date&legend=top-left&sealed_token=lLohLC57bGAPh4lrzSYu2xW6Fmkavbj5r-T25GGt-jA10veIrv9OBPs0wiE5A98VIxP0NyxjbloW1t5OnPdVn6RT_L6Dmsp5EnfiWsGirs6G3Bv5_l_zUw" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=openbmb/staffdeck&type=date&legend=top-left&sealed_token=lLohLC57bGAPh4lrzSYu2xW6Fmkavbj5r-T25GGt-jA10veIrv9OBPs0wiE5A98VIxP0NyxjbloW1t5OnPdVn6RT_L6Dmsp5EnfiWsGirs6G3Bv5_l_zUw" />
+      <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=openbmb/firmdeck&type=date&theme=dark&legend=top-left&sealed_token=lLohLC57bGAPh4lrzSYu2xW6Fmkavbj5r-T25GGt-jA10veIrv9OBPs0wiE5A98VIxP0NyxjbloW1t5OnPdVn6RT_L6Dmsp5EnfiWsGirs6G3Bv5_l_zUw" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=openbmb/firmdeck&type=date&legend=top-left&sealed_token=lLohLC57bGAPh4lrzSYu2xW6Fmkavbj5r-T25GGt-jA10veIrv9OBPs0wiE5A98VIxP0NyxjbloW1t5OnPdVn6RT_L6Dmsp5EnfiWsGirs6G3Bv5_l_zUw" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=openbmb/firmdeck&type=date&legend=top-left&sealed_token=lLohLC57bGAPh4lrzSYu2xW6Fmkavbj5r-T25GGt-jA10veIrv9OBPs0wiE5A98VIxP0NyxjbloW1t5OnPdVn6RT_L6Dmsp5EnfiWsGirs6G3Bv5_l_zUw" />
  </picture>
 </a>
 
@@ -481,4 +481,4 @@ This project is open source under the GNU Affero General Public License v3.0.
 
 ## Acknowledgments
 
-StaffDeck is incubated by the [OpenBMB](https://www.openbmb.cn/) ecosystem.
+FirmDeck is incubated by the [OpenBMB](https://www.openbmb.cn/) ecosystem.

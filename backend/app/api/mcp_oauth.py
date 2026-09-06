@@ -109,7 +109,7 @@ def get_mcp_oauth_status(
     db: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ) -> MCPOAuthStatusRead:
-    """Read OAuth state for exactly the signed-in StaffDeck user."""
+    """Read OAuth state for exactly the signed-in FirmDeck user."""
     ensure_current_user_tenant(tenant_id, current_user)
     server = _get_server(db, tenant_id, server_id)
     if server.auth_mode != "oauth_personal":

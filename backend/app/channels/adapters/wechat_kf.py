@@ -1,4 +1,4 @@
-"""Adapt WeChat Customer Service provider payloads to StaffDeck's channel data plane.
+"""Adapt WeChat Customer Service provider payloads to FirmDeck's channel data plane.
 
 This module owns provider authentication, bounded media/text transport, account administration,
 and inbound normalization. Callback verification and API routing belong to the later API task.
@@ -356,7 +356,7 @@ def _filename_from_content_disposition(value: str) -> str:
 
 
 class WeChatKfAdapter:
-    """Provide StaffDeck's normalized and outbound operations for WeChat客服."""
+    """Provide FirmDeck's normalized and outbound operations for WeChat客服."""
 
     def __init__(self, token_provider: WeChatKfTokenProvider | None = None) -> None:
         """Use the supplied token provider or create one process-local provider cache."""
@@ -413,7 +413,7 @@ class WeChatKfAdapter:
         *,
         max_bytes: int = 0,
     ) -> bytes:
-        """Download one image/file within both StaffDeck and provider byte limits.
+        """Download one image/file within both FirmDeck and provider byte limits.
 
         Successful responses may update the in-memory descriptor's safe filename and MIME type.
         Network/empty/malformed responses are transient, provider validation errors are permanent,
@@ -630,7 +630,7 @@ class WeChatKfAdapter:
         return media_id
 
     def contact_way(
-        self, binding: ChannelBinding, *, open_kfid: str, scene: str = "staffdeck"
+        self, binding: ChannelBinding, *, open_kfid: str, scene: str = "firmdeck"
     ) -> str:
         """Create a provider consultation URL for one non-empty客服 account."""
         normalized_open_kfid = open_kfid.strip()
