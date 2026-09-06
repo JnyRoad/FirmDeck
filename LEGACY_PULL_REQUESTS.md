@@ -1,6 +1,6 @@
 # Legacy Pull Requests
 
-The original `JnyRoad/StaffDeck` fork was deleted after this archive was
+The original `JnyRoad/FirmDeck` fork was deleted after this archive was
 created. GitHub cannot migrate native pull request records to an independent
 repository, so these static records preserve the historical data alongside the
 complete Git commit history already present in FirmDeck.

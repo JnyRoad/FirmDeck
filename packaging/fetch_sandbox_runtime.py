@@ -26,8 +26,8 @@ PACKAGE = "@anthropic-ai/sandbox-runtime@0.0.67"
 MANIFEST_DIR = Path(__file__).resolve().parent
 PACKAGE_JSON = MANIFEST_DIR / "sandbox-runtime-package.json"
 PACKAGE_LOCK = MANIFEST_DIR / "sandbox-runtime-package-lock.json"
-NODE_VERSION = os.environ.get("STAFFDECK_NODE_VERSION", "v22.14.0")
-PATCH_MARKER = "staffdeck-allow-all-domains-patch-v1"
+NODE_VERSION = os.environ.get("FIRMDECK_NODE_VERSION", "v22.14.0")
+PATCH_MARKER = "firmdeck-allow-all-domains-patch-v1"
 PATCHED_SHA256 = {
     "sandbox-config.js": "17a9bdd4cce375bb098f9c02eb564cf80806079571d4ff784e2af7d27db446bb",
     "sandbox-manager.js": "dca5176508d6ee31807e2138eea82bcbb6f6e5e40c67aff2ac9958d3bc893b4c",
@@ -140,7 +140,7 @@ def _download_node_runtime(destination: Path) -> None:
         raise SystemExit(f"Unsupported Node platform: {system}")
     filename = f"node-{NODE_VERSION}-{target}.{suffix}"
     url = f"https://nodejs.org/dist/{NODE_VERSION}/{filename}"
-    with tempfile.TemporaryDirectory(prefix="staffdeck-node-") as temp:
+    with tempfile.TemporaryDirectory(prefix="firmdeck-node-") as temp:
         archive = Path(temp) / filename
         try:
             socket.setdefaulttimeout(60)
@@ -148,12 +148,12 @@ def _download_node_runtime(destination: Path) -> None:
         except Exception as exc:
             raise SystemExit(f"Failed to download Node runtime from {url}: {exc}") from exc
         expected_hash = (
-            os.environ.get("STAFFDECK_NODE_SHA256", "").strip().lower()
+            os.environ.get("FIRMDECK_NODE_SHA256", "").strip().lower()
             or NODE_SHA256.get(filename, "")
         )
         if not expected_hash:
             raise SystemExit(
-                f"No trusted SHA256 is configured for {filename}; set STAFFDECK_NODE_SHA256."
+                f"No trusted SHA256 is configured for {filename}; set FIRMDECK_NODE_SHA256."
             )
         actual_hash = hashlib.sha256(archive.read_bytes()).hexdigest()
         if actual_hash != expected_hash:

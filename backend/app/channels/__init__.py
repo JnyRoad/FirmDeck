@@ -127,8 +127,8 @@ def get_dingtalk_stream_manager():
 
 
 def channel_services_enabled() -> bool:
-    # staffdeck_role 预留角色拆分：all=单体全量，connector=仅渠道连接器
-    return get_settings().staffdeck_role in {"all", "connector"}
+    # firmdeck_role 预留角色拆分：all=单体全量，connector=仅渠道连接器
+    return get_settings().firmdeck_role in {"all", "connector"}
 
 
 def _ensure_adapters_registered() -> None:
@@ -229,7 +229,7 @@ def restart_binding_ingress(channel: str, binding_id: str, *, wait_seconds: floa
 def start_channel_services() -> None:
     global _intake_sweep_thread
     if not channel_services_enabled():
-        logger.info("staffdeck_role=%s,渠道服务不启动", get_settings().staffdeck_role)
+        logger.info("firmdeck_role=%s,渠道服务不启动", get_settings().firmdeck_role)
         return
     if not _acquire_connector_process_lock():
         raise RuntimeError("检测到另一 connector 进程正在运行；每个数据库仅允许一个 connector")
@@ -250,7 +250,7 @@ def start_channel_services() -> None:
         # 启动恢复:一次性清扫崩溃残留的 processing 入站事件(独立线程,不阻塞启动)
         _intake_sweep_thread = threading.Thread(
             target=sweep_stale_inbound_events,
-            name="staffdeck-channel-intake-sweep",
+            name="firmdeck-channel-intake-sweep",
             daemon=True,
         )
         _intake_sweep_thread.start()

@@ -1,4 +1,4 @@
-"""Resolve the immutable GitHub repository trusted by a packaged StaffDeck build."""
+"""Resolve the immutable GitHub repository trusted by a packaged FirmDeck build."""
 
 from __future__ import annotations
 
@@ -11,8 +11,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-DEFAULT_RELEASE_REPOSITORY = "OpenBMB/StaffDeck"
-DISTRIBUTION_METADATA_FILENAME = "staffdeck-distribution.json"
+DEFAULT_RELEASE_REPOSITORY = "OpenBMB/FirmDeck"
+DISTRIBUTION_METADATA_FILENAME = "firmdeck-distribution.json"
 _OWNER_PATTERN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?")
 _REPOSITORY_PATTERN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,98}[A-Za-z0-9_-])?")
 
@@ -71,7 +71,7 @@ def release_repository() -> str | None:
     """Resolve runtime identity while preventing frozen apps from accepting mutable overrides."""
     if getattr(sys, "frozen", False):
         return _bundled_release_repository()
-    configured = os.environ.get("STAFFDECK_RELEASE_REPOSITORY")
+    configured = os.environ.get("FIRMDECK_RELEASE_REPOSITORY")
     if configured is None or configured == "":
         return DEFAULT_RELEASE_REPOSITORY
     return validate_release_repository(configured)
@@ -140,7 +140,7 @@ def _configured_build_repository(variable_name: str) -> str | None:
 def resolve_build_release_repository(repository_root: Path) -> str:
     """Resolve package identity from explicit input, CI, GitHub origin, then the safe default."""
     # A caller-supplied identity is authoritative for controlled local and test builds.
-    explicit = _configured_build_repository("STAFFDECK_RELEASE_REPOSITORY")
+    explicit = _configured_build_repository("FIRMDECK_RELEASE_REPOSITORY")
     if explicit is not None:
         return explicit
 
@@ -162,7 +162,7 @@ def write_distribution_metadata(destination: Path, repository: str) -> Path:
     """Validate and write immutable package metadata; invalid build input raises ValueError."""
     validated = validate_release_repository(repository)
     if validated is None:
-        raise ValueError(f"invalid StaffDeck release repository: {repository!r}")
+        raise ValueError(f"invalid FirmDeck release repository: {repository!r}")
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(
         json.dumps({"release_repository": validated}, separators=(",", ":")) + "\n",

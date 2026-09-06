@@ -986,7 +986,7 @@ def test_repeated_start_stop_leaves_no_supervisor_threads_or_children(
         leaked_threads = [
             thread
             for thread in threading.enumerate()
-            if thread.name.startswith("staffdeck-feishu-supervisor")
+            if thread.name.startswith("firmdeck-feishu-supervisor")
         ]
         new_children = {
             process.pid for process in multiprocessing.active_children()

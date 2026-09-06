@@ -79,9 +79,9 @@ def _oauth_server_update(
             headers=headers or {},
         ),
         auth_mode="oauth_personal",
-        oauth_client_id="staffdeck-public",
+        oauth_client_id="firmdeck-public",
         oauth_redirect_uri=(
-            "https://staffdeck.example/api/enterprise/mcp-servers/oauth/callback"
+            "https://firmdeck.example/api/enterprise/mcp-servers/oauth/callback"
         ),
     )
 
@@ -113,9 +113,9 @@ def _seed_oauth_server_and_grant(
         transport="streamable_http",
         url="https://mcp.example.test/mcp",
         auth_mode="oauth_personal",
-        oauth_client_id="staffdeck-public",
+        oauth_client_id="firmdeck-public",
         oauth_redirect_uri=(
-            "https://staffdeck.example/api/enterprise/mcp-servers/oauth/callback"
+            "https://firmdeck.example/api/enterprise/mcp-servers/oauth/callback"
         ),
         headers_json=headers or {},
     )
@@ -139,7 +139,7 @@ def test_updating_oauth_binding_configuration_deletes_existing_grants(
     monkeypatch,
 ) -> None:
     """Catch server identity changes retaining tokens issued for the prior target."""
-    monkeypatch.setenv("STAFFDECK_PUBLIC_URL", "https://staffdeck.example")
+    monkeypatch.setenv("FIRMDECK_PUBLIC_URL", "https://firmdeck.example")
     with _test_session() as db:
         server = _seed_oauth_server_and_grant(db)
 
@@ -159,7 +159,7 @@ def test_updating_oauth_binding_configuration_cancels_pending_flows(
     """Prevent a callback for the old server identity from reaching its live SDK task."""
     import app.api.tools as tools_api
 
-    monkeypatch.setenv("STAFFDECK_PUBLIC_URL", "https://staffdeck.example")
+    monkeypatch.setenv("FIRMDECK_PUBLIC_URL", "https://firmdeck.example")
     invalidated: list[tuple[str, str, str]] = []
 
     class FakeChangeCoordinator:
@@ -209,7 +209,7 @@ def test_updating_oauth_binding_configuration_cancels_pending_flows(
 
 def test_rotating_static_mcp_headers_deletes_existing_oauth_grants(monkeypatch) -> None:
     """Prevent restoring an old grant after a static request credential is rotated."""
-    monkeypatch.setenv("STAFFDECK_PUBLIC_URL", "https://staffdeck.example")
+    monkeypatch.setenv("FIRMDECK_PUBLIC_URL", "https://firmdeck.example")
     with _test_session() as db:
         server = _seed_oauth_server_and_grant(db, headers={"X-API-Key": "old-key"})
 
@@ -227,7 +227,7 @@ def test_updating_only_oauth_server_presentation_preserves_existing_grants(
     monkeypatch,
 ) -> None:
     """Catch harmless presentation edits disconnecting every authorized user."""
-    monkeypatch.setenv("STAFFDECK_PUBLIC_URL", "https://staffdeck.example")
+    monkeypatch.setenv("FIRMDECK_PUBLIC_URL", "https://firmdeck.example")
     with _test_session() as db:
         server = _seed_oauth_server_and_grant(db)
 
@@ -297,7 +297,7 @@ def test_mcp_apps_negotiation_preserves_metadata_and_resource() -> None:
     tool = discovery["tools"][0]
     assert "io.modelcontextprotocol/ui" in discovery["server_capabilities"]["extensions"]
     assert tool["app"] == {
-        "resource_uri": "ui://staffdeck/demo-card",
+        "resource_uri": "ui://firmdeck/demo-card",
         "visibility": ["model", "app"],
     }
     assert tool["annotations"]["readOnlyHint"] is True
@@ -306,7 +306,7 @@ def test_mcp_apps_negotiation_preserves_metadata_and_resource() -> None:
     assert result["data"] == {"message": "hello"}
     assert result["meta"] == {"ui": {"render": True}}
 
-    resource = read_mcp_resource(config, "ui://staffdeck/demo-card")
+    resource = read_mcp_resource(config, "ui://firmdeck/demo-card")
     assert resource["contents"][0]["mimeType"] == "text/html;profile=mcp-app"
 
 
@@ -330,13 +330,13 @@ def test_mcp_app_resource_limit_is_ten_mib() -> None:
         {
             "contents": [
                 {
-                    "uri": "ui://staffdeck/large-card",
+                    "uri": "ui://firmdeck/large-card",
                     "mimeType": "text/html;profile=mcp-app",
                     "text": accepted,
                 }
             ]
         },
-        "ui://staffdeck/large-card",
+        "ui://firmdeck/large-card",
     )
     assert text == accepted
 
@@ -345,13 +345,13 @@ def test_mcp_app_resource_limit_is_ten_mib() -> None:
             {
                 "contents": [
                     {
-                        "uri": "ui://staffdeck/too-large",
+                        "uri": "ui://firmdeck/too-large",
                         "mimeType": "text/html;profile=mcp-app",
                         "text": "x" * (MCP_APP_RESOURCE_MAX_BYTES + 1),
                     }
                 ]
             },
-            "ui://staffdeck/too-large",
+            "ui://firmdeck/too-large",
         )
 
 
@@ -404,13 +404,13 @@ def test_synced_mcp_app_renders_and_calls_read_only_tool() -> None:
         )
         assert result.success is True
         assert result.mcp_app is not None
-        assert result.mcp_app.resource_uri == "ui://staffdeck/demo-card"
+        assert result.mcp_app.resource_uri == "ui://firmdeck/demo-card"
         assert result.mcp_metadata == {"ui": {"render": True}}
 
         resource = get_mcp_app_resource(
             server.id,
             "tenant_demo",
-            "ui://staffdeck/demo-card",
+            "ui://firmdeck/demo-card",
             "agent_overall",
             db,
             _admin_user(),
@@ -498,9 +498,9 @@ def test_protected_mcp_app_resource_uses_current_users_sdk_grant(monkeypatch) ->
             url="https://mcp.example.test/mcp",
             apps_mode="auto",
             auth_mode="oauth_personal",
-            oauth_client_id="staffdeck-public",
+            oauth_client_id="firmdeck-public",
             oauth_redirect_uri=(
-                "https://staffdeck.example.test/"
+                "https://firmdeck.example.test/"
                 "api/enterprise/mcp-servers/oauth/callback"
             ),
             enabled=True,
@@ -583,7 +583,7 @@ def test_mcp_app_side_effect_call_requires_confirmation() -> None:
             config_json={
                 "tool": "render_card",
                 "mcp_apps": {
-                    "resource_uri": "ui://staffdeck/demo-card",
+                    "resource_uri": "ui://firmdeck/demo-card",
                     "visibility": ["model", "app"],
                 },
                 "mcp_annotations": {},
@@ -652,7 +652,7 @@ def test_mcp_app_sop_specific_call_requires_active_sop() -> None:
             config_json={
                 "tool": "render_card",
                 "mcp_apps": {
-                    "resource_uri": "ui://staffdeck/demo-card",
+                    "resource_uri": "ui://firmdeck/demo-card",
                     "visibility": ["model", "app"],
                 },
                 "mcp_annotations": {"readOnlyHint": True},

@@ -123,7 +123,7 @@ class MCPOAuthFlowCoordinator:
     @staticmethod
     def browser_cookie_name(flow_id: str) -> str:
         """Return one host-only cookie name scoped to a single concurrent browser flow."""
-        return f"staffdeck_mcp_oauth_{flow_id}"
+        return f"firmdeck_mcp_oauth_{flow_id}"
 
     def browser_cookie_name_for_state(self, state: str) -> str | None:
         """Resolve the expected browser cookie without exposing its stored digest."""

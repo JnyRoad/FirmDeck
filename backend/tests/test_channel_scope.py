@@ -252,7 +252,7 @@ def test_bind_unbind_never_migrates_other_corp_data() -> None:
                 channel="wecom",
                 external_account_scope="corpA",
                 external_user_id="zhangsan",
-                staffdeck_user_id=lazy_a.id,
+                firmdeck_user_id=lazy_a.id,
             )
         )
         db.add(
@@ -261,7 +261,7 @@ def test_bind_unbind_never_migrates_other_corp_data() -> None:
                 channel="wecom",
                 external_account_scope="corpB",
                 external_user_id="zhangsan",
-                staffdeck_user_id=lazy_b.id,
+                firmdeck_user_id=lazy_b.id,
             )
         )
         db.add(
@@ -388,7 +388,7 @@ def _build_legacy_scope_schema(engine) -> None:
                     tenant_id VARCHAR,
                     channel VARCHAR,
                     external_user_id VARCHAR NOT NULL,
-                    staffdeck_user_id VARCHAR,
+                    firmdeck_user_id VARCHAR,
                     display_name VARCHAR,
                     created_at DATETIME,
                     updated_at DATETIME,
@@ -461,7 +461,7 @@ def _build_legacy_scope_schema(engine) -> None:
         )
         conn.execute(
             sa_text(
-                "INSERT INTO channel_identities (id, tenant_id, channel, external_user_id, staffdeck_user_id) VALUES "
+                "INSERT INTO channel_identities (id, tenant_id, channel, external_user_id, firmdeck_user_id) VALUES "
                 "('ci_1', 'tenant_demo', 'wecom', 'zhangsan', 'lazy_1'), "
                 "('ci_2', 'tenant_demo', 'wechat', 'wxid_1', 'lazy_2'), "
                 "('ci_3', 'tenant_b', 'wecom', 'lisi', 'lazy_3')"
@@ -566,7 +566,7 @@ def test_scope_rebuild_uses_session_binding_in_multi_corp_tenant(
         conn.execute(
             sa_text(
                 "INSERT INTO channel_identities "
-                "(id, tenant_id, channel, external_user_id, staffdeck_user_id) VALUES "
+                "(id, tenant_id, channel, external_user_id, firmdeck_user_id) VALUES "
                 "('ci_alice', 'tenant_demo', 'wecom', 'alice', 'old_user'), "
                 "('ci_ambiguous', 'tenant_demo', 'wecom', 'nobody', 'unused_user'), "
                 "('ci_group', 'tenant_demo', 'wecom', 'group_roomB', 'group_user'), "
@@ -618,7 +618,7 @@ def test_scope_rebuild_uses_session_binding_in_multi_corp_tenant(
         }
         group_identity = conn.execute(
             sa_text(
-                "SELECT external_user_id, staffdeck_user_id FROM channel_identities "
+                "SELECT external_user_id, firmdeck_user_id FROM channel_identities "
                 "WHERE id = 'ci_group'"
             )
         ).one()
@@ -765,7 +765,7 @@ def _seed_scope_history(engine, binding_id: str, scope: str) -> None:
                 channel="wecom",
                 external_account_scope=scope,
                 external_user_id="zhangsan",
-                staffdeck_user_id=lazy.id,
+                firmdeck_user_id=lazy.id,
             )
         )
         db.add(
@@ -818,7 +818,7 @@ def test_credentials_corp_id_fill_migrates_identity_sessions_and_pointer(monkeyp
         identity = db.exec(select(ChannelIdentity)).one()
         # 身份连续:scope 更新为 corpA,仍指向同一 User
         assert identity.external_account_scope == "corpA"
-        assert identity.staffdeck_user_id == "lazy_scope"
+        assert identity.firmdeck_user_id == "lazy_scope"
         assert db.get(ChatSession, "s_scope").external_conv_id == "wecom_corpA_p2p_zhangsan"
         state = db.exec(select(ChannelConvState)).one()
         assert state.external_conv_id == "wecom_corpA_p2p_zhangsan"
@@ -842,7 +842,7 @@ def test_scope_migration_includes_identities_without_sessions() -> None:
                 channel="wecom",
                 external_account_scope="aib_bot1",
                 external_user_id="zhangsan",
-                staffdeck_user_id="l1",
+                firmdeck_user_id="l1",
             )
         )
         db.add(
@@ -851,7 +851,7 @@ def test_scope_migration_includes_identities_without_sessions() -> None:
                 channel="wecom",
                 external_account_scope="aib_bot1",
                 external_user_id="lisi",
-                staffdeck_user_id="l2",
+                firmdeck_user_id="l2",
             )
         )
         binding = db.get(ChannelBinding, binding_id)
@@ -919,7 +919,7 @@ def test_scope_migration_normalizes_legacy_group_identity_once() -> None:
                 channel="wecom",
                 external_account_scope="aib_bot1",
                 external_user_id="group_aib_bot1_room1",
-                staffdeck_user_id="legacy_group_user",
+                firmdeck_user_id="legacy_group_user",
             )
         )
         binding = db.get(ChannelBinding, binding_id)
@@ -1075,7 +1075,7 @@ def test_scope_migration_narrowed_to_current_binding() -> None:
                     channel="wecom",
                     external_account_scope=scope,
                     external_user_id=conv_suffix,
-                    staffdeck_user_id=lazy_id,
+                    firmdeck_user_id=lazy_id,
                 )
             )
             db.add(
@@ -1158,7 +1158,7 @@ def test_scope_migration_conflict_aborts_without_merging_users() -> None:
                 channel="wecom",
                 external_account_scope="aib_bot1",
                 external_user_id="zhangsan",
-                staffdeck_user_id="lazy_old",
+                firmdeck_user_id="lazy_old",
             )
         )
         db.add(
@@ -1167,7 +1167,7 @@ def test_scope_migration_conflict_aborts_without_merging_users() -> None:
                 channel="wecom",
                 external_account_scope="corpY",
                 external_user_id="zhangsan",
-                staffdeck_user_id="user_web",
+                firmdeck_user_id="user_web",
             )
         )
         db.add(
@@ -1213,7 +1213,7 @@ def test_scope_migration_conflict_aborts_without_merging_users() -> None:
         # 合并后身份与会话一致:同一 User、同一 conv 前缀
         rows = db.exec(select(ChannelIdentity)).all()
         assert len(rows) == 2
-        assert {(row.external_account_scope, row.staffdeck_user_id) for row in rows} == {
+        assert {(row.external_account_scope, row.firmdeck_user_id) for row in rows} == {
             ("aib_bot1", "lazy_old"),
             ("corpY", "user_web"),
         }
@@ -1552,7 +1552,7 @@ def test_scope_backfill_priority_rules(monkeypatch, tmp_path) -> None:
         )
         conn.execute(
             sa_text(
-                "INSERT INTO channel_identities (id, tenant_id, channel, external_user_id, staffdeck_user_id) VALUES "
+                "INSERT INTO channel_identities (id, tenant_id, channel, external_user_id, firmdeck_user_id) VALUES "
                 "('id_alice', 'tenant_demo', 'wecom', 'alice', 'u_alice'), "
                 "('id_nobody', 'tenant_demo', 'wecom', 'nobody', 'u_nobody'), "
                 "('id_ghost', 'tenant_b', 'wecom', 'ghost', 'u_ghost')"

@@ -9,7 +9,7 @@ import {
   type AppLocale,
 } from './locales';
 
-const AGENT_REPLY_LOCALE_STORAGE_PREFIX = 'staffdeck_agent_reply_locale';
+const AGENT_REPLY_LOCALE_STORAGE_PREFIX = 'firmdeck_agent_reply_locale';
 
 export const LANGUAGE_CONTEXT_SOURCES = [
   'explicit_request',

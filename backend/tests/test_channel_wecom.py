@@ -381,9 +381,9 @@ def test_normalize_group_frame_preserves_leading_colleague_mention() -> None:
 
 
 def test_normalize_single_frame_preserves_leading_mention() -> None:
-    inbound = normalize_wecom_frame(_text_frame(text={"content": "@StaffDeck /帮助"}))
+    inbound = normalize_wecom_frame(_text_frame(text={"content": "@FirmDeck /帮助"}))
     assert inbound is not None
-    assert inbound.text == "@StaffDeck /帮助"
+    assert inbound.text == "@FirmDeck /帮助"
 
 
 def test_normalize_group_mention_only_frame_is_ignored() -> None:
@@ -759,18 +759,18 @@ def test_stream_reply_updates_separate_progress_and_answer_streams() -> None:
 
     assert client.sent
     assert client.sent[-2][1] == {
-        "stream_id": "staffdeck:binding-1:incoming-1:progress",
+        "stream_id": "firmdeck:binding-1:incoming-1:progress",
         "content": "✅ 流程已结束",
         "finish": True,
     }
     assert client.sent[-1][1] == {
-        "stream_id": "staffdeck:binding-1:incoming-1:answer",
+        "stream_id": "firmdeck:binding-1:incoming-1:answer",
         "content": "你好，世界",
         "finish": True,
     }
     assert {item[1]["stream_id"] for item in client.sent if "stream_id" in item[1]} == {
-        "staffdeck:binding-1:incoming-1:progress",
-        "staffdeck:binding-1:incoming-1:answer",
+        "firmdeck:binding-1:incoming-1:progress",
+        "firmdeck:binding-1:incoming-1:answer",
     }
 
 
@@ -815,11 +815,11 @@ def test_stream_reply_localizes_progress_and_preserves_raw_answer() -> None:
     answer_frames = [
         body for _target, body in client.sent if body.get("stream_id") == reply._answer_stream_id
     ]
-    assert progress_frames[-1]["stream_id"] == "staffdeck:binding-en:incoming-en:progress"
+    assert progress_frames[-1]["stream_id"] == "firmdeck:binding-en:incoming-en:progress"
     assert "✅ Workflow finished" in progress_frames[-1]["content"]
     assert progress_frames[-1]["finish"] is True
     assert answer_frames[-1] == {
-        "stream_id": "staffdeck:binding-en:incoming-en:answer",
+        "stream_id": "firmdeck:binding-en:incoming-en:answer",
         "content": raw,
         "finish": True,
     }
@@ -2434,7 +2434,7 @@ def _seed_disconnect_alert_binding(engine, *, age_minutes: float) -> str:
                 channel="wecom",
                 external_account_scope="aib_bot1",
                 external_user_id="owner_uid",
-                staffdeck_user_id="user_owner",
+                firmdeck_user_id="user_owner",
                 display_name="owner",
             )
         )

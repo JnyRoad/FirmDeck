@@ -1830,8 +1830,8 @@
     {
       "id": "toolsPage.a2a.connectionDescription",
       "source": "frontend-enterprise/src/pages/ToolsPage.tsx",
-      "en-US": "Automatically discover the Agent Card; prefer streaming subscription and fall back to polling after disconnect. StaffDeck persists tasks, events, and artifacts.",
-      "zh-CN": "自动发现 Agent Card；优先流式订阅，断线后回退轮询。任务、事件和产物由 StaffDeck 持久化。",
+      "en-US": "Automatically discover the Agent Card; prefer streaming subscription and fall back to polling after disconnect. FirmDeck persists tasks, events, and artifacts.",
+      "zh-CN": "自动发现 Agent Card；优先流式订阅，断线后回退轮询。任务、事件和产物由 FirmDeck 持久化。",
       "params": {}
     },
     {

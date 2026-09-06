@@ -1,7 +1,7 @@
 # Legacy Pull Request Archive
 
 This directory is a static snapshot of the pull request records from
-`JnyRoad/StaffDeck` taken before that repository was deleted.
+`JnyRoad/FirmDeck` taken before that repository was deleted.
 
 Each JSON file includes the PR metadata, issue comments, reviews, inline
 review comments, commits, changed-file metadata, timeline events, and head

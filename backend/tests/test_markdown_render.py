@@ -213,11 +213,11 @@ def test_parse_toplevel_code_block_hash_comment_not_heading():
 
 
 def test_parse_link():
-    blocks = parse_markdown("[StaffDeck](https://staffdeck.ai)")
+    blocks = parse_markdown("[FirmDeck](https://firmdeck.ai)")
     spans = blocks[0].spans
     link = next(s for s in spans if s.href)
-    assert link.text == "StaffDeck"
-    assert link.href == "https://staffdeck.ai"
+    assert link.text == "FirmDeck"
+    assert link.href == "https://firmdeck.ai"
 
 
 def test_parse_unordered_list():

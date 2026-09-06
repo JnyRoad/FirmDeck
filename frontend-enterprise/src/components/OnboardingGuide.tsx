@@ -13,11 +13,11 @@ import type { MessageId } from "@/i18n/types";
 import galleryImage from "@/assets/onboarding-gallery.png";
 import profileImage from "@/assets/onboarding-profile.png";
 
-export const ONBOARDING_SEEN_KEY = "staffdeck_onboarding_guide_seen";
+export const ONBOARDING_SEEN_KEY = "firmdeck_onboarding_guide_seen";
 
 /** Custom event that lets any part of the app re-open the onboarding guide. */
-export const OPEN_ONBOARDING_EVENT = "staffdeck-open-onboarding";
-export const OPEN_QUICK_START_EVENT = "staffdeck-open-quick-start";
+export const OPEN_ONBOARDING_EVENT = "firmdeck-open-onboarding";
+export const OPEN_QUICK_START_EVENT = "firmdeck-open-quick-start";
 
 type GuideCard = {
   icon: ReactNode;

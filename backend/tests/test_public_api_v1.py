@@ -1955,7 +1955,7 @@ def test_admin_account_master_key_sees_all_visible_tenant_agents(monkeypatch) ->
                 is_overall=False,
                 metadata_json={
                     "owner_user_id": admin.id,
-                    "hidden_from_staffdeck": True,
+                    "hidden_from_firmdeck": True,
                 },
             )
         )

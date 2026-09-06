@@ -9,7 +9,7 @@ class Settings(BaseSettings):
     app_name: str = "Skill Agent Loop Service"
     database_url: str = "sqlite:///./skill_agent_loop.db"
     app_secret: str = "change-me-in-development"
-    staffdeck_public_url: str = ""
+    firmdeck_public_url: str = ""
     system_admin_secret: str = Field(default="", repr=False, exclude=True)
     demo_model_base_url: str = "http://localhost:52010/v1"
     demo_model_name: str = "qwen3.6-27b"
@@ -40,7 +40,7 @@ class Settings(BaseSettings):
     general_skill_pip_timeout_seconds: int = 180
     general_skill_network_install: bool = True
     channel_secret: str = ""
-    staffdeck_role: str = "all"
+    firmdeck_role: str = "all"
     wechat_ilink_base_url: str = "https://ilinkai.weixin.qq.com"
     channel_delivery_poll_seconds: float = 1.0
     channel_delivery_max_attempts: int = 8

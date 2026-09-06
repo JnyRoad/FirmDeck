@@ -821,9 +821,9 @@ def test_protected_mcp_tool_without_user_identity_fails_closed(monkeypatch) -> N
                 transport="streamable_http",
                 url="https://mcp.example/mcp",
                 auth_mode="oauth_personal",
-                oauth_client_id="staffdeck-public",
+                oauth_client_id="firmdeck-public",
                 oauth_redirect_uri=(
-                    "https://staffdeck.example/api/enterprise/mcp-servers/oauth/callback"
+                    "https://firmdeck.example/api/enterprise/mcp-servers/oauth/callback"
                 ),
             )
         )
@@ -865,7 +865,7 @@ def test_protected_mcp_tool_uses_current_user_grant_and_official_adapter(monkeyp
             captured.update(kwargs)
 
         async def call_tool(self, name: str, arguments: dict[str, object]):
-            """Return the existing StaffDeck tool-result envelope without network access."""
+            """Return the existing FirmDeck tool-result envelope without network access."""
             captured["tool_name"] = name
             captured["arguments"] = arguments
             return {"data": {"ok": True}, "meta": {"provider": "official-sdk"}}
@@ -882,9 +882,9 @@ def test_protected_mcp_tool_uses_current_user_grant_and_official_adapter(monkeyp
                 url="https://mcp.example/mcp",
                 headers_json={"Authorization": "Bearer forbidden-static", "X-Public": "ok"},
                 auth_mode="oauth_personal",
-                oauth_client_id="staffdeck-public",
+                oauth_client_id="firmdeck-public",
                 oauth_redirect_uri=(
-                    "https://staffdeck.example/api/enterprise/"
+                    "https://firmdeck.example/api/enterprise/"
                     "mcp-servers/oauth/callback"
                 ),
             )

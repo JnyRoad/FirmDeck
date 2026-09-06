@@ -237,7 +237,7 @@ def harness_storage_root(*, tenant_id: str, db: Session | None = None) -> Path:
 def default_harness_storage_root() -> Path:
     """Return the user-owned default root for newly created Harness workspaces."""
 
-    return Path.home() / ".staffdeck" / "workspaces"
+    return Path.home() / ".firmdeck" / "workspaces"
 
 
 def legacy_harness_storage_root() -> Path:

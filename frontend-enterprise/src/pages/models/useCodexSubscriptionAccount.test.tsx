@@ -88,7 +88,7 @@ beforeEach(() => {
 afterEach(() => {
   vi.useRealTimers();
   vi.restoreAllMocks();
-  window.localStorage.setItem('staffdeck_locale', 'zh-CN');
+  window.localStorage.setItem('firmdeck_locale', 'zh-CN');
 });
 
 describe('useCodexSubscriptionAccount', () => {

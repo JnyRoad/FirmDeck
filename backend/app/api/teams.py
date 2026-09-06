@@ -136,7 +136,7 @@ from app.teams.wakeup import (
 
 router = APIRouter(prefix="/api/enterprise/teams", tags=["enterprise:teams"])
 
-TEAM_LOG_EXPORT_SCHEMA = "staffdeck.team-conversation-log.v1"
+TEAM_LOG_EXPORT_SCHEMA = "firmdeck.team-conversation-log.v1"
 
 # 可被人改判的任务状态:TL 验收后(review)或已升级(escalated)
 OVERRIDABLE_STATUSES = {"review", "escalated"}
@@ -1236,7 +1236,7 @@ def export_team_conversation_log(
         "sessions": _session_details_payload(db, tenant_id, ordered_sessions),
     }
     timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    filename = f"staffdeck-team-log-{_safe_filename_part(team.id)}-{timestamp}.json"
+    filename = f"firmdeck-team-log-{_safe_filename_part(team.id)}-{timestamp}.json"
     return _json_download_response(payload, filename)
 
 

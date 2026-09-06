@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 
 import { api } from '@/api/client';
-import StaffdeckIcon from '@/components/StaffdeckIcon';
+import FirmdeckIcon from '@/components/FirmdeckIcon';
 import { useAppIntl } from '@/i18n/useAppIntl';
 
 import type { MCPAppViewDescriptor } from '../chatTypes';
@@ -85,7 +85,7 @@ export default function MCPAppView({ descriptor }: { descriptor: MCPAppViewDescr
       if (request.method === 'ui/initialize' || request.method === 'ui/initialize/request') {
         postRpcResult(request.id, {
           protocolVersion: APP_PROTOCOL_VERSION,
-          hostInfo: { name: 'StaffDeck', version: '1' },
+          hostInfo: { name: 'FirmDeck', version: '1' },
           hostCapabilities: { tools: { call: true }, textFallback: true },
         });
         return;
@@ -162,7 +162,7 @@ export default function MCPAppView({ descriptor }: { descriptor: MCPAppViewDescr
   if (resourceLoadFailed) {
     return (
       <div className="mt-2 flex items-start gap-2 rounded-lg border border-[#eceef1] bg-[#fafbfc] px-3 py-2 text-xs text-[#858b9c]">
-        <StaffdeckIcon name="warning" size={14} />
+        <FirmdeckIcon name="warning" size={14} />
         <span>{t('chat.mcp.renderFailed')}</span>
       </div>
     );

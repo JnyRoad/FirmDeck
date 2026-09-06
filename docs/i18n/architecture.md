@@ -1,8 +1,8 @@
-# StaffDeck 国际化架构
+# FirmDeck 国际化架构
 
 ## 目标与边界
 
-StaffDeck 将国际化定义为产品契约，不是渲染后的文本替换。产品自有 UI、错误、系统事件与
+FirmDeck 将国际化定义为产品契约，不是渲染后的文本替换。产品自有 UI、错误、系统事件与
 Agent 控制提示可本地化；用户输入、员工/团队名、知识库/文档原文、Agent/工具/provider 原始产出、
 标识符、路径、密钥和技术日志不翻译。
 
@@ -51,7 +51,7 @@ checker 拒绝宽泛 ignore。
   恢复时重新注入 `language_prompt_contract`，而不是依赖当前进程或 UI 状态。
 - `language_prompt_contract` 进入所有一方可控 Agent/LLM stage；raw-source marker 防止翻译历史、用户内容与工具结果。
 
-远程 A2A/MCP/provider 能力是第三方边界：StaffDeck 传递 context 并持久化恢复，但真实对端是否遵循
+远程 A2A/MCP/provider 能力是第三方边界：FirmDeck 传递 context 并持久化恢复，但真实对端是否遵循
 reply locale 必须通过集成测试验证，不得从本地 mock 推断。
 
 ## 格式化、缺失与回退

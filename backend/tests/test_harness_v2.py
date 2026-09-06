@@ -3085,7 +3085,7 @@ def test_mcp_app_descriptor_is_host_only_and_emitted_as_trace(
     )
     app_descriptor = {
         "server_id": "server-apps",
-        "resource_uri": "ui://staffdeck/card",
+        "resource_uri": "ui://firmdeck/card",
         "tool_name": app_tool.name,
         "visibility": ["model", "app"],
         "mime_type": "text/html;profile=mcp-app",

@@ -61,7 +61,7 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
-packaging/assets/staffdeck.iconset/
+packaging/assets/firmdeck.iconset/
 
 # superpowers SDD scratch (ledger, briefs, review packages)
 .superpowers/

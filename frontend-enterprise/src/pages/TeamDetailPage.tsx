@@ -915,7 +915,7 @@ export default function TeamDetailPage({
     uiSinks.download(
       blob,
       createMessageDescriptor('teamDetailPage.download.teamLog'),
-      `staffdeck-${safeName || teamId}`,
+      `firmdeck-${safeName || teamId}`,
       'json',
     );
     toast.success(createMessageDescriptor('teamDetailPage.toast.logDownloaded'));

@@ -5,7 +5,7 @@ cd "$REPO"
 VERSION="${VERSION:-$(cat "$REPO/backend/VERSION" 2>/dev/null || node -p 'require(process.argv[1]).version' "$REPO/frontend-enterprise/package.json" 2>/dev/null || echo 0.0.0-dev)}"
 export VERSION
 HOST_ARCH="$(uname -m)"
-TARGET_ARCH="${STAFFDECK_MACOS_ARCH:-$HOST_ARCH}"
+TARGET_ARCH="${FIRMDECK_MACOS_ARCH:-$HOST_ARCH}"
 MAC_SIGN_ID="${MAC_SIGN_ID:-}"
 NOTARY_PROFILE="${NOTARY_PROFILE:-}"
 NOTARY_KEYCHAIN="${NOTARY_KEYCHAIN:-}"
@@ -98,7 +98,7 @@ PY
     echo "未配置 MAC_SIGN_ID，使用 ad-hoc 签名"
     find "$app/Contents/Frameworks" -type f -name "*.dylib" 2>/dev/null \
       -exec codesign --force --timestamp=none --sign - {} \; 2>/dev/null || true
-    codesign --force --timestamp=none --sign - "$app/Contents/MacOS/staffdeck" 2>/dev/null || true
+    codesign --force --timestamp=none --sign - "$app/Contents/MacOS/firmdeck" 2>/dev/null || true
   fi
   sign_code "$app"
 }
@@ -145,13 +145,13 @@ if ! .venv/bin/python -c "import AppKit, WebKit" >/dev/null 2>&1; then
   fi
 fi
 
-echo "==> [3/5] PyInstaller 打包（spec 在 macOS 下同时产出 StaffDeck.app）"
+echo "==> [3/5] PyInstaller 打包（spec 在 macOS 下同时产出 FirmDeck.app）"
 .venv/bin/pyinstaller ../packaging/ultrarag.spec --noconfirm \
   --distpath ../packaging/out --workpath ../packaging/build
 cd "$REPO"
-APP="packaging/out/StaffDeck.app"
+APP="packaging/out/FirmDeck.app"
 test -d "$APP" || { echo "PyInstaller 未产出 $APP"; exit 1; }
-"$APP/Contents/MacOS/staffdeck" --packaging-smoke
+"$APP/Contents/MacOS/firmdeck" --packaging-smoke
 
 echo "==> [4/5] 附带 python 运行时（放 .app/Contents/Resources/runtime）"
 # 注意：runtime 必须放 Resources 而非 MacOS。放 MacOS 时 codesign 会把 runtime 里
@@ -183,35 +183,35 @@ backend/.venv/bin/python packaging/smoke_sandbox_runtime.py "$APP/Contents/Resou
 # 捕获 cryptography/OpenSSL ABI 错配，而不是到用户机器上才发现。
 bash packaging/smoke_macos_app.sh "$APP"
 
-DMG="packaging/out/StaffDeck-macos-${ARCH}.dmg"
+DMG="packaging/out/FirmDeck-macos-${ARCH}.dmg"
 DMG_ROOT="packaging/out/dmg-root"
-DMG_BACKGROUND="packaging/build/staffdeck-dmg-background.png"
+DMG_BACKGROUND="packaging/build/firmdeck-dmg-background.png"
 rm -f "$DMG"
-rm -f "packaging/out/rw."*"StaffDeck-macos-${ARCH}.dmg" 2>/dev/null || true
+rm -f "packaging/out/rw."*"FirmDeck-macos-${ARCH}.dmg" 2>/dev/null || true
 rm -rf "$DMG_ROOT"
 mkdir -p "$DMG_ROOT"
-ditto "$APP" "$DMG_ROOT/StaffDeck.app"
+ditto "$APP" "$DMG_ROOT/FirmDeck.app"
 python3 packaging/make_dmg_background.py "$DMG_BACKGROUND"
 
 if command -v create-dmg >/dev/null 2>&1; then
-  LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8 create-dmg --volname "StaffDeck" \
+  LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8 create-dmg --volname "FirmDeck" \
     --window-pos 120 100 --window-size 840 360 \
     --background "$DMG_BACKGROUND" \
     --icon-size 96 --text-size 13 \
-    --icon "StaffDeck.app" 230 180 \
-    --hide-extension "StaffDeck.app" \
+    --icon "FirmDeck.app" 230 180 \
+    --hide-extension "FirmDeck.app" \
     --app-drop-link 610 175 \
     --app-drop-link-name "Applications" \
-    --volicon "packaging/assets/staffdeck.icns" \
+    --volicon "packaging/assets/firmdeck.icns" \
     --no-internet-enable --overwrite \
     "$DMG" "$DMG_ROOT" \
-    || { ln -s /Applications "$DMG_ROOT/Applications"; hdiutil create -volname StaffDeck -srcfolder "$DMG_ROOT" -ov -format UDZO "$DMG"; }
+    || { ln -s /Applications "$DMG_ROOT/Applications"; hdiutil create -volname FirmDeck -srcfolder "$DMG_ROOT" -ov -format UDZO "$DMG"; }
 else
   ln -s /Applications "$DMG_ROOT/Applications"
-  hdiutil create -volname StaffDeck -srcfolder "$DMG_ROOT" -ov -format UDZO "$DMG"
+  hdiutil create -volname FirmDeck -srcfolder "$DMG_ROOT" -ov -format UDZO "$DMG"
 fi
 rm -rf "$DMG_ROOT"
-rm -f "packaging/out/rw."*"StaffDeck-macos-${ARCH}.dmg" 2>/dev/null || true
+rm -f "packaging/out/rw."*"FirmDeck-macos-${ARCH}.dmg" 2>/dev/null || true
 
 if [ -n "$MAC_SIGN_ID" ]; then
   codesign --force --timestamp --sign "$MAC_SIGN_ID" "$DMG"

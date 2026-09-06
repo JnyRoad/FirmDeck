@@ -303,7 +303,7 @@ describe('model provider diagnostics', () => {
   });
 
   it('renders ChatGPT subscription account statuses from the API in English', async () => {
-    window.localStorage.setItem('staffdeck_locale', 'en-US');
+    window.localStorage.setItem('firmdeck_locale', 'en-US');
 
     for (const [message, account] of Object.entries(subscriptionStatusCopy)) {
       const fetchMock = stubModelsPageFetch({
@@ -328,11 +328,11 @@ describe('model provider diagnostics', () => {
 
       cleanup();
       vi.unstubAllGlobals();
-      window.localStorage.setItem('staffdeck_locale', 'en-US');
+      window.localStorage.setItem('firmdeck_locale', 'en-US');
     }
   });
 
-  it('explains that Codex, rather than StaffDeck, owns ChatGPT login credentials', async () => {
+  it('explains that Codex, rather than FirmDeck, owns ChatGPT login credentials', async () => {
     const fetchMock = stubModelsPageFetch({
       status: 'connected',
       plan_type: null,
@@ -352,7 +352,7 @@ describe('model provider diagnostics', () => {
     await user.click(await screen.findByRole('button', { name: '下一步' }));
 
     expect(await screen.findByText(
-      '登录由本机 Codex runtime 管理。StaffDeck 不保存 ChatGPT OAuth code、access token 或 refresh token。',
+      '登录由本机 Codex runtime 管理。FirmDeck 不保存 ChatGPT OAuth code、access token 或 refresh token。',
     )).toBeTruthy();
     expect(screen.queryByText(/加密保存必要订阅凭据/)).toBeNull();
   });

@@ -648,7 +648,7 @@ def list_my_identity_bindings(
         select(ChannelIdentity)
         .where(
             ChannelIdentity.tenant_id == tenant_id,
-            ChannelIdentity.staffdeck_user_id == current_user.id,
+            ChannelIdentity.firmdeck_user_id == current_user.id,
         )
         .order_by(ChannelIdentity.channel)
     ).all()
@@ -695,7 +695,7 @@ def delete_my_identity_binding(
     statement = select(ChannelIdentity).where(
         ChannelIdentity.tenant_id == tenant_id,
         ChannelIdentity.channel == channel,
-        ChannelIdentity.staffdeck_user_id == current_user.id,
+        ChannelIdentity.firmdeck_user_id == current_user.id,
     )
     if external_user_id:
         statement = statement.where(ChannelIdentity.external_user_id == external_user_id)
@@ -2534,7 +2534,7 @@ def create_wechat_kf_contact_way(
     current_user: Annotated[User, Depends(get_current_user)],
     db: Annotated[Session, Depends(get_session)],
     tenant_id: str = Query(...),
-    scene: str = Query("staffdeck", min_length=1, max_length=32, pattern=r"^[A-Za-z0-9_-]+$"),
+    scene: str = Query("firmdeck", min_length=1, max_length=32, pattern=r"^[A-Za-z0-9_-]+$"),
     open_kfid: str = Query(..., min_length=1, max_length=128),
 ) -> dict[str, str]:
     """为已绑定账号创建咨询链接；会执行一次远端写入且不记录 provider URL。"""
@@ -2881,10 +2881,10 @@ def list_channel_conversations(
     message_counts: dict[str, int] = {}
     if user_ids:
         identities = db.exec(
-            select(ChannelIdentity).where(ChannelIdentity.staffdeck_user_id.in_(user_ids))
+            select(ChannelIdentity).where(ChannelIdentity.firmdeck_user_id.in_(user_ids))
         ).all()
         identity_names = {
-            row.staffdeck_user_id: row.display_name for row in identities if row.display_name
+            row.firmdeck_user_id: row.display_name for row in identities if row.display_name
         }
         users = db.exec(select(User).where(User.id.in_(user_ids))).all()
         user_names = {row.id: row.display_name for row in users if row.display_name}

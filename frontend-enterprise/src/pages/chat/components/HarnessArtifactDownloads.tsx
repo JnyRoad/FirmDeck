@@ -1,6 +1,6 @@
 import { useEffect, useState, type ReactNode } from 'react';
 
-import StaffdeckIcon from '@/components/StaffdeckIcon';
+import FirmdeckIcon from '@/components/FirmdeckIcon';
 import { createToastNotifier } from '@/components/ui/app-toast';
 import { api } from '@/api/client';
 import { RawContent, RawIdentifier } from '@/i18n/RawContent';
@@ -71,7 +71,7 @@ export default function HarnessArtifactDownloads({
   return (
     <div className={CHAT_ARTIFACTS_CLASS} aria-label={t('chat.artifacts.heading')}>
       <div className={CHAT_ARTIFACT_HEADING_CLASS}>
-        <StaffdeckIcon name="folder" size={14} />
+        <FirmdeckIcon name="folder" size={14} />
         <span>{t('chat.artifacts.heading')}</span>
       </div>
       <div className={CHAT_ARTIFACT_LIST_CLASS}>
@@ -106,7 +106,7 @@ export default function HarnessArtifactDownloads({
               onClick={() => void downloadArtifact(artifact)}
             >
               <span className={CHAT_ARTIFACT_ICON_CLASS}>
-                <StaffdeckIcon name="file" size={17} />
+                <FirmdeckIcon name="file" size={17} />
               </span>
               <span className={CHAT_ARTIFACT_COPY_CLASS}>
                 <span className={CHAT_ARTIFACT_NAME_CLASS}>
@@ -116,7 +116,7 @@ export default function HarnessArtifactDownloads({
                   {isDownloading ? t('chat.artifacts.downloading') : artifactMeta(artifact, locale, t)}
                 </span>
               </span>
-              <StaffdeckIcon name="download" size={16} />
+              <FirmdeckIcon name="download" size={16} />
             </button>
           );
         })}
@@ -213,7 +213,7 @@ function ArtifactImagePreview({
           aria-busy={isDownloading}
           onClick={onDownload}
         >
-          <StaffdeckIcon name="download" size={16} />
+          <FirmdeckIcon name="download" size={16} />
         </button>
       </figcaption>
     </figure>

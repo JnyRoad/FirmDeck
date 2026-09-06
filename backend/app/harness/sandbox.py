@@ -45,7 +45,7 @@ def diagnostics() -> SandboxDiagnostics:
         return SandboxDiagnostics(
             "unavailable", "SANDBOX_UNAVAILABLE",
             "未检测到可用的 SRT 或 Bubblewrap 沙盒运行时。",
-            "请修复安装或重新安装 StaffDeck。",
+            "请修复安装或重新安装 FirmDeck。",
         )
     report = _environment_diagnostics(backend)
     if sys.platform == "win32" and report.status == "unavailable":
@@ -53,8 +53,8 @@ def diagnostics() -> SandboxDiagnostics:
             "degraded",
             "SANDBOX_UNSANDBOXED_FALLBACK",
             "安全沙盒不可用，当前已自动降级为无沙盒执行。",
-            "高风险部署：执行可以访问 StaffDeck 进程权限范围内的主机资源。"
-            "生产环境请配置已签名的 Windows SRT，或将 StaffDeck 放入隔离容器/专用虚拟机。",
+            "高风险部署：执行可以访问 FirmDeck 进程权限范围内的主机资源。"
+            "生产环境请配置已签名的 Windows SRT，或将 FirmDeck 放入隔离容器/专用虚拟机。",
             backend="unsandboxed",
         )
     return report
@@ -65,8 +65,8 @@ def _environment_diagnostics(backend: str) -> SandboxDiagnostics:
         if backend == "srt" and os.geteuid() == 0:
             return SandboxDiagnostics(
                 "unavailable", "SANDBOX_ROOT_USER",
-                "当前 StaffDeck 由 root 用户运行，Linux SRT 无法安全创建 UID 映射。",
-                "请使用独立的普通服务账号（例如 staffdeck）重启 StaffDeck。",
+                "当前 FirmDeck 由 root 用户运行，Linux SRT 无法安全创建 UID 映射。",
+                "请使用独立的普通服务账号（例如 firmdeck）重启 FirmDeck。",
             )
         userns_clone = _read_int("/proc/sys/kernel/unprivileged_userns_clone")
         max_namespaces = _read_int("/proc/sys/user/max_user_namespaces")
@@ -94,7 +94,7 @@ def _environment_diagnostics(backend: str) -> SandboxDiagnostics:
 def windows_install_command() -> str:
     resolved = resolve_srt()
     if resolved is None:
-        return "重新运行 StaffDeck 安装程序以修复沙盒组件"
+        return "重新运行 FirmDeck 安装程序以修复沙盒组件"
     node, cli = resolved
     return subprocess.list2cmdline([str(node), str(cli), "windows-install"])
 
@@ -103,7 +103,7 @@ def windows_install_command() -> str:
 def _windows_srt_ready(node: Path, cli: Path) -> bool:
     """Run SRT initialization once; upstream verifies user credentials and WFP."""
     try:
-        with tempfile.TemporaryDirectory(prefix="staffdeck-srt-probe-") as raw_dir:
+        with tempfile.TemporaryDirectory(prefix="firmdeck-srt-probe-") as raw_dir:
             settings = Path(raw_dir) / "settings.json"
             settings.write_text(
                 json.dumps(
@@ -161,7 +161,7 @@ def available_backend() -> str | None:
 def resolve_srt() -> tuple[Path, Path] | None:
     """Resolve ``(node, cli.js)`` from a reviewed bundle or the host PATH."""
     candidates: list[tuple[Path, Path]] = []
-    explicit = os.environ.get("STAFFDECK_SRT_RUNTIME", "").strip()
+    explicit = os.environ.get("FIRMDECK_SRT_RUNTIME", "").strip()
     if explicit:
         root = Path(explicit).expanduser()
         candidates.append(
@@ -208,7 +208,7 @@ def resolve_srt() -> tuple[Path, Path] | None:
             )
     except OSError:
         pass
-    allow_global = os.environ.get("STAFFDECK_ALLOW_GLOBAL_SRT", "").strip().lower()
+    allow_global = os.environ.get("FIRMDECK_ALLOW_GLOBAL_SRT", "").strip().lower()
     srt = shutil.which("srt") if allow_global in {"1", "true", "yes", "on"} else None
     node = shutil.which("node") if srt else None
     if srt and node:

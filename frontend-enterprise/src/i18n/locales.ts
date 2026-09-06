@@ -8,7 +8,7 @@ export type AppLocale = (typeof SUPPORTED_LOCALES)[number];
 
 export const DEFAULT_LOCALE: AppLocale = 'zh-CN';
 export const CANONICAL_LOCALE: AppLocale = 'en-US';
-export const LOCALE_STORAGE_KEY = 'staffdeck_locale';
+export const LOCALE_STORAGE_KEY = 'firmdeck_locale';
 
 /**
  * 将外部语言标签整理为标准 BCP 47 形式；无效输入返回 null，且不修改任何全局状态。

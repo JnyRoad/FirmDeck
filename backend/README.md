@@ -20,7 +20,7 @@ cp .env.example .env
 .venv/bin/uvicorn single_port_app:app --host 127.0.0.1 --port 5173
 ```
 
-StaffDeck Open API documentation: `http://localhost:5173/api/v1/docs`
+FirmDeck Open API documentation: `http://localhost:5173/api/v1/docs`
 
 When using the packaged desktop application, do not assume port `5173`. An administrator can
 open **运行设置 → 网络与 API** to copy the active same-machine API Base URL. The same card can
@@ -39,7 +39,7 @@ sets the local single-port origin by default and can add a public tunnel origin 
 
 ChatGPT subscription models use the local Codex CLI's `app-server` runtime. Install and sign in
 to Codex on the same machine, then set `CODEX_SUBSCRIPTION_COMMAND` only when `codex` is not
-already on the service process `PATH`. StaffDeck resolves that command when a session starts and
+already on the service process `PATH`. FirmDeck resolves that command when a session starts and
 does not store ChatGPT OAuth codes, access tokens, refresh tokens, or subscription credentials.
 Signing out from the model configuration signs the local Codex CLI out of ChatGPT and can affect
 other local applications that use the same Codex login.
@@ -58,10 +58,10 @@ python3 packaging/fetch_sandbox_runtime.py packaging/sandbox_runtime
 ```
 
 The bootstrap uses the committed dependency lock and `npm ci`, verifies the
-downloaded Node archive, and applies StaffDeck's reviewed unrestricted-network
+downloaded Node archive, and applies FirmDeck's reviewed unrestricted-network
 compatibility patch. The repository-local runtime takes precedence over a
 global `srt` installation. Unreviewed global installations are ignored unless
-development explicitly sets `STAFFDECK_ALLOW_GLOBAL_SRT=true`; normal
+development explicitly sets `FIRMDECK_ALLOW_GLOBAL_SRT=true`; normal
 `scripts/dev_up.sh` startup prepares the reviewed local runtime automatically.
 
 When `srt` is unavailable, Linux deployments may use the existing Bubblewrap

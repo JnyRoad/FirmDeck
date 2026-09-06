@@ -110,7 +110,7 @@ def test_collaborator_can_save_feishu_credentials(monkeypatch) -> None:
     monkeypatch.setattr(
         channels_api,
         "validate_feishu_credentials",
-        lambda app_id, secret: {"bot_open_id": "ou_bot", "bot_name": "StaffDeck Bot"},
+        lambda app_id, secret: {"bot_open_id": "ou_bot", "bot_name": "FirmDeck Bot"},
     )
     binding_id = _seed_binding(engine, status="pending")
     client.post(

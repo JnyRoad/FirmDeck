@@ -129,7 +129,7 @@ def problem_response(
         internal=internal,
     )
     payload: dict[str, Any] = {
-        "type": f"urn:staffdeck:error:{canonical['code'].lower()}",
+        "type": f"urn:firmdeck:error:{canonical['code'].lower()}",
         "title": canonical["code"],
         "status": status_code,
         **canonical,

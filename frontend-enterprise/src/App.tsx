@@ -27,7 +27,7 @@ import QuickStartGuide, {
   QUICK_START_SEEN_KEY,
 } from "./components/QuickStartGuide";
 import UpdateReminder from "./components/UpdateReminder";
-import StaffdeckIcon from "./components/StaffdeckIcon";
+import FirmdeckIcon from "./components/FirmdeckIcon";
 import { SidebarProvider } from "@/components/ui/sidebar";
 import { EnterpriseRoute } from "./enums/routes";
 import {
@@ -572,7 +572,7 @@ function Shell({
             <div className="mx-[24px] mt-[18px] mb-[10px] flex shrink-0 flex-col items-start justify-between gap-[12px] rounded-[12px] border border-[#f3d28b] bg-[#fff8e8] px-[18px] py-[12px] text-[#6f4500] shadow-[0_8px_24px_rgba(92,62,0,0.08)] sm:flex-row sm:items-center">
               <div className="flex min-w-0 items-center gap-[10px]">
                 <span className="flex size-[28px] shrink-0 items-center justify-center rounded-[8px] bg-[#ffe7ad] text-[#8a4b00]">
-                  <StaffdeckIcon name="model" className="size-[15px]" />
+                  <FirmdeckIcon name="model" className="size-[15px]" />
                 </span>
                 <span className="min-w-0 text-[13px] leading-[20px]">{modelSetupNoticeText}</span>
               </div>

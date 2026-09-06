@@ -27,22 +27,22 @@ COPY --from=frontend-build /src/frontend-enterprise/dist ./frontend-enterprise/d
 
 # Drop root before serving: create a dedicated unprivileged user and give it
 # ownership of /data (where the SQLite DB and other runtime state live).
-RUN groupadd --system --gid 10001 staffdeck \
-    && useradd --system --uid 10001 --gid staffdeck --home-dir /app --shell /usr/sbin/nologin staffdeck \
+RUN groupadd --system --gid 10001 firmdeck \
+    && useradd --system --uid 10001 --gid firmdeck --home-dir /app --shell /usr/sbin/nologin firmdeck \
     && mkdir -p /data \
-    && chown -R staffdeck:staffdeck /app /data
+    && chown -R firmdeck:firmdeck /app /data
 
 WORKDIR /app/backend
 
 # Headless server: bind 0.0.0.0 inside the container, expose 5173.
-ENV STAFFDECK_HEADLESS=true \
+ENV FIRMDECK_HEADLESS=true \
     ULTRARAG_HOST=0.0.0.0 \
     ULTRARAG_PORT=5173 \
     ULTRARAG_DATA_DIR=/data
 
 VOLUME ["/data"]
 EXPOSE 5173
-USER staffdeck
+USER firmdeck
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=5 \
     CMD curl -fsS http://127.0.0.1:5173/api/health || exit 1

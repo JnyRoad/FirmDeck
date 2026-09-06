@@ -87,7 +87,7 @@ cd frontend-enterprise && npx shadcn@latest add <component> -y
 // ✅ 推荐 — 先落到 assets，再作为组件/资源引入
 import ArrowIcon from '@/assets/icons/arrow.svg?react';
 // 或统一封装后按名引用
-import { StaffdeckIcon } from '@/components/StaffdeckIcon';
+import { FirmdeckIcon } from '@/components/FirmdeckIcon';
 
 <ArrowIcon className="size-4" />;
 

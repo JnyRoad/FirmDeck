@@ -1012,7 +1012,7 @@ function inspectCallExpression(node, sourceFile, checker, report) {
   }
 }
 
-/** Detect JSX text explicitly owned by code/raw-source markup rather than StaffDeck product chrome. */
+/** Detect JSX text explicitly owned by code/raw-source markup rather than FirmDeck product chrome. */
 function isRawJsxText(node) {
   let current = node.parent;
   while (current) {

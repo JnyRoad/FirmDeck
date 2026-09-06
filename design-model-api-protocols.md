@@ -1,8 +1,8 @@
-# StaffDeck 模型 API 协议接入落地方案
+# FirmDeck 模型 API 协议接入落地方案
 
 ## 1. 背景与问题
 
-StaffDeck 当前的模型配置包含 `provider` 字段，但该字段仅被保存和展示，模型运行时并不读取它。所有模型请求都会无条件使用 OpenAI SDK 的 Chat Completions 接口：
+FirmDeck 当前的模型配置包含 `provider` 字段，但该字段仅被保存和展示，模型运行时并不读取它。所有模型请求都会无条件使用 OpenAI SDK 的 Chat Completions 接口：
 
 ```python
 client.chat.completions.create(...)
@@ -16,7 +16,7 @@ client.chat.completions.create(...)
 - 通用技能等路径通过 `SimpleNamespace` 手工复制模型配置，可能遗漏协议或请求参数；
 - 前端允许自由填写 Provider，后端也不校验，错误配置只能到运行阶段才暴露。
 
-StaffDeck 真正需要识别的是服务端暴露的 API 协议，而不是模型品牌或供应商。
+FirmDeck 真正需要识别的是服务端暴露的 API 协议，而不是模型品牌或供应商。
 
 ### 1.1 评审状态与实施决策
 
@@ -52,7 +52,7 @@ StaffDeck 真正需要识别的是服务端暴露的 API 协议，而不是模�
 - 不同协议之间自动转换 `extra_body`；
 - 新的模型能力注册系统。
 
-StaffDeck 继续使用自身 Agent Loop、技能状态机和 ToolExecutor，不引入第二套供应商原生工具编排。
+FirmDeck 继续使用自身 Agent Loop、技能状态机和 ToolExecutor，不引入第二套供应商原生工具编排。
 
 ## 4. API 协议模型
 
@@ -89,7 +89,7 @@ OPENAI_RESPONSES = "openai_responses"
 | Google Gemini Generate Content API | `gemini_generate_content` |
 | 企业 Gemini Generate Content 代理 | `gemini_generate_content` |
 
-StaffDeck 不根据模型名或 Base URL 猜测协议。
+FirmDeck 不根据模型名或 Base URL 猜测协议。
 
 ## 5. 数据模型与迁移
 
@@ -373,7 +373,7 @@ class ModelUsage:
 - 一旦输出首个用户可见 token，任何中断都不得自动重试，避免重复文本；
 - 取消记录为 `cancelled`，不是 provider failure；
 - 即使结束事件缺少 usage，也必须正常完成并以空指标记录；
-- SDK 自带重试与 StaffDeck 重试只能启用一层，避免请求倍增。
+- SDK 自带重试与 FirmDeck 重试只能启用一层，避免请求倍增。
 
 ### 7.3 Driver 接口
 
@@ -452,7 +452,7 @@ Driver 仅负责协议转换，不负责：
 
 ### 9.4 图片
 
-现有 StaffDeck 图片为 OpenAI 风格 Data URL：
+现有 FirmDeck 图片为 OpenAI 风格 Data URL：
 
 ```json
 {"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}
@@ -469,7 +469,7 @@ Anthropic Driver 转为 base64 image source。
 
 不自动下载远程 URL，避免 SSRF。远程 URL 或非法 Data URL 在发送前返回可读错误。
 
-第一版采用确定的本地安全上限：按 Base64 严格解码后的字节计量，单图 `<= 5 MiB`、单请求最多 6 张、所有图片合计 `<= 18 MiB`、标准请求序列化后总正文 `<= 25 MiB`，边界值允许。校验顺序固定为格式/MIME → 单图 → 数量 → 解码图片总量 → 序列化正文，因此同时超限时返回最先命中的稳定错误码。超限分别返回 `MODEL_IMAGE_TOO_LARGE`、`MODEL_TOO_MANY_IMAGES` 或 `MODEL_REQUEST_TOO_LARGE`。同时校验 Data URL MIME、Base64 完整性、声明 MIME 与 magic bytes 一致及允许类型，不把 Base64 内容写入日志。这些是 StaffDeck 首版保护值，不代表上游模型极限；后续只能通过版本化配置调整并补契约测试。
+第一版采用确定的本地安全上限：按 Base64 严格解码后的字节计量，单图 `<= 5 MiB`、单请求最多 6 张、所有图片合计 `<= 18 MiB`、标准请求序列化后总正文 `<= 25 MiB`，边界值允许。校验顺序固定为格式/MIME → 单图 → 数量 → 解码图片总量 → 序列化正文，因此同时超限时返回最先命中的稳定错误码。超限分别返回 `MODEL_IMAGE_TOO_LARGE`、`MODEL_TOO_MANY_IMAGES` 或 `MODEL_REQUEST_TOO_LARGE`。同时校验 Data URL MIME、Base64 完整性、声明 MIME 与 magic bytes 一致及允许类型，不把 Base64 内容写入日志。这些是 FirmDeck 首版保护值，不代表上游模型极限；后续只能通过版本化配置调整并补契约测试。
 
 ### 9.5 JSON
 
@@ -588,7 +588,7 @@ generate_json(..., validator=None, cancellation=None) -> T | dict[str, Any]
 
 统一错误分类：
 
-| 内部分类 | StaffDeck HTTP | 稳定业务码 | 用户提示 |
+| 内部分类 | FirmDeck HTTP | 稳定业务码 | 用户提示 |
 | --- | --- | --- | --- |
 | authentication | 422 | `MODEL_AUTHENTICATION_FAILED` | API Key 无效 |
 | permission | 422 | `MODEL_PERMISSION_DENIED` | 当前凭据无模型权限 |
@@ -615,7 +615,7 @@ API 返回稳定错误结构：
 
 上游原始错误不直接返回 API。原始异常只进入受控 debug 日志，并经过统一 scrubber。
 
-连接/能力测试是一个被正常处理的检测操作：只要测试任务本身成功执行，HTTP 返回 200，并在 `capabilities[]` 中逐项返回 `success/error`；配置不存在、权限不足、非法状态或请求 schema 错误仍使用标准 4xx。普通模型业务调用按上表返回 HTTP 状态。前端只能依赖 StaffDeck 状态和稳定业务码，不能依赖上游文案。
+连接/能力测试是一个被正常处理的检测操作：只要测试任务本身成功执行，HTTP 返回 200，并在 `capabilities[]` 中逐项返回 `success/error`；配置不存在、权限不足、非法状态或请求 schema 错误仍使用标准 4xx。普通模型业务调用按上表返回 HTTP 状态。前端只能依赖 FirmDeck 状态和稳定业务码，不能依赖上游文案。
 
 安全要求：
 
@@ -669,14 +669,14 @@ anthropic.messages
 - 验证 macOS Intel/Apple Silicon、Windows 和 Linux 目标（按现有发布矩阵）；
 - 验证升级安装不影响数据库迁移。
 
-依赖必须锁定经过验证的版本范围，并检查与现有 `httpx`、`pydantic` 的依赖冲突、CA bundle、系统代理和自定义企业证书。最终产物需要覆盖当前发布矩阵的 macOS ARM、macOS Intel、Windows 和 Linux，而不只验证源码环境。SDK 默认重试关闭，由 StaffDeck 统一控制。
+依赖必须锁定经过验证的版本范围，并检查与现有 `httpx`、`pydantic` 的依赖冲突、CA bundle、系统代理和自定义企业证书。最终产物需要覆盖当前发布矩阵的 macOS ARM、macOS Intel、Windows 和 Linux，而不只验证源码环境。SDK 默认重试关闭，由 FirmDeck 统一控制。
 
 如果使用现有 `httpx` 自行实现，可减少打包依赖，但需要自行维护流式事件、错误类型和协议版本。为降低协议维护风险，本方案推荐官方 SDK，并将打包验证列为发布门禁。
 
 提供仅在测试构建或显式测试环境启用的包内诊断入口：
 
 ```text
-staffdeck --protocol-smoke anthropic_messages --base-url http://127.0.0.1:<port>
+firmdeck --protocol-smoke anthropic_messages --base-url http://127.0.0.1:<port>
 ```
 
 四平台 CI 必须从最终 `.app`、Windows 安装产物和 Linux 产物内部执行该入口，经实际锁定版本的官方 SDK 请求本地契约服务器。入口仅存在于测试构建，只接受 loopback Base URL 和编译时固定测试 token，拒绝用户传入 Key、非 loopback 地址及正式构建调用，也不得打印测试 token。
@@ -875,7 +875,7 @@ docs(models): document supported API protocols
 
 ## 21. 验收标准
 
-只有同时满足以下条件，才视为 StaffDeck 已支持 Anthropic Messages 与 Gemini Generate Content：
+只有同时满足以下条件，才视为 FirmDeck 已支持 Anthropic Messages 与 Gemini Generate Content：
 
 - 管理员可明确选择 Anthropic Messages 协议；
 - 配置可保存、测试、启用并设为默认；

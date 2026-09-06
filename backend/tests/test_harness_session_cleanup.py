@@ -335,11 +335,11 @@ def test_default_task_workspace_uses_home_without_writing_to_app_data(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A new task must provision its workspace below the user's StaffDeck home directory."""
+    """A new task must provision its workspace below the user's FirmDeck home directory."""
 
     home = tmp_path / "home"
     app_data = tmp_path / "app-data"
-    expected_root = home / ".staffdeck" / "workspaces"
+    expected_root = home / ".firmdeck" / "workspaces"
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("ULTRARAG_DATA_DIR", str(app_data))
 

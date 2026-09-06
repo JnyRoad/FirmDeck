@@ -36,8 +36,8 @@ def _db(tmp_path) -> tuple[object, Session]:
             transport="streamable_http",
             url="https://mcp.example/mcp",
             auth_mode="oauth_personal",
-            oauth_client_id="staffdeck-public",
-            oauth_redirect_uri="https://staffdeck.example/api/enterprise/mcp-servers/oauth/callback",
+            oauth_client_id="firmdeck-public",
+            oauth_redirect_uri="https://firmdeck.example/api/enterprise/mcp-servers/oauth/callback",
         )
     )
     db.commit()
@@ -63,7 +63,7 @@ async def test_status_and_start_are_scoped_to_current_user(tmp_path, monkeypatch
     from app.tools.mcp_oauth_service import MCPGrantTokenStorage
 
     engine, db = _db(tmp_path)
-    monkeypatch.setenv("STAFFDECK_PUBLIC_URL", "https://staffdeck.example")
+    monkeypatch.setenv("FIRMDECK_PUBLIC_URL", "https://firmdeck.example")
     server = db.get(MCPServer, "server_1")
     assert server is not None
     first_storage = MCPGrantTokenStorage(
@@ -129,7 +129,7 @@ async def test_status_and_start_are_scoped_to_current_user(tmp_path, monkeypatch
     assert captured["storage"].user_id == "user_2"
     assert captured["storage"].config_fingerprint
     cookie = http_response.headers["set-cookie"]
-    assert "staffdeck_mcp_oauth_flow_1=" in cookie
+    assert "firmdeck_mcp_oauth_flow_1=" in cookie
     assert "HttpOnly" in cookie
     assert "SameSite=lax" in cookie
     assert "Secure" in cookie
@@ -152,7 +152,7 @@ async def test_start_rejects_a_persisted_redirect_for_another_origin(
     )
     db.add(server)
     db.commit()
-    monkeypatch.setenv("STAFFDECK_PUBLIC_URL", "https://staffdeck.example")
+    monkeypatch.setenv("FIRMDECK_PUBLIC_URL", "https://firmdeck.example")
 
     class UnexpectedCoordinator:
         """Fail if invalid persisted configuration reaches flow creation."""
@@ -187,7 +187,7 @@ async def test_start_discards_a_grant_bound_to_old_server_configuration(
     from app.tools.mcp_oauth_service import MCPGrantTokenStorage
 
     engine, db = _db(tmp_path)
-    monkeypatch.setenv("STAFFDECK_PUBLIC_URL", "https://staffdeck.example")
+    monkeypatch.setenv("FIRMDECK_PUBLIC_URL", "https://firmdeck.example")
     stale = MCPGrantTokenStorage(
         engine,
         "tenant_1",
@@ -402,7 +402,7 @@ async def test_callback_contains_unknown_failures_and_clears_the_flow_cookie(
     class FakeCoordinator:
         def browser_cookie_name_for_state(self, _state: str) -> str:
             """Resolve the terminal browser cookie without exposing callback state."""
-            return "staffdeck_mcp_oauth_flow_unknown"
+            return "firmdeck_mcp_oauth_flow_unknown"
 
         async def complete_callback(self, **kwargs):
             """Model an unexpected provider failure after callback routing."""
@@ -416,7 +416,7 @@ async def test_callback_contains_unknown_failures_and_clears_the_flow_cookie(
             {
                 "type": "http",
                 "headers": [
-                    (b"cookie", b"staffdeck_mcp_oauth_flow_unknown=browser-binding")
+                    (b"cookie", b"firmdeck_mcp_oauth_flow_unknown=browser-binding")
                 ],
             }
         ),

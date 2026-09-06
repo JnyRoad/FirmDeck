@@ -23,7 +23,7 @@ import { cn } from '@/lib/utils';
 import { teamIdFromScope, toTeamScope } from '@/lib/agent-scope-storage';
 import EmployeeAvatar from './EmployeeAvatar';
 import BrandLogo from './BrandLogo';
-import StaffdeckIcon from './StaffdeckIcon';
+import FirmdeckIcon from './FirmdeckIcon';
 import { employeeDisplayNameWithCreator, employeeProfile } from '../employee';
 import { EnterpriseRoute } from '../enums/routes';
 import type { MessageId } from '../i18n/types';
@@ -511,7 +511,7 @@ function CollapsedAgentSwitcher({
   );
 }
 
-/** 渲染收起态管理导航并本地化所有 StaffDeck 自有控件。 */
+/** 渲染收起态管理导航并本地化所有 FirmDeck 自有控件。 */
 function CollapsedSidebar({
   selected,
   onNavigate,
@@ -1435,7 +1435,7 @@ function ChatSidebarVariant({
               <ChatSessionSkeletonList />
             ) : sessions.length === 0 ? (
               <div className="flex flex-col items-center gap-[8px] py-[28px] text-center text-[12px] text-[#a2a8b8]">
-                <StaffdeckIcon name="inbox" size={22} />
+                <FirmdeckIcon name="inbox" size={22} />
                 <span>{t('sidebar.noHistory')}</span>
               </div>
             ) : (

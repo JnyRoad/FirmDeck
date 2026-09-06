@@ -86,7 +86,7 @@ class CodexAppServerSession:
         self._reader.start()
         self._request(
             "initialize",
-            {"clientInfo": {"name": "StaffDeck", "version": "local"}},
+            {"clientInfo": {"name": "FirmDeck", "version": "local"}},
         )
 
     def account_read(self) -> dict[str, Any]:
@@ -102,7 +102,7 @@ class CodexAppServerSession:
         return self._request("account/login/cancel", {"loginId": login_id})
 
     def account_logout(self) -> dict[str, Any]:
-        """请求 Codex 清除其自身管理的登录状态，不访问 StaffDeck 数据库。"""
+        """请求 Codex 清除其自身管理的登录状态，不访问 FirmDeck 数据库。"""
         return self._request("account/logout", {})
 
     def model_list(self) -> dict[str, Any]:

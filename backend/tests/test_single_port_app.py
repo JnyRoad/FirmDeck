@@ -91,7 +91,7 @@ def test_valid_application_javascript_mapping_is_not_reported_as_correction(
     app = FastAPI()
     app.mount("/assets", single_port_app.FrontendStaticFiles(directory=asset_dir))
 
-    with caplog.at_level("INFO", logger="staffdeck.static"):
+    with caplog.at_level("INFO", logger="firmdeck.static"):
         response = TestClient(app).head("/assets/bundle.js")
 
     assert response.headers["content-type"] == "text/javascript; charset=utf-8"
@@ -114,7 +114,7 @@ def test_mime_diagnostic_does_not_record_requested_asset_name(
 
     single_port_app.logger.addHandler(caplog.handler)
     try:
-        with caplog.at_level("WARNING", logger="staffdeck.static"):
+        with caplog.at_level("WARNING", logger="firmdeck.static"):
             response = TestClient(app).head(f"/assets/{sensitive_name}")
     finally:
         single_port_app.logger.removeHandler(caplog.handler)

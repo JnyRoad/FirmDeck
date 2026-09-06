@@ -106,7 +106,7 @@ enterprise_router = APIRouter(prefix="/api/enterprise/agents", tags=["enterprise
 chat_router = APIRouter(prefix="/api/chat/agents", tags=["chat:agents"])
 scope_router = APIRouter(prefix="/api/enterprise/agent-scope", tags=["enterprise:agent-scope"])
 
-STAFFDECK_AGENT_API_CLIENT_NAME = "StaffDeck 员工 API 密钥"
+FIRMDECK_AGENT_API_CLIENT_NAME = "FirmDeck 员工 API 密钥"
 
 
 def _agent_error(
@@ -153,7 +153,7 @@ def list_agents(
         .where(AgentProfile.tenant_id == tenant_id)
         .order_by(AgentProfile.is_overall.desc(), AgentProfile.updated_at.desc())
     ).all()
-    rows = [row for row in rows if not _agent_hidden_from_staffdeck(row)]
+    rows = [row for row in rows if not _agent_hidden_from_firmdeck(row)]
     if not _is_admin_user(user):
         # Non-admin users still need the overall agent as a read-only open-gallery
         # source for copy/use flows. Mutations remain guarded by manage/update
@@ -270,7 +270,7 @@ def create_agent_api_credential(
     _ensure_can_manage_agent(agent, current_user)
     if agent.is_overall:
         raise _agent_error("AGENT_OPEN_GALLERY_CREDENTIAL_FORBIDDEN", 400)
-    client = _ensure_staffdeck_agent_api_client(db, request.tenant_id, current_user)
+    client = _ensure_firmdeck_agent_api_client(db, request.tenant_id, current_user)
     # 再同时持久化认证摘要与不可出现在列表响应中的加密副本。
     token, prefix, digest = generate_api_key()
     row = APICredential(
@@ -1006,7 +1006,7 @@ def list_chat_agents(
         )
         .order_by(AgentProfile.updated_at.desc())
     ).all()
-    rows = [row for row in rows if not _agent_hidden_from_staffdeck(row)]
+    rows = [row for row in rows if not _agent_hidden_from_firmdeck(row)]
     used_agent_ids = _used_agent_ids_for_user(db, tenant_id, current_user)
     rows = [
         row for row in rows if _chat_agent_selectable_to_user(row, current_user, used_agent_ids)
@@ -1227,7 +1227,7 @@ def _ensure_request_tenant(tenant_id: str, user: User) -> None:
         raise _agent_error("TENANT_MISMATCH", 403)
 
 
-def _ensure_staffdeck_agent_api_client(
+def _ensure_firmdeck_agent_api_client(
     db: Session,
     tenant_id: str,
     current_user: User,
@@ -1235,7 +1235,7 @@ def _ensure_staffdeck_agent_api_client(
     row = db.exec(
         select(APIClient).where(
             APIClient.tenant_id == tenant_id,
-            APIClient.name == STAFFDECK_AGENT_API_CLIENT_NAME,
+            APIClient.name == FIRMDECK_AGENT_API_CLIENT_NAME,
         )
     ).first()
     required_scopes = sorted({"credentials:write", *AGENT_KEY_ALLOWED_SCOPES})
@@ -1249,7 +1249,7 @@ def _ensure_staffdeck_agent_api_client(
         return row
     row = APIClient(
         tenant_id=tenant_id,
-        name=STAFFDECK_AGENT_API_CLIENT_NAME,
+        name=FIRMDECK_AGENT_API_CLIENT_NAME,
         description="由数字员工设置页管理的单员工运行密钥。",
         scopes_json=required_scopes,
         created_by_user_id=current_user.id,
@@ -1290,7 +1290,7 @@ def _agent_api_credential_read(row: APICredential) -> AgentAPICredentialRead:
 
 
 def _agent_visible_to_user(row: AgentProfile, user: User) -> bool:
-    if _agent_hidden_from_staffdeck(row):
+    if _agent_hidden_from_firmdeck(row):
         return False
     if _is_admin_user(user):
         return True
@@ -1300,8 +1300,8 @@ def _agent_visible_to_user(row: AgentProfile, user: User) -> bool:
     return _agent_owned_by_user(row, user) or metadata.get("published_to_gallery") is True
 
 
-def _agent_hidden_from_staffdeck(row: AgentProfile) -> bool:
-    return (row.metadata_json or {}).get("hidden_from_staffdeck") is True
+def _agent_hidden_from_firmdeck(row: AgentProfile) -> bool:
+    return (row.metadata_json or {}).get("hidden_from_firmdeck") is True
 
 
 def _agent_published_to_gallery(row: AgentProfile) -> bool:

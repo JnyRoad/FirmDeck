@@ -6,7 +6,7 @@
 
 ## 背景
 
-StaffDeck 既有运行时曾以自然语言 source-key、数字占位符和全局 DOM observer 兼容旧页面。
+FirmDeck 既有运行时曾以自然语言 source-key、数字占位符和全局 DOM observer 兼容旧页面。
 这种方式无法可靠覆盖 Toast、原生对话框、页面标题、iframe/postMessage 和其他非 DOM 输出，
 也会把用户输入、业务名称或 Agent 原文误判为可翻译产品文本。目录键、语言文案和参数契约
 必须分离，才能在开发期暴露漏翻，在生产期安全回退，并支持未来增加语言。

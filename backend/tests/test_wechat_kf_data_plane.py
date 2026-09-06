@@ -720,7 +720,7 @@ def test_wechat_kf_media_upload_and_account_operations_use_provider_contract(mon
         ("/kf/account/del", {"open_kfid": "wk-created"}),
         (
             "/kf/add_contact_way",
-            {"open_kfid": "wk-created", "scene": "staffdeck"},
+            {"open_kfid": "wk-created", "scene": "firmdeck"},
         ),
     ]
 

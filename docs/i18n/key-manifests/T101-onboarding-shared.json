@@ -37,7 +37,7 @@
   "raw_boundaries": [
     {
       "source": "frontend-enterprise/src/components/BrandLogo.tsx",
-      "values": ["StaffDeck"],
+      "values": ["FirmDeck"],
       "reason": "Exact product brand; not a translatable message."
     },
     {
@@ -64,7 +64,7 @@
     {"id":"auth.login.passwordLabel","status":"existing","en-US":"Password","zh-CN":"密码","icu":{"params":[],"structure":"plain"},"sources":["frontend-enterprise/src/pages/LoginPage.tsx"]},
     {"id":"auth.login.passwordPlaceholder","status":"existing","en-US":"Enter your password (enter admin for first use)","zh-CN":"请输入密码（首次使用请输入admin）","icu":{"params":[],"structure":"plain"},"sources":["frontend-enterprise/src/pages/LoginPage.tsx"]},
     {"id":"auth.login.passwordRequired","status":"existing","en-US":"Enter your password","zh-CN":"请输入密码","icu":{"params":[],"structure":"plain"},"sources":["frontend-enterprise/src/pages/LoginPage.tsx"]},
-    {"id":"auth.login.previewAlt","status":"existing","en-US":"StaffDeck Product Preview","zh-CN":"StaffDeck 产品预览","icu":{"params":[],"structure":"plain"},"sources":["frontend-enterprise/src/pages/LoginPage.tsx"]},
+    {"id":"auth.login.previewAlt","status":"existing","en-US":"FirmDeck Product Preview","zh-CN":"FirmDeck 产品预览","icu":{"params":[],"structure":"plain"},"sources":["frontend-enterprise/src/pages/LoginPage.tsx"]},
     {"id":"auth.login.productName","status":"existing","en-US":"Digital Employee Operations Platform","zh-CN":"数字员工运营平台","icu":{"params":[],"structure":"plain"},"sources":["frontend-enterprise/src/pages/LoginPage.tsx"]},
     {"id":"auth.login.showPassword","status":"existing","en-US":"Show Password","zh-CN":"显示密码","icu":{"params":[],"structure":"plain"},"sources":["frontend-enterprise/src/pages/LoginPage.tsx"]},
     {"id":"auth.login.usernamePlaceholder","status":"existing","en-US":"Enter your account (enter admin for first use)","zh-CN":"请输入账号（首次使用请输入admin）","icu":{"params":[],"structure":"plain"},"sources":["frontend-enterprise/src/pages/LoginPage.tsx"]},
@@ -115,7 +115,7 @@
     {"id":"onboarding.welcome.card.process.description","status":"missing","en-US":"Every digital employee has a profile, role, and growth history.","zh-CN":"每位数字员工都有档案、岗位与成长记录。","icu":{"params":[],"structure":"plain"},"sources":["frontend-enterprise/src/components/OnboardingGuide.tsx"]},
     {"id":"onboarding.welcome.card.process.title","status":"missing","en-US":"Execute tasks through processes","zh-CN":"按流程执行任务","icu":{"params":[],"structure":"plain"},"sources":["frontend-enterprise/src/components/OnboardingGuide.tsx"]},
     {"id":"onboarding.welcome.description","status":"missing","en-US":"Build your digital employee team as you would recruit, develop, and manage human employees. Delegate repetitive work to digital employees so you can focus on what matters more.","zh-CN":"像招聘、培养、管理真人员工一样，构建你的数字员工团队。把重复的事情交给数字员工，让自己专注更重要的工作。","icu":{"params":[],"structure":"plain"},"sources":["frontend-enterprise/src/components/OnboardingGuide.tsx"]},
-    {"id":"onboarding.welcome.eyebrow","status":"missing","en-US":"Welcome to StaffDeck","zh-CN":"欢迎使用 StaffDeck","icu":{"params":[],"structure":"plain"},"sources":["frontend-enterprise/src/components/OnboardingGuide.tsx"]},
+    {"id":"onboarding.welcome.eyebrow","status":"missing","en-US":"Welcome to FirmDeck","zh-CN":"欢迎使用 FirmDeck","icu":{"params":[],"structure":"plain"},"sources":["frontend-enterprise/src/components/OnboardingGuide.tsx"]},
     {"id":"onboarding.welcome.titlePrimary","status":"missing","en-US":"Digital employees","zh-CN":"数字员工","icu":{"params":[],"structure":"plain"},"sources":["frontend-enterprise/src/components/OnboardingGuide.tsx"]},
     {"id":"onboarding.welcome.titleSecondary","status":"missing","en-US":"Full-lifecycle building and management platform","zh-CN":"全流程构建与管理平台","icu":{"params":[],"structure":"plain"},"sources":["frontend-enterprise/src/components/OnboardingGuide.tsx"]},
 
@@ -147,7 +147,7 @@
     {"id":"quickStart.sop.title","status":"missing","en-US":"SOP · Process-based skills","zh-CN":"SOP · 流程型技能","icu":{"params":[],"structure":"plain"},"sources":["frontend-enterprise/src/components/QuickStartGuide.tsx"]},
 
     {"id":"updateReminder.close","status":"missing","en-US":"Close update reminder","zh-CN":"关闭更新提醒","icu":{"params":[],"structure":"plain"},"sources":["frontend-enterprise/src/components/UpdateReminder.tsx"]},
-    {"id":"updateReminder.title","status":"missing","en-US":"A new StaffDeck version is available","zh-CN":"StaffDeck 有新版本","icu":{"params":[],"structure":"plain"},"sources":["frontend-enterprise/src/components/UpdateReminder.tsx"]},
+    {"id":"updateReminder.title","status":"missing","en-US":"A new FirmDeck version is available","zh-CN":"FirmDeck 有新版本","icu":{"params":[],"structure":"plain"},"sources":["frontend-enterprise/src/components/UpdateReminder.tsx"]},
     {"id":"updateReminder.versionSummary","status":"missing","en-US":"v{latestVersion} is available; you are using v{currentVersion}","zh-CN":"v{latestVersion} 已发布，你正在使用 v{currentVersion}","icu":{"params":["currentVersion","latestVersion"],"structure":"named-arguments"},"sources":["frontend-enterprise/src/components/UpdateReminder.tsx"]},
     {"id":"updateReminder.viewUpdate","status":"missing","en-US":"View update","zh-CN":"查看更新","icu":{"params":[],"structure":"plain"},"sources":["frontend-enterprise/src/components/UpdateReminder.tsx"]}
   ]

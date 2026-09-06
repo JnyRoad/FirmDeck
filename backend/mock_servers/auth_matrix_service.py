@@ -8,7 +8,7 @@ from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException, Request
 
-app = FastAPI(title="StaffDeck Tool Auth Matrix")
+app = FastAPI(title="FirmDeck Tool Auth Matrix")
 
 
 def _require(condition: bool, scheme: str) -> None:

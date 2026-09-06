@@ -362,7 +362,7 @@ def test_account_list_select_create_update_delete_and_contact_way(monkeypatch) -
         params={
             "tenant_id": "tenant_demo",
             "open_kfid": "wk-existing",
-            "scene": "staffdeck",
+            "scene": "firmdeck",
         },
         headers=_auth(users["owner"]),
     )

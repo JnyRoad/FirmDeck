@@ -34,7 +34,7 @@ from app.session.message_visibility import visible_message_content, visible_mess
 
 router = APIRouter(prefix="/api/enterprise/sessions", tags=["enterprise:sessions"])
 
-SESSION_LOG_EXPORT_SCHEMA = "staffdeck.conversation-log.v1"
+SESSION_LOG_EXPORT_SCHEMA = "firmdeck.conversation-log.v1"
 
 
 class SessionLogExportRequest(BaseModel):
@@ -85,7 +85,7 @@ def export_session_logs(
             "count": len(details),
             "items": details,
         },
-        f"staffdeck-conversation-logs-{exported_at.strftime('%Y%m%d-%H%M%S')}.json",
+        f"firmdeck-conversation-logs-{exported_at.strftime('%Y%m%d-%H%M%S')}.json",
     )
 
 
@@ -104,7 +104,7 @@ def export_session_log(
             "exported_at": datetime.now(UTC),
             "item": _session_detail_payload(db, tenant_id, row),
         },
-        f"staffdeck-conversation-log-{_safe_filename_part(session_id)}.json",
+        f"firmdeck-conversation-log-{_safe_filename_part(session_id)}.json",
     )
 
 

@@ -81,7 +81,7 @@ class ReleaseEntry:
 
 
 def _parse_version(value: str) -> Version | None:
-    """Parse StaffDeck's optional-v SemVer representation without build metadata."""
+    """Parse FirmDeck's optional-v SemVer representation without build metadata."""
     normalized = value.strip()
     if normalized[:1].lower() == "v":
         normalized = normalized[1:]
@@ -182,7 +182,7 @@ def _fetch_version() -> AppVersionRead:
     try:
         response = httpx.get(
             source.feed_url,
-            headers={"Accept": "application/atom+xml", "User-Agent": "StaffDeck"},
+            headers={"Accept": "application/atom+xml", "User-Agent": "FirmDeck"},
             timeout=4.0,
             follow_redirects=True,
         )

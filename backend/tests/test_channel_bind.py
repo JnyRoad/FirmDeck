@@ -148,7 +148,7 @@ def _make_lazy_account(engine) -> User:
                 tenant_id="tenant_demo",
                 channel="wechat",
                 external_user_id="user_ab12cd34@im.wechat",
-                staffdeck_user_id=lazy.id,
+                firmdeck_user_id=lazy.id,
                 display_name=lazy.display_name,
             )
         )
@@ -285,7 +285,7 @@ def test_list_users_hides_channel_accounts_by_default() -> None:
                 channel="feishu",
                 external_account_scope="app_1",
                 external_user_id="ou_member",
-                staffdeck_user_id=member.id,
+                firmdeck_user_id=member.id,
                 display_name="张三",
             )
         )
@@ -295,7 +295,7 @@ def test_list_users_hides_channel_accounts_by_default() -> None:
                 channel="feishu",
                 external_account_scope="app_1",
                 external_user_id="group:chat_1",
-                staffdeck_user_id=member.id,
+                firmdeck_user_id=member.id,
                 display_name="测试群",
             )
         )
@@ -424,7 +424,7 @@ def test_bind_code_is_claimed_once_under_concurrency(tmp_path) -> None:
         record = db.exec(select(ChannelBindCode)).one()
         assert record.used_at is not None
         identities = db.exec(
-            select(ChannelIdentity).where(ChannelIdentity.staffdeck_user_id == "user_web")
+            select(ChannelIdentity).where(ChannelIdentity.firmdeck_user_id == "user_web")
         ).all()
         assert len(identities) == 1
         notices = db.exec(select(ChannelDelivery).where(ChannelDelivery.kind == "notice")).all()
@@ -558,13 +558,13 @@ def test_bind_success_migrates_history_and_marks_code_used() -> None:
 
     notices = _notice_texts(engine)
     assert any(
-        "绑定成功，微信对话将与你的 StaffDeck 账号「张三」共享记忆与对话记录。" == text
+        "绑定成功，微信对话将与你的 FirmDeck 账号「张三」共享记忆与对话记录。" == text
         for text in notices
     )
 
     with Session(engine) as db:
         identity = db.exec(select(ChannelIdentity)).one()
-        assert identity.staffdeck_user_id == "user_web"
+        assert identity.firmdeck_user_id == "user_web"
         # 显示名同步为码主账号名,不残留懒建期占位名
         assert identity.display_name == "张三"
         assert db.get(ChatSession, "s_p2p").user_id == "user_web"
@@ -616,7 +616,7 @@ def test_bind_rejected_when_identity_bound_to_other_web_account() -> None:
                 tenant_id="tenant_demo",
                 channel="wechat",
                 external_user_id="user_ab12cd34@im.wechat",
-                staffdeck_user_id="user_web2",
+                firmdeck_user_id="user_web2",
                 display_name="李四",
             )
         )
@@ -630,7 +630,7 @@ def test_bind_rejected_when_identity_bound_to_other_web_account() -> None:
     assert any("已绑定" in text and "/解绑" in text for text in notices)
     with Session(engine) as db:
         identity = db.exec(select(ChannelIdentity)).one()
-        assert identity.staffdeck_user_id == "user_web2"
+        assert identity.firmdeck_user_id == "user_web2"
         record = db.exec(select(ChannelBindCode)).one()
         assert record.used_at is None
 
@@ -665,7 +665,7 @@ def test_unbind_moves_history_back_to_lazy_account() -> None:
 
     with Session(engine) as db:
         identity = db.exec(select(ChannelIdentity)).one()
-        assert identity.staffdeck_user_id == "user_lazy"
+        assert identity.firmdeck_user_id == "user_lazy"
         # 解绑后显示名同步回懒建账号
         assert identity.display_name == "微信用户 ab12cd34"
         assert db.get(ChatSession, "s_p2p").user_id == "user_lazy"
@@ -690,7 +690,7 @@ def test_unbind_creates_lazy_account_when_missing() -> None:
                 tenant_id="tenant_demo",
                 channel="wechat",
                 external_user_id="user_ab12cd34@im.wechat",
-                staffdeck_user_id="user_web",
+                firmdeck_user_id="user_web",
                 display_name="张三",
             )
         )
@@ -707,7 +707,7 @@ def test_unbind_creates_lazy_account_when_missing() -> None:
         ).one()
         assert lazy.source == "wechat"
         identity = db.exec(select(ChannelIdentity)).one()
-        assert identity.staffdeck_user_id == lazy.id
+        assert identity.firmdeck_user_id == lazy.id
 
 
 def test_unbind_without_binding_is_noop() -> None:
@@ -781,7 +781,7 @@ def _seed_bound_state(engine) -> None:
                 tenant_id="tenant_demo",
                 channel="wechat",
                 external_user_id="user_ab12cd34@im.wechat",
-                staffdeck_user_id="user_web",
+                firmdeck_user_id="user_web",
                 display_name="张三",
             )
         )
@@ -862,7 +862,7 @@ def test_delete_my_identity_binding_unbinds_like_command() -> None:
 
     with Session(engine) as db:
         identity = db.exec(select(ChannelIdentity)).one()
-        assert identity.staffdeck_user_id == "user_lazy"
+        assert identity.firmdeck_user_id == "user_lazy"
         assert db.get(ChatSession, "s_p2p").user_id == "user_lazy"
         memory = db.get(MemoryRecord, "mem_1")
         assert memory.user_id == "user_lazy"
@@ -961,7 +961,7 @@ def _make_wecom_lazy_account(engine) -> User:
                 channel="wecom",
                 external_account_scope="aib_bot1",
                 external_user_id="zhangsan",
-                staffdeck_user_id=lazy.id,
+                firmdeck_user_id=lazy.id,
                 display_name=lazy.display_name,
             )
         )
@@ -1019,13 +1019,13 @@ def test_wecom_bind_success_full_chain() -> None:
 
     notices = _notice_texts(engine)
     assert any(
-        "绑定成功，企业微信对话将与你的 StaffDeck 账号「张三」共享记忆与对话记录。" == text
+        "绑定成功，企业微信对话将与你的 FirmDeck 账号「张三」共享记忆与对话记录。" == text
         for text in notices
     )
 
     with Session(engine) as db:
         identity = db.exec(select(ChannelIdentity)).one()
-        assert identity.staffdeck_user_id == "user_web"
+        assert identity.firmdeck_user_id == "user_web"
         assert db.get(ChatSession, "s_wecom_p2p").user_id == "user_web"
         memory = db.get(MemoryRecord, "mem_wecom_1")
         assert memory.user_id == "user_web"
@@ -1061,7 +1061,7 @@ def test_wecom_unbind_moves_history_back() -> None:
 
     with Session(engine) as db:
         identity = db.exec(select(ChannelIdentity)).one()
-        assert identity.staffdeck_user_id == "user_wecom_lazy"
+        assert identity.firmdeck_user_id == "user_wecom_lazy"
         assert identity.display_name == "企微用户 zhangsan"
         assert db.get(ChatSession, "s_wecom_p2p").user_id == "user_wecom_lazy"
         memory = db.get(MemoryRecord, "mem_wecom_1")
@@ -1106,7 +1106,7 @@ def test_wecom_delete_my_identity_binding_moves_data_back() -> None:
                 channel="wecom",
                 external_account_scope="corpA",
                 external_user_id="zhangsan",
-                staffdeck_user_id=users["web"].id,
+                firmdeck_user_id=users["web"].id,
                 display_name="张三",
             )
         )
@@ -1141,7 +1141,7 @@ def test_wecom_delete_my_identity_binding_moves_data_back() -> None:
 
     with Session(engine) as db:
         identity = db.exec(select(ChannelIdentity)).one()
-        assert identity.staffdeck_user_id == "user_wecom_lazy"
+        assert identity.firmdeck_user_id == "user_wecom_lazy"
         assert db.get(ChatSession, "s_wecom_bound").user_id == "user_wecom_lazy"
         memory = db.get(MemoryRecord, "mem_wecom_bound")
         assert memory.user_id == "user_wecom_lazy"
@@ -1167,7 +1167,7 @@ def test_bind_failure_throttle_cooldown_and_recovery() -> None:
             is False
         )
     notices = _notice_texts(engine)
-    assert notices[-1] == "绑定码无效或已过期，请在 StaffDeck 网页端重新生成后再试。"
+    assert notices[-1] == "绑定码无效或已过期，请在 FirmDeck 网页端重新生成后再试。"
     assert len(notices) == 5
 
     # 第 6 次(即使是正确码):冷却期拒绝
@@ -1296,7 +1296,7 @@ def test_my_identity_bindings_returns_external_account_scope() -> None:
                 channel="wechat",
                 external_account_scope="",
                 external_user_id="wxid_1",
-                staffdeck_user_id=users["web"].id,
+                firmdeck_user_id=users["web"].id,
                 display_name="张三",
             )
         )
@@ -1306,7 +1306,7 @@ def test_my_identity_bindings_returns_external_account_scope() -> None:
                 channel="wecom",
                 external_account_scope="corpA",
                 external_user_id="zhangsan",
-                staffdeck_user_id=users["web"].id,
+                firmdeck_user_id=users["web"].id,
                 display_name="张三",
             )
         )
@@ -1334,7 +1334,7 @@ def test_my_identity_bindings_heals_stale_display_name() -> None:
                 channel="feishu",
                 external_account_scope="app:20:cli_aaf3d15c5138dbe5:tenant:16:1a0aaaa3801ddcbc",
                 external_user_id="ou_admin",
-                staffdeck_user_id=users["web"].id,
+                firmdeck_user_id=users["web"].id,
                 display_name="飞书用户 609115",
             )
         )
@@ -1363,7 +1363,7 @@ def _seed_wecom_bound_identity(engine, user, external_id: str, scope: str) -> No
                 channel="wecom",
                 external_account_scope=scope,
                 external_user_id=external_id,
-                staffdeck_user_id=user.id,
+                firmdeck_user_id=user.id,
                 display_name=user.display_name,
             )
         )
@@ -1409,7 +1409,7 @@ def test_delete_my_identity_binding_by_external_user_id() -> None:
 
     with Session(engine) as db:
         identities = {
-            row.external_user_id: row.staffdeck_user_id
+            row.external_user_id: row.firmdeck_user_id
             for row in db.exec(select(ChannelIdentity)).all()
         }
         # 只解绑目标行:zhangsan 回懒建账号,lisi 仍绑在 web 账号
@@ -1433,7 +1433,7 @@ def test_delete_my_identity_binding_by_external_user_id_404() -> None:
     assert missing.status_code == 404
     with Session(engine) as db:
         # 404 不动现有绑定
-        assert db.exec(select(ChannelIdentity)).one().staffdeck_user_id == users["web"].id
+        assert db.exec(select(ChannelIdentity)).one().firmdeck_user_id == users["web"].id
 
 
 def test_delete_my_identity_binding_ambiguous_scope_requires_explicit_param() -> None:
@@ -1455,7 +1455,7 @@ def test_delete_my_identity_binding_ambiguous_scope_requires_explicit_param() ->
         rows = db.exec(select(ChannelIdentity)).all()
         # 两行都保持绑定,未被误删
         assert len(rows) == 2
-        assert all(row.staffdeck_user_id == web.id for row in rows)
+        assert all(row.firmdeck_user_id == web.id for row in rows)
 
 
 def test_delete_my_identity_binding_by_row_with_scope() -> None:
@@ -1479,7 +1479,7 @@ def test_delete_my_identity_binding_by_row_with_scope() -> None:
     assert deleted.status_code == 204
     with Session(engine) as db:
         rows = {
-            row.external_account_scope: row.staffdeck_user_id
+            row.external_account_scope: row.firmdeck_user_id
             for row in db.exec(select(ChannelIdentity)).all()
         }
         # corpA 行已解绑(指针回懒建账号),corpB 行仍绑在 web 账号

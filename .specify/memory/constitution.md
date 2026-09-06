@@ -15,9 +15,9 @@ Sync Impact Report
   docs/adr/ADR-001~004
 -->
 
-# StaffDeck Constitution
+# FirmDeck Constitution
 
-本宪法只固化 StaffDeck 特有的技术栈约束、架构边界、领域规则与取舍。通用工程原则由开发者
+本宪法只固化 FirmDeck 特有的技术栈约束、架构边界、领域规则与取舍。通用工程原则由开发者
 的全局规则提供，这里不重复；两者冲突时取更严的一方。事实源优先级：本宪法 → `CONTEXT.md`
 与 `docs/adr/` → `docs/agents/*.md` → 代码注释。规格、计划与代码不得与上述事实源静默偏离，
 发现冲突先修事实源再改代码。

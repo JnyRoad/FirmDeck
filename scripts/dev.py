@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cross-platform development lifecycle commands for StaffDeck."""
+"""Cross-platform development lifecycle commands for FirmDeck."""
 
 from __future__ import annotations
 
@@ -174,7 +174,7 @@ def _select_available_port(host: str, preferred: int) -> int:
     for port in candidates:
         if _port_available(host, port):
             return port
-    raise RuntimeError(f"No available StaffDeck port in {candidates[0]}-{candidates[-1]}")
+    raise RuntimeError(f"No available FirmDeck port in {candidates[0]}-{candidates[-1]}")
 
 
 def _restore_runtime_port() -> None:
@@ -306,13 +306,13 @@ def _ensure_sandbox_runtime() -> None:
     cli = runtime / "node_modules" / "@anthropic-ai" / "sandbox-runtime" / "dist" / "cli.js"
     node = runtime / "bin" / ("node.exe" if sys.platform == "win32" else "node")
     manager = cli.parent / "sandbox" / "sandbox-manager.js"
-    marker = "staffdeck-allow-all-domains-patch-v1"
+    marker = "firmdeck-allow-all-domains-patch-v1"
     try:
         if node.is_file() and cli.is_file() and marker in manager.read_text(encoding="utf-8"):
             return
     except OSError:
         pass
-    print("Preparing the reviewed StaffDeck sandbox runtime...")
+    print("Preparing the reviewed FirmDeck sandbox runtime...")
     subprocess.run(
         [
             sys.executable,
@@ -404,7 +404,7 @@ def _start_detached(supervisor) -> int:
 
 
 def command_up(detach_flag: bool) -> int:
-    """Prepare dependencies and start StaffDeck development services.
+    """Prepare dependencies and start FirmDeck development services.
 
     The flag selects detached supervision while environment settings control ports and restart
     behavior. This command may install local dependencies, stop services, build assets, and start
@@ -432,7 +432,7 @@ def command_up(detach_flag: bool) -> int:
         _build_frontend()
 
     if not detach:
-        print("StaffDeck development services are starting. Press Ctrl-C to stop.")
+        print("FirmDeck development services are starting. Press Ctrl-C to stop.")
         return supervisor.main()
 
     pid = _start_detached(supervisor)
@@ -444,14 +444,14 @@ def command_up(detach_flag: bool) -> int:
         base = f"http://{supervisor.url_host(supervisor.APP_HOST)}:{supervisor.APP_PORT}"
         _wait_for_url("chat", base + "/chat/", LOG_DIR / "app.log")
         _wait_for_url("enterprise", base + "/enterprise/dashboard", LOG_DIR / "app.log")
-        print(f"Started StaffDeck supervisor ({pid})")
+        print(f"Started FirmDeck supervisor ({pid})")
         print(f"  app        {base}/chat/")
         print(f"  enterprise {base}/enterprise/dashboard")
         print(f"  api docs   {base}/docs")
     else:
         backend = f"http://{supervisor.url_host(supervisor.BACKEND_HOST)}:{supervisor.BACKEND_PORT}"
         frontend = f"http://{supervisor.url_host(supervisor.ENTERPRISE_HOST)}:{supervisor.ENTERPRISE_PORT}"
-        print(f"Started StaffDeck supervisor ({pid})")
+        print(f"Started FirmDeck supervisor ({pid})")
         print(f"  backend    {backend}/docs")
         print(f"  enterprise {frontend}/enterprise/dashboard")
         print(f"  chat       {frontend}/chat/")

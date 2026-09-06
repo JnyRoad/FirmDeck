@@ -69,7 +69,7 @@ python weather.py -json -today <地区名称>
 
 @pytest.fixture(scope="module", autouse=True)
 def _reviewed_srt_runtime(tmp_path_factory):
-    if os.environ.get("STAFFDECK_SRT_RUNTIME", "").strip():
+    if os.environ.get("FIRMDECK_SRT_RUNTIME", "").strip():
         yield
         return
     repo_root = Path(__file__).resolve().parents[2]
@@ -86,11 +86,11 @@ def _reviewed_srt_runtime(tmp_path_factory):
             ],
             check=True,
         )
-    os.environ["STAFFDECK_SRT_RUNTIME"] = str(runtime)
+    os.environ["FIRMDECK_SRT_RUNTIME"] = str(runtime)
     try:
         yield
     finally:
-        os.environ.pop("STAFFDECK_SRT_RUNTIME", None)
+        os.environ.pop("FIRMDECK_SRT_RUNTIME", None)
 
 
 def test_runner_accepts_only_explicit_artifact_manifest_files(tmp_path: Path) -> None:

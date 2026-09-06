@@ -1064,7 +1064,7 @@ def start_delivery_daemon(*, db_engine=None) -> None:
         _delivery_thread = threading.Thread(
             target=run_delivery_daemon,
             kwargs={"db_engine": db_engine},
-            name="staffdeck-channel-delivery",
+            name="firmdeck-channel-delivery",
             daemon=True,
         )
         _delivery_thread.start()
@@ -1072,7 +1072,7 @@ def start_delivery_daemon(*, db_engine=None) -> None:
         _reaction_delivery_thread = threading.Thread(
             target=run_reaction_delivery_daemon,
             kwargs={"db_engine": db_engine},
-            name="staffdeck-channel-reaction-delivery",
+            name="firmdeck-channel-reaction-delivery",
             daemon=True,
         )
         _reaction_delivery_thread.start()
@@ -1116,7 +1116,7 @@ def notify_binding_creator(db: Session, binding: ChannelBinding, text: str) -> N
                 ChannelIdentity.tenant_id == binding.tenant_id,
                 ChannelIdentity.channel == binding.channel,
                 ChannelIdentity.external_account_scope == scope,
-                ChannelIdentity.staffdeck_user_id == binding.created_by_user_id,
+                ChannelIdentity.firmdeck_user_id == binding.created_by_user_id,
             )
         ).first()
         if not identity:
@@ -1176,7 +1176,7 @@ def _resolve_assignee_feishu_open_id(
     """确定 handoff assignee 的飞书 open_id。
 
     主链路:用当前 binding 的 external_account_scope 查 ChannelIdentity
-    (staffdeck_user_id → external_user_id),保证跨 binding/scope 隔离。
+    (firmdeck_user_id → external_user_id),保证跨 binding/scope 隔离。
     未命中返回 None(由调用方兜底,网页收件箱仍可用)。
 
     注:手机号/邮箱反查需要 User 表存储手机号/邮箱,当前 User 模型无此字段,
@@ -1189,7 +1189,7 @@ def _resolve_assignee_feishu_open_id(
                 ChannelIdentity.tenant_id == binding.tenant_id,
                 ChannelIdentity.channel == "feishu",
                 ChannelIdentity.external_account_scope == scope,
-                ChannelIdentity.staffdeck_user_id == assignee_user_id,
+                ChannelIdentity.firmdeck_user_id == assignee_user_id,
             )
         ).first()
         if identity and identity.external_user_id:
@@ -1216,7 +1216,7 @@ def resolve_assignee_channel_identity(
             ChannelIdentity.tenant_id == binding.tenant_id,
             ChannelIdentity.channel == binding.channel,
             ChannelIdentity.external_account_scope == scope,
-            ChannelIdentity.staffdeck_user_id == assignee_user_id,
+            ChannelIdentity.firmdeck_user_id == assignee_user_id,
             ~ChannelIdentity.external_user_id.startswith("group:"),
         )
     ).first()
@@ -1300,7 +1300,7 @@ def _resolve_inquirer_display_name(
     scope = external_account_scope(db, binding)
     identity = db.exec(
         select(ChannelIdentity).where(
-            ChannelIdentity.staffdeck_user_id == session.user_id,
+            ChannelIdentity.firmdeck_user_id == session.user_id,
             ChannelIdentity.channel == binding.channel,
             ChannelIdentity.external_account_scope == scope,
         )

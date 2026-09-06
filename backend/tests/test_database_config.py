@@ -1001,7 +1001,7 @@ def test_frozen_sqlite_does_not_follow_the_harness_workspace_root(
     result = _normalize_database_url("sqlite:///./skill_agent_loop.db")
 
     assert result == f"sqlite:///{(app_data / 'skill_agent_loop.db').resolve()}"
-    assert not (home / ".staffdeck" / "workspaces").exists()
+    assert not (home / ".firmdeck" / "workspaces").exists()
 
 
 def test_default_model_output_limit_migration_is_scoped_and_runs_once(tmp_path) -> None:

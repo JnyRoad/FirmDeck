@@ -117,7 +117,7 @@ export default function EmployeeCard({
   const galleryPublished = isGalleryEmployee(employee);
   const online = employee.status === 'active';
 
-  // Show raw API values on the card (bypass the SD1 term relabeling in staffdeckDisplayText).
+  // Show raw API values on the card (bypass the SD1 term relabeling in firmdeckDisplayText).
   const rawRoleName = (employee.metadata?.role_name as string | undefined) || profile.roleName;
   const displayName = employee.is_overall ? ui.openMarketplaceName : employeeDisplayNameWithCreator(employee);
   const displayDescription = employee.description || ui.descriptionPlaceholder;

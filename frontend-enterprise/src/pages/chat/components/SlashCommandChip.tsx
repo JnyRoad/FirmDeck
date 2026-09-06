@@ -1,4 +1,4 @@
-import StaffdeckIcon from '@/components/StaffdeckIcon';
+import FirmdeckIcon from '@/components/FirmdeckIcon';
 import { RawContent, RawIdentifier } from '@/i18n/RawContent';
 import { useAppIntl } from '@/i18n/useAppIntl';
 import type { ChatSlashCommand } from '@/types';
@@ -43,7 +43,7 @@ export default function SlashCommandChip({
       data-chat-slash-command={command.command}
     >
       <span className={CHAT_COMPOSER_COMMAND_ICON_CLASS} aria-hidden="true">
-        <StaffdeckIcon
+        <FirmdeckIcon
           name={command.kind === 'sop' ? 'branch' : command.kind === 'skill' ? 'spark' : 'tool'}
           size={13}
         />

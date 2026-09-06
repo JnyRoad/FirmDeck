@@ -15,11 +15,11 @@ import IconCapClipboard from '../../assets/icons/cap-clipboard.svg?react';
 import IconCapBriefcase from '../../assets/icons/cap-briefcase.svg?react';
 import IconProfileAlarm from '../../assets/icons/profile-alarm.svg?react';
 import IconProfileCalendar from '../../assets/icons/profile-calendar.svg?react';
-import capabilityLogs from '../../assets/staffdeck/capabilityLogs.png';
-import capabilityTasks from '../../assets/staffdeck/capabilityTasks.png';
-import capabilityTools from '../../assets/staffdeck/capabilityTools.png';
-import StaffdeckIcon from '../../components/StaffdeckIcon';
-import { staffdeckDisplayText } from '../../employee';
+import capabilityLogs from '../../assets/firmdeck/capabilityLogs.png';
+import capabilityTasks from '../../assets/firmdeck/capabilityTasks.png';
+import capabilityTools from '../../assets/firmdeck/capabilityTools.png';
+import FirmdeckIcon from '../../components/FirmdeckIcon';
+import { firmdeckDisplayText } from '../../employee';
 import type {
   AgentProfileRead,
   AgentWorkRecordEventRead,
@@ -277,7 +277,7 @@ export default function WorkRecordTab({
       title: copy.titleKnowledge,
       tone: 'knowledge',
       count: activeKnowledge.length,
-      body: activeKnowledge.slice(0, 3).map((item) => staffdeckDisplayText(item.name)).join(' / '),
+      body: activeKnowledge.slice(0, 3).map((item) => firmdeckDisplayText(item.name)).join(' / '),
       emptyBody: copy.emptyKnowledge,
       icon: <IconCapFolder className={capabilityGlyphClass} />,
       dark: false,
@@ -287,7 +287,7 @@ export default function WorkRecordTab({
       title: copy.titleGeneralSkills,
       tone: 'skill',
       count: activeGeneralSkills.length,
-      body: activeGeneralSkills.slice(0, 3).map((item) => staffdeckDisplayText(item.name)).join(' / '),
+      body: activeGeneralSkills.slice(0, 3).map((item) => firmdeckDisplayText(item.name)).join(' / '),
       emptyBody: copy.emptyGeneralSkills,
       icon: <IconCapMagicWand className={capabilityGlyphClass} />,
       dark: false,
@@ -297,7 +297,7 @@ export default function WorkRecordTab({
       title: copy.titleSop,
       tone: 'sop',
       count: activeSkills.length,
-      body: activeSkills.slice(0, 3).map((item) => staffdeckDisplayText(item.name)).join(' / '),
+      body: activeSkills.slice(0, 3).map((item) => firmdeckDisplayText(item.name)).join(' / '),
       emptyBody: copy.emptySop,
       icon: <IconCapClipboard className={capabilityGlyphClass} />,
       dark: false,
@@ -307,7 +307,7 @@ export default function WorkRecordTab({
       title: copy.titleTools,
       tone: 'tools',
       count: activeTools.length,
-      body: activeTools.slice(0, 3).map((item) => staffdeckDisplayText(item.display_name || item.name)).join(' / '),
+      body: activeTools.slice(0, 3).map((item) => firmdeckDisplayText(item.display_name || item.name)).join(' / '),
       emptyBody: copy.emptyTools,
       icon: <IconCapBriefcase className={capabilityGlyphClass} />,
       dark: true,
@@ -318,7 +318,7 @@ export default function WorkRecordTab({
       title: copy.titleScheduledTasks,
       tone: 'tasks',
       count: activeScheduledTasks.length,
-      body: activeScheduledTasks.slice(0, 2).map((item) => staffdeckDisplayText(item.title)).join(' / '),
+      body: activeScheduledTasks.slice(0, 2).map((item) => firmdeckDisplayText(item.title)).join(' / '),
       emptyBody: copy.emptyTasks,
       icon: <IconProfileAlarm className={capabilityGlyphClass} />,
       dark: true,
@@ -329,7 +329,7 @@ export default function WorkRecordTab({
       title: copy.titleLogs,
       tone: 'logs',
       count: conversationCount,
-      body: staffdeckDisplayText(employeeSessions[0]?.summary || employeeSessions[0]?.last_agent_question || ''),
+      body: firmdeckDisplayText(employeeSessions[0]?.summary || employeeSessions[0]?.last_agent_question || ''),
       emptyBody: copy.emptyLogs,
       icon: <IconProfileCalendar className={capabilityGlyphClass} />,
       dark: true,
@@ -367,7 +367,7 @@ export default function WorkRecordTab({
                     <span className="absolute top-[-8px] left-1/2 size-0 -translate-x-1/2 border-x-6 border-b-8 border-x-transparent border-b-[#f6f6f6] in-data-[theme=dark]:border-b-[#2b2d33]" />
                     <span className="truncate text-[10px] leading-none text-[#757f9c]">{item.kind}</span>
                     <span className="truncate text-[12px] leading-none text-[#464c5e] in-data-[theme=dark]:text-[#c9cede]">
-                      {staffdeckDisplayText(item.title)}
+                      {firmdeckDisplayText(item.title)}
                     </span>
                   </div>
                 </div>
@@ -546,7 +546,7 @@ function ActivityTimeline({ events }: ActivityTimelineProps) {
       grouped[track.key] = collect(
         events
           .filter((item) => item.kind === track.key)
-          .map((item) => ({ value: item.timestamp, name: staffdeckDisplayText(item.label) })),
+          .map((item) => ({ value: item.timestamp, name: firmdeckDisplayText(item.label) })),
       );
       return grouped;
     }, {});
@@ -1291,7 +1291,7 @@ function buildDayActivities(events: AgentWorkRecordEventRead[], copy: WorkRecord
           : item.kind === 'skill'
             ? copy.addedSkillPrefix
             : '';
-    push(item, `${prefix}${staffdeckDisplayText(item.label)}`);
+    push(item, `${prefix}${firmdeckDisplayText(item.label)}`);
   });
 
   return map;
@@ -1325,7 +1325,7 @@ function growthTimeline(
         )
         : copy.growthSopCreatedDesc(item.version),
       timestamp: stableGrowthTimestamp(item),
-      icon: <StaffdeckIcon name="filter" />,
+      icon: <FirmdeckIcon name="filter" />,
       tone: 'mint',
     });
   });
@@ -1340,7 +1340,7 @@ function growthTimeline(
         ? copy.growthGeneralSkillUpgradedDesc
         : copy.growthGeneralSkillCreatedDesc(item.slug),
       timestamp: stableGrowthTimestamp(item),
-      icon: <StaffdeckIcon name="spark" />,
+      icon: <FirmdeckIcon name="spark" />,
       tone: 'teal',
     });
   });
@@ -1355,7 +1355,7 @@ function growthTimeline(
         item.tool_type.toUpperCase(),
       ),
       timestamp: stableGrowthTimestamp(item),
-      icon: <StaffdeckIcon name="tool" />,
+      icon: <FirmdeckIcon name="tool" />,
       tone: 'green',
     });
   });

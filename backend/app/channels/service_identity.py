@@ -184,7 +184,7 @@ def resolve_or_provision_user(
     *,
     name_resolver: Callable[[str], str | None] | None = None,
 ) -> User:
-    """按 (tenant, channel, scope, external_id) 解析 StaffDeck 用户，不存在则开通懒建账号。
+    """按 (tenant, channel, scope, external_id) 解析 FirmDeck 用户，不存在则开通懒建账号。
 
     name_resolver 可选:传入 open_id 返回真实姓名;用于将占位 display_name 替换为渠道真实名。
     """
@@ -201,7 +201,7 @@ def resolve_or_provision_user(
             db.flush()
             identity = legacy
     if identity:
-        user = db.get(User, identity.staffdeck_user_id)
+        user = db.get(User, identity.firmdeck_user_id)
         if user and user.tenant_id == tenant_id:
             # 尝试用真实姓名替换占位名
             if (
@@ -243,7 +243,7 @@ def resolve_or_provision_user(
             channel=channel,
             external_account_scope=account_scope,
             external_user_id=external_id,
-            staffdeck_user_id=user.id,
+            firmdeck_user_id=user.id,
             display_name=user.display_name,
         )
     )
@@ -254,7 +254,7 @@ def resolve_or_provision_user(
         db.rollback()
         identity = find_channel_identity(db, tenant_id, channel, external_id, account_scope)
         if identity:
-            user = db.get(User, identity.staffdeck_user_id)
+            user = db.get(User, identity.firmdeck_user_id)
             if user and user.tenant_id == tenant_id:
                 return user
             db.delete(identity)
@@ -269,7 +269,7 @@ def resolve_or_provision_user(
                     channel=channel,
                     external_account_scope=account_scope,
                     external_user_id=external_id,
-                    staffdeck_user_id=user.id,
+                    firmdeck_user_id=user.id,
                     display_name=user.display_name,
                 )
             )
@@ -292,7 +292,7 @@ def unbind_external_identity(
     群身份(group: 开头)不属于个人,不应调用本函数。
     """
     identity = find_channel_identity(db, tenant_id, channel, external_id, account_scope)
-    current = db.get(User, identity.staffdeck_user_id) if identity else None
+    current = db.get(User, identity.firmdeck_user_id) if identity else None
     if not identity or not current or current.source != "web":
         return None
 
@@ -317,7 +317,7 @@ def unbind_external_identity(
         )
         db.add(lazy)
         db.flush()
-    identity.staffdeck_user_id = lazy.id
+    identity.firmdeck_user_id = lazy.id
     # 显示名同步回懒建账号,避免残留原绑定账号名
     identity.display_name = lazy.display_name or lazy.username
     identity.updated_at = utc_now()
@@ -397,9 +397,9 @@ def migrate_scope_for_binding(
         conflict = find_channel_identity(
             db, binding.tenant_id, binding.channel, new_external_id, new_scope
         )
-        if conflict and conflict.id != row.id and conflict.staffdeck_user_id != row.staffdeck_user_id:
+        if conflict and conflict.id != row.id and conflict.firmdeck_user_id != row.firmdeck_user_id:
             raise IdentityScopeConflict(
-                "目标企业中该渠道身份已关联其他 StaffDeck 用户: "
+                "目标企业中该渠道身份已关联其他 FirmDeck 用户: "
                 f"external_user_id={new_external_id}"
             )
         migration_rows.append((row, new_external_id, conflict))

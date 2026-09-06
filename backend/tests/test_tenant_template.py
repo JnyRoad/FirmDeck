@@ -3,7 +3,7 @@
 import pytest
 from sqlmodel import Session, SQLModel, create_engine, select
 
-from app.db import staffdeck_seed
+from app.db import firmdeck_seed
 from app.db.models import (
     AgentKnowledgeBranch,
     AgentProfile,
@@ -219,8 +219,8 @@ def test_default_tenant_template_ids_and_embedded_references_are_tenant_determin
         assert first_branch_ids
         assert first_branch_ids == second_branch_ids
 
-        raw = staffdeck_seed._load_seed_fixtures(
-            (staffdeck_seed.FIXTURE_PATH, staffdeck_seed.EXPANDED_FIXTURE_PATH)
+        raw = firmdeck_seed._load_seed_fixtures(
+            (firmdeck_seed.FIXTURE_PATH, firmdeck_seed.EXPANDED_FIXTURE_PATH)
         )
         fixture_agent_ids = {
             str(row["id"])

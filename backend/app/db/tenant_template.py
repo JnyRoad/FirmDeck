@@ -3,7 +3,7 @@
 from sqlmodel import Session, select
 
 from app.db.models import AgentProfile, User
-from app.db.staffdeck_seed import SEED_SOURCE, SELECTED_AGENT_NAMES, seed_staffdeck_tenant_gallery
+from app.db.firmdeck_seed import SEED_SOURCE, SELECTED_AGENT_NAMES, seed_firmdeck_tenant_gallery
 
 
 def seed_default_tenant_template(session: Session, tenant_id: str, tenant_admin: User) -> None:
@@ -17,7 +17,7 @@ def seed_default_tenant_template(session: Session, tenant_id: str, tenant_admin:
         raise ValueError("Tenant administrator does not belong to the requested tenant")
 
     _reject_reserved_employee_conflicts(session, tenant_id)
-    seed_staffdeck_tenant_gallery(
+    seed_firmdeck_tenant_gallery(
         session,
         tenant_id=tenant_id,
         admin_user_id=tenant_admin.id,

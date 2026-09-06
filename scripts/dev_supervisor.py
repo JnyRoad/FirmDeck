@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local development supervisor for StaffDeck services."""
+"""Local development supervisor for FirmDeck services."""
 
 from __future__ import annotations
 

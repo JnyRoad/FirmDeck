@@ -38,7 +38,7 @@ def test_macos_bundle_keeps_webkit_packaging_support() -> None:
 def test_pyinstaller_bundle_contains_the_build_version_resource() -> None:
     spec_path = Path(__file__).resolve().parents[2] / "packaging" / "ultrarag.spec"
     content = spec_path.read_text(encoding="utf-8")
-    assert 'staffdeck-version.txt' in content
+    assert 'firmdeck-version.txt' in content
     assert '(str(VERSION_FILE), ".")' in content
 
 
@@ -86,7 +86,7 @@ def test_pyinstaller_bundle_contains_distribution_metadata_resource() -> None:
     spec_path = Path(__file__).resolve().parents[2] / "packaging" / "ultrarag.spec"
     content = spec_path.read_text(encoding="utf-8")
 
-    assert "staffdeck-distribution.json" in content
+    assert "firmdeck-distribution.json" in content
     assert "DISTRIBUTION_METADATA_FILE" in content
     assert '(str(DISTRIBUTION_METADATA_FILE), ".")' in content
 
@@ -97,7 +97,7 @@ def test_release_workflow_binds_distribution_to_running_repository() -> None:
     workflow = yaml.load(workflow_path.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
     build_step = next(step for step in workflow["jobs"]["build"]["steps"] if step.get("name") == "Build")
 
-    assert build_step["env"]["STAFFDECK_RELEASE_REPOSITORY"] == "${{ github.repository }}"
+    assert build_step["env"]["FIRMDECK_RELEASE_REPOSITORY"] == "${{ github.repository }}"
 
 
 def test_release_builds_require_the_reusable_quality_gate_and_lockfile_install() -> None:

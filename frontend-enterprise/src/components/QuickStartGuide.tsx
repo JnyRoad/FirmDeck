@@ -15,10 +15,10 @@ import { useAppIntl } from "@/i18n/useAppIntl";
 import type { MessageId } from "@/i18n/types";
 import { OPEN_QUICK_START_EVENT } from "./OnboardingGuide";
 
-const ONBOARDING_SEEN_KEY = "staffdeck_onboarding_guide_seen";
-export const QUICK_START_SEEN_KEY = "staffdeck_quick_start_guide_seen";
-export const QUICK_START_COMPLETED_EVENT = "staffdeck-quick-start-completed";
-export const OPEN_MODEL_CREATE_EVENT = "staffdeck-open-model-create";
+const ONBOARDING_SEEN_KEY = "firmdeck_onboarding_guide_seen";
+export const QUICK_START_SEEN_KEY = "firmdeck_quick_start_guide_seen";
+export const QUICK_START_COMPLETED_EVENT = "firmdeck-quick-start-completed";
+export const OPEN_MODEL_CREATE_EVENT = "firmdeck-open-model-create";
 
 type QuickStartStep = {
   titleId: MessageId;

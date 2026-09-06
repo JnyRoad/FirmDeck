@@ -1,5 +1,5 @@
 /**
- * 将持久化语言偏好、React Intl 和 StaffDeck facade 组合为语义消息运行时的 React 根边界。
+ * 将持久化语言偏好、React Intl 和 FirmDeck facade 组合为语义消息运行时的 React 根边界。
  */
 
 import {

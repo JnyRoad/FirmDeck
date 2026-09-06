@@ -1,4 +1,4 @@
-"""Versioned StaffDeck product events with safe, locale-independent payloads."""
+"""Versioned FirmDeck product events with safe, locale-independent payloads."""
 
 from __future__ import annotations
 

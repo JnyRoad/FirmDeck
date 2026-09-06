@@ -12,14 +12,14 @@ const LOGIN_LOCALES = [
     action: '登录',
     account: '账号',
     product: '数字员工运营平台',
-    title: 'StaffDeck 数字员工运营平台',
+    title: 'FirmDeck 数字员工运营平台',
   },
   {
     locale: 'en-US' as const,
     action: 'Log in',
     account: 'Account',
     product: 'Digital Employee Operations Platform',
-    title: 'StaffDeck Digital Employee Operations Platform',
+    title: 'FirmDeck Digital Employee Operations Platform',
   },
 ];
 

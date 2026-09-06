@@ -398,7 +398,7 @@ class WeChatClient:
                 "from_user_id": "",
                 "to_user_id": to_user_id,
                 # 确定性幂等:同一投递的重试复用同一 client_id;未指定时保持随机
-                "client_id": client_id or f"staffdeck:{int(time.time() * 1000)}:{uuid4().hex[:8]}",
+                "client_id": client_id or f"firmdeck:{int(time.time() * 1000)}:{uuid4().hex[:8]}",
                 "message_type": 2,
                 "message_state": 2,
                 "context_token": context_token,
@@ -581,7 +581,7 @@ class WeChatAdapter:
         # 同一投递的每次重试使用同一 client_id 前缀,分片按下标区分(服务端按 client_id 幂等)
         client = self._client_factory(binding)
         for index, chunk in enumerate(split_wechat_text(text)):
-            client_id = f"staffdeck:{idempotency_key}:{index}" if idempotency_key else ""
+            client_id = f"firmdeck:{idempotency_key}:{index}" if idempotency_key else ""
             client.send_message(to_user_id, context_token, chunk, client_id=client_id)
 
     def send_typing(
@@ -858,7 +858,7 @@ class WeChatPollManager:
         self._stopped.clear()
         self._reconcile_thread = threading.Thread(
             target=self._reconcile_loop,
-            name="staffdeck-wechat-reconcile",
+            name="firmdeck-wechat-reconcile",
             daemon=True,
         )
         self._reconcile_thread.start()
@@ -894,7 +894,7 @@ class WeChatPollManager:
             thread = threading.Thread(
                 target=self._poll_loop,
                 args=(binding_id, flag),
-                name=f"staffdeck-wechat-poll-{binding_id}",
+                name=f"firmdeck-wechat-poll-{binding_id}",
                 daemon=True,
             )
             self._threads[binding_id] = thread

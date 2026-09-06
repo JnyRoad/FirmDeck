@@ -12,9 +12,9 @@ const stableSandboxFields = {
   sandbox_status_code: 'SANDBOX_WINDOWS_SETUP_REQUIRED',
   sandbox_status_params: { backend: 'srt' },
   sandbox_remediation_code: 'SANDBOX_WINDOWS_SETUP_REQUIRED',
-  sandbox_remediation_params: { command: '/opt/staffdeck/node srt-cli.js windows-install' },
+  sandbox_remediation_params: { command: '/opt/firmdeck/node srt-cli.js windows-install' },
   sandbox_setup_code: 'SANDBOX_WINDOWS_SETUP_REQUIRED',
-  sandbox_setup_params: { command: '/opt/staffdeck/node srt-cli.js windows-install' },
+  sandbox_setup_params: { command: '/opt/firmdeck/node srt-cli.js windows-install' },
 } satisfies Pick<
   UIConfigRead,
   | 'sandbox_status'

@@ -298,7 +298,7 @@ export function ContentTab({ api, kb, ownerAgentId, ownerAgentName, onChanged }:
       key: 'status',
       title: t('knowledgeAdmin.content.table.status'),
       width: 120,
-      // I8：`ready`/`archived` 是 StaffDeck 自己的文档状态枚举，不是用户原文——
+      // I8：`ready`/`archived` 是 FirmDeck 自己的文档状态枚举，不是用户原文——
       // 必须本地化，且不该套 `RawContent`（那是 raw 内容边界标记）。落键模式同
       // `VersionsTab.tsx` 的 `STATE_LABEL_IDS`；未登记的新状态原样显示码本身。
       render: (row) => {

@@ -94,7 +94,7 @@ class FeishuProcessSupervisor:
         self._monitor_stop = threading.Event()
         self._monitor_thread = threading.Thread(
             target=self._monitor_loop,
-            name="staffdeck-feishu-supervisor",
+            name="firmdeck-feishu-supervisor",
             daemon=True,
         )
         self._monitor_thread.start()
@@ -177,7 +177,7 @@ class FeishuProcessSupervisor:
         process = self._ctx.Process(
             target=connector_child_entry,
             args=(spec, child_connection),
-            name=f"staffdeck-feishu-{binding_id}",
+            name=f"firmdeck-feishu-{binding_id}",
         )
         record = ConnectorRecord(spec=spec, process=process, connection=parent_connection)
         try:

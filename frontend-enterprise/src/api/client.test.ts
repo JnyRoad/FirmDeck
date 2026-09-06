@@ -239,7 +239,7 @@ describe('WeChat Customer Service API client', () => {
       ['PATCH', '/api/enterprise/channels/binding-1/wechat_kf/account'],
       ['DELETE', '/api/enterprise/channels/binding-1/wechat_kf/account/wk-existing?tenant_id=tenant_demo'],
       ['POST', '/api/enterprise/channels/binding-1/wechat_kf/avatar?tenant_id=tenant_demo'],
-      ['POST', '/api/enterprise/channels/binding-1/wechat_kf/contact-way?tenant_id=tenant_demo&open_kfid=wk-existing&scene=staffdeck'],
+      ['POST', '/api/enterprise/channels/binding-1/wechat_kf/contact-way?tenant_id=tenant_demo&open_kfid=wk-existing&scene=firmdeck'],
     ]);
     expect(calls[1]?.body).toBe(JSON.stringify({
       ...payload,

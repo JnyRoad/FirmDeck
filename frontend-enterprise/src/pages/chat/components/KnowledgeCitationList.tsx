@@ -1,4 +1,4 @@
-import StaffdeckIcon from '@/components/StaffdeckIcon';
+import FirmdeckIcon from '@/components/FirmdeckIcon';
 import { RawIdentifier } from '@/i18n/RawContent';
 import { useAppIntl } from '@/i18n/useAppIntl';
 import type { KnowledgeCitation } from '@/types';
@@ -29,7 +29,7 @@ export default function KnowledgeCitationList({
   return (
     <div className={CHAT_CITATIONS_CLASS} aria-label={t('chat.dialog.citations')}>
       <div className={CHAT_CITATION_HEADING_CLASS}>
-        <StaffdeckIcon name="file" size={14} />
+        <FirmdeckIcon name="file" size={14} />
         <span>{t('chat.dialog.citationSources')}</span>
       </div>
       <div className={CHAT_CITATION_LIST_CLASS}>

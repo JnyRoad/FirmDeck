@@ -73,7 +73,7 @@ def test_provision_creates_member_user_and_identity() -> None:
                 ChannelIdentity.external_user_id == "wxid_ab12cd34",
             )
         ).one()
-        assert identity.staffdeck_user_id == user.id
+        assert identity.firmdeck_user_id == user.id
 
 
 def test_second_call_hits_existing_mapping() -> None:
@@ -110,7 +110,7 @@ def test_corrupt_cross_tenant_identity_is_replaced_in_current_tenant() -> None:
                 channel="wecom",
                 external_account_scope="corpB",
                 external_user_id="zhangsan",
-                staffdeck_user_id=foreign_user.id,
+                firmdeck_user_id=foreign_user.id,
             )
         )
         db.commit()
@@ -133,8 +133,8 @@ def test_corrupt_cross_tenant_identity_is_replaced_in_current_tenant() -> None:
                 ChannelIdentity.external_user_id == "zhangsan",
             )
         ).one()
-        assert identity.staffdeck_user_id == current_user.id
-        assert identity.staffdeck_user_id != foreign_user.id
+        assert identity.firmdeck_user_id == current_user.id
+        assert identity.firmdeck_user_id != foreign_user.id
 
 
 def test_group_account_provision() -> None:
@@ -172,7 +172,7 @@ def test_username_conflict_falls_back_to_existing_user() -> None:
                 ChannelIdentity.external_user_id == "wxid_conflict",
             )
         ).one()
-        assert identity.staffdeck_user_id == existing.id
+        assert identity.firmdeck_user_id == existing.id
 
 
 def test_username_sanitizes_and_truncates() -> None:

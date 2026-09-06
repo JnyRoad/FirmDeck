@@ -40,7 +40,7 @@ def test_harness_workspace_config_uses_user_default_and_preserves_stable_path_co
     monkeypatch.setenv("ULTRARAG_DATA_DIR", str(tmp_path / "app-data"))
 
     default_read = ui_config_read(UIConfig(tenant_id="tenant_demo"))
-    assert default_read.effective_harness_storage_path == str(home / ".staffdeck" / "workspaces")
+    assert default_read.effective_harness_storage_path == str(home / ".firmdeck" / "workspaces")
 
     engine = create_engine(
         "sqlite://",
@@ -103,7 +103,7 @@ def test_harness_workspace_config_treats_legacy_whitespace_as_the_default_root(
         )
     )
 
-    assert result.effective_harness_storage_path == str(home / ".staffdeck" / "workspaces")
+    assert result.effective_harness_storage_path == str(home / ".firmdeck" / "workspaces")
 
 
 def test_context_runtime_settings_validate_related_limits() -> None:
@@ -242,7 +242,7 @@ def test_sandbox_diagnostics_use_codes_and_typed_raw_parameters(
     monkeypatch.setattr(
         ui_config_module,
         "windows_install_command",
-        lambda: "/opt/staffdeck/node srt-cli.js windows-install",
+        lambda: "/opt/firmdeck/node srt-cli.js windows-install",
     )
 
     result = ui_config_read(UIConfig(tenant_id="tenant_demo", sandbox_enabled=True))
@@ -251,9 +251,9 @@ def test_sandbox_diagnostics_use_codes_and_typed_raw_parameters(
     assert result.sandbox_status_code == "SANDBOX_WINDOWS_SETUP_REQUIRED"
     assert result.sandbox_status_params.backend == "srt"
     assert result.sandbox_remediation_code == "SANDBOX_WINDOWS_SETUP_REQUIRED"
-    assert result.sandbox_remediation_params.command == "/opt/staffdeck/node srt-cli.js windows-install"
+    assert result.sandbox_remediation_params.command == "/opt/firmdeck/node srt-cli.js windows-install"
     assert result.sandbox_setup_code == "SANDBOX_WINDOWS_SETUP_REQUIRED"
-    assert result.sandbox_setup_params.command == "/opt/staffdeck/node srt-cli.js windows-install"
+    assert result.sandbox_setup_params.command == "/opt/firmdeck/node srt-cli.js windows-install"
     assert "POISON_LOCALIZED_STATUS" not in str(payload)
     assert "POISON_LOCALIZED_REMEDIATION" not in str(payload)
     assert "sandbox_status_message" not in payload

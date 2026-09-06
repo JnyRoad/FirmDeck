@@ -7,7 +7,7 @@ import BrandLogo from '../components/BrandLogo';
 import IconFieldClear from '../assets/icons/field-clear.svg?react';
 import IconFieldEye from '../assets/icons/field-eye.svg?react';
 import IconFieldEyeOn from '../assets/icons/field-eye-on.svg?react';
-import loginPreview from '../assets/staffdeck/login-preview.png';
+import loginPreview from '../assets/firmdeck/login-preview.png';
 import { useAppIntl } from '../i18n/useAppIntl';
 import { RawIdentifier } from '../i18n/RawContent';
 
@@ -161,7 +161,7 @@ export default function LoginPage({ onLogin }: LoginPageProps) {
             {t('auth.login.heroPrompt')}
           </span>
           <h1 className="mt-[6px] text-center text-[54px] font-semibold leading-[80px] tracking-[1.08px] text-[#18181a]">
-            <RawIdentifier value="StaffDeck" />
+            <RawIdentifier value="FirmDeck" />
             <br />
             {t('auth.login.productName')}
           </h1>

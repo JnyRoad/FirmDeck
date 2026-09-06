@@ -22,7 +22,7 @@ from app.db.models import (
 )
 from app.security.encryption import encrypt_secret
 from app.security.auth import hash_password
-from app.db.staffdeck_seed import seed_staffdeck_admin_gallery
+from app.db.firmdeck_seed import seed_firmdeck_admin_gallery
 
 
 ADAPTIVE_FLOW_RULE = (
@@ -1028,7 +1028,7 @@ def seed_demo_data(session: Session) -> None:
     _seed_weather_general_skill(session)
     session.flush()
     _publish_seeded_system_resources(session)
-    seed_staffdeck_admin_gallery(session)
+    seed_firmdeck_admin_gallery(session)
 
     default_model = session.exec(
         select(ModelConfig).where(
@@ -1155,7 +1155,7 @@ def _archive_seed_default_agent(session: Session, tenant_id: str) -> None:
     metadata.update(
         {
             "is_default_employee": True,
-            "hidden_from_staffdeck": True,
+            "hidden_from_firmdeck": True,
             "archived_by_seed": True,
         }
     )

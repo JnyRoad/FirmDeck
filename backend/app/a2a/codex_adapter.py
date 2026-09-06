@@ -135,7 +135,7 @@ def _language_metadata(task: A2ATaskRun) -> dict[str, Any]:
 def _codex_runtime_prompt(prompt: str, context: LanguageContext) -> str:
     """Add a locale-only runtime instruction while preserving the persisted raw user prompt."""
     return (
-        "[StaffDeck language contract] Respond to the user in "
+        "[FirmDeck language contract] Respond to the user in "
         f"{context.agent_reply_locale.value}. Keep user-provided text and source content raw.\n\n"
         f"{prompt}"
     )
@@ -452,7 +452,7 @@ def _submit_message_locked(
 
     settings = get_settings()
     language_context = _a2a_language_context(params, message)
-    workspace_root = Path(settings.codex_a2a_workspace_root or "/tmp/staffdeck-codex-a2a")
+    workspace_root = Path(settings.codex_a2a_workspace_root or "/tmp/firmdeck-codex-a2a")
     task_public_id = uuid.uuid4().hex
     workspace = (workspace_root / task_public_id).resolve()
     workspace.mkdir(parents=True, exist_ok=True)
@@ -647,8 +647,8 @@ def _run_codex_task(task_id: str, *, recovery: bool = False) -> None:
     child_env = os.environ.copy()
     child_env.update(
         {
-            "STAFFDECK_UI_LOCALE": language_context.ui_locale.value,
-            "STAFFDECK_AGENT_REPLY_LOCALE": language_context.agent_reply_locale.value,
+            "FIRMDECK_UI_LOCALE": language_context.ui_locale.value,
+            "FIRMDECK_AGENT_REPLY_LOCALE": language_context.agent_reply_locale.value,
         }
     )
     try:

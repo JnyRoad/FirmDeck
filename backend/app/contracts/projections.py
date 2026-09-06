@@ -351,7 +351,7 @@ def project_problem_details(
     descriptor = _safe_public_descriptor(occurrence, registry)
     entry = registry.require(descriptor.code)
     return {
-        "type": f"urn:staffdeck:error:{descriptor.code.lower()}",
+        "type": f"urn:firmdeck:error:{descriptor.code.lower()}",
         "title": descriptor.code,
         "status": entry.default_http_status,
         "code": descriptor.code,

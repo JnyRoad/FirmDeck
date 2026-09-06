@@ -97,7 +97,7 @@ const runtimeStatus = {
   enabled: true,
   credential_configured: true,
   command: 'codex',
-  workspace_root: '/srv/staffdeck/codex-runtime',
+  workspace_root: '/srv/firmdeck/codex-runtime',
   timeout_seconds: 45,
 };
 
@@ -257,7 +257,7 @@ describe('system client HTTP contract', () => {
     });
 
     const url = String(fetchMock.mock.calls[0][0]);
-    const parsed = new URL(url, 'https://staffdeck.test');
+    const parsed = new URL(url, 'https://firmdeck.test');
     expect(parsed.pathname).toBe('/api/system/tenants');
     expect(Object.fromEntries(parsed.searchParams)).toEqual({
       query: 'Alpha & Beta',
@@ -271,7 +271,7 @@ describe('system client HTTP contract', () => {
     await client.listTenants({ query: '   ', cursor: '', limit: 101 });
     await client.listTenants({ limit: Number.NaN });
     for (const [input] of fetchMock.mock.calls.slice(1)) {
-      const filtered = new URL(String(input), 'https://staffdeck.test');
+      const filtered = new URL(String(input), 'https://firmdeck.test');
       expect([...filtered.searchParams]).toEqual([]);
     }
   });
@@ -537,7 +537,7 @@ describe('system client HTTP contract', () => {
     await client.listTenantAudit('tenant alpha/id', { cursor: 'cursor/value', limit: 50 });
 
     const url = String(fetchMock.mock.calls[0][0]);
-    const parsed = new URL(url, 'https://staffdeck.test');
+    const parsed = new URL(url, 'https://firmdeck.test');
     expect(parsed.pathname).toBe('/api/system/tenants/tenant%20alpha%2Fid/audit');
     expect(Object.fromEntries(parsed.searchParams)).toEqual({
       cursor: 'cursor/value',

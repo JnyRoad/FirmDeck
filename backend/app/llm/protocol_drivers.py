@@ -202,7 +202,7 @@ class OpenAIResponsesDriver:
 
 @dataclass(frozen=True)
 class CodexAppServerDriver:
-    """将 StaffDeck 的模型请求映射为本机 Codex app-server 的 thread/turn 会话。"""
+    """将 FirmDeck 的模型请求映射为本机 Codex app-server 的 thread/turn 会话。"""
 
     session_factory: Callable[[], Any]
     request_kind: str = "codex.app_server"

@@ -114,4 +114,4 @@ def test_attachment_directory_does_not_follow_the_harness_workspace_root(
     )
 
     assert directory.is_relative_to(app_data / "harness_uploads")
-    assert not (home / ".staffdeck" / "workspaces").exists()
+    assert not (home / ".firmdeck" / "workspaces").exists()

@@ -6,7 +6,7 @@ import sys
 from typing import Any
 
 
-RESOURCE_URI = "ui://staffdeck/demo-card"
+RESOURCE_URI = "ui://firmdeck/demo-card"
 MIME_TYPE = "text/html;profile=mcp-app"
 
 
@@ -35,7 +35,7 @@ def main() -> None:
                             else {}
                         ),
                     },
-                    "serverInfo": {"name": "StaffDeck-mock-apps", "version": "0.1.0"},
+                    "serverInfo": {"name": "FirmDeck-mock-apps", "version": "0.1.0"},
                 },
             )
         elif method == "notifications/initialized":

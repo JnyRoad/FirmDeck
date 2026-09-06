@@ -1095,7 +1095,7 @@ def _bind_external_identity(
         return render_channel_notice(ChannelNotice("binding.invalid"), context)
 
     identity = find_channel_identity(db, binding.tenant_id, binding.channel, external_id, scope)
-    old_user_id = identity.staffdeck_user_id if identity else None
+    old_user_id = identity.firmdeck_user_id if identity else None
     if old_user_id and old_user_id != owner.id:
         current = db.get(User, old_user_id)
         if current and current.source == "web":
@@ -1118,7 +1118,7 @@ def _bind_external_identity(
     # ① 身份指针改指码主账号(无记录则新建);显示名同步为码主账号名,
     # 避免残留懒建期占位名(如"飞书用户 xxx")在绑定列表里显示成另一个身份。
     if identity:
-        identity.staffdeck_user_id = owner.id
+        identity.firmdeck_user_id = owner.id
         identity.display_name = owner.display_name or owner.username
         identity.updated_at = utc_now()
     else:
@@ -1127,7 +1127,7 @@ def _bind_external_identity(
             channel=binding.channel,
             external_account_scope=scope,
             external_user_id=external_id,
-            staffdeck_user_id=owner.id,
+            firmdeck_user_id=owner.id,
             display_name=owner.display_name or owner.username,
         )
     db.add(identity)
@@ -1409,7 +1409,7 @@ def _try_handle_feishu_handoff_reply(
             language_context=handoff_context,
         )
         return True
-    # assignee 的 StaffDeck 用户 id:从 ChannelIdentity 反查(同 binding scope)。
+    # assignee 的 FirmDeck 用户 id:从 ChannelIdentity 反查(同 binding scope)。
     scope = external_account_scope(db, binding)
     identity = db.exec(
         select(ChannelIdentity).where(
@@ -1419,7 +1419,7 @@ def _try_handle_feishu_handoff_reply(
             ChannelIdentity.external_user_id == inbound.from_user_id,
         )
     ).first()
-    answered_by = identity.staffdeck_user_id if identity else handoff.assignee_user_id
+    answered_by = identity.firmdeck_user_id if identity else handoff.assignee_user_id
     from app.api.chat import _apply_handoff_reply
 
     _pin_handoff_resume_lifecycle_version(
@@ -1466,7 +1466,7 @@ def _run_handoff_reply_command(
     匹配策略(按优先级):
     1. 引用通知(parent_id):按 handoff.notify_message_id == parent_id 精确匹配。
     2. 企业微信显式 handoff ID 或最近一次已投递通知。
-    3. 其他渠道查发送者在当前 binding scope 下的 ChannelIdentity → staffdeck_user_id,
+    3. 其他渠道查发送者在当前 binding scope 下的 ChannelIdentity → firmdeck_user_id,
        再查该 user 名下 status=pending 的 handoff。恰好一个时直接使用;多个时拒绝,
        提示处理人回复对应通知消息。
     命中后复用 _apply_handoff_reply 置 answered + 恢复 SOP,并给处理人回确认。
@@ -1495,7 +1495,7 @@ def _run_handoff_reply_command(
             ChannelIdentity.external_user_id == inbound.from_user_id,
         )
     ).first()
-    assignee_user_id = identity.staffdeck_user_id if identity else None
+    assignee_user_id = identity.firmdeck_user_id if identity else None
     if not assignee_user_id:
         return render_channel_notice(ChannelNotice("handoff.identity_missing"), context)
 
@@ -1600,11 +1600,11 @@ def _run_handoff_reply_command(
             or str(notice_target.get("receive_id") or "").strip() != inbound.from_user_id
             or handoff.assignee_user_id != assignee_user_id
         ):
-            # 同时校验通知实际目标与当前 StaffDeck 身份，防止引用或身份变更后越权。
+            # 同时校验通知实际目标与当前 FirmDeck 身份，防止引用或身份变更后越权。
             return render_channel_notice(ChannelNotice("handoff.forbidden"), context)
 
     # 策略 2:企业微信没有统一的引用消息字段,按当前绑定下最近一次已投递的
-    # handoff 通知匹配;仍限制在当前账号和当前 StaffDeck 身份作用域内。
+    # handoff 通知匹配;仍限制在当前账号和当前 FirmDeck 身份作用域内。
     if not handoff and binding.channel == "wecom":
         notices = db.exec(
             select(ChannelDelivery)
@@ -2683,7 +2683,7 @@ def start_staged_inbound_daemon(*, db_engine=None) -> None:
     _staged_inbound_thread = threading.Thread(
         target=run_staged_inbound_daemon,
         kwargs={"db_engine": db_engine},
-        name="staffdeck-channel-durable-intake",
+        name="firmdeck-channel-durable-intake",
         daemon=True,
     )
     _staged_inbound_thread.start()

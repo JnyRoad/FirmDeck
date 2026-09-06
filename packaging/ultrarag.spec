@@ -15,8 +15,8 @@ from app.distribution import resolve_build_release_repository, write_distributio
 REPO = BACKEND.parent
 DIST = REPO / "frontend-enterprise" / "dist"
 ASSETS = REPO / "packaging" / "assets"
-ICNS = ASSETS / "staffdeck.icns"
-ICO = ASSETS / "staffdeck.ico"
+ICNS = ASSETS / "firmdeck.icns"
+ICO = ASSETS / "firmdeck.ico"
 assert DIST.exists(), "先构建前端：npm --prefix frontend-enterprise run build"
 
 DEFAULT_VERSION_FILE = BACKEND / "VERSION"
@@ -34,15 +34,15 @@ if not re.fullmatch(
     r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?",
     RAW_VERSION,
 ):
-    raise ValueError(f"VERSION must be a valid StaffDeck version, got: {RAW_VERSION!r}")
+    raise ValueError(f"VERSION must be a valid FirmDeck version, got: {RAW_VERSION!r}")
 BUNDLE_VERSION = RAW_VERSION[1:] if RAW_VERSION[:1].lower() == "v" else RAW_VERSION
-VERSION_FILE = REPO / "packaging" / "build" / "staffdeck-version.txt"
+VERSION_FILE = REPO / "packaging" / "build" / "firmdeck-version.txt"
 VERSION_FILE.parent.mkdir(parents=True, exist_ok=True)
 VERSION_FILE.write_text(BUNDLE_VERSION + "\n", encoding="utf-8")
 
 DISTRIBUTION_REPOSITORY = resolve_build_release_repository(REPO)
 DISTRIBUTION_METADATA_FILE = (
-    REPO / "packaging" / "build" / "staffdeck-distribution.json"
+    REPO / "packaging" / "build" / "firmdeck-distribution.json"
 )
 write_distribution_metadata(DISTRIBUTION_METADATA_FILE, DISTRIBUTION_REPOSITORY)
 
@@ -55,7 +55,7 @@ datas = [
     (str(DIST), "frontend-enterprise/dist"),
     (str(VERSION_FILE), "."),
     (str(DISTRIBUTION_METADATA_FILE), "."),
-    (str(ASSETS / "staffdeck.png"), "packaging/assets"),
+    (str(ASSETS / "firmdeck.png"), "packaging/assets"),
     (str(BACKEND / "app" / "llm" / "prompts"), "app/llm/prompts"),
     (str(BACKEND / "app" / "db" / "seed_fixtures"), "app/db/seed_fixtures"),
     (str(BACKEND / "mock_servers"), "mock_servers"),
@@ -101,31 +101,31 @@ a = Analysis(
 pyz = PYZ(a.pure)
 # console=False：作为 GUI app 常驻 Dock（console=True 会加 LSBackgroundOnly 变纯后台不进 Dock）。
 # 日志由 launcher 重定向到用户数据目录，启动问题可查文件。
-exe = EXE(pyz, a.scripts, [], exclude_binaries=True, name="staffdeck",
-          # Linux users need to run `staffdeck setup` from a headless terminal;
+exe = EXE(pyz, a.scripts, [], exclude_binaries=True, name="firmdeck",
+          # Linux users need to run `firmdeck setup` from a headless terminal;
           # macOS/Windows retain their desktop-shell behavior.
           console=sys.platform == "linux", disable_windowed_traceback=False, icon=_exe_icon)
-coll = COLLECT(exe, a.binaries, a.datas, strip=False, upx=False, name="staffdeck")
+coll = COLLECT(exe, a.binaries, a.datas, strip=False, upx=False, name="firmdeck")
 
 # macOS：额外产出标准 .app bundle（PyInstaller 正确处理 Contents/Frameworks 布局）。
 # 附带 Python 与 SRT runtime 由 build 脚本在打包后拷进 .app/Contents/Resources。
 if sys.platform == "darwin":
     app = BUNDLE(
         coll,
-        name="StaffDeck.app",
+        name="FirmDeck.app",
         icon=str(ICNS) if ICNS.exists() else None,
-        bundle_identifier="ai.staffdeck.desktop",
+        bundle_identifier="ai.firmdeck.desktop",
         info_plist={
-            "CFBundleName": "StaffDeck",
-            "CFBundleDisplayName": "StaffDeck",
-            # 可执行名保持 staffdeck（COLLECT/EXE 名 + build 脚本按此路径拷 runtime）
-            "CFBundleExecutable": "staffdeck",
+            "CFBundleName": "FirmDeck",
+            "CFBundleDisplayName": "FirmDeck",
+            # 可执行名保持 firmdeck（COLLECT/EXE 名 + build 脚本按此路径拷 runtime）
+            "CFBundleExecutable": "firmdeck",
             "CFBundleShortVersionString": BUNDLE_VERSION,
             "CFBundleVersion": BUNDLE_VERSION,
             "CFBundleURLTypes": [
                 {
-                    "CFBundleURLName": "StaffDeck URL",
-                    "CFBundleURLSchemes": ["staffdeck"],
+                    "CFBundleURLName": "FirmDeck URL",
+                    "CFBundleURLSchemes": ["firmdeck"],
                 },
             ],
             "NSHighResolutionCapable": True,

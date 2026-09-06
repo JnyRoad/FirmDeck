@@ -46,9 +46,9 @@ def test_packaging_smoke_rejects_wrong_lark_sdk_version(monkeypatch) -> None:
     [
         ("http://127.0.0.1:5173/workspace", False),
         ("http://127.0.0.1:5174/workspace", True),
-        ("https://github.com/OpenBMB/StaffDeck/releases", True),
+        ("https://github.com/OpenBMB/FirmDeck/releases", True),
         ("http://127.0.0.1:invalid/workspace", False),
-        ("staffdeck://open", False),
+        ("firmdeck://open", False),
         ("not-a-url", False),
     ],
 )
@@ -92,7 +92,7 @@ def test_network_config_does_not_follow_the_harness_workspace_root(monkeypatch, 
     config_path = desktop_launcher._save_network_config("local", "", 5180)
 
     assert config_path == app_data / "network.json"
-    assert not (home / ".staffdeck" / "workspaces").exists()
+    assert not (home / ".firmdeck" / "workspaces").exists()
 
 
 def test_save_network_config_rejects_invalid_update_without_replacing_existing_file(
@@ -111,13 +111,13 @@ def test_save_network_config_rejects_invalid_update_without_replacing_existing_f
 
 def test_apply_runtime_env_records_the_actual_selected_runtime_port(monkeypatch) -> None:
     """Expose the launcher's chosen port to the ASGI API without using request headers."""
-    monkeypatch.delenv("STAFFDECK_RUNTIME_NETWORK", raising=False)
+    monkeypatch.delenv("FIRMDECK_RUNTIME_NETWORK", raising=False)
 
     desktop_launcher.apply_runtime_env(
         {"mode": "lan", "host": "0.0.0.0", "port": 6204, "public_url": ""}
     )
 
-    assert desktop_launcher.os.environ["STAFFDECK_RUNTIME_NETWORK"] == (
+    assert desktop_launcher.os.environ["FIRMDECK_RUNTIME_NETWORK"] == (
         '{"mode":"lan","host":"0.0.0.0","port":6204,"public_url":""}'
     )
 
@@ -221,7 +221,7 @@ def test_port_in_use_false_for_unused_port() -> None:
     assert desktop_launcher.port_in_use("127.0.0.1", 59999) is False
 
 
-def test_health_requires_staffdeck_marker(monkeypatch) -> None:
+def test_health_requires_firmdeck_marker(monkeypatch) -> None:
     class FakeResponse:
         def __init__(self, payload: bytes):
             self.payload = payload
@@ -238,7 +238,7 @@ def test_health_requires_staffdeck_marker(monkeypatch) -> None:
     def fake_urlopen(url, timeout):
         assert url == "http://127.0.0.1:5173/api/health"
         assert timeout == 1
-        return FakeResponse(b'{"status":"ok","app":"StaffDeck"}')
+        return FakeResponse(b'{"status":"ok","app":"FirmDeck"}')
 
     monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
     assert desktop_launcher._health_ok("http://127.0.0.1:5173") is True
@@ -276,7 +276,7 @@ def test_preload_server_app_imports_reference_on_calling_thread(monkeypatch) -> 
 
 
 def test_windows_taskbar_app_only_used_for_frozen_windows(monkeypatch) -> None:
-    monkeypatch.delenv("STAFFDECK_HEADLESS", raising=False)
+    monkeypatch.delenv("FIRMDECK_HEADLESS", raising=False)
     monkeypatch.setattr(desktop_launcher.sys, "platform", "win32")
     monkeypatch.delattr(desktop_launcher.sys, "frozen", raising=False)
     assert desktop_launcher._use_windows_taskbar_app() is False
@@ -288,14 +288,14 @@ def test_windows_taskbar_app_only_used_for_frozen_windows(monkeypatch) -> None:
 def test_windows_taskbar_app_disabled_in_headless_mode(monkeypatch) -> None:
     monkeypatch.setattr(desktop_launcher.sys, "platform", "win32")
     monkeypatch.setattr(desktop_launcher.sys, "frozen", True, raising=False)
-    monkeypatch.setenv("STAFFDECK_HEADLESS", "1")
+    monkeypatch.setenv("FIRMDECK_HEADLESS", "1")
     assert desktop_launcher._use_windows_taskbar_app() is False
 
 
 def test_macos_dock_app_disabled_in_headless_mode(monkeypatch) -> None:
     monkeypatch.setattr(desktop_launcher.sys, "platform", "darwin")
     monkeypatch.setattr(desktop_launcher.sys, "frozen", True, raising=False)
-    monkeypatch.setenv("STAFFDECK_HEADLESS", "1")
+    monkeypatch.setenv("FIRMDECK_HEADLESS", "1")
     assert desktop_launcher._use_macos_dock_app() is False
 
 
@@ -473,7 +473,7 @@ def test_macos_window_embeds_local_ui() -> None:
     assert isinstance(webview, FakeWebView)
     assert webview is events["content_view"]
     assert events["request"] == "request:url:http://127.0.0.1:5173/chat/"
-    assert events["title"] == "StaffDeck"
+    assert events["title"] == "FirmDeck"
     assert events["window_init"][1] & FakeAppKit.NSWindowStyleMaskFullSizeContentView
     assert events["title_visibility"] == FakeAppKit.NSWindowTitleHidden
     assert events["titlebar_transparent"] is True
@@ -583,15 +583,15 @@ def test_macos_main_menu_routes_edit_shortcuts_through_responder_chain() -> None
     delegate = object()
     main_menu = desktop_launcher._create_macos_main_menu(FakeAppKit, delegate)
 
-    assert [item.title for item in main_menu.items] == ["StaffDeck", "编辑"]
+    assert [item.title for item in main_menu.items] == ["FirmDeck", "编辑"]
 
     app_items = [item for item in main_menu.items[0].submenu.items if not item.separator]
     assert [(item.title, item.action, item.key) for item in app_items] == [
-        ("关于 StaffDeck", "showAbout:", ""),
-        ("隐藏 StaffDeck", "hide:", "h"),
+        ("关于 FirmDeck", "showAbout:", ""),
+        ("隐藏 FirmDeck", "hide:", "h"),
         ("隐藏其他", "hideOtherApplications:", "h"),
         ("全部显示", "unhideAllApplications:", ""),
-        ("退出 StaffDeck", "quitStaffDeck:", "q"),
+        ("退出 FirmDeck", "quitFirmDeck:", "q"),
     ]
     assert app_items[0].target is delegate
     assert app_items[2].modifiers == command | option

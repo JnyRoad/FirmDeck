@@ -75,7 +75,7 @@ const routeMatrixCopy = {
     personaPrompt: '岗位 Prompt',
     personaNamePlaceholder: '数字员工姓名',
     tutorialHero: '企业数字员工运行时，从配置到持续运营',
-    tutorialNavigation: 'StaffDeck 单页文档目录',
+    tutorialNavigation: 'FirmDeck 单页文档目录',
     quickStart: '快速开始',
   },
   'en-US': {
@@ -94,7 +94,7 @@ const routeMatrixCopy = {
     personaPrompt: 'Role prompt',
     personaNamePlaceholder: 'Employee name',
     tutorialHero: 'Enterprise digital employee runtime, from configuration to continuous operations',
-    tutorialNavigation: 'StaffDeck single-page documentation navigation',
+    tutorialNavigation: 'FirmDeck single-page documentation navigation',
     quickStart: 'Quick start',
   },
 } as const satisfies Record<AppLocale, Record<string, string>>;

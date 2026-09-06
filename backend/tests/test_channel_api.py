@@ -1182,7 +1182,7 @@ def _seed_conversations(engine, binding_id: str) -> None:
                 tenant_id="tenant_demo",
                 channel="wechat",
                 external_user_id="u1",
-                staffdeck_user_id="u_wx1",
+                firmdeck_user_id="u_wx1",
                 display_name="微信用户 ab12cd34",
             )
         )
@@ -1191,7 +1191,7 @@ def _seed_conversations(engine, binding_id: str) -> None:
                 tenant_id="tenant_demo",
                 channel="wechat",
                 external_user_id="group_room_1",
-                staffdeck_user_id="u_grp",
+                firmdeck_user_id="u_grp",
                 display_name="微信群聊 room_1",
             )
         )
@@ -1770,7 +1770,7 @@ def test_put_feishu_default_handoff_assignee_channel_variant_requires_bound_iden
                 external_account_scope="cli_feishu:tenant_a",
                 external_user_id="ou_owner",
                 display_name="Owner",
-                staffdeck_user_id="user_owner",
+                firmdeck_user_id="user_owner",
             )
         )
         db.commit()
@@ -1875,7 +1875,7 @@ def test_put_non_feishu_default_handoff_assignee_channel_rejected() -> None:
                 external_account_scope="",
                 external_user_id="staff_owner",
                 display_name="Owner",
-                staffdeck_user_id="user_owner",
+                firmdeck_user_id="user_owner",
             )
         )
         db.commit()
@@ -1932,7 +1932,7 @@ def test_put_wecom_default_handoff_assignee_channel_variant_requires_scope_ident
                 channel="wecom",
                 external_account_scope="corp_other",
                 external_user_id="staff_owner_other",
-                staffdeck_user_id="user_owner",
+                firmdeck_user_id="user_owner",
             )
         )
         db.commit()
@@ -1954,7 +1954,7 @@ def test_put_wecom_default_handoff_assignee_channel_variant_requires_scope_ident
                 channel="wecom",
                 external_account_scope="corp_current",
                 external_user_id="staff_owner",
-                staffdeck_user_id="user_owner",
+                firmdeck_user_id="user_owner",
             )
         )
         db.commit()

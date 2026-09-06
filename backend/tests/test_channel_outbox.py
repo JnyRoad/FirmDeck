@@ -1655,7 +1655,7 @@ def _seed_alertable_wechat_binding(engine, *, with_identity: bool, with_session:
                     channel="wechat",
                     external_account_scope="",
                     external_user_id="wxid_creator",
-                    staffdeck_user_id="user_web",
+                    firmdeck_user_id="user_web",
                     display_name="张三",
                 )
             )
@@ -1969,7 +1969,7 @@ def test_notify_scopes_session_lookup_to_own_binding() -> None:
                 channel="wechat",
                 external_account_scope="",
                 external_user_id="wxid_creator",
-                staffdeck_user_id="user_web",
+                firmdeck_user_id="user_web",
             )
         )
         # 同一创建者在两个微信账号下各有私聊会话(目标地址不同)
@@ -2033,7 +2033,7 @@ def test_notify_identity_fallback_uses_own_binding_scope() -> None:
                 channel="wecom",
                 external_account_scope="corpA",
                 external_user_id="zhangsan_corp_a",
-                staffdeck_user_id="user_web",
+                firmdeck_user_id="user_web",
             )
         )
         db.add(
@@ -2042,7 +2042,7 @@ def test_notify_identity_fallback_uses_own_binding_scope() -> None:
                 channel="wecom",
                 external_account_scope="corpB",
                 external_user_id="zhangsan_corp_b",
-                staffdeck_user_id="user_web",
+                firmdeck_user_id="user_web",
             )
         )
         db.commit()
@@ -2079,7 +2079,7 @@ def test_notify_identity_fallback_skips_when_scope_missing() -> None:
                 channel="wecom",
                 external_account_scope="corpA",
                 external_user_id="zhangsan_corp_a",
-                staffdeck_user_id="user_web",
+                firmdeck_user_id="user_web",
             )
         )
         db.commit()

@@ -2004,7 +2004,7 @@ def test_validate_handoff_assignees_accepts_internal_and_bound_channel_variants(
                 channel="feishu",
                 external_account_scope="app:cli_a:tenant:t_a",
                 external_user_id="ou_owner",
-                staffdeck_user_id="user_owner",
+                firmdeck_user_id="user_owner",
             )
         )
         db.commit()
@@ -2026,7 +2026,7 @@ def test_validate_handoff_assignees_rejects_unbound_channel_variant() -> None:
                 channel="feishu",
                 external_account_scope="app:cli_a:tenant:t_a",
                 external_user_id="group:chat_1",
-                staffdeck_user_id="user_owner",
+                firmdeck_user_id="user_owner",
             )
         )
         db.commit()
@@ -2056,7 +2056,7 @@ def test_validate_handoff_assignees_scope_level_reachability() -> None:
                 channel="feishu",
                 external_account_scope="app:cli_b:tenant:t_b",
                 external_user_id="ou_other_org",
-                staffdeck_user_id="user_owner",
+                firmdeck_user_id="user_owner",
             )
         )
         db.commit()
@@ -2092,7 +2092,7 @@ def test_validate_handoff_assignees_ignores_team_and_inactive_bindings() -> None
                 channel="feishu",
                 external_account_scope="app:cli_team:tenant:t",
                 external_user_id="ou_team",
-                staffdeck_user_id="user_owner",
+                firmdeck_user_id="user_owner",
             )
         )
         db.commit()
@@ -2116,7 +2116,7 @@ def test_validate_handoff_assignees_accepts_wecom_scope_reachability() -> None:
                 channel="wecom",
                 external_account_scope="corp_1",
                 external_user_id="staff_owner",
-                staffdeck_user_id="user_owner",
+                firmdeck_user_id="user_owner",
             )
         )
         db.commit()
@@ -2155,7 +2155,7 @@ def test_validate_handoff_assignees_rejects_unsupported_private_message_channel(
                 channel="dingtalk",
                 external_account_scope="ding_scope",
                 external_user_id="staff_owner",
-                staffdeck_user_id="user_owner",
+                firmdeck_user_id="user_owner",
             )
         )
         db.commit()

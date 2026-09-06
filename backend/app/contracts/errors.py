@@ -15,7 +15,7 @@ JsonValue = TypeAliasType(
 
 
 class ErrorDescriptor(BaseModel):
-    """Stable and safe error fields allowed to cross StaffDeck product boundaries."""
+    """Stable and safe error fields allowed to cross FirmDeck product boundaries."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 

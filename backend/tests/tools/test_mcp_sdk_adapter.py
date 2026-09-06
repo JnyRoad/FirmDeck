@@ -104,7 +104,7 @@ async def test_provider_restores_persisted_token_endpoint_for_refresh(tmp_path) 
         server_url="https://mcp.example.test/mcp",
         headers={},
         storage=restored,
-        redirect_uri="https://staffdeck.example/oauth/callback",
+        redirect_uri="https://firmdeck.example/oauth/callback",
         transport=httpx2.MockTransport(lambda request: httpx2.Response(500, request=request)),
         url_validator=lambda _url: None,
     ).build_oauth_provider()
@@ -148,7 +148,7 @@ async def test_provider_does_not_guess_refresh_endpoint_without_persisted_metada
         server_url="https://mcp.example.test/mcp",
         headers={},
         storage=restored,
-        redirect_uri="https://staffdeck.example/oauth/callback",
+        redirect_uri="https://firmdeck.example/oauth/callback",
         transport=httpx2.MockTransport(lambda request: httpx2.Response(500, request=request)),
         url_validator=lambda _url: None,
     ).build_oauth_provider()
@@ -180,7 +180,7 @@ async def test_adapter_rejects_private_network_targets_before_transport(tmp_path
         server_url="https://127.0.0.1/mcp",
         headers={},
         storage=storage,
-        redirect_uri="https://staffdeck.example/oauth/callback",
+        redirect_uri="https://firmdeck.example/oauth/callback",
         transport=httpx2.MockTransport(private_transport),
     )
 
@@ -300,7 +300,7 @@ async def test_adapter_rejects_private_authorization_server_before_transport(tmp
         server_url="https://93.184.216.34/mcp",
         headers={},
         storage=storage,
-        redirect_uri="https://staffdeck.example/oauth/callback",
+        redirect_uri="https://firmdeck.example/oauth/callback",
         transport=httpx2.MockTransport(redirected_transport),
     )
 
@@ -324,8 +324,8 @@ async def test_adapter_rejects_private_browser_authorization_target(tmp_path) ->
         "tenant_1",
         "server_1",
         "user_1",
-        public_client_id="staffdeck-public",
-        redirect_uri="https://staffdeck.example/oauth/callback",
+        public_client_id="firmdeck-public",
+        redirect_uri="https://firmdeck.example/oauth/callback",
     )
     redirect_called = False
     authorization_url = ""
@@ -381,7 +381,7 @@ async def test_adapter_rejects_private_browser_authorization_target(tmp_path) ->
         server_url="https://93.184.216.34/mcp",
         headers={},
         storage=storage,
-        redirect_uri="https://staffdeck.example/oauth/callback",
+        redirect_uri="https://firmdeck.example/oauth/callback",
         redirect_handler=capture_redirect,
         callback_handler=complete_callback,
         transport=httpx2.MockTransport(metadata_transport),
@@ -433,7 +433,7 @@ async def test_adapter_cancellation_while_waiting_does_not_strand_operation_lock
         server_url="https://mcp.example.test/mcp",
         headers={},
         storage=LockOnlyStorage(lock),  # type: ignore[arg-type]
-        redirect_uri="https://staffdeck.example/oauth/callback",
+        redirect_uri="https://firmdeck.example/oauth/callback",
         url_validator=lambda _url: None,
     )
 
@@ -473,7 +473,7 @@ async def test_adapter_bounds_operation_lock_wait_by_request_timeout() -> None:
         server_url="https://mcp.example.test/mcp",
         headers={},
         storage=LockOnlyStorage(),  # type: ignore[arg-type]
-        redirect_uri="https://staffdeck.example/oauth/callback",
+        redirect_uri="https://firmdeck.example/oauth/callback",
         timeout_seconds=0.01,
         url_validator=lambda _url: None,
     )
@@ -618,8 +618,8 @@ async def test_adapter_uses_official_pkce_flow_and_normalizes_results(tmp_path) 
         "tenant_1",
         "server_1",
         "user_1",
-        public_client_id="staffdeck-public",
-        redirect_uri="https://staffdeck.example/oauth/callback",
+        public_client_id="firmdeck-public",
+        redirect_uri="https://firmdeck.example/oauth/callback",
     )
     server = _OAuthMCPServer()
     authorization_url = ""
@@ -646,7 +646,7 @@ async def test_adapter_uses_official_pkce_flow_and_normalizes_results(tmp_path) 
             "X-Api-Key": "mcp-api-key",
         },
         storage=storage,
-        redirect_uri="https://staffdeck.example/oauth/callback",
+        redirect_uri="https://firmdeck.example/oauth/callback",
         redirect_handler=capture_redirect,
         callback_handler=complete_callback,
         transport=httpx2.MockTransport(server.handle),
@@ -658,7 +658,7 @@ async def test_adapter_uses_official_pkce_flow_and_normalizes_results(tmp_path) 
 
     auth_query = parse_qs(urlparse(authorization_url).query)
     assert auth_query["code_challenge_method"] == ["S256"]
-    assert auth_query["client_id"] == ["staffdeck-public"]
+    assert auth_query["client_id"] == ["firmdeck-public"]
     assert server.token_form["code_verifier"][0]
     assert discovery["tools"] == [
         {
@@ -759,7 +759,7 @@ async def test_adapter_clears_old_issuer_tokens_before_re_registration_denial(tm
                 201,
                 json={
                     "client_id": "new-client",
-                    "redirect_uris": ["https://staffdeck.example/oauth/callback"],
+                    "redirect_uris": ["https://firmdeck.example/oauth/callback"],
                     "token_endpoint_auth_method": "none",
                 },
                 request=request,
@@ -786,7 +786,7 @@ async def test_adapter_clears_old_issuer_tokens_before_re_registration_denial(tm
         server_url="https://mcp.example.test/mcp",
         headers={},
         storage=storage,
-        redirect_uri="https://staffdeck.example/oauth/callback",
+        redirect_uri="https://firmdeck.example/oauth/callback",
         redirect_handler=capture_redirect,
         callback_handler=deny_callback,
         transport=httpx2.MockTransport(switched_issuer),
@@ -824,8 +824,8 @@ async def test_adapter_redacts_token_endpoint_error_body_from_sdk_logs(
         "tenant_1",
         "server_1",
         "user_1",
-        public_client_id="staffdeck-public",
-        redirect_uri="https://staffdeck.example/oauth/callback",
+        public_client_id="firmdeck-public",
+        redirect_uri="https://firmdeck.example/oauth/callback",
     )
     server = _OAuthMCPServer()
     authorization_url = ""
@@ -858,7 +858,7 @@ async def test_adapter_redacts_token_endpoint_error_body_from_sdk_logs(
         server_url="https://mcp.example.test/mcp",
         headers={},
         storage=storage,
-        redirect_uri="https://staffdeck.example/oauth/callback",
+        redirect_uri="https://firmdeck.example/oauth/callback",
         redirect_handler=capture_redirect,
         callback_handler=complete_callback,
         transport=httpx2.MockTransport(sensitive_token_error),
@@ -905,12 +905,12 @@ async def test_adapter_keeps_configured_public_client_across_issuer_switch(tmp_p
         "server_1",
         "user_1",
         public_client_id="configured-public",
-        redirect_uri="https://staffdeck.example/oauth/callback",
+        redirect_uri="https://firmdeck.example/oauth/callback",
     )
     await storage.set_client_info(
         OAuthClientInformationFull(
             client_id="configured-public",
-            redirect_uris=["https://staffdeck.example/oauth/callback"],
+            redirect_uris=["https://firmdeck.example/oauth/callback"],
             token_endpoint_auth_method="none",
             issuer="https://old-auth.example.test",
         )
@@ -972,7 +972,7 @@ async def test_adapter_keeps_configured_public_client_across_issuer_switch(tmp_p
         server_url="https://mcp.example.test/mcp",
         headers={},
         storage=storage,
-        redirect_uri="https://staffdeck.example/oauth/callback",
+        redirect_uri="https://firmdeck.example/oauth/callback",
         redirect_handler=capture_redirect,
         callback_handler=deny_callback,
         transport=httpx2.MockTransport(switched_public_issuer),
@@ -1005,7 +1005,7 @@ async def test_adapter_primes_persisted_absolute_expiry(tmp_path) -> None:
         server_url="https://mcp.example.test/mcp",
         headers={},
         storage=storage,
-        redirect_uri="https://staffdeck.example/oauth/callback",
+        redirect_uri="https://firmdeck.example/oauth/callback",
         transport=httpx2.MockTransport(_OAuthMCPServer().handle),
         url_validator=lambda _url: None,
     )
@@ -1041,7 +1041,7 @@ async def test_adapter_maps_provider_forbidden_without_exposing_response_body(tm
         server_url="https://mcp.example.test/mcp",
         headers={},
         storage=storage,
-        redirect_uri="https://staffdeck.example/oauth/callback",
+        redirect_uri="https://firmdeck.example/oauth/callback",
         transport=httpx2.MockTransport(forbidden),
         url_validator=lambda _url: None,
     )
@@ -1066,7 +1066,7 @@ async def test_adapter_reads_app_resources_through_the_owner_bound_sdk_client(tm
         server_url="https://mcp.example.test/mcp",
         headers={},
         storage=storage,
-        redirect_uri="https://staffdeck.example/oauth/callback",
+        redirect_uri="https://firmdeck.example/oauth/callback",
         url_validator=lambda _url: None,
     )
 

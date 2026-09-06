@@ -340,13 +340,13 @@ def _validate_handoff_assignees(db: Session, content: SkillCard, tenant_id: str)
             select(ChannelIdentity).where(
                 ChannelIdentity.tenant_id == tenant_id,
                 ChannelIdentity.channel == channel,
-                ChannelIdentity.staffdeck_user_id.in_(channel_user_ids),
+                ChannelIdentity.firmdeck_user_id.in_(channel_user_ids),
                 ~ChannelIdentity.external_user_id.startswith("group:"),
             )
         ).all()
         for identity in identities:
             if identity.external_account_scope in scopes:
-                reachable_by_user.setdefault(identity.staffdeck_user_id, set()).add(channel)
+                reachable_by_user.setdefault(identity.firmdeck_user_id, set()).add(channel)
     for user_id, channel in sorted(channel_specs):
         if channel not in reachable_by_user.get(user_id, set()):
             raise _skill_error("SKILL_HANDOFF_ASSIGNEE_UNREACHABLE", 400)

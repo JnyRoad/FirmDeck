@@ -172,8 +172,8 @@ const SCHEDULE_WEEKDAY_IDS = [
 const ENTERPRISE_SIDEBAR_STORAGE_KEY = 'ultrarag_enterprise_sidebar_expanded';
 const MISSING_MODEL_CONFIG_PATTERN = /missing_model_config|missing model config|没有默认模型配置|没有可用模型|模型配置不存在|模型未配置/i;
 const MODEL_CONFIGS_UPDATED_EVENT = 'ultrarag-enterprise-model-configs-updated';
-const ONBOARDING_SEEN_KEY = 'staffdeck_onboarding_guide_seen';
-const QUICK_START_SEEN_KEY = 'staffdeck_quick_start_guide_seen';
+const ONBOARDING_SEEN_KEY = 'firmdeck_onboarding_guide_seen';
+const QUICK_START_SEEN_KEY = 'firmdeck_quick_start_guide_seen';
 
 function isMissingModelConfigurationError(value: unknown): boolean {
   if (value instanceof ApiError) {

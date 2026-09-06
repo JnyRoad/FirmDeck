@@ -29,12 +29,12 @@ const updateCopy = {
   'zh-CN': {
     close: '关闭更新提醒',
     link: '查看更新',
-    title: 'StaffDeck 有新版本',
+    title: 'FirmDeck 有新版本',
   },
   'en-US': {
     close: 'Close update reminder',
     link: 'View update',
-    title: 'A new StaffDeck version is available',
+    title: 'A new FirmDeck version is available',
   },
 } as const satisfies Record<AppLocale, Record<string, string>>;
 
@@ -42,7 +42,7 @@ const update = {
   current_version: '0.2.0',
   latest_version: '0.3.0',
   update_available: true,
-  release_url: 'https://github.com/OpenBMB/StaffDeck/releases/tag/v0.3.0',
+  release_url: 'https://github.com/OpenBMB/FirmDeck/releases/tag/v0.3.0',
   check_enabled: true,
   check_succeeded: true,
 };
