@@ -794,7 +794,7 @@ export function ContentTab({ api, kb, onChanged }: ContentTabProps) {
             <Button
               disabled={uploading}
               onClick={() => fileInputRef.current?.click()}
-              className={cn(OUTLINE_ACTION_BUTTON_SM_CLASS, 'bg-[#18181a] text-white hover:bg-[#303030] hover:text-white')}
+              className={cn(OUTLINE_ACTION_BUTTON_SM_CLASS, 'bg-primary text-white hover:bg-primary/80 hover:text-white')}
             >
               {t('knowledgeAdmin.content.actions.upload')}
             </Button>
@@ -898,7 +898,7 @@ export function ContentTab({ api, kb, onChanged }: ContentTabProps) {
             <Button
               disabled={applying || !reviewOutput || reviewOutput.pendingCount > 0}
               onClick={() => void applyReview()}
-              className="h-[32px] min-w-[100px] rounded-[10px] bg-[#18181a] px-[12px] text-[14px] font-normal text-white hover:bg-[#303030]"
+              className="h-[32px] min-w-[100px] rounded-[10px] bg-primary px-[12px] text-[14px] font-normal text-white hover:bg-primary/80"
             >
               {t('knowledgeAdmin.content.review.apply')}
             </Button>

@@ -410,7 +410,7 @@ export default function ScheduledTaskEditorPage({
         <Button
           variant="outline"
           onClick={() => navigate('/enterprise/scheduled-tasks')}
-          className="h-8 gap-1 rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-5 text-[12px] font-normal text-[#757f9c] hover:border-[#cbd3e6] hover:bg-white hover:text-[#18181a]"
+          className="h-8 gap-1 rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-5 text-[12px] font-normal text-[#757f9c] hover:border-[#cbd3e6] hover:bg-white hover:text-primary"
         >
           <IconArrowRight className="size-3.5 rotate-180" />
           {translate('scheduledTasksPage.editor.action.back')}
@@ -418,7 +418,7 @@ export default function ScheduledTaskEditorPage({
         <Button
           onClick={() => void save()}
           disabled={saving}
-          className="h-8 gap-1 rounded-[10px] bg-[#18181a] px-5 text-[12px] font-normal text-white hover:bg-[#303030]"
+          className="h-8 gap-1 rounded-[10px] bg-primary px-5 text-[12px] font-normal text-white hover:bg-primary/80"
         >
           {translate('scheduledTasksPage.editor.action.save')}
         </Button>

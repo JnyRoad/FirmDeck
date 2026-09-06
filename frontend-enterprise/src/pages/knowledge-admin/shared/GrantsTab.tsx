@@ -288,7 +288,7 @@ export function GrantsTab({ api, kb }: GrantsTabProps) {
             type="button"
             disabled={!selectedTeamId || bindInProgress}
             onClick={() => void bindTeam()}
-            className="h-[34px] rounded-[9px] bg-[#18181a] px-[14px] text-[12px] text-white"
+            className="h-[34px] rounded-[9px] bg-primary px-[14px] text-[12px] text-white"
           >
             {bindInProgress
               ? t('knowledgeAdmin.grants.bindSection.binding')

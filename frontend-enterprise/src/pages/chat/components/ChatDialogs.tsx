@@ -234,7 +234,7 @@ export default function ChatDialogs({ chat }: { chat: UseChatSession }) {
           <div className="flex items-center justify-end gap-[8px] pt-[12px] pr-[16px] pb-[16px] pl-[12px]">
             <Button
               variant="outline"
-              className="h-[32px] w-[80px] rounded-[10px] border-[#e3e7f1] bg-white px-[12px] py-[8px] text-[14px] font-normal text-[#464c5e] hover:border-[#e3e7f1] hover:bg-[#f6f6f6] hover:text-[#18181a]"
+              className="h-[32px] w-[80px] rounded-[10px] border-[#e3e7f1] bg-white px-[12px] py-[8px] text-[14px] font-normal text-[#464c5e] hover:border-[#e3e7f1] hover:bg-[#f6f6f6] hover:text-primary"
               onClick={() => {
                 setRenameSession(null);
                 setRenameTitle('');
@@ -243,7 +243,7 @@ export default function ChatDialogs({ chat }: { chat: UseChatSession }) {
               {t('common.action.cancel')}
             </Button>
             <Button
-              className="h-[32px] w-[80px] rounded-[10px] bg-[#18181a] px-[12px] py-[8px] text-[14px] font-normal text-white hover:bg-[#303030]"
+              className="h-[32px] w-[80px] rounded-[10px] bg-primary px-[12px] py-[8px] text-[14px] font-normal text-white hover:bg-primary/80"
               onClick={() => void saveRename()}
             >
               {t('common.action.save')}

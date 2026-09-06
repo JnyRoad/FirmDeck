@@ -561,7 +561,7 @@ export default function TeamsPage({
                         event.stopPropagation();
                         void startTeamChat(team);
                       }}
-                      className="inline-flex h-[30px] items-center gap-[5px] rounded-[9px] bg-[#18181a] px-[10px] text-[11px] text-white transition-colors hover:bg-[#303030] disabled:cursor-wait disabled:opacity-50"
+                      className="inline-flex h-[30px] items-center gap-[5px] rounded-[9px] bg-primary px-[10px] text-[11px] text-white transition-colors hover:bg-primary/80 disabled:cursor-wait disabled:opacity-50"
                     >
                       <MessageCircle className="size-[13px]" />
                       {startingTeamId === team.id ? t('teamsPage.action.startingChat') : t('teamsPage.action.startChat')}
@@ -778,7 +778,7 @@ export default function TeamsPage({
               type="button"
               disabled={creating}
               onClick={() => void createTeam()}
-              className="h-[32px] rounded-[10px] bg-[#18181a] px-[16px] text-[14px] font-normal text-white hover:bg-[#303030]"
+              className="h-[32px] rounded-[10px] bg-primary px-[16px] text-[14px] font-normal text-white hover:bg-primary/80"
             >
               {creating ? t('teamsPage.dialog.creating') : t('teamsPage.dialog.create')}
             </Button>

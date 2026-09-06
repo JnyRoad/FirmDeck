@@ -201,7 +201,7 @@ export default function Composer({ chat }: { chat: UseChatSession }) {
               <button
                 type="button"
                 onClick={() => setModelSetupOpen(true)}
-                className="h-[30px] shrink-0 rounded-[8px] bg-[#18181a] px-[12px] text-[12px] text-white transition-colors hover:bg-[#303030]"
+                className="h-[30px] shrink-0 rounded-[8px] bg-primary px-[12px] text-[12px] text-white transition-colors hover:bg-primary/80"
               >
                 {t('chat.composer.modelSetup')}
               </button>

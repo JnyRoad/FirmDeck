@@ -459,7 +459,7 @@ export default function MemoriesTab({
             }}
           >
             {canFilterUsers && (
-              <label className="flex h-[34px] w-[260px] items-center overflow-hidden rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white transition-colors focus-within:border-[#18181a] max-[900px]:w-full">
+              <label className="flex h-[34px] w-[260px] items-center overflow-hidden rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white transition-colors focus-within:border-primary max-[900px]:w-full">
                 <span className="flex h-full w-[58px] shrink-0 items-center justify-center border-r-[0.5px] border-[#e3e7f1] bg-[#f6f6f6] text-[12px] text-[#858b9c]">
                   {t('dashboard.memories.filter.userScope')}
                 </span>
@@ -509,7 +509,7 @@ export default function MemoriesTab({
             <UIButton
               type="submit"
               disabled={loading}
-              className="h-[34px] w-[80px] gap-[4px] rounded-[10px] bg-[#18181a] px-[20px] text-[12px] font-normal text-white hover:bg-[#303030]"
+              className="h-[34px] w-[80px] gap-[4px] rounded-[10px] bg-primary px-[20px] text-[12px] font-normal text-white hover:bg-primary/80"
             >
               <IconSearch className="size-[14px]" />
               {t('dashboard.memories.action.search')}
@@ -519,7 +519,7 @@ export default function MemoriesTab({
               variant="outline"
               onClick={resetFilter}
               disabled={loading}
-              className="h-[34px] w-[80px] gap-[4px] rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[20px] text-[12px] font-normal text-[#757f9c] hover:border-[#cbd3e6] hover:bg-white hover:text-[#18181a]"
+              className="h-[34px] w-[80px] gap-[4px] rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[20px] text-[12px] font-normal text-[#757f9c] hover:border-[#cbd3e6] hover:bg-white hover:text-primary"
             >
               <IconRefresh className={cn('size-[14px]', loading && 'animate-spin')} />
               {t('dashboard.memories.action.reset')}
@@ -583,7 +583,7 @@ function PrefixInput({
   onChange: (value: string) => void;
 }) {
   return (
-    <label className="flex h-[34px] w-[260px] items-center overflow-hidden rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white transition-colors focus-within:border-[#18181a] max-[900px]:w-full">
+    <label className="flex h-[34px] w-[260px] items-center overflow-hidden rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white transition-colors focus-within:border-primary max-[900px]:w-full">
       <span className="flex h-full w-[58px] shrink-0 items-center justify-center border-r-[0.5px] border-[#e3e7f1] bg-[#f6f6f6] text-[12px] text-[#858b9c]">
         {label}
       </span>

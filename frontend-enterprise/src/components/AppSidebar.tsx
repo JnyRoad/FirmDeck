@@ -1080,7 +1080,7 @@ function ChatSessionRow({
             event.stopPropagation();
             onRenameSession(session);
           }}
-          className="inline-grid size-[24px] place-items-center rounded-[10px] text-[#858b9c] transition-colors hover:bg-[#e3e7f1] hover:text-[#18181a]"
+          className="inline-grid size-[24px] place-items-center rounded-[10px] text-[#858b9c] transition-colors hover:bg-[#e3e7f1] hover:text-primary"
         >
           <IconEdit className="size-[14px]!" />
         </button>
@@ -1237,7 +1237,7 @@ function CollapsedChatSidebar({
                 type="button"
                 onClick={onNewConversation}
                 aria-label={t('sidebar.newConversation')}
-                className="flex h-[32px] w-full items-center justify-center rounded-[8px] bg-[#18181a] text-white transition-colors hover:bg-[#303030]"
+                className="flex h-[32px] w-full items-center justify-center rounded-[8px] bg-primary text-white transition-colors hover:bg-primary/80"
               >
                 <IconAdd className="size-[16px]!" />
               </button>
@@ -1419,7 +1419,7 @@ function ChatSidebarVariant({
               <button
                 type="button"
                 onClick={onNewConversation}
-                className="flex h-[40px] w-full items-center justify-center gap-[8px] rounded-[10px] bg-[#18181a] px-[16px] text-[14px] font-medium text-white transition-colors hover:bg-[#303030]"
+                className="flex h-[40px] w-full items-center justify-center gap-[8px] rounded-[10px] bg-primary px-[16px] text-[14px] font-medium text-white transition-colors hover:bg-primary/80"
               >
                 <IconAdd className="size-[16px]! shrink-0" />
                 <span>{t('sidebar.newConversation')}</span>

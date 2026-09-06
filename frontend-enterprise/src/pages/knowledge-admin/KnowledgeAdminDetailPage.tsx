@@ -294,7 +294,7 @@ export default function KnowledgeAdminDetailPage({ currentUser, onLogout }: Know
                 type="button"
                 disabled={kb.status === 'archived' || !ownerAgentId}
                 onClick={() => setConversionOpen(true)}
-                className="h-[32px] rounded-[10px] bg-[#18181a] px-[14px] text-[12px] font-normal text-white hover:bg-[#303030] disabled:opacity-50"
+                className="h-[32px] rounded-[10px] bg-primary px-[14px] text-[12px] font-normal text-white hover:bg-primary/80 disabled:opacity-50"
               >
                 {t('knowledgeAdmin.detail.actions.convertToShared')}
               </Button>

@@ -81,7 +81,7 @@ export default function PlatformCategoryPanel({
             </div>
           )}
 
-          <label className="flex h-[34px] w-[260px] max-w-full shrink-0 items-center gap-[8px] overflow-hidden rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[12px] transition-colors focus-within:border-[#18181a]">
+          <label className="flex h-[34px] w-[260px] max-w-full shrink-0 items-center gap-[8px] overflow-hidden rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[12px] transition-colors focus-within:border-primary">
             <IconSearch className="size-[14px] shrink-0 text-[#858b9c]" />
             <input
               autoComplete="off"

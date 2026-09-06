@@ -55,7 +55,7 @@ export function UpdateNotice({
         target="_blank"
         rel="noreferrer"
         onClick={onClose}
-        className="flex h-[32px] shrink-0 items-center gap-[4px] rounded-[7px] bg-[#18181a] px-[10px] text-[12px] font-medium text-white transition-opacity hover:opacity-80"
+        className="flex h-[32px] shrink-0 items-center gap-[4px] rounded-[7px] bg-primary px-[10px] text-[12px] font-medium text-white transition-opacity hover:opacity-80"
       >
         {t('updateReminder.viewUpdate')}
         <ArrowUpRight className="size-[13px]" aria-hidden="true" />

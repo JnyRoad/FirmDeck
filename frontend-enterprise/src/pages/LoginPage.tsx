@@ -19,7 +19,7 @@ export type LoginPageProps = {
 const TENANT_SLUG_PATTERN = /^(?=.{3,63}$)[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/;
 
 const INPUT_BASE_CLASS =
-  'flex h-[44px] w-full items-center gap-[8px] rounded-[10px] border bg-white px-[16px] transition-colors focus-within:border-[#18181a]';
+  'flex h-[44px] w-full items-center gap-[8px] rounded-[10px] border bg-white px-[16px] transition-colors focus-within:border-primary';
 
 /**
  * Signed-out landing / tenant login page. The tenant slug is deliberately
@@ -144,7 +144,7 @@ export default function LoginPage({ onLogin }: LoginPageProps) {
   }
 
   const fieldErrorClass = (error: string, value: string) => (
-    error ? 'border-[#f54a45]' : value ? 'border-[#18181a]' : 'border-[#e3e7f1]'
+    error ? 'border-[#f54a45]' : value ? 'border-primary' : 'border-[#e3e7f1]'
   );
 
   return (
@@ -171,7 +171,7 @@ export default function LoginPage({ onLogin }: LoginPageProps) {
               ref={openLoginButtonRef}
               type="button"
               onClick={() => setShowForm(true)}
-              className="mt-[24px] flex items-center justify-center rounded-[10px] bg-[#18181a] px-[36px] py-[10px] text-[16px] font-normal text-white transition-colors hover:bg-[#18181a]/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#18181a]/30"
+              className="mt-[24px] flex items-center justify-center rounded-[10px] bg-primary px-[36px] py-[10px] text-[16px] font-normal text-white transition-colors hover:bg-primary/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30"
             >
               {t('auth.login.action')}
             </button>
@@ -262,7 +262,7 @@ export default function LoginPage({ onLogin }: LoginPageProps) {
                         usernameFieldRef.current?.focus();
                       }}
                       disabled={loading}
-                      className="grid size-[18px] shrink-0 place-items-center text-[#667085] outline-none transition-colors hover:text-[#464c5e] focus-visible:ring-2 focus-visible:ring-[#18181a]/30"
+                      className="grid size-[18px] shrink-0 place-items-center text-[#667085] outline-none transition-colors hover:text-[#464c5e] focus-visible:ring-2 focus-visible:ring-primary/30"
                     >
                       <IconFieldClear className="size-[18px]" aria-hidden="true" />
                     </button>
@@ -307,7 +307,7 @@ export default function LoginPage({ onLogin }: LoginPageProps) {
                     aria-pressed={showPassword}
                     onClick={() => setShowPassword((prev) => !prev)}
                     disabled={loading}
-                    className="grid size-[18px] shrink-0 place-items-center text-[#677185] outline-none transition-colors hover:text-[#464c5e] focus-visible:ring-2 focus-visible:ring-[#18181a]/30"
+                    className="grid size-[18px] shrink-0 place-items-center text-[#677185] outline-none transition-colors hover:text-[#464c5e] focus-visible:ring-2 focus-visible:ring-primary/30"
                   >
                     {showPassword ? (
                       <IconFieldEyeOn className="size-[18px]" aria-hidden="true" />
@@ -334,14 +334,14 @@ export default function LoginPage({ onLogin }: LoginPageProps) {
                   type="button"
                   onClick={closeForm}
                   disabled={loading}
-                  className="flex h-[40px] min-w-[88px] items-center justify-center rounded-[10px] border border-[#e3e7f1] px-[18px] text-[14px] font-normal text-[#464c5e] transition-colors hover:bg-[#f6f6f6] disabled:cursor-not-allowed disabled:opacity-60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#18181a]/30"
+                  className="flex h-[40px] min-w-[88px] items-center justify-center rounded-[10px] border border-[#e3e7f1] px-[18px] text-[14px] font-normal text-[#464c5e] transition-colors hover:bg-[#f6f6f6] disabled:cursor-not-allowed disabled:opacity-60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30"
                 >
                   {t('auth.login.cancel')}
                 </button>
                 <button
                   type="submit"
                   disabled={loading}
-                  className="flex h-[40px] min-w-[120px] items-center justify-center rounded-[10px] bg-[#18181a] px-[18px] text-[16px] font-normal text-white transition-colors hover:bg-[#18181a]/90 disabled:cursor-not-allowed disabled:opacity-60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#18181a]/30"
+                  className="flex h-[40px] min-w-[120px] items-center justify-center rounded-[10px] bg-primary px-[18px] text-[16px] font-normal text-white transition-colors hover:bg-primary/80 disabled:cursor-not-allowed disabled:opacity-60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30"
                 >
                   {loading ? t('auth.login.loading') : t('auth.login.action')}
                 </button>

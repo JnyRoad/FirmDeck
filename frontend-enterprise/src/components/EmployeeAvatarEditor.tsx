@@ -320,14 +320,14 @@ export default function EmployeeAvatarEditor({
             variant="outline"
             disabled={saving}
             onClick={onClose}
-            className="h-8 w-[92px] rounded-[10px] border-[#e3e7f1] bg-white px-3 text-sm font-normal text-[#464c5e] hover:border-[#e3e7f1] hover:bg-[#f6f6f6] hover:text-[#18181a]"
+            className="h-8 w-[92px] rounded-[10px] border-[#e3e7f1] bg-white px-3 text-sm font-normal text-[#464c5e] hover:border-[#e3e7f1] hover:bg-[#f6f6f6] hover:text-primary"
           >
             {t('employeeAvatar.action.cancel')}
           </Button>
           <Button
             disabled={saving}
             onClick={() => void save()}
-            className="h-8 w-[92px] rounded-[10px] bg-[#18181a] px-3 text-sm font-normal text-white hover:bg-[#303030]"
+            className="h-8 w-[92px] rounded-[10px] bg-primary px-3 text-sm font-normal text-white hover:bg-primary/80"
           >
             {t('employeeAvatar.action.save')}
           </Button>

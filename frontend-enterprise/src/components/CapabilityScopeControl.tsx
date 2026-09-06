@@ -101,7 +101,7 @@ export function CapabilityScopeControl({
               <button
                 type="button"
                 aria-label={t('capabilityScope.action.viewDescription')}
-                className="inline-flex size-[18px] shrink-0 items-center justify-center rounded-full text-[#8b93a7] outline-none transition-colors hover:text-[#18181a] focus-visible:ring-2 focus-visible:ring-[#1a71ff]/40"
+                className="inline-flex size-[18px] shrink-0 items-center justify-center rounded-full text-[#8b93a7] outline-none transition-colors hover:text-primary focus-visible:ring-2 focus-visible:ring-[#1a71ff]/40"
               >
                 <InfoCircleOutlined className="size-[14px]" />
               </button>

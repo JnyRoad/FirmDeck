@@ -149,7 +149,7 @@ export default function SystemLoginPage({ client = systemClient, onLogin }: Syst
             <Button
               type="submit"
               disabled={loading}
-              className="mt-1 h-11 w-full rounded-[10px] bg-[#18181a] text-[14px] text-white hover:bg-[#303238]"
+              className="mt-1 h-11 w-full rounded-[10px] bg-primary text-[14px] text-white hover:bg-primary/80"
             >
               {loading ? t('system.login.loading') : t('system.login.submit')}
             </Button>

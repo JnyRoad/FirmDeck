@@ -14,9 +14,9 @@ import type { ChannelBindingRead } from '../../types';
 import { StatusBadge } from '../scheduled-tasks/StatusBadge';
 
 const PRIMARY_BUTTON_CLASS =
-  'h-8 gap-1 rounded-[10px] bg-[#18181a] px-5 text-[12px] font-normal text-white hover:bg-[#303030]';
+  'h-8 gap-1 rounded-[10px] bg-primary px-5 text-[12px] font-normal text-white hover:bg-primary/80';
 const OUTLINE_BUTTON_CLASS =
-  'h-8 gap-1 rounded-[10px] border-[#e3e7f1] px-5 text-[12px] font-normal text-[#464c5e] hover:bg-[#f6f6f6] hover:text-[#18181a]';
+  'h-8 gap-1 rounded-[10px] border-[#e3e7f1] px-5 text-[12px] font-normal text-[#464c5e] hover:bg-[#f6f6f6] hover:text-primary';
 
 /** 将稳定后端错误投影为当前 setup 页面可展示的 descriptor，禁止原始异常文本成为 UI。 */
 function errorDescriptor(error: unknown, fallbackId: MessageId): MessageDescriptor {

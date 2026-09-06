@@ -300,7 +300,7 @@ export function VersionsTab({ api, kb, onChanged }: VersionsTabProps) {
   return (
     <div className="flex flex-col gap-[12px]">
       <div className="flex justify-end">
-        <Button onClick={() => setCreateOpen(true)} className={cn(OUTLINE_ACTION_BUTTON_SM_CLASS, 'bg-[#18181a] text-white hover:bg-[#303030] hover:text-white')}>
+        <Button onClick={() => setCreateOpen(true)} className={cn(OUTLINE_ACTION_BUTTON_SM_CLASS, 'bg-primary text-white hover:bg-primary/80 hover:text-white')}>
           {t('knowledgeAdmin.versions.actions.createDraft')}
         </Button>
       </div>

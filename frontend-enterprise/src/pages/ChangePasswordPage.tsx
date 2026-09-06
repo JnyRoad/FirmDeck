@@ -42,7 +42,7 @@ const DEFAULT_PASSWORD_POLICY: PasswordPolicy = {
   require_special: false,
 };
 const INPUT_BASE_CLASS =
-  'h-[44px] w-full rounded-[10px] border border-[#e3e7f1] bg-white px-[16px] text-[14px] text-[#18181a] outline-none transition-colors placeholder:text-[#858b9c] focus:border-[#18181a] focus:ring-2 focus:ring-[#18181a]/10 disabled:cursor-not-allowed disabled:opacity-60';
+  'h-[44px] w-full rounded-[10px] border border-[#e3e7f1] bg-white px-[16px] text-[14px] text-[#18181a] outline-none transition-colors placeholder:text-[#858b9c] focus:border-primary focus:ring-2 focus:ring-primary/10 disabled:cursor-not-allowed disabled:opacity-60';
 
 type PasswordField = 'current' | 'next' | 'confirm';
 
@@ -357,14 +357,14 @@ export default function ChangePasswordPage({
                 type="button"
                 onClick={cancel}
                 disabled={loading}
-                className="h-11 rounded-[10px] border border-[#e3e7f1] px-5 text-[14px] text-[#464c5e] transition-colors hover:bg-[#f6f6f6] disabled:cursor-not-allowed disabled:opacity-60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#18181a]/30"
+                className="h-11 rounded-[10px] border border-[#e3e7f1] px-5 text-[14px] text-[#464c5e] transition-colors hover:bg-[#f6f6f6] disabled:cursor-not-allowed disabled:opacity-60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30"
               >
                 {t('auth.changePassword.cancel')}
               </button>
               <button
                 type="submit"
                 disabled={loading}
-                className="h-11 rounded-[10px] bg-[#18181a] px-5 text-[14px] text-white transition-colors hover:bg-[#303238] disabled:cursor-not-allowed disabled:opacity-60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#18181a]/30"
+                className="h-11 rounded-[10px] bg-primary px-5 text-[14px] text-white transition-colors hover:bg-primary/80 disabled:cursor-not-allowed disabled:opacity-60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30"
               >
                 {loading ? t('auth.changePassword.loading') : t('auth.changePassword.submit')}
               </button>
@@ -444,7 +444,7 @@ const PasswordInput = forwardRef<HTMLInputElement, PasswordInputProps>(function 
         aria-pressed={visible}
         onClick={onToggle}
         disabled={disabled}
-        className="absolute inset-y-0 right-0 grid w-11 place-items-center text-[#7d879a] outline-none transition-colors hover:text-[#464c5e] disabled:cursor-not-allowed focus-visible:text-[#18181a]"
+        className="absolute inset-y-0 right-0 grid w-11 place-items-center text-[#7d879a] outline-none transition-colors hover:text-[#464c5e] disabled:cursor-not-allowed focus-visible:text-primary"
       >
         {visible ? (
           <IconFieldEyeOn className="size-[18px]" aria-hidden="true" />

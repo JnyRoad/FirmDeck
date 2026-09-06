@@ -29,7 +29,7 @@ const MAX_AVATAR_BYTES = 2 * 1024 * 1024;
 const AVATAR_TYPES = new Set(['image/jpeg', 'image/png']);
 const CONTACT_URL_HOSTS = new Set(['work.weixin.qq.com']);
 const PRIMARY_BUTTON_CLASS =
-  'h-8 rounded-[10px] bg-[#18181a] px-4 text-[12px] font-normal text-white hover:bg-[#303030]';
+  'h-8 rounded-[10px] bg-primary px-4 text-[12px] font-normal text-white hover:bg-primary/80';
 const OUTLINE_BUTTON_CLASS =
   'h-8 rounded-[10px] border-[#e3e7f1] px-4 text-[12px] font-normal text-[#464c5e] hover:bg-[#f6f6f6]';
 

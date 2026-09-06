@@ -80,7 +80,7 @@ function NavChevron({
       aria-label={label}
       disabled={disabled}
       onClick={onClick}
-      className="grid size-[14px] place-items-center text-[#757f9c] transition-colors enabled:hover:text-[#18181a] disabled:cursor-not-allowed disabled:opacity-35"
+      className="grid size-[14px] place-items-center text-[#757f9c] transition-colors enabled:hover:text-primary disabled:cursor-not-allowed disabled:opacity-35"
     >
       <IconChevronDown
         className={cn('size-[14px]', direction === 'prev' ? 'rotate-90' : '-rotate-90')}
@@ -139,7 +139,7 @@ export default function PlatformEmployeeDrawer({
               type="button"
               aria-label={ui.closeLabel}
               onClick={onClose}
-              className="grid size-[14px] place-items-center text-[#757f9c] transition-colors hover:text-[#18181a]"
+              className="grid size-[14px] place-items-center text-[#757f9c] transition-colors hover:text-primary"
             >
               <XIcon className="size-[14px]" strokeWidth={1.75} />
             </button>
@@ -252,7 +252,7 @@ export default function PlatformEmployeeDrawer({
           <button
             type="button"
             onClick={onUse}
-            className="inline-flex h-[34px] shrink-0 items-center justify-center whitespace-nowrap rounded-[10px] bg-[#18181a] px-[18px] text-[12px] text-white transition-colors hover:bg-[#2a2a2e]"
+            className="inline-flex h-[34px] shrink-0 items-center justify-center whitespace-nowrap rounded-[10px] bg-primary px-[18px] text-[12px] text-white transition-colors hover:bg-primary/80"
           >
             {ui.useAction}
           </button>

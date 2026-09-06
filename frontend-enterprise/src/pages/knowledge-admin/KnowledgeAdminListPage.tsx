@@ -509,7 +509,7 @@ export default function KnowledgeAdminListPage({ currentUser, onLogout }: Knowle
           </Button>
           <Button
             onClick={() => setCreateOpen(true)}
-            className="h-[34px] gap-[4px] rounded-[10px] bg-[#18181a] px-[20px] text-[12px] font-normal text-white hover:bg-[#303030]"
+            className="h-[34px] gap-[4px] rounded-[10px] bg-primary px-[20px] text-[12px] font-normal text-white hover:bg-primary/80"
           >
             <IconAdd className="size-[14px]" />
             {t('knowledgeAdmin.list.actions.create')}

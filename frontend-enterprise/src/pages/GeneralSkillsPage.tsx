@@ -519,9 +519,9 @@ const SECTION_CARD_CLASS =
 const SECTION_CARD_TITLE_CLASS = 'text-[14px] font-medium text-[#18181a]';
 const FIELD_LABEL_CLASS = 'text-[13px] font-medium text-[#18181a]';
 const RETURN_BUTTON_CLASS =
-  'h-8 gap-1 rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-5 text-[12px] font-normal text-[#757f9c] hover:border-[#cbd3e6]! hover:bg-white! hover:text-[#18181a]! aria-expanded:border-[#cbd3e6]! aria-expanded:bg-white! aria-expanded:text-[#18181a]!';
+  'h-8 gap-1 rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-5 text-[12px] font-normal text-[#757f9c] hover:border-[#cbd3e6]! hover:bg-white! hover:text-primary! aria-expanded:border-[#cbd3e6]! aria-expanded:bg-white! aria-expanded:text-primary!';
 const PRIMARY_BUTTON_CLASS =
-  'h-8 gap-1 rounded-[10px] bg-[#18181a] px-5 text-[12px] font-normal text-white hover:bg-[#303030]';
+  'h-8 gap-1 rounded-[10px] bg-primary px-5 text-[12px] font-normal text-white hover:bg-primary/80';
 const DELETE_BUTTON_CLASS =
   'h-8 gap-1 rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-5 text-[12px] font-normal text-[#d20b0b] hover:border-[#f3b6b6]! hover:bg-[#fce7e7]! hover:text-[#d20b0b]! aria-expanded:border-[#f3b6b6]! aria-expanded:bg-[#fce7e7]! aria-expanded:text-[#d20b0b]!';
 const EDITOR_ACTION_OUTLINE_CLASS = RETURN_BUTTON_CLASS;
@@ -529,9 +529,9 @@ const EDITOR_ACTION_PRIMARY_CLASS = PRIMARY_BUTTON_CLASS;
 const HIDDEN_FILE_INPUT_CLASS =
   'pointer-events-none fixed size-px opacity-0 [inset:auto_auto_0_0]';
 const SKILL_EDITOR_DRAG_ACTIVE_CLASS =
-  'ring-1 ring-[#18181a]/20 shadow-[0_-4px_16px_0_rgba(0,0,0,0.08)]';
+  'ring-1 ring-primary/20 shadow-[0_-4px_16px_0_rgba(0,0,0,0.08)]';
 const SKILL_DROP_HINT_CLASS =
-  'pointer-events-none absolute inset-x-[18px] bottom-[18px] top-[46px] z-[6] flex items-center justify-center gap-3 rounded-[14px] border border-dashed border-[#18181a] bg-white/90 text-[15px] font-semibold text-[#18181a] shadow-sm backdrop-blur-sm';
+  'pointer-events-none absolute inset-x-[18px] bottom-[18px] top-[46px] z-[6] flex items-center justify-center gap-3 rounded-[14px] border border-dashed border-primary bg-white/90 text-[15px] font-semibold text-primary shadow-sm backdrop-blur-sm';
 const SKILL_FILE_EDITOR_CLASS =
   'grid min-h-[560px] flex-1 grid-cols-[minmax(180px,240px)_minmax(0,1fr)] overflow-hidden border-t border-[#e3e7f1] bg-[#fafafa]';
 const SKILL_FILE_TREE_CLASS =
@@ -547,7 +547,7 @@ const SKILL_FILE_PANE_CLASS =
 const SKILL_FILE_TAB_CLASS =
   'flex min-h-[44px] items-center gap-2 border-b border-[#e3e7f1] bg-[#f6f6f6] px-[14px] text-[12px] font-medium text-[#757f9c]';
 const SKILL_FILE_TAB_ACTION_BUTTON_CLASS =
-  'inline-flex h-[28px] shrink-0 items-center gap-[4px] rounded-[6px] px-[8px] text-[12px] font-medium text-[#757f9c] transition-colors hover:bg-[#edf1f7] hover:text-[#18181a] disabled:pointer-events-none disabled:opacity-40';
+  'inline-flex h-[28px] shrink-0 items-center gap-[4px] rounded-[6px] px-[8px] text-[12px] font-medium text-[#757f9c] transition-colors hover:bg-[#edf1f7] hover:text-primary disabled:pointer-events-none disabled:opacity-40';
 const SKILL_CODE_EDITOR_CLASS =
   'relative min-h-0 overflow-hidden bg-[#fafafa] font-mono text-[13px] leading-[1.7] tab-[2] shadow-[inset_0_1px_0_#e3e7f1]';
 const SKILL_MARKDOWN_PREVIEW_CLASS =
@@ -559,7 +559,7 @@ const SKILL_CODE_HIGHLIGHT_CLASS =
 const SKILL_CODE_HIGHLIGHT_CODE_CLASS =
   'block w-max min-w-full font-[inherit] will-change-transform';
 const SKILL_CODE_INPUT_CLASS =
-  'absolute inset-0 z-[2] m-0 size-full min-h-0 resize-none overflow-auto rounded-none border-0 bg-transparent! p-[18px_20px] font-[inherit] leading-[inherit] tracking-normal whitespace-pre text-transparent caret-[#18181a] outline-none tab-[2] [scrollbar-gutter:stable] selection:bg-[rgba(0,120,215,0.24)] [-webkit-text-fill-color:transparent]';
+  'absolute inset-0 z-[2] m-0 size-full min-h-0 resize-none overflow-auto rounded-none border-0 bg-transparent! p-[18px_20px] font-[inherit] leading-[inherit] tracking-normal whitespace-pre text-transparent caret-primary outline-none tab-[2] [scrollbar-gutter:stable] selection:bg-[rgba(0,120,215,0.24)] [-webkit-text-fill-color:transparent]';
 const SKILL_RESULT_LAYOUT_CLASS = 'grid gap-5';
 const SKILL_SECTION_LABEL_CLASS =
   'mb-2 text-[12px] font-semibold text-[#757f9c]';
@@ -589,7 +589,7 @@ const SKILL_OUTPUT_STACK_CLASS = 'grid gap-[10px]';
 function skillFileNodeClass(active: boolean) {
   return cn(
     'flex w-full min-w-0 cursor-pointer items-center gap-2 rounded-lg border-0 bg-transparent px-[10px] py-2 text-left text-[12px] text-[#757f9c] transition-[background,color,box-shadow] duration-150',
-    'hover:bg-[#f6f6f6] hover:text-[#18181a]',
+    'hover:bg-[#f6f6f6] hover:text-primary',
     active && 'bg-[#f6f6f6] text-[#18181a]',
   );
 }
@@ -1387,14 +1387,14 @@ function GeneralSkillsPageContent({ embedded = false, currentUser, onLogout }: {
               variant="outline"
               onClick={() => void load()}
               disabled={loading}
-              className="h-[34px] gap-[4px] rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[20px] text-[12px] font-normal text-[#757f9c] hover:border-[#cbd3e6] hover:bg-white hover:text-[#18181a]"
+              className="h-[34px] gap-[4px] rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[20px] text-[12px] font-normal text-[#757f9c] hover:border-[#cbd3e6] hover:bg-white hover:text-primary"
             >
               <IconRefresh className={cn('size-[14px]', loading && 'animate-spin')} />
               {copy.refresh}
             </UIButton>
             {canManageCurrentScope && (
               <DropdownMenu>
-                <DropdownMenuTrigger data-guide-target="skills-create" className="flex h-[34px] items-center gap-[4px] rounded-[10px] bg-[#18181a] px-[20px] text-[12px] font-normal text-white outline-none transition-colors hover:bg-[#303030]">
+                <DropdownMenuTrigger data-guide-target="skills-create" className="flex h-[34px] items-center gap-[4px] rounded-[10px] bg-primary px-[20px] text-[12px] font-normal text-white outline-none transition-colors hover:bg-primary/80">
                   <IconAdd className="size-[14px]" />
                   {copy.add}
                   <IconChevronDown className="size-[12px]" />
@@ -1442,7 +1442,7 @@ function GeneralSkillsPageContent({ embedded = false, currentUser, onLogout }: {
           </div>
 
           <div className="flex flex-wrap items-center gap-[16px]">
-            <label className="flex h-[34px] w-[300px] items-center gap-[8px] overflow-hidden rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[12px] transition-colors focus-within:border-[#18181a] max-[900px]:w-full">
+            <label className="flex h-[34px] w-[300px] items-center gap-[8px] overflow-hidden rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[12px] transition-colors focus-within:border-primary max-[900px]:w-full">
               <IconSearch className="size-[14px] shrink-0 text-[#858b9c]" />
               <input
                 autoComplete="off"
@@ -1618,7 +1618,7 @@ function ClawHubDialog({
             value={source}
             onChange={(event) => onSourceChange(event.target.value)}
             placeholder={copy.importOpenSourcePlaceholder}
-            className="h-[34px] w-full rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[12px] text-[12px] text-[#17191f] outline-none transition-colors placeholder:text-[#c0c6d4] focus:border-[#18181a]"
+            className="h-[34px] w-full rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[12px] text-[12px] text-[#17191f] outline-none transition-colors placeholder:text-[#c0c6d4] focus:border-primary"
           />
         </div>
 
@@ -1627,14 +1627,14 @@ function ClawHubDialog({
             variant="outline"
             disabled={loading}
             onClick={onClose}
-            className="h-[32px] w-[80px] rounded-[10px] border-[#e3e7f1] bg-white px-[12px] text-[14px] font-normal text-[#464c5e] hover:border-[#e3e7f1] hover:bg-[#f6f6f6] hover:text-[#18181a]"
+            className="h-[32px] w-[80px] rounded-[10px] border-[#e3e7f1] bg-white px-[12px] text-[14px] font-normal text-[#464c5e] hover:border-[#e3e7f1] hover:bg-[#f6f6f6] hover:text-primary"
           >
             {copy.cancelAction}
           </UIButton>
           <UIButton
             disabled={loading}
             onClick={onSubmit}
-            className="h-[32px] w-[80px] rounded-[10px] bg-[#18181a] px-[12px] text-[14px] font-normal text-white hover:bg-[#303030]"
+            className="h-[32px] w-[80px] rounded-[10px] bg-primary px-[12px] text-[14px] font-normal text-white hover:bg-primary/80"
           >
             {copy.add}
           </UIButton>
@@ -3621,7 +3621,7 @@ function GeneralSkillEditorPageContent({ mode, currentUser, onLogout }: { mode: 
             extra={(
               <button
                 type="button"
-                className="inline-flex size-[32px] items-center justify-center rounded-[6px] text-[#757f9c] transition-colors hover:bg-[#f2f3f7] hover:text-[#18181a]"
+                className="inline-flex size-[32px] items-center justify-center rounded-[6px] text-[#757f9c] transition-colors hover:bg-[#f2f3f7] hover:text-primary"
                 aria-label={resultExpanded ? copy.collapseResults : copy.expandResults}
                 aria-expanded={resultExpanded}
                 onClick={() => setResultExpanded((current) => !current)}
@@ -3825,13 +3825,13 @@ function GeneralSkillEditorPageContent({ mode, currentUser, onLogout }: { mode: 
             <UIButton
               variant="outline"
               onClick={() => setCreateEntryMode(null)}
-              className="h-[32px] w-[80px] rounded-[10px] border-[#e3e7f1] bg-white px-[12px] text-[14px] font-normal text-[#464c5e] hover:border-[#e3e7f1] hover:bg-[#f6f6f6] hover:text-[#18181a]"
+              className="h-[32px] w-[80px] rounded-[10px] border-[#e3e7f1] bg-white px-[12px] text-[14px] font-normal text-[#464c5e] hover:border-[#e3e7f1] hover:bg-[#f6f6f6] hover:text-primary"
             >
               {copy.cancelAction}
             </UIButton>
             <UIButton
               onClick={runCreateEntry}
-              className="h-[32px] w-[80px] rounded-[10px] bg-[#18181a] px-[12px] text-[14px] font-normal text-white hover:bg-[#303030]"
+              className="h-[32px] w-[80px] rounded-[10px] bg-primary px-[12px] text-[14px] font-normal text-white hover:bg-primary/80"
             >
               {copy.createEntry}
             </UIButton>
@@ -3854,20 +3854,20 @@ function GeneralSkillEditorPageContent({ mode, currentUser, onLogout }: { mode: 
             <UIButton
               variant="outline"
               onClick={() => { setImportPrepareOpen(false); importPrepareActionRef.current = null; }}
-              className="h-[32px] rounded-[10px] border-[#e3e7f1] bg-white px-[14px] text-[14px] font-normal text-[#464c5e] hover:border-[#e3e7f1] hover:bg-[#f6f6f6] hover:text-[#18181a]"
+              className="h-[32px] rounded-[10px] border-[#e3e7f1] bg-white px-[14px] text-[14px] font-normal text-[#464c5e] hover:border-[#e3e7f1] hover:bg-[#f6f6f6] hover:text-primary"
             >
               {copy.cancelAction}
             </UIButton>
             <UIButton
               variant="outline"
               onClick={() => void confirmImportPrepareSkip()}
-              className="h-[32px] rounded-[10px] border-[#e3e7f1] bg-white px-[14px] text-[14px] font-normal text-[#464c5e] hover:border-[#e3e7f1] hover:bg-[#f6f6f6] hover:text-[#18181a]"
+              className="h-[32px] rounded-[10px] border-[#e3e7f1] bg-white px-[14px] text-[14px] font-normal text-[#464c5e] hover:border-[#e3e7f1] hover:bg-[#f6f6f6] hover:text-primary"
             >
               {copy.importPrepareSkip}
             </UIButton>
             <UIButton
               onClick={() => void confirmImportPrepareSave()}
-              className="h-[32px] rounded-[10px] bg-[#18181a] px-[14px] text-[14px] font-normal text-white hover:bg-[#303030]"
+              className="h-[32px] rounded-[10px] bg-primary px-[14px] text-[14px] font-normal text-white hover:bg-primary/80"
             >
               {copy.importPrepareSave}
             </UIButton>
@@ -3909,13 +3909,13 @@ function GeneralSkillEditorPageContent({ mode, currentUser, onLogout }: { mode: 
                 setRenameTarget(null);
                 setRenameFolderTarget(null);
               }}
-              className="h-[32px] w-[80px] rounded-[10px] border-[#e3e7f1] bg-white px-[12px] text-[14px] font-normal text-[#464c5e] hover:border-[#e3e7f1] hover:bg-[#f6f6f6] hover:text-[#18181a]"
+              className="h-[32px] w-[80px] rounded-[10px] border-[#e3e7f1] bg-white px-[12px] text-[14px] font-normal text-[#464c5e] hover:border-[#e3e7f1] hover:bg-[#f6f6f6] hover:text-primary"
             >
               {copy.cancelAction}
             </UIButton>
             <UIButton
               onClick={renameFolderTarget ? runRenameFolder : runRenameFile}
-              className="h-[32px] w-[80px] rounded-[10px] bg-[#18181a] px-[12px] text-[14px] font-normal text-white hover:bg-[#303030]"
+              className="h-[32px] w-[80px] rounded-[10px] bg-primary px-[12px] text-[14px] font-normal text-white hover:bg-primary/80"
             >
               {copy.renameAction}
             </UIButton>

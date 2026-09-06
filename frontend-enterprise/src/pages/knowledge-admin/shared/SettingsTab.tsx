@@ -151,7 +151,7 @@ export function SettingsTab({ api, kb, draftCount, draftCountUnknown = false, on
             <Button
               disabled={saving}
               onClick={() => void saveBasicInfo()}
-              className="h-[32px] min-w-[80px] rounded-[10px] bg-[#18181a] px-[12px] text-[14px] font-normal text-white hover:bg-[#303030]"
+              className="h-[32px] min-w-[80px] rounded-[10px] bg-primary px-[12px] text-[14px] font-normal text-white hover:bg-primary/80"
             >
               {t('common.action.save')}
             </Button>
@@ -171,7 +171,7 @@ export function SettingsTab({ api, kb, draftCount, draftCountUnknown = false, on
             variant="outline"
             disabled={statusSaving}
             onClick={() => void toggleStatus()}
-            className="h-[32px] shrink-0 rounded-[10px] border-[#e3e7f1] px-[14px] text-[12px] font-normal text-[#464c5e] hover:border-[#cbd3e6] hover:text-[#18181a]"
+            className="h-[32px] shrink-0 rounded-[10px] border-[#e3e7f1] px-[14px] text-[12px] font-normal text-[#464c5e] hover:border-[#cbd3e6] hover:text-primary"
           >
             {isActive ? t('knowledgeAdmin.list.menu.archive') : t('knowledgeAdmin.list.menu.activate')}
           </Button>

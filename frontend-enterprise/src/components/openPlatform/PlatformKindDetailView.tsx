@@ -7,7 +7,7 @@ import { Button as UIButton } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
 
 const RETURN_BUTTON_CLASS =
-  'h-8 gap-1 rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-5 text-[12px] font-normal text-[#757f9c] hover:border-[#cbd3e6] hover:bg-white hover:text-[#18181a]';
+  'h-8 gap-1 rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-5 text-[12px] font-normal text-[#757f9c] hover:border-[#cbd3e6] hover:bg-white hover:text-primary';
 
 import IconArrowRight from '../../assets/icons/arrow-right.svg?react';
 import IconAdd from '../../assets/icons/add.svg?react';
@@ -162,7 +162,7 @@ export default function PlatformKindDetailView({
           {ui.backAction}
         </UIButton>
         {onCreate && (
-          <UIButton onClick={onCreate} className="h-8 gap-1 rounded-[10px] bg-[#18181a] px-5 text-[12px] font-normal text-white hover:bg-[#303030]">
+          <UIButton onClick={onCreate} className="h-8 gap-1 rounded-[10px] bg-primary px-5 text-[12px] font-normal text-white hover:bg-primary/80">
             <IconAdd className="size-3.5" />
             {ui.createAction}
           </UIButton>
@@ -202,7 +202,7 @@ export default function PlatformKindDetailView({
             </div>
           )}
 
-          <label className="flex h-[34px] w-full max-w-[360px] items-center gap-[8px] overflow-hidden rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[12px] transition-colors focus-within:border-[#18181a]">
+          <label className="flex h-[34px] w-full max-w-[360px] items-center gap-[8px] overflow-hidden rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[12px] transition-colors focus-within:border-primary">
             <IconSearch className="size-[14px] shrink-0 text-[#858b9c]" />
             <input
               autoComplete="off"

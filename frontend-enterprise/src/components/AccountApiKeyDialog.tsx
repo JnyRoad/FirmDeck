@@ -238,7 +238,7 @@ export default function AccountApiKeyDialog({
       >
         <DialogHeader className="border-b border-[#e9ecf2] bg-white px-[26px] py-[22px]">
           <div className="flex items-center gap-[12px]">
-            <span className="grid size-[38px] place-items-center rounded-[12px] bg-[#18181a] text-white">
+            <span className="grid size-[38px] place-items-center rounded-[12px] bg-primary text-white">
               <KeyRound className="size-[18px]" />
             </span>
             <div>
