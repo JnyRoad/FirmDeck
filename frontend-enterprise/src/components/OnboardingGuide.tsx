@@ -164,7 +164,7 @@ export default function OnboardingGuide() {
               type="button"
               onClick={finish}
               aria-label={t("onboarding.action.close")}
-              className="flex size-[20px] items-center justify-center text-[#757f9c] transition-colors hover:text-[#18181a]"
+              className="flex size-[20px] items-center justify-center text-[#757f9c] transition-colors hover:text-primary"
             >
               <XIcon className="size-[14px]" />
             </button>
@@ -219,7 +219,7 @@ export default function OnboardingGuide() {
                 onClick={goPrev}
                 disabled={isFirst}
                 aria-label={t("onboarding.action.previous")}
-                className="flex size-[14px] items-center justify-center transition-colors enabled:hover:text-[#18181a] disabled:cursor-default disabled:opacity-40"
+                className="flex size-[14px] items-center justify-center transition-colors enabled:hover:text-primary disabled:cursor-default disabled:opacity-40"
               >
                 <ChevronLeft className="size-[14px]" />
               </button>
@@ -231,7 +231,7 @@ export default function OnboardingGuide() {
                 onClick={goNext}
                 disabled={isLast}
                 aria-label={t("onboarding.action.next")}
-                className="flex size-[14px] items-center justify-center transition-colors enabled:hover:text-[#18181a] disabled:cursor-default disabled:opacity-40"
+                className="flex size-[14px] items-center justify-center transition-colors enabled:hover:text-primary disabled:cursor-default disabled:opacity-40"
               >
                 <ChevronRight className="size-[14px]" />
               </button>
@@ -241,14 +241,14 @@ export default function OnboardingGuide() {
               <button
                 type="button"
                 onClick={finish}
-                className="flex w-[80px] items-center justify-center rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[20px] py-[8px] text-[14px] text-[#757f9c] transition-colors hover:bg-[#f6f6f6] hover:text-[#18181a]"
+                className="flex w-[80px] items-center justify-center rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[20px] py-[8px] text-[14px] text-[#757f9c] transition-colors hover:bg-[#f6f6f6] hover:text-primary"
               >
                 {t("onboarding.action.skip")}
               </button>
               <button
                 type="button"
                 onClick={goNext}
-                className="flex w-[134px] items-center justify-center rounded-[10px] bg-[#18181a] px-[32px] py-[8px] text-[14px] text-white transition-colors hover:bg-[#303030]"
+                className="flex w-[134px] items-center justify-center rounded-[10px] bg-primary px-[32px] py-[8px] text-[14px] text-white transition-colors hover:bg-primary/80"
               >
                 {isLast ? t("onboarding.action.start") : t("onboarding.action.next")}
               </button>

@@ -585,7 +585,7 @@ function ActivityTimeline({ events }: ActivityTimelineProps) {
           <button
             type="button"
             onClick={() => shift(-1)}
-            className="flex size-[14px] items-center justify-center text-[#464c5e] transition-colors hover:text-[#18181a] in-data-[theme=dark]:text-[#c9cede]"
+            className="flex size-[14px] items-center justify-center text-[#464c5e] transition-colors hover:text-primary in-data-[theme=dark]:text-[#c9cede]"
             aria-label={copy.previousPeriod}
           >
             <TimelineChevron direction="left" />
@@ -599,7 +599,7 @@ function ActivityTimeline({ events }: ActivityTimelineProps) {
           <button
             type="button"
             onClick={() => shift(1)}
-            className="flex size-[14px] items-center justify-center text-[#464c5e] transition-colors hover:text-[#18181a] in-data-[theme=dark]:text-[#c9cede]"
+            className="flex size-[14px] items-center justify-center text-[#464c5e] transition-colors hover:text-primary in-data-[theme=dark]:text-[#c9cede]"
             aria-label={copy.nextPeriod}
           >
             <TimelineChevron direction="right" />
@@ -1117,7 +1117,7 @@ function TimelineDatePicker({
       <PopoverTrigger asChild>
         <button
           type="button"
-          className="text-[12px] whitespace-nowrap text-[#464c5e] transition-colors hover:text-[#18181a] in-data-[theme=dark]:text-[#c9cede]"
+          className="text-[12px] whitespace-nowrap text-[#464c5e] transition-colors hover:text-primary in-data-[theme=dark]:text-[#c9cede]"
         >
           {label}
         </button>

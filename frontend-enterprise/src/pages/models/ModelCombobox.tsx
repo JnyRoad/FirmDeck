@@ -73,7 +73,7 @@ export default function ModelCombobox({
           setQuery(event.target.value);
           setOpen(true);
         }}
-        className="h-[36px] w-full rounded-[9px] border border-[#e3e7f1] px-[12px] text-[13px] text-[#18181a] outline-none focus:border-[#18181a] disabled:cursor-not-allowed disabled:bg-[#f9fafb] disabled:text-[#b7bccb]"
+        className="h-[36px] w-full rounded-[9px] border border-[#e3e7f1] px-[12px] text-[13px] text-[#18181a] outline-none focus:border-primary disabled:cursor-not-allowed disabled:bg-[#f9fafb] disabled:text-[#b7bccb]"
       />
       {loading && (
         <LoaderCircle className="absolute top-[11px] right-[12px] size-[14px] animate-spin text-[#858b9c]" />

@@ -1252,7 +1252,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
       <DropdownMenu>
         <DropdownMenuTrigger
           aria-label={t('knowledgePage.table.actionsMenu')}
-          className="grid size-7 place-items-center rounded-[8px] text-[#858b9c] transition-colors outline-none hover:bg-black/5 hover:text-[#18181a]"
+          className="grid size-7 place-items-center rounded-[8px] text-[#858b9c] transition-colors outline-none hover:bg-black/5 hover:text-primary"
           onClick={(event) => event.stopPropagation()}
         >
           <MoreOutlined />
@@ -1392,7 +1392,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
       className={cn(
         MOBILE_CARD_CLASS,
         'cursor-pointer',
-        selectedKnowledgeBase?.id === item.id && 'ring-2 ring-[#18181a]',
+        selectedKnowledgeBase?.id === item.id && 'ring-2 ring-primary',
       )}
       key={item.id}
       onClick={() => selectKnowledgeBase(item.id)}
@@ -1456,7 +1456,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
         </UIButton>
         {canManageCurrentScope && (
           <DropdownMenu>
-            <DropdownMenuTrigger data-guide-target="knowledge-create" className="flex h-[34px] items-center gap-[4px] rounded-[10px] bg-[#18181a] px-[20px] text-[12px] font-normal text-white outline-none transition-colors hover:bg-[#303030]">
+            <DropdownMenuTrigger data-guide-target="knowledge-create" className="flex h-[34px] items-center gap-[4px] rounded-[10px] bg-primary px-[20px] text-[12px] font-normal text-white outline-none transition-colors hover:bg-primary/80">
               <IconAdd className="size-[14px]" />
               {t('knowledgePage.actions.createKnowledgeBase')}
               <IconChevronDown className="size-[12px]" />
@@ -1501,7 +1501,7 @@ export default function KnowledgeManagePage({ currentUser, onLogout }: Knowledge
             <span className="text-[14px] font-normal leading-none">{listLabel}</span>
           </div>
 
-          <label className="flex h-[34px] w-[300px] max-w-full items-center gap-[8px] overflow-hidden rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[12px] transition-colors focus-within:border-[#18181a]">
+          <label className="flex h-[34px] w-[300px] max-w-full items-center gap-[8px] overflow-hidden rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[12px] transition-colors focus-within:border-primary">
             <IconSearch className="size-[14px] shrink-0 text-[#858b9c]" />
             <input
               autoComplete="off"

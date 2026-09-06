@@ -1,6 +1,6 @@
 import { cn } from '@/lib/utils';
 import { RawIdentifier } from '@/i18n/RawContent';
-import logoMark from '../assets/LOGO.svg';
+import logoMark from '../assets/firmdeck/firmdeck-logo-mark.png';
 
 export type BrandLogoProps = {
   /** Hide the "OpenBMB / FirmDeck" wordmark and only render the logo mark. */

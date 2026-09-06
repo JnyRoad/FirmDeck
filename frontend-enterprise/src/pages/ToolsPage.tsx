@@ -1277,14 +1277,14 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
           variant="outline"
           onClick={() => void load()}
           disabled={loading}
-          className="h-[34px] gap-[4px] rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[20px] text-[12px] font-normal text-[#757f9c] hover:border-[#cbd3e6] hover:bg-white hover:text-[#18181a]"
+          className="h-[34px] gap-[4px] rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[20px] text-[12px] font-normal text-[#757f9c] hover:border-[#cbd3e6] hover:bg-white hover:text-primary"
         >
           <IconRefresh className={cn('size-[14px]', loading && 'animate-spin')} />
           {t(TOOLS_MESSAGE_IDS.actionRefresh)}
         </UIButton>
         {canOpenCreateMenu && (
           <DropdownMenu>
-            <DropdownMenuTrigger data-guide-target="tools-create" className="flex h-[34px] items-center gap-[4px] rounded-[10px] bg-[#18181a] px-[20px] text-[12px] font-normal text-white outline-none transition-colors hover:bg-[#303030]">
+            <DropdownMenuTrigger data-guide-target="tools-create" className="flex h-[34px] items-center gap-[4px] rounded-[10px] bg-primary px-[20px] text-[12px] font-normal text-white outline-none transition-colors hover:bg-primary/80">
               <IconAdd className="size-[14px]" />
               {t(TOOLS_MESSAGE_IDS.actionCreate)}
               <IconChevronDown className="size-[12px]" />
@@ -1397,7 +1397,7 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
           </div>
 
           <div className="flex flex-wrap items-center gap-[16px]">
-            <label className="flex h-[34px] w-[300px] items-center gap-[8px] overflow-hidden rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[12px] transition-colors focus-within:border-[#18181a] max-[900px]:w-full">
+            <label className="flex h-[34px] w-[300px] items-center gap-[8px] overflow-hidden rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[12px] transition-colors focus-within:border-primary max-[900px]:w-full">
               <IconSearch className="size-[14px] shrink-0 text-[#858b9c]" />
               <input
                 autoComplete="off"
@@ -1625,7 +1625,7 @@ function ToolTypeSwitcher({ active, onProtocolChange }: { active: 'http' | 'a2a'
               className={cn(
                 'relative flex min-w-[200px] flex-1 items-start gap-[10px] rounded-[12px] border px-[16px] py-[12px] text-left transition-all',
                 isActive
-                  ? 'border-[#18181a] bg-[#18181a] shadow-[0_4px_12px_0_rgba(24,24,26,0.18)]'
+                  ? 'border-primary bg-primary shadow-[0_4px_12px_0_rgba(24,24,26,0.18)]'
                   : 'border-[#e3e7f1] bg-white hover:border-[#cbd3e6] hover:bg-[#fafbfc]',
               )}
               aria-pressed={isActive}
@@ -1837,9 +1837,9 @@ const SUBSECTION_TITLE_CLASS = 'text-[13px] font-medium text-[#18181a]';
 const HINT_CLASS = 'text-[12px] leading-[1.55] text-[#858b9c]';
 const MONO_INPUT_CLASS = 'font-mono text-[12px] leading-[1.65]';
 const RETURN_BUTTON_CLASS =
-  'h-8 gap-1 rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-5 text-[12px] font-normal text-[#757f9c] hover:border-[#cbd3e6] hover:bg-white hover:text-[#18181a]';
+  'h-8 gap-1 rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-5 text-[12px] font-normal text-[#757f9c] hover:border-[#cbd3e6] hover:bg-white hover:text-primary';
 const PRIMARY_BUTTON_CLASS =
-  'h-8 gap-1 rounded-[10px] bg-[#18181a] px-5 text-[12px] font-normal text-white hover:bg-[#303030]';
+  'h-8 gap-1 rounded-[10px] bg-primary px-5 text-[12px] font-normal text-white hover:bg-primary/80';
 
 /** 统一工具页卡片容器；加载状态由当前界面 locale 渲染，children 不改写原始业务数据。 */
 function SectionCard({

@@ -632,7 +632,7 @@ export default function ModelSetupWizard({
                 type="button"
                 aria-label={t('modelSetup.actions.close')}
                 onClick={handleClose}
-                className="grid size-[28px] shrink-0 place-items-center rounded-[8px] text-[#858b9c] outline-none hover:text-[#18181a]"
+                className="grid size-[28px] shrink-0 place-items-center rounded-[8px] text-[#858b9c] outline-none hover:text-primary"
               >
                 <X className="size-[14px]" />
               </button>
@@ -719,7 +719,7 @@ export default function ModelSetupWizard({
                   <button
                     type="button"
                     onClick={() => setShowAdvanced((prev) => !prev)}
-                    className="flex w-fit items-center gap-[4px] text-[12px] text-[#757f9c] hover:text-[#18181a]"
+                    className="flex w-fit items-center gap-[4px] text-[12px] text-[#757f9c] hover:text-primary"
                   >
                     <ChevronRight className={`size-[12px] transition-transform ${showAdvanced ? 'rotate-90' : ''}`} />
                     {t('modelSetup.vendor.advancedToggle')}
@@ -799,7 +799,7 @@ export default function ModelSetupWizard({
                   <button
                     type="button"
                     onClick={() => setShowCustomAdvanced((prev) => !prev)}
-                    className="flex w-fit items-center gap-[4px] text-[12px] text-[#757f9c] hover:text-[#18181a]"
+                    className="flex w-fit items-center gap-[4px] text-[12px] text-[#757f9c] hover:text-primary"
                   >
                     <ChevronRight className={`size-[12px] transition-transform ${showCustomAdvanced ? 'rotate-90' : ''}`} />
                     {t('modelSetup.custom.advancedToggle')}
@@ -945,7 +945,7 @@ export default function ModelSetupWizard({
 
             <div className="flex items-center justify-between border-t border-[#f0f1f4] px-[24px] py-[14px]">
               {step === 1 ? (
-                  <button type="button" onClick={handleClose} className="h-[32px] px-[8px] text-[13px] text-[#757f9c] hover:text-[#18181a]">
+                  <button type="button" onClick={handleClose} className="h-[32px] px-[8px] text-[13px] text-[#757f9c] hover:text-primary">
                   {t('modelSetup.actions.cancel')}
                   </button>
               ) : (
@@ -966,7 +966,7 @@ export default function ModelSetupWizard({
                   type="button"
                   disabled={!selectedChannelId}
                   onClick={() => setStep(2)}
-                  className="h-[34px] gap-[6px] rounded-[10px] bg-[#18181a] px-[20px] text-[13px] text-white hover:bg-[#303030] disabled:opacity-40"
+                  className="h-[34px] gap-[6px] rounded-[10px] bg-primary px-[20px] text-[13px] text-white hover:bg-primary/80 disabled:opacity-40"
                 >
                   {t('modelSetup.actions.next')}
                   <ArrowRight className="size-[14px]" />
@@ -977,7 +977,7 @@ export default function ModelSetupWizard({
                   type="button"
                   disabled={saving || !step2Complete || !configName.trim()}
                   onClick={() => void saveVerified()}
-                  className="h-[34px] gap-[6px] rounded-[10px] bg-[#18181a] px-[20px] text-[13px] text-white hover:bg-[#303030] disabled:opacity-40"
+                  className="h-[34px] gap-[6px] rounded-[10px] bg-primary px-[20px] text-[13px] text-white hover:bg-primary/80 disabled:opacity-40"
                 >
                   {saving && <LoaderCircle className="size-[14px] animate-spin" />}
                   {saving

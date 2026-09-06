@@ -390,7 +390,7 @@ export function ContentTab({ api, kb, ownerAgentId, ownerAgentName, onChanged }:
           <Button
             disabled={uploading || !ownerAgentId}
             onClick={() => fileInputRef.current?.click()}
-            className="h-[30px] rounded-[9px] bg-[#18181a] px-[14px] text-[12px] text-white hover:bg-[#303030]"
+            className="h-[30px] rounded-[9px] bg-primary px-[14px] text-[12px] text-white hover:bg-primary/80"
           >
             {t('knowledgeAdmin.content.actions.upload')}
           </Button>
@@ -440,7 +440,7 @@ export function ContentTab({ api, kb, ownerAgentId, ownerAgentName, onChanged }:
             <Button
               disabled={saving || editLoading || editContentMissing}
               onClick={() => void handleSaveEdit()}
-              className="h-[32px] min-w-[80px] rounded-[10px] bg-[#18181a] px-[12px] text-[14px] font-normal text-white hover:bg-[#303030]"
+              className="h-[32px] min-w-[80px] rounded-[10px] bg-primary px-[12px] text-[14px] font-normal text-white hover:bg-primary/80"
             >
               {t('knowledgeAdmin.private.content.editDialog.save')}
             </Button>

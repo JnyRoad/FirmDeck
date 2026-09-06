@@ -200,7 +200,7 @@ export default function TeamKnowledgePermissionMatrix({
             knowledgeBaseName: binding.knowledge_base_name,
           })}
           onClick={() => void onSave(binding, grantPayload())}
-          className="h-[30px] rounded-[9px] bg-[#18181a] px-[12px] text-[12px] text-white"
+          className="h-[30px] rounded-[9px] bg-primary px-[12px] text-[12px] text-white"
         >
           {busy
             ? t('teamKnowledgePermissionMatrix.action.saving')

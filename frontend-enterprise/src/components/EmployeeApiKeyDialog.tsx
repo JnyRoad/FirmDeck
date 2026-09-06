@@ -322,7 +322,7 @@ export default function EmployeeApiKeyDialog({
       >
         <DialogHeader className="border-b border-[#e9ecf2] bg-white px-[26px] py-[22px]">
           <div className="flex items-center gap-[12px]">
-            <span className="grid size-[38px] place-items-center rounded-[12px] bg-[#18181a] text-white">
+            <span className="grid size-[38px] place-items-center rounded-[12px] bg-primary text-white">
               <KeyRound className="size-[18px]" />
             </span>
             <div>
@@ -356,7 +356,7 @@ export default function EmployeeApiKeyDialog({
                 type="button"
                 disabled={Boolean(creating || actingId || revealingId)}
                 onClick={() => void createCredential(RUNTIME_ACCESS_META.access)}
-                className="mt-[14px] h-[32px] w-full rounded-[10px] bg-[#18181a] text-[12px] text-white hover:bg-[#303033]"
+                className="mt-[14px] h-[32px] w-full rounded-[10px] bg-primary text-[12px] text-white hover:bg-primary/80"
               >
                 {creating === RUNTIME_ACCESS_META.access && <LoaderCircle className="size-[14px] animate-spin" />}
                 {t('employeeApiKey.actions.createRuntime')}

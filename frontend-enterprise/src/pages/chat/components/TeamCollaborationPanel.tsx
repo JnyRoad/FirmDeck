@@ -477,7 +477,7 @@ export default function TeamCollaborationPanel({
                       aria-label={t('chat.team.continueAction')}
                       disabled={!taskAnswer.trim() || submittingTaskId === taskId}
                       onClick={() => void resumeTask(conversation)}
-                      className="flex h-[36px] shrink-0 items-center gap-[5px] rounded-[10px] bg-[#18181a] px-[12px] text-[11px] font-medium text-white transition hover:bg-[#343437] disabled:cursor-not-allowed disabled:opacity-40"
+                      className="flex h-[36px] shrink-0 items-center gap-[5px] rounded-[10px] bg-primary px-[12px] text-[11px] font-medium text-white transition hover:bg-primary/80 disabled:cursor-not-allowed disabled:opacity-40"
                     >
                       {submittingTaskId === taskId
                         ? <LoaderCircle className="size-[13px] animate-spin" />

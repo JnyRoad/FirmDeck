@@ -18,7 +18,7 @@ import type { ScheduledTaskRead } from '../../types';
 type TaskActionsMessageId = MessageId;
 
 const MENU_ITEM_CLASS =
-  'w-[110px] cursor-pointer gap-[4px] rounded-[10px] px-[12px] py-[6px] text-[12px] text-[#858b9c] focus:text-[#18181a] [&_svg]:size-[14px]';
+  'w-[110px] cursor-pointer gap-[4px] rounded-[10px] px-[12px] py-[6px] text-[12px] text-[#858b9c] focus:text-primary [&_svg]:size-[14px]';
 const MENU_ITEM_DANGER_CLASS =
   'w-[110px] cursor-pointer gap-[4px] rounded-[10px] px-[12px] py-[6px] text-[12px] text-[#d20b0b] focus:bg-[#fce7e7] focus:text-[#d20b0b] focus:[&_svg]:text-[#d20b0b]! [&_svg]:size-[14px]';
 

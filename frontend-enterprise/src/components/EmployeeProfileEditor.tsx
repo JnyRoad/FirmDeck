@@ -314,14 +314,14 @@ export default function EmployeeProfileEditor({
             variant="outline"
             disabled={saving}
             onClick={onClose}
-            className="h-[32px] min-w-[80px] whitespace-nowrap rounded-[10px] border-[#e3e7f1] bg-white px-[12px] text-[14px] font-normal text-[#464c5e] hover:border-[#e3e7f1] hover:bg-[#f6f6f6] hover:text-[#18181a]"
+            className="h-[32px] min-w-[80px] whitespace-nowrap rounded-[10px] border-[#e3e7f1] bg-white px-[12px] text-[14px] font-normal text-[#464c5e] hover:border-[#e3e7f1] hover:bg-[#f6f6f6] hover:text-primary"
           >
             {t('employeeProfile.action.cancel')}
           </UIButton>
           <UIButton
             disabled={saving}
             onClick={() => void save()}
-            className="h-[32px] min-w-[80px] whitespace-nowrap rounded-[10px] bg-[#18181a] px-[12px] text-[14px] font-normal text-white hover:bg-[#303030]"
+            className="h-[32px] min-w-[80px] whitespace-nowrap rounded-[10px] bg-primary px-[12px] text-[14px] font-normal text-white hover:bg-primary/80"
           >
             {t('employeeProfile.action.save')}
           </UIButton>
@@ -366,7 +366,7 @@ function TagsField({
 
   return (
     <div className="flex flex-col gap-[8px]">
-      <div className="flex min-h-[34px] flex-wrap items-center gap-[6px] rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[8px] py-[5px] transition-colors focus-within:border-[#18181a]">
+      <div className="flex min-h-[34px] flex-wrap items-center gap-[6px] rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[8px] py-[5px] transition-colors focus-within:border-primary">
         {value.map((tag) => (
           <span
             key={tag}
@@ -377,7 +377,7 @@ function TagsField({
               type="button"
               aria-label={t('employeeProfile.tags.remove')}
               onClick={() => removeTag(tag)}
-              className="grid place-items-center text-[#858b9c] hover:text-[#18181a]"
+              className="grid place-items-center text-[#858b9c] hover:text-primary"
             >
               <XIcon className="size-[12px]" />
             </button>
@@ -410,7 +410,7 @@ function TagsField({
               key={item}
               type="button"
               onClick={() => addTags(item)}
-              className="rounded-[6px] border-[0.5px] border-[#e3e7f1] px-[8px] py-[2px] text-[12px] text-[#858b9c] hover:border-[#18181a] hover:text-[#18181a]"
+              className="rounded-[6px] border-[0.5px] border-[#e3e7f1] px-[8px] py-[2px] text-[12px] text-[#858b9c] hover:border-primary hover:text-primary"
             >
               + {t(messageIds[item])}
             </button>

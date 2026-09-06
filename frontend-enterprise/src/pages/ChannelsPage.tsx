@@ -77,9 +77,9 @@ import { StatusBadge } from './scheduled-tasks/StatusBadge';
 import { type BadgeTone } from './scheduled-tasks/shared';
 
 const PRIMARY_BUTTON_CLASS =
-  'h-8 gap-1 rounded-[10px] bg-[#18181a] px-5 text-[12px] font-normal text-white hover:bg-[#303030]';
+  'h-8 gap-1 rounded-[10px] bg-primary px-5 text-[12px] font-normal text-white hover:bg-primary/80';
 const OUTLINE_BUTTON_CLASS =
-  'h-8 gap-1 rounded-[10px] border-[#e3e7f1] px-5 text-[12px] font-normal text-[#464c5e] hover:bg-[#f6f6f6] hover:text-[#18181a]';
+  'h-8 gap-1 rounded-[10px] border-[#e3e7f1] px-5 text-[12px] font-normal text-[#464c5e] hover:bg-[#f6f6f6] hover:text-primary';
 
 type LocalizedStatus = {
   tone: BadgeTone;
@@ -1269,7 +1269,7 @@ function ChannelsPageContent({
       <div className="flex items-center justify-end gap-[8px]">
         <UIButton
           onClick={openCreate}
-          className="h-[34px] gap-[4px] rounded-[10px] bg-[#18181a] px-[20px] text-[12px] font-normal text-white hover:bg-[#303030]"
+          className="h-[34px] gap-[4px] rounded-[10px] bg-primary px-[20px] text-[12px] font-normal text-white hover:bg-primary/80"
         >
           <IconAdd className="size-[14px]" />
           {t('channels.action.connect')}
@@ -1330,7 +1330,7 @@ function ChannelsPageContent({
                         openRename(item);
                       }}
                       onKeyDown={(event) => event.stopPropagation()}
-                      className="ml-auto h-[26px] gap-1 rounded-[8px] border-[#e3e7f1] px-[12px] text-[11px] font-normal text-[#464c5e] hover:bg-[#f6f6f6] hover:text-[#18181a]"
+                      className="ml-auto h-[26px] gap-1 rounded-[8px] border-[#e3e7f1] px-[12px] text-[11px] font-normal text-[#464c5e] hover:bg-[#f6f6f6] hover:text-primary"
                     >
                       {t('channels.action.rename')}
                     </UIButton>
@@ -2112,7 +2112,7 @@ function ChannelsPageContent({
                         'flex-1 rounded-[8px] py-[6px] text-[12px] transition-colors',
                         createTarget === option.key
                           ? 'bg-white font-medium text-[#18181a]'
-                          : 'text-[#858b9c] hover:text-[#18181a]',
+                          : 'text-[#858b9c] hover:text-primary',
                       )}
                     >
                       {t(option.labelId)}

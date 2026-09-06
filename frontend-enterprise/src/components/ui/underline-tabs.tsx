@@ -65,11 +65,11 @@ export function UnderlineTabs<T extends string = string>({
               isLine ? 'pt-[6px] pb-[8px] mb-[-0.5px] border-b-2' : 'py-[6px]',
               isLine
                 ? active
-                  ? 'border-[#18181a] font-medium text-[#18181a]'
-                  : 'border-transparent font-normal text-[#4f5669] hover:text-[#18181a]'
+                  ? 'border-primary font-medium text-primary'
+                  : 'border-transparent font-normal text-[#4f5669] hover:text-primary'
                 : active
-                  ? 'font-medium text-[#18181A]'
-                  : 'font-normal text-[#858B9C] hover:text-[#18181A]',
+                  ? 'font-medium text-primary'
+                  : 'font-normal text-[#858B9C] hover:text-primary',
               'disabled:cursor-not-allowed disabled:opacity-50',
               tabClassName,
             )}
@@ -78,7 +78,7 @@ export function UnderlineTabs<T extends string = string>({
             {!isLine && active && (
               <span
                 aria-hidden="true"
-                className="absolute bottom-0 left-1/2 h-[3px] w-[10px] -translate-x-1/2 rounded-[4px] bg-[#18181A]"
+                className="absolute bottom-0 left-1/2 h-[3px] w-[10px] -translate-x-1/2 rounded-[4px] bg-primary"
               />
             )}
           </button>

@@ -1546,7 +1546,7 @@ export default function TeamDetailPage({
             type="button"
             disabled={startingChat || !team}
             onClick={() => void startTeamChat()}
-            className="h-[34px] gap-[6px] rounded-[10px] bg-[#18181a] px-[14px] text-[12px] font-normal text-white hover:bg-[#303030]"
+            className="h-[34px] gap-[6px] rounded-[10px] bg-primary px-[14px] text-[12px] font-normal text-white hover:bg-primary/80"
           >
             <MessageCircle className="size-[14px]" />
             {startingChat ? t('teamDetailPage.action.startingChat') : t('teamDetailPage.action.startChat')}
@@ -1712,7 +1712,7 @@ export default function TeamDetailPage({
               type="button"
               disabled={addingMember}
               onClick={() => void addMember()}
-              className="h-[36px] shrink-0 rounded-[10px] bg-[#18181a] px-[16px] text-[14px] font-normal text-white hover:bg-[#303030]"
+              className="h-[36px] shrink-0 rounded-[10px] bg-primary px-[16px] text-[14px] font-normal text-white hover:bg-primary/80"
             >
               {t('teamDetailPage.members.add')}
             </Button>
@@ -1764,7 +1764,7 @@ export default function TeamDetailPage({
               type="button"
               disabled={savingConfig || !team}
               onClick={() => void saveTeamConfig()}
-              className="h-[32px] rounded-[10px] bg-[#18181a] px-[16px] text-[13px] font-normal text-white hover:bg-[#303030]"
+              className="h-[32px] rounded-[10px] bg-primary px-[16px] text-[13px] font-normal text-white hover:bg-primary/80"
             >
               {savingConfig ? t('teamDetailPage.settings.saving') : t('teamDetailPage.settings.save')}
             </Button>
@@ -1828,7 +1828,7 @@ export default function TeamDetailPage({
               type="button"
               disabled={!addKnowledgeBaseId || knowledgeBusyIds.size > 0}
               onClick={() => void bindExistingKnowledgeBase()}
-              className="h-[34px] shrink-0 rounded-[9px] bg-[#18181a] px-[12px] text-[12px] text-white"
+              className="h-[34px] shrink-0 rounded-[9px] bg-primary px-[12px] text-[12px] text-white"
             >
               {t('teamDetailPage.knowledge.bind')}
             </Button>
@@ -1845,7 +1845,7 @@ export default function TeamDetailPage({
               type="button"
               disabled={!newSharedKnowledgeName.trim() || knowledgeBusyIds.size > 0}
               onClick={() => void createAndBindSharedKnowledgeBase()}
-              className="h-[34px] shrink-0 rounded-[9px] bg-[#18181a] px-[12px] text-[12px] text-white"
+              className="h-[34px] shrink-0 rounded-[9px] bg-primary px-[12px] text-[12px] text-white"
             >
               {t('teamDetailPage.knowledge.createAndBind')}
             </Button>
@@ -1966,7 +1966,7 @@ export default function TeamDetailPage({
             type="button"
             disabled={postingEntry || !boardContent.trim()}
             onClick={() => void addBoardEntry()}
-            className="h-[36px] shrink-0 rounded-[10px] bg-[#18181a] px-[16px] text-[14px] font-normal text-white hover:bg-[#303030]"
+            className="h-[36px] shrink-0 rounded-[10px] bg-primary px-[16px] text-[14px] font-normal text-white hover:bg-primary/80"
           >
             {postingEntry ? t('teamDetailPage.blackboard.adding') : t('teamDetailPage.blackboard.add')}
           </Button>
@@ -1979,7 +1979,7 @@ export default function TeamDetailPage({
           <Button
             type="button"
             onClick={() => setTaskDialogOpen(true)}
-            className="h-[32px] rounded-[10px] bg-[#18181a] px-[16px] text-[13px] font-normal text-white hover:bg-[#303030]"
+            className="h-[32px] rounded-[10px] bg-primary px-[16px] text-[13px] font-normal text-white hover:bg-primary/80"
           >
             {t('teamDetailPage.task.create')}
           </Button>
@@ -2188,7 +2188,7 @@ export default function TeamDetailPage({
                         type="button"
                         disabled={awarding || !awardAgentId}
                         onClick={() => void awardOverride()}
-                        className="h-[32px] rounded-[10px] bg-[#18181a] px-[16px] text-[13px] font-normal text-white hover:bg-[#303030]"
+                        className="h-[32px] rounded-[10px] bg-primary px-[16px] text-[13px] font-normal text-white hover:bg-primary/80"
                       >
                         {awarding ? t('teamDetailPage.task.submitting') : t('teamDetailPage.task.confirmOverride')}
                       </Button>
@@ -2232,7 +2232,7 @@ export default function TeamDetailPage({
                       type="button"
                       disabled={overriding}
                       onClick={() => void overrideTask('approve')}
-                      className="h-[32px] rounded-[10px] bg-[#18181a] px-[16px] text-[13px] font-normal text-white hover:bg-[#303030]"
+                      className="h-[32px] rounded-[10px] bg-primary px-[16px] text-[13px] font-normal text-white hover:bg-primary/80"
                     >
                       {t('teamDetailPage.review.approveButton')}
                     </Button>
@@ -2331,7 +2331,7 @@ export default function TeamDetailPage({
                 type="button"
                 disabled={creatingTask || !newTaskTitle.trim()}
                 onClick={() => void createTask()}
-                className="h-[32px] rounded-[10px] bg-[#18181a] px-[16px] text-[13px] font-normal text-white hover:bg-[#303030]"
+                className="h-[32px] rounded-[10px] bg-primary px-[16px] text-[13px] font-normal text-white hover:bg-primary/80"
               >
                 {creatingTask ? t('teamDetailPage.task.creating') : t('teamDetailPage.task.createSubmit')}
               </Button>
@@ -2378,7 +2378,7 @@ export default function TeamDetailPage({
                 type="button"
                 disabled={savingEntry || !editContent.trim()}
                 onClick={() => void saveEditEntry()}
-                className="h-[32px] rounded-[10px] bg-[#18181a] px-[16px] text-[13px] font-normal text-white hover:bg-[#303030]"
+                className="h-[32px] rounded-[10px] bg-primary px-[16px] text-[13px] font-normal text-white hover:bg-primary/80"
               >
                 {savingEntry ? t('teamDetailPage.dialog.saving') : t('teamDetailPage.dialog.save')}
               </Button>

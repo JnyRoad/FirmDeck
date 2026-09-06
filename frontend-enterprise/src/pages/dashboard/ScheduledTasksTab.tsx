@@ -755,7 +755,7 @@ export default function ScheduledTasksTab() {
         data-guide-target="scheduled-task-create"
         onClick={() => navigate('/enterprise/scheduled-tasks/new')}
         disabled={createDisabled}
-        className="h-8 w-[100px] gap-1 rounded-[10px] bg-[#18181a] px-5 text-[12px] font-normal text-white hover:bg-[#303030]"
+        className="h-8 w-[100px] gap-1 rounded-[10px] bg-primary px-5 text-[12px] font-normal text-white hover:bg-primary/80"
       >
         <IconAdd className="size-3.5" />
         {translate('scheduledTasksPage.action.create')}

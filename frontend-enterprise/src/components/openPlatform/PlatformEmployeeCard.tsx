@@ -91,7 +91,7 @@ export default function PlatformEmployeeCard({
                 </span>
               </div>
             </div>
-            <span className="grid size-[28px] shrink-0 self-center place-items-center rounded-[10px] bg-white text-[#757f9c] transition-colors group-hover:text-[#18181a]">
+            <span className="grid size-[28px] shrink-0 self-center place-items-center rounded-[10px] bg-white text-[#757f9c] transition-colors group-hover:text-primary">
               <IconArrowRight className="size-[15px]" />
             </span>
           </div>

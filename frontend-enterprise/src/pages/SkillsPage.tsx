@@ -1071,14 +1071,14 @@ export default function SkillsPage({
           variant="outline"
           onClick={() => void load()}
           disabled={loading}
-          className="h-[34px] gap-[4px] rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[20px] text-[12px] font-normal text-[#757f9c] hover:border-[#cbd3e6] hover:bg-white hover:text-[#18181a]"
+          className="h-[34px] gap-[4px] rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[20px] text-[12px] font-normal text-[#757f9c] hover:border-[#cbd3e6] hover:bg-white hover:text-primary"
         >
           <IconRefresh className={cn('size-[14px]', loading && 'animate-spin')} />
           {copy.refresh}
         </UIButton>
         {canManageCurrentScope && (
           <DropdownMenu>
-            <DropdownMenuTrigger data-guide-target="sop-create" className="flex h-[34px] items-center gap-[4px] rounded-[10px] bg-[#18181a] px-[20px] text-[12px] font-normal text-white outline-none transition-colors hover:bg-[#303030]">
+            <DropdownMenuTrigger data-guide-target="sop-create" className="flex h-[34px] items-center gap-[4px] rounded-[10px] bg-primary px-[20px] text-[12px] font-normal text-white outline-none transition-colors hover:bg-primary/80">
               <IconAdd className="size-[14px]" />
               {copy.add}
               <IconChevronDown className="size-[12px]" />
@@ -1113,7 +1113,7 @@ export default function SkillsPage({
           </div>
 
           <div className="flex flex-wrap items-center gap-[16px]">
-            <label className="flex h-[34px] w-[260px] items-center gap-[8px] overflow-hidden rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[12px] transition-colors focus-within:border-[#18181a] max-[900px]:w-full">
+            <label className="flex h-[34px] w-[260px] items-center gap-[8px] overflow-hidden rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[12px] transition-colors focus-within:border-primary max-[900px]:w-full">
               <IconSearch className="size-[14px] shrink-0 text-[#858b9c]" />
               <input
                 autoComplete="off"
@@ -1385,7 +1385,7 @@ function ScopeToggle({
             'rounded-[6px] px-[10px] py-[3px] text-[11px] leading-none transition-colors',
             value === scope
               ? 'bg-white text-[#18181a] shadow-sm'
-              : 'text-[#858b9c] hover:text-[#18181a]',
+              : 'text-[#858b9c] hover:text-primary',
           )}
         >
           {scope === 'current' ? copy.rankingCurrent : copy.rankingTotal}

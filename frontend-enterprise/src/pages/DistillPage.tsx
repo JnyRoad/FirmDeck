@@ -2740,7 +2740,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
             <UIButton
               variant="ghost"
               size="icon"
-              className="size-7 rounded-[8px] text-[#858b9c] hover:bg-[#f1f3f6] hover:text-[#18181a]"
+              className="size-7 rounded-[8px] text-[#858b9c] hover:bg-[#f1f3f6] hover:text-primary"
               aria-label={t('distillPage.panel.collapseAi')}
               title={t('distillPage.panel.collapseAi')}
               onClick={() => setFlowAssistantPanelOpen(false)}

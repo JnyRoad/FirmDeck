@@ -91,7 +91,7 @@ export default function ChatHeader({ chat }: { chat: UseChatSession }) {
               type="button"
               aria-label={t('chat.header.rename')}
               onClick={() => openRename(currentSession)}
-              className="inline-grid size-[14px] shrink-0 place-items-center text-[#858b9c] transition-colors hover:text-[#18181a]"
+              className="inline-grid size-[14px] shrink-0 place-items-center text-[#858b9c] transition-colors hover:text-primary"
             >
               <IconEdit className="size-[14px]!" />
             </button>

@@ -27,7 +27,7 @@ import EmployeeAvatar from './EmployeeAvatar';
 // DropdownMenuContent (see below), so items only need layout + default color here.
 // Kept in sync with the ScheduledTasksTab action menu.
 const MENU_ITEM_CLASS =
-  'cursor-pointer gap-[4px] rounded-[10px] px-[12px] py-[6px] text-[12px] text-[#858b9c] focus:text-[#18181a]';
+  'cursor-pointer gap-[4px] rounded-[10px] px-[12px] py-[6px] text-[12px] text-[#858b9c] focus:text-primary';
 const MENU_ITEM_DANGER_CLASS =
   'cursor-pointer gap-[4px] rounded-[10px] px-[12px] py-[6px] text-[12px] text-[#d20b0b] focus:bg-[#fce7e7] focus:text-[#d20b0b] focus:[&_svg]:text-[#d20b0b]!';
 
@@ -193,7 +193,7 @@ export default function EmployeeCard({
             event.stopPropagation();
             onChat();
           }}
-          className="grid size-[28px] shrink-0 self-center place-items-center rounded-[10px] bg-white text-[#757F9C] transition-colors hover:text-[#18181A] disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:text-[#757F9C]"
+          className="grid size-[28px] shrink-0 self-center place-items-center rounded-[10px] bg-white text-[#757F9C] transition-colors hover:text-primary disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:text-[#757F9C]"
         >
           <IconChat className="size-[16px]!" />
         </button>

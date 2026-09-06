@@ -319,7 +319,7 @@ export default function AppHeader({
                           </span>
                         )}
                         {!avatarSaving && (
-                          <span className="pointer-events-none absolute -bottom-[2px] -right-[2px] grid size-[16px] place-items-center rounded-full bg-[#18181a] text-white">
+                          <span className="pointer-events-none absolute -bottom-[2px] -right-[2px] grid size-[16px] place-items-center rounded-full bg-primary text-white">
                             <IconEdit className="size-[9px]" />
                           </span>
                         )}

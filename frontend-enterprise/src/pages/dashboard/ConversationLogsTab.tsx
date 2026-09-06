@@ -1076,7 +1076,7 @@ export default function ConversationLogsTab() {
             />
           </div>
           <div className="flex shrink-0 items-center gap-[8px] max-[1099px]:w-full max-[520px]:flex-col">
-            <label className="flex h-[34px] w-[280px] shrink-0 items-center overflow-hidden rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white transition-colors focus-within:border-[#18181a] max-[1099px]:flex-1 max-[520px]:w-full">
+            <label className="flex h-[34px] w-[280px] shrink-0 items-center overflow-hidden rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white transition-colors focus-within:border-primary max-[1099px]:flex-1 max-[520px]:w-full">
               <span className="flex h-full w-[72px] shrink-0 items-center justify-center border-r-[0.5px] border-[#e3e7f1] bg-[#f6f6f6] text-[12px] text-[#858b9c]">
                 {t('dashboard.conversationLogs.userFilter.label')}
               </span>
@@ -1548,7 +1548,7 @@ function FeedbackMessage({
                 variant="outline"
                 disabled={reanalyzing}
                 onClick={() => onReanalyze(item.feedback_id as string)}
-                className="mt-[8px] h-[30px] gap-[4px] rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[14px] text-[12px] font-normal text-[#757f9c] hover:border-[#cbd3e6] hover:text-[#18181a]"
+                className="mt-[8px] h-[30px] gap-[4px] rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[14px] text-[12px] font-normal text-[#757f9c] hover:border-[#cbd3e6] hover:text-primary"
               >
                 <RefreshCw className={cn('size-3.5', reanalyzing && 'animate-spin')} />
                 {t('dashboard.conversationLogs.actions.reanalyze')}

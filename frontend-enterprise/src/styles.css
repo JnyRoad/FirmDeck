@@ -5180,6 +5180,16 @@ pre {
   --accent: #111111;
   --accent-soft: #f2f3f5;
   --accent-foreground: #ffffff;
+  /* Keep shadcn's semantic action tokens in lockstep with the ink/surface
+     tokens above -- the base :root further up still ships the scaffold's
+     teal/cream defaults, which otherwise leak into any control (Button,
+     Badge, focus rings, muted copy) that doesn't hardcode its own color. */
+  --primary: #111111;
+  --primary-foreground: #ffffff;
+  --secondary: #f2f3f7;
+  --secondary-foreground: #464c5e;
+  --muted-foreground: #858b9c;
+  --ring: #111111;
   --shadow-float: 0 18px 48px rgba(17, 17, 17, 0.10);
   --shadow-soft: 0 8px 24px rgba(17, 17, 17, 0.045);
   --font-body: "Inter", "IBM Plex Sans", "Noto Sans SC", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif;

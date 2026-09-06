@@ -911,7 +911,7 @@ function Shell({
                     className={cn(
                       "rounded-[8px] px-[14px] py-[5px] text-[13px] font-medium transition-colors",
                       agentForm.sourceMode === option.value
-                        ? "bg-[#18181a] text-white"
+                        ? "bg-primary text-white"
                         : "text-[#5b6273] hover:text-foreground",
                     )}
                     onClick={() =>

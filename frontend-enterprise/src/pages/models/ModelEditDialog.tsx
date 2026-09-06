@@ -430,14 +430,14 @@ export default function ModelEditDialog({
             variant="outline"
             disabled={saving}
             onClick={closeDialog}
-            className="h-[32px] w-[80px] rounded-[10px] border-[#e3e7f1] bg-white px-[12px] text-[14px] font-normal text-[#464c5e] hover:border-[#e3e7f1] hover:bg-[#f6f6f6] hover:text-[#18181a]"
+            className="h-[32px] w-[80px] rounded-[10px] border-[#e3e7f1] bg-white px-[12px] text-[14px] font-normal text-[#464c5e] hover:border-[#e3e7f1] hover:bg-[#f6f6f6] hover:text-primary"
           >
             {t('common.action.cancel')}
           </UIButton>
           <UIButton
             disabled={saving}
             onClick={() => void save()}
-            className="h-[32px] w-[80px] rounded-[10px] bg-[#18181a] px-[12px] text-[14px] font-normal text-white hover:bg-[#303030]"
+            className="h-[32px] w-[80px] rounded-[10px] bg-primary px-[12px] text-[14px] font-normal text-white hover:bg-primary/80"
           >
             {saving && <LoaderCircle className="size-[14px] animate-spin" />}
             {saveStage === 'testing' ? t('modelSetup.actions.testAndSave') : saving ? t('modelSetup.actions.saving') : t('common.action.save')}
